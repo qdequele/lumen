@@ -93,6 +93,10 @@ pub enum GatewayError {
         capability: Capability,
     },
 
+    /// A rerank request supplied no documents to score.
+    #[error("`documents` must not be empty")]
+    EmptyDocuments,
+
     // ---- Upstream errors (FG-3xxx) ------------------------------------------
     /// An upstream provider rate limited the request (HTTP 429).
     #[error("upstream provider '{provider}' rate limited the request")]
@@ -146,6 +150,7 @@ impl GatewayError {
             GatewayError::PayloadTooLarge { .. } => "FG-1002",
             GatewayError::ModelNotFound(_) => "FG-2001",
             GatewayError::UnsupportedCapability { .. } => "FG-2002",
+            GatewayError::EmptyDocuments => "FG-2010",
             GatewayError::UpstreamRateLimited { .. } => "FG-3001",
             GatewayError::UpstreamInvalidResponse { .. } => "FG-3002",
             GatewayError::Upstream { .. } => "FG-3003",
@@ -162,7 +167,9 @@ impl GatewayError {
     #[must_use]
     pub const fn http_status(&self) -> u16 {
         match self {
-            GatewayError::InvalidRequest(_) | GatewayError::UnsupportedCapability { .. } => 400,
+            GatewayError::InvalidRequest(_)
+            | GatewayError::UnsupportedCapability { .. }
+            | GatewayError::EmptyDocuments => 400,
             GatewayError::Unauthorized => 401,
             GatewayError::BudgetExceeded => 402,
             GatewayError::ModelNotFound(_) => 404,
@@ -182,6 +189,7 @@ impl GatewayError {
             GatewayError::InvalidRequest(_)
             | GatewayError::ModelNotFound(_)
             | GatewayError::UnsupportedCapability { .. }
+            | GatewayError::EmptyDocuments
             | GatewayError::PayloadTooLarge { .. }
             | GatewayError::Unauthorized
             | GatewayError::BudgetExceeded
@@ -342,8 +350,18 @@ mod tests {
             .code(),
             "FG-3003"
         );
+        // Empty rerank documents (pinned by the M3 spec).
+        assert_eq!(GatewayError::EmptyDocuments.code(), "FG-2010");
         assert_eq!(GatewayError::Unauthorized.code(), "FG-4001");
         assert_eq!(GatewayError::Internal("boom".into()).code(), "FG-5001");
+    }
+
+    #[test]
+    fn empty_documents_is_a_400_client_error() {
+        let err = GatewayError::EmptyDocuments;
+        assert_eq!(err.http_status(), 400);
+        assert_eq!(err.error_type(), ErrorType::InvalidRequest);
+        assert_eq!(err.public_message(), "`documents` must not be empty");
     }
 
     #[test]

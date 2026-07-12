@@ -31,7 +31,9 @@ pub use chat::{
 pub use embed::{EmbedData, EmbedInput, EmbedRequest, EmbedResponse, EmbedUsage};
 pub use error::{ErrorBody, ErrorEnvelope, ErrorType, GatewayError, ProviderError};
 pub use provider::{ChatProvider, EmbeddingProvider, RerankProvider};
-pub use rerank::{RerankDocument, RerankRequest, RerankResponse, RerankResult};
+pub use rerank::{
+    RerankDocument, RerankRequest, RerankResponse, RerankResult, RerankResultDocument, RerankUsage,
+};
 
 #[cfg(test)]
 mod tests {
@@ -99,5 +101,36 @@ mod tests {
         assert_eq!(req.query, "q");
         assert_eq!(req.documents.len(), 2);
         assert_eq!(req.top_n, Some(1));
+        // Absent `return_documents` defaults to false (bandwidth-saving).
+        assert!(!req.return_documents);
+    }
+
+    #[test]
+    fn rerank_documents_accept_strings_and_objects() {
+        let req: RerankRequest = serde_json::from_str(
+            r#"{"model":"m","query":"q","documents":["bare",{"text":"wrapped"}],"return_documents":true}"#,
+        )
+        .unwrap();
+        assert_eq!(req.documents.len(), 2);
+        // Both forms expose their text uniformly.
+        assert_eq!(req.documents[0].text(), "bare");
+        assert_eq!(req.documents[1].text(), "wrapped");
+        assert!(req.return_documents);
+    }
+
+    #[test]
+    fn rerank_response_omits_document_when_absent() {
+        let resp = RerankResponse {
+            results: vec![RerankResult {
+                index: 0,
+                relevance_score: 0.9,
+                document: None,
+            }],
+            usage: RerankUsage { search_units: 1 },
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        // `document` is skipped entirely when None (criterion 5).
+        assert!(json["results"][0].get("document").is_none());
+        assert_eq!(json["usage"]["search_units"], 1);
     }
 }
