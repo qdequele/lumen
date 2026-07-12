@@ -1,6 +1,6 @@
 //! Assembly of the axum application and its middleware stack.
 
-use crate::{embeddings, models, rerank, routes, state::AppState};
+use crate::{chat, embeddings, models, rerank, routes, state::AppState};
 use axum::{
     routing::{get, post},
     Router,
@@ -32,6 +32,7 @@ pub fn build_app(state: AppState, body_limit: usize) -> Router {
         .route("/health", get(routes::health))
         .route("/metrics", get(routes::metrics))
         .route("/v1/models", get(models::models))
+        .route("/v1/chat/completions", post(chat::chat))
         .route("/v1/embeddings", post(embeddings::embeddings))
         .route("/v1/rerank", post(rerank::rerank_handler))
         .with_state(state)

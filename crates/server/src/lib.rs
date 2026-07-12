@@ -6,6 +6,7 @@
 #![forbid(unsafe_code)]
 
 pub mod app;
+pub mod chat;
 pub mod config;
 pub mod embeddings;
 pub mod error;
