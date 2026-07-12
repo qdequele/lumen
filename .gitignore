@@ -1,0 +1,23 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# Local config that may reference real secrets
+/config.toml
+/config.local.toml
+
+# Local databases
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+
+# Env files
+.env
+.env.*
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
