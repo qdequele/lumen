@@ -103,7 +103,37 @@ where
     if let Some(key) = api_key {
         builder = builder.bearer_auth(key);
     }
+    open(builder, provider, cancel).await
+}
 
+/// Like [`open_stream`], but applies arbitrary request headers instead of
+/// bearer auth (Anthropic's `x-api-key`, Google's `x-goog-api-key`). Header
+/// values must never be logged.
+pub async fn open_stream_with_headers<B>(
+    client: &reqwest::Client,
+    url: &str,
+    body: &B,
+    headers: &[(&str, &str)],
+    provider: &str,
+    cancel: &CancellationToken,
+) -> Result<BoxStream<'static, Result<Bytes, ProviderError>>, ProviderError>
+where
+    B: Serialize + ?Sized,
+{
+    let mut builder = client.post(url).json(body);
+    for (name, value) in headers {
+        builder = builder.header(*name, *value);
+    }
+    open(builder, provider, cancel).await
+}
+
+/// Send a prepared streaming request and return the response body as a `Bytes`
+/// stream (shared core of the two `open_stream*` variants).
+async fn open(
+    builder: reqwest::RequestBuilder,
+    provider: &str,
+    cancel: &CancellationToken,
+) -> Result<BoxStream<'static, Result<Bytes, ProviderError>>, ProviderError> {
     let call = async {
         let response = builder
             .send()

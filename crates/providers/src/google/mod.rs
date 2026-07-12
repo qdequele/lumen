@@ -1,17 +1,22 @@
 //! Google Gemini provider — chat completions with bidirectional translation.
 //!
 //! Gemini's `generateContent` API differs from OpenAI in several ways this
-//! module bridges (non-streaming in this slice; `streamGenerateContent`
-//! translation lands with the other streaming translators):
+//! module bridges:
 //!
 //! * auth is an `x-goog-api-key` header (the key is never put in the URL);
-//! * the model is part of the URL path (`/models/{model}:generateContent`);
+//! * the model is part of the URL path (`/models/{model}:generateContent`,
+//!   or `:streamGenerateContent?alt=sse` when streaming);
 //! * messages are `contents` with roles `user`/`model` (assistant → `model`);
 //!   system prompts go in a top-level `systemInstruction`;
 //! * generation params live under `generationConfig`;
-//! * responses are `candidates` with a `finishReason` and `usageMetadata`.
+//! * responses are `candidates` with a `finishReason` and `usageMetadata`;
+//! * streaming events are partial responses, translated fragment by fragment
+//!   in [`stream`] (bounded state — the text is never accumulated).
+
+mod stream;
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use ferrogate_core::{
     ChatChoice, ChatChunk, ChatMessage, ChatProvider, ChatRequest, ChatResponse, ProviderError,
     Usage,
@@ -21,8 +26,9 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use tokio_util::sync::CancellationToken;
 
-use crate::chat::single_shot_stream;
-use crate::http::post_json_with_headers;
+use self::stream::GoogleTranslator;
+use crate::chat::{items_to_chunks, items_to_sse_bytes, translate_sse_stream, StreamItem};
+use crate::http::{open_stream_with_headers, post_json_with_headers};
 
 /// Default Gemini API base (the path adds `/v1beta/models/...`).
 const DEFAULT_BASE_URL: &str = "https://generativelanguage.googleapis.com";
@@ -292,9 +298,52 @@ impl ChatProvider for GoogleProvider {
         req: ChatRequest,
         cancel: CancellationToken,
     ) -> Result<BoxStream<'static, Result<ChatChunk, ProviderError>>, ProviderError> {
-        // Interim single-shot; streamGenerateContent translation is future work.
-        let resp = self.chat(req, cancel).await?;
-        Ok(single_shot_stream(resp))
+        let items = self.open_translated_stream(req, cancel).await?;
+        Ok(items_to_chunks(items))
+    }
+
+    /// Fragment-by-fragment translation to OpenAI SSE frames. `data: [DONE]`
+    /// is emitted only after a genuine upstream `finishReason`, so a mid-stream
+    /// upstream death surfaces as a missing terminator (FG-3010 downstream).
+    async fn chat_stream_bytes(
+        &self,
+        req: ChatRequest,
+        cancel: CancellationToken,
+    ) -> Result<BoxStream<'static, Result<Bytes, ProviderError>>, ProviderError> {
+        let items = self.open_translated_stream(req, cancel).await?;
+        Ok(items_to_sse_bytes(items))
+    }
+}
+
+impl GoogleProvider {
+    /// Open the upstream SSE stream and translate its fragments (shared by
+    /// both streaming trait methods).
+    async fn open_translated_stream(
+        &self,
+        req: ChatRequest,
+        cancel: CancellationToken,
+    ) -> Result<BoxStream<'static, Result<StreamItem, ProviderError>>, ProviderError> {
+        // `alt=sse` selects SSE framing; the key stays in a header, never the URL.
+        let url = format!(
+            "{}/v1beta/models/{}:streamGenerateContent?alt=sse",
+            self.base_url, req.model
+        );
+        let body = translate_request(&req);
+        let headers = [("x-goog-api-key", self.api_key.as_deref().unwrap_or(""))];
+
+        let bytes = open_stream_with_headers(
+            &self.client,
+            &url,
+            &body,
+            &headers,
+            &self.provider_name,
+            &cancel,
+        )
+        .await?;
+        Ok(translate_sse_stream(
+            bytes,
+            GoogleTranslator::new(&req.model),
+        ))
     }
 }
 
