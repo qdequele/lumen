@@ -71,3 +71,26 @@ milestone.
 - The four hosted rerank providers default `max_batch_size` conservatively
   (Cohere 96, Jina/Voyage/OpenAI-style large, TEI 32). Revisit against real
   provider limits; embeddings batching already exercises these.
+
+## Noted while building M4 (slice 1 — non-streaming chat)
+
+- **Streaming disconnect test is a no-hang assertion, not an abort assertion.**
+  `streaming_client_disconnect_does_not_hang_server` proves the server stays
+  responsive but not that the upstream connection was actually closed (M4
+  acceptance criterion 2: "amont fermé en < 100 ms"). And because the interim
+  single-shot `chat_stream` awaits the full `chat()` before the guard is moved
+  into the SSE body, the moved-guard path is not exercised. Strengthen in the
+  streaming slice: assert via wiremock that the upstream request was aborted,
+  and add a case where the client cuts *after* the body starts.
+- Anthropic `translate_request` copies message roles verbatim and does not
+  normalise user/assistant alternation or drop/merge `tool`/empty-content
+  messages (spec 4.3 bullet). Fine for the interim text path; complete with
+  tool translation in the streaming slice.
+- Anthropic responses set `created: 0` (the API returns no timestamp). Some
+  OpenAI clients expect a real epoch; set `SystemTime::now()` if one complains.
+- `to_sse_body`'s `Chain` drops the mapping closure (and thus the cancel guard)
+  as soon as the chunk stream is exhausted, a hair before the `[DONE]` frame.
+  Benign today (nothing left to cancel once the upstream is done), but the real
+  streaming slice must not tie a live resource to guard survival through `[DONE]`.
+- Interim single-shot emits `[DONE]` even after a mid-stream error frame.
+  Harmless with one item; real streaming must terminate after an error.

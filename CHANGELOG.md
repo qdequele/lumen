@@ -6,6 +6,32 @@ All notable changes to Ferrogate are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added — M4 (slice 1): chat completions (non-streaming)
+
+- `POST /v1/chat/completions`: non-streaming JSON end to end (validate → route →
+  provider → OpenAI-shaped response), and a functional streaming SSE path
+  (`text/event-stream`, `data: {...}` frames, terminal `data: [DONE]`, 15 s
+  keep-alive pings). Client disconnect cancels the per-request token and aborts
+  the upstream (the drop guard is moved into the SSE body stream).
+- Chat providers: **OpenAI** and **Mistral** (OpenAI-compatible passthrough),
+  and **Anthropic** with non-streaming bidirectional translation (system hoisted
+  to the top-level field, `max_tokens` defaulted, `stop`→`stop_sequences`,
+  `stop_reason`→`finish_reason`, `input/output_tokens`→`usage`; auth via
+  `x-api-key`/`anthropic-version`, not bearer).
+- Chat routing (`resolve_chat`, FG-2001/FG-2002) and registry chat routes; a
+  shared `chat::single_shot_stream` adapter backs the interim `chat_stream`.
+- Reserved streaming error codes `FG-3010` (upstream stream interrupted, 502)
+  and `FG-3011` (first-token timeout, 504) in the taxonomy and `docs/errors.md`.
+
+  *Deferred to the M4 streaming slice:* zero-copy incremental SSE passthrough,
+  Anthropic streaming-event translation, Google Gemini, Mistral embeddings, the
+  first-token timeout, and streaming token estimation (ADR 003).
+
+### Changed
+
+- `http::post_json` gained a header-based sibling `post_json_with_headers` (for
+  Anthropic's non-bearer auth); the two share one send/classify core.
+
 ### Added — M3: reranking & model discovery
 
 - `POST /v1/rerank` (Cohere wire format): `documents` accept bare strings or

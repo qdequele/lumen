@@ -6,8 +6,8 @@
 ## Tâches
 
 ### 4.1 Non-streaming
-- [ ] `POST /v1/chat/completions` (stream=false) : validation → router → provider → réponse OpenAI
-- [ ] Support : messages (system/user/assistant/tool), temperature, max_tokens, stop, tools/tool_choice, response_format json
+- [x] `POST /v1/chat/completions` (stream=false) : validation → router → provider → réponse OpenAI
+- [x] Support : messages (system/user/assistant/tool), temperature, max_tokens, stop, tools/tool_choice, response_format json (passthrough via `extra`)
 
 ### 4.2 Streaming SSE
 - [ ] `stream=true` : réponse `text/event-stream`, chunks `data: {...}`, terminaison `data: [DONE]`

@@ -44,6 +44,8 @@ retried on a fallback (M6) before surfacing.
 | `FG-3003` | 502  | An upstream provider returned an error status.                 |
 | `FG-3004` | 503  | No healthy upstream available (circuit open / fallbacks spent).|
 | `FG-3005` | 504  | An upstream provider timed out.                                |
+| `FG-3010` | 502  | An upstream stream ended prematurely (no terminator).          |
+| `FG-3011` | 504  | An upstream produced no first token within the deadline.       |
 
 For `FG-3001` (and `FG-4003`), a `Retry-After` value may be advertised.
 
