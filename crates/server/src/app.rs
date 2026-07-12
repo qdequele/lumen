@@ -1,7 +1,10 @@
 //! Assembly of the axum application and its middleware stack.
 
-use crate::{routes, state::AppState};
-use axum::{routing::get, Router};
+use crate::{embeddings, routes, state::AppState};
+use axum::{
+    routing::{get, post},
+    Router,
+};
 use tower::ServiceBuilder;
 use tower_http::{
     limit::RequestBodyLimitLayer,
@@ -28,6 +31,7 @@ pub fn build_app(state: AppState, body_limit: usize) -> Router {
     Router::new()
         .route("/health", get(routes::health))
         .route("/metrics", get(routes::metrics))
+        .route("/v1/embeddings", post(embeddings::embeddings))
         .with_state(state)
         .layer(middleware)
 }

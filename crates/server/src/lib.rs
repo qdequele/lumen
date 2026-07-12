@@ -7,6 +7,8 @@
 
 pub mod app;
 pub mod config;
+pub mod embeddings;
+pub mod error;
 pub mod lifecycle;
 pub mod routes;
 pub mod state;
@@ -15,6 +17,22 @@ pub use app::build_app;
 pub use config::{Config, ConfigError};
 pub use lifecycle::{serve, shutdown_signal};
 pub use state::AppState;
+
+use ferrogate_providers::Registry;
+use std::sync::Arc;
+
+/// Build the provider registry from config, sharing one HTTP client.
+///
+/// # Errors
+/// Returns a [`RegistryError`](ferrogate_providers::RegistryError) if a provider
+/// spec is invalid (e.g. a keyless provider missing its required `base_url`).
+pub fn build_registry(
+    config: &Config,
+) -> Result<Arc<Registry>, ferrogate_providers::RegistryError> {
+    let client = ferrogate_providers::http::build_client();
+    let registry = Registry::build(config.provider_specs(), client)?;
+    Ok(Arc::new(registry))
+}
 
 /// Emit the startup log line and one line per loaded model.
 ///

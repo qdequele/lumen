@@ -10,6 +10,7 @@
 //! time, so deriving `Debug` on these structs cannot leak a key.
 
 use ferrogate_core::Capability;
+use ferrogate_providers::{ModelSpec, ProviderKind, ProviderSpec};
 use ferrogate_telemetry::logging::LogFormat;
 use figment::{
     providers::{Env, Format, Toml},
@@ -88,22 +89,6 @@ impl ModelConfig {
     pub fn resolved_upstream_id(&self) -> &str {
         self.upstream_id.as_deref().unwrap_or(&self.id)
     }
-}
-
-/// The built-in provider implementations Ferrogate knows how to talk to.
-///
-/// An unknown `kind` in the TOML is a hard error at load time.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ProviderKind {
-    Openai,
-    Anthropic,
-    Cohere,
-    Ollama,
-    Tei,
-    Jina,
-    Mistral,
-    Google,
 }
 
 /// Log output format, mirrored to [`LogFormat`].
@@ -253,6 +238,37 @@ impl Config {
             }
         }
         Ok(())
+    }
+
+    /// Build the provider specs used to construct the registry, resolving each
+    /// `api_key_env` to its value from the environment.
+    ///
+    /// A missing env var yields `api_key = None` rather than a startup failure,
+    /// so the gateway still boots (and `/health` still answers) without secrets;
+    /// requests to that provider fail upstream with a clear error instead.
+    #[must_use]
+    pub fn provider_specs(&self) -> Vec<ProviderSpec> {
+        self.providers
+            .iter()
+            .map(|p| ProviderSpec {
+                name: p.name.clone(),
+                kind: p.kind,
+                api_key: p
+                    .api_key_env
+                    .as_ref()
+                    .and_then(|var| std::env::var(var).ok()),
+                base_url: p.base_url.clone(),
+                models: p
+                    .models
+                    .iter()
+                    .map(|m| ModelSpec {
+                        id: m.id.clone(),
+                        upstream_id: m.resolved_upstream_id().to_owned(),
+                        capabilities: m.capabilities.clone(),
+                    })
+                    .collect(),
+            })
+            .collect()
     }
 
     /// A secret-free summary of every loaded model, for the boot log.

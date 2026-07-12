@@ -20,6 +20,7 @@ path = "src/lib.rs"
 [dependencies]
 ferrogate-core = { workspace = true }
 ferrogate-telemetry = { workspace = true }
+ferrogate-providers = { workspace = true }
 ferrogate-router = { workspace = true }
 ferrogate-auth = { workspace = true }
 
@@ -46,6 +47,8 @@ figment = { workspace = true }
 reqwest = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "sync", "time", "test-util"] }
 figment = { workspace = true, features = ["test"] }
+wiremock = { workspace = true }
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

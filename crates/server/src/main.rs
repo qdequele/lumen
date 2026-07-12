@@ -8,7 +8,9 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use anyhow::Context;
-use ferrogate_server::{build_app, config::Config, lifecycle, log_startup, state::AppState};
+use ferrogate_server::{
+    build_app, build_registry, config::Config, lifecycle, log_startup, state::AppState,
+};
 use ferrogate_telemetry::{logging::init_logging, Metrics};
 use tokio::net::TcpListener;
 
@@ -103,7 +105,8 @@ fn run(config: Config) -> anyhow::Result<()> {
             .with_context(|| format!("failed to bind {addr}"))?;
         tracing::info!(%addr, "listening");
 
-        let state = AppState::new(Metrics::new());
+        let registry = build_registry(&config).context("failed to build provider registry")?;
+        let state = AppState::new(Metrics::new(), registry);
         let app = build_app(state, config.server.body_limit);
 
         lifecycle::serve(listener, app, DRAIN_TIMEOUT, lifecycle::shutdown_signal())
