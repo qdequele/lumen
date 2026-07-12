@@ -122,6 +122,15 @@ pub enum GatewayError {
     #[error("upstream provider '{provider}' timed out")]
     UpstreamTimeout { provider: String },
 
+    /// An upstream stream ended without its terminator (e.g. no `[DONE]`),
+    /// so the response is truncated. The upstream's fault → 502.
+    #[error("upstream provider '{provider}' stream ended prematurely")]
+    UpstreamStreamInterrupted { provider: String },
+
+    /// An upstream produced no first token within the configured deadline.
+    #[error("upstream provider '{provider}' produced no first token in time")]
+    UpstreamFirstTokenTimeout { provider: String },
+
     // ---- Auth / budget errors (FG-4xxx) -------------------------------------
     /// Missing or invalid virtual key.
     #[error("authentication required")]
@@ -156,6 +165,8 @@ impl GatewayError {
             GatewayError::Upstream { .. } => "FG-3003",
             GatewayError::UpstreamUnavailable { .. } => "FG-3004",
             GatewayError::UpstreamTimeout { .. } => "FG-3005",
+            GatewayError::UpstreamStreamInterrupted { .. } => "FG-3010",
+            GatewayError::UpstreamFirstTokenTimeout { .. } => "FG-3011",
             GatewayError::Unauthorized => "FG-4001",
             GatewayError::BudgetExceeded => "FG-4002",
             GatewayError::RateLimited { .. } => "FG-4003",
@@ -176,9 +187,12 @@ impl GatewayError {
             GatewayError::PayloadTooLarge { .. } => 413,
             GatewayError::RateLimited { .. } | GatewayError::UpstreamRateLimited { .. } => 429,
             GatewayError::Internal(_) => 500,
-            GatewayError::Upstream { .. } | GatewayError::UpstreamInvalidResponse { .. } => 502,
+            GatewayError::Upstream { .. }
+            | GatewayError::UpstreamInvalidResponse { .. }
+            | GatewayError::UpstreamStreamInterrupted { .. } => 502,
             GatewayError::UpstreamUnavailable { .. } => 503,
-            GatewayError::UpstreamTimeout { .. } => 504,
+            GatewayError::UpstreamTimeout { .. }
+            | GatewayError::UpstreamFirstTokenTimeout { .. } => 504,
         }
     }
 
@@ -198,6 +212,8 @@ impl GatewayError {
             | GatewayError::UpstreamInvalidResponse { .. }
             | GatewayError::UpstreamUnavailable { .. }
             | GatewayError::UpstreamTimeout { .. }
+            | GatewayError::UpstreamStreamInterrupted { .. }
+            | GatewayError::UpstreamFirstTokenTimeout { .. }
             | GatewayError::UpstreamRateLimited { .. } => ErrorType::UpstreamError,
             GatewayError::Internal(_) => ErrorType::Internal,
         }
@@ -352,6 +368,21 @@ mod tests {
         );
         // Empty rerank documents (pinned by the M3 spec).
         assert_eq!(GatewayError::EmptyDocuments.code(), "FG-2010");
+        // Streaming upstream faults (M4).
+        assert_eq!(
+            GatewayError::UpstreamStreamInterrupted {
+                provider: "openai".into()
+            }
+            .code(),
+            "FG-3010"
+        );
+        assert_eq!(
+            GatewayError::UpstreamFirstTokenTimeout {
+                provider: "openai".into()
+            }
+            .code(),
+            "FG-3011"
+        );
         assert_eq!(GatewayError::Unauthorized.code(), "FG-4001");
         assert_eq!(GatewayError::Internal("boom".into()).code(), "FG-5001");
     }
