@@ -1,0 +1,51 @@
+[package]
+name = "server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Ferrogate HTTP server binary (axum, SSE, config, hot reload)."
+default-run = "ferrogate"
+
+[[bin]]
+name = "ferrogate"
+path = "src/main.rs"
+
+[lib]
+name = "ferrogate_server"
+path = "src/lib.rs"
+
+[dependencies]
+ferrogate-core = { workspace = true }
+ferrogate-telemetry = { workspace = true }
+ferrogate-router = { workspace = true }
+ferrogate-auth = { workspace = true }
+
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+hyper = { workspace = true }
+futures = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+figment = { workspace = true }
+
+[dev-dependencies]
+reqwest = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "sync", "time", "test-util"] }
+figment = { workspace = true, features = ["test"] }
+
+[lints]
+workspace = true

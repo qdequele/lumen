@@ -1,0 +1,74 @@
+# Ferrogate example configuration.
+#
+# Copy to `config.toml` and adjust. Every value can also be overridden with an
+# environment variable prefixed `FERROGATE_`, using `__` for nesting, e.g.:
+#   FERROGATE_SERVER__PORT=9090
+#   FERROGATE_LOG_FORMAT=json
+#
+# SECURITY: API keys are NEVER written here. Each provider references the *name*
+# of an environment variable that holds its key (`api_key_env`). Ferrogate reads
+# that variable at startup-time only when the provider is actually used.
+
+# Log format: "pretty" (human-readable, default) or "json" (production).
+# NOTE: top-level keys must appear BEFORE any [table] header in TOML.
+log_format = "pretty"
+
+# ---------------------------------------------------------------------------
+# HTTP server
+# ---------------------------------------------------------------------------
+[server]
+host = "127.0.0.1"        # bind address; use "0.0.0.0" in a container
+port = 8080               # must not be 0
+body_limit = 10485760     # max request body in bytes (10 MiB)
+
+# ---------------------------------------------------------------------------
+# Providers
+#
+# Each `[[providers]]` block declares one upstream. `kind` selects the built-in
+# implementation: openai | anthropic | cohere | ollama | tei | jina | mistral |
+# google. `name` is your own label and must be unique.
+#
+# Each `[[providers.models]]` block exposes a model to clients:
+#   id            the id clients send (owned entirely by you)
+#   upstream_id   what Ferrogate sends upstream (defaults to `id`)
+#   capabilities  any of: "chat", "embed", "rerank"
+# Model ids must be unique across ALL providers.
+# ---------------------------------------------------------------------------
+
+# OpenAI: chat + embeddings.
+[[providers]]
+name = "openai"
+kind = "openai"
+api_key_env = "OPENAI_API_KEY"
+# base_url = "https://api.openai.com/v1"   # optional override
+
+[[providers.models]]
+id = "gpt-4o"
+upstream_id = "gpt-4o-2024-08-06"
+capabilities = ["chat"]
+
+[[providers.models]]
+id = "text-embedding-3-small"
+capabilities = ["embed"]
+
+# Ollama: local, keyless. Requires a base_url.
+[[providers]]
+name = "ollama-local"
+kind = "ollama"
+base_url = "http://localhost:11434"
+
+[[providers.models]]
+id = "nomic-embed"
+upstream_id = "nomic-embed-text"
+capabilities = ["embed"]
+
+# Cohere: embeddings + reranking.
+[[providers]]
+name = "cohere"
+kind = "cohere"
+api_key_env = "COHERE_API_KEY"
+
+[[providers.models]]
+id = "rerank-english"
+upstream_id = "rerank-english-v3.0"
+capabilities = ["rerank"]
