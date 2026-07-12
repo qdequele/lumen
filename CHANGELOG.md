@@ -6,6 +6,42 @@ All notable changes to Ferrogate are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added — M4 (final slice): streaming translation, tools, and stream guards
+
+**M4 is complete.** This slice closes every remaining criterion:
+
+- **Incremental SSE parser** (`providers::sse`): reassembles upstream events
+  fragmented across TCP packets (LF and CRLF, multi-line `data:`, comments
+  ignored), buffering only the current incomplete event with a hard size cap.
+- **Anthropic streaming translation**: typed events (`message_start`,
+  `content_block_start/delta`, `message_delta`, `message_stop`) → OpenAI
+  chunks, including streamed **tool_use** (`input_json_delta` → `tool_calls`
+  argument deltas, OpenAI indices allocated in order of appearance). Bounded
+  state — the response text is never accumulated. In-stream `error` events
+  propagate only the upstream error *type*, never message bodies.
+- **Anthropic tools, both directions** (criterion 3): OpenAI `tools` →
+  Anthropic `tools` (+ `tool_choice` mapping), assistant `tool_calls` →
+  `tool_use` blocks, role `tool` → `tool_result` blocks (consecutive results
+  merged into one user message); response `tool_use` blocks → OpenAI
+  `tool_calls` with `arguments` re-encoded as a JSON string. Verified by an
+  exact-JSON snapshot test.
+- **Gemini streaming** (`streamGenerateContent?alt=sse`): partial responses →
+  OpenAI chunks; the final fragment carries `finish_reason` + full usage.
+- **Stream guards** in the server (all configurable):
+  - *first-token timeout* (`first_token_timeout_ms`, default 30 s) → FG-3011:
+    a plain 504 when the upstream never answered, an SSE error frame when the
+    stream had started; non-streaming applies the window to the whole upstream
+    call (per-phase timeouts land in M6);
+  - *missing terminator* → FG-3010 error frame when the upstream dies without
+    `data: [DONE]` (criterion 5) — detection survives a `[DONE]` split across
+    frame boundaries; the gateway never fabricates the terminator itself;
+  - *heartbeat* (`sse_heartbeat_ms`, default 15 s): `: ping` comments on idle
+    streams so proxies don't reap slow upstreams.
+- **Streaming usage (ADR 003), upstream half**: passthrough requests
+  `stream_options.include_usage`; translated providers emit full usage in the
+  final chunk. The local-estimation fallback (`estimated=true`) moves to M5
+  with the Prometheus counters and `usage_log`.
+
 ### Added — M4 (slice 3, partial): Google Gemini + Mistral embeddings
 
 - **Google Gemini** chat provider (non-streaming) with bidirectional

@@ -29,11 +29,16 @@ Spec : `specs/milestones/M2-embeddings.md`
 Spec : `specs/milestones/M3-rerank-models.md`
 
 ## M4 — Chat + streaming SSE
-- [ ] POST /v1/chat/completions non-streaming, format OpenAI
-- [ ] Streaming SSE zero-copy (passthrough Bytes quand schéma identique)
-- [ ] Provider Anthropic avec traduction bidirectionnelle (messages, system, tool_use, usage)
-- [ ] Providers Mistral + Google (Gemini)
-- [ ] Déconnexion client → abort amont, testé
+- [x] POST /v1/chat/completions non-streaming, format OpenAI
+- [x] Streaming SSE zero-copy (passthrough Bytes quand schéma identique)
+- [x] Provider Anthropic avec traduction bidirectionnelle (messages, system, tool_use, usage)
+- [x] Providers Mistral + Google (Gemini), streaming inclus
+- [x] Déconnexion client → abort amont, testé
+- [x] Gardes de stream : first-token timeout (FG-3011), amont mort sans `[DONE]` (FG-3010), heartbeat `: ping`
+
+Note : l'estimation locale des tokens en streaming (usage amont absent →
+`estimated=true`, ADR 003) part en M5 avec les compteurs Prometheus et
+`usage_log` ; l'usage amont, lui, est déjà propagé (dernier chunk).
 Spec : `specs/milestones/M4-chat-streaming.md`
 
 ## M5 — Auth, clés virtuelles & budgets durs
@@ -42,6 +47,7 @@ Spec : `specs/milestones/M4-chat-streaming.md`
 - [ ] Quotas RPM/TPM par clé
 - [ ] Comptage coûts par capacité (tokens chat, tokens input embeddings, searches rerank)
 - [ ] Écriture des logs d'usage via channel borné → writer batché (jamais sync)
+- [ ] Estimation locale des tokens quand l'amont n'en renvoie pas (streaming inclus), marquée `estimated` (ADR 003)
 - [ ] Header de métadonnées par requête (`x-ferrogate-metadata`, style Cloudflare AI Gateway) → logs + `usage_log` + labels Prometheus via allowlist (ADR 002)
 Spec : `specs/milestones/M5-auth-budgets.md`
 
