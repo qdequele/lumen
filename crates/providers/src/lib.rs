@@ -24,6 +24,7 @@ pub mod ollama;
 pub mod openai;
 pub mod registry;
 pub mod rerank;
+pub mod sse;
 pub mod tei;
 pub mod voyage;
 
