@@ -17,7 +17,7 @@ use figment::{
     Figment,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 /// Top-level gateway configuration.
@@ -208,7 +208,9 @@ impl Config {
         }
 
         let mut provider_names = HashSet::new();
-        let mut model_ids = HashSet::new();
+        // model id -> the provider that first declared it, so a collision can
+        // cite BOTH conflicting locations (M3 acceptance criterion 4).
+        let mut model_owner: HashMap<&str, &str> = HashMap::new();
         for provider in &self.providers {
             if provider.name.trim().is_empty() {
                 return Err(err("a provider has an empty 'name'".to_owned()));
@@ -229,10 +231,12 @@ impl Config {
                         model.id
                     )));
                 }
-                if !model_ids.insert(model.id.as_str()) {
+                if let Some(first_owner) = model_owner.insert(model.id.as_str(), &provider.name) {
                     return Err(err(format!(
-                        "duplicate model id '{}' (model ids must be unique across providers)",
-                        model.id
+                        "duplicate model id '{}': declared by both provider '{}' and provider \
+                         '{}' (model ids must be unique across providers; use distinct aliases \
+                         and map each to its upstream_id)",
+                        model.id, first_owner, provider.name
                     )));
                 }
             }
@@ -368,20 +372,51 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_model_id_is_rejected() {
+    fn duplicate_model_id_across_providers_cites_both() {
         let toml = r#"
             [[providers]]
-            name = "a"
+            name = "provider-one"
             kind = "openai"
             [[providers.models]]
             id = "dup"
-            capabilities = ["chat"]
+            capabilities = ["embed"]
+
+            [[providers]]
+            name = "provider-two"
+            kind = "cohere"
             [[providers.models]]
             id = "dup"
-            capabilities = ["embed"]
+            capabilities = ["rerank"]
         "#;
         let err = load_str(toml).unwrap_err();
-        assert!(err.to_string().contains("dup"));
+        let msg = err.to_string();
+        assert!(matches!(err, ConfigError::Validation { .. }));
+        // The message names the colliding id AND both conflicting providers.
+        assert!(msg.contains("dup"), "{msg}");
+        assert!(msg.contains("provider-one"), "{msg}");
+        assert!(msg.contains("provider-two"), "{msg}");
+    }
+
+    #[test]
+    fn multiple_aliases_may_share_one_upstream_id() {
+        // Two distinct public ids, both mapped to the same upstream model.
+        let toml = r#"
+            [[providers]]
+            name = "openai"
+            kind = "openai"
+            [[providers.models]]
+            id = "fast-embed"
+            upstream_id = "text-embedding-3-small"
+            capabilities = ["embed"]
+            [[providers.models]]
+            id = "cheap-embed"
+            upstream_id = "text-embedding-3-small"
+            capabilities = ["embed"]
+        "#;
+        let cfg = load_str(toml).unwrap();
+        let models = &cfg.providers[0].models;
+        assert_eq!(models[0].resolved_upstream_id(), "text-embedding-3-small");
+        assert_eq!(models[1].resolved_upstream_id(), "text-embedding-3-small");
     }
 
     #[test]
@@ -429,6 +464,25 @@ mod tests {
         // Debug output contains the var name but no key material could exist.
         let dbg = format!("{cfg:?}");
         assert!(dbg.contains("OPENAI_API_KEY"));
+    }
+
+    #[test]
+    fn shipped_example_config_is_valid() {
+        // Guards against the example rotting (a malformed example bit us before).
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../config.example.toml");
+        let cfg = Config::load(Path::new(path)).expect("config.example.toml must parse");
+        // Sanity: it exercises every rerank provider kind added in M3.
+        for kind in [
+            ProviderKind::Cohere,
+            ProviderKind::Jina,
+            ProviderKind::Voyage,
+            ProviderKind::Tei,
+        ] {
+            assert!(
+                cfg.providers.iter().any(|p| p.kind == kind),
+                "example should demo {kind:?}"
+            );
+        }
     }
 
     #[test]

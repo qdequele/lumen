@@ -10,6 +10,8 @@ pub mod config;
 pub mod embeddings;
 pub mod error;
 pub mod lifecycle;
+pub mod models;
+pub mod rerank;
 pub mod routes;
 pub mod state;
 
