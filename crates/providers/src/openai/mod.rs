@@ -9,8 +9,7 @@ use ferrogate_core::{EmbedRequest, EmbedResponse, EmbeddingProvider, ProviderErr
 use std::fmt;
 use tokio_util::sync::CancellationToken;
 
-use crate::http::with_cancel;
-use crate::mapping::{classify_status, parse_retry_after};
+use crate::http::post_json;
 
 /// Default OpenAI API base (includes the `/v1` prefix).
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
@@ -51,18 +50,6 @@ impl OpenAiProvider {
             api_key,
         }
     }
-
-    fn map_transport(&self, err: &reqwest::Error) -> ProviderError {
-        if err.is_timeout() {
-            ProviderError::Timeout {
-                provider: self.provider_name.clone(),
-            }
-        } else {
-            ProviderError::Unavailable {
-                provider: self.provider_name.clone(),
-            }
-        }
-    }
 }
 
 /// Redacted so the API key can never reach a log line via `{:?}`.
@@ -86,34 +73,22 @@ impl EmbeddingProvider for OpenAiProvider {
     ) -> Result<EmbedResponse, ProviderError> {
         let url = format!("{}/embeddings", self.base_url);
 
-        let call = async {
-            let mut builder = self.client.post(&url).json(&req);
-            if let Some(key) = &self.api_key {
-                builder = builder.bearer_auth(key);
-            }
+        // Shared transport + error classification; a client disconnect aborts
+        // the in-flight call (see `post_json`).
+        let bytes = post_json(
+            &self.client,
+            &url,
+            &req,
+            self.api_key.as_deref(),
+            &self.provider_name,
+            &cancel,
+        )
+        .await?;
 
-            let response = builder.send().await.map_err(|e| self.map_transport(&e))?;
-            let status = response.status();
-
-            if status.is_success() {
-                let bytes = response.bytes().await.map_err(|e| self.map_transport(&e))?;
-                // The detail stays out of the client response (from_provider
-                // discards it) so a malformed body cannot leak upstream data.
-                serde_json::from_slice::<EmbedResponse>(&bytes).map_err(|e| {
-                    ProviderError::Translation(format!("openai embeddings response: {e}"))
-                })
-            } else {
-                let retry_after = parse_retry_after(response.headers());
-                Err(classify_status(
-                    &self.provider_name,
-                    status.as_u16(),
-                    retry_after,
-                ))
-            }
-        };
-
-        // Client disconnect aborts the in-flight HTTP call (see `with_cancel`).
-        with_cancel(&cancel, call).await
+        // The detail stays out of the client response (from_provider discards
+        // it) so a malformed body cannot leak upstream data.
+        serde_json::from_slice::<EmbedResponse>(&bytes)
+            .map_err(|e| ProviderError::Translation(format!("openai embeddings response: {e}")))
     }
 
     fn max_batch_size(&self) -> usize {

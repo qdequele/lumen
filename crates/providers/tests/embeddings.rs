@@ -17,7 +17,10 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use ferrogate_core::{EmbedInput, EmbedRequest, EmbeddingProvider, ProviderError};
-use ferrogate_providers::{batch, OllamaProvider, OpenAiProvider};
+use ferrogate_providers::{
+    batch, CohereProvider, JinaProvider, OllamaProvider, OpenAiProvider, TeiProvider,
+    VoyageProvider,
+};
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 use wiremock::matchers::method;
@@ -39,6 +42,13 @@ trait EmbedFixture: Send + Sync {
 
     /// Mount a delayed but valid success (for the cancellation scenario).
     async fn mount_delayed(&self, mock: &MockServer, delay: Duration);
+
+    /// Whether this provider reports token usage. TEI, for instance, returns
+    /// no usage, so the batching scenario skips the usage-sum assertion for it
+    /// (summing absent usage correctly yields zero).
+    fn reports_usage(&self) -> bool {
+        true
+    }
 }
 
 /// Extract the input texts from a request body, tolerating string-or-array.
@@ -177,6 +187,170 @@ impl EmbedFixture for OllamaFixture {
 }
 
 // --------------------------------------------------------------------------
+// Cohere fixture — request `texts`, response `{ embeddings: { float } }`
+// --------------------------------------------------------------------------
+
+struct CohereEmbedFixture;
+
+struct CohereEcho;
+impl Respond for CohereEcho {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
+        let inputs = extract_inputs(&body["texts"]);
+        let float: Vec<Value> = inputs
+            .iter()
+            .map(|s| json!([s.parse::<f32>().unwrap_or(f32::NAN)]))
+            .collect();
+        let n = inputs.len();
+        ResponseTemplate::new(200).set_body_json(json!({
+            "embeddings": { "float": float },
+            "meta": { "billed_units": { "input_tokens": n } }
+        }))
+    }
+}
+
+#[async_trait]
+impl EmbedFixture for CohereEmbedFixture {
+    fn build(&self, base_url: String) -> Arc<dyn EmbeddingProvider> {
+        Arc::new(CohereProvider::new(
+            reqwest::Client::new(),
+            "cohere-test",
+            Some(base_url),
+            Some("sk-test-xxx".to_owned()),
+        ))
+    }
+
+    async fn mount_echo(&self, mock: &MockServer) {
+        Mock::given(method("POST"))
+            .respond_with(CohereEcho)
+            .mount(mock)
+            .await;
+    }
+
+    async fn mount_delayed(&self, mock: &MockServer, delay: Duration) {
+        let body = json!({
+            "embeddings": { "float": [[0.0]] },
+            "meta": { "billed_units": { "input_tokens": 1 } }
+        });
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(body)
+                    .set_delay(delay),
+            )
+            .mount(mock)
+            .await;
+    }
+}
+
+// --------------------------------------------------------------------------
+// TEI fixture — request `inputs`, response is a bare `[[f32]]` array
+// --------------------------------------------------------------------------
+
+struct TeiEmbedFixture;
+
+struct TeiEcho;
+impl Respond for TeiEcho {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
+        let inputs = extract_inputs(&body["inputs"]);
+        let vectors: Vec<Value> = inputs
+            .iter()
+            .map(|s| json!([s.parse::<f32>().unwrap_or(f32::NAN)]))
+            .collect();
+        ResponseTemplate::new(200).set_body_json(json!(vectors))
+    }
+}
+
+#[async_trait]
+impl EmbedFixture for TeiEmbedFixture {
+    fn build(&self, base_url: String) -> Arc<dyn EmbeddingProvider> {
+        Arc::new(TeiProvider::new(
+            reqwest::Client::new(),
+            "tei-test",
+            base_url,
+            None,
+        ))
+    }
+
+    async fn mount_echo(&self, mock: &MockServer) {
+        Mock::given(method("POST"))
+            .respond_with(TeiEcho)
+            .mount(mock)
+            .await;
+    }
+
+    async fn mount_delayed(&self, mock: &MockServer, delay: Duration) {
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!([[0.0]]))
+                    .set_delay(delay),
+            )
+            .mount(mock)
+            .await;
+    }
+
+    fn reports_usage(&self) -> bool {
+        false
+    }
+}
+
+// --------------------------------------------------------------------------
+// Jina & Voyage fixtures — OpenAI-compatible embeddings (reuse `OpenAiEcho`)
+// --------------------------------------------------------------------------
+
+struct JinaEmbedFixture;
+
+#[async_trait]
+impl EmbedFixture for JinaEmbedFixture {
+    fn build(&self, base_url: String) -> Arc<dyn EmbeddingProvider> {
+        Arc::new(JinaProvider::new(
+            reqwest::Client::new(),
+            "jina-test",
+            Some(base_url),
+            Some("sk-test-xxx".to_owned()),
+        ))
+    }
+
+    async fn mount_echo(&self, mock: &MockServer) {
+        Mock::given(method("POST"))
+            .respond_with(OpenAiEcho)
+            .mount(mock)
+            .await;
+    }
+
+    async fn mount_delayed(&self, mock: &MockServer, delay: Duration) {
+        OpenAiFixture.mount_delayed(mock, delay).await;
+    }
+}
+
+struct VoyageEmbedFixture;
+
+#[async_trait]
+impl EmbedFixture for VoyageEmbedFixture {
+    fn build(&self, base_url: String) -> Arc<dyn EmbeddingProvider> {
+        Arc::new(VoyageProvider::new(
+            reqwest::Client::new(),
+            "voyage-test",
+            Some(base_url),
+            Some("sk-test-xxx".to_owned()),
+        ))
+    }
+
+    async fn mount_echo(&self, mock: &MockServer) {
+        Mock::given(method("POST"))
+            .respond_with(OpenAiEcho)
+            .mount(mock)
+            .await;
+    }
+
+    async fn mount_delayed(&self, mock: &MockServer, delay: Duration) {
+        OpenAiFixture.mount_delayed(mock, delay).await;
+    }
+}
+
+// --------------------------------------------------------------------------
 // Shared error mounts (schema-agnostic)
 // --------------------------------------------------------------------------
 
@@ -253,8 +427,10 @@ async fn scenario_batching_in_order(fx: &dyn EmbedFixture) {
         assert_eq!(d.index as usize, i, "index out of order at {i}");
         assert_eq!(d.embedding[0], i as f32, "embedding out of order at {i}");
     }
-    // Usage summed across sub-batches.
-    assert_eq!(resp.usage.total_tokens as usize, n);
+    // Usage summed across sub-batches (for providers that report it).
+    if fx.reports_usage() {
+        assert_eq!(resp.usage.total_tokens as usize, n);
+    }
 }
 
 async fn scenario_rate_limited(fx: &dyn EmbedFixture) {
@@ -367,6 +543,26 @@ async fn openai_passes_conformance_suite() {
 #[tokio::test]
 async fn ollama_passes_conformance_suite() {
     run_conformance(&OllamaFixture).await;
+}
+
+#[tokio::test]
+async fn cohere_passes_embed_conformance_suite() {
+    run_conformance(&CohereEmbedFixture).await;
+}
+
+#[tokio::test]
+async fn tei_passes_embed_conformance_suite() {
+    run_conformance(&TeiEmbedFixture).await;
+}
+
+#[tokio::test]
+async fn jina_passes_embed_conformance_suite() {
+    run_conformance(&JinaEmbedFixture).await;
+}
+
+#[tokio::test]
+async fn voyage_passes_embed_conformance_suite() {
+    run_conformance(&VoyageEmbedFixture).await;
 }
 
 /// M2 acceptance criterion 1, verbatim: 5000 inputs, max_batch 2048 → exactly

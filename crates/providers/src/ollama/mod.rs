@@ -13,8 +13,7 @@ use ferrogate_core::{
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
-use crate::http::with_cancel;
-use crate::mapping::{classify_status, parse_retry_after};
+use crate::http::post_json;
 
 /// A conservative default batch size; Ollama has no hard documented limit but
 /// is memory-bound, so we keep sub-batches modest.
@@ -41,18 +40,6 @@ impl OllamaProvider {
             client,
             provider_name: provider_name.into(),
             base_url: base_url.into().trim_end_matches('/').to_owned(),
-        }
-    }
-
-    fn map_transport(&self, err: &reqwest::Error) -> ProviderError {
-        if err.is_timeout() {
-            ProviderError::Timeout {
-                provider: self.provider_name.clone(),
-            }
-        } else {
-            ProviderError::Unavailable {
-                provider: self.provider_name.clone(),
-            }
         }
     }
 }
@@ -97,33 +84,20 @@ impl EmbeddingProvider for OllamaProvider {
             input: &req.input,
         };
 
-        let call = async {
-            let response = self
-                .client
-                .post(&url)
-                .json(&body)
-                .send()
-                .await
-                .map_err(|e| self.map_transport(&e))?;
-            let status = response.status();
+        // Ollama is keyless; a client disconnect aborts the call (see `post_json`).
+        let bytes = post_json(
+            &self.client,
+            &url,
+            &body,
+            None,
+            &self.provider_name,
+            &cancel,
+        )
+        .await?;
 
-            if status.is_success() {
-                let bytes = response.bytes().await.map_err(|e| self.map_transport(&e))?;
-                let parsed: OllamaEmbedResponse = serde_json::from_slice(&bytes).map_err(|e| {
-                    ProviderError::Translation(format!("ollama embed response: {e}"))
-                })?;
-                Ok(translate_response(parsed, &req.model))
-            } else {
-                let retry_after = parse_retry_after(response.headers());
-                Err(classify_status(
-                    &self.provider_name,
-                    status.as_u16(),
-                    retry_after,
-                ))
-            }
-        };
-
-        with_cancel(&cancel, call).await
+        let parsed: OllamaEmbedResponse = serde_json::from_slice(&bytes)
+            .map_err(|e| ProviderError::Translation(format!("ollama embed response: {e}")))?;
+        Ok(translate_response(parsed, &req.model))
     }
 
     fn max_batch_size(&self) -> usize {

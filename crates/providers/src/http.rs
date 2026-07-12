@@ -4,10 +4,14 @@
 //! each provider (a clone is a cheap `Arc` bump), so connections are pooled
 //! across providers. `reqwest::Client` uses rustls, never OpenSSL.
 
+use bytes::Bytes;
 use ferrogate_core::ProviderError;
+use serde::Serialize;
 use std::future::Future;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
+
+use crate::mapping::{classify_status, parse_retry_after};
 
 /// Build the process-wide HTTP client.
 ///
@@ -25,6 +29,68 @@ pub fn build_client() -> reqwest::Client {
         // Falls back to the default client if the builder somehow fails; the
         // default is always constructible, so this cannot panic in practice.
         .unwrap_or_default()
+}
+
+/// POST `body` as JSON to `url`, with optional bearer auth, honouring `cancel`.
+///
+/// The whole request/response is subject to cancellation (see [`with_cancel`]),
+/// so a client disconnect aborts the in-flight upstream call. On a success
+/// status the raw response body is returned for the provider to translate; on a
+/// non-success status the shared [`classify_status`] policy applies (429 → rate
+/// limited, 5xx → retryable upstream, other → fatal upstream). Transport
+/// failures map to [`ProviderError::Timeout`] or [`ProviderError::Unavailable`].
+///
+/// Every provider shares this path so transport handling and error
+/// classification are identical across them; only body translation differs.
+pub async fn post_json<B>(
+    client: &reqwest::Client,
+    url: &str,
+    body: &B,
+    api_key: Option<&str>,
+    provider: &str,
+    cancel: &CancellationToken,
+) -> Result<Bytes, ProviderError>
+where
+    B: Serialize + ?Sized,
+{
+    let call = async {
+        let mut builder = client.post(url).json(body);
+        if let Some(key) = api_key {
+            builder = builder.bearer_auth(key);
+        }
+
+        let response = builder
+            .send()
+            .await
+            .map_err(|e| map_transport(provider, &e))?;
+        let status = response.status();
+
+        if status.is_success() {
+            response
+                .bytes()
+                .await
+                .map_err(|e| map_transport(provider, &e))
+        } else {
+            let retry_after = parse_retry_after(response.headers());
+            Err(classify_status(provider, status.as_u16(), retry_after))
+        }
+    };
+
+    with_cancel(cancel, call).await
+}
+
+/// Map a reqwest transport error to a provider error, distinguishing a timeout
+/// from an unreachable upstream. Never embeds the URL or any request detail.
+fn map_transport(provider: &str, err: &reqwest::Error) -> ProviderError {
+    if err.is_timeout() {
+        ProviderError::Timeout {
+            provider: provider.to_owned(),
+        }
+    } else {
+        ProviderError::Unavailable {
+            provider: provider.to_owned(),
+        }
+    }
 }
 
 /// Run an upstream call, aborting it if `cancel` fires first.

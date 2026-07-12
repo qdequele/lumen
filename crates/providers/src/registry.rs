@@ -9,13 +9,17 @@
 //! passed in already — the registry never reads env vars or holds config.
 
 use arc_swap::ArcSwap;
-use ferrogate_core::{Capability, EmbeddingProvider};
+use ferrogate_core::{Capability, EmbeddingProvider, RerankProvider};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::cohere::CohereProvider;
+use crate::jina::JinaProvider;
 use crate::kind::ProviderKind;
 use crate::ollama::OllamaProvider;
 use crate::openai::OpenAiProvider;
+use crate::tei::TeiProvider;
+use crate::voyage::VoyageProvider;
 
 /// A model exposed by a provider, with its upstream id and capabilities.
 #[derive(Debug, Clone)]
@@ -49,7 +53,29 @@ pub struct ProviderSpec {
 pub enum RegistryError {
     /// A provider that requires a base URL did not have one configured.
     #[error("provider '{name}' (kind '{kind}') requires a base_url")]
-    MissingBaseUrl { name: String, kind: &'static str },
+    MissingBaseUrl {
+        /// The offending provider's name.
+        name: String,
+        /// Its kind, for the operator's benefit.
+        kind: &'static str,
+    },
+
+    /// Two providers declared the same model id. The registry is the last line
+    /// of defence: the server config validates this at boot, but any other
+    /// caller (e.g. M7 hot reload building specs directly) must not be able to
+    /// silently shadow a route. Names both conflicting providers.
+    #[error(
+        "duplicate model id '{id}': declared by both provider '{first_provider}' \
+         and provider '{second_provider}'"
+    )]
+    DuplicateModelId {
+        /// The colliding model id.
+        id: String,
+        /// The provider that first declared it.
+        first_provider: String,
+        /// The provider that redeclared it.
+        second_provider: String,
+    },
 }
 
 /// A resolved embedding route: the provider to call and the upstream model id.
@@ -73,14 +99,58 @@ impl std::fmt::Debug for EmbeddingRoute {
     }
 }
 
+/// A resolved rerank route: the provider to call and the upstream model id.
+#[derive(Clone)]
+pub struct RerankRoute {
+    /// The provider serving the model.
+    pub provider: Arc<dyn RerankProvider>,
+    /// The configured provider name (for attributing upstream errors).
+    pub provider_name: String,
+    /// The upstream model id to send (already alias-resolved).
+    pub upstream_id: String,
+}
+
+impl std::fmt::Debug for RerankRoute {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RerankRoute")
+            .field("provider_name", &self.provider_name)
+            .field("upstream_id", &self.upstream_id)
+            .field("provider", &"<dyn RerankProvider>")
+            .finish()
+    }
+}
+
+/// A secret-free summary of one exposed model, for `GET /v1/models`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadedModelSummary {
+    /// Client-facing model id.
+    pub id: String,
+    /// The provider that owns it.
+    pub owned_by: String,
+    /// Capabilities it exposes.
+    pub capabilities: Vec<Capability>,
+}
+
 #[derive(Default)]
 struct Inner {
     /// model id -> embedding route.
     embedding: HashMap<String, EmbeddingRoute>,
+    /// model id -> rerank route.
+    rerank: HashMap<String, RerankRoute>,
     /// model id -> declared capabilities (all of them, even not-yet-served
-    /// ones like chat in M2). Lets the router tell "unknown model" apart from
+    /// ones like chat). Lets the router tell "unknown model" apart from
     /// "known model, wrong capability".
     model_capabilities: HashMap<String, Vec<Capability>>,
+    /// Every exposed model, in configuration order, for `GET /v1/models`.
+    models: Vec<LoadedModelSummary>,
+}
+
+/// Concrete provider instances built for one spec. A single provider type may
+/// implement several capability traits; those are the same instance behind
+/// distinct trait-object pointers.
+struct BuiltProviders {
+    embed: Option<Arc<dyn EmbeddingProvider>>,
+    rerank: Option<Arc<dyn RerankProvider>>,
 }
 
 /// The process-wide provider registry.
@@ -117,6 +187,12 @@ impl Registry {
         self.inner.load().embedding.get(model_id).cloned()
     }
 
+    /// Resolve a model id to a rerank route, if one serves it.
+    #[must_use]
+    pub fn rerank_route(&self, model_id: &str) -> Option<RerankRoute> {
+        self.inner.load().rerank.get(model_id).cloned()
+    }
+
     /// Whether any provider declares this model id (for any capability).
     #[must_use]
     pub fn knows_model(&self, model_id: &str) -> bool {
@@ -128,25 +204,46 @@ impl Registry {
     pub fn capabilities(&self, model_id: &str) -> Option<Vec<Capability>> {
         self.inner.load().model_capabilities.get(model_id).cloned()
     }
+
+    /// Every exposed model, in configuration order (for `GET /v1/models`).
+    #[must_use]
+    pub fn list_models(&self) -> Vec<LoadedModelSummary> {
+        self.inner.load().models.clone()
+    }
 }
 
 fn build_inner(specs: &[ProviderSpec], client: &reqwest::Client) -> Result<Inner, RegistryError> {
     let mut inner = Inner::default();
+    // model id -> the provider that first declared it, so a collision names both.
+    let mut owner: HashMap<&str, &str> = HashMap::new();
 
     for spec in specs {
-        // One embedding provider instance per configured provider, shared
-        // across all of its embedding models via `Arc`.
-        let embed_provider = build_embedding_provider(spec, client)?;
+        // One instance per provider, shared across all of its models via `Arc`.
+        let built = build_providers(spec, client)?;
 
         for model in &spec.models {
+            if let Some(first) = owner.insert(model.id.as_str(), spec.name.as_str()) {
+                return Err(RegistryError::DuplicateModelId {
+                    id: model.id.clone(),
+                    first_provider: first.to_owned(),
+                    second_provider: spec.name.clone(),
+                });
+            }
+
             inner
                 .model_capabilities
                 .entry(model.id.clone())
                 .or_default()
                 .extend(model.capabilities.iter().copied());
 
+            inner.models.push(LoadedModelSummary {
+                id: model.id.clone(),
+                owned_by: spec.name.clone(),
+                capabilities: model.capabilities.clone(),
+            });
+
             if model.capabilities.contains(&Capability::Embed) {
-                if let Some(provider) = &embed_provider {
+                if let Some(provider) = &built.embed {
                     inner.embedding.insert(
                         model.id.clone(),
                         EmbeddingRoute {
@@ -156,13 +253,22 @@ fn build_inner(specs: &[ProviderSpec], client: &reqwest::Client) -> Result<Inner
                         },
                     );
                 } else {
-                    tracing::warn!(
-                        provider = %spec.name,
-                        kind = %spec.kind.as_str(),
-                        model = %model.id,
-                        "model declares 'embed' but this provider kind has no embedding \
-                         implementation yet; it will not resolve for embeddings"
+                    warn_unsupported(spec, &model.id, "embed");
+                }
+            }
+
+            if model.capabilities.contains(&Capability::Rerank) {
+                if let Some(provider) = &built.rerank {
+                    inner.rerank.insert(
+                        model.id.clone(),
+                        RerankRoute {
+                            provider: provider.clone(),
+                            provider_name: spec.name.clone(),
+                            upstream_id: model.upstream_id.clone(),
+                        },
                     );
+                } else {
+                    warn_unsupported(spec, &model.id, "rerank");
                 }
             }
         }
@@ -171,32 +277,119 @@ fn build_inner(specs: &[ProviderSpec], client: &reqwest::Client) -> Result<Inner
     Ok(inner)
 }
 
-/// Build an embedding provider for the given spec, or `None` if this kind does
-/// not implement embeddings yet.
-fn build_embedding_provider(
+/// Warn that a model declares a capability its provider kind cannot serve yet.
+fn warn_unsupported(spec: &ProviderSpec, model_id: &str, capability: &str) {
+    tracing::warn!(
+        provider = %spec.name,
+        kind = %spec.kind.as_str(),
+        model = %model_id,
+        capability,
+        "model declares a capability this provider kind has no implementation \
+         for yet; it will not resolve for that capability"
+    );
+}
+
+/// Build the capability-provider instances for one spec.
+fn build_providers(
     spec: &ProviderSpec,
     client: &reqwest::Client,
-) -> Result<Option<Arc<dyn EmbeddingProvider>>, RegistryError> {
+) -> Result<BuiltProviders, RegistryError> {
+    let require_base_url = || {
+        spec.base_url.clone().ok_or(RegistryError::MissingBaseUrl {
+            name: spec.name.clone(),
+            kind: spec.kind.as_str(),
+        })
+    };
+
     match spec.kind {
-        ProviderKind::Openai => Ok(Some(Arc::new(OpenAiProvider::new(
-            client.clone(),
-            spec.name.clone(),
-            spec.base_url.clone(),
-            spec.api_key.clone(),
-        )))),
+        ProviderKind::Openai => {
+            let embed: Arc<dyn EmbeddingProvider> = Arc::new(OpenAiProvider::new(
+                client.clone(),
+                spec.name.clone(),
+                spec.base_url.clone(),
+                spec.api_key.clone(),
+            ));
+            Ok(BuiltProviders {
+                embed: Some(embed),
+                rerank: None,
+            })
+        }
         ProviderKind::Ollama => {
-            let base_url = spec.base_url.clone().ok_or(RegistryError::MissingBaseUrl {
-                name: spec.name.clone(),
-                kind: spec.kind.as_str(),
-            })?;
-            Ok(Some(Arc::new(OllamaProvider::new(
+            let base_url = require_base_url()?;
+            let embed: Arc<dyn EmbeddingProvider> = Arc::new(OllamaProvider::new(
                 client.clone(),
                 spec.name.clone(),
                 base_url,
-            ))))
+            ));
+            Ok(BuiltProviders {
+                embed: Some(embed),
+                rerank: None,
+            })
         }
-        // Embeddings for these kinds arrive in later milestones (M3+).
-        _ => Ok(None),
+        ProviderKind::Cohere => {
+            let provider = Arc::new(CohereProvider::new(
+                client.clone(),
+                spec.name.clone(),
+                spec.base_url.clone(),
+                spec.api_key.clone(),
+            ));
+            let embed: Arc<dyn EmbeddingProvider> = provider.clone();
+            let rerank: Arc<dyn RerankProvider> = provider;
+            Ok(BuiltProviders {
+                embed: Some(embed),
+                rerank: Some(rerank),
+            })
+        }
+        ProviderKind::Jina => {
+            let provider = Arc::new(JinaProvider::new(
+                client.clone(),
+                spec.name.clone(),
+                spec.base_url.clone(),
+                spec.api_key.clone(),
+            ));
+            let embed: Arc<dyn EmbeddingProvider> = provider.clone();
+            let rerank: Arc<dyn RerankProvider> = provider;
+            Ok(BuiltProviders {
+                embed: Some(embed),
+                rerank: Some(rerank),
+            })
+        }
+        ProviderKind::Tei => {
+            let base_url = require_base_url()?;
+            let provider = Arc::new(TeiProvider::new(
+                client.clone(),
+                spec.name.clone(),
+                base_url,
+                spec.api_key.clone(),
+            ));
+            let embed: Arc<dyn EmbeddingProvider> = provider.clone();
+            let rerank: Arc<dyn RerankProvider> = provider;
+            Ok(BuiltProviders {
+                embed: Some(embed),
+                rerank: Some(rerank),
+            })
+        }
+        ProviderKind::Voyage => {
+            let provider = Arc::new(VoyageProvider::new(
+                client.clone(),
+                spec.name.clone(),
+                spec.base_url.clone(),
+                spec.api_key.clone(),
+            ));
+            let embed: Arc<dyn EmbeddingProvider> = provider.clone();
+            let rerank: Arc<dyn RerankProvider> = provider;
+            Ok(BuiltProviders {
+                embed: Some(embed),
+                rerank: Some(rerank),
+            })
+        }
+        // Chat-only kinds arrive in M4; they serve no embed/rerank routes yet.
+        ProviderKind::Anthropic | ProviderKind::Mistral | ProviderKind::Google => {
+            Ok(BuiltProviders {
+                embed: None,
+                rerank: None,
+            })
+        }
     }
 }
 
@@ -265,6 +458,20 @@ mod tests {
     }
 
     #[test]
+    fn tei_without_base_url_is_a_build_error() {
+        let result = Registry::build(
+            vec![spec(
+                ProviderKind::Tei,
+                "tei",
+                None,
+                vec![model("e", &[Capability::Embed])],
+            )],
+            reqwest::Client::new(),
+        );
+        assert!(matches!(result, Err(RegistryError::MissingBaseUrl { .. })));
+    }
+
+    #[test]
     fn upstream_id_is_carried_on_the_route() {
         let reg = Registry::build(
             vec![spec(
@@ -284,5 +491,83 @@ mod tests {
             reg.embedding_route("friendly").unwrap().upstream_id,
             "text-embedding-3-small"
         );
+    }
+
+    #[test]
+    fn cohere_model_resolves_for_both_embed_and_rerank() {
+        let reg = Registry::build(
+            vec![spec(
+                ProviderKind::Cohere,
+                "cohere",
+                None,
+                vec![model("multi", &[Capability::Embed, Capability::Rerank])],
+            )],
+            reqwest::Client::new(),
+        )
+        .unwrap();
+        assert!(reg.embedding_route("multi").is_some());
+        assert!(reg.rerank_route("multi").is_some());
+    }
+
+    #[test]
+    fn duplicate_model_id_across_providers_is_a_build_error_naming_both() {
+        let result = Registry::build(
+            vec![
+                spec(
+                    ProviderKind::Openai,
+                    "provider-one",
+                    None,
+                    vec![model("dup", &[Capability::Embed])],
+                ),
+                spec(
+                    ProviderKind::Cohere,
+                    "provider-two",
+                    None,
+                    vec![model("dup", &[Capability::Rerank])],
+                ),
+            ],
+            reqwest::Client::new(),
+        );
+        match result {
+            Err(RegistryError::DuplicateModelId {
+                id,
+                first_provider,
+                second_provider,
+            }) => {
+                assert_eq!(id, "dup");
+                assert_eq!(first_provider, "provider-one");
+                assert_eq!(second_provider, "provider-two");
+            }
+            _ => panic!("expected DuplicateModelId build error"),
+        }
+    }
+
+    #[test]
+    fn list_models_reflects_config_with_owner_and_capabilities() {
+        let reg = Registry::build(
+            vec![
+                spec(
+                    ProviderKind::Cohere,
+                    "cohere",
+                    None,
+                    vec![model("rr", &[Capability::Embed, Capability::Rerank])],
+                ),
+                spec(
+                    ProviderKind::Openai,
+                    "openai",
+                    None,
+                    vec![model("emb", &[Capability::Embed])],
+                ),
+            ],
+            reqwest::Client::new(),
+        )
+        .unwrap();
+
+        let models = reg.list_models();
+        assert_eq!(models.len(), 2);
+        let cohere = models.iter().find(|m| m.id == "rr").unwrap();
+        assert_eq!(cohere.owned_by, "cohere");
+        assert!(cohere.capabilities.contains(&Capability::Rerank));
+        assert!(cohere.capabilities.contains(&Capability::Embed));
     }
 }

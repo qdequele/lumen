@@ -11,15 +11,27 @@
 #![forbid(unsafe_code)]
 
 pub mod batch;
+pub mod cohere;
 pub mod http;
+pub mod jina;
 pub mod kind;
 pub mod mapping;
 pub mod ollama;
 pub mod openai;
 pub mod registry;
+pub mod rerank;
+pub mod tei;
+pub mod voyage;
 
 pub use batch::embed_batched;
+pub use cohere::CohereProvider;
+pub use jina::JinaProvider;
 pub use kind::ProviderKind;
 pub use ollama::OllamaProvider;
 pub use openai::OpenAiProvider;
-pub use registry::{EmbeddingRoute, ModelSpec, ProviderSpec, Registry, RegistryError};
+pub use registry::{
+    EmbeddingRoute, LoadedModelSummary, ModelSpec, ProviderSpec, Registry, RegistryError,
+    RerankRoute,
+};
+pub use tei::TeiProvider;
+pub use voyage::VoyageProvider;

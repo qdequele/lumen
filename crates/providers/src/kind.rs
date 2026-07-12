@@ -15,6 +15,7 @@ pub enum ProviderKind {
     Ollama,
     Tei,
     Jina,
+    Voyage,
     Mistral,
     Google,
 }
@@ -30,6 +31,7 @@ impl ProviderKind {
             ProviderKind::Ollama => "ollama",
             ProviderKind::Tei => "tei",
             ProviderKind::Jina => "jina",
+            ProviderKind::Voyage => "voyage",
             ProviderKind::Mistral => "mistral",
             ProviderKind::Google => "google",
         }
