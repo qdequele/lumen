@@ -9,13 +9,15 @@
 //! passed in already — the registry never reads env vars or holds config.
 
 use arc_swap::ArcSwap;
-use ferrogate_core::{Capability, EmbeddingProvider, RerankProvider};
+use ferrogate_core::{Capability, ChatProvider, EmbeddingProvider, RerankProvider};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::anthropic::AnthropicProvider;
 use crate::cohere::CohereProvider;
 use crate::jina::JinaProvider;
 use crate::kind::ProviderKind;
+use crate::mistral::MistralProvider;
 use crate::ollama::OllamaProvider;
 use crate::openai::OpenAiProvider;
 use crate::tei::TeiProvider;
@@ -120,6 +122,27 @@ impl std::fmt::Debug for RerankRoute {
     }
 }
 
+/// A resolved chat route: the provider to call and the upstream model id.
+#[derive(Clone)]
+pub struct ChatRoute {
+    /// The provider serving the model.
+    pub provider: Arc<dyn ChatProvider>,
+    /// The configured provider name (for attributing upstream errors).
+    pub provider_name: String,
+    /// The upstream model id to send (already alias-resolved).
+    pub upstream_id: String,
+}
+
+impl std::fmt::Debug for ChatRoute {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChatRoute")
+            .field("provider_name", &self.provider_name)
+            .field("upstream_id", &self.upstream_id)
+            .field("provider", &"<dyn ChatProvider>")
+            .finish()
+    }
+}
+
 /// A secret-free summary of one exposed model, for `GET /v1/models`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoadedModelSummary {
@@ -133,6 +156,8 @@ pub struct LoadedModelSummary {
 
 #[derive(Default)]
 struct Inner {
+    /// model id -> chat route.
+    chat: HashMap<String, ChatRoute>,
     /// model id -> embedding route.
     embedding: HashMap<String, EmbeddingRoute>,
     /// model id -> rerank route.
@@ -149,6 +174,7 @@ struct Inner {
 /// implement several capability traits; those are the same instance behind
 /// distinct trait-object pointers.
 struct BuiltProviders {
+    chat: Option<Arc<dyn ChatProvider>>,
     embed: Option<Arc<dyn EmbeddingProvider>>,
     rerank: Option<Arc<dyn RerankProvider>>,
 }
@@ -179,6 +205,12 @@ impl Registry {
         let inner = build_inner(&specs, &self.client)?;
         self.inner.store(Arc::new(inner));
         Ok(())
+    }
+
+    /// Resolve a model id to a chat route, if one serves it.
+    #[must_use]
+    pub fn chat_route(&self, model_id: &str) -> Option<ChatRoute> {
+        self.inner.load().chat.get(model_id).cloned()
     }
 
     /// Resolve a model id to an embedding route, if one serves it.
@@ -242,6 +274,21 @@ fn build_inner(specs: &[ProviderSpec], client: &reqwest::Client) -> Result<Inner
                 capabilities: model.capabilities.clone(),
             });
 
+            if model.capabilities.contains(&Capability::Chat) {
+                if let Some(provider) = &built.chat {
+                    inner.chat.insert(
+                        model.id.clone(),
+                        ChatRoute {
+                            provider: provider.clone(),
+                            provider_name: spec.name.clone(),
+                            upstream_id: model.upstream_id.clone(),
+                        },
+                    );
+                } else {
+                    warn_unsupported(spec, &model.id, "chat");
+                }
+            }
+
             if model.capabilities.contains(&Capability::Embed) {
                 if let Some(provider) = &built.embed {
                     inner.embedding.insert(
@@ -290,6 +337,9 @@ fn warn_unsupported(spec: &ProviderSpec, model_id: &str, capability: &str) {
 }
 
 /// Build the capability-provider instances for one spec.
+// A flat per-kind dispatch table; length scales with the number of providers,
+// not complexity. Splitting it would only scatter the mapping.
+#[allow(clippy::too_many_lines)]
 fn build_providers(
     spec: &ProviderSpec,
     client: &reqwest::Client,
@@ -303,6 +353,13 @@ fn build_providers(
 
     match spec.kind {
         ProviderKind::Openai => {
+            let chat: Arc<dyn ChatProvider> = Arc::new(OpenAiProvider::new(
+                client.clone(),
+                spec.name.clone(),
+                spec.base_url.clone(),
+                spec.api_key.clone(),
+            ));
+            // Same instance behind the embedding trait object.
             let embed: Arc<dyn EmbeddingProvider> = Arc::new(OpenAiProvider::new(
                 client.clone(),
                 spec.name.clone(),
@@ -310,7 +367,34 @@ fn build_providers(
                 spec.api_key.clone(),
             ));
             Ok(BuiltProviders {
+                chat: Some(chat),
                 embed: Some(embed),
+                rerank: None,
+            })
+        }
+        ProviderKind::Mistral => {
+            let chat: Arc<dyn ChatProvider> = Arc::new(MistralProvider::new(
+                client.clone(),
+                spec.name.clone(),
+                spec.base_url.clone(),
+                spec.api_key.clone(),
+            ));
+            Ok(BuiltProviders {
+                chat: Some(chat),
+                embed: None,
+                rerank: None,
+            })
+        }
+        ProviderKind::Anthropic => {
+            let chat: Arc<dyn ChatProvider> = Arc::new(AnthropicProvider::new(
+                client.clone(),
+                spec.name.clone(),
+                spec.base_url.clone(),
+                spec.api_key.clone(),
+            ));
+            Ok(BuiltProviders {
+                chat: Some(chat),
+                embed: None,
                 rerank: None,
             })
         }
@@ -322,6 +406,7 @@ fn build_providers(
                 base_url,
             ));
             Ok(BuiltProviders {
+                chat: None,
                 embed: Some(embed),
                 rerank: None,
             })
@@ -336,6 +421,7 @@ fn build_providers(
             let embed: Arc<dyn EmbeddingProvider> = provider.clone();
             let rerank: Arc<dyn RerankProvider> = provider;
             Ok(BuiltProviders {
+                chat: None,
                 embed: Some(embed),
                 rerank: Some(rerank),
             })
@@ -350,6 +436,7 @@ fn build_providers(
             let embed: Arc<dyn EmbeddingProvider> = provider.clone();
             let rerank: Arc<dyn RerankProvider> = provider;
             Ok(BuiltProviders {
+                chat: None,
                 embed: Some(embed),
                 rerank: Some(rerank),
             })
@@ -365,6 +452,7 @@ fn build_providers(
             let embed: Arc<dyn EmbeddingProvider> = provider.clone();
             let rerank: Arc<dyn RerankProvider> = provider;
             Ok(BuiltProviders {
+                chat: None,
                 embed: Some(embed),
                 rerank: Some(rerank),
             })
@@ -379,17 +467,17 @@ fn build_providers(
             let embed: Arc<dyn EmbeddingProvider> = provider.clone();
             let rerank: Arc<dyn RerankProvider> = provider;
             Ok(BuiltProviders {
+                chat: None,
                 embed: Some(embed),
                 rerank: Some(rerank),
             })
         }
-        // Chat-only kinds arrive in M4; they serve no embed/rerank routes yet.
-        ProviderKind::Anthropic | ProviderKind::Mistral | ProviderKind::Google => {
-            Ok(BuiltProviders {
-                embed: None,
-                rerank: None,
-            })
-        }
+        // Google Gemini chat arrives in the M4 streaming slice.
+        ProviderKind::Google => Ok(BuiltProviders {
+            chat: None,
+            embed: None,
+            rerank: None,
+        }),
     }
 }
 

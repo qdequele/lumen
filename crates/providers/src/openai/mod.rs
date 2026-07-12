@@ -5,10 +5,15 @@
 //! Later capabilities (chat, M4) will add a `translate.rs`.
 
 use async_trait::async_trait;
-use ferrogate_core::{EmbedRequest, EmbedResponse, EmbeddingProvider, ProviderError};
+use ferrogate_core::{
+    ChatChunk, ChatProvider, ChatRequest, ChatResponse, EmbedRequest, EmbedResponse,
+    EmbeddingProvider, ProviderError,
+};
+use futures::stream::BoxStream;
 use std::fmt;
 use tokio_util::sync::CancellationToken;
 
+use crate::chat::single_shot_stream;
 use crate::http::post_json;
 
 /// Default OpenAI API base (includes the `/v1` prefix).
@@ -93,5 +98,40 @@ impl EmbeddingProvider for OpenAiProvider {
 
     fn max_batch_size(&self) -> usize {
         MAX_BATCH_SIZE
+    }
+}
+
+#[async_trait]
+impl ChatProvider for OpenAiProvider {
+    async fn chat(
+        &self,
+        mut req: ChatRequest,
+        cancel: CancellationToken,
+    ) -> Result<ChatResponse, ProviderError> {
+        // This entry point is non-streaming; never ask the upstream to stream.
+        req.stream = false;
+        let url = format!("{}/chat/completions", self.base_url);
+        let bytes = post_json(
+            &self.client,
+            &url,
+            &req,
+            self.api_key.as_deref(),
+            &self.provider_name,
+            &cancel,
+        )
+        .await?;
+        serde_json::from_slice::<ChatResponse>(&bytes)
+            .map_err(|e| ProviderError::Translation(format!("openai chat response: {e}")))
+    }
+
+    async fn chat_stream(
+        &self,
+        req: ChatRequest,
+        cancel: CancellationToken,
+    ) -> Result<BoxStream<'static, Result<ChatChunk, ProviderError>>, ProviderError> {
+        // Interim: fetch the full response and emit it as one chunk. Real
+        // incremental SSE passthrough lands in the M4 streaming slice.
+        let resp = self.chat(req, cancel).await?;
+        Ok(single_shot_stream(resp))
     }
 }

@@ -53,12 +53,43 @@ pub async fn post_json<B>(
 where
     B: Serialize + ?Sized,
 {
-    let call = async {
-        let mut builder = client.post(url).json(body);
-        if let Some(key) = api_key {
-            builder = builder.bearer_auth(key);
-        }
+    let mut builder = client.post(url).json(body);
+    if let Some(key) = api_key {
+        builder = builder.bearer_auth(key);
+    }
+    send(builder, provider, cancel).await
+}
 
+/// Like [`post_json`], but applies arbitrary request headers instead of bearer
+/// auth. Used by providers whose auth is not a bearer token (e.g. Anthropic's
+/// `x-api-key` + `anthropic-version`). Header values must never be logged.
+pub async fn post_json_with_headers<B>(
+    client: &reqwest::Client,
+    url: &str,
+    body: &B,
+    headers: &[(&str, &str)],
+    provider: &str,
+    cancel: &CancellationToken,
+) -> Result<Bytes, ProviderError>
+where
+    B: Serialize + ?Sized,
+{
+    let mut builder = client.post(url).json(body);
+    for (name, value) in headers {
+        builder = builder.header(*name, *value);
+    }
+    send(builder, provider, cancel).await
+}
+
+/// Send a prepared request, honouring `cancel`, and classify the outcome. On a
+/// success status the raw body is returned; otherwise the shared
+/// [`classify_status`] policy applies.
+async fn send(
+    builder: reqwest::RequestBuilder,
+    provider: &str,
+    cancel: &CancellationToken,
+) -> Result<Bytes, ProviderError> {
+    let call = async {
         let response = builder
             .send()
             .await
