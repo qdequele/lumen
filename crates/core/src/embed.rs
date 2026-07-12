@@ -1,6 +1,6 @@
 //! Embedding types, mirroring the OpenAI `embeddings` schema.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 /// Input to an embedding request: either a single string or a batch.
 ///
@@ -72,7 +72,47 @@ pub struct EmbedData {
     /// Always `"embedding"`.
     pub object: String,
     pub index: u32,
+    /// The vector. Deserializes from either a float array or OpenAI's base64
+    /// form (little-endian f32 bytes); always serialized back as a float array.
+    #[serde(deserialize_with = "deserialize_embedding")]
     pub embedding: Vec<f32>,
+}
+
+/// Deserialize an embedding as a float array or an OpenAI base64 string.
+///
+/// When `encoding_format: "base64"` is requested, OpenAI returns each embedding
+/// as base64-encoded little-endian `f32` bytes. We decode it to a float vector
+/// so a base64 request never breaks parsing (Ferrogate always returns float
+/// arrays to the client in v1).
+fn deserialize_embedding<'de, D>(deserializer: D) -> Result<Vec<f32>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Repr {
+        Floats(Vec<f32>),
+        Base64(String),
+    }
+
+    match Repr::deserialize(deserializer)? {
+        Repr::Floats(v) => Ok(v),
+        Repr::Base64(s) => {
+            use base64::Engine;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(s.as_bytes())
+                .map_err(serde::de::Error::custom)?;
+            if bytes.len() % 4 != 0 {
+                return Err(serde::de::Error::custom(
+                    "base64 embedding byte length is not a multiple of 4",
+                ));
+            }
+            Ok(bytes
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect())
+        }
+    }
 }
 
 /// An embedding response in OpenAI format.

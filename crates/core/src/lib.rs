@@ -58,6 +58,27 @@ mod tests {
     }
 
     #[test]
+    fn embed_data_decodes_base64_embedding_to_floats() {
+        use base64::Engine;
+        // base64 of the little-endian bytes of [1.0f32, 2.0f32].
+        let bytes: Vec<u8> = [1.0f32, 2.0f32]
+            .iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let json = format!(r#"{{"object":"embedding","index":0,"embedding":"{b64}"}}"#);
+        let data: EmbedData = serde_json::from_str(&json).unwrap();
+        assert_eq!(data.embedding, vec![1.0, 2.0]);
+    }
+
+    #[test]
+    fn embed_data_still_accepts_float_array() {
+        let json = r#"{"object":"embedding","index":1,"embedding":[0.5,-0.5]}"#;
+        let data: EmbedData = serde_json::from_str(json).unwrap();
+        assert_eq!(data.embedding, vec![0.5, -0.5]);
+    }
+
+    #[test]
     fn embed_input_accepts_single_or_batch() {
         let single: EmbedRequest = serde_json::from_str(r#"{"model":"m","input":"one"}"#).unwrap();
         assert_eq!(single.input.len(), 1);

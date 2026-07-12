@@ -18,6 +18,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2a4385e2e34eb35d6b3efe798b9eb88096925d87726c0798709bf56d9ed84af3"
 
 [[package]]
+name = "arc-swap"
+version = "1.9.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c049c0be4daef0b145cb3555416b3b8ef5b7888a38aea1a3a155801fe7b0810b"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "assert-json-diff"
 version = "2.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -178,6 +187,7 @@ name = "core"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64",
  "futures",
  "serde",
  "serde_json",
@@ -891,12 +901,14 @@ dependencies = [
 name = "providers"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "async-trait",
  "core",
  "futures",
  "reqwest",
  "serde",
  "serde_json",
+ "thiserror 2.0.18",
  "tokio",
  "tokio-util",
  "tracing",
@@ -1099,6 +1111,7 @@ version = "0.1.0"
 dependencies = [
  "core",
  "providers",
+ "reqwest",
  "tokio",
  "tracing",
 ]
@@ -1119,7 +1132,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1261,6 +1274,7 @@ dependencies = [
  "figment",
  "futures",
  "hyper",
+ "providers",
  "reqwest",
  "router",
  "serde",
@@ -1273,6 +1287,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "wiremock",
 ]
 
 [[package]]
@@ -1385,7 +1400,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

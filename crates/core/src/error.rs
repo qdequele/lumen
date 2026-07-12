@@ -35,6 +35,11 @@ pub enum ProviderError {
     #[error("provider '{provider}' timed out")]
     Timeout { provider: String },
 
+    /// The upstream could not be reached at all (DNS failure, connection
+    /// refused, TLS error) — distinct from an HTTP error status.
+    #[error("provider '{provider}' is unreachable")]
+    Unavailable { provider: String },
+
     /// The downstream client disconnected; the upstream call was aborted.
     #[error("request cancelled")]
     Cancelled,
@@ -67,11 +72,16 @@ pub enum ErrorType {
 /// An error the gateway returns to the client.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum GatewayError {
-    // ---- Client errors (FG-1xxx) --------------------------------------------
+    // ---- Request errors (FG-1xxx) -------------------------------------------
     /// Malformed or invalid request body / parameters.
     #[error("invalid request: {0}")]
     InvalidRequest(String),
 
+    /// The request body exceeded the configured size limit.
+    #[error("payload too large (limit {limit} bytes)")]
+    PayloadTooLarge { limit: usize },
+
+    // ---- Routing errors (FG-2xxx) -------------------------------------------
     /// No model matched the requested id.
     #[error("model '{0}' not found")]
     ModelNotFound(String),
@@ -83,23 +93,19 @@ pub enum GatewayError {
         capability: Capability,
     },
 
-    /// The request body exceeded the configured size limit.
-    #[error("payload too large (limit {limit} bytes)")]
-    PayloadTooLarge { limit: usize },
+    // ---- Upstream errors (FG-3xxx) ------------------------------------------
+    /// An upstream provider rate limited the request (HTTP 429).
+    #[error("upstream provider '{provider}' rate limited the request")]
+    UpstreamRateLimited {
+        provider: String,
+        retry_after: Option<Duration>,
+    },
 
-    /// Missing or invalid virtual key.
-    #[error("authentication required")]
-    Unauthorized,
+    /// An upstream provider returned a response the gateway could not parse
+    /// (malformed / schema mismatch). The upstream's fault, so 502 — never 500.
+    #[error("upstream provider '{provider}' returned an unparseable response")]
+    UpstreamInvalidResponse { provider: String },
 
-    /// The virtual key's hard budget is exhausted.
-    #[error("budget exceeded for this key")]
-    BudgetExceeded,
-
-    /// A gateway-side quota (RPM/TPM) was exceeded.
-    #[error("rate limit exceeded")]
-    RateLimited { retry_after: Option<Duration> },
-
-    // ---- Upstream errors (FG-2xxx) ------------------------------------------
     /// An upstream provider returned an error status.
     #[error("upstream provider '{provider}' returned an error (HTTP {status})")]
     Upstream { provider: String, status: u16 },
@@ -112,12 +118,18 @@ pub enum GatewayError {
     #[error("upstream provider '{provider}' timed out")]
     UpstreamTimeout { provider: String },
 
-    /// An upstream provider rate limited the request.
-    #[error("upstream provider '{provider}' rate limited the request")]
-    UpstreamRateLimited {
-        provider: String,
-        retry_after: Option<Duration>,
-    },
+    // ---- Auth / budget errors (FG-4xxx) -------------------------------------
+    /// Missing or invalid virtual key.
+    #[error("authentication required")]
+    Unauthorized,
+
+    /// The virtual key's hard budget is exhausted.
+    #[error("budget exceeded for this key")]
+    BudgetExceeded,
+
+    /// A gateway-side quota (RPM/TPM) was exceeded.
+    #[error("rate limit exceeded")]
+    RateLimited { retry_after: Option<Duration> },
 
     // ---- Internal errors (FG-5xxx) ------------------------------------------
     /// An internal gateway malfunction. The detail is logged, never returned.
@@ -131,16 +143,17 @@ impl GatewayError {
     pub const fn code(&self) -> &'static str {
         match self {
             GatewayError::InvalidRequest(_) => "FG-1001",
-            GatewayError::ModelNotFound(_) => "FG-1002",
-            GatewayError::UnsupportedCapability { .. } => "FG-1003",
-            GatewayError::PayloadTooLarge { .. } => "FG-1004",
-            GatewayError::Unauthorized => "FG-1005",
-            GatewayError::BudgetExceeded => "FG-1006",
-            GatewayError::RateLimited { .. } => "FG-1007",
-            GatewayError::Upstream { .. } => "FG-2001",
-            GatewayError::UpstreamUnavailable { .. } => "FG-2002",
-            GatewayError::UpstreamTimeout { .. } => "FG-2003",
-            GatewayError::UpstreamRateLimited { .. } => "FG-2004",
+            GatewayError::PayloadTooLarge { .. } => "FG-1002",
+            GatewayError::ModelNotFound(_) => "FG-2001",
+            GatewayError::UnsupportedCapability { .. } => "FG-2002",
+            GatewayError::UpstreamRateLimited { .. } => "FG-3001",
+            GatewayError::UpstreamInvalidResponse { .. } => "FG-3002",
+            GatewayError::Upstream { .. } => "FG-3003",
+            GatewayError::UpstreamUnavailable { .. } => "FG-3004",
+            GatewayError::UpstreamTimeout { .. } => "FG-3005",
+            GatewayError::Unauthorized => "FG-4001",
+            GatewayError::BudgetExceeded => "FG-4002",
+            GatewayError::RateLimited { .. } => "FG-4003",
             GatewayError::Internal(_) => "FG-5001",
         }
     }
@@ -156,7 +169,7 @@ impl GatewayError {
             GatewayError::PayloadTooLarge { .. } => 413,
             GatewayError::RateLimited { .. } | GatewayError::UpstreamRateLimited { .. } => 429,
             GatewayError::Internal(_) => 500,
-            GatewayError::Upstream { .. } => 502,
+            GatewayError::Upstream { .. } | GatewayError::UpstreamInvalidResponse { .. } => 502,
             GatewayError::UpstreamUnavailable { .. } => 503,
             GatewayError::UpstreamTimeout { .. } => 504,
         }
@@ -174,6 +187,7 @@ impl GatewayError {
             | GatewayError::BudgetExceeded
             | GatewayError::RateLimited { .. } => ErrorType::InvalidRequest,
             GatewayError::Upstream { .. }
+            | GatewayError::UpstreamInvalidResponse { .. }
             | GatewayError::UpstreamUnavailable { .. }
             | GatewayError::UpstreamTimeout { .. }
             | GatewayError::UpstreamRateLimited { .. } => ErrorType::UpstreamError,
@@ -231,6 +245,9 @@ impl GatewayError {
             ProviderError::Timeout { provider: p } => GatewayError::UpstreamTimeout {
                 provider: p_or(provider, p),
             },
+            ProviderError::Unavailable { provider: p } => GatewayError::UpstreamUnavailable {
+                provider: p_or(provider, p),
+            },
             ProviderError::RateLimited {
                 provider: p,
                 retry_after,
@@ -238,8 +255,9 @@ impl GatewayError {
                 provider: p_or(provider, p),
                 retry_after,
             },
-            // A malformed upstream response is the upstream's fault → 503.
-            ProviderError::Translation(_) => GatewayError::UpstreamUnavailable {
+            // A malformed / unparseable upstream response is the upstream's
+            // fault → 502 (FG-3002), never a gateway 500.
+            ProviderError::Translation(_) => GatewayError::UpstreamInvalidResponse {
                 provider: provider.to_owned(),
             },
             // Cancellation is normally handled before a body is produced; if it
@@ -289,16 +307,42 @@ mod tests {
     #[test]
     fn error_codes_are_stable() {
         assert_eq!(GatewayError::InvalidRequest("x".into()).code(), "FG-1001");
-        assert_eq!(GatewayError::ModelNotFound("x".into()).code(), "FG-1002");
-        assert_eq!(GatewayError::Unauthorized.code(), "FG-1005");
+        assert_eq!(GatewayError::PayloadTooLarge { limit: 1 }.code(), "FG-1002");
+        // Routing errors (pinned by the M2 spec).
+        assert_eq!(GatewayError::ModelNotFound("x".into()).code(), "FG-2001");
+        assert_eq!(
+            GatewayError::UnsupportedCapability {
+                model: "m".into(),
+                capability: Capability::Embed
+            }
+            .code(),
+            "FG-2002"
+        );
+        // Upstream errors (FG-3001 / FG-3002 pinned by the M2 spec).
+        assert_eq!(
+            GatewayError::UpstreamRateLimited {
+                provider: "openai".into(),
+                retry_after: None
+            }
+            .code(),
+            "FG-3001"
+        );
+        assert_eq!(
+            GatewayError::UpstreamInvalidResponse {
+                provider: "openai".into()
+            }
+            .code(),
+            "FG-3002"
+        );
         assert_eq!(
             GatewayError::Upstream {
                 provider: "openai".into(),
                 status: 500
             }
             .code(),
-            "FG-2001"
+            "FG-3003"
         );
+        assert_eq!(GatewayError::Unauthorized.code(), "FG-4001");
         assert_eq!(GatewayError::Internal("boom".into()).code(), "FG-5001");
     }
 
@@ -324,7 +368,7 @@ mod tests {
     fn envelope_json_matches_public_schema() {
         let err = GatewayError::ModelNotFound("gpt-9".into());
         let json = serde_json::to_value(err.to_envelope()).unwrap();
-        assert_eq!(json["error"]["code"], "FG-1002");
+        assert_eq!(json["error"]["code"], "FG-2001");
         assert_eq!(json["error"]["type"], "invalid_request");
         assert_eq!(json["error"]["message"], "model 'gpt-9' not found");
     }
@@ -372,6 +416,19 @@ mod tests {
             GatewayError::UpstreamTimeout { provider } => assert_eq!(&provider, "openai"),
             other => panic!("expected UpstreamTimeout, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn malformed_upstream_response_is_502_never_500() {
+        // A translation/parse failure is the upstream's fault, not ours.
+        let ge = GatewayError::from_provider(
+            "openai",
+            ProviderError::Translation("unexpected end of JSON".into()),
+        );
+        assert_eq!(ge.code(), "FG-3002");
+        assert_eq!(ge.http_status(), 502);
+        assert_ne!(ge.http_status(), 500);
+        assert_eq!(ge.error_type(), ErrorType::UpstreamError);
     }
 
     #[test]
