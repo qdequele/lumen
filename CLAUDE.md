@@ -8,6 +8,7 @@ Gateway self-hostable, légère et rapide pour **tous les types de modèles** : 
 2. **Souveraineté** : zéro télémétrie, prompts JAMAIS loggés par défaut, binaire unique self-host.
 3. **Robustesse** : cancellation propagée, backpressure, DB hors du chemin de requête.
 4. **Multi-capacités** : chat + embeddings + rerank sont des citoyens de première classe.
+5. **Observabilité des tokens** : CHAQUE requête de CHAQUE capacité produit un compte de tokens (jamais zéro par défaut) — usage amont si dispo, sinon estimation locale marquée `estimated`. Exposé en réponse, en Prometheus et dans `usage_log`. Raison d'être centrale. Voir ADR 003.
 
 ## Architecture (workspace Cargo)
 ```
@@ -16,7 +17,7 @@ crates/
 ├── providers   # 1 module par provider (openai, anthropic, cohere, ollama, tei...)
 ├── router      # résolution modèle→provider, fallback, load balancing
 ├── auth        # clés virtuelles, quotas, budgets durs
-├── telemetry   # métriques Prometheus, logs structurés (tracing), comptage coûts
+├── telemetry   # métriques Prometheus, logs structurés (tracing), comptage TOKENS (ADR 003) + coûts
 └── server      # binaire axum, SSE, config, hot reload
 ```
 

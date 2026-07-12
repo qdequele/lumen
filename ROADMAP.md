@@ -2,6 +2,8 @@
 
 > Instruction pour Claude Code : traite les milestones DANS L'ORDRE. Le milestone courant = premier non coché. Lis sa spec dans `specs/milestones/` avant tout code. Coche les cases ici ET dans la spec au fur et à mesure. Ne commence jamais un milestone si le précédent a des tests rouges.
 
+> **Promesse transverse — comptage des tokens (ADR 003) :** CHAQUE requête de CHAQUE capacité (chat/embed/rerank) produit un compte de tokens, jamais zéro par défaut : usage amont si présent, sinon estimation locale marquée `estimated`. Exposé en réponse, en compteurs Prometheus et dans `usage_log` (M5). C'est une raison d'être centrale du projet.
+
 ## M1 — Squelette & fondations ✅
 - [x] Workspace Cargo 6 crates (core, providers, router, auth, telemetry, server)
 - [x] Types et traits de capacités dans core (ChatProvider, EmbeddingProvider, RerankProvider)

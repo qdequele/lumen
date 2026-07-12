@@ -11,7 +11,8 @@
 
 ### 4.2 Streaming SSE
 - [ ] `stream=true` : réponse `text/event-stream`, chunks `data: {...}`, terminaison `data: [DONE]`
-- [ ] **Passthrough zero-copy** : quand le provider amont parle déjà le format OpenAI (OpenAI, Mistral, Ollama, vLLM), forwarder les frames SSE en `Bytes` SANS désérialiser chaque chunk. Parse minimal uniquement pour extraire l'usage du dernier chunk (comptage coûts).
+- [ ] **Passthrough zero-copy** : quand le provider amont parle déjà le format OpenAI (OpenAI, Mistral, Ollama, vLLM), forwarder les frames SSE en `Bytes` SANS désérialiser chaque chunk. Parse minimal uniquement pour extraire l'usage du dernier chunk (comptage des tokens — ADR 003).
+- [ ] Comptage des tokens en streaming (ADR 003) : usage du dernier chunk si présent (`estimated=false`) ; sinon compter les tokens out à partir des deltas accumulés / fallback estimation (`estimated=true`) — sans jamais bufferiser le contenu complet ni bloquer.
 - [ ] `stream_options: {include_usage: true}` supporté
 - [ ] Heartbeat SSE (`: ping`) toutes les 15 s si l'amont est silencieux (keep-alive proxies)
 - [ ] Déconnexion client → drop du stream → abort reqwest immédiat (LA leçon LiteLLM #22805)
@@ -33,6 +34,7 @@
 4. Streaming Anthropic : fixture d'événements SSE Anthropic (y compris tool_use) → séquence de chunks OpenAI attendue (snapshot).
 5. Amont ferme le stream sans [DONE] → le client reçoit un chunk d'erreur SSE `data: {"error": {"code": "FG-3010"...}}` puis fermeture propre, pas de hang.
 6. First-token timeout dépassé → 504 FG-3011 (non-streaming) ou erreur SSE (streaming).
+7. Comptage tokens (ADR 003) : streaming avec `include_usage` → tokens in/out du dernier chunk, `estimated=false` ; streaming SANS usage amont → tokens out comptés localement, `estimated=true`, réponse et log non nuls. Non-streaming → usage amont surface tel quel.
 
 ## Pièges
 - L'état de traduction streaming Anthropic doit être borné : ne JAMAIS accumuler le texte complet en mémoire.

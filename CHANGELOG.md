@@ -36,6 +36,12 @@ All notable changes to Ferrogate are documented here. The format is based on
 - Planned a Cloudflare-style per-request metadata header
   (`x-ferrogate-metadata`) for logs, `usage_log` and cardinality-bounded
   Prometheus labels — design in ADR 002, tasks folded into the M5 spec.
+- Elevated **token accounting** to a first-class, always-on promise: every
+  request of every capability yields a token count (upstream usage when present,
+  else a labelled local estimate — never a silent zero, e.g. TEI), surfaced in
+  the response, Prometheus counters and `usage_log`. Design in ADR 003; tasks
+  threaded through M4 (streaming extraction) and M5 (counters, estimation,
+  storage), and added to the mission pillars and ROADMAP.
 
 ### Changed
 

@@ -22,10 +22,18 @@ Clés virtuelles avec budgets DURS enforced dans le chemin de requête — le ga
 - [ ] Channel plein → drop du log + compteur Prometheus `usage_log_dropped_total` incrémenté. Le request path ne bloque JAMAIS sur le logging (leçon LiteLLM #12067)
 - [ ] Rétention configurable : purge des usage_log > N jours (tâche de fond, défaut 30 j)
 
-### 5.4 Comptage des coûts
+### 5.4 Comptage des tokens (promesse centrale — voir ADR 003)
+- [ ] **Un compte de tokens pour CHAQUE requête, toute capacité**, jamais `0` par défaut : chat (in + out), embeddings (in), rerank (search_units si dispo + tokens query+documents)
+- [ ] Source prioritaire : usage rapporté par l'amont (`estimated = false`) ; sinon fallback estimation (`estimated = true`)
+- [ ] Fallback : heuristique légère (byte/char) par défaut, tokenizer précis optionnel par modèle (config) exécuté via `spawn_blocking` — JAMAIS de tokenizer lourd sur le chemin de requête (pilier 1)
+- [ ] TEI (aucun usage amont) → tokens estimés, jamais zéro silencieux
+- [ ] Compteurs Prometheus à cardinalité fixe : `ferrogate_tokens_total{capability,model,provider,direction,estimated}`, `ferrogate_rerank_search_units_total{model,provider}`, `tokens_estimated_total`
+- [ ] Le comptage ne bloque ni ne fait échouer JAMAIS une requête ; l'estimation précise se fait hors du hot path (dans le writer async)
+
+### 5.4b Comptage des coûts (consommateur des tokens ci-dessus)
 - [ ] Table de prix par modèle dans la config (`cost_per_1m_input`, `cost_per_1m_output`, `cost_per_1k_searches`)
-- [ ] Chat : tokens in/out ; embeddings : tokens in seulement ; rerank : search units
-- [ ] Usage extrait du dernier chunk en streaming ; si absent, estimation et flag `estimated: true` dans le log
+- [ ] Coût dérivé des tokens comptés en 5.4 ; embeddings : tokens in seulement ; rerank : search units
+- [ ] Usage extrait du dernier chunk en streaming ; si absent, estimation et flag `estimated: true` dans le log et la réponse
 
 ### 5.5 API d'admin minimale
 - [ ] `POST/GET/PATCH /admin/keys` protégé par la master key — créer/lister/désactiver des clés, ajuster les budgets
@@ -48,3 +56,7 @@ Clés virtuelles avec budgets DURS enforced dans le chemin de requête — le ga
 6. Test : redémarrage → budgets rechargés depuis la DB, une clé épuisée reste épuisée.
 7. Test : `x-ferrogate-metadata` valide → apparaît dans le log d'usage ; seules les clés de l'allowlist deviennent des labels Prometheus ; une clé hors allowlist n'ajoute AUCune série temporelle.
 8. Test : métadonnée malformée ou > bornes → requête réussit quand même, `metadata_rejected_total` incrémenté, rien dans les labels.
+9. Test : embeddings via TEI (amont sans usage) → le log ET `ferrogate_tokens_total` rapportent un compte > 0 avec `estimated="true"` ; jamais zéro.
+10. Test : embeddings via OpenAI (amont avec usage) → compte = valeur amont, `estimated="false"`.
+11. Test : chaque capacité (chat/embed/rerank) incrémente `ferrogate_tokens_total` avec le bon `capability`/`direction` ; rerank incrémente aussi `ferrogate_rerank_search_units_total`.
+12. Test : latence p99 du chemin de requête inchangée quand l'estimation par tokenizer est activée (l'estimation reste hors hot path).
