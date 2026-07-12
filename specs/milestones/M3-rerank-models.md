@@ -6,25 +6,25 @@ Le rerank (format Cohere) et `/v1/models` avec capacités. Ferrogate devient la 
 ## Tâches
 
 ### 3.1 Endpoint rerank
-- [ ] `POST /v1/rerank` : body `{ model, query, documents: [string|{text}], top_n?, return_documents? }`
-- [ ] Réponse : `{ results: [{index, relevance_score, document?}], usage: {search_units} }`
-- [ ] Validation : documents vide → 400 FG-2010 ; top_n > len(documents) → clamp silencieux
+- [x] `POST /v1/rerank` : body `{ model, query, documents: [string|{text}], top_n?, return_documents? }`
+- [x] Réponse : `{ results: [{index, relevance_score, document?}], usage: {search_units} }`
+- [x] Validation : documents vide → 400 FG-2010 ; top_n > len(documents) → clamp silencieux
 
 ### 3.2 Providers
-- [ ] Cohere : `EmbeddingProvider` + `RerankProvider` (API v2)
-- [ ] Jina : `EmbeddingProvider` + `RerankProvider`
-- [ ] TEI (Text Embeddings Inference, self-hosted) : `EmbeddingProvider` + `RerankProvider` — API `/embed` et `/rerank`, pas d'auth par défaut
-- [ ] Voyage : `EmbeddingProvider` + `RerankProvider`
-- [ ] Chacun passe la suite de conformité de M2 (étendue au rerank : `rerank_conformance_suite`)
+- [x] Cohere : `EmbeddingProvider` + `RerankProvider` (API v2)
+- [x] Jina : `EmbeddingProvider` + `RerankProvider`
+- [x] TEI (Text Embeddings Inference, self-hosted) : `EmbeddingProvider` + `RerankProvider` — API `/embed` et `/rerank`, pas d'auth par défaut
+- [x] Voyage : `EmbeddingProvider` + `RerankProvider`
+- [x] Chacun passe la suite de conformité de M2 (étendue au rerank : `rerank_conformance_suite`)
 
 ### 3.3 /v1/models
-- [ ] `GET /v1/models` : format OpenAI étendu — `{ id, object: "model", owned_by: <provider>, capabilities: ["chat"|"embed"|"rerank"] }`
-- [ ] Reflète UNIQUEMENT la config utilisateur (pas d'introspection amont)
+- [x] `GET /v1/models` : format OpenAI étendu — `{ id, object: "model", owned_by: <provider>, capabilities: ["chat"|"embed"|"rerank"] }`
+- [x] Reflète UNIQUEMENT la config utilisateur (pas d'introspection amont)
 
 ### 3.4 Aliasing versionné
-- [ ] Config : `[[providers.models]] id = "my-embedder" upstream_id = "text-embedding-3-large"` — l'ID public appartient à l'utilisateur
-- [ ] Plusieurs alias peuvent pointer vers le même upstream_id
-- [ ] Collision d'ID entre providers → erreur au boot avec les deux emplacements en conflit
+- [x] Config : `[[providers.models]] id = "my-embedder" upstream_id = "text-embedding-3-large"` — l'ID public appartient à l'utilisateur
+- [x] Plusieurs alias peuvent pointer vers le même upstream_id
+- [x] Collision d'ID entre providers → erreur au boot avec les deux emplacements en conflit
 
 ## Critères d'acceptation
 1. Suite de conformité rerank passée par Cohere, Jina, TEI, Voyage (wiremock).

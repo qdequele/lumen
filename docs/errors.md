@@ -24,12 +24,13 @@ code prefix groups by cause: `1xxx` request, `2xxx` routing, `3xxx` upstream,
 | `FG-1001` | 400  | Malformed or invalid request body / parameters.                |
 | `FG-1002` | 413  | Request body exceeded the configured size limit.               |
 
-## Routing errors — `FG-2xxx` · `type: invalid_request`
+## Routing & capability-request errors — `FG-2xxx` · `type: invalid_request`
 
 | Code      | HTTP | Meaning                                                        |
 |-----------|------|----------------------------------------------------------------|
 | `FG-2001` | 404  | The requested model id was not found.                          |
 | `FG-2002` | 400  | The model exists but does not serve the requested capability.  |
+| `FG-2010` | 400  | A rerank request supplied no `documents` to score.             |
 
 ## Upstream errors — `FG-3xxx` · `type: upstream_error`
 

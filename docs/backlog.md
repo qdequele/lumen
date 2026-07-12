@@ -51,3 +51,23 @@ milestone.
   The HTTP-level disconnect test asserts the server stays responsive and the
   upstream got the request — the actual upstream abort is proven at the provider
   layer (conformance `scenario_cancellation_aborts_upstream`).
+
+## Noted while building M3
+
+- Cohere v2 embed requires an `input_type`; the gateway can't know query-vs-
+  document intent, so it always sends `search_document`. Expose a per-request
+  or per-model override (`input_type`) if a caller needs `search_query`.
+- `usage.search_units` is only meaningful for Cohere; Jina and Voyage bill
+  rerank in tokens, so they report `0`. If token-based rerank usage matters for
+  M5 cost counting, widen `RerankUsage` (e.g. add `total_tokens`) rather than
+  overloading `search_units`.
+- Rerank `documents` accept string or `{text}` only. Cohere also allows
+  arbitrary objects with a `rank_fields` selector — out of scope; reduce to text
+  at the edge if a provider needs it.
+- TEI serves one model per process and ignores the request `model`/`top_n`; the
+  gateway truncates to `top_n` after sorting. The configured `upstream_id` is
+  informational for TEI. A future health/introspection hook could verify the
+  configured model matches what the TEI process actually serves.
+- The four hosted rerank providers default `max_batch_size` conservatively
+  (Cohere 96, Jina/Voyage/OpenAI-style large, TEI 32). Revisit against real
+  provider limits; embeddings batching already exercises these.

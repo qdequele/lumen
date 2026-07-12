@@ -6,6 +6,36 @@ All notable changes to Ferrogate are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added — M3: reranking & model discovery
+
+- `POST /v1/rerank` (Cohere wire format): `documents` accept bare strings or
+  `{ "text": ... }` objects; the gateway guarantees the client-facing invariants
+  regardless of upstream behaviour — results sorted by descending
+  `relevance_score`, `top_n` clamped to the document count then truncated,
+  `document` echoed only when `return_documents` is set (off by default). Empty
+  `documents` is rejected with `FG-2010` (400) before any upstream call.
+- Four new providers, each implementing **both** `EmbeddingProvider` and
+  `RerankProvider`: **Cohere** (v2 `embed`/`rerank`), **Jina**
+  (OpenAI-compatible embed, Cohere-shaped rerank), **TEI** (self-hosted, keyless,
+  bare-array `/embed` and `/rerank`), and **Voyage** (`top_k`/`data[]` rerank).
+- A generic **rerank conformance suite** all four providers pass identically
+  (ordering, 429/`Retry-After`, 5xx, malformed response, cancellation) — the
+  rerank counterpart of the embeddings harness.
+- `GET /v1/models`: OpenAI-shaped list extended with a `capabilities` array,
+  reflecting only the operator's configuration (no upstream introspection); a
+  single Cohere model configured for embed+rerank appears with both.
+- Versioned aliasing hardened: a duplicate model id now aborts startup with a
+  message naming **both** conflicting providers; several aliases may map to one
+  `upstream_id`. `config.example.toml` demonstrates every rerank provider.
+
+### Changed
+
+- Extracted a shared `http::post_json` helper (transport + error classification)
+  that every provider now shares, including OpenAI and Ollama (behaviour
+  unchanged); only body translation differs per provider.
+- Added `FG-2010` (empty rerank `documents`, 400) to the taxonomy and
+  `docs/errors.md`, and a `Voyage` variant to `ProviderKind`.
+
 ### Added — M2: embeddings (first complete request path)
 
 - `POST /v1/embeddings` end to end (OpenAI wire format): validate → route →

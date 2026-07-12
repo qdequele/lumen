@@ -25,14 +25,15 @@ body_limit = 10485760     # max request body in bytes (10 MiB)
 # Providers
 #
 # Each `[[providers]]` block declares one upstream. `kind` selects the built-in
-# implementation: openai | anthropic | cohere | ollama | tei | jina | mistral |
-# google. `name` is your own label and must be unique.
+# implementation: openai | anthropic | cohere | ollama | tei | jina | voyage |
+# mistral | google. `name` is your own label and must be unique.
 #
 # Each `[[providers.models]]` block exposes a model to clients:
 #   id            the id clients send (owned entirely by you)
 #   upstream_id   what Ferrogate sends upstream (defaults to `id`)
 #   capabilities  any of: "chat", "embed", "rerank"
-# Model ids must be unique across ALL providers.
+# Model ids must be unique across ALL providers (a collision aborts startup and
+# names both offending providers). Several ids MAY map to the same upstream_id.
 # ---------------------------------------------------------------------------
 
 # OpenAI: chat + embeddings.
@@ -62,7 +63,7 @@ id = "nomic-embed"
 upstream_id = "nomic-embed-text"
 capabilities = ["embed"]
 
-# Cohere: embeddings + reranking.
+# Cohere: embeddings + reranking. A single model can serve BOTH capabilities.
 [[providers]]
 name = "cohere"
 kind = "cohere"
@@ -70,5 +71,47 @@ api_key_env = "COHERE_API_KEY"
 
 [[providers.models]]
 id = "rerank-english"
-upstream_id = "rerank-english-v3.0"
+upstream_id = "rerank-v3.5"
+capabilities = ["rerank"]
+
+# Versioned aliasing: a stable public id pinned to a specific upstream version.
+# Bump `upstream_id` to roll the model forward without changing client code.
+[[providers.models]]
+id = "embed-multilingual"
+upstream_id = "embed-v4.0"
+capabilities = ["embed", "rerank"]
+
+# Jina: embeddings + reranking (hosted).
+[[providers]]
+name = "jina"
+kind = "jina"
+api_key_env = "JINA_API_KEY"
+
+[[providers.models]]
+id = "jina-rerank"
+upstream_id = "jina-reranker-v2-base-multilingual"
+capabilities = ["rerank"]
+
+# Voyage: embeddings + reranking (hosted).
+[[providers]]
+name = "voyage"
+kind = "voyage"
+api_key_env = "VOYAGE_API_KEY"
+
+[[providers.models]]
+id = "voyage-rerank"
+upstream_id = "rerank-2"
+capabilities = ["rerank"]
+
+# TEI (Text Embeddings Inference): self-hosted, keyless. Requires a base_url.
+# Serves one model per process; `upstream_id` is ignored by TEI but kept for
+# your own clarity.
+[[providers]]
+name = "tei-local"
+kind = "tei"
+base_url = "http://localhost:8081"
+
+[[providers.models]]
+id = "bge-reranker"
+upstream_id = "BAAI/bge-reranker-large"
 capabilities = ["rerank"]

@@ -19,11 +19,11 @@ Spec : `specs/milestones/M1-skeleton.md`
 - [x] Cancellation de bout en bout testée
 Spec : `specs/milestones/M2-embeddings.md`
 
-## M3 — Reranking + découverte de modèles
-- [ ] POST /v1/rerank format Cohere
-- [ ] Providers : Cohere (embed+rerank), Jina (embed+rerank), TEI self-hosted (embed+rerank)
-- [ ] GET /v1/models avec capabilities par modèle
-- [ ] Aliasing de modèles versionné dans la config (les IDs n'appartiennent qu'à l'utilisateur)
+## M3 — Reranking + découverte de modèles ✅
+- [x] POST /v1/rerank format Cohere
+- [x] Providers : Cohere (embed+rerank), Jina (embed+rerank), TEI self-hosted (embed+rerank), Voyage (embed+rerank)
+- [x] GET /v1/models avec capabilities par modèle
+- [x] Aliasing de modèles versionné dans la config (les IDs n'appartiennent qu'à l'utilisateur)
 Spec : `specs/milestones/M3-rerank-models.md`
 
 ## M4 — Chat + streaming SSE
