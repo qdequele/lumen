@@ -491,3 +491,315 @@ async fn streaming_client_disconnect_aborts_upstream_connection() {
         "upstream connection was not aborted after client disconnect"
     );
 }
+
+// ---- M4 finish: streaming translation + stream guards ----------------------
+
+/// Anthropic SSE event fixture (text + tool_use), in upstream wire format.
+fn anthropic_sse_body() -> String {
+    [
+        (
+            "message_start",
+            json!({
+                "type": "message_start",
+                "message": {
+                    "id": "msg_str", "model": "claude-3-5-sonnet",
+                    "usage": { "input_tokens": 12 }
+                }
+            }),
+        ),
+        (
+            "content_block_start",
+            json!({
+                "type": "content_block_start", "index": 0,
+                "content_block": { "type": "text", "text": "" }
+            }),
+        ),
+        (
+            "content_block_delta",
+            json!({
+                "type": "content_block_delta", "index": 0,
+                "delta": { "type": "text_delta", "text": "Hel" }
+            }),
+        ),
+        (
+            "content_block_delta",
+            json!({
+                "type": "content_block_delta", "index": 0,
+                "delta": { "type": "text_delta", "text": "lo" }
+            }),
+        ),
+        (
+            "content_block_stop",
+            json!({ "type": "content_block_stop", "index": 0 }),
+        ),
+        (
+            "content_block_start",
+            json!({
+                "type": "content_block_start", "index": 1,
+                "content_block": { "type": "tool_use", "id": "toolu_9", "name": "lookup" }
+            }),
+        ),
+        (
+            "content_block_delta",
+            json!({
+                "type": "content_block_delta", "index": 1,
+                "delta": { "type": "input_json_delta", "partial_json": "{\"q\":\"x\"}" }
+            }),
+        ),
+        (
+            "message_delta",
+            json!({
+                "type": "message_delta",
+                "delta": { "stop_reason": "tool_use" },
+                "usage": { "output_tokens": 9 }
+            }),
+        ),
+        ("message_stop", json!({ "type": "message_stop" })),
+    ]
+    .iter()
+    .map(|(name, data)| format!("event: {name}\ndata: {data}\n\n"))
+    .collect()
+}
+
+/// Parse the `data:` payloads of an SSE body (excluding `[DONE]` and comments).
+fn sse_data_frames(body: &str) -> Vec<Value> {
+    body.split("\n\n")
+        .filter_map(|frame| frame.strip_prefix("data: "))
+        .filter(|data| *data != "[DONE]")
+        .map(|data| serde_json::from_str(data).expect("frame is JSON"))
+        .collect()
+}
+
+#[tokio::test]
+async fn anthropic_streaming_translates_events_to_openai_chunks() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(anthropic_sse_body()),
+        )
+        .mount(&upstream)
+        .await;
+
+    let base = common::spawn_with(anthropic_registry(&upstream.uri()), LIMIT).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&json!({
+            "model": "claude",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let text = resp.text().await.unwrap();
+
+    // Clean upstream termination: translated [DONE], and no FG-3010.
+    assert!(text.ends_with("data: [DONE]\n\n"), "got: {text}");
+    assert!(!text.contains("FG-3010"));
+
+    let chunks = sse_data_frames(&text);
+    // role, 2 text deltas, tool open, tool args, finish.
+    assert_eq!(chunks.len(), 6, "got: {text}");
+    assert_eq!(chunks[0]["choices"][0]["delta"]["role"], "assistant");
+    assert_eq!(chunks[0]["id"], "msg_str");
+    assert_eq!(chunks[0]["model"], "claude-3-5-sonnet");
+    assert_eq!(chunks[1]["choices"][0]["delta"]["content"], "Hel");
+    assert_eq!(chunks[2]["choices"][0]["delta"]["content"], "lo");
+    let tool_open = &chunks[3]["choices"][0]["delta"]["tool_calls"][0];
+    assert_eq!(tool_open["index"], 0);
+    assert_eq!(tool_open["id"], "toolu_9");
+    assert_eq!(tool_open["function"]["name"], "lookup");
+    let tool_args = &chunks[4]["choices"][0]["delta"]["tool_calls"][0];
+    assert_eq!(tool_args["function"]["arguments"], "{\"q\":\"x\"}");
+    assert_eq!(chunks[5]["choices"][0]["finish_reason"], "tool_calls");
+    // ADR 003: the final chunk carries full usage.
+    assert_eq!(chunks[5]["usage"]["prompt_tokens"], 12);
+    assert_eq!(chunks[5]["usage"]["completion_tokens"], 9);
+    assert_eq!(chunks[5]["usage"]["total_tokens"], 21);
+
+    // The upstream was asked to stream.
+    let requests = upstream.received_requests().await.unwrap();
+    let sent: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(sent["stream"], true);
+}
+
+#[tokio::test]
+async fn gemini_streaming_translates_fragments_to_openai_chunks() {
+    let upstream = MockServer::start().await;
+    let body = [
+        json!({
+            "candidates": [
+                { "content": { "parts": [{ "text": "Bon" }], "role": "model" } }
+            ]
+        }),
+        json!({
+            "candidates": [{
+                "content": { "parts": [{ "text": "jour" }], "role": "model" },
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 5, "candidatesTokenCount": 3, "totalTokenCount": 8
+            }
+        }),
+    ]
+    .iter()
+    .map(|data| format!("data: {data}\n\n"))
+    .collect::<String>();
+
+    Mock::given(method("POST"))
+        .and(path(
+            "/v1beta/models/gemini-2.0-flash:streamGenerateContent",
+        ))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(body),
+        )
+        .mount(&upstream)
+        .await;
+
+    let base = common::spawn_with(google_registry(&upstream.uri()), LIMIT).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&json!({
+            "model": "gemini",
+            "messages": [{ "role": "user", "content": "salut" }],
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let text = resp.text().await.unwrap();
+
+    assert!(text.ends_with("data: [DONE]\n\n"), "got: {text}");
+    assert!(!text.contains("FG-3010"));
+
+    let chunks = sse_data_frames(&text);
+    // role, 2 text deltas, finish.
+    assert_eq!(chunks.len(), 4, "got: {text}");
+    assert_eq!(chunks[0]["choices"][0]["delta"]["role"], "assistant");
+    assert_eq!(chunks[1]["choices"][0]["delta"]["content"], "Bon");
+    assert_eq!(chunks[2]["choices"][0]["delta"]["content"], "jour");
+    assert_eq!(chunks[3]["choices"][0]["finish_reason"], "stop");
+    assert_eq!(chunks[3]["usage"]["total_tokens"], 8);
+}
+
+#[tokio::test]
+async fn upstream_stream_without_done_yields_fg3010_error_frame() {
+    let upstream = MockServer::start().await;
+    // Two valid chunks, then the body just ends — no `data: [DONE]`.
+    let truncated: String = upstream_sse_body(2)
+        .strip_suffix("data: [DONE]\n\n")
+        .unwrap()
+        .to_owned();
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(truncated),
+        )
+        .mount(&upstream)
+        .await;
+
+    let base = common::spawn_with(openai_registry(&upstream.uri()), LIMIT).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&json!({
+            "model": "gpt",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let text = resp.text().await.unwrap();
+
+    // Both real chunks were forwarded, then a terminal FG-3010 error frame
+    // (criterion 5) — and the stream ended cleanly, no hang.
+    assert_eq!(text.matches("chat.completion.chunk").count(), 2);
+    assert!(!text.contains("data: [DONE]"));
+    let frames = sse_data_frames(&text);
+    let last = frames.last().unwrap();
+    assert_eq!(last["error"]["code"], "FG-3010");
+    assert_eq!(last["error"]["type"], "upstream_error");
+}
+
+#[tokio::test]
+async fn first_token_timeout_non_streaming_is_504_fg3011() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(openai_chat_body("gpt-4o-2024-08-06"))
+                .set_delay(Duration::from_secs(5)),
+        )
+        .mount(&upstream)
+        .await;
+
+    let guards = ferrogate_server::StreamGuards {
+        first_token_timeout: Duration::from_millis(150),
+        heartbeat_interval: Duration::from_secs(15),
+    };
+    let base = common::spawn_with_guards(openai_registry(&upstream.uri()), LIMIT, guards).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&json!({ "model": "gpt", "messages": [{ "role": "user", "content": "hi" }] }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 504);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "FG-3011");
+    assert_eq!(body["error"]["type"], "upstream_error");
+}
+
+#[tokio::test]
+async fn first_token_timeout_streaming_before_headers_is_504_fg3011() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(upstream_sse_body(1))
+                .set_delay(Duration::from_secs(5)),
+        )
+        .mount(&upstream)
+        .await;
+
+    let guards = ferrogate_server::StreamGuards {
+        first_token_timeout: Duration::from_millis(150),
+        heartbeat_interval: Duration::from_secs(15),
+    };
+    let base = common::spawn_with_guards(openai_registry(&upstream.uri()), LIMIT, guards).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&json!({
+            "model": "gpt",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    // The upstream never answered within the window: the stream never started,
+    // so this is an honest 504 JSON envelope rather than an SSE error frame.
+    assert_eq!(resp.status(), 504);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "FG-3011");
+}

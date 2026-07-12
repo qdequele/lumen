@@ -48,6 +48,15 @@ pub struct ServerConfig {
     /// Maximum request body size in bytes. Defaults to 10 MiB.
     #[serde(default = "default_body_limit")]
     pub body_limit: usize,
+    /// How long to wait for the upstream's first sign of life before failing
+    /// with FG-3011 (504), in milliseconds. Streaming: time to the first SSE
+    /// frame; non-streaming: the whole upstream call. Defaults to 30 000.
+    #[serde(default = "default_first_token_timeout_ms")]
+    pub first_token_timeout_ms: u64,
+    /// Idle interval after which a `: ping` SSE comment is sent on silent
+    /// streams (keep-alive for proxies), in milliseconds. Defaults to 15 000.
+    #[serde(default = "default_sse_heartbeat_ms")]
+    pub sse_heartbeat_ms: u64,
 }
 
 /// A single upstream provider and the models it serves.
@@ -120,6 +129,12 @@ const fn default_port() -> u16 {
 const fn default_body_limit() -> usize {
     10 * 1024 * 1024
 }
+const fn default_first_token_timeout_ms() -> u64 {
+    30_000
+}
+const fn default_sse_heartbeat_ms() -> u64 {
+    15_000
+}
 
 impl Default for ServerConfig {
     fn default() -> Self {
@@ -127,6 +142,8 @@ impl Default for ServerConfig {
             host: default_host(),
             port: default_port(),
             body_limit: default_body_limit(),
+            first_token_timeout_ms: default_first_token_timeout_ms(),
+            sse_heartbeat_ms: default_sse_heartbeat_ms(),
         }
     }
 }
@@ -205,6 +222,12 @@ impl Config {
 
         if self.server.port == 0 {
             return Err(err("server.port must not be 0".to_owned()));
+        }
+        if self.server.first_token_timeout_ms == 0 {
+            return Err(err("server.first_token_timeout_ms must not be 0".to_owned()));
+        }
+        if self.server.sse_heartbeat_ms == 0 {
+            return Err(err("server.sse_heartbeat_ms must not be 0".to_owned()));
         }
 
         let mut provider_names = HashSet::new();

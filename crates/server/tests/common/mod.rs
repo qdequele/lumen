@@ -5,7 +5,7 @@
 #![allow(dead_code)]
 
 use ferrogate_providers::{http, Registry};
-use ferrogate_server::{build_app, serve, AppState};
+use ferrogate_server::{build_app, serve, AppState, StreamGuards};
 use ferrogate_telemetry::Metrics;
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,11 +13,24 @@ use tokio::net::TcpListener;
 
 /// Spawn the app with a given registry and body limit; returns its base URL.
 pub async fn spawn_with(registry: Arc<Registry>, body_limit: usize) -> String {
+    spawn_with_guards(registry, body_limit, StreamGuards::default()).await
+}
+
+/// Spawn the app with explicit stream guard timings (first-token timeout,
+/// heartbeat interval) — for the FG-3011 tests, which need a short window.
+pub async fn spawn_with_guards(
+    registry: Arc<Registry>,
+    body_limit: usize,
+    guards: StreamGuards,
+) -> String {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind ephemeral port");
     let addr = listener.local_addr().expect("read local addr");
-    let app = build_app(AppState::new(Metrics::new(), registry), body_limit);
+    let app = build_app(
+        AppState::new(Metrics::new(), registry).with_guards(guards),
+        body_limit,
+    );
 
     // `pending()` shutdown = never shut down for the lifetime of the test.
     tokio::spawn(async move {

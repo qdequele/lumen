@@ -19,7 +19,7 @@ pub mod state;
 pub use app::build_app;
 pub use config::{Config, ConfigError};
 pub use lifecycle::{serve, shutdown_signal};
-pub use state::AppState;
+pub use state::{AppState, StreamGuards};
 
 use ferrogate_providers::Registry;
 use std::sync::Arc;

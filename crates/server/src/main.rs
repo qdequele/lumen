@@ -106,7 +106,11 @@ fn run(config: Config) -> anyhow::Result<()> {
         tracing::info!(%addr, "listening");
 
         let registry = build_registry(&config).context("failed to build provider registry")?;
-        let state = AppState::new(Metrics::new(), registry);
+        let guards = ferrogate_server::StreamGuards {
+            first_token_timeout: Duration::from_millis(config.server.first_token_timeout_ms),
+            heartbeat_interval: Duration::from_millis(config.server.sse_heartbeat_ms),
+        };
+        let state = AppState::new(Metrics::new(), registry).with_guards(guards);
         let app = build_app(state, config.server.body_limit);
 
         lifecycle::serve(listener, app, DRAIN_TIMEOUT, lifecycle::shutdown_signal())

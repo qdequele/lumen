@@ -21,6 +21,16 @@ host = "127.0.0.1"        # bind address; use "0.0.0.0" in a container
 port = 8080               # must not be 0
 body_limit = 10485760     # max request body in bytes (10 MiB)
 
+# How long to wait for the upstream's first sign of life before failing with
+# FG-3011 (504). Streaming: time to the first SSE frame. Non-streaming: the
+# whole upstream call (per-phase timeouts land later) — raise this if you run
+# long non-streaming generations.
+first_token_timeout_ms = 30000
+
+# Idle interval after which a `: ping` SSE comment keeps proxies from reaping
+# a silent stream.
+sse_heartbeat_ms = 15000
+
 # ---------------------------------------------------------------------------
 # Providers
 #
