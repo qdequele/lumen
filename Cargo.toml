@@ -1,0 +1,79 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/providers",
+    "crates/router",
+    "crates/auth",
+    "crates/telemetry",
+    "crates/server",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "Apache-2.0"
+repository = "https://github.com/meilisearch/ferrogate"
+authors = ["Ferrogate contributors"]
+
+[workspace.dependencies]
+# Internal crates. Package names are bare (`core`, `server`, ...) so the
+# documented `cargo run -p server` commands work; the `ferrogate-*` keys keep
+# imports unambiguous (`use ferrogate_core::...`).
+ferrogate-core = { path = "crates/core", package = "core" }
+ferrogate-providers = { path = "crates/providers", package = "providers" }
+ferrogate-router = { path = "crates/router", package = "router" }
+ferrogate-auth = { path = "crates/auth", package = "auth" }
+ferrogate-telemetry = { path = "crates/telemetry", package = "telemetry" }
+
+# Async runtime & web
+tokio = { version = "1.40", features = ["rt-multi-thread", "macros", "signal", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "http2", "json", "tokio"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["trace", "limit", "request-id", "util"] }
+hyper = "1.5"
+futures = "0.3"
+async-trait = "0.1"
+bytes = "1.8"
+
+# HTTP client (rustls, never openssl)
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Errors
+thiserror = "2"
+anyhow = "1"
+
+# Logging / metrics
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
+prometheus = { version = "0.13", default-features = false }
+
+# Config
+figment = { version = "0.10", features = ["toml", "env"] }
+notify = "7"
+
+# Testing
+wiremock = "0.6"
+
+[workspace.lints.clippy]
+# Pedantic is on across the workspace (CLAUDE.md rule 6).
+pedantic = { level = "warn", priority = -1 }
+# ...minus a few lints that fight the house style without adding safety.
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+doc_markdown = "allow"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true
+opt-level = 3
