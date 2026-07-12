@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use crate::anthropic::AnthropicProvider;
 use crate::cohere::CohereProvider;
+use crate::google::GoogleProvider;
 use crate::jina::JinaProvider;
 use crate::kind::ProviderKind;
 use crate::mistral::MistralProvider;
@@ -373,15 +374,17 @@ fn build_providers(
             })
         }
         ProviderKind::Mistral => {
-            let chat: Arc<dyn ChatProvider> = Arc::new(MistralProvider::new(
+            let provider = Arc::new(MistralProvider::new(
                 client.clone(),
                 spec.name.clone(),
                 spec.base_url.clone(),
                 spec.api_key.clone(),
             ));
+            let chat: Arc<dyn ChatProvider> = provider.clone();
+            let embed: Arc<dyn EmbeddingProvider> = provider;
             Ok(BuiltProviders {
                 chat: Some(chat),
-                embed: None,
+                embed: Some(embed),
                 rerank: None,
             })
         }
@@ -472,12 +475,19 @@ fn build_providers(
                 rerank: Some(rerank),
             })
         }
-        // Google Gemini chat arrives in the M4 streaming slice.
-        ProviderKind::Google => Ok(BuiltProviders {
-            chat: None,
-            embed: None,
-            rerank: None,
-        }),
+        ProviderKind::Google => {
+            let chat: Arc<dyn ChatProvider> = Arc::new(GoogleProvider::new(
+                client.clone(),
+                spec.name.clone(),
+                spec.base_url.clone(),
+                spec.api_key.clone(),
+            ));
+            Ok(BuiltProviders {
+                chat: Some(chat),
+                embed: None,
+                rerank: None,
+            })
+        }
     }
 }
 

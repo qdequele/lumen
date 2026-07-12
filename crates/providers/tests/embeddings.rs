@@ -18,8 +18,8 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use ferrogate_core::{EmbedInput, EmbedRequest, EmbeddingProvider, ProviderError};
 use ferrogate_providers::{
-    batch, CohereProvider, JinaProvider, OllamaProvider, OpenAiProvider, TeiProvider,
-    VoyageProvider,
+    batch, CohereProvider, JinaProvider, MistralProvider, OllamaProvider, OpenAiProvider,
+    TeiProvider, VoyageProvider,
 };
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
@@ -325,6 +325,31 @@ impl EmbedFixture for JinaEmbedFixture {
     }
 }
 
+struct MistralEmbedFixture;
+
+#[async_trait]
+impl EmbedFixture for MistralEmbedFixture {
+    fn build(&self, base_url: String) -> Arc<dyn EmbeddingProvider> {
+        Arc::new(MistralProvider::new(
+            reqwest::Client::new(),
+            "mistral-test",
+            Some(base_url),
+            Some("sk-test-xxx".to_owned()),
+        ))
+    }
+
+    async fn mount_echo(&self, mock: &MockServer) {
+        Mock::given(method("POST"))
+            .respond_with(OpenAiEcho)
+            .mount(mock)
+            .await;
+    }
+
+    async fn mount_delayed(&self, mock: &MockServer, delay: Duration) {
+        OpenAiFixture.mount_delayed(mock, delay).await;
+    }
+}
+
 struct VoyageEmbedFixture;
 
 #[async_trait]
@@ -563,6 +588,11 @@ async fn jina_passes_embed_conformance_suite() {
 #[tokio::test]
 async fn voyage_passes_embed_conformance_suite() {
     run_conformance(&VoyageEmbedFixture).await;
+}
+
+#[tokio::test]
+async fn mistral_passes_embed_conformance_suite() {
+    run_conformance(&MistralEmbedFixture).await;
 }
 
 /// M2 acceptance criterion 1, verbatim: 5000 inputs, max_batch 2048 → exactly
