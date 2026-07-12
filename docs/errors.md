@@ -10,35 +10,49 @@ HTTP status, and a coarse `type`. The response body is always:
 The `type` is one of `invalid_request`, `upstream_error`, or `internal`. The
 gateway always distinguishes three situations and never disguises one as
 another — in particular, an internal malfunction is never reported as a
-misleading `401` (a lesson from OpenRouter outages).
+misleading `401` (a lesson from OpenRouter outages), and a malformed *upstream*
+response is a `502`, never a gateway `500`.
 
-Codes are stable: once assigned, a code keeps its meaning across releases.
+Codes are stable: once assigned, a code keeps its meaning across releases. The
+code prefix groups by cause: `1xxx` request, `2xxx` routing, `3xxx` upstream,
+`4xxx` auth/budget, `5xxx` internal.
 
-## Client errors — `FG-1xxx` · `type: invalid_request`
+## Request errors — `FG-1xxx` · `type: invalid_request`
 
 | Code      | HTTP | Meaning                                                        |
 |-----------|------|----------------------------------------------------------------|
 | `FG-1001` | 400  | Malformed or invalid request body / parameters.                |
-| `FG-1002` | 404  | The requested model id was not found.                          |
-| `FG-1003` | 400  | The model exists but does not serve the requested capability.  |
-| `FG-1004` | 413  | Request body exceeded the configured size limit.               |
-| `FG-1005` | 401  | Missing or invalid virtual key. *(M5)*                          |
-| `FG-1006` | 402  | The virtual key's hard budget is exhausted. *(M5)*             |
-| `FG-1007` | 429  | A gateway-side quota (RPM/TPM) was exceeded. *(M5)*            |
+| `FG-1002` | 413  | Request body exceeded the configured size limit.               |
 
-## Upstream errors — `FG-2xxx` · `type: upstream_error`
+## Routing errors — `FG-2xxx` · `type: invalid_request`
+
+| Code      | HTTP | Meaning                                                        |
+|-----------|------|----------------------------------------------------------------|
+| `FG-2001` | 404  | The requested model id was not found.                          |
+| `FG-2002` | 400  | The model exists but does not serve the requested capability.  |
+
+## Upstream errors — `FG-3xxx` · `type: upstream_error`
 
 These always name the provider that failed. Retriable ones may be transparently
 retried on a fallback (M6) before surfacing.
 
 | Code      | HTTP | Meaning                                                        |
 |-----------|------|----------------------------------------------------------------|
-| `FG-2001` | 502  | An upstream provider returned an error status.                 |
-| `FG-2002` | 503  | No healthy upstream available (circuit open / fallbacks spent).|
-| `FG-2003` | 504  | An upstream provider timed out.                                |
-| `FG-2004` | 429  | An upstream provider rate limited the request.                 |
+| `FG-3001` | 429  | An upstream provider rate limited the request.                 |
+| `FG-3002` | 502  | An upstream provider returned an unparseable/malformed response.|
+| `FG-3003` | 502  | An upstream provider returned an error status.                 |
+| `FG-3004` | 503  | No healthy upstream available (circuit open / fallbacks spent).|
+| `FG-3005` | 504  | An upstream provider timed out.                                |
 
-For `FG-2004` (and `FG-1007`), a `Retry-After` value may be advertised.
+For `FG-3001` (and `FG-4003`), a `Retry-After` value may be advertised.
+
+## Auth / budget errors — `FG-4xxx` · `type: invalid_request` *(M5)*
+
+| Code      | HTTP | Meaning                                                        |
+|-----------|------|----------------------------------------------------------------|
+| `FG-4001` | 401  | Missing or invalid virtual key.                                |
+| `FG-4002` | 402  | The virtual key's hard budget is exhausted.                    |
+| `FG-4003` | 429  | A gateway-side quota (RPM/TPM) was exceeded.                    |
 
 ## Internal errors — `FG-5xxx` · `type: internal`
 
@@ -49,5 +63,5 @@ For `FG-2004` (and `FG-1007`), a `Retry-After` value may be advertised.
 Internal errors return an opaque `"internal error"` message to the client; the
 underlying detail is written only to the server logs, never the response.
 
-> Codes marked *(M5)* / *(M6)* are defined now (the taxonomy is stable) but are
-> only emitted once the corresponding milestone lands.
+> Codes marked *(M5)* are defined now (the taxonomy is stable) but are only
+> emitted once the corresponding milestone lands.

@@ -6,6 +6,35 @@ All notable changes to Ferrogate are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added — M2: embeddings (first complete request path)
+
+- `POST /v1/embeddings` end to end (OpenAI wire format): validate → route →
+  provider → response, with the client model id resolved to its upstream alias.
+- OpenAI embeddings provider (the canonical reference) and a keyless Ollama
+  provider, both driven by a shared, pooled rustls HTTP client.
+- A generic embeddings **conformance suite** that both providers pass
+  identically (nominal, batching-in-order, 429/`Retry-After`, 5xx, malformed
+  response, cancellation) — the reusable harness every future provider must pass.
+- Provider **registry** behind `ArcSwap` (ready for M7 hot reload) that builds
+  instances from config-derived specs and resolves `(capability, model)`; the
+  **router** turns misses into `FG-2001` (unknown model, 404) or `FG-2002`
+  (capability mismatch, 400).
+- Automatic **batching**: requests over a provider's `max_batch_size` split into
+  sub-batches run with bounded concurrency (default 4), reassembled in original
+  order with summed usage; any sub-batch failure fails the whole request.
+- End-to-end **cancellation**: a per-request `CancellationToken` is cancelled on
+  client disconnect and aborts the in-flight upstream call.
+
+### Changed
+
+- Error taxonomy realigned to the codes pinned by the M2 spec: `1xxx` request,
+  `2xxx` routing (`FG-2001`/`FG-2002`), `3xxx` upstream (`FG-3001` rate-limited,
+  `FG-3002` malformed-response → 502, plus generic/unavailable/timeout), `4xxx`
+  auth/budget, `5xxx` internal. Added a `ProviderError::Unavailable` variant for
+  transport failures (→ 503). `docs/errors.md` updated.
+- `ProviderKind` moved from the server config into the `providers` crate (it is
+  the registry's construction discriminant); crate package names stay bare.
+
 ### Added — M1: skeleton & foundations
 
 - Cargo workspace with six crates (`core`, `providers`, `router`, `auth`,

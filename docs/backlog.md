@@ -34,3 +34,20 @@ milestone.
 - Graceful shutdown is unit-tested via an injected shutdown future; the real
   SIGINT/SIGTERM path (`shutdown_signal`) has no integration test (hard to do
   portably). Acceptable; revisit if signal handling grows.
+
+## Noted while building M2
+
+- Embedding output is always a float array in v1. Base64 embeddings are decoded
+  on the way IN (a client requesting `encoding_format: "base64"` won't error),
+  but we do not re-encode on the way OUT. Add base64 *output* if a client needs it.
+- Ollama drops the OpenAI-only `dimensions` field with a `debug!` log; a client
+  asking for a specific dimension silently gets full-width vectors. Consider a
+  400 (FG-1001) when an unsupported-but-meaningful field is set under a strict mode.
+- `FG-1002` (payload too large, 413) is emitted by `RequestBodyLimitLayer` as a
+  raw 413 without our JSON error envelope. Map the tower-http rejection to
+  `GatewayError::PayloadTooLarge` for a consistent body.
+- Cancellation tests use real (short) wall-clock delays rather than
+  `tokio(start_paused)`; robust today but revisit if they flake under CI load.
+  The HTTP-level disconnect test asserts the server stays responsive and the
+  upstream got the request — the actual upstream abort is proven at the provider
+  layer (conformance `scenario_cancellation_aborts_upstream`).

@@ -11,12 +11,12 @@
 - [x] CI GitHub Actions : fmt + clippy -D warnings + tests
 Spec : `specs/milestones/M1-skeleton.md`
 
-## M2 — Embeddings (premier chemin complet)
-- [ ] POST /v1/embeddings format OpenAI
-- [ ] Provider OpenAI embeddings + provider Ollama embeddings
-- [ ] Batching automatique (découpage selon max_batch_size, réassemblage ordonné)
-- [ ] Router : résolution (capacité, modèle) → provider depuis la config
-- [ ] Cancellation de bout en bout testée
+## M2 — Embeddings (premier chemin complet) ✅
+- [x] POST /v1/embeddings format OpenAI
+- [x] Provider OpenAI embeddings + provider Ollama embeddings
+- [x] Batching automatique (découpage selon max_batch_size, réassemblage ordonné)
+- [x] Router : résolution (capacité, modèle) → provider depuis la config
+- [x] Cancellation de bout en bout testée
 Spec : `specs/milestones/M2-embeddings.md`
 
 ## M3 — Reranking + découverte de modèles
