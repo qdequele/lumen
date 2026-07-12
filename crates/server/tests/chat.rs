@@ -57,6 +57,21 @@ fn anthropic_registry(upstream: &str) -> Arc<Registry> {
     Arc::new(Registry::build(specs, http::build_client()).expect("registry builds"))
 }
 
+fn google_registry(upstream: &str) -> Arc<Registry> {
+    let specs = vec![ProviderSpec {
+        name: "google".to_owned(),
+        kind: ProviderKind::Google,
+        api_key: Some("goog-test".to_owned()),
+        base_url: Some(upstream.to_owned()),
+        models: vec![ModelSpec {
+            id: "gemini".to_owned(),
+            upstream_id: "gemini-2.0-flash".to_owned(),
+            capabilities: vec![Capability::Chat],
+        }],
+    }];
+    Arc::new(Registry::build(specs, http::build_client()).expect("registry builds"))
+}
+
 fn openai_chat_body(model: &str) -> Value {
     json!({
         "object": "chat.completion",
@@ -230,6 +245,55 @@ async fn anthropic_translation_round_trip() {
     assert_eq!(sent["messages"].as_array().unwrap().len(), 1);
     assert_eq!(sent["messages"][0]["role"], "user");
     assert_eq!(sent["max_tokens"], 100);
+}
+
+#[tokio::test]
+async fn google_gemini_translation_round_trip() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1beta/models/gemini-2.0-flash:generateContent"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "candidates": [{
+                "content": { "role": "model", "parts": [{ "text": "salut" }] },
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 5,
+                "candidatesTokenCount": 2,
+                "totalTokenCount": 7
+            }
+        })))
+        .mount(&upstream)
+        .await;
+
+    let base = common::spawn_with(google_registry(&upstream.uri()), LIMIT).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&json!({
+            "model": "gemini",
+            "messages": [
+                { "role": "system", "content": "sois bref" },
+                { "role": "user", "content": "bonjour" }
+            ]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["object"], "chat.completion");
+    assert_eq!(body["choices"][0]["message"]["content"], "salut");
+    assert_eq!(body["choices"][0]["finish_reason"], "stop");
+    assert_eq!(body["usage"]["total_tokens"], 7);
+
+    // Outgoing Gemini request: system hoisted, roles mapped, model in the path.
+    let requests = upstream.received_requests().await.unwrap();
+    let sent: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(sent["systemInstruction"]["parts"][0]["text"], "sois bref");
+    assert_eq!(sent["contents"][0]["role"], "user");
+    assert_eq!(sent["contents"][0]["parts"][0]["text"], "bonjour");
 }
 
 /// Build an upstream OpenAI-style SSE body of `n` chunk frames + `[DONE]`, with
