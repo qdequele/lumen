@@ -74,6 +74,11 @@ Un provider implémente 1 à N traits. Le router route par (capacité, modèle).
 8. Les erreurs distinguent TOUJOURS : erreur client (4xx) / erreur provider amont (502/503 + nom du provider) / erreur gateway interne (500). Jamais de 401 trompeur pendant une panne interne (leçon OpenRouter).
 
 ## Boucle de travail (à suivre à chaque session)
+0. **Fraîcheur des dépendances (TOUJOURS, en début de session)** : `rustup update`
+   pour la dernière stable, puis `cargo outdated --workspace --root-deps-only`.
+   Monter les versions dans `Cargo.toml` quand c'est sûr, puis relancer la
+   validation (étape 4) — clippy pedantic peut introduire de nouveaux lints à
+   chaque version de Rust. Noter tout bump notable dans `CHANGELOG.md`.
 1. Lire `ROADMAP.md` → identifier le milestone courant (premier non coché).
 2. Lire `specs/milestones/M<N>-*.md` correspondant.
 3. Pour chaque tâche du milestone : écrire les tests D'ABORD, puis l'implémentation.

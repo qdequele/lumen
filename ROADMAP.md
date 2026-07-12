@@ -40,6 +40,7 @@ Spec : `specs/milestones/M4-chat-streaming.md`
 - [ ] Quotas RPM/TPM par clé
 - [ ] Comptage coûts par capacité (tokens chat, tokens input embeddings, searches rerank)
 - [ ] Écriture des logs d'usage via channel borné → writer batché (jamais sync)
+- [ ] Header de métadonnées par requête (`x-ferrogate-metadata`, style Cloudflare AI Gateway) → logs + `usage_log` + labels Prometheus via allowlist (ADR 002)
 Spec : `specs/milestones/M5-auth-budgets.md`
 
 ## M6 — Résilience

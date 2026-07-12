@@ -31,6 +31,14 @@ Clés virtuelles avec budgets DURS enforced dans le chemin de requête — le ga
 - [ ] `POST/GET/PATCH /admin/keys` protégé par la master key — créer/lister/désactiver des clés, ajuster les budgets
 - [ ] La réponse de création est la SEULE fois où la clé claire est visible
 
+### 5.6 Métadonnées de requête (style Cloudflare AI Gateway) — voir ADR 002
+- [ ] Header `x-ferrogate-metadata` (+ alias `cf-aig-metadata`) : objet JSON PLAT `clé → (string|number|bool)`, parsé une fois au bord dans les extensions de requête (zéro alloc si absent)
+- [ ] Bornes : ≤ 16 clés, clé ≤ 64 o, valeur ≤ 256 o, header ≤ 4 Kio
+- [ ] Sink logs : la métadonnée complète est attachée aux champs du log structuré ET stockée dans une colonne `metadata` de `usage_log` (filtrage à la Cloudflare)
+- [ ] Sink Prometheus : SEULES les clés de l'allowlist config (`telemetry.metadata_labels`, défaut vide) deviennent des labels ; les autres restent logs-only (cardinalité bornée par l'opérateur, jamais par le client)
+- [ ] Robustesse : métadonnée absente/malformée/hors-bornes → droppée avec `warn!` + compteur `metadata_rejected_total`, la requête N'ÉCHOUE JAMAIS
+- [ ] Sécurité : métadonnée opaque, jamais inspectée ; documenter qu'elle est loggée et ne doit pas contenir de secret ni de contenu de prompt
+
 ## Critères d'acceptation
 1. Test de course : 50 requêtes concurrentes sur une clé avec budget pour 10 → exactement les requêtes couvertes par le budget passent, zéro dépassement (assert sur le compteur atomique final).
 2. Test : budget épuisé → 402 AVANT tout appel amont (wiremock : zéro requête reçue).
@@ -38,3 +46,5 @@ Clés virtuelles avec budgets DURS enforced dans le chemin de requête — le ga
 4. Test : channel de logs saturé → requêtes non bloquées, compteur dropped incrémenté.
 5. Test : la clé virtuelle claire n'apparaît ni en DB ni dans les logs (grep sur logs capturés + dump DB).
 6. Test : redémarrage → budgets rechargés depuis la DB, une clé épuisée reste épuisée.
+7. Test : `x-ferrogate-metadata` valide → apparaît dans le log d'usage ; seules les clés de l'allowlist deviennent des labels Prometheus ; une clé hors allowlist n'ajoute AUCune série temporelle.
+8. Test : métadonnée malformée ou > bornes → requête réussit quand même, `metadata_rejected_total` incrémenté, rien dans les labels.

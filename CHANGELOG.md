@@ -28,6 +28,15 @@ All notable changes to Ferrogate are documented here. The format is based on
   message naming **both** conflicting providers; several aliases may map to one
   `upstream_id`. `config.example.toml` demonstrates every rerank provider.
 
+### Tooling
+
+- Adopted a session-start dependency-freshness step (`rustup update` +
+  `cargo outdated`); documented in the work loop. Toolchain moved to Rust
+  **1.97.0** (from 1.95.0) — clippy pedantic and the full suite stay green.
+- Planned a Cloudflare-style per-request metadata header
+  (`x-ferrogate-metadata`) for logs, `usage_log` and cardinality-bounded
+  Prometheus labels — design in ADR 002, tasks folded into the M5 spec.
+
 ### Changed
 
 - Extracted a shared `http::post_json` helper (transport + error classification)
