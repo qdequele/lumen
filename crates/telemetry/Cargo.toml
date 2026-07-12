@@ -1,0 +1,22 @@
+[package]
+name = "telemetry"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Prometheus metrics registry and structured logging setup for Ferrogate."
+
+[lib]
+name = "ferrogate_telemetry"
+path = "src/lib.rs"
+
+[dependencies]
+prometheus = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true
