@@ -11,7 +11,19 @@
 #![forbid(unsafe_code)]
 
 use ferrogate_core::{Capability, GatewayError};
-use ferrogate_providers::{EmbeddingRoute, Registry, RerankRoute};
+use ferrogate_providers::{ChatRoute, EmbeddingRoute, Registry, RerankRoute};
+
+/// Resolve a model id to a chat route, or the appropriate routing error.
+///
+/// # Errors
+/// * [`GatewayError::ModelNotFound`] (`FG-2001`) if no provider declares the model.
+/// * [`GatewayError::UnsupportedCapability`] (`FG-2002`) if the model exists but
+///   does not serve chat.
+pub fn resolve_chat(registry: &Registry, model_id: &str) -> Result<ChatRoute, GatewayError> {
+    registry
+        .chat_route(model_id)
+        .ok_or_else(|| miss(registry, model_id, Capability::Chat))
+}
 
 /// Resolve a model id to an embedding route, or the appropriate routing error.
 ///
