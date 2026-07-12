@@ -24,8 +24,8 @@
 - [ ] tool_use en streaming : input_json_delta → tool_calls delta OpenAI
 
 ### 4.4 Providers Mistral + Google
-- [ ] Mistral : quasi-passthrough OpenAI
-- [ ] Google Gemini : API generateContent + streamGenerateContent, traduction contents/parts, usageMetadata
+- [x] Mistral : quasi-passthrough OpenAI (chat + embeddings)
+- [~] Google Gemini : `generateContent` (non-streaming) traduit — contents/parts, systemInstruction, usageMetadata, finishReason. `streamGenerateContent` (streaming) reste à faire.
 
 ## Critères d'acceptation
 1. Streaming passthrough : test wiremock envoyant 100 chunks → le client reçoit 100 chunks identiques byte-à-byte + [DONE] ; assertion qu'aucune désérialisation complète n'a lieu (compteur dans le code de test ou benchmark d'allocations).

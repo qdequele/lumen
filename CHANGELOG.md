@@ -6,6 +6,22 @@ All notable changes to Ferrogate are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added — M4 (slice 3, partial): Google Gemini + Mistral embeddings
+
+- **Google Gemini** chat provider (non-streaming) with bidirectional
+  translation: OpenAI messages → `contents` (assistant→`model`, system hoisted
+  to `systemInstruction`), params → `generationConfig`, response `candidates`/
+  `finishReason`/`usageMetadata` → OpenAI shape. Auth via `x-goog-api-key`
+  header; the model rides in the URL path, the key never does.
+- **Mistral embeddings** (`EmbeddingProvider`, OpenAI-compatible passthrough) —
+  Mistral now serves both chat and embeddings; added to the embeddings
+  conformance suite.
+
+  *Still remaining to complete M4:* Anthropic + Gemini streaming-event
+  translation (criterion 4), first-token timeout FG-3011 (criterion 6),
+  upstream-closes-without-`[DONE]` → FG-3010 (criterion 5), SSE heartbeat, and
+  streaming token estimation (ADR 003).
+
 ### Added — M4 (slice 2): zero-copy SSE streaming
 
 - Real incremental streaming for `stream=true`: the gateway forwards the
