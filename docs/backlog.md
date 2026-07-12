@@ -94,3 +94,14 @@ milestone.
   streaming slice must not tie a live resource to guard survival through `[DONE]`.
 - Interim single-shot emits `[DONE]` even after a mid-stream error frame.
   Harmless with one item; real streaming must terminate after an error.
+
+## Noted while building M4 (slice 2 — zero-copy streaming)
+
+- **Acceptance criterion 5 (FG-3010) not yet implemented.** In passthrough, if
+  the upstream closes cleanly WITHOUT a `[DONE]` terminator and without a
+  transport error, `bytes_stream()` just ends: the gateway stops gracefully (no
+  hang, no panic) but emits no `data: {"error": {"code": "FG-3010"...}}` frame.
+  Detecting a missing `[DONE]` requires sniffing the tail bytes, which fights
+  pure zero-copy — design it in slice 3 (e.g. a lightweight tail-watcher that
+  only inspects frame boundaries, not JSON). No mid-stream error-frame test yet
+  either. Tracked as slice-3 work.

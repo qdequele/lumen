@@ -4,13 +4,14 @@
 //! near-passthrough (like [`crate::openai`] for chat). Embeddings are deferred.
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use ferrogate_core::{ChatChunk, ChatProvider, ChatRequest, ChatResponse, ProviderError};
 use futures::stream::BoxStream;
 use std::fmt;
 use tokio_util::sync::CancellationToken;
 
-use crate::chat::single_shot_stream;
-use crate::http::post_json;
+use crate::chat::{enable_stream_usage, single_shot_stream};
+use crate::http::{open_stream, post_json};
 
 /// Default Mistral API base (includes the `/v1` prefix).
 const DEFAULT_BASE_URL: &str = "https://api.mistral.ai/v1";
@@ -86,5 +87,24 @@ impl ChatProvider for MistralProvider {
     ) -> Result<BoxStream<'static, Result<ChatChunk, ProviderError>>, ProviderError> {
         let resp = self.chat(req, cancel).await?;
         Ok(single_shot_stream(resp))
+    }
+
+    async fn chat_stream_bytes(
+        &self,
+        mut req: ChatRequest,
+        cancel: CancellationToken,
+    ) -> Result<BoxStream<'static, Result<Bytes, ProviderError>>, ProviderError> {
+        // Zero-copy passthrough (Mistral speaks OpenAI SSE). See ADR 004.
+        enable_stream_usage(&mut req);
+        let url = format!("{}/chat/completions", self.base_url);
+        open_stream(
+            &self.client,
+            &url,
+            &req,
+            self.api_key.as_deref(),
+            &self.provider_name,
+            &cancel,
+        )
+        .await
     }
 }

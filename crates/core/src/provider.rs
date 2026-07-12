@@ -11,7 +11,8 @@ use crate::embed::{EmbedRequest, EmbedResponse};
 use crate::error::ProviderError;
 use crate::rerank::{RerankRequest, RerankResponse};
 use async_trait::async_trait;
-use futures::stream::BoxStream;
+use bytes::Bytes;
+use futures::stream::{self, BoxStream, StreamExt};
 use tokio_util::sync::CancellationToken;
 
 /// A provider that can serve chat completions.
@@ -24,15 +25,43 @@ pub trait ChatProvider: Send + Sync {
         cancel: CancellationToken,
     ) -> Result<ChatResponse, ProviderError>;
 
-    /// Perform a streaming chat completion, yielding chunks as they arrive.
+    /// Perform a streaming chat completion, yielding typed chunks as they arrive.
     ///
     /// The returned stream is `'static` so it can be handed directly to the SSE
-    /// responder without borrowing the provider.
+    /// responder without borrowing the provider. This is the path translating
+    /// providers (Anthropic, Gemini) implement; passthrough providers instead
+    /// override [`chat_stream_bytes`](ChatProvider::chat_stream_bytes).
     async fn chat_stream(
         &self,
         req: ChatRequest,
         cancel: CancellationToken,
     ) -> Result<BoxStream<'static, Result<ChatChunk, ProviderError>>, ProviderError>;
+
+    /// Stream the complete SSE response body as raw bytes: `data: {json}\n\n`
+    /// frames including the terminal `data: [DONE]\n\n`.
+    ///
+    /// The default adapts [`chat_stream`](ChatProvider::chat_stream) by
+    /// serializing each typed chunk — correct for translating providers.
+    /// Passthrough providers (whose upstream already speaks OpenAI SSE) override
+    /// this to forward upstream bytes verbatim with no per-chunk `serde` round
+    /// trip (zero-copy; see ADR 004). Errors before the first frame surface as
+    /// `Err`; a mid-stream failure is emitted as an SSE error frame by the
+    /// server. See ADR 004 for the design.
+    async fn chat_stream_bytes(
+        &self,
+        req: ChatRequest,
+        cancel: CancellationToken,
+    ) -> Result<BoxStream<'static, Result<Bytes, ProviderError>>, ProviderError> {
+        let chunks = self.chat_stream(req, cancel).await?;
+        let framed = chunks.map(|item| {
+            item.map(|chunk| {
+                let json = serde_json::to_string(&chunk).unwrap_or_else(|_| "{}".to_owned());
+                Bytes::from(format!("data: {json}\n\n"))
+            })
+        });
+        let done = stream::once(async { Ok(Bytes::from_static(b"data: [DONE]\n\n")) });
+        Ok(framed.chain(done).boxed())
+    }
 }
 
 /// A provider that can produce text embeddings.

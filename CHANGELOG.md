@@ -6,6 +6,22 @@ All notable changes to Ferrogate are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added — M4 (slice 2): zero-copy SSE streaming
+
+- Real incremental streaming for `stream=true`: the gateway forwards the
+  upstream SSE bytes **verbatim** — no per-chunk `serde` round trip (ADR 004).
+  New `ChatProvider::chat_stream_bytes` (default serializes the typed
+  `chat_stream`; OpenAI/Mistral override it to pipe `reqwest`'s `bytes_stream`
+  via the shared `http::open_stream`). The server writes a raw `Bytes` body
+  (`Body::from_stream`, `content-type: text/event-stream`) with the cancel
+  drop-guard moved inside it, so a client disconnect aborts the upstream.
+  Proven byte-identical over 100 chunks; `stream_options.include_usage` is
+  requested automatically without overriding a client's choice.
+
+  *Still deferred to slice 3:* Anthropic streaming-event translation, Google
+  Gemini, Mistral embeddings, first-token timeout (FG-3011), SSE heartbeat, and
+  streaming token sniffing/estimation (ADR 003).
+
 ### Added — M4 (slice 1): chat completions (non-streaming)
 
 - `POST /v1/chat/completions`: non-streaming JSON end to end (validate → route →

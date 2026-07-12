@@ -188,6 +188,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "base64",
+ "bytes",
  "futures",
  "serde",
  "serde_json",
@@ -1271,6 +1272,7 @@ dependencies = [
  "anyhow",
  "auth",
  "axum",
+ "bytes",
  "core",
  "figment",
  "futures",

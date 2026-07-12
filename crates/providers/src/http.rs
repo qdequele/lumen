@@ -6,6 +6,7 @@
 
 use bytes::Bytes;
 use ferrogate_core::ProviderError;
+use futures::stream::{BoxStream, StreamExt};
 use serde::Serialize;
 use std::future::Future;
 use std::time::Duration;
@@ -81,6 +82,50 @@ where
     send(builder, provider, cancel).await
 }
 
+/// Open a streaming POST: send `body` as JSON (optional bearer auth), and on a
+/// success status return the response body as a `Bytes` stream, mapping
+/// transport errors to [`ProviderError`]. The initial send honours `cancel`; the
+/// returned stream is aborted by being dropped (the server holds the cancel drop
+/// guard inside the response body — see ADR 004). A non-success status is
+/// classified and returned as `Err` before any streaming begins.
+pub async fn open_stream<B>(
+    client: &reqwest::Client,
+    url: &str,
+    body: &B,
+    api_key: Option<&str>,
+    provider: &str,
+    cancel: &CancellationToken,
+) -> Result<BoxStream<'static, Result<Bytes, ProviderError>>, ProviderError>
+where
+    B: Serialize + ?Sized,
+{
+    let mut builder = client.post(url).json(body);
+    if let Some(key) = api_key {
+        builder = builder.bearer_auth(key);
+    }
+
+    let call = async {
+        let response = builder
+            .send()
+            .await
+            .map_err(|e| map_transport(provider, &e))?;
+        let status = response.status();
+        if status.is_success() {
+            Ok(response)
+        } else {
+            let retry_after = parse_retry_after(response.headers());
+            Err(classify_status(provider, status.as_u16(), retry_after))
+        }
+    };
+
+    let response = with_cancel(cancel, call).await?;
+    let provider = provider.to_owned();
+    Ok(response
+        .bytes_stream()
+        .map(move |item| item.map_err(|e| map_transport(&provider, &e)))
+        .boxed())
+}
+
 /// Send a prepared request, honouring `cancel`, and classify the outcome. On a
 /// success status the raw body is returned; otherwise the shared
 /// [`classify_status`] policy applies.
@@ -112,7 +157,7 @@ async fn send(
 
 /// Map a reqwest transport error to a provider error, distinguishing a timeout
 /// from an unreachable upstream. Never embeds the URL or any request detail.
-fn map_transport(provider: &str, err: &reqwest::Error) -> ProviderError {
+pub(crate) fn map_transport(provider: &str, err: &reqwest::Error) -> ProviderError {
     if err.is_timeout() {
         ProviderError::Timeout {
             provider: provider.to_owned(),

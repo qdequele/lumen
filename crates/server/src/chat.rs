@@ -9,19 +9,22 @@
 //!   response (client disconnect) cancels the token and aborts the upstream.
 //!
 //! Errors that occur before streaming starts are returned as a normal JSON error
-//! envelope; a mid-stream error is emitted as a terminal SSE error frame. The
-//! stream always ends with `data: [DONE]`.
+//! envelope; a mid-stream error is emitted as a terminal SSE error frame. On a
+//! successful stream the terminal `data: [DONE]` comes from the provider byte
+//! stream itself (verbatim upstream for passthrough, or appended by the typed
+//! default) — the server never adds or duplicates it.
 
 use std::convert::Infallible;
-use std::time::Duration;
 
+use axum::body::Body;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::State;
-use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::http::header;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use ferrogate_core::{ChatChunk, ChatRequest, GatewayError, ProviderError};
-use futures::stream::{self, BoxStream, StreamExt};
+use bytes::Bytes;
+use ferrogate_core::{ChatRequest, GatewayError, ProviderError};
+use futures::stream::{BoxStream, StreamExt};
 use tokio_util::sync::{CancellationToken, DropGuard};
 
 use crate::error::ApiError;
@@ -49,18 +52,22 @@ pub async fn chat(
     let guard = cancel.clone().drop_guard();
 
     if req.stream {
-        let stream = route
+        // Zero-copy passthrough where the upstream speaks OpenAI SSE; typed
+        // providers fall back to the serializing default (see ADR 004). Errors
+        // before the first frame surface here as a JSON error envelope.
+        let byte_stream = route
             .provider
-            .chat_stream(req, cancel)
+            .chat_stream_bytes(req, cancel)
             .await
             .map_err(|e| GatewayError::from_provider(&provider_name, e))?;
-        let body = to_sse_body(stream, provider_name, guard);
-        Ok(Sse::new(body)
-            .keep_alive(
-                KeepAlive::new()
-                    .interval(Duration::from_secs(15))
-                    .text("ping"),
-            )
+        let body = Body::from_stream(to_event_stream(byte_stream, provider_name, guard));
+        Ok((
+            [
+                (header::CONTENT_TYPE, "text/event-stream"),
+                (header::CACHE_CONTROL, "no-cache"),
+            ],
+            body,
+        )
             .into_response())
     } else {
         // Held across the await so a disconnect during the call cancels it.
@@ -74,38 +81,34 @@ pub async fn chat(
     }
 }
 
-/// Turn a provider chunk stream into an SSE body: each chunk becomes a
-/// `data: {json}` frame, a mid-stream error becomes a terminal error frame, and
-/// the stream always ends with `data: [DONE]`.
+/// Forward a provider's raw SSE `Bytes` stream into the response body.
+///
+/// The provider's byte stream already carries complete SSE framing and its own
+/// terminal `data: [DONE]\n\n` (verbatim from the upstream for passthrough, or
+/// appended by the serializing default for typed providers — ADR 004), so the
+/// server does not re-frame. A mid-stream provider error becomes a terminal SSE
+/// error frame carrying the standard JSON envelope.
 ///
 /// `guard` is moved into the mapping closure so it lives exactly as long as the
-/// body: when the client disconnects, the body is dropped, the guard drops, and
-/// the upstream call is cancelled.
-fn to_sse_body(
-    stream: BoxStream<'static, Result<ChatChunk, ProviderError>>,
+/// body: a client disconnect drops the body, drops the guard, and aborts the
+/// upstream byte stream.
+fn to_event_stream(
+    stream: BoxStream<'static, Result<Bytes, ProviderError>>,
     provider_name: String,
     guard: DropGuard,
-) -> impl futures::Stream<Item = Result<Event, Infallible>> {
-    let frames = stream.map(move |item| {
+) -> impl futures::Stream<Item = Result<Bytes, Infallible>> {
+    stream.map(move |item| {
         // Capture the guard so it stays alive for the whole stream.
         let _keepalive = &guard;
-        let event = match item {
-            Ok(chunk) => Event::default().data(serialize(&chunk)),
+        let bytes = match item {
+            Ok(frame) => frame,
             Err(e) => {
                 let ge = GatewayError::from_provider(&provider_name, e);
-                Event::default().data(serialize(&ge.to_envelope()))
+                let json =
+                    serde_json::to_string(&ge.to_envelope()).unwrap_or_else(|_| "{}".to_owned());
+                Bytes::from(format!("data: {json}\n\n"))
             }
         };
-        Ok::<Event, Infallible>(event)
-    });
-
-    let done = stream::once(async { Ok(Event::default().data("[DONE]")) });
-    frames.chain(done)
-}
-
-/// Serialize a value to a compact JSON string for an SSE `data:` field. A
-/// serialization failure (should not happen for these types) degrades to an
-/// empty object rather than panicking.
-fn serialize<T: serde::Serialize>(value: &T) -> String {
-    serde_json::to_string(value).unwrap_or_else(|_| "{}".to_owned())
+        Ok::<Bytes, Infallible>(bytes)
+    })
 }

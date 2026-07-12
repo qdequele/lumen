@@ -7,8 +7,21 @@
 //! `chat_stream` with genuine incremental SSE (zero-copy passthrough where the
 //! upstream already speaks OpenAI; chunk-by-chunk translation for Anthropic).
 
-use ferrogate_core::{ChatChunk, ChatChunkChoice, ChatDelta, ChatResponse, ProviderError};
+use ferrogate_core::{
+    ChatChunk, ChatChunkChoice, ChatDelta, ChatRequest, ChatResponse, ProviderError,
+};
 use futures::stream::{self, BoxStream, StreamExt};
+
+/// Prepare an OpenAI-compatible request for streaming: set `stream = true` and,
+/// unless the client already set `stream_options`, ask the upstream to include
+/// a final usage chunk (the ADR 003 token-accounting hook). Never overrides a
+/// client-provided `stream_options`.
+pub fn enable_stream_usage(req: &mut ChatRequest) {
+    req.stream = true;
+    req.extra
+        .entry("stream_options".to_owned())
+        .or_insert_with(|| serde_json::json!({ "include_usage": true }));
+}
 
 /// Turn a full [`ChatResponse`] into a single-frame chunk stream.
 ///
@@ -70,6 +83,40 @@ mod tests {
             }),
             extra: serde_json::Map::new(),
         }
+    }
+
+    fn empty_request() -> ChatRequest {
+        ChatRequest {
+            model: "m".to_owned(),
+            messages: Vec::new(),
+            temperature: None,
+            top_p: None,
+            max_tokens: None,
+            n: None,
+            stop: None,
+            stream: false,
+            extra: serde_json::Map::new(),
+        }
+    }
+
+    #[test]
+    fn enable_stream_usage_sets_stream_and_default_usage_option() {
+        let mut req = empty_request();
+        enable_stream_usage(&mut req);
+        assert!(req.stream);
+        assert_eq!(req.extra["stream_options"]["include_usage"], true);
+    }
+
+    #[test]
+    fn enable_stream_usage_never_overrides_client_stream_options() {
+        let mut req = empty_request();
+        req.extra.insert(
+            "stream_options".to_owned(),
+            serde_json::json!({ "include_usage": false }),
+        );
+        enable_stream_usage(&mut req);
+        // The client's explicit choice is preserved.
+        assert_eq!(req.extra["stream_options"]["include_usage"], false);
     }
 
     #[tokio::test]

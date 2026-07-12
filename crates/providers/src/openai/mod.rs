@@ -5,6 +5,7 @@
 //! Later capabilities (chat, M4) will add a `translate.rs`.
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use ferrogate_core::{
     ChatChunk, ChatProvider, ChatRequest, ChatResponse, EmbedRequest, EmbedResponse,
     EmbeddingProvider, ProviderError,
@@ -13,8 +14,8 @@ use futures::stream::BoxStream;
 use std::fmt;
 use tokio_util::sync::CancellationToken;
 
-use crate::chat::single_shot_stream;
-use crate::http::post_json;
+use crate::chat::{enable_stream_usage, single_shot_stream};
+use crate::http::{open_stream, post_json};
 
 /// Default OpenAI API base (includes the `/v1` prefix).
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
@@ -129,9 +130,29 @@ impl ChatProvider for OpenAiProvider {
         req: ChatRequest,
         cancel: CancellationToken,
     ) -> Result<BoxStream<'static, Result<ChatChunk, ProviderError>>, ProviderError> {
-        // Interim: fetch the full response and emit it as one chunk. Real
-        // incremental SSE passthrough lands in the M4 streaming slice.
+        // Typed fallback (rarely used: the server streams via chat_stream_bytes).
         let resp = self.chat(req, cancel).await?;
         Ok(single_shot_stream(resp))
+    }
+
+    async fn chat_stream_bytes(
+        &self,
+        mut req: ChatRequest,
+        cancel: CancellationToken,
+    ) -> Result<BoxStream<'static, Result<Bytes, ProviderError>>, ProviderError> {
+        // Zero-copy passthrough: OpenAI already speaks OpenAI SSE, so forward
+        // the upstream body bytes verbatim (framing + `[DONE]`), no per-chunk
+        // serde round trip. See ADR 004.
+        enable_stream_usage(&mut req);
+        let url = format!("{}/chat/completions", self.base_url);
+        open_stream(
+            &self.client,
+            &url,
+            &req,
+            self.api_key.as_deref(),
+            &self.provider_name,
+            &cancel,
+        )
+        .await
     }
 }

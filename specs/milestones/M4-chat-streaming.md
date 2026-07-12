@@ -10,12 +10,12 @@
 - [x] Support : messages (system/user/assistant/tool), temperature, max_tokens, stop, tools/tool_choice, response_format json (passthrough via `extra`)
 
 ### 4.2 Streaming SSE
-- [ ] `stream=true` : réponse `text/event-stream`, chunks `data: {...}`, terminaison `data: [DONE]`
-- [ ] **Passthrough zero-copy** : quand le provider amont parle déjà le format OpenAI (OpenAI, Mistral, Ollama, vLLM), forwarder les frames SSE en `Bytes` SANS désérialiser chaque chunk. Parse minimal uniquement pour extraire l'usage du dernier chunk (comptage des tokens — ADR 003).
-- [ ] Comptage des tokens en streaming (ADR 003) : usage du dernier chunk si présent (`estimated=false`) ; sinon compter les tokens out à partir des deltas accumulés / fallback estimation (`estimated=true`) — sans jamais bufferiser le contenu complet ni bloquer.
-- [ ] `stream_options: {include_usage: true}` supporté
-- [ ] Heartbeat SSE (`: ping`) toutes les 15 s si l'amont est silencieux (keep-alive proxies)
-- [ ] Déconnexion client → drop du stream → abort reqwest immédiat (LA leçon LiteLLM #22805)
+- [x] `stream=true` : réponse `text/event-stream`, chunks `data: {...}`, terminaison `data: [DONE]`
+- [x] **Passthrough zero-copy** : quand le provider amont parle déjà le format OpenAI (OpenAI, Mistral, Ollama, vLLM), forwarder les frames SSE en `Bytes` SANS désérialiser chaque chunk (ADR 004 ; `chat_stream_bytes` + `http::open_stream`). Prouvé byte-à-byte sur 100 chunks.
+- [ ] Comptage des tokens en streaming (ADR 003) : usage du dernier chunk si présent (`estimated=false`) ; sinon compter les tokens out à partir des deltas accumulés / fallback estimation (`estimated=true`) — sans jamais bufferiser le contenu complet ni bloquer. *(sniffing différé — Slice 3 / M5)*
+- [x] `stream_options: {include_usage: true}` supporté (demandé automatiquement à l'amont, sans écraser un choix client)
+- [ ] Heartbeat SSE (`: ping`) toutes les 15 s si l'amont est silencieux (keep-alive proxies) *(différé Slice 3)*
+- [x] Déconnexion client → drop du stream → abort reqwest immédiat (LA leçon LiteLLM #22805) : drop-guard movné dans le body
 
 ### 4.3 Provider Anthropic (traduction complète)
 - [ ] Requête : messages OpenAI → format Anthropic (system extrait vers `system`, alternance user/assistant normalisée, tools OpenAI → tools Anthropic, max_tokens obligatoire avec défaut configurable)
