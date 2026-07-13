@@ -9,8 +9,10 @@
 
 pub mod logging;
 pub mod metrics;
+pub mod resilience;
 pub mod tokens;
 
 pub use logging::init_logging;
 pub use metrics::Metrics;
+pub use resilience::ResilienceMetrics;
 pub use tokens::{Direction, TokenMetrics};
