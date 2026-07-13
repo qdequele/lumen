@@ -22,6 +22,7 @@ pub mod embed;
 pub mod error;
 pub mod provider;
 pub mod rerank;
+pub mod tokens;
 
 pub use capability::Capability;
 pub use chat::{
