@@ -634,7 +634,10 @@ mod tests {
             ProviderError::Cancelled,
         ] {
             assert!(!err.is_retryable(), "{err:?} must not be retried");
-            assert!(!err.is_provider_fault(), "{err:?} must not fault the breaker");
+            assert!(
+                !err.is_provider_fault(),
+                "{err:?} must not fault the breaker"
+            );
         }
     }
 

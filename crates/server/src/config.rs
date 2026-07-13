@@ -105,7 +105,10 @@ impl ResilienceConfig {
             message,
         };
         let checks: [(&str, u64); 7] = [
-            ("resilience.retry_max_attempts", u64::from(self.retry_max_attempts)),
+            (
+                "resilience.retry_max_attempts",
+                u64::from(self.retry_max_attempts),
+            ),
             ("resilience.retry_base_ms", self.retry_base_ms),
             ("resilience.retry_max_ms", self.retry_max_ms),
             (
@@ -595,10 +598,7 @@ impl Config {
     /// Validate every model's fallback chain (M6 §6.2): each fallback id must
     /// exist, differ from the model itself, and serve every capability the
     /// model declares (so any request routed to the model can fall over to it).
-    fn validate_fallbacks(
-        &self,
-        err: &impl Fn(String) -> ConfigError,
-    ) -> Result<(), ConfigError> {
+    fn validate_fallbacks(&self, err: &impl Fn(String) -> ConfigError) -> Result<(), ConfigError> {
         // model id -> its declared capabilities, across all providers.
         let mut caps: HashMap<&str, &[Capability]> = HashMap::new();
         for provider in &self.providers {

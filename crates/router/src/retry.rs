@@ -95,7 +95,9 @@ pub fn backoff_delay(
 fn jitter01() -> f64 {
     const GAMMA: u64 = 0x9E37_79B9_7F4A_7C15;
     static STATE: AtomicU64 = AtomicU64::new(GAMMA);
-    let seed = STATE.fetch_add(GAMMA, Ordering::Relaxed).wrapping_add(GAMMA);
+    let seed = STATE
+        .fetch_add(GAMMA, Ordering::Relaxed)
+        .wrapping_add(GAMMA);
     let mut z = seed;
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
@@ -177,7 +179,10 @@ mod tests {
         let p = policy();
         // 200·2^20 would be huge; the cap (5 s) applies before jitter.
         assert_eq!(backoff_delay(20, &p, None, 1.0), Duration::from_secs(5));
-        assert_eq!(backoff_delay(20, &p, None, 0.0), Duration::from_millis(2500));
+        assert_eq!(
+            backoff_delay(20, &p, None, 0.0),
+            Duration::from_millis(2500)
+        );
     }
 
     #[test]
@@ -236,6 +241,34 @@ mod tests {
         assert!(
             start.elapsed() >= Duration::from_millis(300),
             "elapsed {:?} < 300 ms floor",
+            start.elapsed()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retry_loop_waits_at_least_the_retry_after() {
+        // A 429 with Retry-After: 3 s must delay the retry by ≥ 3 s (simulated).
+        let start = Instant::now();
+        let cancel = CancellationToken::new();
+        let calls = AtomicU32::new(0);
+        let result = retry(&policy(), &cancel, || {
+            let n = calls.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if n == 0 {
+                    Err(ProviderError::RateLimited {
+                        provider: "p".to_owned(),
+                        retry_after: Some(Duration::from_secs(3)),
+                    })
+                } else {
+                    Ok::<u32, ProviderError>(n)
+                }
+            }
+        })
+        .await;
+        assert_eq!(result.unwrap(), 1);
+        assert!(
+            start.elapsed() >= Duration::from_secs(3),
+            "Retry-After floor not honoured: {:?}",
             start.elapsed()
         );
     }

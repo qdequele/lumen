@@ -113,13 +113,14 @@ impl CircuitBreaker {
     /// the request path is forbidden — CLAUDE.md rule 1). The guarded data is
     /// plain counters, so an inconsistent state after a panic is harmless.
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
-        self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     fn report(&self, state: CircuitState) {
         if let Some(metrics) = &self.metrics {
-            metrics
-                .set_circuit_state(&self.provider, &self.model, state.gauge_value());
+            metrics.set_circuit_state(&self.provider, &self.model, state.gauge_value());
         }
     }
 
@@ -238,12 +239,7 @@ impl CircuitBreakers {
             self.metrics.clone(),
         ));
         // `entry` keeps creation atomic against a racing insert of the same key.
-        Arc::clone(
-            self.map
-                .entry(key)
-                .or_insert(breaker)
-                .value(),
-        )
+        Arc::clone(self.map.entry(key).or_insert(breaker).value())
     }
 
     /// A snapshot of every known breaker's state (observability; not the hot
@@ -355,10 +351,7 @@ mod tests {
             b.admit(after + Duration::from_secs(1)),
             Admission::Rejected { .. }
         ));
-        assert_eq!(
-            b.admit(after + Duration::from_secs(31)),
-            Admission::Allowed
-        );
+        assert_eq!(b.admit(after + Duration::from_secs(31)), Admission::Allowed);
     }
 
     #[tokio::test]

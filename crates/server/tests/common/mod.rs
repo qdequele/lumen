@@ -34,7 +34,8 @@ pub async fn spawn_with_guards(
     // Align the executor's first-token timeout with the guard the test set, so
     // the FG-3011 tests still exercise their short window (the executor now owns
     // the first-token deadline, M6).
-    let resilience = Arc::new(ResilienceRuntime::defaults().with_first_token(guards.first_token_timeout));
+    let resilience =
+        Arc::new(ResilienceRuntime::defaults().with_first_token(guards.first_token_timeout));
     let state = base_state(registry)
         .with_guards(guards)
         .with_resilience(resilience);

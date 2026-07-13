@@ -164,11 +164,13 @@ where
         }
     }
 
-    Err(last_error.unwrap_or_else(|| GatewayError::UpstreamUnavailable {
-        provider: links
-            .first()
-            .map_or_else(|| "unknown".to_owned(), |l| l.provider_name.clone()),
-    }))
+    Err(
+        last_error.unwrap_or_else(|| GatewayError::UpstreamUnavailable {
+            provider: links
+                .first()
+                .map_or_else(|| "unknown".to_owned(), |l| l.provider_name.clone()),
+        }),
+    )
 }
 
 #[cfg(test)]
@@ -280,7 +282,11 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(out.model_used, "claude", "should skip straight to fallback");
-        assert_eq!(primary_calls.load(Ordering::SeqCst), 0, "primary never called");
+        assert_eq!(
+            primary_calls.load(Ordering::SeqCst),
+            0,
+            "primary never called"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -323,7 +329,11 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(err.code(), "FG-3003"); // upstream error status, 502
-        assert_eq!(fallback_calls.load(Ordering::SeqCst), 0, "4xx must not fall back");
+        assert_eq!(
+            fallback_calls.load(Ordering::SeqCst),
+            0,
+            "4xx must not fall back"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -382,6 +392,9 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(out.value, "ok");
-        assert_eq!(cb.get("openai", "gpt-4o").state(), crate::circuit::CircuitState::Closed);
+        assert_eq!(
+            cb.get("openai", "gpt-4o").state(),
+            crate::circuit::CircuitState::Closed
+        );
     }
 }

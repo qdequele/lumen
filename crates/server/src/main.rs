@@ -130,8 +130,8 @@ fn run(config: Config) -> anyhow::Result<()> {
         let metrics = Metrics::new();
         let tokens = TokenMetrics::register(&metrics, &config.telemetry.metadata_labels)
             .context("failed to register token metrics")?;
-        let resilience_metrics =
-            ResilienceMetrics::register(&metrics).context("failed to register resilience metrics")?;
+        let resilience_metrics = ResilienceMetrics::register(&metrics)
+            .context("failed to register resilience metrics")?;
         let resilience = Arc::new(ResilienceRuntime::from_config(
             &config,
             Some(resilience_metrics.clone()),

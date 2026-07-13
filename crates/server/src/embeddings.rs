@@ -80,7 +80,10 @@ pub async fn embeddings(
             let provider = chain[i].route.provider.clone();
             let cancel = cancel.clone();
             let mut attempt_req = req.clone();
-            chain[i].route.upstream_id.clone_into(&mut attempt_req.model);
+            chain[i]
+                .route
+                .upstream_id
+                .clone_into(&mut attempt_req.model);
             async move {
                 batch::embed_batched(
                     provider.as_ref(),
@@ -111,9 +114,7 @@ pub async fn embeddings(
         response.usage.total_tokens = response.usage.prompt_tokens;
         response.usage.estimated = Some(true);
     }
-    let cost = state
-        .pricing
-        .token_cost(&executed.model_used, tokens_in, 0);
+    let cost = state.pricing.token_cost(&executed.model_used, tokens_in, 0);
     accounting.finish(&Outcome {
         tokens_in,
         tokens_out: 0,

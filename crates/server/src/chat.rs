@@ -115,7 +115,10 @@ pub async fn chat(
                 let cancel = cancel.clone();
                 let mut attempt_req = req.clone();
                 attempt_req.stream = true;
-                chain[i].route.upstream_id.clone_into(&mut attempt_req.model);
+                chain[i]
+                    .route
+                    .upstream_id
+                    .clone_into(&mut attempt_req.model);
                 async move { provider.chat_stream_bytes(attempt_req, cancel).await }
             },
         )
@@ -157,7 +160,10 @@ pub async fn chat(
                 let provider = chain[i].route.provider.clone();
                 let cancel = cancel.clone();
                 let mut attempt_req = req.clone();
-                chain[i].route.upstream_id.clone_into(&mut attempt_req.model);
+                chain[i]
+                    .route
+                    .upstream_id
+                    .clone_into(&mut attempt_req.model);
                 async move { provider.chat(attempt_req, cancel).await }
             },
         )
@@ -166,7 +172,13 @@ pub async fn chat(
         accounting.served_by(&executed.model_used, &executed.provider_used);
         let mut response = executed.value;
         let served_model = executed.model_used.clone();
-        settle_non_streaming(accounting, &state, &served_model, estimated_input, &mut response);
+        settle_non_streaming(
+            accounting,
+            &state,
+            &served_model,
+            estimated_input,
+            &mut response,
+        );
         Ok((model_used_headers(&served_model), Json(response)).into_response())
     }
 }

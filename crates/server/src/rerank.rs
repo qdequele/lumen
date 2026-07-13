@@ -79,7 +79,10 @@ pub async fn rerank_handler(
             let provider = chain[i].route.provider.clone();
             let cancel = cancel.clone();
             let mut attempt_req = req.clone();
-            chain[i].route.upstream_id.clone_into(&mut attempt_req.model);
+            chain[i]
+                .route
+                .upstream_id
+                .clone_into(&mut attempt_req.model);
             async move { rerank::rerank(provider.as_ref(), attempt_req, &cancel).await }
         },
     )
