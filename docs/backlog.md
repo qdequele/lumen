@@ -184,3 +184,14 @@ milestone.
   (~3 µs) is benchmarked; the full p50/p99/RAM/req·s head-to-head is a
   reproducible `bench/` harness (docker-compose + k6) run by the operator, not
   captured as a committed baseline.
+
+## Backlog debt paid down (post-v0.1.0)
+
+- **Full-config hot reload (DEBT-1)** — done. Reload now swaps pricing and the
+  resilience policy (retry/timeouts/fallbacks) as well as the routing table,
+  preserving circuit-breaker state. (Auth knobs + server bind still boot-time.)
+- **Key-material zeroization (DEBT-2)** — done. `MasterKey` wipes on drop and
+  the raw `FERROGATE_MASTER_KEY` string is zeroized after use.
+- **Richer health probe (DEBT-3)** — done for TEI (`/health` liveness; non-2xx =
+  down). Other kinds keep bare host-reachability (no reliable unauthenticated
+  liveness endpoint); a per-kind probe for vendor APIs remains out of scope.

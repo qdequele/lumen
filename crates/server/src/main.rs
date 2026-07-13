@@ -253,6 +253,7 @@ fn boot_health(
             p.base_url.clone().map(|url| ProbeTarget {
                 name: p.name.clone(),
                 url,
+                kind: p.kind,
             })
         })
         .collect();

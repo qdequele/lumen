@@ -104,13 +104,37 @@ pub async fn providers_health(
     Json(state.health.snapshot())
 }
 
-/// A provider to probe: its name and the base URL to GET.
+/// A provider to probe: its name, configured base URL, and kind (which decides
+/// the liveness endpoint — a real one where the kind exposes it, else the base
+/// URL for bare reachability).
 #[derive(Debug, Clone)]
 pub struct ProbeTarget {
     /// Provider instance name.
     pub name: String,
-    /// The base URL to probe (only providers with a configured URL are probed).
+    /// The base URL (only providers with a configured URL are probed).
     pub url: String,
+    /// The provider kind, selecting the liveness endpoint.
+    pub kind: ferrogate_providers::ProviderKind,
+}
+
+impl ProbeTarget {
+    /// The URL to GET: a real liveness endpoint where the kind has one (TEI
+    /// serves `/health`), otherwise the base URL for host reachability.
+    fn probe_url(&self) -> String {
+        match self.kind {
+            ferrogate_providers::ProviderKind::Tei => {
+                format!("{}/health", self.url.trim_end_matches('/'))
+            }
+            _ => self.url.clone(),
+        }
+    }
+
+    /// Whether the probe hits a true liveness endpoint (so a non-2xx means the
+    /// server is up but *not ready* → down) or just checks reachability (any
+    /// response means the host is up).
+    fn is_liveness_endpoint(&self) -> bool {
+        matches!(self.kind, ferrogate_providers::ProviderKind::Tei)
+    }
 }
 
 /// Run one round of probes, updating the registry and the gauge. A GET that
@@ -125,14 +149,32 @@ pub async fn probe_once(
 ) {
     for target in targets {
         let started = tokio::time::Instant::now();
-        let outcome = client.get(&target.url).timeout(timeout).send().await;
+        let outcome = client.get(target.probe_url()).timeout(timeout).send().await;
         let elapsed = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         let status = match outcome {
+            // A liveness endpoint that answers non-2xx means the server is up
+            // but not ready → down; a reachability probe treats any response as
+            // up (the host answered).
+            Ok(response) if target.is_liveness_endpoint() && !response.status().is_success() => {
+                ProviderStatus {
+                    status: HealthState::Down,
+                    checked_at: Some(now_unix()),
+                    latency_ms: Some(elapsed),
+                    detail: Some(format!(
+                        "liveness returned HTTP {}",
+                        response.status().as_u16()
+                    )),
+                }
+            }
             Ok(_) => ProviderStatus {
                 status: HealthState::Up,
                 checked_at: Some(now_unix()),
                 latency_ms: Some(elapsed),
-                detail: Some("reachable".to_owned()),
+                detail: Some(if target.is_liveness_endpoint() {
+                    "liveness ok".to_owned()
+                } else {
+                    "reachable".to_owned()
+                }),
             },
             Err(_) => ProviderStatus {
                 status: HealthState::Down,
@@ -194,6 +236,27 @@ mod tests {
         assert_eq!(snap["a"].latency_ms, Some(7));
         // Untouched provider stays unknown.
         assert_eq!(snap["b"].status, HealthState::Unknown);
+    }
+
+    #[test]
+    fn probe_url_uses_a_liveness_endpoint_only_where_the_kind_has_one() {
+        use ferrogate_providers::ProviderKind;
+        let tei = ProbeTarget {
+            name: "tei".to_owned(),
+            url: "http://tei:8080/".to_owned(),
+            kind: ProviderKind::Tei,
+        };
+        assert_eq!(tei.probe_url(), "http://tei:8080/health");
+        assert!(tei.is_liveness_endpoint());
+
+        let ollama = ProbeTarget {
+            name: "ollama".to_owned(),
+            url: "http://ollama:11434".to_owned(),
+            kind: ProviderKind::Ollama,
+        };
+        // No known liveness endpoint → bare reachability against the base URL.
+        assert_eq!(ollama.probe_url(), "http://ollama:11434");
+        assert!(!ollama.is_liveness_endpoint());
     }
 
     #[test]
