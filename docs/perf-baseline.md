@@ -52,9 +52,12 @@ bounded copy plus the `[DONE]`/heartbeat scan, not a deserialize.
 |---|---|
 | Idle RSS (release binary, one provider, after serving `/health`) | **~8.8 MB** (9040 KB) |
 | Binary size (macOS arm64, release) | ~7.7 MB |
+| Docker image (distroless/static + musl binary, arm64) | **10.6 MB** |
 
-The static musl binary size (the release artifact) is measured by the Docker
-build (`Dockerfile`) — see §Packaging in the README; it is of the same order.
+The Docker image was built from `Dockerfile` and smoke-tested: `docker run -v
+config.toml -e OPENAI_API_KEY …` answers `/health` 200 and `/v1/models`. At
+10.6 MB it is well under the 30 MB image budget (§7.2). The amd64 image is built
+in CI via buildx (`release.yml`).
 
 ## Targets
 

@@ -63,13 +63,19 @@ Spec : `specs/milestones/M5-auth-budgets.md`
 - [x] Health checks providers en tâche de fond, JAMAIS dans le request path
 Spec : `specs/milestones/M6-resilience.md`
 
-## M7 — Release
-- [ ] Benchmarks criterion + comparatif public vs LiteLLM (latence ajoutée, RAM, throughput)
-- [ ] Dockerfile distroless multi-arch < 20 Mo, binaire statique musl
-- [ ] Hot reload de config sans drop de connexions
-- [ ] Docs complètes (README, quickstart, guides providers, errors.md)
-- [ ] cargo-audit + cargo-deny dans la CI
+## M7 — Release ✅
+- [x] Benchmarks criterion + comparatif public vs LiteLLM (latence ajoutée, RAM, throughput)
+- [x] Dockerfile distroless multi-arch < 20 Mo, binaire statique musl
+- [x] Hot reload de config sans drop de connexions
+- [x] Docs complètes (README, quickstart, guides providers, errors.md)
+- [x] cargo-audit + cargo-deny dans la CI
 Spec : `specs/milestones/M7-release.md`
+
+Note : overhead hors réseau mesuré (~3 µs médian, image 10,6 Mo, RSS idle
+8,8 Mo) ; le comparatif chargé vs LiteLLM est fourni comme harnais reproductible
+(`bench/`) — voir `docs/perf-baseline.md`. cargo-audit/deny/fuzz câblés en CI
+(binaires non installés dans l'environnement de dev). Image amd64 via buildx CI ;
+arm64 vérifiée localement (`docker run`).
 
 ## Backlog v2 (ne pas implémenter)
 UI admin, cache sémantique, multimodal (images/audio), guardrails, rate limiting distribué (Redis), OTLP tracing, plugin WASM.
