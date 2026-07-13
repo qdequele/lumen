@@ -4,7 +4,39 @@ All notable changes to Ferrogate are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.1.0] — 2026-07-13
+
+First tagged release. Ferrogate is a universal, self-hostable LLM gateway in
+Rust — chat, embeddings and reranking as first-class capabilities behind one
+OpenAI/Cohere-compatible surface, with a measured **~3 µs** added CPU per
+request off-network, **~8.8 MB** idle RAM, hard budgets, end-to-end
+cancellation, and zero telemetry. See the milestone entries below (M1–M7) for
+the full feature history.
+
+### Added — M7: release (hot reload, packaging, security, benchmarks)
+
+- **Config hot reload** (§7.3): `SIGHUP` or a config-file change re-validates and
+  atomically swaps the provider routing table via the registry's ArcSwap;
+  in-flight requests are untouched. An invalid reload keeps the running config
+  and increments `ferrogate_config_reload_failures_total`. Scope: the routing
+  table (server/auth/pricing/resilience stay boot-time).
+- **Packaging** (§7.2): multi-stage `Dockerfile` → static musl binary on
+  `distroless/static:nonroot` (no shell, no libc). `release.yml` builds musl
+  binaries (x86_64 + aarch64, capped at 25 MB) on `v*` tags and buildx-pushes a
+  multi-arch image to GHCR.
+- **Default security headers** (§7.4): `X-Content-Type-Options: nosniff`,
+  `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`,
+  `Content-Security-Policy: default-src 'none'` on every response; `SECURITY.md`
+  documents the disclosure policy and security model.
+- **Supply chain** (§7.4): `cargo audit` + `cargo deny` (permissive-license
+  allowlist, advisory/source pinning) in CI; a standalone `fuzz/` crate with
+  libfuzzer targets for the SSE and request parsers, run 10 min/target weekly.
+- **Benchmarks** (§7.1): a Criterion `gateway_overhead` bench and
+  `docs/perf-baseline.md` recording the measured in-process overhead, idle RAM
+  and binary size; `bench/` is a reproducible docker-compose + k6 head-to-head
+  vs LiteLLM.
+- **New metrics**: `ferrogate_config_reloads_total`,
+  `ferrogate_config_reload_failures_total`.
 
 ### Added — M6: résilience (retries, fallback, circuit breaker, timeouts, health)
 
@@ -304,4 +336,4 @@ can NEVER be overrun, and a token count for every single request.
 - Docs: error-code reference (`docs/errors.md`), ADR 001 (crate/lib naming),
   and this changelog.
 
-[Unreleased]: https://github.com/meilisearch/ferrogate/commits/main
+[0.1.0]: https://github.com/meilisearch/ferrogate/releases/tag/v0.1.0

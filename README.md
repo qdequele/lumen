@@ -1,130 +1,288 @@
-# Kit de bootstrap Ferrogate — mode d'emploi
+# Ferrogate
 
-Ce dossier contient tout ce qu'il faut pour que Claude Code itère en autonomie sur le projet.
+A universal, self-hostable LLM gateway written in Rust. One OpenAI-compatible
+endpoint in front of many providers — for **chat**, **embeddings** and
+**reranking** alike. It is designed to be light, fast and sovereign: a single
+static binary, **zero telemetry**, and prompts that are **never logged by
+default**.
 
-## Contenu
-```
-CLAUDE.md                    # Contexte permanent : architecture, règles, boucle de travail
-ROADMAP.md                   # Pilotage : milestones ordonnés avec cases à cocher
-.claude/agents/              # 5 subagents spécialisés
-├── provider-integrator.md   # Ajout de providers (le travail le plus répétitif)
-├── test-writer.md           # TDD : tests avant implémentation
-├── code-reviewer.md         # Review read-only avant chaque commit
-├── perf-auditor.md          # Audit perf du chemin de requête
-└── docs-writer.md           # Docs utilisateur
-specs/
-├── 00-vision.md             # Le pourquoi (ancre les décisions ambiguës)
-└── milestones/M1..M7        # Specs détaillées avec critères d'acceptation testables
-```
+Ferrogate is an alternative to LiteLLM (Python, heavier) and OpenRouter (SaaS,
+not self-hostable). The gateway's own overhead is **microseconds, off-network**:
+the per-request CPU work it adds is **~3.2 µs median** (M6 resilience executor +
+OpenAI-surface (de)serialization), measured with `cargo bench` on Apple Silicon.
+Streaming forwards upstream bytes verbatim with no per-chunk re-serialization
+(see [ADR 004](docs/adr/004-streaming-passthrough.md)). A full, reproducible
+head-to-head against LiteLLM under load ships in [`bench/`](bench/README.md);
+the honest numbers and the method are in
+[`docs/perf-baseline.md`](docs/perf-baseline.md).
 
-## Démarrage
-```bash
-mkdir ferrogate && cd ferrogate
-git init
-# copier le contenu de ce kit à la racine
-claude
-```
+## Contents
 
-Premier prompt suggéré :
-> Lis CLAUDE.md, ROADMAP.md et specs/00-vision.md. Commence le milestone M1 en suivant la boucle de travail : test-writer d'abord, implémentation ensuite, code-reviewer avant chaque commit.
+- [Capabilities & API](#capabilities--api)
+- [5-minute quickstart](#5-minute-quickstart)
+- [Providers × capabilities](#providers--capabilities)
+- [Features](#features)
+- [Configuration](#configuration)
+- [Benchmarks](#benchmarks)
+- [Security](#security)
 
-## Pour les sessions suivantes
-> Reprends là où on en est : lis ROADMAP.md, identifie le milestone courant et continue.
+## Capabilities & API
 
-## Conseils pour l'autonomie
-- **Une session ≈ un milestone** (ou une moitié pour M4/M5). Ne pas enchaîner deux milestones dans la même session : le contexte se dégrade.
-- Utilise `/compact` si la session devient longue, ou redémarre — la ROADMAP et les cases cochées portent l'état, pas la conversation.
-- Après M2, l'ajout de providers devient parallélisable : "Utilise le subagent provider-integrator pour Cohere, Jina et TEI en parallèle."
-- Lance le subagent code-reviewer explicitement en fin de milestone si Claude ne le fait pas spontanément.
-- Vérifie toi-même les critères d'acceptation d'un milestone avant de laisser Claude passer au suivant (5 min de lecture des tests suffisent).
-- Mode autonome : `claude --dangerously-skip-permissions` accélère mais fais-le dans un conteneur/VM dédié ; sinon configure les permissions dans `.claude/settings.json` (allow: cargo, git commit ; deny: git push).
+| Method & path                 | What it does                                            |
+|--------------------------------|---------------------------------------------------------|
+| `POST /v1/chat/completions`    | Chat completions, OpenAI format, streaming SSE.         |
+| `POST /v1/embeddings`          | Embeddings, OpenAI format.                              |
+| `POST /v1/rerank`              | Reranking, Cohere format (`query`, `documents`, `top_n`).|
+| `GET  /v1/models`              | Lists configured models with a `capabilities` array.    |
+| `GET  /health`                 | Liveness. No I/O, never touches the DB or providers.    |
+| `GET  /health/providers`       | Background provider-probe results (opt-in, see below).  |
+| `GET  /metrics`                | Prometheus exposition.                                  |
+| `POST/GET/PATCH /admin/*`      | Key/budget admin. Only mounted when auth is enabled.    |
 
-## Fichiers que Claude Code créera lui-même
-`CHANGELOG.md`, `docs/adr/`, `docs/errors.md`, `docs/backlog.md`, `docs/perf-baseline.md`, `config.example.toml`, et tout le code.
+A single model id is owned entirely by you and may serve one to three
+capabilities. The router resolves each request by `(capability, model)`.
 
----
+## 5-minute quickstart
 
-## Resilience (M6)
+Zero to a successful **chat + embed + rerank** request.
 
-Ferrogate keeps a request alive across a flaky upstream without ever
-destabilising the gateway itself. Four mechanisms compose, all configured in
-the `[resilience]` section of `config.toml` (see `config.example.toml` for the
-fully commented version) plus a per-model `fallbacks` list. Everything below is
-on by default with sensible values; nothing here touches the database on the
-request path.
+### 1. Write a minimal `config.toml`
 
-### Retries
-
-Retryable upstream failures (5xx, connect/read timeout, 429) are retried with
-exponential backoff and equal jitter. An upstream `Retry-After` is honoured as a
-floor. A client `4xx` is never retried — a different provider would reject it
-too. While streaming, a retry only happens if no chunk has yet reached the
-client.
-
-### Fallback chains
-
-A model can name an ordered list of fallback models. They are tried, in order,
-once the primary has exhausted its retries or its circuit is open. Every
-fallback must exist and serve every capability of the model it backs — this is
-validated at boot, so a typo fails startup rather than a live request. The model
-that actually served is reported in the `x-ferrogate-model-used` response header
-and recorded in `usage_log.model_used`.
+The ids below (`gpt-4o`, `text-embedding-3-small`, `rerank-english`) are the
+same ones used throughout [`config.example.toml`](config.example.toml). This
+minimal file needs an OpenAI key (chat + embeddings) and a Cohere key (rerank).
 
 ```toml
+# config.toml — minimal quickstart config
+[[providers]]
+name = "openai"
+kind = "openai"
+api_key_env = "OPENAI_API_KEY"
+
 [[providers.models]]
 id = "gpt-4o"
+upstream_id = "gpt-4o-2024-08-06"
 capabilities = ["chat"]
-fallbacks = ["claude-3-5-sonnet"]   # tried if OpenAI is down / circuit open
+
+[[providers.models]]
+id = "text-embedding-3-small"
+capabilities = ["embed"]
+
+[[providers]]
+name = "cohere"
+kind = "cohere"
+api_key_env = "COHERE_API_KEY"
+
+[[providers.models]]
+id = "rerank-english"
+upstream_id = "rerank-v3.5"
+capabilities = ["rerank"]
 ```
 
-### Circuit breaker
+### 2. Run it
 
-Per `(provider, model)`: after `circuit_failure_threshold` consecutive
-provider-fault failures (default 5) the circuit opens; the model is then skipped
-straight to its next fallback. After `circuit_cooldown_ms` (default 30 s) a
-single half-open probe decides whether to close again. An open circuit with no
-fallback left returns `503 FG-3020` with a `Retry-After`.
+**Docker** (the released image; sets `FERROGATE_SERVER__HOST=0.0.0.0` for you):
 
-### Timeouts
-
-Three distinct timeouts, each surfacing a distinct `504` for debugging:
-
-| Phase       | Config                                    | Default | Code      |
-|-------------|-------------------------------------------|---------|-----------|
-| connect     | `resilience.connect_timeout_ms` (global)  | 5 s     | `FG-3012` |
-| first token | `server.first_token_timeout_ms`           | 30 s    | `FG-3011` |
-| total       | `resilience.total_timeout_ms`             | 600 s   | `FG-3013` |
-
-`connect` is client-wide (one pooled HTTP client). The first-token and total
-timeouts can be overridden per provider with `first_token_timeout_ms` /
-`total_timeout_ms` on a `[[providers]]` block; the total deadline bounds all
-retries and fallbacks together.
-
-### Background health checks
-
-Off by default. When enabled, a periodic task probes every provider that has a
-configured `base_url` (self-hosted TEI/Ollama, or an explicit override) and
-publishes the result at `GET /health/providers`. Providers on a built-in vendor
-URL report `unknown` (never probed). The gateway's own `GET /health` stays fully
-independent of provider health and does no I/O.
-
-```toml
-[resilience]
-retry_max_attempts = 3
-circuit_failure_threshold = 5
-circuit_cooldown_ms = 30000
-total_timeout_ms = 600000
-health_check_enabled = true
-health_check_interval_ms = 30000
+```bash
+docker run -p 8080:8080 \
+  -v ./config.toml:/config.toml \
+  -e OPENAI_API_KEY=sk-... \
+  -e COHERE_API_KEY=... \
+  ghcr.io/meilisearch/ferrogate:latest
 ```
 
-### Metrics
+**From source** (needs a recent stable Rust toolchain):
 
-Two Prometheus gauges expose resilience state on `GET /metrics`:
+```bash
+export OPENAI_API_KEY=sk-...
+export COHERE_API_KEY=...
+cargo run -p server -- --config config.toml
+```
 
-- `ferrogate_circuit_state{provider,model}` — `0` closed, `1` open, `2` half-open.
-- `ferrogate_provider_up{provider}` — `1` up, `0` down (background health checks;
-  a provider that is never probed simply reports no sample).
+> The bundled [`config.example.toml`](config.example.toml) also runs as-is
+> (`cargo run -p server -- --config config.example.toml`); it additionally wires
+> Anthropic/Ollama/Jina/Voyage/TEI and demonstrates fallbacks. Providers whose
+> API-key env var is unset are only rejected when a request actually routes to
+> them, so a partial set of keys is fine.
 
-See `docs/errors.md` for the full `FG-3xxx` code reference and
-`docs/adr/005-resilience-execution.md` for the design rationale.
+By default auth is **off**, so these requests need no `Authorization` header.
+
+### 3. Chat completion
+
+```bash
+curl -s http://localhost:8080/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{
+    "model": "gpt-4o",
+    "messages": [{"role": "user", "content": "Say hello in one word."}]
+  }'
+```
+
+Stream it by adding `"stream": true` — the response becomes `text/event-stream`
+with `data: {…}` frames and a terminal `data: [DONE]`.
+
+### 4. Embeddings
+
+```bash
+curl -s http://localhost:8080/v1/embeddings \
+  -H 'content-type: application/json' \
+  -d '{
+    "model": "text-embedding-3-small",
+    "input": ["the quick brown fox", "a lazy dog"]
+  }'
+```
+
+### 5. Rerank
+
+```bash
+curl -s http://localhost:8080/v1/rerank \
+  -H 'content-type: application/json' \
+  -d '{
+    "model": "rerank-english",
+    "query": "What is the capital of France?",
+    "documents": ["Paris is the capital of France.", "Berlin is in Germany."],
+    "top_n": 2
+  }'
+```
+
+Results come back sorted by descending `relevance_score`. `documents` must be
+non-empty (an empty list is rejected with `FG-2010`).
+
+## Providers × capabilities
+
+Nine provider kinds. The `kind` string is what you put in a `[[providers]]`
+block. **Self-hosted** kinds are keyless and require a `base_url`; hosted kinds
+read their API key from the env var named by `api_key_env`.
+
+| `kind`      | Chat | Embed | Rerank | Auth                  | Notes                          |
+|-------------|:----:|:-----:|:------:|-----------------------|--------------------------------|
+| `openai`    |  ✅  |  ✅   |        | `api_key_env`         |                                |
+| `mistral`   |  ✅  |  ✅   |        | `api_key_env`         | OpenAI-compatible              |
+| `anthropic` |  ✅  |       |        | `api_key_env`         | bidirectional translation      |
+| `google`    |  ✅  |       |        | `api_key_env`         | Gemini                         |
+| `cohere`    |      |  ✅   |   ✅   | `api_key_env`         | one model can do embed+rerank  |
+| `jina`      |      |  ✅   |   ✅   | `api_key_env`         |                                |
+| `voyage`    |      |  ✅   |   ✅   | `api_key_env`         |                                |
+| `tei`       |      |  ✅   |   ✅   | keyless, **`base_url`** | self-hosted (Text Embeddings Inference) |
+| `ollama`    |      |  ✅   |        | keyless, **`base_url`** | self-hosted                    |
+
+Per-provider setup (env var, `base_url`, batch limits) is in
+[`docs/providers.md`](docs/providers.md).
+
+## Features
+
+Each area is summarized here; the linked docs and ADRs carry the detail.
+
+### Auth, keys & hard budgets (M5)
+
+Off by default — with `[auth].enabled = false` the gateway is an open proxy with
+no database at all. When enabled (requires `FERROGATE_MASTER_KEY`, 64 hex
+chars), it adds **virtual keys**, **hard budgets** and **RPM/TPM quotas**, all
+enforced **in memory before any upstream call**, so a rejected request never
+spends. The DB is never on the request path. Refusals are `402 FG-4001`
+(budget), `429 FG-4002` (RPM), `429 FG-4003` (TPM); a missing/invalid key is
+`401 FG-4004`. Keys and budgets are managed via the `/admin/*` API, gated by the
+master key. See [`SECURITY.md`](SECURITY.md).
+
+### Resilience (M6)
+
+Survives flaky upstreams without becoming flaky itself: **retries** with
+exponential backoff + jitter (retryable failures only, never a client 4xx),
+per-model **fallback chains**, a per-`(provider, model)` **circuit breaker**, and
+three distinct **per-phase timeouts** (`FG-3012` connect, `FG-3011` first-token,
+`FG-3013` total). Optional **background health checks** publish
+`GET /health/providers`. The model that actually served a request is reported in
+the `x-ferrogate-model-used` response header. All configured under
+`[resilience]`; design in [ADR 005](docs/adr/005-resilience-execution.md).
+
+### Observability & token accounting (M5, ADR 003)
+
+**Every** request of every capability produces a token count — upstream usage
+when reported, otherwise a local byte-heuristic estimate flagged
+`"estimated": true`. Never a silent zero. Surfaced three ways: in the response
+body, on `/metrics`, and (when auth is on) in the `usage_log` table. Key
+metrics: `ferrogate_tokens_total{capability,model,provider,direction,estimated}`,
+`ferrogate_rerank_search_units_total`, `ferrogate_circuit_state{provider,model}`,
+`ferrogate_provider_up{provider}`, `ferrogate_usage_log_dropped_total`,
+`ferrogate_config_reloads_total` / `ferrogate_config_reload_failures_total`. The
+usage log is written on a bounded async channel that **drops rather than blocks**
+the request path, and stores token counts, cost and metadata labels — **never
+message content**. See [ADR 003](docs/adr/003-token-accounting.md) and
+[ADR 002](docs/adr/002-request-metadata-header.md) for the `x-ferrogate-metadata`
+header.
+
+### Config hot reload (M7)
+
+`SIGHUP` or a file-watch triggers a reload: the new config is validated, then the
+provider registry is atomically swapped. In-flight requests are unaffected. An
+invalid config is **rejected** — the old config keeps serving and
+`ferrogate_config_reload_failures_total` increments.
+
+### Security headers (M7)
+
+Every response carries `X-Content-Type-Options: nosniff`,
+`X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, and
+`Content-Security-Policy: default-src 'none'`. TLS is intentionally left to a
+terminating reverse proxy — see [`SECURITY.md`](SECURITY.md).
+
+## Configuration
+
+Everything is one TOML file (plus `FERROGATE_*` env overrides, using `__` for
+nesting, e.g. `FERROGATE_SERVER__PORT=9090`). The exhaustively commented
+reference is [`config.example.toml`](config.example.toml), with sections:
+
+- `log_format` — `"pretty"` (default) or `"json"`.
+- `[server]` — bind host/port, body limit, first-token timeout, SSE heartbeat.
+- `[auth]` — virtual keys, budgets, quotas, usage log (off by default).
+- `[telemetry]` — which `x-ferrogate-metadata` keys become Prometheus labels.
+- `[resilience]` — retries, circuit breaker, timeouts, health checks.
+- `[[providers]]` / `[[providers.models]]` — upstreams, model ids, capabilities,
+  prices, and per-model `fallbacks`.
+
+API keys are **never** written in the config — a provider references the *name*
+of the env var that holds its key.
+
+## Benchmarks
+
+From [`docs/perf-baseline.md`](docs/perf-baseline.md) (Apple Silicon, release
+profile, `rustc 1.97.0`):
+
+| Measure                                             | Value             |
+|-----------------------------------------------------|-------------------|
+| M6 executor around an instant provider (`executor_overhead_chat`) | ~1.21 µs median |
+| Parse a chat request (`json_request_deserialize`)   | ~1.34 µs median   |
+| Serialize a chat response (`json_response_serialize`)| ~0.60 µs median  |
+| **Total added CPU per non-streaming chat request**  | **~3.2 µs median**|
+| Idle RSS (release binary, one provider)             | ~8.8 MB           |
+
+Reproduce the in-process numbers:
+
+```bash
+cargo bench -p server --bench gateway_overhead
+```
+
+The full loaded head-to-head against LiteLLM (added latency p50/p99, RAM, req/s)
+is a one-command Docker + k6 harness — see [`bench/README.md`](bench/README.md).
+That comparison is not executed in the recording environment; the microsecond
+off-network overhead above is what is asserted, and the harness lets anyone
+produce the loaded numbers on their own hardware.
+
+## Security
+
+Ferrogate runs inside your own trust boundary. Provider keys are referenced by
+env-var name (or encrypted at rest under `FERROGATE_MASTER_KEY`), never logged,
+never returned in errors. Prompts and responses are never logged by default.
+Vulnerability reporting and the full security model are in
+[`SECURITY.md`](SECURITY.md).
+
+## Reference
+
+- Error codes: [`docs/errors.md`](docs/errors.md)
+- Provider setup: [`docs/providers.md`](docs/providers.md)
+- Performance: [`docs/perf-baseline.md`](docs/perf-baseline.md)
+- Architecture decisions: [`docs/adr/`](docs/adr/)
+- Changelog: [`CHANGELOG.md`](CHANGELOG.md)
+
+## License
+
+Apache-2.0.
