@@ -25,10 +25,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
 use ferrogate_providers::{Registry, RegistryError};
 use ferrogate_telemetry::ReloadMetrics;
 
 use crate::config::{Config, ConfigError};
+use crate::pricing::CostTable;
+use crate::resilience::ResilienceRuntime;
 
 /// Why a reload was rejected. The previous config is always kept on error.
 #[derive(Debug, thiserror::Error)]
@@ -41,29 +44,38 @@ pub enum ReloadError {
     Registry(#[from] RegistryError),
 }
 
+/// The process-wide handles a reload swaps: the routing table, the price table
+/// and the resilience policy (the circuit breakers inside `resilience` are
+/// deliberately *not* swapped — their live state survives the reload). Bundled
+/// so the reload signature stays small and future config surfaces can join.
+pub struct ReloadTargets {
+    /// The provider routing table (its own `ArcSwap` inside).
+    pub registry: Arc<Registry>,
+    /// The price table cell (DEBT-1).
+    pub pricing: Arc<ArcSwap<CostTable>>,
+    /// The resilience runtime; only its policy cell is swapped.
+    pub resilience: Arc<ResilienceRuntime>,
+    /// Reload success/failure counters.
+    pub metrics: ReloadMetrics,
+    /// Boot-time DB provider-key snapshot, re-applied so a reload never strips
+    /// a stored key (env still wins).
+    pub key_backfill: HashMap<String, String>,
+}
+
 /// Re-load `path`, validate it, and (only on success) atomically swap the
-/// registry's routing table. `key_backfill` (provider name → key) re-applies
-/// keys that were resolved from the encrypted DB at boot for providers whose
-/// env var is unset — env still wins. Increments the success/failure counters.
-/// On any error the registry is left exactly as it was.
+/// routing table, price table and resilience policy. Increments the
+/// success/failure counters. On any error every target is left exactly as it
+/// was (the fallible registry rebuild runs first, before any swap).
 ///
 /// # Errors
 /// [`ReloadError`] if the file is missing/invalid or the registry rebuild
 /// fails; the running config is unaffected in both cases.
-// The backfill map always comes from the boot stack's default-hasher map;
-// generalizing over the hasher would add noise for no caller benefit.
-#[allow(clippy::implicit_hasher)]
-pub fn apply_reload(
-    path: &Path,
-    registry: &Registry,
-    metrics: &ReloadMetrics,
-    key_backfill: &HashMap<String, String>,
-) -> Result<(), ReloadError> {
+pub fn apply_reload(path: &Path, targets: &ReloadTargets) -> Result<(), ReloadError> {
     // `Config::load` parses AND validates; a bad file never reaches `reload`.
     let config = match Config::load(path) {
         Ok(config) => config,
         Err(error) => {
-            metrics.inc_failure();
+            targets.metrics.inc_failure();
             tracing::warn!(%error, "config reload rejected; keeping the running config");
             return Err(error.into());
         }
@@ -72,20 +84,25 @@ pub fn apply_reload(
     // DB-key snapshot for any provider still keyless, mirroring boot back-fill
     // so a reload never strips a DB-stored key (env keeps precedence).
     let mut specs = config.provider_specs();
-    merge_key_backfill(&mut specs, key_backfill);
-    // The registry rebuild is the last line of defence (duplicate model ids
-    // etc. are already caught by validation, but a keyless provider missing a
-    // base_url would surface here). A failure leaves the old table in place.
-    if let Err(error) = registry.reload(specs) {
-        metrics.inc_failure();
+    merge_key_backfill(&mut specs, &targets.key_backfill);
+    // The fallible step goes FIRST: the registry rebuild is the last line of
+    // defence (a keyless provider missing a base_url surfaces here). On failure
+    // nothing has been swapped yet, so every target keeps its old value.
+    if let Err(error) = targets.registry.reload(specs) {
+        targets.metrics.inc_failure();
         tracing::warn!(%error, "config reload rejected by registry; keeping the running config");
         return Err(error.into());
     }
-    metrics.inc_success();
+    // Registry swapped; the remaining swaps are infallible.
+    targets
+        .pricing
+        .store(Arc::new(CostTable::from_config(&config)));
+    targets.resilience.reload_policy(&config);
+    targets.metrics.inc_success();
     tracing::info!(
         model_count = config.loaded_models().len(),
         provider_count = config.providers.len(),
-        "configuration reloaded; routing table swapped"
+        "configuration reloaded; routing table, pricing and resilience policy swapped"
     );
     Ok(())
 }
@@ -119,12 +136,9 @@ const DEBOUNCE: Duration = Duration::from_millis(250);
 /// the caller should log it and continue (hot reload via SIGHUP still works if
 /// the watcher fails — but here both share the watcher setup, so a failure
 /// disables both and is surfaced to the caller).
-#[allow(clippy::implicit_hasher)] // always the boot stack's default-hasher map
 pub fn spawn_config_reloader(
     path: PathBuf,
-    registry: Arc<Registry>,
-    metrics: ReloadMetrics,
-    key_backfill: HashMap<String, String>,
+    targets: ReloadTargets,
 ) -> Result<tokio::task::JoinHandle<()>, notify::Error> {
     use notify::{RecursiveMode, Watcher};
 
@@ -154,7 +168,7 @@ pub fn spawn_config_reloader(
         .map_or(path.as_path(), |p| p);
     watcher.watch(watch_target, RecursiveMode::NonRecursive)?;
 
-    let backfill = Arc::new(key_backfill);
+    let targets = Arc::new(targets);
     let handle = tokio::spawn(async move {
         // Keep the watcher alive for the lifetime of the task.
         let _watcher = watcher;
@@ -163,7 +177,7 @@ pub fn spawn_config_reloader(
             tokio::select! {
                 () = wait_for_hangup(&mut sighup) => {
                     tracing::info!("SIGHUP received; reloading config");
-                    reload_blocking(&path, &registry, &metrics, &backfill).await;
+                    reload_blocking(&path, &targets).await;
                 }
                 event = rx.recv() => {
                     if event.is_none() {
@@ -172,7 +186,7 @@ pub fn spawn_config_reloader(
                     // Coalesce the rest of the burst before reloading.
                     tokio::time::sleep(DEBOUNCE).await;
                     while rx.try_recv().is_ok() {}
-                    reload_blocking(&path, &registry, &metrics, &backfill).await;
+                    reload_blocking(&path, &targets).await;
                 }
             }
         }
@@ -182,18 +196,11 @@ pub fn spawn_config_reloader(
 
 /// Run [`apply_reload`] on a blocking thread (it does synchronous figment file
 /// I/O), so the runtime worker is never blocked (CLAUDE.md rule 2 in spirit).
-async fn reload_blocking(
-    path: &Path,
-    registry: &Arc<Registry>,
-    metrics: &ReloadMetrics,
-    backfill: &Arc<HashMap<String, String>>,
-) {
+async fn reload_blocking(path: &Path, targets: &Arc<ReloadTargets>) {
     let path = path.to_path_buf();
-    let registry = Arc::clone(registry);
-    let metrics = metrics.clone();
-    let backfill = Arc::clone(backfill);
+    let targets = Arc::clone(targets);
     let joined = tokio::task::spawn_blocking(move || {
-        let _ = apply_reload(&path, &registry, &metrics, &backfill);
+        let _ = apply_reload(&path, &targets);
     })
     .await;
     if let Err(error) = joined {
@@ -274,6 +281,18 @@ mod tests {
         Arc::new(Registry::build(config.provider_specs(), http::build_client()).expect("registry"))
     }
 
+    /// Reload targets sharing `registry`/`metrics`, with default pricing and
+    /// resilience and no key backfill.
+    fn targets(registry: Arc<Registry>, metrics: ReloadMetrics) -> ReloadTargets {
+        ReloadTargets {
+            registry,
+            pricing: Arc::new(ArcSwap::from_pointee(CostTable::default())),
+            resilience: Arc::new(ResilienceRuntime::defaults()),
+            metrics,
+            key_backfill: HashMap::new(),
+        }
+    }
+
     #[test]
     fn valid_reload_swaps_the_routing_table() {
         let dir = tempdir();
@@ -283,12 +302,69 @@ mod tests {
         assert!(registry.embedding_route("embed").is_none());
 
         let metrics = ReloadMetrics::register(&Metrics::new()).unwrap();
+        let t = targets(Arc::clone(&registry), metrics);
         write_config(&dir, TWO_MODELS);
-        apply_reload(&path, &registry, &metrics, &HashMap::new()).expect("valid reload");
+        apply_reload(&path, &t).expect("valid reload");
 
         // The new model is now routable — the swap took effect.
         assert!(registry.embedding_route("embed").is_some());
         assert!(registry.knows_model("gpt"));
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)] // prices come straight from config: exact
+    fn valid_reload_swaps_pricing_and_resilience_but_keeps_breaker_state() {
+        use ferrogate_router::circuit::CircuitState;
+        let dir = tempdir();
+        // Start with no price and no fallback.
+        let path = write_config(&dir, ONE_MODEL);
+        let registry = registry_from(&path);
+        let t = targets(
+            Arc::clone(&registry),
+            ReloadMetrics::register(&Metrics::new()).unwrap(),
+        );
+
+        // Baseline: model unpriced, no fallback chain.
+        assert_eq!(t.pricing.load().token_cost("gpt", 1_000_000, 0), 0.0);
+        assert_eq!(t.resilience.chain_ids("gpt"), vec!["gpt"]);
+
+        // Trip the breaker for (openai, gpt) so we can prove it survives reload.
+        let breaker = t.resilience.breakers.get("openai", "gpt");
+        let now = tokio::time::Instant::now();
+        // Default threshold is 5 consecutive failures.
+        for _ in 0..5 {
+            breaker.on_failure(now);
+        }
+        assert_eq!(breaker.state(), CircuitState::Open);
+
+        // Reload with a price + a fallback for gpt.
+        write_config(
+            &dir,
+            r#"
+            [[providers]]
+            name = "openai"
+            kind = "openai"
+            [[providers.models]]
+            id = "gpt"
+            capabilities = ["chat"]
+            cost_per_1m_input = 2.5
+            fallbacks = ["backup"]
+            [[providers.models]]
+            id = "backup"
+            capabilities = ["chat"]
+            "#,
+        );
+        apply_reload(&path, &t).expect("valid reload");
+
+        // Pricing + resilience policy swapped...
+        assert_eq!(t.pricing.load().token_cost("gpt", 1_000_000, 0), 2.5);
+        assert_eq!(t.resilience.chain_ids("gpt"), vec!["gpt", "backup"]);
+        // ...but the breaker's live state was preserved across the swap.
+        assert_eq!(
+            t.resilience.breakers.get("openai", "gpt").state(),
+            CircuitState::Open,
+            "reload must not reset circuit-breaker state"
+        );
     }
 
     #[test]
@@ -318,7 +394,8 @@ mod tests {
             capabilities = ["chat"]
             "#,
         );
-        let err = apply_reload(&path, &registry, &reload, &HashMap::new()).unwrap_err();
+        let t = targets(Arc::clone(&registry), reload);
+        let err = apply_reload(&path, &t).unwrap_err();
         assert!(matches!(err, ReloadError::Config(_)));
 
         // Old routing table intact: the pre-reload models still resolve.
@@ -339,7 +416,8 @@ mod tests {
         let reload = ReloadMetrics::register(&metrics).unwrap();
 
         std::fs::remove_file(&path).expect("remove config");
-        let err = apply_reload(&path, &registry, &reload, &HashMap::new()).unwrap_err();
+        let t = targets(Arc::clone(&registry), reload);
+        let err = apply_reload(&path, &t).unwrap_err();
         assert!(matches!(
             err,
             ReloadError::Config(ConfigError::NotFound { .. })

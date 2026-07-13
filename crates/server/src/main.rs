@@ -8,6 +8,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use anyhow::Context;
+use arc_swap::ArcSwap;
 use ferrogate_auth::crypto::MasterKey;
 use ferrogate_auth::key::hash_key;
 use ferrogate_auth::state::AuthState;
@@ -20,7 +21,7 @@ use ferrogate_server::{
     health::{spawn_health_checks, ProbeTarget, ProviderHealth},
     lifecycle, log_startup,
     pricing::CostTable,
-    reload::spawn_config_reloader,
+    reload::{spawn_config_reloader, ReloadTargets},
     resilience::ResilienceRuntime,
     state::AppState,
 };
@@ -165,15 +166,22 @@ fn run(config: Config, config_path: PathBuf) -> anyhow::Result<()> {
                 .context("failed to build provider registry")?,
         );
 
+        // The price table lives in a shared cell so the hot reloader swaps the
+        // very cell the handlers read (DEBT-1).
+        let pricing = Arc::new(ArcSwap::from_pointee(CostTable::from_config(&config)));
+
         // Config hot reload (M7 §7.3): SIGHUP or a config-file change re-validates
-        // and atomically swaps the routing table. A watcher-setup failure only
+        // and atomically swaps the routing table, price table and resilience
+        // policy (circuit-breaker state preserved). A watcher-setup failure only
         // disables reload — the server still runs — so it is logged, not fatal.
-        match spawn_config_reloader(
-            config_path,
-            Arc::clone(&registry),
-            reload_metrics,
+        let reload_targets = ReloadTargets {
+            registry: Arc::clone(&registry),
+            pricing: Arc::clone(&pricing),
+            resilience: Arc::clone(&resilience),
+            metrics: reload_metrics,
             key_backfill,
-        ) {
+        };
+        match spawn_config_reloader(config_path, reload_targets) {
             Ok(_handle) => tracing::info!("config hot reload armed (SIGHUP + file watch)"),
             Err(error) => tracing::warn!(%error, "config hot reload unavailable"),
         }
@@ -182,7 +190,7 @@ fn run(config: Config, config_path: PathBuf) -> anyhow::Result<()> {
 
         let mut state = AppState::new(metrics, registry, tokens)
             .with_guards(guards)
-            .with_pricing(CostTable::from_config(&config))
+            .with_pricing_cell(pricing)
             .with_resilience(resilience)
             .with_health(health);
         if let Some(runtime) = auth_runtime.clone() {

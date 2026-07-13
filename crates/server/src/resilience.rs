@@ -8,6 +8,7 @@
 //! All state is in-memory; nothing here touches a database.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::http::{HeaderMap, HeaderName, HeaderValue};
@@ -43,11 +44,11 @@ pub struct Timeouts {
     pub total: Duration,
 }
 
-/// Process-wide resilience state and resolved policy.
-#[derive(Debug)]
-pub struct ResilienceRuntime {
-    /// Per-(provider, model) circuit breakers.
-    pub breakers: CircuitBreakers,
+/// The hot-swappable part of the resilience config: everything derived from the
+/// config file. The circuit breakers are deliberately *not* here — their live
+/// state must survive a reload (a reload must not reset an open circuit).
+#[derive(Debug, Clone)]
+struct ResiliencePolicy {
     retry: RetryPolicy,
     default_timeouts: Timeouts,
     /// Per-model timeout overrides (inherited from the owning provider).
@@ -56,21 +57,9 @@ pub struct ResilienceRuntime {
     fallbacks: HashMap<String, Vec<String>>,
 }
 
-impl ResilienceRuntime {
-    /// Build from config, wiring circuit-state transitions to `metrics` when
-    /// provided.
-    #[must_use]
-    pub fn from_config(config: &Config, metrics: Option<ResilienceMetrics>) -> Self {
+impl ResiliencePolicy {
+    fn from_config(config: &Config) -> Self {
         let r = &config.resilience;
-        let retry = RetryPolicy {
-            max_attempts: r.retry_max_attempts,
-            base: Duration::from_millis(r.retry_base_ms),
-            max: Duration::from_millis(r.retry_max_ms),
-        };
-        let breaker_config = BreakerConfig {
-            failure_threshold: r.circuit_failure_threshold,
-            cooldown: Duration::from_millis(r.circuit_cooldown_ms),
-        };
         let default_timeouts = Timeouts {
             first_token: Duration::from_millis(config.server.first_token_timeout_ms),
             total: Duration::from_millis(r.total_timeout_ms),
@@ -90,20 +79,19 @@ impl ResilienceRuntime {
             })
             .collect();
         Self {
-            breakers: CircuitBreakers::new(breaker_config, metrics),
-            retry,
+            retry: RetryPolicy {
+                max_attempts: r.retry_max_attempts,
+                base: Duration::from_millis(r.retry_base_ms),
+                max: Duration::from_millis(r.retry_max_ms),
+            },
             default_timeouts,
             model_timeouts,
             fallbacks: config.fallback_map(),
         }
     }
 
-    /// A runtime with library defaults, no fallbacks and no gauge — used by
-    /// tests and as the open-gateway baseline.
-    #[must_use]
-    pub fn defaults() -> Self {
+    fn defaults() -> Self {
         Self {
-            breakers: CircuitBreakers::new(BreakerConfig::default(), None),
             retry: RetryPolicy::default(),
             default_timeouts: Timeouts {
                 first_token: Duration::from_secs(30),
@@ -113,30 +101,83 @@ impl ResilienceRuntime {
             fallbacks: HashMap::new(),
         }
     }
+}
+
+/// Process-wide resilience state. The circuit breakers are stable for the life
+/// of the process (so their state survives a hot reload); the derived policy is
+/// behind an [`ArcSwap`] so a config reload can replace it atomically without
+/// touching breaker state (DEBT-1 / M7 §7.3).
+#[derive(Debug)]
+pub struct ResilienceRuntime {
+    /// Per-(provider, model) circuit breakers — never rebuilt on reload.
+    pub breakers: CircuitBreakers,
+    policy: arc_swap::ArcSwap<ResiliencePolicy>,
+}
+
+impl ResilienceRuntime {
+    /// Build from config, wiring circuit-state transitions to `metrics` when
+    /// provided.
+    #[must_use]
+    pub fn from_config(config: &Config, metrics: Option<ResilienceMetrics>) -> Self {
+        let r = &config.resilience;
+        let breaker_config = BreakerConfig {
+            failure_threshold: r.circuit_failure_threshold,
+            cooldown: Duration::from_millis(r.circuit_cooldown_ms),
+        };
+        Self {
+            breakers: CircuitBreakers::new(breaker_config, metrics),
+            policy: arc_swap::ArcSwap::from_pointee(ResiliencePolicy::from_config(config)),
+        }
+    }
+
+    /// A runtime with library defaults, no fallbacks and no gauge — used by
+    /// tests and as the open-gateway baseline.
+    #[must_use]
+    pub fn defaults() -> Self {
+        Self {
+            breakers: CircuitBreakers::new(BreakerConfig::default(), None),
+            policy: arc_swap::ArcSwap::from_pointee(ResiliencePolicy::defaults()),
+        }
+    }
+
+    /// Atomically replace the derived policy (retry, timeouts, fallbacks) from a
+    /// new config — the hot-reload entry point. Circuit-breaker state is left
+    /// untouched, so an open circuit stays open across a reload.
+    pub fn reload_policy(&self, config: &Config) {
+        self.policy
+            .store(Arc::new(ResiliencePolicy::from_config(config)));
+    }
+
+    /// Mutate the current policy in place (builder helper for tests + overrides).
+    fn map_policy(self, f: impl FnOnce(&mut ResiliencePolicy)) -> Self {
+        let mut policy = (*self.policy.load_full()).clone();
+        f(&mut policy);
+        self.policy.store(Arc::new(policy));
+        self
+    }
 
     /// Override the default first-token timeout (builder style). Used by tests
     /// and by callers that drive the executor without a full config.
     #[must_use]
-    pub fn with_first_token(mut self, first_token: Duration) -> Self {
-        self.default_timeouts.first_token = first_token;
-        self
+    pub fn with_first_token(self, first_token: Duration) -> Self {
+        self.map_policy(|p| p.default_timeouts.first_token = first_token)
     }
 
     /// Override the retry policy (builder style) — e.g. tests that assert on a
     /// single attempt.
     #[must_use]
-    pub fn with_retry(mut self, retry: RetryPolicy) -> Self {
-        self.retry = retry;
-        self
+    pub fn with_retry(self, retry: RetryPolicy) -> Self {
+        self.map_policy(|p| p.retry = retry)
     }
 
     /// The ordered chain of client-facing model ids to try for `model`: the
     /// model itself first, then its configured fallbacks.
     #[must_use]
     pub fn chain_ids(&self, model: &str) -> Vec<String> {
-        let mut ids = Vec::with_capacity(1 + self.fallbacks.get(model).map_or(0, Vec::len));
+        let policy = self.policy.load();
+        let mut ids = Vec::with_capacity(1 + policy.fallbacks.get(model).map_or(0, Vec::len));
         ids.push(model.to_owned());
-        if let Some(fallbacks) = self.fallbacks.get(model) {
+        if let Some(fallbacks) = policy.fallbacks.get(model) {
             ids.extend(fallbacks.iter().cloned());
         }
         ids
@@ -146,13 +187,14 @@ impl ResilienceRuntime {
     /// per-model timeout override when present.
     #[must_use]
     pub fn exec_config(&self, model: &str) -> ExecConfig {
-        let t = self
+        let policy = self.policy.load();
+        let t = policy
             .model_timeouts
             .get(model)
             .copied()
-            .unwrap_or(self.default_timeouts);
+            .unwrap_or(policy.default_timeouts);
         ExecConfig {
-            retry: self.retry,
+            retry: policy.retry,
             first_token: t.first_token,
             total: t.total,
         }

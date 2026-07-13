@@ -33,6 +33,7 @@ hyper = { workspace = true }
 futures = { workspace = true }
 bytes = { workspace = true }
 dashmap = { workspace = true }
+arc-swap = { workspace = true }
 reqwest = { workspace = true }
 
 serde = { workspace = true }

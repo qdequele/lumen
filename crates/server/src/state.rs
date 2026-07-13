@@ -4,6 +4,7 @@ use crate::auth::AuthRuntime;
 use crate::health::ProviderHealth;
 use crate::pricing::CostTable;
 use crate::resilience::ResilienceRuntime;
+use arc_swap::ArcSwap;
 use ferrogate_auth::usage::UsageLogger;
 use ferrogate_providers::Registry;
 use ferrogate_telemetry::{Metrics, TokenMetrics};
@@ -52,8 +53,10 @@ pub struct AppState {
     pub auth: Option<Arc<AuthRuntime>>,
     /// Usage-log channel; `None` = no usage database.
     pub usage: Option<UsageLogger>,
-    /// Per-model price table (M5 cost counting).
-    pub pricing: Arc<CostTable>,
+    /// Per-model price table (M5 cost counting), behind an [`ArcSwap`] so a
+    /// config hot reload can replace it atomically (DEBT-1). Read a consistent
+    /// per-request snapshot via [`pricing`](AppState::pricing).
+    pub pricing: Arc<ArcSwap<CostTable>>,
     /// Resilience runtime: circuit breakers, retry policy, timeouts, fallback
     /// chains (M6). All in-memory; never on a database path.
     pub resilience: Arc<ResilienceRuntime>,
@@ -74,7 +77,7 @@ impl AppState {
             tokens,
             auth: None,
             usage: None,
-            pricing: Arc::new(CostTable::default()),
+            pricing: Arc::new(ArcSwap::from_pointee(CostTable::default())),
             resilience: Arc::new(ResilienceRuntime::defaults()),
             health: Arc::new(ProviderHealth::default()),
         }
@@ -118,7 +121,23 @@ impl AppState {
     /// Attach the per-model price table (builder style).
     #[must_use]
     pub fn with_pricing(mut self, pricing: CostTable) -> Self {
-        self.pricing = Arc::new(pricing);
+        self.pricing = Arc::new(ArcSwap::from_pointee(pricing));
         self
+    }
+
+    /// Attach a shared price-table cell (builder style) — used when the hot
+    /// reloader must swap the same cell the handlers read (DEBT-1).
+    #[must_use]
+    pub fn with_pricing_cell(mut self, pricing: Arc<ArcSwap<CostTable>>) -> Self {
+        self.pricing = pricing;
+        self
+    }
+
+    /// A consistent per-request snapshot of the price table. Taken once per
+    /// request so a mid-request hot reload can't change prices between the
+    /// pre-call estimate and the post-call settlement.
+    #[must_use]
+    pub fn pricing(&self) -> Arc<CostTable> {
+        self.pricing.load_full()
     }
 }

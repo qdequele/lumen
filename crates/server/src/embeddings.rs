@@ -47,8 +47,11 @@ pub async fn embeddings(
     // Admission BEFORE the upstream call: the pre-call estimate is reserved
     // atomically against the key's budget and quotas (M5 §5.2). The provider
     // label is corrected to the one that actually serves (M6) after execution.
+    // One consistent price snapshot for the whole request (a mid-request hot
+    // reload can't shift prices between estimate and settlement).
+    let pricing = state.pricing();
     let estimated_input = tokens::estimate_embed_input(&req);
-    let estimated_cost = state.pricing.token_cost(&client_model, estimated_input, 0);
+    let estimated_cost = pricing.token_cost(&client_model, estimated_input, 0);
     let mut accounting = Accounting::begin(
         &state,
         &headers,
@@ -60,6 +63,7 @@ pub async fn embeddings(
         },
         estimated_input,
         estimated_cost,
+        pricing.clone(),
     )?;
 
     // Per-request cancellation. The guard fires on handler drop (client
@@ -114,7 +118,7 @@ pub async fn embeddings(
         response.usage.total_tokens = response.usage.prompt_tokens;
         response.usage.estimated = Some(true);
     }
-    let cost = state.pricing.token_cost(&executed.model_used, tokens_in, 0);
+    let cost = pricing.token_cost(&executed.model_used, tokens_in, 0);
     accounting.finish(&Outcome {
         tokens_in,
         tokens_out: 0,

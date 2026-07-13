@@ -85,6 +85,7 @@ impl Accounting {
         target: Target<'_>,
         estimated_tokens: u64,
         estimated_cost: f64,
+        pricing: Arc<CostTable>,
     ) -> Result<Self, GatewayError> {
         let metadata = match RequestMetadata::extract(headers) {
             MetadataOutcome::Absent => None,
@@ -119,7 +120,7 @@ impl Accounting {
             metadata,
             tokens: state.tokens.clone(),
             usage: state.usage.clone(),
-            pricing: Arc::clone(&state.pricing),
+            pricing,
             started: Instant::now(),
         })
     }

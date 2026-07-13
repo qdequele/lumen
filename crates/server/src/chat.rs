@@ -74,13 +74,12 @@ pub async fn chat(
     // estimate (prompt heuristic + `max_tokens`, or a default output
     // reservation) against the key's budget; TPM counts the same estimate.
     // The reservation is settled to the real usage afterwards.
+    let pricing = state.pricing();
     let estimated_input = tokens::estimate_chat_prompt(&req);
     let reserved_output = req
         .max_tokens
         .map_or(DEFAULT_RESERVED_OUTPUT_TOKENS, u64::from);
-    let estimated_cost = state
-        .pricing
-        .token_cost(&client_model, estimated_input, reserved_output);
+    let estimated_cost = pricing.token_cost(&client_model, estimated_input, reserved_output);
     let accounting = Accounting::begin(
         &state,
         &headers,
@@ -92,6 +91,7 @@ pub async fn chat(
         },
         estimated_input + reserved_output,
         estimated_cost,
+        pricing,
     )?;
 
     // Per-request cancellation. The guard fires on drop (client disconnect).
@@ -212,7 +212,6 @@ async fn chat_non_streaming(
     let served_model = executed.model_used.clone();
     settle_non_streaming(
         accounting,
-        ctx.state,
         &served_model,
         ctx.estimated_input,
         &mut response,
@@ -225,7 +224,6 @@ async fn chat_non_streaming(
 /// surfaced (flagged) in the response body too.
 fn settle_non_streaming(
     accounting: Accounting,
-    state: &AppState,
     client_model: &str,
     estimated_input: u64,
     response: &mut ferrogate_core::ChatResponse,
@@ -260,8 +258,8 @@ fn settle_non_streaming(
             estimated: Some(true),
         });
     }
-    let cost = state
-        .pricing
+    let cost = accounting
+        .pricing()
         .token_cost(client_model, tokens_in, tokens_out);
     accounting.finish(&Outcome {
         tokens_in,

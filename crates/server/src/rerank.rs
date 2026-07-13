@@ -49,9 +49,10 @@ pub async fn rerank_handler(
 
     // Admission BEFORE the upstream call (M5 §5.2). Rerank cost is billed in
     // search units; TPM counts the query × documents token estimate.
+    let pricing = state.pricing();
     let estimated_tokens = tokens::estimate_rerank(&req);
     let estimated_units = estimate_search_units(req.documents.len());
-    let estimated_cost = state.pricing.search_cost(&client_model, estimated_units);
+    let estimated_cost = pricing.search_cost(&client_model, estimated_units);
     let mut accounting = Accounting::begin(
         &state,
         &headers,
@@ -63,6 +64,7 @@ pub async fn rerank_handler(
         },
         estimated_tokens,
         estimated_cost,
+        pricing.clone(),
     )?;
 
     // Per-request cancellation. The guard fires on handler drop (client
@@ -103,9 +105,7 @@ pub async fn rerank_handler(
         response.usage.search_units = u32::try_from(search_units).unwrap_or(u32::MAX);
         response.usage.estimated = Some(true);
     }
-    let cost = state
-        .pricing
-        .search_cost(&executed.model_used, search_units);
+    let cost = pricing.search_cost(&executed.model_used, search_units);
     accounting.finish(&Outcome {
         // Rerank tokens are always gateway-estimated (uniform observability
         // per ADR 003); the billing unit is `search_units`.
