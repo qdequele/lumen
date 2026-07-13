@@ -8,11 +8,27 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use anyhow::Context;
+use ferrogate_auth::crypto::MasterKey;
+use ferrogate_auth::key::hash_key;
+use ferrogate_auth::state::AuthState;
+use ferrogate_auth::store::KeyStore;
+use ferrogate_auth::usage::{spawn_usage_writer, UsageWriterConfig};
 use ferrogate_server::{
-    build_app, build_registry, config::Config, lifecycle, log_startup, state::AppState,
+    auth::{now_unix, AuthRuntime},
+    build_app,
+    config::Config,
+    lifecycle, log_startup,
+    pricing::CostTable,
+    state::AppState,
 };
-use ferrogate_telemetry::{logging::init_logging, Metrics};
+use ferrogate_telemetry::{logging::init_logging, Metrics, TokenMetrics};
+use std::sync::Arc;
 use tokio::net::TcpListener;
+
+/// Env var holding the master key (64 hex chars): admin-API token and
+/// at-rest encryption key for stored provider keys. Required when
+/// `auth.enabled = true`. The value itself is never logged or stored.
+const MASTER_KEY_ENV: &str = "FERROGATE_MASTER_KEY";
 
 /// How long to drain in-flight requests after a shutdown signal.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
@@ -105,19 +121,149 @@ fn run(config: Config) -> anyhow::Result<()> {
             .with_context(|| format!("failed to bind {addr}"))?;
         tracing::info!(%addr, "listening");
 
-        let registry = build_registry(&config).context("failed to build provider registry")?;
         let guards = ferrogate_server::StreamGuards {
             first_token_timeout: Duration::from_millis(config.server.first_token_timeout_ms),
             heartbeat_interval: Duration::from_millis(config.server.sse_heartbeat_ms),
         };
-        let state = AppState::new(Metrics::new(), registry).with_guards(guards);
+        let metrics = Metrics::new();
+        let tokens = TokenMetrics::register(&metrics, &config.telemetry.metadata_labels)
+            .context("failed to register token metrics")?;
+
+        // The M5 auth stack: SQLite store, in-memory key state, usage writer,
+        // periodic budget flush and retention purge. All optional — the
+        // gateway stays a stateless open proxy when auth is disabled.
+        let mut provider_specs = config.provider_specs();
+        let (auth_runtime, usage_logger) = if config.auth.enabled {
+            let (runtime, logger) = boot_auth_stack(&config, &mut provider_specs).await?;
+            (Some(runtime), Some(logger))
+        } else {
+            (None, None)
+        };
+
+        let client = ferrogate_providers::http::build_client();
+        let registry = Arc::new(
+            ferrogate_providers::Registry::build(provider_specs, client)
+                .context("failed to build provider registry")?,
+        );
+
+        let mut state = AppState::new(metrics, registry, tokens)
+            .with_guards(guards)
+            .with_pricing(CostTable::from_config(&config));
+        if let Some(runtime) = auth_runtime.clone() {
+            state = state.with_auth(runtime);
+        }
+        if let Some(logger) = usage_logger {
+            state = state.with_usage(logger);
+        }
         let app = build_app(state, config.server.body_limit);
 
         lifecycle::serve(listener, app, DRAIN_TIMEOUT, lifecycle::shutdown_signal())
             .await
             .context("server error")?;
 
+        // Final budget flush so a clean shutdown loses zero accounting.
+        if let Some(runtime) = auth_runtime {
+            let dirty = runtime.keys.drain_dirty();
+            if !dirty.is_empty() {
+                if let Err(error) = runtime.store.persist_budgets(&dirty).await {
+                    tracing::warn!(%error, "final budget flush failed");
+                }
+            }
+        }
+
         tracing::info!("shutdown complete");
         Ok(())
     })
+}
+
+/// Boot the M5 auth stack: master key, SQLite store, provider-key back-fill,
+/// in-memory key table, usage writer, periodic budget flush and retention
+/// purge. Returns the runtime and the usage-log handle.
+async fn boot_auth_stack(
+    config: &Config,
+    provider_specs: &mut [ferrogate_providers::ProviderSpec],
+) -> anyhow::Result<(Arc<AuthRuntime>, ferrogate_auth::usage::UsageLogger)> {
+    let master_value = std::env::var(MASTER_KEY_ENV).with_context(|| {
+        format!("auth.enabled requires the {MASTER_KEY_ENV} env var (64 hex chars)")
+    })?;
+    let master = MasterKey::from_env_value(&master_value)
+        .with_context(|| format!("invalid {MASTER_KEY_ENV}"))?;
+
+    let store = KeyStore::connect(&config.auth.db_url())
+        .await
+        .with_context(|| format!("failed to open auth database '{}'", config.auth.db_path))?;
+
+    // Provider keys stored encrypted in the DB back-fill any provider whose
+    // env var is unset (env vars stay the primary source).
+    for spec in provider_specs.iter_mut() {
+        if spec.api_key.is_none() {
+            if let Some(key) = store
+                .load_provider_key(&spec.name, &master)
+                .await
+                .with_context(|| format!("failed to decrypt stored provider key '{}'", spec.name))?
+            {
+                spec.api_key = Some(key);
+            }
+        }
+    }
+
+    let entries = store
+        .load_auth_entries()
+        .await
+        .context("failed to load virtual keys")?;
+    let keys = AuthState::load(entries);
+    tracing::info!(key_count = keys.len(), "virtual keys loaded");
+
+    let (logger, _writer) = spawn_usage_writer(
+        store.clone(),
+        UsageWriterConfig {
+            capacity: config.auth.usage_channel_capacity,
+            batch_max: config.auth.usage_batch_max,
+            flush_interval: Duration::from_millis(config.auth.usage_flush_ms),
+        },
+    );
+
+    let runtime = Arc::new(AuthRuntime {
+        keys,
+        store: store.clone(),
+        admin_token_hash: hash_key(&master_value),
+        master: Some(master),
+    });
+
+    // Periodic budget flush: memory → DB. A crash loses at most one interval
+    // of *accounting*; enforcement lives in memory and is reloaded from the
+    // last flush at boot.
+    let flush_runtime = Arc::clone(&runtime);
+    let flush_interval = Duration::from_millis(config.auth.flush_interval_ms);
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(flush_interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            let dirty = flush_runtime.keys.drain_dirty();
+            if dirty.is_empty() {
+                continue;
+            }
+            if let Err(error) = flush_runtime.store.persist_budgets(&dirty).await {
+                tracing::warn!(%error, "budget flush failed; will retry next interval");
+            }
+        }
+    });
+
+    // Retention purge: drop usage_log rows older than the window.
+    let retention = i64::from(config.auth.retention_days) * 86_400;
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(3_600));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            match store.purge_usage_older_than(now_unix() - retention).await {
+                Ok(0) => {}
+                Ok(purged) => tracing::info!(purged, "usage-log retention purge"),
+                Err(error) => tracing::warn!(%error, "usage-log purge failed"),
+            }
+        }
+    });
+
+    Ok((runtime, logger))
 }

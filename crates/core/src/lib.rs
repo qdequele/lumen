@@ -127,7 +127,10 @@ mod tests {
                 relevance_score: 0.9,
                 document: None,
             }],
-            usage: RerankUsage { search_units: 1 },
+            usage: RerankUsage {
+                search_units: 1,
+                estimated: None,
+            },
         };
         let json = serde_json::to_value(&resp).unwrap();
         // `document` is skipped entirely when None (criterion 5).

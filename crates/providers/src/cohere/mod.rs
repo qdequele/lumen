@@ -156,6 +156,7 @@ impl EmbeddingProvider for CohereProvider {
             usage: EmbedUsage {
                 prompt_tokens: parsed.meta.billed_units.input_tokens,
                 total_tokens: parsed.meta.billed_units.input_tokens,
+                estimated: None,
             },
         })
     }
@@ -235,6 +236,7 @@ impl RerankProvider for CohereProvider {
                 .collect(),
             usage: RerankUsage {
                 search_units: parsed.meta.billed_units.search_units,
+                estimated: None,
             },
         })
     }

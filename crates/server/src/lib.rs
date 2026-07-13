@@ -5,13 +5,18 @@
 
 #![forbid(unsafe_code)]
 
+pub mod accounting;
+pub mod admin;
 pub mod app;
+pub mod auth;
 pub mod chat;
 pub mod config;
 pub mod embeddings;
 pub mod error;
 pub mod lifecycle;
+pub mod metadata;
 pub mod models;
+pub mod pricing;
 pub mod rerank;
 pub mod routes;
 pub mod state;

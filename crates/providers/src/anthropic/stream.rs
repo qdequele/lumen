@@ -172,6 +172,7 @@ impl SseTranslator for AnthropicTranslator {
                     prompt_tokens: self.input_tokens,
                     completion_tokens: completion,
                     total_tokens: self.input_tokens.saturating_add(completion),
+                    estimated: None,
                 };
                 Ok(vec![StreamItem::Chunk(self.chunk(
                     ChatDelta::default(),

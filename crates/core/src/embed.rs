@@ -64,6 +64,10 @@ pub struct EmbedUsage {
     pub prompt_tokens: u32,
     #[serde(default)]
     pub total_tokens: u32,
+    /// `Some(true)` when the gateway locally estimated the counts because the
+    /// upstream reported none (ADR 003); omitted for upstream-reported usage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated: Option<bool>,
 }
 
 /// A single embedding vector with its position in the batch.

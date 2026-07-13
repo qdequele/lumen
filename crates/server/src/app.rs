@@ -1,8 +1,9 @@
 //! Assembly of the axum application and its middleware stack.
 
-use crate::{chat, embeddings, models, rerank, routes, state::AppState};
+use crate::{admin, auth, chat, embeddings, models, rerank, routes, state::AppState};
 use axum::{
-    routing::{get, post},
+    middleware,
+    routing::{get, patch, post, put},
     Router,
 };
 use tower::ServiceBuilder;
@@ -21,22 +22,47 @@ use tracing::info_span;
 ///    but never the body or query string (user data is never logged);
 /// 3. propagate the request id onto the response;
 /// 4. reject bodies larger than `body_limit` bytes.
+///
+/// Route groups:
+/// * `/health`, `/metrics` — operational, never authenticated, no I/O;
+/// * `/v1/*` — the API surface; virtual-key auth when enabled (M5);
+/// * `/admin/*` — key management; mounted only when auth is enabled,
+///   protected by the master key.
 pub fn build_app(state: AppState, body_limit: usize) -> Router {
-    let middleware = ServiceBuilder::new()
+    let middleware_stack = ServiceBuilder::new()
         .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
         .layer(TraceLayer::new_for_http().make_span_with(make_request_span))
         .layer(PropagateRequestIdLayer::x_request_id())
         .layer(RequestBodyLimitLayer::new(body_limit));
 
-    Router::new()
-        .route("/health", get(routes::health))
-        .route("/metrics", get(routes::metrics))
+    let api = Router::new()
         .route("/v1/models", get(models::models))
         .route("/v1/chat/completions", post(chat::chat))
         .route("/v1/embeddings", post(embeddings::embeddings))
         .route("/v1/rerank", post(rerank::rerank_handler))
-        .with_state(state)
-        .layer(middleware)
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_virtual_key,
+        ));
+
+    let mut app = Router::new()
+        .route("/health", get(routes::health))
+        .route("/metrics", get(routes::metrics))
+        .merge(api);
+
+    if state.auth.is_some() {
+        let admin_routes = Router::new()
+            .route("/admin/keys", post(admin::create_key).get(admin::list_keys))
+            .route("/admin/keys/{id}", patch(admin::patch_key))
+            .route("/admin/provider-keys/{name}", put(admin::put_provider_key))
+            .route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                auth::require_master_key,
+            ));
+        app = app.merge(admin_routes);
+    }
+
+    app.with_state(state).layer(middleware_stack)
 }
 
 /// Build the per-request tracing span. Only metadata — never the body or query.

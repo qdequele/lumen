@@ -161,7 +161,10 @@ impl RerankProvider for VoyageProvider {
                 })
                 .collect(),
             // Voyage bills in tokens, not search units; the field does not apply.
-            usage: RerankUsage { search_units: 0 },
+            usage: RerankUsage {
+                search_units: 0,
+                estimated: None,
+            },
         })
     }
 }

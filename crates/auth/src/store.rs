@@ -196,6 +196,35 @@ impl KeyStore {
         Ok(record)
     }
 
+    /// Every key **with its hash** — exclusively for building the in-memory
+    /// [`AuthState`](crate::state::AuthState) at boot. The hash never leaves
+    /// the auth layer.
+    pub async fn load_auth_entries(&self) -> Result<Vec<(String, VirtualKeyRecord)>, AuthError> {
+        let rows = sqlx::query(
+            "SELECT id, key_hash, name, budget_max, budget_spent, rpm_limit, tpm_limit, expires_at, disabled, created_at \
+             FROM virtual_keys",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut entries = Vec::with_capacity(rows.len());
+        for row in rows {
+            let hash: String = row.try_get("key_hash")?;
+            let record = VirtualKeyRecord {
+                id: row.try_get("id")?,
+                name: row.try_get("name")?,
+                budget_max: row.try_get("budget_max")?,
+                budget_spent: row.try_get("budget_spent")?,
+                rpm_limit: row.try_get("rpm_limit")?,
+                tpm_limit: row.try_get("tpm_limit")?,
+                expires_at: row.try_get("expires_at")?,
+                disabled: row.try_get("disabled")?,
+                created_at: row.try_get("created_at")?,
+            };
+            entries.push((hash, record));
+        }
+        Ok(entries)
+    }
+
     /// Every key, hash included nowhere — for boot loading and the admin API.
     pub async fn list_keys(&self) -> Result<Vec<VirtualKeyRecord>, AuthError> {
         let records = sqlx::query_as::<_, VirtualKeyRecord>(

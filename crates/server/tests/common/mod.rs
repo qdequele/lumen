@@ -6,10 +6,17 @@
 
 use ferrogate_providers::{http, Registry};
 use ferrogate_server::{build_app, serve, AppState, StreamGuards};
-use ferrogate_telemetry::Metrics;
+use ferrogate_telemetry::{Metrics, TokenMetrics};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
+
+/// Build a fresh AppState with default guards and no auth.
+pub fn base_state(registry: Arc<Registry>) -> AppState {
+    let metrics = Metrics::new();
+    let tokens = TokenMetrics::register(&metrics, &[]).expect("register token metrics");
+    AppState::new(metrics, registry, tokens)
+}
 
 /// Spawn the app with a given registry and body limit; returns its base URL.
 pub async fn spawn_with(registry: Arc<Registry>, body_limit: usize) -> String {
@@ -23,14 +30,17 @@ pub async fn spawn_with_guards(
     body_limit: usize,
     guards: StreamGuards,
 ) -> String {
+    spawn_state(base_state(registry).with_guards(guards), body_limit).await
+}
+
+/// Spawn the app from a fully-built state (auth/pricing/usage attached by the
+/// caller); returns its base URL.
+pub async fn spawn_state(state: AppState, body_limit: usize) -> String {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind ephemeral port");
     let addr = listener.local_addr().expect("read local addr");
-    let app = build_app(
-        AppState::new(Metrics::new(), registry).with_guards(guards),
-        body_limit,
-    );
+    let app = build_app(state, body_limit);
 
     // `pending()` shutdown = never shut down for the lifetime of the test.
     tokio::spawn(async move {

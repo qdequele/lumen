@@ -106,7 +106,10 @@ mod tests {
             self.seen_top_n.lock().expect("lock").push(req.top_n);
             Ok(RerankResponse {
                 results: self.results.clone(),
-                usage: RerankUsage { search_units: 1 },
+                usage: RerankUsage {
+                    search_units: 1,
+                    estimated: None,
+                },
             })
         }
     }

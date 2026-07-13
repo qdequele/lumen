@@ -132,6 +132,7 @@ fn translate_response(resp: OllamaEmbedResponse, requested_model: &str) -> Embed
         usage: EmbedUsage {
             prompt_tokens: resp.prompt_eval_count,
             total_tokens: resp.prompt_eval_count,
+            estimated: None,
         },
     }
 }

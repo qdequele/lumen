@@ -93,6 +93,10 @@ pub struct RerankUsage {
     /// batch of up to 100 documents, upstream-defined).
     #[serde(default)]
     pub search_units: u32,
+    /// `Some(true)` when the gateway derived the unit count itself because the
+    /// upstream reported none (ADR 003); omitted for upstream-reported usage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated: Option<bool>,
 }
 
 /// A rerank response, ordered by descending `relevance_score`.

@@ -373,6 +373,7 @@ fn translate_response(resp: AnthropicResponse, requested_model: &str) -> ChatRes
             .usage
             .input_tokens
             .saturating_add(resp.usage.output_tokens),
+        estimated: None,
     };
 
     ChatResponse {

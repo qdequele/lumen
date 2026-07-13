@@ -1,7 +1,10 @@
 //! Shared application state handed to axum handlers.
 
+use crate::auth::AuthRuntime;
+use crate::pricing::CostTable;
+use ferrogate_auth::usage::UsageLogger;
 use ferrogate_providers::Registry;
-use ferrogate_telemetry::Metrics;
+use ferrogate_telemetry::{Metrics, TokenMetrics};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -31,9 +34,8 @@ impl Default for StreamGuards {
 
 /// Cheap-to-clone state shared across all handlers.
 ///
-/// Holds only process-wide, secret-free handles (the metrics registry and the
-/// provider registry). It is `Clone` because axum clones state per request; the
-/// heavy pieces sit behind `Arc`.
+/// Holds only process-wide, secret-free handles; the heavy pieces sit behind
+/// `Arc`. It is `Clone` because axum clones state per request.
 #[derive(Clone)]
 pub struct AppState {
     /// The Prometheus metrics registry.
@@ -42,17 +44,30 @@ pub struct AppState {
     pub registry: Arc<Registry>,
     /// Chat streaming guard timings.
     pub guards: StreamGuards,
+    /// Token-accounting counters (ADR 003) — always on.
+    pub tokens: TokenMetrics,
+    /// Virtual-key auth runtime; `None` = auth disabled (open gateway).
+    pub auth: Option<Arc<AuthRuntime>>,
+    /// Usage-log channel; `None` = no usage database.
+    pub usage: Option<UsageLogger>,
+    /// Per-model price table (M5 cost counting).
+    pub pricing: Arc<CostTable>,
 }
 
 impl AppState {
-    /// Create application state from the metrics and provider registries,
-    /// with default [`StreamGuards`].
+    /// Create application state. `tokens` must be registered against
+    /// `metrics` (see [`TokenMetrics::register`]); auth, usage logging and
+    /// pricing are attached with the builder methods below.
     #[must_use]
-    pub fn new(metrics: Metrics, registry: Arc<Registry>) -> Self {
+    pub fn new(metrics: Metrics, registry: Arc<Registry>, tokens: TokenMetrics) -> Self {
         Self {
             metrics,
             registry,
             guards: StreamGuards::default(),
+            tokens,
+            auth: None,
+            usage: None,
+            pricing: Arc::new(CostTable::default()),
         }
     }
 
@@ -60,6 +75,27 @@ impl AppState {
     #[must_use]
     pub fn with_guards(mut self, guards: StreamGuards) -> Self {
         self.guards = guards;
+        self
+    }
+
+    /// Attach the virtual-key auth runtime (builder style).
+    #[must_use]
+    pub fn with_auth(mut self, auth: Arc<AuthRuntime>) -> Self {
+        self.auth = Some(auth);
+        self
+    }
+
+    /// Attach the usage-log channel (builder style).
+    #[must_use]
+    pub fn with_usage(mut self, usage: UsageLogger) -> Self {
+        self.usage = Some(usage);
+        self
+    }
+
+    /// Attach the per-model price table (builder style).
+    #[must_use]
+    pub fn with_pricing(mut self, pricing: CostTable) -> Self {
+        self.pricing = Arc::new(pricing);
         self
     }
 }

@@ -21,7 +21,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 /// Top-level gateway configuration.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     /// HTTP server settings.
@@ -33,6 +33,115 @@ pub struct Config {
     /// Log output format.
     #[serde(default)]
     pub log_format: LogFormatConfig,
+    /// Virtual keys, budgets and usage logging (M5). Disabled by default.
+    #[serde(default)]
+    pub auth: AuthConfig,
+    /// Telemetry knobs (metadata label allowlist, ADR 002).
+    #[serde(default)]
+    pub telemetry: TelemetryConfig,
+}
+
+/// Virtual-key auth, hard budgets and usage logging (M5).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthConfig {
+    /// Master switch. When `false` (default) the gateway is open: no key
+    /// checks, no budgets, no usage database.
+    #[serde(default)]
+    pub enabled: bool,
+    /// SQLite database path (created if missing).
+    #[serde(default = "default_db_path")]
+    pub db_path: String,
+    /// How often in-memory budget counters are flushed to the DB, in
+    /// milliseconds. A crash loses at most this much *accounting*; it can
+    /// never allow a budget overrun (enforcement is in memory).
+    #[serde(default = "default_flush_interval_ms")]
+    pub flush_interval_ms: u64,
+    /// Bounded usage-log channel capacity.
+    #[serde(default = "default_usage_channel_capacity")]
+    pub usage_channel_capacity: usize,
+    /// Usage-log batch size that triggers an immediate write.
+    #[serde(default = "default_usage_batch_max")]
+    pub usage_batch_max: usize,
+    /// Maximum time a pending usage batch waits before being written, ms.
+    #[serde(default = "default_usage_flush_ms")]
+    pub usage_flush_ms: u64,
+    /// Usage-log retention in days (purged by a background task).
+    #[serde(default = "default_retention_days")]
+    pub retention_days: u32,
+}
+
+impl AuthConfig {
+    /// The sqlx connection URL for [`db_path`](Self::db_path).
+    #[must_use]
+    pub fn db_url(&self) -> String {
+        format!("sqlite://{}", self.db_path)
+    }
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            db_path: default_db_path(),
+            flush_interval_ms: default_flush_interval_ms(),
+            usage_channel_capacity: default_usage_channel_capacity(),
+            usage_batch_max: default_usage_batch_max(),
+            usage_flush_ms: default_usage_flush_ms(),
+            retention_days: default_retention_days(),
+        }
+    }
+}
+
+/// Telemetry configuration (ADR 002).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TelemetryConfig {
+    /// Metadata keys allowed to become Prometheus labels. Default empty:
+    /// client metadata NEVER creates time series unless the operator opts a
+    /// key in here (cardinality stays operator-bounded).
+    #[serde(default)]
+    pub metadata_labels: Vec<String>,
+}
+
+/// Base label names already used by the token counters — an allowlisted
+/// metadata key may not shadow them.
+const RESERVED_LABELS: [&str; 5] = ["capability", "model", "provider", "direction", "estimated"];
+
+impl TelemetryConfig {
+    /// ADR 002: the allowlist is the ONLY thing that turns metadata into
+    /// metric labels, so it must produce valid, non-colliding label names.
+    fn validate(&self, path_label: &str) -> Result<(), ConfigError> {
+        let err = |message: String| ConfigError::Validation {
+            path: path_label.to_owned(),
+            message,
+        };
+        if self.metadata_labels.len() > 16 {
+            return Err(err(
+                "telemetry.metadata_labels: at most 16 entries".to_owned()
+            ));
+        }
+        let mut seen_labels = HashSet::new();
+        for label in &self.metadata_labels {
+            if !is_valid_label_name(label) {
+                return Err(err(format!(
+                    "telemetry.metadata_labels: '{label}' is not a valid Prometheus label \
+                     name ([a-zA-Z_][a-zA-Z0-9_]*)"
+                )));
+            }
+            if RESERVED_LABELS.contains(&label.as_str()) {
+                return Err(err(format!(
+                    "telemetry.metadata_labels: '{label}' collides with a built-in label"
+                )));
+            }
+            if !seen_labels.insert(label.as_str()) {
+                return Err(err(format!(
+                    "telemetry.metadata_labels: duplicate entry '{label}'"
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// HTTP server settings.
@@ -60,7 +169,7 @@ pub struct ServerConfig {
 }
 
 /// A single upstream provider and the models it serves.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderConfig {
     /// Unique, user-chosen name for this provider instance.
@@ -80,7 +189,7 @@ pub struct ProviderConfig {
 }
 
 /// A model exposed by the gateway, mapped to an upstream model id.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelConfig {
     /// The model id clients use (owned entirely by the operator).
@@ -90,6 +199,15 @@ pub struct ModelConfig {
     pub upstream_id: Option<String>,
     /// Capabilities this model serves.
     pub capabilities: Vec<Capability>,
+    /// Price per **million input tokens**, USD (M5 cost counting).
+    #[serde(default)]
+    pub cost_per_1m_input: Option<f64>,
+    /// Price per **million output tokens**, USD.
+    #[serde(default)]
+    pub cost_per_1m_output: Option<f64>,
+    /// Price per **thousand rerank searches**, USD.
+    #[serde(default)]
+    pub cost_per_1k_searches: Option<f64>,
 }
 
 impl ModelConfig {
@@ -120,6 +238,16 @@ impl From<LogFormatConfig> for LogFormat {
     }
 }
 
+/// Prometheus label names: `[a-zA-Z_][a-zA-Z0-9_]*`.
+fn is_valid_label_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
 fn default_host() -> String {
     "127.0.0.1".to_owned()
 }
@@ -134,6 +262,24 @@ const fn default_first_token_timeout_ms() -> u64 {
 }
 const fn default_sse_heartbeat_ms() -> u64 {
     15_000
+}
+fn default_db_path() -> String {
+    "ferrogate.db".to_owned()
+}
+const fn default_flush_interval_ms() -> u64 {
+    10_000
+}
+const fn default_usage_channel_capacity() -> usize {
+    10_000
+}
+const fn default_usage_batch_max() -> usize {
+    500
+}
+const fn default_usage_flush_ms() -> u64 {
+    2_000
+}
+const fn default_retention_days() -> u32 {
+    30
 }
 
 impl Default for ServerConfig {
@@ -230,6 +376,29 @@ impl Config {
             return Err(err("server.sse_heartbeat_ms must not be 0".to_owned()));
         }
 
+        if self.auth.enabled {
+            if self.auth.db_path.trim().is_empty() {
+                return Err(err("auth.db_path must not be empty".to_owned()));
+            }
+            if self.auth.flush_interval_ms == 0 {
+                return Err(err("auth.flush_interval_ms must not be 0".to_owned()));
+            }
+            if self.auth.usage_channel_capacity == 0 {
+                return Err(err("auth.usage_channel_capacity must not be 0".to_owned()));
+            }
+            if self.auth.usage_batch_max == 0 {
+                return Err(err("auth.usage_batch_max must not be 0".to_owned()));
+            }
+            if self.auth.usage_flush_ms == 0 {
+                return Err(err("auth.usage_flush_ms must not be 0".to_owned()));
+            }
+            if self.auth.retention_days == 0 {
+                return Err(err("auth.retention_days must not be 0".to_owned()));
+            }
+        }
+
+        self.telemetry.validate(path_label)?;
+
         let mut provider_names = HashSet::new();
         // model id -> the provider that first declared it, so a collision can
         // cite BOTH conflicting locations (M3 acceptance criterion 4).
@@ -253,6 +422,18 @@ impl Config {
                         "model '{}' must declare at least one capability",
                         model.id
                     )));
+                }
+                for (field, value) in [
+                    ("cost_per_1m_input", model.cost_per_1m_input),
+                    ("cost_per_1m_output", model.cost_per_1m_output),
+                    ("cost_per_1k_searches", model.cost_per_1k_searches),
+                ] {
+                    if value.is_some_and(|v| !v.is_finite() || v < 0.0) {
+                        return Err(err(format!(
+                            "model '{}': {field} must be a finite, non-negative number",
+                            model.id
+                        )));
+                    }
                 }
                 if let Some(first_owner) = model_owner.insert(model.id.as_str(), &provider.name) {
                     return Err(err(format!(
@@ -454,6 +635,63 @@ mod tests {
         "#;
         let err = load_str(toml).unwrap_err();
         assert!(err.to_string().contains("capability"));
+    }
+
+    #[test]
+    fn auth_section_defaults_are_off_and_sane() {
+        let cfg = load_str("").unwrap();
+        assert!(!cfg.auth.enabled);
+        assert_eq!(cfg.auth.flush_interval_ms, 10_000);
+        assert_eq!(cfg.auth.usage_channel_capacity, 10_000);
+        assert_eq!(cfg.auth.usage_batch_max, 500);
+        assert_eq!(cfg.auth.usage_flush_ms, 2_000);
+        assert_eq!(cfg.auth.retention_days, 30);
+        assert!(cfg.telemetry.metadata_labels.is_empty());
+    }
+
+    #[test]
+    fn enabled_auth_rejects_zero_knobs() {
+        let err = load_str("[auth]\nenabled = true\nflush_interval_ms = 0\n").unwrap_err();
+        assert!(err.to_string().contains("flush_interval_ms"));
+        let err = load_str("[auth]\nenabled = true\nretention_days = 0\n").unwrap_err();
+        assert!(err.to_string().contains("retention_days"));
+    }
+
+    #[test]
+    fn disabled_auth_ignores_zero_knobs() {
+        // The section is inert when disabled; don't block boot on it.
+        assert!(load_str("[auth]\nenabled = false\nflush_interval_ms = 0\n").is_ok());
+    }
+
+    #[test]
+    fn metadata_labels_must_be_valid_and_not_reserved() {
+        let err = load_str("[telemetry]\nmetadata_labels = [\"not ok\"]\n").unwrap_err();
+        assert!(err.to_string().contains("not ok"));
+        let err = load_str("[telemetry]\nmetadata_labels = [\"model\"]\n").unwrap_err();
+        assert!(err.to_string().contains("built-in"));
+        let err = load_str("[telemetry]\nmetadata_labels = [\"team\", \"team\"]\n").unwrap_err();
+        assert!(err.to_string().contains("duplicate"));
+        assert!(load_str("[telemetry]\nmetadata_labels = [\"team\", \"env_1\"]\n").is_ok());
+    }
+
+    #[test]
+    fn model_prices_parse_and_negative_prices_are_rejected() {
+        let toml = r#"
+            [[providers]]
+            name = "openai"
+            kind = "openai"
+            [[providers.models]]
+            id = "gpt"
+            capabilities = ["chat"]
+            cost_per_1m_input = 2.5
+            cost_per_1m_output = 10.0
+        "#;
+        let cfg = load_str(toml).unwrap();
+        assert_eq!(cfg.providers[0].models[0].cost_per_1m_input, Some(2.5));
+
+        let bad = toml.replace("2.5", "-1.0");
+        let err = load_str(&bad).unwrap_err();
+        assert!(err.to_string().contains("cost_per_1m_input"));
     }
 
     #[test]

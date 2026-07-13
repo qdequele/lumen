@@ -241,6 +241,7 @@ fn translate_response(resp: GeminiResponse, requested_model: &str) -> ChatRespon
         prompt_tokens: resp.usage_metadata.prompt,
         completion_tokens: resp.usage_metadata.candidates,
         total_tokens: resp.usage_metadata.total,
+        estimated: None,
     };
 
     ChatResponse {

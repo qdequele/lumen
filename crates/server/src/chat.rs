@@ -28,20 +28,25 @@ use std::convert::Infallible;
 use axum::body::Body;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::State;
-use axum::http::header;
+use axum::http::{header, HeaderMap};
 use axum::response::{IntoResponse, Response};
-use axum::Json;
+use axum::{Extension, Json};
 use bytes::Bytes;
-use ferrogate_core::{ChatRequest, GatewayError, ProviderError};
+use ferrogate_core::{tokens, ChatRequest, GatewayError, ProviderError, Usage};
 use futures::stream::{BoxStream, StreamExt};
 use tokio_util::sync::{CancellationToken, DropGuard};
 
+use crate::accounting::{Accounting, Outcome, StreamAccounting, Target};
+use crate::auth::AuthedKey;
 use crate::error::ApiError;
+use crate::pricing::DEFAULT_RESERVED_OUTPUT_TOKENS;
 use crate::state::{AppState, StreamGuards};
 
 /// Handle a chat completion request (streaming or not, per `stream`).
 pub async fn chat(
     State(state): State<AppState>,
+    headers: HeaderMap,
+    key: Option<Extension<AuthedKey>>,
     payload: Result<Json<ChatRequest>, JsonRejection>,
 ) -> Result<Response, ApiError> {
     // Malformed body → FG-1001 in our envelope (not axum's plain-text default).
@@ -52,10 +57,35 @@ pub async fn chat(
     }
 
     // Resolve the client-facing model id to a provider + upstream id.
+    let client_model = req.model.clone();
     let route = ferrogate_router::resolve_chat(&state.registry, &req.model)?;
     req.model = route.upstream_id.clone();
     let provider_name = route.provider_name.clone();
     let guards = state.guards;
+
+    // Admission BEFORE the upstream call (M5 §5.2): reserve the pre-call
+    // estimate (prompt heuristic + `max_tokens`, or a default output
+    // reservation) against the key's budget; TPM counts the same estimate.
+    // The reservation is settled to the real usage afterwards.
+    let estimated_input = tokens::estimate_chat_prompt(&req);
+    let reserved_output = req
+        .max_tokens
+        .map_or(DEFAULT_RESERVED_OUTPUT_TOKENS, u64::from);
+    let estimated_cost = state
+        .pricing
+        .token_cost(&client_model, estimated_input, reserved_output);
+    let accounting = Accounting::begin(
+        &state,
+        &headers,
+        key.as_deref(),
+        Target {
+            capability: "chat",
+            model: &client_model,
+            provider: &route.provider_name,
+        },
+        estimated_input + reserved_output,
+        estimated_cost,
+    )?;
 
     // Per-request cancellation. The guard fires on drop (client disconnect).
     let cancel = CancellationToken::new();
@@ -77,12 +107,17 @@ pub async fn chat(
                     provider: provider_name.clone(),
                 })?;
         let byte_stream = opened.map_err(|e| GatewayError::from_provider(&provider_name, e))?;
+        // Accounting rides inside the stream: the sniffer reads the final
+        // usage chunk (or falls back to estimates) and settles when the
+        // stream ends — including on client disconnect, via its Drop.
+        let stream_accounting = StreamAccounting::new(accounting, estimated_input);
         let body = Body::from_stream(to_event_stream(
             byte_stream,
             provider_name,
             guard,
             guards,
             deadline,
+            Some(stream_accounting),
         ));
         Ok((
             [
@@ -97,15 +132,76 @@ pub async fn chat(
         let _guard = guard;
         // Non-streaming has no observable "first token": the whole upstream
         // call gets the window (per-phase refinement lands in M6).
-        let response =
+        let mut response =
             tokio::time::timeout(guards.first_token_timeout, route.provider.chat(req, cancel))
                 .await
                 .map_err(|_| GatewayError::UpstreamFirstTokenTimeout {
                     provider: provider_name.clone(),
                 })?
                 .map_err(|e| GatewayError::from_provider(&provider_name, e))?;
+        // (an early return above drops `accounting`, refunding the reservation)
+        settle_non_streaming(
+            accounting,
+            &state,
+            &client_model,
+            estimated_input,
+            &mut response,
+        );
         Ok(Json(response).into_response())
     }
+}
+
+/// Close the books on a non-streaming completion (ADR 003): upstream usage
+/// when reported, else local estimates — never a silent zero. The estimate is
+/// surfaced (flagged) in the response body too.
+fn settle_non_streaming(
+    accounting: Accounting,
+    state: &AppState,
+    client_model: &str,
+    estimated_input: u64,
+    response: &mut ferrogate_core::ChatResponse,
+) {
+    let reported = response
+        .usage
+        .filter(|u| u.prompt_tokens > 0 || u.completion_tokens > 0);
+    let (tokens_in, tokens_out, estimated) = if let Some(usage) = reported {
+        (
+            u64::from(usage.prompt_tokens),
+            u64::from(usage.completion_tokens),
+            false,
+        )
+    } else {
+        let output: u64 = response
+            .choices
+            .iter()
+            .map(|c| {
+                c.message
+                    .content
+                    .as_deref()
+                    .map_or(0, tokens::estimate_text)
+            })
+            .sum();
+        (estimated_input, output, true)
+    };
+    if estimated {
+        response.usage = Some(Usage {
+            prompt_tokens: u32::try_from(tokens_in).unwrap_or(u32::MAX),
+            completion_tokens: u32::try_from(tokens_out).unwrap_or(u32::MAX),
+            total_tokens: u32::try_from(tokens_in + tokens_out).unwrap_or(u32::MAX),
+            estimated: Some(true),
+        });
+    }
+    let cost = state
+        .pricing
+        .token_cost(client_model, tokens_in, tokens_out);
+    accounting.finish(&Outcome {
+        tokens_in,
+        tokens_out,
+        estimated,
+        search_units: None,
+        cost,
+        status: 200,
+    });
 }
 
 /// The `data: [DONE]` marker scanned for in forwarded frames. Anchored on a
@@ -148,12 +244,19 @@ struct EventStreamState {
     /// Trailing bytes of the previous frame, so a `[DONE]` marker split across
     /// two frames is still detected. At most `DONE_MARKER.len() - 1` bytes.
     tail: Vec<u8>,
+    /// Token/cost accounting riding along the stream (M5). `None` in unit
+    /// tests that only exercise the guards. Its `Drop` settles the books, so
+    /// a client disconnect can never leak a budget reservation.
+    accounting: Option<StreamAccounting>,
 }
 
 impl EventStreamState {
     /// Record a forwarded frame, detecting `data: [DONE]` even when the marker
     /// is split across frame boundaries.
     fn scan_frame(&mut self, frame: &[u8]) {
+        if let Some(accounting) = &mut self.accounting {
+            accounting.scan(frame);
+        }
         let mut window = std::mem::take(&mut self.tail);
         window.extend_from_slice(frame);
         if window.windows(DONE_MARKER.len()).any(|w| w == DONE_MARKER) {
@@ -161,6 +264,13 @@ impl EventStreamState {
         }
         let keep = window.len().min(DONE_MARKER.len() - 1);
         self.tail = window.split_off(window.len() - keep);
+    }
+
+    /// Close the accounting record (idempotent; Drop is the safety net).
+    fn settle_accounting(&mut self) {
+        if let Some(mut accounting) = self.accounting.take() {
+            accounting.finalize();
+        }
     }
 }
 
@@ -184,6 +294,7 @@ fn to_event_stream(
     guard: DropGuard,
     guards: StreamGuards,
     first_frame_deadline: tokio::time::Instant,
+    accounting: Option<StreamAccounting>,
 ) -> impl futures::Stream<Item = Result<Bytes, Infallible>> {
     let state = EventStreamState {
         inner: stream,
@@ -197,6 +308,7 @@ fn to_event_stream(
         // Seeded with a virtual line start so a `[DONE]` opening the very
         // first frame still matches the line-anchored marker.
         tail: vec![b'\n'],
+        accounting,
     };
 
     futures::stream::unfold(state, |mut s| async move {
@@ -235,10 +347,12 @@ fn to_event_stream(
             Step::Item(Some(Err(e))) => {
                 // Mid-stream provider error: terminal error frame, then done.
                 s.ended = true;
+                s.settle_accounting();
                 error_frame(&GatewayError::from_provider(&s.provider, e))
             }
             Step::Item(None) => {
                 s.ended = true;
+                s.settle_accounting();
                 if s.saw_done {
                     // Clean upstream termination — nothing left to add.
                     return None;
@@ -251,6 +365,7 @@ fn to_event_stream(
             Step::Ping => Bytes::from_static(b": ping\n\n"),
             Step::FirstTokenTimeout => {
                 s.ended = true;
+                s.settle_accounting();
                 error_frame(&GatewayError::UpstreamFirstTokenTimeout {
                     provider: s.provider.clone(),
                 })
@@ -283,7 +398,7 @@ mod tests {
         g: StreamGuards,
     ) -> impl futures::Stream<Item = Result<Bytes, Infallible>> {
         let deadline = tokio::time::Instant::now() + g.first_token_timeout;
-        to_event_stream(stream, "p".to_owned(), drop_guard(), g, deadline)
+        to_event_stream(stream, "p".to_owned(), drop_guard(), g, deadline, None)
     }
 
     fn frames(
