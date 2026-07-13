@@ -171,9 +171,11 @@ milestone.
   the config and atomically swap the provider registry (ArcSwap). Server bind
   address, `[auth]`, `[resilience]` and pricing are read once at boot; changing
   them still needs a restart. Extending the swap to those is a follow-up.
-- **Hot reload re-resolves provider keys from the environment only.** DB-stored
-  provider keys (`PUT /admin/provider-keys`) are still applied at boot, not on
-  reload (same limitation already noted for M5).
+- **Hot reload re-resolves env keys fresh; DB keys are a boot snapshot.** A
+  reload re-reads provider keys from the environment and re-applies the DB-key
+  snapshot captured at boot (so a reload never strips a stored key). *Rotating*
+  a DB-stored key (`PUT /admin/provider-keys`) after boot still needs a restart
+  to take effect — the snapshot is boot-time.
 - **Anthropic/Gemini translation fuzzing** goes only as deep as the shared SSE
   parser today. Fuzzing the `translate_request`/`translate_response`/stream
   translators directly needs a small public (or `#[cfg(fuzzing)]`) shim over the

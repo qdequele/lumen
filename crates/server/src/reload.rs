@@ -11,9 +11,16 @@
 //! Scope: the reload swaps the **routing table** (providers, models, aliases,
 //! fallbacks resolve against it). Server bind address, auth, pricing and the
 //! resilience runtime are read once at boot and are *not* hot-reloaded — those
-//! still require a restart (noted in `docs/backlog.md`). Provider API keys are
-//! re-resolved from the environment only; DB-stored keys remain boot-time.
+//! still require a restart (noted in `docs/backlog.md`).
+//!
+//! Provider API keys are re-resolved from the environment on every reload (env
+//! stays the primary source). Keys that were back-filled from the encrypted DB
+//! at boot are preserved across reloads via a snapshot captured at boot and
+//! merged in here — so a reload never silently drops a DB-stored key and sends
+//! unauthenticated upstream requests. Rotating a DB key still needs a restart
+//! (the snapshot is boot-time; noted in `docs/backlog.md`).
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -35,16 +42,22 @@ pub enum ReloadError {
 }
 
 /// Re-load `path`, validate it, and (only on success) atomically swap the
-/// registry's routing table. Increments the success/failure counters. On any
-/// error the registry is left exactly as it was.
+/// registry's routing table. `key_backfill` (provider name → key) re-applies
+/// keys that were resolved from the encrypted DB at boot for providers whose
+/// env var is unset — env still wins. Increments the success/failure counters.
+/// On any error the registry is left exactly as it was.
 ///
 /// # Errors
 /// [`ReloadError`] if the file is missing/invalid or the registry rebuild
 /// fails; the running config is unaffected in both cases.
+// The backfill map always comes from the boot stack's default-hasher map;
+// generalizing over the hasher would add noise for no caller benefit.
+#[allow(clippy::implicit_hasher)]
 pub fn apply_reload(
     path: &Path,
     registry: &Registry,
     metrics: &ReloadMetrics,
+    key_backfill: &HashMap<String, String>,
 ) -> Result<(), ReloadError> {
     // `Config::load` parses AND validates; a bad file never reaches `reload`.
     let config = match Config::load(path) {
@@ -55,10 +68,15 @@ pub fn apply_reload(
             return Err(error.into());
         }
     };
+    // `provider_specs` resolves keys from the environment; re-apply the boot
+    // DB-key snapshot for any provider still keyless, mirroring boot back-fill
+    // so a reload never strips a DB-stored key (env keeps precedence).
+    let mut specs = config.provider_specs();
+    merge_key_backfill(&mut specs, key_backfill);
     // The registry rebuild is the last line of defence (duplicate model ids
     // etc. are already caught by validation, but a keyless provider missing a
     // base_url would surface here). A failure leaves the old table in place.
-    if let Err(error) = registry.reload(config.provider_specs()) {
+    if let Err(error) = registry.reload(specs) {
         metrics.inc_failure();
         tracing::warn!(%error, "config reload rejected by registry; keeping the running config");
         return Err(error.into());
@@ -70,6 +88,22 @@ pub fn apply_reload(
         "configuration reloaded; routing table swapped"
     );
     Ok(())
+}
+
+/// Re-apply DB-boot-time provider keys to any spec still keyless after env
+/// resolution. Env keys win (a spec with a resolved env key is left untouched).
+#[allow(clippy::implicit_hasher)]
+fn merge_key_backfill(
+    specs: &mut [ferrogate_providers::ProviderSpec],
+    key_backfill: &HashMap<String, String>,
+) {
+    for spec in specs {
+        if spec.api_key.is_none() {
+            if let Some(key) = key_backfill.get(&spec.name) {
+                spec.api_key = Some(key.clone());
+            }
+        }
+    }
 }
 
 /// Debounce window: coalesce a burst of file-system events (editors often write
@@ -85,30 +119,42 @@ const DEBOUNCE: Duration = Duration::from_millis(250);
 /// the caller should log it and continue (hot reload via SIGHUP still works if
 /// the watcher fails — but here both share the watcher setup, so a failure
 /// disables both and is surfaced to the caller).
+#[allow(clippy::implicit_hasher)] // always the boot stack's default-hasher map
 pub fn spawn_config_reloader(
     path: PathBuf,
     registry: Arc<Registry>,
     metrics: ReloadMetrics,
+    key_backfill: HashMap<String, String>,
 ) -> Result<tokio::task::JoinHandle<()>, notify::Error> {
     use notify::{RecursiveMode, Watcher};
 
+    // Watch the parent directory (editors replace the file via rename, which a
+    // watch on the file itself would miss), but only react to events that touch
+    // the config file — a neighbour file (e.g. the SQLite DB) must not trigger
+    // a reload. Matching by file name avoids canonicalize races when the file
+    // is briefly absent mid-rename.
+    let config_name = path.file_name().map(std::ffi::OsStr::to_owned);
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-        if res.is_ok() {
-            // Non-blocking; a full/closed channel just drops the tick (the next
-            // event, or the debounce drain, still triggers a reload).
-            let _ = tx.send(());
+        if let Ok(event) = res {
+            let touches_config = event
+                .paths
+                .iter()
+                .any(|p| p.file_name() == config_name.as_deref());
+            if touches_config {
+                // Non-blocking; a full/closed channel just drops the tick (the
+                // next event, or the debounce drain, still triggers a reload).
+                let _ = tx.send(());
+            }
         }
     })?;
-    // Watch the parent directory: many editors replace the file (rename), which
-    // stops a watch on the file itself from firing. Fall back to the file when
-    // it has no parent component.
     let watch_target = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .map_or(path.as_path(), |p| p);
     watcher.watch(watch_target, RecursiveMode::NonRecursive)?;
 
+    let backfill = Arc::new(key_backfill);
     let handle = tokio::spawn(async move {
         // Keep the watcher alive for the lifetime of the task.
         let _watcher = watcher;
@@ -117,7 +163,7 @@ pub fn spawn_config_reloader(
             tokio::select! {
                 () = wait_for_hangup(&mut sighup) => {
                     tracing::info!("SIGHUP received; reloading config");
-                    let _ = apply_reload(&path, &registry, &metrics);
+                    reload_blocking(&path, &registry, &metrics, &backfill).await;
                 }
                 event = rx.recv() => {
                     if event.is_none() {
@@ -126,12 +172,33 @@ pub fn spawn_config_reloader(
                     // Coalesce the rest of the burst before reloading.
                     tokio::time::sleep(DEBOUNCE).await;
                     while rx.try_recv().is_ok() {}
-                    let _ = apply_reload(&path, &registry, &metrics);
+                    reload_blocking(&path, &registry, &metrics, &backfill).await;
                 }
             }
         }
     });
     Ok(handle)
+}
+
+/// Run [`apply_reload`] on a blocking thread (it does synchronous figment file
+/// I/O), so the runtime worker is never blocked (CLAUDE.md rule 2 in spirit).
+async fn reload_blocking(
+    path: &Path,
+    registry: &Arc<Registry>,
+    metrics: &ReloadMetrics,
+    backfill: &Arc<HashMap<String, String>>,
+) {
+    let path = path.to_path_buf();
+    let registry = Arc::clone(registry);
+    let metrics = metrics.clone();
+    let backfill = Arc::clone(backfill);
+    let joined = tokio::task::spawn_blocking(move || {
+        let _ = apply_reload(&path, &registry, &metrics, &backfill);
+    })
+    .await;
+    if let Err(error) = joined {
+        tracing::warn!(%error, "config reload task panicked");
+    }
 }
 
 #[cfg(unix)]
@@ -217,7 +284,7 @@ mod tests {
 
         let metrics = ReloadMetrics::register(&Metrics::new()).unwrap();
         write_config(&dir, TWO_MODELS);
-        apply_reload(&path, &registry, &metrics).expect("valid reload");
+        apply_reload(&path, &registry, &metrics, &HashMap::new()).expect("valid reload");
 
         // The new model is now routable — the swap took effect.
         assert!(registry.embedding_route("embed").is_some());
@@ -251,7 +318,7 @@ mod tests {
             capabilities = ["chat"]
             "#,
         );
-        let err = apply_reload(&path, &registry, &reload).unwrap_err();
+        let err = apply_reload(&path, &registry, &reload, &HashMap::new()).unwrap_err();
         assert!(matches!(err, ReloadError::Config(_)));
 
         // Old routing table intact: the pre-reload models still resolve.
@@ -272,7 +339,7 @@ mod tests {
         let reload = ReloadMetrics::register(&metrics).unwrap();
 
         std::fs::remove_file(&path).expect("remove config");
-        let err = apply_reload(&path, &registry, &reload).unwrap_err();
+        let err = apply_reload(&path, &registry, &reload, &HashMap::new()).unwrap_err();
         assert!(matches!(
             err,
             ReloadError::Config(ConfigError::NotFound { .. })
@@ -281,6 +348,40 @@ mod tests {
         assert!(metrics
             .encode_text()
             .contains("ferrogate_config_reload_failures_total 1"));
+    }
+
+    #[test]
+    fn key_backfill_fills_only_env_keyless_providers() {
+        use ferrogate_providers::{ProviderKind, ProviderSpec};
+        let mut specs = vec![
+            ProviderSpec {
+                name: "from-env".to_owned(),
+                kind: ProviderKind::Openai,
+                api_key: Some("env-key".to_owned()), // already resolved from env
+                base_url: None,
+                models: Vec::new(),
+            },
+            ProviderSpec {
+                name: "from-db".to_owned(),
+                kind: ProviderKind::Cohere,
+                api_key: None, // env var unset → would go out unauthenticated
+                base_url: None,
+                models: Vec::new(),
+            },
+        ];
+        let mut backfill = HashMap::new();
+        backfill.insert("from-db".to_owned(), "db-key".to_owned());
+        // A stale entry for the env-keyed provider must NOT override env.
+        backfill.insert("from-env".to_owned(), "should-not-win".to_owned());
+
+        merge_key_backfill(&mut specs, &backfill);
+
+        assert_eq!(specs[0].api_key.as_deref(), Some("env-key"), "env wins");
+        assert_eq!(
+            specs[1].api_key.as_deref(),
+            Some("db-key"),
+            "DB key re-applied so the reload doesn't strip it"
+        );
     }
 
     /// A unique temp dir under the OS temp root (no external crate).

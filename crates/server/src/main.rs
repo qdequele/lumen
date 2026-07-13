@@ -146,11 +146,12 @@ fn run(config: Config, config_path: PathBuf) -> anyhow::Result<()> {
         // periodic budget flush and retention purge. All optional — the
         // gateway stays a stateless open proxy when auth is disabled.
         let mut provider_specs = config.provider_specs();
-        let (auth_runtime, usage_logger, usage_writer) = if config.auth.enabled {
-            let (runtime, logger, writer) = boot_auth_stack(&config, &mut provider_specs).await?;
-            (Some(runtime), Some(logger), Some(writer))
+        let (auth_runtime, usage_logger, usage_writer, key_backfill) = if config.auth.enabled {
+            let (runtime, logger, writer, backfill) =
+                boot_auth_stack(&config, &mut provider_specs).await?;
+            (Some(runtime), Some(logger), Some(writer), backfill)
         } else {
-            (None, None, None)
+            (None, None, None, std::collections::HashMap::new())
         };
 
         // Connect timeout is client-wide (one pooled client); the overall cap
@@ -167,7 +168,12 @@ fn run(config: Config, config_path: PathBuf) -> anyhow::Result<()> {
         // Config hot reload (M7 §7.3): SIGHUP or a config-file change re-validates
         // and atomically swaps the routing table. A watcher-setup failure only
         // disables reload — the server still runs — so it is logged, not fatal.
-        match spawn_config_reloader(config_path, Arc::clone(&registry), reload_metrics) {
+        match spawn_config_reloader(
+            config_path,
+            Arc::clone(&registry),
+            reload_metrics,
+            key_backfill,
+        ) {
             Ok(_handle) => tracing::info!("config hot reload armed (SIGHUP + file watch)"),
             Err(error) => tracing::warn!(%error, "config hot reload unavailable"),
         }
@@ -270,6 +276,7 @@ async fn boot_auth_stack(
     Arc<AuthRuntime>,
     ferrogate_auth::usage::UsageLogger,
     tokio::task::JoinHandle<()>,
+    std::collections::HashMap<String, String>,
 )> {
     let master_value = std::env::var(MASTER_KEY_ENV).with_context(|| {
         format!("auth.enabled requires the {MASTER_KEY_ENV} env var (64 hex chars)")
@@ -282,7 +289,10 @@ async fn boot_auth_stack(
         .with_context(|| format!("failed to open auth database '{}'", config.auth.db_path))?;
 
     // Provider keys stored encrypted in the DB back-fill any provider whose
-    // env var is unset (env vars stay the primary source).
+    // env var is unset (env vars stay the primary source). The snapshot is
+    // handed to the hot-reload path so a reload re-applies these keys instead
+    // of stripping them (they are absent from the env-only spec rebuild).
+    let mut key_backfill = std::collections::HashMap::new();
     for spec in provider_specs.iter_mut() {
         if spec.api_key.is_none() {
             if let Some(key) = store
@@ -290,7 +300,8 @@ async fn boot_auth_stack(
                 .await
                 .with_context(|| format!("failed to decrypt stored provider key '{}'", spec.name))?
             {
-                spec.api_key = Some(key);
+                spec.api_key = Some(key.clone());
+                key_backfill.insert(spec.name.clone(), key);
             }
         }
     }
@@ -353,5 +364,5 @@ async fn boot_auth_stack(
         }
     });
 
-    Ok((runtime, logger, writer))
+    Ok((runtime, logger, writer, key_backfill))
 }
