@@ -15,8 +15,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use ferrogate_core::{ProviderError, RerankDocument, RerankProvider, RerankRequest};
-use ferrogate_providers::{rerank, CohereProvider, JinaProvider, TeiProvider, VoyageProvider};
+use lumen_core::{ProviderError, RerankDocument, RerankProvider, RerankRequest};
+use lumen_providers::{rerank, CohereProvider, JinaProvider, TeiProvider, VoyageProvider};
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 use wiremock::matchers::method;

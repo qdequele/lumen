@@ -1,4 +1,4 @@
-# Vision — pourquoi Ferrogate existe
+# Vision — pourquoi LUMEN existe
 
 ## Le problème
 Les gateways LLM existantes ont des défauts structurels documentés :

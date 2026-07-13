@@ -76,7 +76,7 @@ pub fn build_app(state: AppState, body_limit: usize) -> Router {
 
 /// Conservative default security headers for every response (M7 §7.4).
 ///
-/// Ferrogate is a JSON/SSE API, never a browser-rendered app, so the strictest
+/// LUMEN is a JSON/SSE API, never a browser-rendered app, so the strictest
 /// values are safe: deny framing and sniffing, send no referrer, and lock the
 /// CSP to `default-src 'none'`. HSTS is deliberately *not* set — it depends on
 /// the deployment terminating TLS, so it is left to the operator's proxy.

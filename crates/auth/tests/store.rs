@@ -7,9 +7,9 @@
 // columns — strict equality is the correct assertion here.
 #![allow(clippy::float_cmp)]
 
-use ferrogate_auth::crypto::MasterKey;
-use ferrogate_auth::key::hash_key;
-use ferrogate_auth::store::{KeyPatch, KeyStore, NewKey, UsageRecord};
+use lumen_auth::crypto::MasterKey;
+use lumen_auth::key::hash_key;
+use lumen_auth::store::{KeyPatch, KeyStore, NewKey, UsageRecord};
 
 fn new_key(name: &str) -> NewKey {
     NewKey {

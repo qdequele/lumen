@@ -6,14 +6,14 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Provider implementations (OpenAI, Anthropic, Cohere, Ollama, TEI, ...) for Ferrogate."
+description = "Provider implementations (OpenAI, Anthropic, Cohere, Ollama, TEI, ...) for LUMEN."
 
 [lib]
-name = "ferrogate_providers"
+name = "lumen_providers"
 path = "src/lib.rs"
 
 [dependencies]
-ferrogate-core = { workspace = true }
+lumen-core = { workspace = true }
 reqwest = { workspace = true }
 bytes = { workspace = true }
 serde = { workspace = true }

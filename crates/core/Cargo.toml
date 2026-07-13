@@ -6,10 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Shared types, capability traits and error taxonomy for Ferrogate."
+description = "Shared types, capability traits and error taxonomy for LUMEN."
 
 [lib]
-name = "ferrogate_core"
+name = "lumen_core"
 path = "src/lib.rs"
 
 [dependencies]

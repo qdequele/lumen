@@ -14,18 +14,18 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.80"
 license = "Apache-2.0"
-repository = "https://github.com/meilisearch/ferrogate"
-authors = ["Ferrogate contributors"]
+repository = "https://github.com/qdequele/lumen"
+authors = ["LUMEN contributors"]
 
 [workspace.dependencies]
 # Internal crates. Package names are bare (`core`, `server`, ...) so the
-# documented `cargo run -p server` commands work; the `ferrogate-*` keys keep
-# imports unambiguous (`use ferrogate_core::...`).
-ferrogate-core = { path = "crates/core", package = "core" }
-ferrogate-providers = { path = "crates/providers", package = "providers" }
-ferrogate-router = { path = "crates/router", package = "router" }
-ferrogate-auth = { path = "crates/auth", package = "auth" }
-ferrogate-telemetry = { path = "crates/telemetry", package = "telemetry" }
+# documented `cargo run -p server` commands work; the `lumen-*` keys keep
+# imports unambiguous (`use lumen_core::...`).
+lumen-core = { path = "crates/core", package = "core" }
+lumen-providers = { path = "crates/providers", package = "providers" }
+lumen-router = { path = "crates/router", package = "router" }
+lumen-auth = { path = "crates/auth", package = "auth" }
+lumen-telemetry = { path = "crates/telemetry", package = "telemetry" }
 
 # Async runtime & web
 tokio = { version = "1.40", features = ["rt-multi-thread", "macros", "signal", "sync", "time"] }

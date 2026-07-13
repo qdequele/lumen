@@ -4,7 +4,7 @@
 //! [`AuthState`] — a hash lookup, no database — and stores the live
 //! [`KeyEntry`] in request extensions for the handlers' budget/quota
 //! admission. Unknown, disabled and expired keys are indistinguishable to the
-//! caller (FG-4004, 401). When auth is disabled in config the middleware is a
+//! caller (LM-4004, 401). When auth is disabled in config the middleware is a
 //! no-op and the gateway stays open.
 
 use crate::state::AppState;
@@ -12,10 +12,10 @@ use axum::extract::{Request, State};
 use axum::http::header;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use ferrogate_auth::key::hash_key;
-use ferrogate_auth::state::{AuthState, KeyEntry};
-use ferrogate_auth::store::KeyStore;
-use ferrogate_core::GatewayError;
+use lumen_auth::key::hash_key;
+use lumen_auth::state::{AuthState, KeyEntry};
+use lumen_auth::store::KeyStore;
+use lumen_core::GatewayError;
 use std::sync::Arc;
 
 /// Everything the server keeps when auth is enabled.
@@ -25,12 +25,12 @@ pub struct AuthRuntime {
     /// The SQLite store (admin API, flushes, usage log) — never consulted on
     /// the request path.
     pub store: KeyStore,
-    /// BLAKE3 hash of the `FERROGATE_MASTER_KEY` value; the admin API
+    /// BLAKE3 hash of the `LUMEN_MASTER_KEY` value; the admin API
     /// compares hashes so the raw admin token is never retained as text.
     pub admin_token_hash: String,
     /// The parsed master key, for sealing provider keys at rest. `None` in
     /// test setups that exercise auth without encryption.
-    pub master: Option<ferrogate_auth::crypto::MasterKey>,
+    pub master: Option<lumen_auth::crypto::MasterKey>,
 }
 
 impl std::fmt::Debug for AuthRuntime {

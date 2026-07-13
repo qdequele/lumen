@@ -1,6 +1,6 @@
 //! End-to-end tests for M5: virtual-key auth, hard budgets, quotas, token
 //! accounting, cost counting, usage logging, metadata (ADR 002) and the
-//! admin API. The upstream is wiremock; Ferrogate sits in front with auth
+//! admin API. The upstream is wiremock; LUMEN sits in front with auth
 //! enabled and an in-memory SQLite store.
 
 mod common;
@@ -8,18 +8,18 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
-use ferrogate_auth::crypto::MasterKey;
-use ferrogate_auth::key::hash_key;
-use ferrogate_auth::state::AuthState;
-use ferrogate_auth::store::{KeyStore, NewKey};
-use ferrogate_auth::usage::{spawn_usage_writer, UsageWriterConfig};
-use ferrogate_core::Capability;
-use ferrogate_providers::{http, ModelSpec, ProviderKind, ProviderSpec, Registry};
-use ferrogate_server::auth::AuthRuntime;
-use ferrogate_server::config::Config;
-use ferrogate_server::pricing::CostTable;
-use ferrogate_server::AppState;
-use ferrogate_telemetry::{Metrics, TokenMetrics};
+use lumen_auth::crypto::MasterKey;
+use lumen_auth::key::hash_key;
+use lumen_auth::state::AuthState;
+use lumen_auth::store::{KeyStore, NewKey};
+use lumen_auth::usage::{spawn_usage_writer, UsageWriterConfig};
+use lumen_core::Capability;
+use lumen_providers::{http, ModelSpec, ProviderKind, ProviderSpec, Registry};
+use lumen_server::auth::AuthRuntime;
+use lumen_server::config::Config;
+use lumen_server::pricing::CostTable;
+use lumen_server::AppState;
+use lumen_telemetry::{Metrics, TokenMetrics};
 use figment::providers::{Format, Toml};
 use figment::Figment;
 use serde_json::{json, Value};
@@ -293,7 +293,7 @@ async fn missing_or_invalid_key_is_401_fg4004_before_upstream() {
         .expect("send");
     assert_eq!(resp.status(), 401);
     let body: Value = resp.json().await.expect("json");
-    assert_eq!(body["error"]["code"], "FG-4004");
+    assert_eq!(body["error"]["code"], "LM-4004");
 
     // A made-up key.
     let resp = h
@@ -350,7 +350,7 @@ async fn exhausted_budget_is_402_fg4001_with_zero_upstream_calls() {
         .expect("send");
     assert_eq!(resp.status(), 402);
     let body: Value = resp.json().await.expect("json");
-    assert_eq!(body["error"]["code"], "FG-4001");
+    assert_eq!(body["error"]["code"], "LM-4001");
 
     // wiremock received NOTHING (criterion 2).
     assert!(upstream.received_requests().await.expect("reqs").is_empty());
@@ -464,7 +464,7 @@ async fn rpm_quota_is_429_fg4002_with_retry_after() {
     assert_eq!(second.status(), 429);
     assert!(second.headers().contains_key("retry-after"));
     let body: Value = second.json().await.expect("json");
-    assert_eq!(body["error"]["code"], "FG-4002");
+    assert_eq!(body["error"]["code"], "LM-4002");
 }
 
 #[tokio::test]
@@ -497,7 +497,7 @@ async fn tpm_quota_is_429_fg4003() {
         .expect("send");
     assert_eq!(second.status(), 429);
     let body: Value = second.json().await.expect("json");
-    assert_eq!(body["error"]["code"], "FG-4003");
+    assert_eq!(body["error"]["code"], "LM-4003");
 }
 
 // ---- Usage logging (criteria 3 & 4) -----------------------------------------
@@ -535,7 +535,7 @@ async fn dead_usage_writer_never_blocks_requests_and_drops_are_counted() {
 
     let metrics = h.metrics_text().await;
     assert!(
-        metrics.contains("ferrogate_usage_log_dropped_total 70"),
+        metrics.contains("lumen_usage_log_dropped_total 70"),
         "every entry dropped AND counted, metrics:\n{metrics}"
     );
 }
@@ -594,7 +594,7 @@ async fn tei_embeddings_without_upstream_usage_are_estimated_never_zero() {
     assert!(metrics.contains(r#"estimated="true""#), "{metrics}");
     assert!(metrics.contains(r#"model="tei-embed""#));
     // The dedicated estimation counter moved too.
-    assert!(!metrics.contains("ferrogate_tokens_estimated_total 0"));
+    assert!(!metrics.contains("lumen_tokens_estimated_total 0"));
 
     h.wait_usage_rows(1).await;
     let dump = h.store.debug_dump().await.expect("dump");
@@ -625,12 +625,12 @@ async fn openai_embeddings_use_upstream_usage_unestimated() {
 
     let metrics = h.metrics_text().await;
     assert!(metrics.contains(r#"estimated="false""#), "{metrics}");
-    assert!(metrics.contains("ferrogate_tokens_estimated_total 0"));
+    assert!(metrics.contains("lumen_tokens_estimated_total 0"));
 }
 
 #[tokio::test]
 async fn every_capability_feeds_the_token_counters_with_its_own_labels() {
-    // Criterion 11: chat + embed + rerank each increment ferrogate_tokens_total
+    // Criterion 11: chat + embed + rerank each increment lumen_tokens_total
     // with the right capability/direction; rerank also counts search units.
     let upstream = MockServer::start().await;
     mount_openai_chat(&upstream).await;
@@ -684,7 +684,7 @@ async fn every_capability_feeds_the_token_counters_with_its_own_labels() {
         r#"capability="rerank""#,
         r#"direction="input""#,
         r#"direction="output""#,
-        "ferrogate_rerank_search_units_total",
+        "lumen_rerank_search_units_total",
         r#"model="rerank-fast""#,
     ] {
         assert!(metrics.contains(needle), "missing {needle} in:\n{metrics}");
@@ -756,7 +756,7 @@ async fn metadata_lands_in_usage_log_and_only_allowlisted_keys_become_labels() {
         .post(format!("{}/v1/embeddings", h.base))
         .bearer_auth(&key)
         .header(
-            "x-ferrogate-metadata",
+            "x-lumen-metadata",
             r#"{"team":"search","user_dim":"u-42"}"#,
         )
         .json(&embed_body())
@@ -791,7 +791,7 @@ async fn malformed_metadata_never_fails_the_request() {
         .client
         .post(format!("{}/v1/embeddings", h.base))
         .bearer_auth(&key)
-        .header("x-ferrogate-metadata", "definitely{not json")
+        .header("x-lumen-metadata", "definitely{not json")
         .json(&embed_body())
         .send()
         .await
@@ -800,7 +800,7 @@ async fn malformed_metadata_never_fails_the_request() {
 
     let metrics = h.metrics_text().await;
     assert!(
-        metrics.contains("ferrogate_metadata_rejected_total 1"),
+        metrics.contains("lumen_metadata_rejected_total 1"),
         "{metrics}"
     );
     // Nothing leaked into labels.

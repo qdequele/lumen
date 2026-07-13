@@ -5,7 +5,7 @@
 //! other non-2xx → fatal upstream error. Providers translate their own success
 //! bodies but share this failure classification.
 
-use ferrogate_core::ProviderError;
+use lumen_core::ProviderError;
 use std::time::Duration;
 
 /// Classify a non-success upstream status into a [`ProviderError`].

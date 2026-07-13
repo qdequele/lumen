@@ -14,7 +14,7 @@ Un binaire qui démarre, sert /health et /metrics, charge sa config, avec toute 
 - [x] Types requêtes/réponses : `ChatRequest/Response/Chunk`, `EmbedRequest/Response`, `RerankRequest/Response` (serde, champs du format OpenAI + Cohere rerank)
 - [x] Traits `ChatProvider`, `EmbeddingProvider`, `RerankProvider` (signatures du CLAUDE.md, avec `CancellationToken`)
 - [x] `ProviderError` (thiserror) : variantes `Upstream { provider, status, retryable }`, `Timeout`, `Cancelled`, `Translation`, `RateLimited { retry_after }`
-- [x] `GatewayError` avec code stable `FG-XXXX`, conversion vers réponse JSON : `{"error": {"code": "FG-1001", "message": "...", "type": "invalid_request|upstream_error|internal"}}`
+- [x] `GatewayError` avec code stable `LM-XXXX`, conversion vers réponse JSON : `{"error": {"code": "LM-1001", "message": "...", "type": "invalid_request|upstream_error|internal"}}`
 - [x] `Capability` enum : `Chat | Embed | Rerank`
 
 ### 1.3 crates/server
@@ -23,7 +23,7 @@ Un binaire qui démarre, sert /health et /metrics, charge sa config, avec toute 
 - [x] Middleware tower : request-id, tracing span par requête, limite de taille de body (configurable, défaut 10 Mo)
 
 ### 1.4 Config
-- [x] figment : `config.toml` + surcharge par env `FERROGATE_*`
+- [x] figment : `config.toml` + surcharge par env `LUMEN_*`
 - [x] Structs : `ServerConfig { host, port, body_limit }`, `ProviderConfig { name, kind, api_key_env, base_url, models: Vec<ModelConfig> }`, `ModelConfig { id, upstream_id, capabilities }`
 - [x] Les clés API sont référencées par NOM de variable d'env (`api_key_env = "OPENAI_API_KEY"`), jamais en clair dans le TOML
 - [x] Validation au boot : config invalide = exit(1) avec message précis (fichier, champ, raison)

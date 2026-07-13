@@ -6,23 +6,23 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Ferrogate HTTP server binary (axum, SSE, config, hot reload)."
-default-run = "ferrogate"
+description = "LUMEN HTTP server binary (axum, SSE, config, hot reload)."
+default-run = "lumen"
 
 [[bin]]
-name = "ferrogate"
+name = "lumen"
 path = "src/main.rs"
 
 [lib]
-name = "ferrogate_server"
+name = "lumen_server"
 path = "src/lib.rs"
 
 [dependencies]
-ferrogate-core = { workspace = true }
-ferrogate-telemetry = { workspace = true }
-ferrogate-providers = { workspace = true }
-ferrogate-router = { workspace = true }
-ferrogate-auth = { workspace = true }
+lumen-core = { workspace = true }
+lumen-telemetry = { workspace = true }
+lumen-providers = { workspace = true }
+lumen-router = { workspace = true }
+lumen-auth = { workspace = true }
 
 tokio = { workspace = true }
 tokio-util = { workspace = true }

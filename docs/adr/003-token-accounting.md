@@ -6,7 +6,7 @@
 
 ## Context
 
-Token counting is a headline reason to run Ferrogate: an operator fronting many
+Token counting is a headline reason to run LUMEN: an operator fronting many
 providers wants one trustworthy answer to "how many tokens did this cost,
 per model / key / team / capability?" — without trusting each upstream to
 report it and without leaking prompts to a third party to find out.
@@ -61,8 +61,8 @@ never a blocking BPE pass. Counting must **never fail or slow a request**.
 ### Three surfaces
 1. **Response body** — OpenAI-compatible `usage` (chat/embeddings) unchanged.
 2. **Prometheus** — cumulative counters, low fixed cardinality:
-   `ferrogate_tokens_total{capability, model, provider, direction, estimated}`
-   and `ferrogate_rerank_search_units_total{model, provider}`. Optional
+   `lumen_tokens_total{capability, model, provider, direction, estimated}`
+   and `lumen_rerank_search_units_total{model, provider}`. Optional
    metadata-allowlist labels come from ADR 002 (never client-unbounded).
 3. **`usage_log`** (M5) — per-request `tokens_in`, `tokens_out`,
    `search_units`, `estimated`, alongside cost and metadata for later slicing.

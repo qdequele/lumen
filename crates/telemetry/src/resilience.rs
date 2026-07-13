@@ -9,7 +9,7 @@
 use crate::metrics::Metrics;
 use prometheus::{IntGaugeVec, Opts};
 
-/// Circuit-breaker state, as exported on `ferrogate_circuit_state`.
+/// Circuit-breaker state, as exported on `lumen_circuit_state`.
 pub const CIRCUIT_CLOSED: i64 = 0;
 /// The breaker is open — calls are short-circuited.
 pub const CIRCUIT_OPEN: i64 = 1;
@@ -26,8 +26,8 @@ pub struct ResilienceMetrics {
 }
 
 impl ResilienceMetrics {
-    /// Register `ferrogate_circuit_state{provider,model}` and
-    /// `ferrogate_provider_up{provider}`.
+    /// Register `lumen_circuit_state{provider,model}` and
+    /// `lumen_provider_up{provider}`.
     ///
     /// # Errors
     ///
@@ -35,14 +35,14 @@ impl ResilienceMetrics {
     pub fn register(metrics: &Metrics) -> Result<Self, prometheus::Error> {
         let circuit_state = IntGaugeVec::new(
             Opts::new(
-                "ferrogate_circuit_state",
+                "lumen_circuit_state",
                 "Circuit-breaker state per (provider, model): 0 closed, 1 open, 2 half-open.",
             ),
             &["provider", "model"],
         )?;
         let provider_up = IntGaugeVec::new(
             Opts::new(
-                "ferrogate_provider_up",
+                "lumen_provider_up",
                 "Background health probe result per provider: 1 up, 0 down (absent = unknown).",
             ),
             &["provider"],
@@ -82,13 +82,13 @@ mod tests {
         let r = ResilienceMetrics::register(&metrics).unwrap();
         r.set_circuit_state("openai", "gpt-4o", CIRCUIT_OPEN);
         let out = metrics.encode_text();
-        assert!(out.contains("ferrogate_circuit_state"));
+        assert!(out.contains("lumen_circuit_state"));
         assert!(out.contains(r#"provider="openai""#));
         assert!(out.contains(r#"model="gpt-4o""#));
         // Gauge is last-write-wins.
         r.set_circuit_state("openai", "gpt-4o", CIRCUIT_CLOSED);
         let out = metrics.encode_text();
-        assert!(out.contains("ferrogate_circuit_state{model=\"gpt-4o\",provider=\"openai\"} 0"));
+        assert!(out.contains("lumen_circuit_state{model=\"gpt-4o\",provider=\"openai\"} 0"));
     }
 
     #[test]
@@ -98,7 +98,7 @@ mod tests {
         r.set_provider_up("tei", true);
         r.set_provider_up("ollama", false);
         let out = metrics.encode_text();
-        assert!(out.contains("ferrogate_provider_up{provider=\"tei\"} 1"));
-        assert!(out.contains("ferrogate_provider_up{provider=\"ollama\"} 0"));
+        assert!(out.contains("lumen_provider_up{provider=\"tei\"} 1"));
+        assert!(out.contains("lumen_provider_up{provider=\"ollama\"} 0"));
     }
 }

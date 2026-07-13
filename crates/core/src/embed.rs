@@ -86,7 +86,7 @@ pub struct EmbedData {
 ///
 /// When `encoding_format: "base64"` is requested, OpenAI returns each embedding
 /// as base64-encoded little-endian `f32` bytes. We decode it to a float vector
-/// so a base64 request never breaks parsing (Ferrogate always returns float
+/// so a base64 request never breaks parsing (LUMEN always returns float
 /// arrays to the client in v1).
 fn deserialize_embedding<'de, D>(deserializer: D) -> Result<Vec<f32>, D::Error>
 where

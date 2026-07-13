@@ -14,21 +14,21 @@ Retries, fallbacks, circuit breaker, timeouts — sans jamais compromettre la st
 ### 6.2 Fallback
 - [x] Config : `fallbacks = ["model-a", "model-b"]` par modèle — même capacité exigée, validée au boot
 - [x] Fallback déclenché après épuisement des retries du provider courant
-- [x] Header de réponse `x-ferrogate-model-used` + champ dans usage_log
+- [x] Header de réponse `x-lumen-model-used` + champ dans usage_log
 - [x] Même règle streaming : pas de fallback après le premier chunk émis
 
 ### 6.3 Circuit breaker
 - [x] Par (provider, modèle) : Closed → Open après N échecs consécutifs (défaut 5) → Half-Open après cooldown (défaut 30 s) → 1 requête sonde
-- [x] Circuit ouvert → skip immédiat vers le fallback ; si aucun fallback : 503 FG-3020 avec Retry-After
+- [x] Circuit ouvert → skip immédiat vers le fallback ; si aucun fallback : 503 LM-3020 avec Retry-After
 - [x] État exposé dans /metrics (`circuit_state{provider,model}`)
 
 ### 6.4 Timeouts
 - [x] Trois timeouts configurables par provider avec défauts globaux : `connect` (5 s), `first_token` (30 s), `total` (600 s)
-- [x] Chaque timeout → erreur distincte (FG-3011/3012/3013) pour le debugging
+- [x] Chaque timeout → erreur distincte (LM-3011/3012/3013) pour le debugging
 
 Note : `connect` est un réglage client global (un seul client HTTP mutualisé) —
 pas d'override par provider ; `first_token` et `total` sont overridables par
-provider. FG-3011 = first-token, FG-3012 = connect, FG-3013 = total. Voir
+provider. LM-3011 = first-token, LM-3012 = connect, LM-3013 = total. Voir
 `docs/adr/005-resilience-execution.md`.
 
 ### 6.5 Health checks de fond
@@ -37,7 +37,7 @@ provider. FG-3011 = first-token, FG-3012 = connect, FG-3013 = total. Voir
 
 ## Critères d'acceptation
 1. Test : amont 500 puis 500 puis 200 → succès, 3 appels wiremock, délais de backoff respectés (temps simulé start_paused).
-2. Test : provider A épuise ses retries → bascule sur B, réponse OK, header x-ferrogate-model-used = B.
+2. Test : provider A épuise ses retries → bascule sur B, réponse OK, header x-lumen-model-used = B.
 3. Test : 5 échecs → circuit Open → la 6e requête ne touche PAS l'amont (compteur wiremock) et fallback immédiatement ; après cooldown, 1 sonde passe.
 4. Test streaming : échec après 2 chunks émis → PAS de retry ni fallback, erreur SSE propre.
 5. Test de charge : 500 requêtes concurrentes vers un amont qui répond 429 → /health répond < 10 ms pendant toute la durée, RAM stable (pas de file d'attente non bornée).

@@ -7,7 +7,7 @@
 
 ### 2.1 Registry & router
 - [x] `crates/providers/src/registry.rs` : construit les instances de providers depuis la config, expose `get(capability, model_id) -> Option<Arc<dyn ...>>`
-- [x] `crates/router` : résout le modèle demandé → provider, renvoie FG-2001 (modèle inconnu) ou FG-2002 (modèle sans cette capacité) sinon
+- [x] `crates/router` : résout le modèle demandé → provider, renvoie LM-2001 (modèle inconnu) ou LM-2002 (modèle sans cette capacité) sinon
 - [x] Registry derrière `ArcSwap` (préparation du hot reload M7)
 
 ### 2.2 Provider OpenAI (embeddings)
@@ -31,9 +31,9 @@
 ## Critères d'acceptation
 1. Test wiremock : requête 5000 inputs, provider avec max_batch 2048 → exactement 3 appels amont, réponse avec 5000 embeddings dans l'ordre d'origine, usage sommé.
 2. Test cancellation : le client drop la connexion pendant l'appel amont → wiremock enregistre la requête amont comme interrompue / le token est annulé avant la fin (assert sur compteur + délai simulé avec start_paused).
-3. Test : modèle inconnu → 404 FG-2001 ; modèle chat-only demandé en embedding → 400 FG-2002.
-4. Test : amont répond 429 avec Retry-After → réponse 429 au client avec le header propagé et code FG-3001.
-5. Test : amont répond du JSON malformé → 502 FG-3002 (jamais 500, jamais de panic).
+3. Test : modèle inconnu → 404 LM-2001 ; modèle chat-only demandé en embedding → 400 LM-2002.
+4. Test : amont répond 429 avec Retry-After → réponse 429 au client avec le header propagé et code LM-3001.
+5. Test : amont répond du JSON malformé → 502 LM-3002 (jamais 500, jamais de panic).
 6. Ollama et OpenAI passent la MÊME suite de tests génériques (macro ou fonction générique de suite de conformité) — ce harnais servira à tous les providers suivants.
 
 ## Pattern à établir (réutilisé partout ensuite)

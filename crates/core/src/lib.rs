@@ -1,4 +1,4 @@
-//! Shared types, capability traits and error taxonomy for Ferrogate.
+//! Shared types, capability traits and error taxonomy for LUMEN.
 //!
 //! This crate is deliberately free of any web framework, HTTP client or
 //! database dependency: it defines the vocabulary the rest of the workspace

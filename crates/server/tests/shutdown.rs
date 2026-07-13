@@ -2,7 +2,7 @@
 //! signal fires, and the server must then return cleanly (process exit 0).
 
 use axum::{routing::get, Router};
-use ferrogate_server::serve;
+use lumen_server::serve;
 use std::time::Duration;
 use tokio::net::TcpListener;
 

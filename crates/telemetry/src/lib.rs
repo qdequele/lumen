@@ -1,4 +1,4 @@
-//! Prometheus metrics and structured logging for Ferrogate.
+//! Prometheus metrics and structured logging for LUMEN.
 //!
 //! Metrics live in a single [`prometheus::Registry`] wrapped by [`Metrics`].
 //! Token accounting (ADR 003) is registered via [`TokenMetrics`]. Logging is

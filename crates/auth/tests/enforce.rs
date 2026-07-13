@@ -3,10 +3,10 @@
 //! Everything here is memory-only — no database in sight — because that is
 //! the whole point: admission control never touches SQLite.
 
-use ferrogate_auth::key::hash_key;
-use ferrogate_auth::state::{usd_to_micro, AuthState};
-use ferrogate_auth::store::VirtualKeyRecord;
-use ferrogate_core::{GatewayError, QuotaKind};
+use lumen_auth::key::hash_key;
+use lumen_auth::state::{usd_to_micro, AuthState};
+use lumen_auth::store::VirtualKeyRecord;
+use lumen_core::{GatewayError, QuotaKind};
 use std::sync::{Arc, Barrier};
 
 const NOW: i64 = 1_800_000_000;

@@ -112,7 +112,7 @@ pub struct KeyStore {
 
 impl KeyStore {
     /// Open (creating if missing) the database at `url` — e.g.
-    /// `sqlite:///var/lib/ferrogate/ferrogate.db` — and apply embedded
+    /// `sqlite:///var/lib/lumen/lumen.db` — and apply embedded
     /// migrations.
     pub async fn connect(url: &str) -> Result<Self, AuthError> {
         let options = SqliteConnectOptions::from_str(url)?

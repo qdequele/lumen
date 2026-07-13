@@ -8,7 +8,7 @@ yanked = "deny"
 
 [licenses]
 version = 2
-# Permissive licenses only — Ferrogate ships as a single self-hostable binary,
+# Permissive licenses only — LUMEN ships as a single self-hostable binary,
 # so no copyleft that would impose obligations on operators.
 allow = [
     "MIT",

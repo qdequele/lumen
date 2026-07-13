@@ -6,10 +6,10 @@
 //! `finishReason` and cumulative `usageMetadata`. There is no explicit
 //! terminal event — the translator marks the stream done when it sees a
 //! `finishReason`, so an upstream that dies earlier leaves no terminator
-//! (FG-3010 downstream). Translation state is bounded: a first-chunk flag and
+//! (LM-3010 downstream). Translation state is bounded: a first-chunk flag and
 //! the ids only — content is never accumulated.
 
-use ferrogate_core::{ChatChunk, ChatChunkChoice, ChatDelta, ProviderError, Usage};
+use lumen_core::{ChatChunk, ChatChunkChoice, ChatDelta, ProviderError, Usage};
 use serde::Deserialize;
 
 use super::map_finish_reason;

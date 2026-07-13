@@ -1,12 +1,12 @@
-# Ferrogate example configuration.
+# LUMEN example configuration.
 #
 # Copy to `config.toml` and adjust. Every value can also be overridden with an
-# environment variable prefixed `FERROGATE_`, using `__` for nesting, e.g.:
-#   FERROGATE_SERVER__PORT=9090
-#   FERROGATE_LOG_FORMAT=json
+# environment variable prefixed `LUMEN_`, using `__` for nesting, e.g.:
+#   LUMEN_SERVER__PORT=9090
+#   LUMEN_LOG_FORMAT=json
 #
 # SECURITY: API keys are NEVER written here. Each provider references the *name*
-# of an environment variable that holds its key (`api_key_env`). Ferrogate reads
+# of an environment variable that holds its key (`api_key_env`). LUMEN reads
 # that variable at startup-time only when the provider is actually used.
 
 # Log format: "pretty" (human-readable, default) or "json" (production).
@@ -22,7 +22,7 @@ port = 8080               # must not be 0
 body_limit = 10485760     # max request body in bytes (10 MiB)
 
 # How long to wait for the upstream's first sign of life before failing with
-# FG-3011 (504). Streaming: time to the first SSE frame. Non-streaming: the
+# LM-3011 (504). Streaming: time to the first SSE frame. Non-streaming: the
 # whole upstream call (per-phase timeouts land later) — raise this if you run
 # long non-streaming generations.
 first_token_timeout_ms = 30000
@@ -35,18 +35,18 @@ sse_heartbeat_ms = 15000
 # Auth: virtual keys, hard budgets, quotas, usage log (M5). Disabled by
 # default — the gateway is then an open proxy with no database at all.
 #
-# When enabled, the FERROGATE_MASTER_KEY env var is REQUIRED (64 hex chars =
+# When enabled, the LUMEN_MASTER_KEY env var is REQUIRED (64 hex chars =
 # 32 bytes). It is both the bearer token of the /admin API and the AES-256-GCM
 # key sealing provider keys stored at rest. Never logged, never stored.
 #
 # Enforcement is in memory on the request path (the DB is never consulted per
 # request): budget checks are an atomic reservation of the pre-call estimate,
-# settled to the real usage after the call. Refusals: 402 FG-4001 (budget),
-# 429 FG-4002 (RPM), 429 FG-4003 (TPM) — always BEFORE the upstream call.
+# settled to the real usage after the call. Refusals: 402 LM-4001 (budget),
+# 429 LM-4002 (RPM), 429 LM-4003 (TPM) — always BEFORE the upstream call.
 # ---------------------------------------------------------------------------
 [auth]
 enabled = false
-db_path = "ferrogate.db"          # SQLite file, created if missing
+db_path = "lumen.db"          # SQLite file, created if missing
 flush_interval_ms = 10000         # memory→DB budget flush; a crash loses at
                                   # most this much ACCOUNTING, never allows an
                                   # overrun (enforcement is in memory)
@@ -58,7 +58,7 @@ retention_days = 30               # purge usage_log rows older than this
 # ---------------------------------------------------------------------------
 # Telemetry (ADR 002).
 #
-# Clients may send an `x-ferrogate-metadata` header (alias: `cf-aig-metadata`)
+# Clients may send an `x-lumen-metadata` header (alias: `cf-aig-metadata`)
 # with a FLAT JSON object (≤ 16 keys, key ≤ 64 B, value ≤ 256 B, header ≤ 4 KiB)
 # of string/number/bool values. The full object is attached to structured logs
 # and the usage_log `metadata` column. It is opaque — never inspected — but it
@@ -93,9 +93,9 @@ retry_max_ms = 5000               # ceiling on the exponential backoff term
 
 # Circuit breaker — per (provider, model). After N consecutive provider-fault
 # failures the circuit opens; while open the model is skipped straight to its
-# next fallback, or answered with 503 FG-3020 (+ Retry-After) when none remains.
+# next fallback, or answered with 503 LM-3020 (+ Retry-After) when none remains.
 # After the cooldown, a single half-open probe decides whether to close again.
-# State is exported as ferrogate_circuit_state{provider,model}
+# State is exported as lumen_circuit_state{provider,model}
 # (0 = closed, 1 = open, 2 = half-open).
 circuit_failure_threshold = 5     # consecutive failures that trip it open
 circuit_cooldown_ms = 30000       # time spent open before a half-open probe
@@ -105,7 +105,7 @@ circuit_cooldown_ms = 30000       # time spent open before a half-open probe
 # (server.first_token_timeout_ms); the total timeout is here. BOTH the
 # first-token and total timeouts can be overridden per provider (see the
 # ollama-local block below). Each timeout maps to a distinct 504 for debugging:
-# FG-3012 connect, FG-3011 first-token, FG-3013 total (the whole request —
+# LM-3012 connect, LM-3011 first-token, LM-3013 total (the whole request —
 # all retries and fallbacks together).
 connect_timeout_ms = 5000         # TCP + TLS connection establishment
 total_timeout_ms = 600000         # absolute per-request deadline (10 minutes)
@@ -113,7 +113,7 @@ total_timeout_ms = 600000         # absolute per-request deadline (10 minutes)
 # Background health checks (OFF by default). When enabled, a periodic task
 # probes every provider that has a configured `base_url` (self-hosted TEI /
 # Ollama, or any explicit override) and publishes the result at
-# GET /health/providers and on ferrogate_provider_up{provider}. Providers on a
+# GET /health/providers and on lumen_provider_up{provider}. Providers on a
 # built-in vendor URL report `unknown` (never probed — the gateway hardcodes no
 # vendor endpoints). The gateway's own /health stays independent of provider
 # health and does no I/O.
@@ -129,7 +129,7 @@ health_check_interval_ms = 30000  # probe cadence (must not be 0 when enabled)
 #
 # Each `[[providers.models]]` block exposes a model to clients:
 #   id            the id clients send (owned entirely by you)
-#   upstream_id   what Ferrogate sends upstream (defaults to `id`)
+#   upstream_id   what LUMEN sends upstream (defaults to `id`)
 #   capabilities  any of: "chat", "embed", "rerank"
 # Model ids must be unique across ALL providers (a collision aborts startup and
 # names both offending providers). Several ids MAY map to the same upstream_id.
@@ -153,7 +153,7 @@ cost_per_1m_output = 10.0
 # Fallback chain: if this provider exhausts its retries or its circuit is open,
 # try these models IN ORDER. Each must exist below and serve every capability
 # declared above (here "chat"), which is validated at boot. Whichever model
-# actually serves the request is reported in the x-ferrogate-model-used
+# actually serves the request is reported in the x-lumen-model-used
 # response header and the usage_log.model_used column.
 fallbacks = ["claude-3-5-sonnet"]
 

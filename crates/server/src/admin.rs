@@ -18,9 +18,9 @@ use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::Json;
-use ferrogate_auth::key::hash_key;
-use ferrogate_auth::store::{KeyPatch, NewKey, VirtualKeyRecord};
-use ferrogate_core::GatewayError;
+use lumen_auth::key::hash_key;
+use lumen_auth::store::{KeyPatch, NewKey, VirtualKeyRecord};
+use lumen_core::GatewayError;
 use serde::{Deserialize, Serialize};
 
 /// `POST /admin/keys` response: the record plus the one-time plaintext key.
@@ -34,7 +34,7 @@ pub struct CreatedKey {
 }
 
 /// Map an auth-layer failure to an opaque 500 — never a misleading 401.
-fn internal(error: &ferrogate_auth::AuthError) -> ApiError {
+fn internal(error: &lumen_auth::AuthError) -> ApiError {
     GatewayError::Internal(error.to_string()).into()
 }
 
@@ -81,8 +81,8 @@ pub async fn list_keys(
 }
 
 /// Patch a key: adjust budgets/limits, enable/disable. An unknown id is a
-/// 400 `FG-1001` naming the id — the public taxonomy reserves 404 for
-/// unknown *models* (`FG-2001`) and has no admin-resource code.
+/// 400 `LM-1001` naming the id — the public taxonomy reserves 404 for
+/// unknown *models* (`LM-2001`) and has no admin-resource code.
 pub async fn patch_key(
     State(state): State<AppState>,
     Path(id): Path<String>,

@@ -2,7 +2,7 @@
 //!
 //! The default mode for provider keys remains environment variables; storing
 //! them in the database is opt-in and always encrypted with a master key from
-//! `FERROGATE_MASTER_KEY` (64 hex chars = 32 bytes). The master key itself is
+//! `LUMEN_MASTER_KEY` (64 hex chars = 32 bytes). The master key itself is
 //! never persisted and never printed — `MasterKey`'s `Debug` is redacted.
 
 use crate::AuthError;
@@ -37,7 +37,7 @@ impl Drop for MasterKey {
 impl zeroize::ZeroizeOnDrop for MasterKey {}
 
 impl MasterKey {
-    /// Parse the `FERROGATE_MASTER_KEY` env value: exactly 64 hex characters.
+    /// Parse the `LUMEN_MASTER_KEY` env value: exactly 64 hex characters.
     pub fn from_env_value(value: &str) -> Result<Self, AuthError> {
         let trimmed = value.trim();
         if !trimmed.is_ascii() || trimmed.len() != 64 {

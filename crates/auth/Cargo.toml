@@ -6,14 +6,14 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Virtual keys, quotas and hard budgets for Ferrogate."
+description = "Virtual keys, quotas and hard budgets for LUMEN."
 
 [lib]
-name = "ferrogate_auth"
+name = "lumen_auth"
 path = "src/lib.rs"
 
 [dependencies]
-ferrogate-core = { workspace = true }
+lumen-core = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }

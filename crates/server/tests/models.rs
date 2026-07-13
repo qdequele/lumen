@@ -6,8 +6,8 @@ mod common;
 
 use std::sync::Arc;
 
-use ferrogate_core::Capability;
-use ferrogate_providers::{http, ModelSpec, ProviderKind, ProviderSpec, Registry};
+use lumen_core::Capability;
+use lumen_providers::{http, ModelSpec, ProviderKind, ProviderSpec, Registry};
 use serde_json::Value;
 
 fn registry() -> Arc<Registry> {

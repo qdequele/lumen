@@ -16,12 +16,12 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use criterion::{criterion_group, criterion_main, Criterion};
-use ferrogate_core::{
+use lumen_core::{
     ChatChoice, ChatMessage, ChatProvider, ChatRequest, ChatResponse, ProviderError, Usage,
 };
-use ferrogate_router::circuit::{BreakerConfig, CircuitBreakers};
-use ferrogate_router::executor::{execute, ExecConfig, Link};
-use ferrogate_router::retry::RetryPolicy;
+use lumen_router::circuit::{BreakerConfig, CircuitBreakers};
+use lumen_router::executor::{execute, ExecConfig, Link};
+use lumen_router::retry::RetryPolicy;
 use futures::stream::BoxStream;
 use tokio_util::sync::CancellationToken;
 
@@ -45,7 +45,7 @@ impl ChatProvider for InstantProvider {
         &self,
         _req: ChatRequest,
         _cancel: CancellationToken,
-    ) -> Result<BoxStream<'static, Result<ferrogate_core::ChatChunk, ProviderError>>, ProviderError>
+    ) -> Result<BoxStream<'static, Result<lumen_core::ChatChunk, ProviderError>>, ProviderError>
     {
         Ok(Box::pin(futures::stream::empty()))
     }

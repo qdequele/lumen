@@ -4,10 +4,10 @@
 //! subset of helpers, so unused-in-one-binary warnings are expected here.
 #![allow(dead_code)]
 
-use ferrogate_providers::{http, Registry};
-use ferrogate_server::resilience::ResilienceRuntime;
-use ferrogate_server::{build_app, serve, AppState, StreamGuards};
-use ferrogate_telemetry::{Metrics, TokenMetrics};
+use lumen_providers::{http, Registry};
+use lumen_server::resilience::ResilienceRuntime;
+use lumen_server::{build_app, serve, AppState, StreamGuards};
+use lumen_telemetry::{Metrics, TokenMetrics};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
@@ -25,14 +25,14 @@ pub async fn spawn_with(registry: Arc<Registry>, body_limit: usize) -> String {
 }
 
 /// Spawn the app with explicit stream guard timings (first-token timeout,
-/// heartbeat interval) — for the FG-3011 tests, which need a short window.
+/// heartbeat interval) — for the LM-3011 tests, which need a short window.
 pub async fn spawn_with_guards(
     registry: Arc<Registry>,
     body_limit: usize,
     guards: StreamGuards,
 ) -> String {
     // Align the executor's first-token timeout with the guard the test set, so
-    // the FG-3011 tests still exercise their short window (the executor now owns
+    // the LM-3011 tests still exercise their short window (the executor now owns
     // the first-token deadline, M6).
     let resilience =
         Arc::new(ResilienceRuntime::defaults().with_first_token(guards.first_token_timeout));

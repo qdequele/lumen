@@ -16,8 +16,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use ferrogate_core::{EmbedInput, EmbedRequest, EmbeddingProvider, ProviderError};
-use ferrogate_providers::{
+use lumen_core::{EmbedInput, EmbedRequest, EmbeddingProvider, ProviderError};
+use lumen_providers::{
     batch, CohereProvider, JinaProvider, MistralProvider, OllamaProvider, OpenAiProvider,
     TeiProvider, VoyageProvider,
 };

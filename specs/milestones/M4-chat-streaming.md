@@ -32,8 +32,8 @@
 2. Cancellation streaming : client coupe après 3 chunks → la connexion amont wiremock est fermée en < 100 ms (temps simulé).
 3. Traduction Anthropic round-trip : fixture de requête OpenAI avec tools → JSON Anthropic exact attendu (snapshot test avec insta) ; idem réponse.
 4. Streaming Anthropic : fixture d'événements SSE Anthropic (y compris tool_use) → séquence de chunks OpenAI attendue (snapshot).
-5. Amont ferme le stream sans [DONE] → le client reçoit un chunk d'erreur SSE `data: {"error": {"code": "FG-3010"...}}` puis fermeture propre, pas de hang.
-6. First-token timeout dépassé → 504 FG-3011 (non-streaming) ou erreur SSE (streaming).
+5. Amont ferme le stream sans [DONE] → le client reçoit un chunk d'erreur SSE `data: {"error": {"code": "LM-3010"...}}` puis fermeture propre, pas de hang.
+6. First-token timeout dépassé → 504 LM-3011 (non-streaming) ou erreur SSE (streaming).
 7. Comptage tokens (ADR 003) : streaming avec `include_usage` → tokens in/out du dernier chunk, `estimated=false` ; streaming SANS usage amont → tokens out comptés localement, `estimated=true`, réponse et log non nuls. Non-streaming → usage amont surface tel quel. *(Satisfait pour la moitié « usage amont » ; l'estimation locale `estimated=true` est vérifiée en M5 avec l'infra télémétrie.)*
 
 ## Pièges

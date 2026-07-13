@@ -11,8 +11,8 @@ use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
-use ferrogate_core::{tokens, GatewayError};
-use ferrogate_providers::batch;
+use lumen_core::{tokens, GatewayError};
+use lumen_providers::batch;
 use tokio_util::sync::CancellationToken;
 
 use crate::accounting::{Accounting, Outcome, Target};
@@ -26,9 +26,9 @@ pub async fn embeddings(
     State(state): State<AppState>,
     headers: HeaderMap,
     key: Option<Extension<AuthedKey>>,
-    payload: Result<Json<ferrogate_core::EmbedRequest>, JsonRejection>,
+    payload: Result<Json<lumen_core::EmbedRequest>, JsonRejection>,
 ) -> Result<Response, ApiError> {
-    // Malformed request body → FG-1001 in our standard envelope (not axum's
+    // Malformed request body → LM-1001 in our standard envelope (not axum's
     // default plain-text rejection).
     let Json(req) = payload.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
 
@@ -40,8 +40,8 @@ pub async fn embeddings(
     // fallbacks), each re-resolved for the embed capability (M6 §6.2).
     let client_model = req.model.clone();
     let chain_ids = state.resilience.chain_ids(&client_model);
-    let chain = ferrogate_router::resolve_embedding_chain(&state.registry, &chain_ids)?;
-    let links = ferrogate_router::embedding_links(&chain);
+    let chain = lumen_router::resolve_embedding_chain(&state.registry, &chain_ids)?;
+    let links = lumen_router::embedding_links(&chain);
     let exec = state.resilience.exec_config(&client_model);
 
     // Admission BEFORE the upstream call: the pre-call estimate is reserved
@@ -75,7 +75,7 @@ pub async fn embeddings(
     // Execute across the chain with retries, fallback, circuit breaking and the
     // per-model timeouts. A fresh request clone (per attempt/link) carries that
     // link's upstream id.
-    let executed = ferrogate_router::executor::execute(
+    let executed = lumen_router::executor::execute(
         &links,
         &state.resilience.breakers,
         &exec,

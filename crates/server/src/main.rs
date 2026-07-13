@@ -1,4 +1,4 @@
-//! Ferrogate server entry point.
+//! LUMEN server entry point.
 //!
 //! Thin orchestration only: parse args, load config, initialise logging, then
 //! hand off to the library. `anyhow` is used here (and only here).
@@ -9,12 +9,12 @@ use std::time::Duration;
 
 use anyhow::Context;
 use arc_swap::ArcSwap;
-use ferrogate_auth::crypto::MasterKey;
-use ferrogate_auth::key::hash_key;
-use ferrogate_auth::state::AuthState;
-use ferrogate_auth::store::KeyStore;
-use ferrogate_auth::usage::{spawn_usage_writer, UsageWriterConfig};
-use ferrogate_server::{
+use lumen_auth::crypto::MasterKey;
+use lumen_auth::key::hash_key;
+use lumen_auth::state::AuthState;
+use lumen_auth::store::KeyStore;
+use lumen_auth::usage::{spawn_usage_writer, UsageWriterConfig};
+use lumen_server::{
     auth::{now_unix, AuthRuntime},
     build_app,
     config::Config,
@@ -25,7 +25,7 @@ use ferrogate_server::{
     resilience::ResilienceRuntime,
     state::AppState,
 };
-use ferrogate_telemetry::{
+use lumen_telemetry::{
     logging::init_logging, Metrics, ReloadMetrics, ResilienceMetrics, TokenMetrics,
 };
 use std::sync::Arc;
@@ -34,16 +34,16 @@ use tokio::net::TcpListener;
 /// Env var holding the master key (64 hex chars): admin-API token and
 /// at-rest encryption key for stored provider keys. Required when
 /// `auth.enabled = true`. The value itself is never logged or stored.
-const MASTER_KEY_ENV: &str = "FERROGATE_MASTER_KEY";
+const MASTER_KEY_ENV: &str = "LUMEN_MASTER_KEY";
 
 /// How long to drain in-flight requests after a shutdown signal.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
 const HELP: &str = "\
-ferrogate — universal LLM gateway
+lumen — universal LLM gateway
 
 USAGE:
-    ferrogate [--config <PATH>]
+    lumen [--config <PATH>]
 
 OPTIONS:
     -c, --config <PATH>    Path to the TOML config file [default: config.toml]
@@ -127,7 +127,7 @@ fn run(config: Config, config_path: PathBuf) -> anyhow::Result<()> {
             .with_context(|| format!("failed to bind {addr}"))?;
         tracing::info!(%addr, "listening");
 
-        let guards = ferrogate_server::StreamGuards {
+        let guards = lumen_server::StreamGuards {
             first_token_timeout: Duration::from_millis(config.server.first_token_timeout_ms),
             heartbeat_interval: Duration::from_millis(config.server.sse_heartbeat_ms),
         };
@@ -157,12 +157,12 @@ fn run(config: Config, config_path: PathBuf) -> anyhow::Result<()> {
 
         // Connect timeout is client-wide (one pooled client); the overall cap
         // is a backstop above the executor's total timeout (M6 §6.4).
-        let client = ferrogate_providers::http::build_client_with(
+        let client = lumen_providers::http::build_client_with(
             Duration::from_millis(config.resilience.connect_timeout_ms),
             Duration::from_millis(config.resilience.total_timeout_ms.saturating_add(30_000)),
         );
         let registry = Arc::new(
-            ferrogate_providers::Registry::build(provider_specs, client.clone())
+            lumen_providers::Registry::build(provider_specs, client.clone())
                 .context("failed to build provider registry")?,
         );
 
@@ -280,10 +280,10 @@ fn boot_health(
 /// purge. Returns the runtime and the usage-log handle.
 async fn boot_auth_stack(
     config: &Config,
-    provider_specs: &mut [ferrogate_providers::ProviderSpec],
+    provider_specs: &mut [lumen_providers::ProviderSpec],
 ) -> anyhow::Result<(
     Arc<AuthRuntime>,
-    ferrogate_auth::usage::UsageLogger,
+    lumen_auth::usage::UsageLogger,
     tokio::task::JoinHandle<()>,
     std::collections::HashMap<String, String>,
 )> {

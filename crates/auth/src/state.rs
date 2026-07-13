@@ -17,7 +17,7 @@
 use crate::key::hash_key;
 use crate::store::VirtualKeyRecord;
 use dashmap::DashMap;
-use ferrogate_core::{GatewayError, QuotaKind};
+use lumen_core::{GatewayError, QuotaKind};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;

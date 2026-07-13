@@ -38,7 +38,7 @@ requested model followed by its configured fallbacks, each re-resolved for the
 *same* capability) and supplies a closure that performs the actual typed call
 for a given link. The chain the executor sees is metadata only
 (`provider_name`, `model_id`), which it uses to key the circuit breaker and to
-report the model that actually served (`x-ferrogate-model-used`).
+report the model that actually served (`x-lumen-model-used`).
 
 Fallback chains are validated **at boot**: every fallback id must exist and
 serve the same capability as the model it backs (spec 6.2). A runtime
@@ -73,7 +73,7 @@ across an `.await`) transitions Closed → Open (after N consecutive
 provider-fault failures) → Half-Open (after the cooldown) → one probe →
 Closed/Open. Concurrent requests that find the breaker Half-Open are refused the
 probe (treated as Open) so exactly one request probes. State is pushed to a
-Prometheus gauge `ferrogate_circuit_state{provider,model}` (0 closed / 1 open /
+Prometheus gauge `lumen_circuit_state{provider,model}` (0 closed / 1 open /
 2 half-open) on every transition — the telemetry crate exposes a numeric setter
 so `router` depends on `telemetry` with no cycle. The breaker map is a
 `DashMap`, entries created on first use; bounded by the (provider × model) count,
@@ -89,7 +89,7 @@ means five requests, not five retries within one.
 `execute_stream` retries and falls back around **opening** the upstream byte
 stream (send + status check, before any body). Once the stream opens (upstream
 returned 2xx and we commit to forwarding), the existing `to_event_stream` guards
-(ADR 004: FG-3010 missing terminator, FG-3011 first-token, heartbeat) own the
+(ADR 004: LM-3010 missing terminator, LM-3011 first-token, heartbeat) own the
 rest and never retry. This satisfies "retry only if no chunk emitted": an open
 failure means nothing was forwarded, a post-open failure becomes a clean SSE
 error frame. (A 2xx-then-immediate-error is deliberately treated as committed —
@@ -98,7 +98,7 @@ not retried — since the upstream accepted the request.)
 One consequence, recorded explicitly: the circuit breaker for a streaming call
 only ever sees the **open** phase. `on_success` fires as soon as the byte stream
 opens, so a provider that opens cleanly but then dies mid-stream every time
-(FG-3010, handled by the frame guards and never surfaced back to the breaker)
+(LM-3010, handled by the frame guards and never surfaced back to the breaker)
 will *not* trip its circuit. This is the accepted trade-off of the open-phase
 boundary; the frame guards still give the client a clean terminal error each
 time.
@@ -120,23 +120,23 @@ Three timeouts, global defaults with per-model overrides:
   only** (per-provider connect would require one client per provider and lose
   connection pooling; deferred, noted in docs). A connect timeout is now
   distinguished from a read timeout: `ProviderError::ConnectTimeout` →
-  `FG-3012` (504).
+  `LM-3012` (504).
 - **first_token** (default 30 s, per-model override) — reuses the M4 path;
-  `FG-3011` (504). For non-streaming it bounds the whole call; for streaming,
+  `LM-3011` (504). For non-streaming it bounds the whole call; for streaming,
   the time to the first frame.
 - **total** (default 600 s, per-model override) — an absolute deadline threaded
   through the executor bounding *all* retries and fallbacks together; exceeding
-  it yields `FG-3013` (504).
+  it yields `LM-3013` (504).
 
-Circuit open with no fallback left is `FG-3020` (503) carrying `Retry-After`
-(the cooldown remainder). `FG-3004` (no healthy upstream) already existed and is
+Circuit open with no fallback left is `LM-3020` (503) carrying `Retry-After`
+(the cooldown remainder). `LM-3004` (no healthy upstream) already existed and is
 kept for "all fallbacks exhausted".
 
 ### Health checks: optional, off the request path
 
 A background task (default **off**) probes each provider that has a configured
 `base_url` (self-hosted TEI/Ollama, or any explicit override) with a short GET,
-storing Up/Down + latency in memory and a `ferrogate_provider_up{provider}`
+storing Up/Down + latency in memory and a `lumen_provider_up{provider}`
 gauge. Providers relying on a built-in vendor URL report `unknown` — the gateway
 never hardcodes vendor endpoints. Results are exposed at **`/health/providers`**
 for observability; the gateway's own **`/health`** stays completely independent
@@ -152,6 +152,6 @@ of provider health (criterion 5) and does no I/O.
 - The circuit-breaker map and health results are process-wide in-memory state in
   `AppState`; nothing resilience-related touches SQLite on the request path.
 - `usage_log` gains a `model_used` column (migration 0002) so a fallback is
-  observable after the fact, mirroring the `x-ferrogate-model-used` header.
+  observable after the fact, mirroring the `x-lumen-model-used` header.
 - Per-provider connect timeouts and true first-frame-peek streaming retries are
   explicitly out of scope for M6 and recorded in `docs/backlog.md`.

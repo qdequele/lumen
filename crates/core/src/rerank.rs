@@ -7,7 +7,7 @@
 //! original document position, plus a `usage.search_units` count.
 //!
 //! Providers translate their own wire schema to/from these types; the gateway
-//! (see `ferrogate_providers::rerank`) guarantees ordering, `top_n` clamping and
+//! (see `lumen_providers::rerank`) guarantees ordering, `top_n` clamping and
 //! optional document echoing regardless of what the upstream does.
 
 use serde::{Deserialize, Serialize};

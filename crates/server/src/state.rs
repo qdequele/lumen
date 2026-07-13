@@ -5,9 +5,9 @@ use crate::health::ProviderHealth;
 use crate::pricing::CostTable;
 use crate::resilience::ResilienceRuntime;
 use arc_swap::ArcSwap;
-use ferrogate_auth::usage::UsageLogger;
-use ferrogate_providers::Registry;
-use ferrogate_telemetry::{Metrics, TokenMetrics};
+use lumen_auth::usage::UsageLogger;
+use lumen_providers::Registry;
+use lumen_telemetry::{Metrics, TokenMetrics};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,7 +18,7 @@ use std::time::Duration;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StreamGuards {
     /// How long to wait for the upstream's first sign of life before failing
-    /// with FG-3011 (504). Streaming: the first SSE frame; non-streaming: the
+    /// with LM-3011 (504). Streaming: the first SSE frame; non-streaming: the
     /// whole upstream call (indivisible until per-phase timeouts land in M6).
     pub first_token_timeout: Duration,
     /// Idle interval after which a `: ping` SSE comment keeps intermediaries

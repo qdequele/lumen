@@ -4,7 +4,7 @@
 //!
 //! * [`ProviderError`] — what a provider returns. Never contains secrets.
 //! * [`GatewayError`] — what the gateway returns to the client. Carries a
-//!   stable `FG-XXXX` code (documented in `docs/errors.md`), an HTTP status,
+//!   stable `LM-XXXX` code (documented in `docs/errors.md`), an HTTP status,
 //!   and a coarse [`ErrorType`].
 //!
 //! The taxonomy always distinguishes three situations (see `CLAUDE.md` rule 8):
@@ -38,14 +38,14 @@ pub enum ProviderError {
 
     /// The gateway could not establish a connection to the upstream within the
     /// connect timeout — the TCP/TLS handshake never completed. Distinct from a
-    /// read timeout so operators can tell a dead host from a slow one (FG-3012).
+    /// read timeout so operators can tell a dead host from a slow one (LM-3012).
     #[error("provider '{provider}' connection timed out")]
     ConnectTimeout { provider: String },
 
     /// The upstream produced no first sign of life (response headers, or the
     /// first SSE frame) within the first-token deadline (M6 §6.4). Imposed by
     /// the gateway, but modelled here so it flows through the retry/fallback
-    /// executor like any other retryable timeout; surfaces as FG-3011.
+    /// executor like any other retryable timeout; surfaces as LM-3011.
     #[error("provider '{provider}' produced no first token in time")]
     FirstTokenTimeout { provider: String },
 
@@ -116,7 +116,7 @@ impl ProviderError {
 }
 
 /// Which gateway-side per-key quota tripped (distinct stable codes: RPM is
-/// `FG-4002`, TPM is `FG-4003` — pinned by the M5 spec).
+/// `LM-4002`, TPM is `LM-4003` — pinned by the M5 spec).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuotaKind {
     /// Requests per minute.
@@ -149,7 +149,7 @@ pub enum ErrorType {
 /// An error the gateway returns to the client.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum GatewayError {
-    // ---- Request errors (FG-1xxx) -------------------------------------------
+    // ---- Request errors (LM-1xxx) -------------------------------------------
     /// Malformed or invalid request body / parameters.
     #[error("invalid request: {0}")]
     InvalidRequest(String),
@@ -158,7 +158,7 @@ pub enum GatewayError {
     #[error("payload too large (limit {limit} bytes)")]
     PayloadTooLarge { limit: usize },
 
-    // ---- Routing errors (FG-2xxx) -------------------------------------------
+    // ---- Routing errors (LM-2xxx) -------------------------------------------
     /// No model matched the requested id.
     #[error("model '{0}' not found")]
     ModelNotFound(String),
@@ -174,7 +174,7 @@ pub enum GatewayError {
     #[error("`documents` must not be empty")]
     EmptyDocuments,
 
-    // ---- Upstream errors (FG-3xxx) ------------------------------------------
+    // ---- Upstream errors (LM-3xxx) ------------------------------------------
     /// An upstream provider rate limited the request (HTTP 429).
     #[error("upstream provider '{provider}' rate limited the request")]
     UpstreamRateLimited {
@@ -227,7 +227,7 @@ pub enum GatewayError {
         retry_after: Option<Duration>,
     },
 
-    // ---- Auth / budget errors (FG-4xxx, codes pinned by the M5 spec) --------
+    // ---- Auth / budget errors (LM-4xxx, codes pinned by the M5 spec) --------
     /// The virtual key's hard budget is exhausted. Enforced *before* any
     /// upstream call, so a rejected request never leaks spend.
     #[error("budget exceeded for this key")]
@@ -246,43 +246,43 @@ pub enum GatewayError {
     #[error("authentication required")]
     Unauthorized,
 
-    // ---- Internal errors (FG-5xxx) ------------------------------------------
+    // ---- Internal errors (LM-5xxx) ------------------------------------------
     /// An internal gateway malfunction. The detail is logged, never returned.
     #[error("internal error: {0}")]
     Internal(String),
 }
 
 impl GatewayError {
-    /// The stable `FG-XXXX` code for this error. Documented in `docs/errors.md`.
+    /// The stable `LM-XXXX` code for this error. Documented in `docs/errors.md`.
     #[must_use]
     pub const fn code(&self) -> &'static str {
         match self {
-            GatewayError::InvalidRequest(_) => "FG-1001",
-            GatewayError::PayloadTooLarge { .. } => "FG-1002",
-            GatewayError::ModelNotFound(_) => "FG-2001",
-            GatewayError::UnsupportedCapability { .. } => "FG-2002",
-            GatewayError::EmptyDocuments => "FG-2010",
-            GatewayError::UpstreamRateLimited { .. } => "FG-3001",
-            GatewayError::UpstreamInvalidResponse { .. } => "FG-3002",
-            GatewayError::Upstream { .. } => "FG-3003",
-            GatewayError::UpstreamUnavailable { .. } => "FG-3004",
-            GatewayError::UpstreamTimeout { .. } => "FG-3005",
-            GatewayError::UpstreamStreamInterrupted { .. } => "FG-3010",
-            GatewayError::UpstreamFirstTokenTimeout { .. } => "FG-3011",
-            GatewayError::UpstreamConnectTimeout { .. } => "FG-3012",
-            GatewayError::UpstreamTotalTimeout { .. } => "FG-3013",
-            GatewayError::CircuitOpen { .. } => "FG-3020",
-            GatewayError::BudgetExceeded => "FG-4001",
+            GatewayError::InvalidRequest(_) => "LM-1001",
+            GatewayError::PayloadTooLarge { .. } => "LM-1002",
+            GatewayError::ModelNotFound(_) => "LM-2001",
+            GatewayError::UnsupportedCapability { .. } => "LM-2002",
+            GatewayError::EmptyDocuments => "LM-2010",
+            GatewayError::UpstreamRateLimited { .. } => "LM-3001",
+            GatewayError::UpstreamInvalidResponse { .. } => "LM-3002",
+            GatewayError::Upstream { .. } => "LM-3003",
+            GatewayError::UpstreamUnavailable { .. } => "LM-3004",
+            GatewayError::UpstreamTimeout { .. } => "LM-3005",
+            GatewayError::UpstreamStreamInterrupted { .. } => "LM-3010",
+            GatewayError::UpstreamFirstTokenTimeout { .. } => "LM-3011",
+            GatewayError::UpstreamConnectTimeout { .. } => "LM-3012",
+            GatewayError::UpstreamTotalTimeout { .. } => "LM-3013",
+            GatewayError::CircuitOpen { .. } => "LM-3020",
+            GatewayError::BudgetExceeded => "LM-4001",
             GatewayError::QuotaExceeded {
                 quota: QuotaKind::Rpm,
                 ..
-            } => "FG-4002",
+            } => "LM-4002",
             GatewayError::QuotaExceeded {
                 quota: QuotaKind::Tpm,
                 ..
-            } => "FG-4003",
-            GatewayError::Unauthorized => "FG-4004",
-            GatewayError::Internal(_) => "FG-5001",
+            } => "LM-4003",
+            GatewayError::Unauthorized => "LM-4004",
+            GatewayError::Internal(_) => "LM-5001",
         }
     }
 
@@ -406,7 +406,7 @@ impl GatewayError {
                 retry_after,
             },
             // A malformed / unparseable upstream response is the upstream's
-            // fault → 502 (FG-3002), never a gateway 500.
+            // fault → 502 (LM-3002), never a gateway 500.
             ProviderError::Translation(_) => GatewayError::UpstreamInvalidResponse {
                 provider: provider.to_owned(),
             },
@@ -442,7 +442,7 @@ pub struct ErrorEnvelope {
 /// The error object itself.
 #[derive(Debug, Clone, Serialize)]
 pub struct ErrorBody {
-    /// Stable `FG-XXXX` code.
+    /// Stable `LM-XXXX` code.
     pub code: &'static str,
     /// Human-readable, secret-free message.
     pub message: String,
@@ -456,33 +456,33 @@ mod tests {
 
     #[test]
     fn error_codes_are_stable() {
-        assert_eq!(GatewayError::InvalidRequest("x".into()).code(), "FG-1001");
-        assert_eq!(GatewayError::PayloadTooLarge { limit: 1 }.code(), "FG-1002");
+        assert_eq!(GatewayError::InvalidRequest("x".into()).code(), "LM-1001");
+        assert_eq!(GatewayError::PayloadTooLarge { limit: 1 }.code(), "LM-1002");
         // Routing errors (pinned by the M2 spec).
-        assert_eq!(GatewayError::ModelNotFound("x".into()).code(), "FG-2001");
+        assert_eq!(GatewayError::ModelNotFound("x".into()).code(), "LM-2001");
         assert_eq!(
             GatewayError::UnsupportedCapability {
                 model: "m".into(),
                 capability: Capability::Embed
             }
             .code(),
-            "FG-2002"
+            "LM-2002"
         );
-        // Upstream errors (FG-3001 / FG-3002 pinned by the M2 spec).
+        // Upstream errors (LM-3001 / LM-3002 pinned by the M2 spec).
         assert_eq!(
             GatewayError::UpstreamRateLimited {
                 provider: "openai".into(),
                 retry_after: None
             }
             .code(),
-            "FG-3001"
+            "LM-3001"
         );
         assert_eq!(
             GatewayError::UpstreamInvalidResponse {
                 provider: "openai".into()
             }
             .code(),
-            "FG-3002"
+            "LM-3002"
         );
         assert_eq!(
             GatewayError::Upstream {
@@ -490,34 +490,34 @@ mod tests {
                 status: 500
             }
             .code(),
-            "FG-3003"
+            "LM-3003"
         );
         // Empty rerank documents (pinned by the M3 spec).
-        assert_eq!(GatewayError::EmptyDocuments.code(), "FG-2010");
+        assert_eq!(GatewayError::EmptyDocuments.code(), "LM-2010");
         // Streaming upstream faults (M4).
         assert_eq!(
             GatewayError::UpstreamStreamInterrupted {
                 provider: "openai".into()
             }
             .code(),
-            "FG-3010"
+            "LM-3010"
         );
         assert_eq!(
             GatewayError::UpstreamFirstTokenTimeout {
                 provider: "openai".into()
             }
             .code(),
-            "FG-3011"
+            "LM-3011"
         );
         // Auth / budget codes (pinned by the M5 spec).
-        assert_eq!(GatewayError::BudgetExceeded.code(), "FG-4001");
+        assert_eq!(GatewayError::BudgetExceeded.code(), "LM-4001");
         assert_eq!(
             GatewayError::QuotaExceeded {
                 quota: QuotaKind::Rpm,
                 retry_after: None
             }
             .code(),
-            "FG-4002"
+            "LM-4002"
         );
         assert_eq!(
             GatewayError::QuotaExceeded {
@@ -525,24 +525,24 @@ mod tests {
                 retry_after: None
             }
             .code(),
-            "FG-4003"
+            "LM-4003"
         );
-        assert_eq!(GatewayError::Unauthorized.code(), "FG-4004");
-        assert_eq!(GatewayError::Internal("boom".into()).code(), "FG-5001");
+        assert_eq!(GatewayError::Unauthorized.code(), "LM-4004");
+        assert_eq!(GatewayError::Internal("boom".into()).code(), "LM-5001");
         // Resilience codes (M6).
         assert_eq!(
             GatewayError::UpstreamConnectTimeout {
                 provider: "openai".into()
             }
             .code(),
-            "FG-3012"
+            "LM-3012"
         );
         assert_eq!(
             GatewayError::UpstreamTotalTimeout {
                 provider: "openai".into()
             }
             .code(),
-            "FG-3013"
+            "LM-3013"
         );
         assert_eq!(
             GatewayError::CircuitOpen {
@@ -550,7 +550,7 @@ mod tests {
                 retry_after: None
             }
             .code(),
-            "FG-3020"
+            "LM-3020"
         );
     }
 
@@ -586,7 +586,7 @@ mod tests {
                 provider: String::new(),
             },
         );
-        assert_eq!(ge.code(), "FG-3012");
+        assert_eq!(ge.code(), "LM-3012");
         assert_eq!(ge.http_status(), 504);
         match ge {
             GatewayError::UpstreamConnectTimeout { provider } => assert_eq!(&provider, "openai"),
@@ -687,7 +687,7 @@ mod tests {
     fn envelope_json_matches_public_schema() {
         let err = GatewayError::ModelNotFound("gpt-9".into());
         let json = serde_json::to_value(err.to_envelope()).unwrap();
-        assert_eq!(json["error"]["code"], "FG-2001");
+        assert_eq!(json["error"]["code"], "LM-2001");
         assert_eq!(json["error"]["type"], "invalid_request");
         assert_eq!(json["error"]["message"], "model 'gpt-9' not found");
     }
@@ -744,7 +744,7 @@ mod tests {
             "openai",
             ProviderError::Translation("unexpected end of JSON".into()),
         );
-        assert_eq!(ge.code(), "FG-3002");
+        assert_eq!(ge.code(), "LM-3002");
         assert_eq!(ge.http_status(), 502);
         assert_ne!(ge.http_status(), 500);
         assert_eq!(ge.error_type(), ErrorType::UpstreamError);

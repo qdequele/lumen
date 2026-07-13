@@ -11,7 +11,7 @@
 //! placed behind an authenticating proxy. A `base_url` is always required.
 
 use async_trait::async_trait;
-use ferrogate_core::{
+use lumen_core::{
     EmbedData, EmbedRequest, EmbedResponse, EmbedUsage, EmbeddingProvider, ProviderError,
     RerankProvider, RerankRequest, RerankResponse, RerankResult, RerankUsage,
 };
@@ -144,7 +144,7 @@ impl RerankProvider for TeiProvider {
         let texts: Vec<&str> = req
             .documents
             .iter()
-            .map(ferrogate_core::RerankDocument::text)
+            .map(lumen_core::RerankDocument::text)
             .collect();
         // TEI has no `top_n`; the gateway truncates after sorting (see
         // `crate::rerank`).

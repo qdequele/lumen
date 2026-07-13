@@ -11,8 +11,8 @@ use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
-use ferrogate_core::{tokens, GatewayError};
-use ferrogate_providers::rerank;
+use lumen_core::{tokens, GatewayError};
+use lumen_providers::rerank;
 use tokio_util::sync::CancellationToken;
 
 use crate::accounting::{Accounting, Outcome, Target};
@@ -30,12 +30,12 @@ pub async fn rerank_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
     key: Option<Extension<AuthedKey>>,
-    payload: Result<Json<ferrogate_core::RerankRequest>, JsonRejection>,
+    payload: Result<Json<lumen_core::RerankRequest>, JsonRejection>,
 ) -> Result<Response, ApiError> {
-    // Malformed body → FG-1001 in our envelope (not axum's plain-text default).
+    // Malformed body → LM-1001 in our envelope (not axum's plain-text default).
     let Json(req) = payload.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
 
-    // Empty documents is a distinct, pinned client error (FG-2010).
+    // Empty documents is a distinct, pinned client error (LM-2010).
     if req.documents.is_empty() {
         return Err(GatewayError::EmptyDocuments.into());
     }
@@ -43,8 +43,8 @@ pub async fn rerank_handler(
     // Resolve the requested model to a fallback chain (M6 §6.2).
     let client_model = req.model.clone();
     let chain_ids = state.resilience.chain_ids(&client_model);
-    let chain = ferrogate_router::resolve_rerank_chain(&state.registry, &chain_ids)?;
-    let links = ferrogate_router::rerank_links(&chain);
+    let chain = lumen_router::resolve_rerank_chain(&state.registry, &chain_ids)?;
+    let links = lumen_router::rerank_links(&chain);
     let exec = state.resilience.exec_config(&client_model);
 
     // Admission BEFORE the upstream call (M5 §5.2). Rerank cost is billed in
@@ -72,7 +72,7 @@ pub async fn rerank_handler(
     let cancel = CancellationToken::new();
     let _guard = cancel.clone().drop_guard();
 
-    let executed = ferrogate_router::executor::execute(
+    let executed = lumen_router::executor::execute(
         &links,
         &state.resilience.breakers,
         &exec,

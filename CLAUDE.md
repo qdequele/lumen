@@ -1,4 +1,4 @@
-# Ferrogate — LLM Gateway universelle en Rust
+# LUMEN — LLM Gateway universelle en Rust
 
 ## Mission
 Gateway self-hostable, légère et rapide pour **tous les types de modèles** : chat/LLM, embeddings, reranking. Alternative à LiteLLM (trop lourd, Python, 1.7-4x d'overhead) et OpenRouter (SaaS, pas self-hostable, télémétrie).
@@ -71,7 +71,7 @@ Un provider implémente 1 à N traits. Le router route par (capacité, modèle).
 4. **OBLIGATOIRE** : le logging des requêtes passe par un channel mpsc borné → writer batché async. JAMAIS d'écriture DB synchrone dans le chemin de requête (leçon LiteLLM issue #12067).
 5. **OBLIGATOIRE** : les secrets providers ne sont JAMAIS loggés, jamais dans les erreurs retournées au client, jamais en Debug (`#[derive]` custom ou `secrecy` crate).
 6. Clippy pedantic activé : `cargo clippy --workspace --all-targets -- -D warnings` doit passer.
-7. Chaque module public a un doc comment. Chaque erreur a un code stable (`FG-1001` etc.) documenté dans `docs/errors.md`.
+7. Chaque module public a un doc comment. Chaque erreur a un code stable (`LM-1001` etc.) documenté dans `docs/errors.md`.
 8. Les erreurs distinguent TOUJOURS : erreur client (4xx) / erreur provider amont (502/503 + nom du provider) / erreur gateway interne (500). Jamais de 401 trompeur pendant une panne interne (leçon OpenRouter).
 
 ## Boucle de travail (à suivre à chaque session)

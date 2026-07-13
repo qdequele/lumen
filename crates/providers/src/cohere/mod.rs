@@ -12,7 +12,7 @@
 //! echoing, so the rerank translation only carries indices, scores and usage.
 
 use async_trait::async_trait;
-use ferrogate_core::{
+use lumen_core::{
     EmbedData, EmbedRequest, EmbedResponse, EmbedUsage, EmbeddingProvider, ProviderError,
     RerankProvider, RerankRequest, RerankResponse, RerankResult, RerankUsage,
 };
@@ -202,7 +202,7 @@ impl RerankProvider for CohereProvider {
         let documents: Vec<&str> = req
             .documents
             .iter()
-            .map(ferrogate_core::RerankDocument::text)
+            .map(lumen_core::RerankDocument::text)
             .collect();
         let body = CohereRerankRequest {
             model: &req.model,

@@ -1,14 +1,14 @@
 # M3 — Reranking + découverte de modèles
 
 ## Objectif
-Le rerank (format Cohere) et `/v1/models` avec capacités. Ferrogate devient la seule gateway où chat/embed/rerank sont égaux.
+Le rerank (format Cohere) et `/v1/models` avec capacités. LUMEN devient la seule gateway où chat/embed/rerank sont égaux.
 
 ## Tâches
 
 ### 3.1 Endpoint rerank
 - [x] `POST /v1/rerank` : body `{ model, query, documents: [string|{text}], top_n?, return_documents? }`
 - [x] Réponse : `{ results: [{index, relevance_score, document?}], usage: {search_units} }`
-- [x] Validation : documents vide → 400 FG-2010 ; top_n > len(documents) → clamp silencieux
+- [x] Validation : documents vide → 400 LM-2010 ; top_n > len(documents) → clamp silencieux
 
 ### 3.2 Providers
 - [x] Cohere : `EmbeddingProvider` + `RerankProvider` (API v2)

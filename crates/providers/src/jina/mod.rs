@@ -6,7 +6,7 @@
 //! `usage.search_units` is reported as `0` (the value does not apply).
 
 use async_trait::async_trait;
-use ferrogate_core::{
+use lumen_core::{
     EmbedRequest, EmbedResponse, EmbeddingProvider, ProviderError, RerankProvider, RerankRequest,
     RerankResponse, RerankResult, RerankUsage,
 };
@@ -125,7 +125,7 @@ impl RerankProvider for JinaProvider {
         let documents: Vec<&str> = req
             .documents
             .iter()
-            .map(ferrogate_core::RerankDocument::text)
+            .map(lumen_core::RerankDocument::text)
             .collect();
         let body = JinaRerankRequest {
             model: &req.model,

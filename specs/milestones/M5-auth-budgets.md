@@ -9,11 +9,11 @@ Clés virtuelles avec budgets DURS enforced dans le chemin de requête — le ga
 - [x] sqlx + SQLite, migrations embarquées (`sqlx::migrate!`)
 - [x] Tables : `virtual_keys(id, key_hash, name, budget_max, budget_spent, rpm_limit, tpm_limit, expires_at, disabled)`, `usage_log(id, key_id, model, capability, tokens_in, tokens_out, search_units, cost, latency_ms, status, ts)` — PAS de colonne prompt/response
 - [x] Clés virtuelles : `fg-` + 32 bytes random ; stockage argon2/blake3 du hash, jamais le clair
-- [x] Clés providers optionnellement en DB, chiffrées AES-256-GCM (master key via env `FERROGATE_MASTER_KEY`) ; le mode par défaut reste les env vars
+- [x] Clés providers optionnellement en DB, chiffrées AES-256-GCM (master key via env `LUMEN_MASTER_KEY`) ; le mode par défaut reste les env vars
 
 ### 5.2 Enforcement dans le request path — SANS toucher la DB
 - [x] État des clés (budget restant, compteurs RPM/TPM) chargé en mémoire au boot dans un `DashMap`/`ArcSwap`
-- [x] Vérification budget/quota = lecture mémoire + CAS atomique. Requête refusée AVANT l'appel amont : 402 FG-4001 (budget épuisé), 429 FG-4002 (RPM), 429 FG-4003 (TPM)
+- [x] Vérification budget/quota = lecture mémoire + CAS atomique. Requête refusée AVANT l'appel amont : 402 LM-4001 (budget épuisé), 429 LM-4002 (RPM), 429 LM-4003 (TPM)
 - [x] Débit du budget : estimation pré-appel (max_tokens) réservée atomiquement, ajustée post-appel avec l'usage réel — pas de course possible entre requêtes concurrentes
 - [x] Persistance : flush périodique (défaut 10 s) des compteurs mémoire → DB. Crash = perte de max 10 s de comptage, jamais de dépassement de budget non détecté à la requête suivante
 
@@ -27,7 +27,7 @@ Clés virtuelles avec budgets DURS enforced dans le chemin de requête — le ga
 - [x] Source prioritaire : usage rapporté par l'amont (`estimated = false`) ; sinon fallback estimation (`estimated = true`)
 - [x] Fallback : heuristique légère (byte/char) par défaut, tokenizer précis optionnel par modèle (config) exécuté via `spawn_blocking` — JAMAIS de tokenizer lourd sur le chemin de requête (pilier 1) *(heuristique implémentée ; le tokenizer précis opt-in part en backlog — dépendance lourde, voir `docs/backlog.md` § M5 — l'invariant « jamais de tokenizer lourd inline » tient par construction)*
 - [x] TEI (aucun usage amont) → tokens estimés, jamais zéro silencieux
-- [x] Compteurs Prometheus à cardinalité fixe : `ferrogate_tokens_total{capability,model,provider,direction,estimated}`, `ferrogate_rerank_search_units_total{model,provider}`, `tokens_estimated_total`
+- [x] Compteurs Prometheus à cardinalité fixe : `lumen_tokens_total{capability,model,provider,direction,estimated}`, `lumen_rerank_search_units_total{model,provider}`, `tokens_estimated_total`
 - [x] Le comptage ne bloque ni ne fait échouer JAMAIS une requête ; l'estimation précise se fait hors du hot path (dans le writer async)
 
 ### 5.4b Comptage des coûts (consommateur des tokens ci-dessus)
@@ -40,7 +40,7 @@ Clés virtuelles avec budgets DURS enforced dans le chemin de requête — le ga
 - [x] La réponse de création est la SEULE fois où la clé claire est visible
 
 ### 5.6 Métadonnées de requête (style Cloudflare AI Gateway) — voir ADR 002
-- [x] Header `x-ferrogate-metadata` (+ alias `cf-aig-metadata`) : objet JSON PLAT `clé → (string|number|bool)`, parsé une fois au bord dans les extensions de requête (zéro alloc si absent)
+- [x] Header `x-lumen-metadata` (+ alias `cf-aig-metadata`) : objet JSON PLAT `clé → (string|number|bool)`, parsé une fois au bord dans les extensions de requête (zéro alloc si absent)
 - [x] Bornes : ≤ 16 clés, clé ≤ 64 o, valeur ≤ 256 o, header ≤ 4 Kio
 - [x] Sink logs : la métadonnée complète est attachée aux champs du log structuré ET stockée dans une colonne `metadata` de `usage_log` (filtrage à la Cloudflare)
 - [x] Sink Prometheus : SEULES les clés de l'allowlist config (`telemetry.metadata_labels`, défaut vide) deviennent des labels ; les autres restent logs-only (cardinalité bornée par l'opérateur, jamais par le client)
@@ -66,9 +66,9 @@ Clés virtuelles avec budgets DURS enforced dans le chemin de requête — le ga
 4. Test : channel de logs saturé → requêtes non bloquées, compteur dropped incrémenté.
 5. Test : la clé virtuelle claire n'apparaît ni en DB ni dans les logs (grep sur logs capturés + dump DB).
 6. Test : redémarrage → budgets rechargés depuis la DB, une clé épuisée reste épuisée.
-7. Test : `x-ferrogate-metadata` valide → apparaît dans le log d'usage ; seules les clés de l'allowlist deviennent des labels Prometheus ; une clé hors allowlist n'ajoute AUCune série temporelle.
+7. Test : `x-lumen-metadata` valide → apparaît dans le log d'usage ; seules les clés de l'allowlist deviennent des labels Prometheus ; une clé hors allowlist n'ajoute AUCune série temporelle.
 8. Test : métadonnée malformée ou > bornes → requête réussit quand même, `metadata_rejected_total` incrémenté, rien dans les labels.
-9. Test : embeddings via TEI (amont sans usage) → le log ET `ferrogate_tokens_total` rapportent un compte > 0 avec `estimated="true"` ; jamais zéro.
+9. Test : embeddings via TEI (amont sans usage) → le log ET `lumen_tokens_total` rapportent un compte > 0 avec `estimated="true"` ; jamais zéro.
 10. Test : embeddings via OpenAI (amont avec usage) → compte = valeur amont, `estimated="false"`.
-11. Test : chaque capacité (chat/embed/rerank) incrémente `ferrogate_tokens_total` avec le bon `capability`/`direction` ; rerank incrémente aussi `ferrogate_rerank_search_units_total`.
+11. Test : chaque capacité (chat/embed/rerank) incrémente `lumen_tokens_total` avec le bon `capability`/`direction` ; rerank incrémente aussi `lumen_rerank_search_units_total`.
 12. Test : latence p99 du chemin de requête inchangée quand l'estimation par tokenizer est activée (l'estimation reste hors hot path).

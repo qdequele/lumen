@@ -1,6 +1,6 @@
 # Performance baseline (M7 §7.1)
 
-Ferrogate's first pillar is **performance**: < 1 ms added p99 off-network,
+LUMEN's first pillar is **performance**: < 1 ms added p99 off-network,
 ~15 MB idle RAM, streaming that doesn't re-serialize. This document records how
 those promises are measured, the numbers obtained, and how to reproduce every
 figure. Where a target is not fully measured in a given environment, the gap is
@@ -17,7 +17,7 @@ Two layers, because "added latency" has two very different scales:
    measure of "latence ajoutée hors réseau": it excludes the upstream and the
    network entirely. Criterion, warmed, reports median with a 95 % CI.
 
-2. **End-to-end head-to-head (`bench/`, docker-compose + k6)** — Ferrogate and
+2. **End-to-end head-to-head (`bench/`, docker-compose + k6)** — LUMEN and
    LiteLLM both proxying the *same* zero-latency mock upstream, driven by k6.
    Added latency = gateway percentile − direct-to-mock percentile. This is the
    number a user feels; it includes one extra localhost hop. Provided as a
@@ -80,12 +80,12 @@ comparison.
 cargo bench -p server --bench gateway_overhead
 
 # Idle RAM + binary size:
-cargo build --release -p server --bin ferrogate
-./target/release/ferrogate --config config.example.toml &   # then: ps -o rss= -p <pid>
+cargo build --release -p server --bin lumen
+./target/release/lumen --config config.example.toml &   # then: ps -o rss= -p <pid>
 
 # Full head-to-head vs LiteLLM (Docker + k6): see bench/README.md
 docker compose -f bench/compose.yaml up -d --build
-OPENAI_API_KEY=sk-mock TARGET=http://localhost:8080 k6 run bench/k6-added-latency.js  # ferrogate
+OPENAI_API_KEY=sk-mock TARGET=http://localhost:8080 k6 run bench/k6-added-latency.js  # lumen
 OPENAI_API_KEY=sk-mock TARGET=http://localhost:4000 k6 run bench/k6-added-latency.js  # litellm
 OPENAI_API_KEY=sk-mock TARGET=http://localhost:1080 k6 run bench/k6-added-latency.js  # direct baseline
 docker stats --no-stream

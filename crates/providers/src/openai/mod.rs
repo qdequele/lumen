@@ -6,7 +6,7 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use ferrogate_core::{
+use lumen_core::{
     ChatChunk, ChatProvider, ChatRequest, ChatResponse, EmbedRequest, EmbedResponse,
     EmbeddingProvider, ProviderError,
 };

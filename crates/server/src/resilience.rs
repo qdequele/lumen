@@ -2,7 +2,7 @@
 //! the resolved retry policy, timeouts and fallback chains derived from config.
 //!
 //! This is the glue between [`Config`](crate::config::Config) and the router's
-//! [`executor`](ferrogate_router::executor): the handlers ask it for a model's
+//! [`executor`](lumen_router::executor): the handlers ask it for a model's
 //! fallback chain ([`chain_ids`](ResilienceRuntime::chain_ids)) and the
 //! per-model execution knobs ([`exec_config`](ResilienceRuntime::exec_config)).
 //! All state is in-memory; nothing here touches a database.
@@ -12,15 +12,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::http::{HeaderMap, HeaderName, HeaderValue};
-use ferrogate_router::circuit::{BreakerConfig, CircuitBreakers};
-use ferrogate_router::executor::ExecConfig;
-use ferrogate_router::retry::RetryPolicy;
-use ferrogate_telemetry::ResilienceMetrics;
+use lumen_router::circuit::{BreakerConfig, CircuitBreakers};
+use lumen_router::executor::ExecConfig;
+use lumen_router::retry::RetryPolicy;
+use lumen_telemetry::ResilienceMetrics;
 
 use crate::config::Config;
 
-/// The `x-ferrogate-model-used` response header name (M6 §6.2).
-const MODEL_USED_HEADER: &str = "x-ferrogate-model-used";
+/// The `x-lumen-model-used` response header name (M6 §6.2).
+const MODEL_USED_HEADER: &str = "x-lumen-model-used";
 
 /// A one-header [`HeaderMap`] advertising the model that actually served the
 /// request. Skips the header rather than failing if the id is not a valid
@@ -38,9 +38,9 @@ pub fn model_used_headers(model_used: &str) -> HeaderMap {
 /// client-wide setting, applied when the HTTP client is built).
 #[derive(Debug, Clone, Copy)]
 pub struct Timeouts {
-    /// Time to the upstream's first sign of life (FG-3011).
+    /// Time to the upstream's first sign of life (LM-3011).
     pub first_token: Duration,
-    /// Overall cap on the whole call, all retries + fallbacks (FG-3013).
+    /// Overall cap on the whole call, all retries + fallbacks (LM-3013).
     pub total: Duration,
 }
 

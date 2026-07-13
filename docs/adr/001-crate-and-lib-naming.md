@@ -1,4 +1,4 @@
-# ADR 001 — Bare package names, `ferrogate_*` library names
+# ADR 001 — Bare package names, `lumen_*` library names
 
 - Status: accepted
 - Date: 2026-07-12
@@ -22,25 +22,25 @@ macros) fail to resolve — observed concretely as `E0433: cannot find 'fmt' in
 
 Keep **package** names bare (`core`, `providers`, `router`, `auth`,
 `telemetry`, `server`) so the documented `-p <name>` commands work, but give
-each library crate an explicit **lib** name prefixed `ferrogate_`:
+each library crate an explicit **lib** name prefixed `lumen_`:
 
 ```toml
 [package]
 name = "core"
 
 [lib]
-name = "ferrogate_core"
+name = "lumen_core"
 path = "src/lib.rs"
 ```
 
 Internal dependencies are wired in `[workspace.dependencies]` with the
-`ferrogate-*` key mapped to the bare package via `package`:
+`lumen-*` key mapped to the bare package via `package`:
 
 ```toml
-ferrogate-core = { path = "crates/core", package = "core" }
+lumen-core = { path = "crates/core", package = "core" }
 ```
 
-So: `cargo run -p server` works, imports read `use ferrogate_core::…`, and no
+So: `cargo run -p server` works, imports read `use lumen_core::…`, and no
 crate shadows a std crate.
 
 ## Consequences

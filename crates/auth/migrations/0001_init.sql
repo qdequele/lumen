@@ -1,6 +1,6 @@
 -- M5 §5.1 — virtual keys, usage log, encrypted provider keys.
 --
--- Deliberately NO prompt/response columns anywhere: Ferrogate never persists
+-- Deliberately NO prompt/response columns anywhere: LUMEN never persists
 -- request or response content (sovereignty pillar).
 
 CREATE TABLE virtual_keys (

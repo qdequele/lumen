@@ -13,11 +13,11 @@ use crate::metadata::{MetadataOutcome, RequestMetadata};
 use crate::pricing::CostTable;
 use crate::state::AppState;
 use axum::http::HeaderMap;
-use ferrogate_auth::state::{usd_to_micro, Reservation};
-use ferrogate_auth::store::UsageRecord;
-use ferrogate_auth::usage::UsageLogger;
-use ferrogate_core::GatewayError;
-use ferrogate_telemetry::tokens::{Direction, TokenMetrics, TokenSample};
+use lumen_auth::state::{usd_to_micro, Reservation};
+use lumen_auth::store::UsageRecord;
+use lumen_auth::usage::UsageLogger;
+use lumen_core::GatewayError;
+use lumen_telemetry::tokens::{Direction, TokenMetrics, TokenSample};
 use serde_json::Value;
 use std::sync::Arc;
 use std::time::Instant;
@@ -158,7 +158,7 @@ impl Accounting {
         // ADR 002 sink 1, log half: the full metadata rides the structured
         // usage event (labels only — never prompt or response content).
         tracing::debug!(
-            target: "ferrogate::usage",
+            target: "lumen::usage",
             capability = self.capability,
             model = %self.model,
             model_used = %self.model_used,

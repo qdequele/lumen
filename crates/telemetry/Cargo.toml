@@ -6,10 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Prometheus metrics registry and structured logging setup for Ferrogate."
+description = "Prometheus metrics registry and structured logging setup for LUMEN."
 
 [lib]
-name = "ferrogate_telemetry"
+name = "lumen_telemetry"
 path = "src/lib.rs"
 
 [dependencies]

@@ -1,4 +1,4 @@
-//! Authentication, virtual keys, quotas and hard budgets for Ferrogate.
+//! Authentication, virtual keys, quotas and hard budgets for LUMEN.
 //!
 //! Budget enforcement happens *inside* the request path, before any upstream
 //! call, so an exhausted budget can never leak spend to a provider — but the

@@ -14,7 +14,7 @@
 
 use std::cmp::Ordering;
 
-use ferrogate_core::{
+use lumen_core::{
     ProviderError, RerankProvider, RerankRequest, RerankResponse, RerankResultDocument,
 };
 use tokio_util::sync::CancellationToken;
@@ -78,7 +78,7 @@ pub async fn rerank(
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use ferrogate_core::{RerankResult, RerankUsage};
+    use lumen_core::{RerankResult, RerankUsage};
 
     /// A provider that returns the given results verbatim, recording the
     /// `top_n` of each call so the clamp can be asserted.
@@ -128,7 +128,7 @@ mod tests {
             query: "q".to_owned(),
             documents: docs
                 .iter()
-                .map(|s| ferrogate_core::RerankDocument::Text((*s).to_owned()))
+                .map(|s| lumen_core::RerankDocument::Text((*s).to_owned()))
                 .collect(),
             top_n,
             return_documents,

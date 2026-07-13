@@ -1,4 +1,4 @@
-//! Ferrogate server library: config, HTTP app assembly and lifecycle.
+//! LUMEN server library: config, HTTP app assembly and lifecycle.
 //!
 //! The binary in `main.rs` is a thin wrapper around this crate so the app can
 //! be driven directly from integration tests.
@@ -29,18 +29,18 @@ pub use config::{Config, ConfigError};
 pub use lifecycle::{serve, shutdown_signal};
 pub use state::{AppState, StreamGuards};
 
-use ferrogate_providers::Registry;
+use lumen_providers::Registry;
 use std::sync::Arc;
 
 /// Build the provider registry from config, sharing one HTTP client.
 ///
 /// # Errors
-/// Returns a [`RegistryError`](ferrogate_providers::RegistryError) if a provider
+/// Returns a [`RegistryError`](lumen_providers::RegistryError) if a provider
 /// spec is invalid (e.g. a keyless provider missing its required `base_url`).
 pub fn build_registry(
     config: &Config,
-) -> Result<Arc<Registry>, ferrogate_providers::RegistryError> {
-    let client = ferrogate_providers::http::build_client();
+) -> Result<Arc<Registry>, lumen_providers::RegistryError> {
+    let client = lumen_providers::http::build_client();
     let registry = Registry::build(config.provider_specs(), client)?;
     Ok(Arc::new(registry))
 }
@@ -54,7 +54,7 @@ pub fn log_startup(config: &Config) {
     tracing::info!(
         model_count = models.len(),
         provider_count = config.providers.len(),
-        "ferrogate starting"
+        "lumen starting"
     );
     for model in &models {
         let capabilities: Vec<&str> = model.capabilities.iter().map(|c| c.as_str()).collect();
@@ -106,7 +106,7 @@ mod tests {
 
     fn config_with_key_env() -> Config {
         // Loaded via the crate's own loader so this exercises the real path.
-        // NOTE: the env var name deliberately has no `FERROGATE_` prefix, so it
+        // NOTE: the env var name deliberately has no `LUMEN_` prefix, so it
         // is never picked up as a config override by the figment `Env` source.
         let toml = r#"
             [[providers]]

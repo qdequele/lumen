@@ -1,7 +1,7 @@
-//! Provider implementations for Ferrogate.
+//! Provider implementations for LUMEN.
 //!
 //! Each provider lives in its own module and implements one or more of the
-//! capability traits from [`ferrogate_core`]. The [`registry`] builds concrete
+//! capability traits from [`lumen_core`]. The [`registry`] builds concrete
 //! instances from config-derived specs and resolves `(capability, model)` to a
 //! provider; [`batch`] splits oversized embedding requests across sub-batches.
 //!

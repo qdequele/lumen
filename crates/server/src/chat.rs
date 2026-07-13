@@ -14,10 +14,10 @@
 //! The streaming body is wrapped in three guards (see [`to_event_stream`]):
 //!
 //! * **first-token timeout** — no first frame within the configured window →
-//!   FG-3011 error frame (or a plain 504 when the upstream never even answered
+//!   LM-3011 error frame (or a plain 504 when the upstream never even answered
 //!   the request);
 //! * **missing terminator** — the upstream ends the stream without ever sending
-//!   `data: [DONE]` → FG-3010 error frame (the terminator only ever comes from
+//!   `data: [DONE]` → LM-3010 error frame (the terminator only ever comes from
 //!   the provider byte stream: verbatim upstream for passthrough, translated
 //!   terminal event otherwise — the server never fabricates it);
 //! * **heartbeat** — a `: ping` SSE comment on idle streams so intermediaries
@@ -32,7 +32,7 @@ use axum::http::{header, HeaderMap};
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
 use bytes::Bytes;
-use ferrogate_core::{tokens, ChatRequest, GatewayError, ProviderError, Usage};
+use lumen_core::{tokens, ChatRequest, GatewayError, ProviderError, Usage};
 use futures::stream::{BoxStream, StreamExt};
 use tokio_util::sync::{CancellationToken, DropGuard};
 
@@ -56,7 +56,7 @@ pub async fn chat(
     key: Option<Extension<AuthedKey>>,
     payload: Result<Json<ChatRequest>, JsonRejection>,
 ) -> Result<Response, ApiError> {
-    // Malformed body → FG-1001 in our envelope (not axum's plain-text default).
+    // Malformed body → LM-1001 in our envelope (not axum's plain-text default).
     let Json(req) = payload.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
 
     if req.messages.is_empty() {
@@ -66,8 +66,8 @@ pub async fn chat(
     // Resolve the requested model to a fallback chain (M6 §6.2).
     let client_model = req.model.clone();
     let chain_ids = state.resilience.chain_ids(&client_model);
-    let chain = ferrogate_router::resolve_chat_chain(&state.registry, &chain_ids)?;
-    let links = ferrogate_router::chat_links(&chain);
+    let chain = lumen_router::resolve_chat_chain(&state.registry, &chain_ids)?;
+    let links = lumen_router::chat_links(&chain);
     let exec = state.resilience.exec_config(&client_model);
 
     // Admission BEFORE the upstream call (M5 §5.2): reserve the pre-call
@@ -118,9 +118,9 @@ pub async fn chat(
 /// under the argument-count lint.
 struct ChatExec<'a> {
     state: &'a AppState,
-    chain: &'a [ferrogate_router::ChatChainLink],
-    links: &'a [ferrogate_router::executor::Link],
-    exec: ferrogate_router::executor::ExecConfig,
+    chain: &'a [lumen_router::ChatChainLink],
+    links: &'a [lumen_router::executor::Link],
+    exec: lumen_router::executor::ExecConfig,
     cancel: &'a CancellationToken,
     req: &'a ChatRequest,
     estimated_input: u64,
@@ -136,7 +136,7 @@ async fn chat_streaming(
     guard: DropGuard,
     mut accounting: Accounting,
 ) -> Result<Response, ApiError> {
-    let executed = ferrogate_router::executor::execute(
+    let executed = lumen_router::executor::execute(
         ctx.links,
         &ctx.state.resilience.breakers,
         &ctx.exec,
@@ -159,7 +159,7 @@ async fn chat_streaming(
 
     // A fresh first-frame deadline now that the stream is open (the open phase
     // already had its own first-token budget). The M4 frame guards
-    // (FG-3010/3011, heartbeat) own the stream from here — no more retries.
+    // (LM-3010/3011, heartbeat) own the stream from here — no more retries.
     let deadline = tokio::time::Instant::now() + ctx.exec.first_token;
     let stream_accounting = StreamAccounting::new(accounting, ctx.estimated_input);
     let body = Body::from_stream(to_event_stream(
@@ -189,7 +189,7 @@ async fn chat_non_streaming(
 ) -> Result<Response, ApiError> {
     // Held across the await so a disconnect during the call cancels it.
     let _guard = guard;
-    let executed = ferrogate_router::executor::execute(
+    let executed = lumen_router::executor::execute(
         ctx.links,
         &ctx.state.resilience.breakers,
         &ctx.exec,
@@ -226,7 +226,7 @@ fn settle_non_streaming(
     accounting: Accounting,
     client_model: &str,
     estimated_input: u64,
-    response: &mut ferrogate_core::ChatResponse,
+    response: &mut lumen_core::ChatResponse,
 ) {
     let reported = response
         .usage
@@ -306,7 +306,7 @@ struct EventStreamState {
     got_first_frame: bool,
     /// Whether a terminal `data: [DONE]` was seen in the forwarded bytes.
     saw_done: bool,
-    /// Set after a terminal frame (error / FG-3010 / FG-3011): stream is over.
+    /// Set after a terminal frame (error / LM-3010 / LM-3011): stream is over.
     ended: bool,
     /// Trailing bytes of the previous frame, so a `[DONE]` marker split across
     /// two frames is still detected. At most `DONE_MARKER.len() - 1` bytes.
@@ -352,7 +352,7 @@ impl EventStreamState {
 /// by the translator on a genuine upstream terminal event — ADR 004), so the
 /// server does not re-frame and never fabricates the terminator. On top of
 /// verbatim forwarding this wrapper adds the three guards described in the
-/// module docs (FG-3011 first-token timeout, FG-3010 missing terminator,
+/// module docs (LM-3011 first-token timeout, LM-3010 missing terminator,
 /// `: ping` heartbeat). A mid-stream provider error becomes a terminal SSE
 /// error frame carrying the standard JSON envelope.
 ///
@@ -515,7 +515,7 @@ mod tests {
         ))
         .await;
         assert_eq!(out.len(), 2);
-        assert!(out[1].contains("FG-3010"), "got: {}", out[1]);
+        assert!(out[1].contains("LM-3010"), "got: {}", out[1]);
         assert!(out[1].contains("upstream_error"));
     }
 
@@ -529,16 +529,16 @@ mod tests {
             guards(30_000, 15_000),
         ))
         .await;
-        // No FG-3010: the split terminator was recognised.
+        // No LM-3010: the split terminator was recognised.
         assert_eq!(out.len(), 2);
-        assert!(!out.iter().any(|f| f.contains("FG-3010")));
+        assert!(!out.iter().any(|f| f.contains("LM-3010")));
     }
 
     #[tokio::test]
     async fn done_marker_inside_model_content_does_not_suppress_fg_3010() {
         // The MODEL's own text contains "data: [DONE]" (inside a JSON string,
         // mid-line). Only a line-anchored terminator counts: when the upstream
-        // then dies without a real [DONE], FG-3010 must still fire.
+        // then dies without a real [DONE], LM-3010 must still fire.
         let out = collect(wrap(
             frames(vec![Ok(Bytes::from_static(
                 b"data: {\"choices\":[{\"delta\":{\"content\":\"data: [DONE]\"}}]}\n\n",
@@ -547,7 +547,7 @@ mod tests {
         ))
         .await;
         assert_eq!(out.len(), 2, "got: {out:?}");
-        assert!(out[1].contains("FG-3010"), "got: {}", out[1]);
+        assert!(out[1].contains("LM-3010"), "got: {}", out[1]);
     }
 
     #[tokio::test]
@@ -577,18 +577,18 @@ mod tests {
         ))
         .await;
         assert_eq!(out.len(), 2);
-        assert!(out[1].contains("FG-3003") || out[1].contains("upstream_error"));
+        assert!(out[1].contains("LM-3003") || out[1].contains("upstream_error"));
     }
 
     #[tokio::test(start_paused = true)]
     async fn silent_upstream_gets_heartbeat_pings_then_first_token_timeout() {
         // First-token window of 40 ms with a 15 ms heartbeat: two pings
-        // (15, 30), then FG-3011 at 40. Paused time makes this exact.
+        // (15, 30), then LM-3011 at 40. Paused time makes this exact.
         let out = collect(wrap(stream::pending().boxed(), guards(40, 15))).await;
         assert_eq!(out.len(), 3, "got: {out:?}");
         assert_eq!(out[0], ": ping\n\n");
         assert_eq!(out[1], ": ping\n\n");
-        assert!(out[2].contains("FG-3011"));
+        assert!(out[2].contains("LM-3011"));
     }
 
     #[tokio::test(start_paused = true)]

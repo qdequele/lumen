@@ -11,8 +11,8 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
-use ferrogate_core::Capability;
-use ferrogate_providers::{http, ModelSpec, ProviderKind, ProviderSpec, Registry};
+use lumen_core::Capability;
+use lumen_providers::{http, ModelSpec, ProviderKind, ProviderSpec, Registry};
 use serde_json::{json, Value};
 use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -134,7 +134,7 @@ async fn unknown_model_is_404_fg2001() {
 
     assert_eq!(resp.status(), 404);
     let body: Value = resp.json().await.unwrap();
-    assert_eq!(body["error"]["code"], "FG-2001");
+    assert_eq!(body["error"]["code"], "LM-2001");
 }
 
 #[tokio::test]
@@ -151,7 +151,7 @@ async fn embed_only_model_requested_for_chat_is_400_fg2002() {
 
     assert_eq!(resp.status(), 400);
     let body: Value = resp.json().await.unwrap();
-    assert_eq!(body["error"]["code"], "FG-2002");
+    assert_eq!(body["error"]["code"], "LM-2002");
 }
 
 #[tokio::test]
@@ -168,7 +168,7 @@ async fn empty_messages_is_400_fg1001() {
 
     assert_eq!(resp.status(), 400);
     let body: Value = resp.json().await.unwrap();
-    assert_eq!(body["error"]["code"], "FG-1001");
+    assert_eq!(body["error"]["code"], "LM-1001");
 }
 
 #[tokio::test]
@@ -191,7 +191,7 @@ async fn upstream_5xx_propagates_as_502_fg3003() {
     assert_eq!(resp.status(), 502);
     assert_eq!(
         resp.json::<Value>().await.unwrap()["error"]["code"],
-        "FG-3003"
+        "LM-3003"
     );
 }
 
@@ -598,9 +598,9 @@ async fn anthropic_streaming_translates_events_to_openai_chunks() {
     assert_eq!(resp.status(), 200);
     let text = resp.text().await.unwrap();
 
-    // Clean upstream termination: translated [DONE], and no FG-3010.
+    // Clean upstream termination: translated [DONE], and no LM-3010.
     assert!(text.ends_with("data: [DONE]\n\n"), "got: {text}");
-    assert!(!text.contains("FG-3010"));
+    assert!(!text.contains("LM-3010"));
 
     let chunks = sse_data_frames(&text);
     // role, 2 text deltas, tool open, tool args, finish.
@@ -680,7 +680,7 @@ async fn gemini_streaming_translates_fragments_to_openai_chunks() {
     let text = resp.text().await.unwrap();
 
     assert!(text.ends_with("data: [DONE]\n\n"), "got: {text}");
-    assert!(!text.contains("FG-3010"));
+    assert!(!text.contains("LM-3010"));
 
     let chunks = sse_data_frames(&text);
     // role, 2 text deltas, finish.
@@ -725,13 +725,13 @@ async fn upstream_stream_without_done_yields_fg3010_error_frame() {
     assert_eq!(resp.status(), 200);
     let text = resp.text().await.unwrap();
 
-    // Both real chunks were forwarded, then a terminal FG-3010 error frame
+    // Both real chunks were forwarded, then a terminal LM-3010 error frame
     // (criterion 5) — and the stream ended cleanly, no hang.
     assert_eq!(text.matches("chat.completion.chunk").count(), 2);
     assert!(!text.contains("data: [DONE]"));
     let frames = sse_data_frames(&text);
     let last = frames.last().unwrap();
-    assert_eq!(last["error"]["code"], "FG-3010");
+    assert_eq!(last["error"]["code"], "LM-3010");
     assert_eq!(last["error"]["type"], "upstream_error");
 }
 
@@ -748,7 +748,7 @@ async fn first_token_timeout_non_streaming_is_504_fg3011() {
         .mount(&upstream)
         .await;
 
-    let guards = ferrogate_server::StreamGuards {
+    let guards = lumen_server::StreamGuards {
         first_token_timeout: Duration::from_millis(150),
         heartbeat_interval: Duration::from_secs(15),
     };
@@ -763,7 +763,7 @@ async fn first_token_timeout_non_streaming_is_504_fg3011() {
 
     assert_eq!(resp.status(), 504);
     let body: Value = resp.json().await.unwrap();
-    assert_eq!(body["error"]["code"], "FG-3011");
+    assert_eq!(body["error"]["code"], "LM-3011");
     assert_eq!(body["error"]["type"], "upstream_error");
 }
 
@@ -781,7 +781,7 @@ async fn first_token_timeout_streaming_before_headers_is_504_fg3011() {
         .mount(&upstream)
         .await;
 
-    let guards = ferrogate_server::StreamGuards {
+    let guards = lumen_server::StreamGuards {
         first_token_timeout: Duration::from_millis(150),
         heartbeat_interval: Duration::from_secs(15),
     };
@@ -802,5 +802,5 @@ async fn first_token_timeout_streaming_before_headers_is_504_fg3011() {
     // so this is an honest 504 JSON envelope rather than an SSE error frame.
     assert_eq!(resp.status(), 504);
     let body: Value = resp.json().await.unwrap();
-    assert_eq!(body["error"]["code"], "FG-3011");
+    assert_eq!(body["error"]["code"], "LM-3011");
 }

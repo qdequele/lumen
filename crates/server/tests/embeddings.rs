@@ -1,14 +1,14 @@
 //! End-to-end HTTP tests for `POST /v1/embeddings`: routing, alias resolution,
 //! upstream error propagation, and client-disconnect handling. The upstream is
-//! a wiremock server; Ferrogate sits in front of it.
+//! a wiremock server; LUMEN sits in front of it.
 
 mod common;
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use ferrogate_core::Capability;
-use ferrogate_providers::{http, ModelSpec, ProviderKind, ProviderSpec, Registry};
+use lumen_core::Capability;
+use lumen_providers::{http, ModelSpec, ProviderKind, ProviderSpec, Registry};
 use serde_json::{json, Value};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -87,7 +87,7 @@ async fn unknown_model_is_404_fg2001() {
 
     assert_eq!(resp.status(), 404);
     let body: Value = resp.json().await.unwrap();
-    assert_eq!(body["error"]["code"], "FG-2001");
+    assert_eq!(body["error"]["code"], "LM-2001");
     assert_eq!(body["error"]["type"], "invalid_request");
 }
 
@@ -105,7 +105,7 @@ async fn chat_only_model_requested_for_embedding_is_400_fg2002() {
 
     assert_eq!(resp.status(), 400);
     let body: Value = resp.json().await.unwrap();
-    assert_eq!(body["error"]["code"], "FG-2002");
+    assert_eq!(body["error"]["code"], "LM-2002");
 }
 
 #[tokio::test]
@@ -129,7 +129,7 @@ async fn upstream_429_propagates_as_429_fg3001_with_retry_after() {
     assert_eq!(resp.status(), 429);
     assert_eq!(resp.headers().get("retry-after").unwrap(), "5");
     let body: Value = resp.json().await.unwrap();
-    assert_eq!(body["error"]["code"], "FG-3001");
+    assert_eq!(body["error"]["code"], "LM-3001");
     assert_eq!(body["error"]["type"], "upstream_error");
 }
 
@@ -153,7 +153,7 @@ async fn malformed_upstream_response_is_502_fg3002_never_500() {
 
     assert_eq!(resp.status(), 502);
     let body: Value = resp.json().await.unwrap();
-    assert_eq!(body["error"]["code"], "FG-3002");
+    assert_eq!(body["error"]["code"], "LM-3002");
 }
 
 #[tokio::test]
@@ -170,7 +170,7 @@ async fn empty_input_is_400_fg1001() {
 
     assert_eq!(resp.status(), 400);
     let body: Value = resp.json().await.unwrap();
-    assert_eq!(body["error"]["code"], "FG-1001");
+    assert_eq!(body["error"]["code"], "LM-1001");
 }
 
 #[tokio::test]

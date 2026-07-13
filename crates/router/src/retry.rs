@@ -15,7 +15,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use ferrogate_core::ProviderError;
+use lumen_core::ProviderError;
 use std::future::Future;
 use tokio_util::sync::CancellationToken;
 

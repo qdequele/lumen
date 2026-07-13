@@ -1,7 +1,7 @@
 //! Configuration loading and validation.
 //!
-//! Config comes from a TOML file, overlaid with `FERROGATE_*` environment
-//! variables (nested keys use `__`, e.g. `FERROGATE_SERVER__PORT=9090`).
+//! Config comes from a TOML file, overlaid with `LUMEN_*` environment
+//! variables (nested keys use `__`, e.g. `LUMEN_SERVER__PORT=9090`).
 //!
 //! # Secrets
 //! API keys are NEVER stored in this config — only the *name* of the
@@ -9,9 +9,9 @@
 //! The actual secret is read from the environment at provider-construction
 //! time, so deriving `Debug` on these structs cannot leak a key.
 
-use ferrogate_core::Capability;
-use ferrogate_providers::{ModelSpec, ProviderKind, ProviderSpec};
-use ferrogate_telemetry::logging::LogFormat;
+use lumen_core::Capability;
+use lumen_providers::{ModelSpec, ProviderKind, ProviderSpec};
+use lumen_telemetry::logging::LogFormat;
 use figment::{
     providers::{Env, Format, Toml},
     Figment,
@@ -251,7 +251,7 @@ pub struct ServerConfig {
     #[serde(default = "default_body_limit")]
     pub body_limit: usize,
     /// How long to wait for the upstream's first sign of life before failing
-    /// with FG-3011 (504), in milliseconds. Streaming: time to the first SSE
+    /// with LM-3011 (504), in milliseconds. Streaming: time to the first SSE
     /// frame; non-streaming: the whole upstream call. Defaults to 30 000.
     #[serde(default = "default_first_token_timeout_ms")]
     pub first_token_timeout_ms: u64,
@@ -370,7 +370,7 @@ const fn default_sse_heartbeat_ms() -> u64 {
     15_000
 }
 fn default_db_path() -> String {
-    "ferrogate.db".to_owned()
+    "lumen.db".to_owned()
 }
 const fn default_flush_interval_ms() -> u64 {
     10_000
@@ -463,7 +463,7 @@ pub enum ConfigError {
 }
 
 impl Config {
-    /// Load and validate configuration from `path`, overlaid with `FERROGATE_*`
+    /// Load and validate configuration from `path`, overlaid with `LUMEN_*`
     /// environment variables.
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
         let label = path.display().to_string();
@@ -475,7 +475,7 @@ impl Config {
         }
         let figment = Figment::new()
             .merge(Toml::file(path))
-            .merge(Env::prefixed("FERROGATE_").split("__"));
+            .merge(Env::prefixed("LUMEN_").split("__"));
         Self::from_figment(&figment, &label)
     }
 
@@ -922,7 +922,7 @@ mod tests {
 
     #[test]
     fn missing_config_file_is_an_error_not_silent_defaults() {
-        let err = Config::load(Path::new("/tmp/ferrogate-does-not-exist-xyz.toml")).unwrap_err();
+        let err = Config::load(Path::new("/tmp/lumen-does-not-exist-xyz.toml")).unwrap_err();
         assert!(matches!(err, ConfigError::NotFound { .. }));
         assert!(err.to_string().contains("not found"));
     }
@@ -933,7 +933,7 @@ mod tests {
         #[allow(clippy::result_large_err)]
         figment::Jail::expect_with(|jail| {
             jail.create_file("config.toml", VALID)?;
-            jail.set_env("FERROGATE_SERVER__PORT", "9090");
+            jail.set_env("LUMEN_SERVER__PORT", "9090");
             let cfg = Config::load(Path::new("config.toml")).unwrap();
             assert_eq!(cfg.server.port, 9090);
             Ok(())

@@ -1,10 +1,10 @@
-//! Routing layer for Ferrogate.
+//! Routing layer for LUMEN.
 //!
 //! Resolves a `(capability, model)` pair to a concrete provider. The routing
-//! table itself lives in [`ferrogate_providers::Registry`]; this crate turns a
+//! table itself lives in [`lumen_providers::Registry`]; this crate turns a
 //! lookup miss into the right client-facing [`GatewayError`], distinguishing an
-//! unknown model (`FG-2001`, 404) from a known model that does not serve the
-//! requested capability (`FG-2002`, 400).
+//! unknown model (`LM-2001`, 404) from a known model that does not serve the
+//! requested capability (`LM-2002`, 400).
 //!
 //! Fallback chains, circuit breaking and load balancing arrive in M6.
 
@@ -14,14 +14,14 @@ pub mod circuit;
 pub mod executor;
 pub mod retry;
 
-use ferrogate_core::{Capability, GatewayError};
-use ferrogate_providers::{ChatRoute, EmbeddingRoute, Registry, RerankRoute};
+use lumen_core::{Capability, GatewayError};
+use lumen_providers::{ChatRoute, EmbeddingRoute, Registry, RerankRoute};
 
 /// Resolve a model id to a chat route, or the appropriate routing error.
 ///
 /// # Errors
-/// * [`GatewayError::ModelNotFound`] (`FG-2001`) if no provider declares the model.
-/// * [`GatewayError::UnsupportedCapability`] (`FG-2002`) if the model exists but
+/// * [`GatewayError::ModelNotFound`] (`LM-2001`) if no provider declares the model.
+/// * [`GatewayError::UnsupportedCapability`] (`LM-2002`) if the model exists but
 ///   does not serve chat.
 pub fn resolve_chat(registry: &Registry, model_id: &str) -> Result<ChatRoute, GatewayError> {
     registry
@@ -32,8 +32,8 @@ pub fn resolve_chat(registry: &Registry, model_id: &str) -> Result<ChatRoute, Ga
 /// Resolve a model id to an embedding route, or the appropriate routing error.
 ///
 /// # Errors
-/// * [`GatewayError::ModelNotFound`] (`FG-2001`) if no provider declares the model.
-/// * [`GatewayError::UnsupportedCapability`] (`FG-2002`) if the model exists but
+/// * [`GatewayError::ModelNotFound`] (`LM-2001`) if no provider declares the model.
+/// * [`GatewayError::UnsupportedCapability`] (`LM-2002`) if the model exists but
 ///   does not serve embeddings.
 pub fn resolve_embedding(
     registry: &Registry,
@@ -47,8 +47,8 @@ pub fn resolve_embedding(
 /// Resolve a model id to a rerank route, or the appropriate routing error.
 ///
 /// # Errors
-/// * [`GatewayError::ModelNotFound`] (`FG-2001`) if no provider declares the model.
-/// * [`GatewayError::UnsupportedCapability`] (`FG-2002`) if the model exists but
+/// * [`GatewayError::ModelNotFound`] (`LM-2001`) if no provider declares the model.
+/// * [`GatewayError::UnsupportedCapability`] (`LM-2002`) if the model exists but
 ///   does not serve reranking.
 pub fn resolve_rerank(registry: &Registry, model_id: &str) -> Result<RerankRoute, GatewayError> {
     registry
@@ -199,7 +199,7 @@ fn warn_skipped_fallback(model_id: &str, capability: &str) {
 }
 
 /// Turn a routing miss into the right client-facing error: a known model that
-/// does not serve `capability` is `FG-2002`; an unknown model is `FG-2001`.
+/// does not serve `capability` is `LM-2002`; an unknown model is `LM-2001`.
 fn miss(registry: &Registry, model_id: &str, capability: Capability) -> GatewayError {
     if registry.knows_model(model_id) {
         GatewayError::UnsupportedCapability {
@@ -214,7 +214,7 @@ fn miss(registry: &Registry, model_id: &str, capability: Capability) -> GatewayE
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ferrogate_providers::{ModelSpec, ProviderKind, ProviderSpec};
+    use lumen_providers::{ModelSpec, ProviderKind, ProviderSpec};
 
     fn registry_with(models: Vec<ModelSpec>) -> Registry {
         Registry::build(
@@ -262,7 +262,7 @@ mod tests {
     fn unknown_model_is_model_not_found_fg2001() {
         let reg = registry_with(vec![model("e", &[Capability::Embed])]);
         let err = resolve_embedding(&reg, "nope").unwrap_err();
-        assert_eq!(err.code(), "FG-2001");
+        assert_eq!(err.code(), "LM-2001");
         assert_eq!(err.http_status(), 404);
     }
 
@@ -270,7 +270,7 @@ mod tests {
     fn chat_only_model_is_unsupported_capability_fg2002() {
         let reg = registry_with(vec![model("c", &[Capability::Chat])]);
         let err = resolve_embedding(&reg, "c").unwrap_err();
-        assert_eq!(err.code(), "FG-2002");
+        assert_eq!(err.code(), "LM-2002");
         assert_eq!(err.http_status(), 400);
     }
 
@@ -284,7 +284,7 @@ mod tests {
     fn unknown_rerank_model_is_model_not_found_fg2001() {
         let reg = cohere_registry(vec![model("rr", &[Capability::Rerank])]);
         let err = resolve_rerank(&reg, "nope").unwrap_err();
-        assert_eq!(err.code(), "FG-2001");
+        assert_eq!(err.code(), "LM-2001");
         assert_eq!(err.http_status(), 404);
     }
 
@@ -309,7 +309,7 @@ mod tests {
         let reg = registry_with(vec![model("gpt", &[Capability::Chat])]);
         let ids = vec!["nope".to_owned()];
         let err = resolve_chat_chain(&reg, &ids).unwrap_err();
-        assert_eq!(err.code(), "FG-2001");
+        assert_eq!(err.code(), "LM-2001");
     }
 
     #[test]
@@ -326,7 +326,7 @@ mod tests {
     fn embed_only_model_is_unsupported_for_rerank_fg2002() {
         let reg = cohere_registry(vec![model("emb", &[Capability::Embed])]);
         let err = resolve_rerank(&reg, "emb").unwrap_err();
-        assert_eq!(err.code(), "FG-2002");
+        assert_eq!(err.code(), "LM-2002");
         assert_eq!(err.http_status(), 400);
         assert!(err.to_string().contains("rerank"));
     }

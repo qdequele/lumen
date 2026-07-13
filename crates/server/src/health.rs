@@ -2,7 +2,7 @@
 //!
 //! An **optional** (default off) periodic task probes each provider that has a
 //! configured `base_url` and records the result in an in-memory registry plus
-//! the `ferrogate_provider_up` gauge. The results are exposed at
+//! the `lumen_provider_up` gauge. The results are exposed at
 //! `/health/providers` purely for observability — the gateway's own `/health`
 //! stays independent of provider health, and nothing here is ever consulted on
 //! the request path (the executor's live circuit breaker is the request-path
@@ -15,7 +15,7 @@ use std::time::Duration;
 use axum::extract::State;
 use axum::Json;
 use dashmap::DashMap;
-use ferrogate_telemetry::ResilienceMetrics;
+use lumen_telemetry::ResilienceMetrics;
 use serde::Serialize;
 
 use crate::auth::now_unix;
@@ -114,7 +114,7 @@ pub struct ProbeTarget {
     /// The base URL (only providers with a configured URL are probed).
     pub url: String,
     /// The provider kind, selecting the liveness endpoint.
-    pub kind: ferrogate_providers::ProviderKind,
+    pub kind: lumen_providers::ProviderKind,
 }
 
 impl ProbeTarget {
@@ -122,7 +122,7 @@ impl ProbeTarget {
     /// serves `/health`), otherwise the base URL for host reachability.
     fn probe_url(&self) -> String {
         match self.kind {
-            ferrogate_providers::ProviderKind::Tei => {
+            lumen_providers::ProviderKind::Tei => {
                 format!("{}/health", self.url.trim_end_matches('/'))
             }
             _ => self.url.clone(),
@@ -133,7 +133,7 @@ impl ProbeTarget {
     /// server is up but *not ready* → down) or just checks reachability (any
     /// response means the host is up).
     fn is_liveness_endpoint(&self) -> bool {
-        matches!(self.kind, ferrogate_providers::ProviderKind::Tei)
+        matches!(self.kind, lumen_providers::ProviderKind::Tei)
     }
 }
 
@@ -240,7 +240,7 @@ mod tests {
 
     #[test]
     fn probe_url_uses_a_liveness_endpoint_only_where_the_kind_has_one() {
-        use ferrogate_providers::ProviderKind;
+        use lumen_providers::ProviderKind;
         let tei = ProbeTarget {
             name: "tei".to_owned(),
             url: "http://tei:8080/".to_owned(),

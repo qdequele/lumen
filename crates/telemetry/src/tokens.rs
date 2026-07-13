@@ -9,9 +9,9 @@
 use crate::metrics::Metrics;
 use prometheus::{IntCounter, IntCounterVec, Opts};
 
-/// Base label names of `ferrogate_tokens_total`.
+/// Base label names of `lumen_tokens_total`.
 const TOKEN_LABELS: [&str; 5] = ["capability", "model", "provider", "direction", "estimated"];
-/// Base label names of `ferrogate_rerank_search_units_total`.
+/// Base label names of `lumen_rerank_search_units_total`.
 const SEARCH_UNIT_LABELS: [&str; 2] = ["model", "provider"];
 
 /// All M5 token/usage counters, registered against one [`Metrics`] registry.
@@ -52,29 +52,29 @@ impl TokenMetrics {
 
         let tokens_total = IntCounterVec::new(
             Opts::new(
-                "ferrogate_tokens_total",
+                "lumen_tokens_total",
                 "Tokens processed, by capability/model/provider/direction and whether the count was locally estimated (ADR 003).",
             ),
             &token_label_names,
         )?;
         let rerank_search_units_total = IntCounterVec::new(
             Opts::new(
-                "ferrogate_rerank_search_units_total",
+                "lumen_rerank_search_units_total",
                 "Rerank search units reported by upstream providers.",
             ),
             &unit_label_names,
         )?;
         let tokens_estimated_total = IntCounter::new(
-            "ferrogate_tokens_estimated_total",
+            "lumen_tokens_estimated_total",
             "Tokens that were locally estimated rather than upstream-reported.",
         )?;
         let usage_log_dropped_total = IntCounter::new(
-            "ferrogate_usage_log_dropped_total",
+            "lumen_usage_log_dropped_total",
             "Usage-log entries dropped because the logging channel was full.",
         )?;
         let metadata_rejected_total = IntCounter::new(
-            "ferrogate_metadata_rejected_total",
-            "x-ferrogate-metadata headers dropped as malformed or out of bounds.",
+            "lumen_metadata_rejected_total",
+            "x-lumen-metadata headers dropped as malformed or out of bounds.",
         )?;
 
         let registry = metrics.registry();
@@ -232,7 +232,7 @@ mod tests {
             42,
         );
         let out = metrics.encode_text();
-        assert!(out.contains("ferrogate_tokens_total"));
+        assert!(out.contains("lumen_tokens_total"));
         assert!(out.contains(r#"capability="chat""#));
         assert!(out.contains(r#"direction="input""#));
         assert!(out.contains(r#"estimated="false""#));
@@ -249,7 +249,7 @@ mod tests {
         );
         let out = metrics.encode_text();
         assert!(out.contains(r#"estimated="true""#));
-        assert!(out.contains("ferrogate_tokens_estimated_total 7"));
+        assert!(out.contains("lumen_tokens_estimated_total 7"));
     }
 
     #[test]
@@ -257,7 +257,7 @@ mod tests {
         let (metrics, tokens) = setup(&[]);
         tokens.add_tokens(&sample("chat", "m", "p", Direction::Output, false), &[], 5);
         let out = metrics.encode_text();
-        assert!(out.contains("ferrogate_tokens_estimated_total 0"));
+        assert!(out.contains("lumen_tokens_estimated_total 0"));
     }
 
     #[test]
@@ -286,7 +286,7 @@ mod tests {
         let (metrics, tokens) = setup(&[]);
         tokens.add_search_units("rerank-v3", "cohere", &[], 3);
         let out = metrics.encode_text();
-        assert!(out.contains("ferrogate_rerank_search_units_total"));
+        assert!(out.contains("lumen_rerank_search_units_total"));
         assert!(out.contains(r#"provider="cohere""#));
     }
 
@@ -321,7 +321,7 @@ mod tests {
         tokens.inc_metadata_rejected();
         tokens.inc_metadata_rejected();
         let out = metrics.encode_text();
-        assert!(out.contains("ferrogate_usage_log_dropped_total 1"));
-        assert!(out.contains("ferrogate_metadata_rejected_total 2"));
+        assert!(out.contains("lumen_usage_log_dropped_total 1"));
+        assert!(out.contains("lumen_metadata_rejected_total 2"));
     }
 }

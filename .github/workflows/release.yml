@@ -37,21 +37,21 @@ jobs:
         run: cargo install cross --locked
 
       - name: Build release binary
-        run: cross build --release --bin ferrogate --target ${{ matrix.target }}
+        run: cross build --release --bin lumen --target ${{ matrix.target }}
 
       - name: Package
         run: |
-          bin="target/${{ matrix.target }}/release/ferrogate"
+          bin="target/${{ matrix.target }}/release/lumen"
           size=$(stat -c%s "$bin")
           echo "binary size: $size bytes"
           # Fail the release if the stripped binary blows past the 25 MB budget.
           test "$size" -lt 26214400 || { echo "binary exceeds 25 MB"; exit 1; }
-          tar -czf "ferrogate-${{ matrix.target }}.tar.gz" -C "target/${{ matrix.target }}/release" ferrogate
+          tar -czf "lumen-${{ matrix.target }}.tar.gz" -C "target/${{ matrix.target }}/release" lumen
 
       - name: Attach to release
         uses: softprops/action-gh-release@v2
         with:
-          files: ferrogate-${{ matrix.target }}.tar.gz
+          files: lumen-${{ matrix.target }}.tar.gz
 
   image:
     name: multi-arch image → GHCR

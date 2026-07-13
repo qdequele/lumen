@@ -11,10 +11,10 @@
 //!   stream to the two `ChatProvider` streaming signatures. The terminal
 //!   `data: [DONE]` is emitted only when the translator saw a genuine upstream
 //!   terminal event, so a mid-stream upstream death is detectable downstream
-//!   (FG-3010 — the server appends the error frame).
+//!   (LM-3010 — the server appends the error frame).
 
 use bytes::Bytes;
-use ferrogate_core::{
+use lumen_core::{
     ChatChunk, ChatChunkChoice, ChatDelta, ChatRequest, ChatResponse, ProviderError,
 };
 use futures::stream::{self, BoxStream, StreamExt};
@@ -78,7 +78,7 @@ pub fn translate_sse_stream<T: SseTranslator>(
 /// Adapt a translated item stream to the `chat_stream_bytes` signature:
 /// each chunk becomes a `data: {json}\n\n` frame; the upstream's terminal event
 /// becomes `data: [DONE]\n\n`. No `[DONE]` is fabricated — if the upstream dies
-/// mid-stream the byte stream simply ends, which the server turns into FG-3010.
+/// mid-stream the byte stream simply ends, which the server turns into LM-3010.
 pub fn items_to_sse_bytes(
     items: BoxStream<'static, Result<StreamItem, ProviderError>>,
 ) -> BoxStream<'static, Result<Bytes, ProviderError>> {
@@ -157,7 +157,7 @@ pub fn single_shot_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ferrogate_core::{ChatChoice, ChatMessage, Usage};
+    use lumen_core::{ChatChoice, ChatMessage, Usage};
 
     fn response() -> ChatResponse {
         ChatResponse {

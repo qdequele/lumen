@@ -17,7 +17,7 @@
 use std::future::Future;
 use std::time::Duration;
 
-use ferrogate_core::{GatewayError, ProviderError};
+use lumen_core::{GatewayError, ProviderError};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
@@ -30,7 +30,7 @@ use crate::retry::{retry, RetryPolicy};
 pub struct Link {
     /// Provider instance name (breaker key + upstream-error attribution).
     pub provider_name: String,
-    /// Client-facing model id (breaker key + `x-ferrogate-model-used`).
+    /// Client-facing model id (breaker key + `x-lumen-model-used`).
     pub model_id: String,
 }
 
@@ -67,7 +67,7 @@ pub struct Executed<T> {
 /// # Errors
 ///
 /// The last upstream error encountered (already mapped to a [`GatewayError`]
-/// naming the provider), `FG-3013` if the total timeout elapsed, `FG-3020` if
+/// naming the provider), `LM-3013` if the total timeout elapsed, `LM-3020` if
 /// every remaining link's breaker was open, or the immediate error for a hard
 /// client fault (which no fallback can fix).
 pub async fn execute<T, F, Fut>(
@@ -304,7 +304,7 @@ mod tests {
         })
         .await
         .unwrap_err();
-        assert_eq!(err.code(), "FG-3020");
+        assert_eq!(err.code(), "LM-3020");
         assert!(err.retry_after().is_some());
     }
 
@@ -328,7 +328,7 @@ mod tests {
         })
         .await
         .unwrap_err();
-        assert_eq!(err.code(), "FG-3003"); // upstream error status, 502
+        assert_eq!(err.code(), "LM-3003"); // upstream error status, 502
         assert_eq!(
             fallback_calls.load(Ordering::SeqCst),
             0,
@@ -353,7 +353,7 @@ mod tests {
         })
         .await
         .unwrap_err();
-        assert_eq!(err.code(), "FG-3013");
+        assert_eq!(err.code(), "LM-3013");
     }
 
     #[tokio::test(start_paused = true)]
@@ -372,7 +372,7 @@ mod tests {
         })
         .await
         .unwrap_err();
-        assert_eq!(err.code(), "FG-3011");
+        assert_eq!(err.code(), "LM-3011");
     }
 
     #[tokio::test(start_paused = true)]

@@ -1,6 +1,6 @@
 //! Error type for the auth/storage layer.
 //!
-//! These are *internal* errors: the server maps them to `FG-5001` (opaque 500)
+//! These are *internal* errors: the server maps them to `LM-5001` (opaque 500)
 //! — never to a misleading 401 during a gateway malfunction. Variants never
 //! embed key material.
 
@@ -15,7 +15,7 @@ pub enum AuthError {
     #[error("migration error: {0}")]
     Migrate(#[from] sqlx::migrate::MigrateError),
 
-    /// `FERROGATE_MASTER_KEY` is missing or malformed.
+    /// `LUMEN_MASTER_KEY` is missing or malformed.
     #[error("invalid master key: {0}")]
     InvalidMasterKey(&'static str),
 

@@ -2,10 +2,10 @@
 //!
 //! On `SIGHUP` or a change to the config file, the config is re-loaded and
 //! **validated**; only if it is valid does the provider routing table swap
-//! atomically via the registry's [`ArcSwap`](ferrogate_providers::Registry).
+//! atomically via the registry's [`ArcSwap`](lumen_providers::Registry).
 //! In-flight requests hold a snapshot of the old table (`.load()`), so the swap
 //! never disturbs them. An invalid reload is logged, the
-//! `ferrogate_config_reload_failures_total` metric is incremented, and the
+//! `lumen_config_reload_failures_total` metric is incremented, and the
 //! previous configuration is kept (criterion 3).
 //!
 //! Scope: the reload swaps the **routing table** (providers, models, aliases,
@@ -26,8 +26,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
-use ferrogate_providers::{Registry, RegistryError};
-use ferrogate_telemetry::ReloadMetrics;
+use lumen_providers::{Registry, RegistryError};
+use lumen_telemetry::ReloadMetrics;
 
 use crate::config::{Config, ConfigError};
 use crate::pricing::CostTable;
@@ -111,7 +111,7 @@ pub fn apply_reload(path: &Path, targets: &ReloadTargets) -> Result<(), ReloadEr
 /// resolution. Env keys win (a spec with a resolved env key is left untouched).
 #[allow(clippy::implicit_hasher)]
 fn merge_key_backfill(
-    specs: &mut [ferrogate_providers::ProviderSpec],
+    specs: &mut [lumen_providers::ProviderSpec],
     key_backfill: &HashMap<String, String>,
 ) {
     for spec in specs {
@@ -244,8 +244,8 @@ async fn wait_for_hangup(_sighup: &mut Option<Hangup>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ferrogate_providers::http;
-    use ferrogate_telemetry::Metrics;
+    use lumen_providers::http;
+    use lumen_telemetry::Metrics;
     use std::io::Write;
 
     fn write_config(dir: &Path, body: &str) -> PathBuf {
@@ -314,7 +314,7 @@ mod tests {
     #[test]
     #[allow(clippy::float_cmp)] // prices come straight from config: exact
     fn valid_reload_swaps_pricing_and_resilience_but_keeps_breaker_state() {
-        use ferrogate_router::circuit::CircuitState;
+        use lumen_router::circuit::CircuitState;
         let dir = tempdir();
         // Start with no price and no fallback.
         let path = write_config(&dir, ONE_MODEL);
@@ -403,8 +403,8 @@ mod tests {
         assert!(registry.chat_route("gpt").is_some());
         // Failure counted, no success.
         let out = metrics.encode_text();
-        assert!(out.contains("ferrogate_config_reload_failures_total 1"));
-        assert!(out.contains("ferrogate_config_reloads_total 0"));
+        assert!(out.contains("lumen_config_reload_failures_total 1"));
+        assert!(out.contains("lumen_config_reloads_total 0"));
     }
 
     #[test]
@@ -425,12 +425,12 @@ mod tests {
         assert!(registry.chat_route("gpt").is_some(), "old table kept");
         assert!(metrics
             .encode_text()
-            .contains("ferrogate_config_reload_failures_total 1"));
+            .contains("lumen_config_reload_failures_total 1"));
     }
 
     #[test]
     fn key_backfill_fills_only_env_keyless_providers() {
-        use ferrogate_providers::{ProviderKind, ProviderSpec};
+        use lumen_providers::{ProviderKind, ProviderSpec};
         let mut specs = vec![
             ProviderSpec {
                 name: "from-env".to_owned(),
@@ -471,7 +471,7 @@ mod tests {
         let base = std::env::temp_dir();
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let pid = std::process::id();
-        let dir = base.join(format!("ferrogate-reload-test-{pid}-{n}"));
+        let dir = base.join(format!("lumen-reload-test-{pid}-{n}"));
         std::fs::create_dir_all(&dir).expect("create temp dir");
         dir
     }

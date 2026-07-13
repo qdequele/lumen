@@ -1,4 +1,6 @@
-# Ferrogate
+# LUMEN
+
+> **L**ightweight **U**nified **M**odel **EN**dpoint
 
 A universal, self-hostable LLM gateway written in Rust. One OpenAI-compatible
 endpoint in front of many providers — for **chat**, **embeddings** and
@@ -6,7 +8,7 @@ endpoint in front of many providers — for **chat**, **embeddings** and
 static binary, **zero telemetry**, and prompts that are **never logged by
 default**.
 
-Ferrogate is an alternative to LiteLLM (Python, heavier) and OpenRouter (SaaS,
+LUMEN is an alternative to LiteLLM (Python, heavier) and OpenRouter (SaaS,
 not self-hostable). The gateway's own overhead is **microseconds, off-network**:
 the per-request CPU work it adds is **~3.2 µs median** (M6 resilience executor +
 OpenAI-surface (de)serialization), measured with `cargo bench` on Apple Silicon.
@@ -81,14 +83,14 @@ capabilities = ["rerank"]
 
 ### 2. Run it
 
-**Docker** (the released image; sets `FERROGATE_SERVER__HOST=0.0.0.0` for you):
+**Docker** (the released image; sets `LUMEN_SERVER__HOST=0.0.0.0` for you):
 
 ```bash
 docker run -p 8080:8080 \
   -v ./config.toml:/config.toml \
   -e OPENAI_API_KEY=sk-... \
   -e COHERE_API_KEY=... \
-  ghcr.io/meilisearch/ferrogate:latest
+  ghcr.io/qdequele/lumen:latest
 ```
 
 **From source** (needs a recent stable Rust toolchain):
@@ -146,7 +148,7 @@ curl -s http://localhost:8080/v1/rerank \
 ```
 
 Results come back sorted by descending `relevance_score`. `documents` must be
-non-empty (an empty list is rejected with `FG-2010`).
+non-empty (an empty list is rejected with `LM-2010`).
 
 ## Providers × capabilities
 
@@ -176,12 +178,12 @@ Each area is summarized here; the linked docs and ADRs carry the detail.
 ### Auth, keys & hard budgets (M5)
 
 Off by default — with `[auth].enabled = false` the gateway is an open proxy with
-no database at all. When enabled (requires `FERROGATE_MASTER_KEY`, 64 hex
+no database at all. When enabled (requires `LUMEN_MASTER_KEY`, 64 hex
 chars), it adds **virtual keys**, **hard budgets** and **RPM/TPM quotas**, all
 enforced **in memory before any upstream call**, so a rejected request never
-spends. The DB is never on the request path. Refusals are `402 FG-4001`
-(budget), `429 FG-4002` (RPM), `429 FG-4003` (TPM); a missing/invalid key is
-`401 FG-4004`. Keys and budgets are managed via the `/admin/*` API, gated by the
+spends. The DB is never on the request path. Refusals are `402 LM-4001`
+(budget), `429 LM-4002` (RPM), `429 LM-4003` (TPM); a missing/invalid key is
+`401 LM-4004`. Keys and budgets are managed via the `/admin/*` API, gated by the
 master key. See [`SECURITY.md`](SECURITY.md).
 
 ### Resilience (M6)
@@ -189,10 +191,10 @@ master key. See [`SECURITY.md`](SECURITY.md).
 Survives flaky upstreams without becoming flaky itself: **retries** with
 exponential backoff + jitter (retryable failures only, never a client 4xx),
 per-model **fallback chains**, a per-`(provider, model)` **circuit breaker**, and
-three distinct **per-phase timeouts** (`FG-3012` connect, `FG-3011` first-token,
-`FG-3013` total). Optional **background health checks** publish
+three distinct **per-phase timeouts** (`LM-3012` connect, `LM-3011` first-token,
+`LM-3013` total). Optional **background health checks** publish
 `GET /health/providers`. The model that actually served a request is reported in
-the `x-ferrogate-model-used` response header. All configured under
+the `x-lumen-model-used` response header. All configured under
 `[resilience]`; design in [ADR 005](docs/adr/005-resilience-execution.md).
 
 ### Observability & token accounting (M5, ADR 003)
@@ -201,14 +203,14 @@ the `x-ferrogate-model-used` response header. All configured under
 when reported, otherwise a local byte-heuristic estimate flagged
 `"estimated": true`. Never a silent zero. Surfaced three ways: in the response
 body, on `/metrics`, and (when auth is on) in the `usage_log` table. Key
-metrics: `ferrogate_tokens_total{capability,model,provider,direction,estimated}`,
-`ferrogate_rerank_search_units_total`, `ferrogate_circuit_state{provider,model}`,
-`ferrogate_provider_up{provider}`, `ferrogate_usage_log_dropped_total`,
-`ferrogate_config_reloads_total` / `ferrogate_config_reload_failures_total`. The
+metrics: `lumen_tokens_total{capability,model,provider,direction,estimated}`,
+`lumen_rerank_search_units_total`, `lumen_circuit_state{provider,model}`,
+`lumen_provider_up{provider}`, `lumen_usage_log_dropped_total`,
+`lumen_config_reloads_total` / `lumen_config_reload_failures_total`. The
 usage log is written on a bounded async channel that **drops rather than blocks**
 the request path, and stores token counts, cost and metadata labels — **never
 message content**. See [ADR 003](docs/adr/003-token-accounting.md) and
-[ADR 002](docs/adr/002-request-metadata-header.md) for the `x-ferrogate-metadata`
+[ADR 002](docs/adr/002-request-metadata-header.md) for the `x-lumen-metadata`
 header.
 
 ### Config hot reload (M7)
@@ -216,7 +218,7 @@ header.
 `SIGHUP` or a file-watch triggers a reload: the new config is validated, then the
 provider registry is atomically swapped. In-flight requests are unaffected. An
 invalid config is **rejected** — the old config keeps serving and
-`ferrogate_config_reload_failures_total` increments.
+`lumen_config_reload_failures_total` increments.
 
 ### Security headers (M7)
 
@@ -227,14 +229,14 @@ terminating reverse proxy — see [`SECURITY.md`](SECURITY.md).
 
 ## Configuration
 
-Everything is one TOML file (plus `FERROGATE_*` env overrides, using `__` for
-nesting, e.g. `FERROGATE_SERVER__PORT=9090`). The exhaustively commented
+Everything is one TOML file (plus `LUMEN_*` env overrides, using `__` for
+nesting, e.g. `LUMEN_SERVER__PORT=9090`). The exhaustively commented
 reference is [`config.example.toml`](config.example.toml), with sections:
 
 - `log_format` — `"pretty"` (default) or `"json"`.
 - `[server]` — bind host/port, body limit, first-token timeout, SSE heartbeat.
 - `[auth]` — virtual keys, budgets, quotas, usage log (off by default).
-- `[telemetry]` — which `x-ferrogate-metadata` keys become Prometheus labels.
+- `[telemetry]` — which `x-lumen-metadata` keys become Prometheus labels.
 - `[resilience]` — retries, circuit breaker, timeouts, health checks.
 - `[[providers]]` / `[[providers.models]]` — upstreams, model ids, capabilities,
   prices, and per-model `fallbacks`.
@@ -269,8 +271,8 @@ produce the loaded numbers on their own hardware.
 
 ## Security
 
-Ferrogate runs inside your own trust boundary. Provider keys are referenced by
-env-var name (or encrypted at rest under `FERROGATE_MASTER_KEY`), never logged,
+LUMEN runs inside your own trust boundary. Provider keys are referenced by
+env-var name (or encrypted at rest under `LUMEN_MASTER_KEY`), never logged,
 never returned in errors. Prompts and responses are never logged by default.
 Vulnerability reporting and the full security model are in
 [`SECURITY.md`](SECURITY.md).

@@ -6,7 +6,7 @@
 //! internal OpenAI-shaped types.
 
 use async_trait::async_trait;
-use ferrogate_core::{
+use lumen_core::{
     EmbedData, EmbedInput, EmbedRequest, EmbedResponse, EmbedUsage, EmbeddingProvider,
     ProviderError,
 };

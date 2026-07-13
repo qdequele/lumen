@@ -12,7 +12,7 @@ environment or experiment a call belongs to. Cloudflare AI Gateway solves this
 with a `cf-aig-metadata` request header carrying a small JSON object that is
 then attached to each request's log for filtering and search.
 
-Ferrogate needs the same capability, feeding both:
+LUMEN needs the same capability, feeding both:
 
 - **structured logs** (`tracing`) and the M5 `usage_log` records, and
 - **Prometheus** metrics.
@@ -35,7 +35,7 @@ treated as prompt content — it is operator/client labels only.
 Introduce a per-request metadata header, parsed once at the edge into a small
 typed value carried in request extensions.
 
-1. **Header.** Canonical `x-ferrogate-metadata`; also accept `cf-aig-metadata`
+1. **Header.** Canonical `x-lumen-metadata`; also accept `cf-aig-metadata`
    as an alias so Cloudflare AI Gateway clients work unchanged. Value is a flat
    JSON object of string → (string | number | bool). Nested objects/arrays are
    rejected (dropped, see 4).
@@ -57,7 +57,7 @@ typed value carried in request extensions.
    metadata is dropped with a `debug!`/`warn!` and a
    `metadata_rejected_total` counter increment; the call proceeds normally.
 
-5. **Opaque, never inspected.** Ferrogate does not parse metadata for meaning or
+5. **Opaque, never inspected.** LUMEN does not parse metadata for meaning or
    PII. Documentation states plainly that metadata is logged and must not carry
    secrets or prompt content.
 

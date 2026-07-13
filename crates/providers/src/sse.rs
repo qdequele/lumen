@@ -12,7 +12,7 @@
 //! (multi-line `data:` joined with `\n`), comment lines (`:`) ignored, LF and
 //! CRLF line endings. `id:`/`retry:` fields are ignored.
 
-use ferrogate_core::ProviderError;
+use lumen_core::ProviderError;
 
 /// Upper bound on one buffered event. A single SSE event from an LLM provider
 /// is a few KiB; anything approaching this limit is a broken or hostile

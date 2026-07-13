@@ -9,7 +9,7 @@
 //! passed in already — the registry never reads env vars or holds config.
 
 use arc_swap::ArcSwap;
-use ferrogate_core::{Capability, ChatProvider, EmbeddingProvider, RerankProvider};
+use lumen_core::{Capability, ChatProvider, EmbeddingProvider, RerankProvider};
 use std::collections::HashMap;
 use std::sync::Arc;
 

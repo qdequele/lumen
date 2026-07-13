@@ -6,16 +6,16 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Model-to-provider resolution, fallback and load balancing for Ferrogate."
+description = "Model-to-provider resolution, fallback and load balancing for LUMEN."
 
 [lib]
-name = "ferrogate_router"
+name = "lumen_router"
 path = "src/lib.rs"
 
 [dependencies]
-ferrogate-core = { workspace = true }
-ferrogate-providers = { workspace = true }
-ferrogate-telemetry = { workspace = true }
+lumen-core = { workspace = true }
+lumen-providers = { workspace = true }
+lumen-telemetry = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 futures = { workspace = true }

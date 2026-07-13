@@ -1,6 +1,6 @@
 //! Per-request metadata header (ADR 002, Cloudflare AI Gateway style).
 //!
-//! `x-ferrogate-metadata` (alias `cf-aig-metadata`) carries a **flat** JSON
+//! `x-lumen-metadata` (alias `cf-aig-metadata`) carries a **flat** JSON
 //! object of `string → string | number | bool`, parsed once here at the edge.
 //! It feeds two sinks with different rules:
 //!
@@ -17,7 +17,7 @@ use axum::http::HeaderMap;
 use serde_json::Value;
 
 /// Canonical header name.
-pub const METADATA_HEADER: &str = "x-ferrogate-metadata";
+pub const METADATA_HEADER: &str = "x-lumen-metadata";
 /// Cloudflare-compatible alias, honoured when the canonical header is absent.
 pub const METADATA_HEADER_ALIAS: &str = "cf-aig-metadata";
 

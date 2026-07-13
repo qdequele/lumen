@@ -17,7 +17,7 @@ mod stream;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use ferrogate_core::{
+use lumen_core::{
     ChatChoice, ChatChunk, ChatMessage, ChatProvider, ChatRequest, ChatResponse, ProviderError,
     Usage,
 };
@@ -305,7 +305,7 @@ impl ChatProvider for GoogleProvider {
 
     /// Fragment-by-fragment translation to OpenAI SSE frames. `data: [DONE]`
     /// is emitted only after a genuine upstream `finishReason`, so a mid-stream
-    /// upstream death surfaces as a missing terminator (FG-3010 downstream).
+    /// upstream death surfaces as a missing terminator (LM-3010 downstream).
     async fn chat_stream_bytes(
         &self,
         req: ChatRequest,

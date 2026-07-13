@@ -7,7 +7,7 @@
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use ferrogate_core::GatewayError;
+use lumen_core::GatewayError;
 
 /// A [`GatewayError`] that can be returned directly from a handler.
 pub struct ApiError(pub GatewayError);

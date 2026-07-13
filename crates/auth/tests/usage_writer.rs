@@ -1,7 +1,7 @@
 //! Tests for the bounded-channel usage writer (M5 §5.3).
 
-use ferrogate_auth::store::{KeyStore, UsageRecord};
-use ferrogate_auth::usage::{spawn_usage_writer, UsageWriterConfig};
+use lumen_auth::store::{KeyStore, UsageRecord};
+use lumen_auth::usage::{spawn_usage_writer, UsageWriterConfig};
 use std::time::Duration;
 
 fn record(model: &str) -> UsageRecord {

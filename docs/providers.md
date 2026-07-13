@@ -1,6 +1,6 @@
 # Providers
 
-Ferrogate ships nine built-in provider kinds. Each `[[providers]]` block in your
+LUMEN ships nine built-in provider kinds. Each `[[providers]]` block in your
 config selects one with a `kind` string and gives it a unique `name` (your own
 label). Each `[[providers.models]]` block under it exposes a model to clients:
 
@@ -13,14 +13,14 @@ api_key_env = "OPENAI_API_KEY"   # NAME of the env var holding the key
 
 [[providers.models]]
 id = "gpt-4o"             # the id clients send (owned entirely by you)
-upstream_id = "gpt-4o-2024-08-06"   # what Ferrogate sends upstream (defaults to `id`)
+upstream_id = "gpt-4o-2024-08-06"   # what LUMEN sends upstream (defaults to `id`)
 capabilities = ["chat"]   # any of "chat", "embed", "rerank"
 ```
 
 Rules that apply to every provider:
 
 - **API keys are never in the config.** `api_key_env` names an environment
-  variable; Ferrogate reads it only when a request actually routes to that
+  variable; LUMEN reads it only when a request actually routes to that
   provider. A hosted provider whose env var is unset fails only at use, not at
   boot — a partial set of keys is fine.
 - **Model ids are globally unique** across all providers. A collision aborts
@@ -94,7 +94,7 @@ capabilities = ["chat"]
 ## anthropic
 
 - **kind**: `anthropic` · **capabilities**: chat only.
-- **Auth**: `api_key_env` (e.g. `ANTHROPIC_API_KEY`). Ferrogate authenticates
+- **Auth**: `api_key_env` (e.g. `ANTHROPIC_API_KEY`). LUMEN authenticates
   with the `x-api-key` / `anthropic-version` headers, not a bearer token.
 - **Translation**: OpenAI ⇄ Anthropic is bidirectional, including tools and
   streaming events, so clients keep using the OpenAI wire format.

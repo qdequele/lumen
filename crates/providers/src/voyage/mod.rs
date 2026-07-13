@@ -7,7 +7,7 @@
 //! reported as `0`.
 
 use async_trait::async_trait;
-use ferrogate_core::{
+use lumen_core::{
     EmbedRequest, EmbedResponse, EmbeddingProvider, ProviderError, RerankProvider, RerankRequest,
     RerankResponse, RerankResult, RerankUsage,
 };
@@ -128,7 +128,7 @@ impl RerankProvider for VoyageProvider {
         let documents: Vec<&str> = req
             .documents
             .iter()
-            .map(ferrogate_core::RerankDocument::text)
+            .map(lumen_core::RerankDocument::text)
             .collect();
         let body = VoyageRerankRequest {
             model: &req.model,

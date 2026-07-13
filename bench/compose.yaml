@@ -1,13 +1,13 @@
-# Reproducible head-to-head: Ferrogate vs LiteLLM in front of the SAME local
+# Reproducible head-to-head: LUMEN vs LiteLLM in front of the SAME local
 # mock upstream, driven by k6 (M7 §7.1). Run:
 #
 #   docker compose -f bench/compose.yaml up -d --build
-#   OPENAI_API_KEY=sk-mock TARGET=http://localhost:8080 k6 run bench/k6-added-latency.js   # ferrogate
+#   OPENAI_API_KEY=sk-mock TARGET=http://localhost:8080 k6 run bench/k6-added-latency.js   # lumen
 #   OPENAI_API_KEY=sk-mock TARGET=http://localhost:4000 k6 run bench/k6-added-latency.js   # litellm
 #   OPENAI_API_KEY=sk-mock TARGET=http://localhost:1080 k6 run bench/k6-added-latency.js   # direct (baseline)
 #
 # Added latency = gateway p50/p99 − direct p50/p99. Record RAM with
-# `docker stats --no-stream ferrogate litellm`. See bench/README.md.
+# `docker stats --no-stream lumen litellm`. See bench/README.md.
 
 services:
   # A zero-logic OpenAI-compatible upstream: constant response, ~0 ms compute,
@@ -21,7 +21,7 @@ services:
     volumes:
       - ./mock-upstream.json:/config/mock.json:ro
 
-  ferrogate:
+  lumen:
     build:
       context: ..
       dockerfile: Dockerfile
@@ -31,7 +31,7 @@ services:
       OPENAI_API_KEY: sk-mock
     command: ["--config", "/config.toml"]
     volumes:
-      - ./ferrogate-bench.toml:/config.toml:ro
+      - ./lumen-bench.toml:/config.toml:ro
     depends_on:
       - mock-upstream
 

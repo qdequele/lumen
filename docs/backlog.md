@@ -42,8 +42,8 @@ milestone.
   but we do not re-encode on the way OUT. Add base64 *output* if a client needs it.
 - Ollama drops the OpenAI-only `dimensions` field with a `debug!` log; a client
   asking for a specific dimension silently gets full-width vectors. Consider a
-  400 (FG-1001) when an unsupported-but-meaningful field is set under a strict mode.
-- `FG-1002` (payload too large, 413) is emitted by `RequestBodyLimitLayer` as a
+  400 (LM-1001) when an unsupported-but-meaningful field is set under a strict mode.
+- `LM-1002` (payload too large, 413) is emitted by `RequestBodyLimitLayer` as a
   raw 413 without our JSON error envelope. Map the tower-http rejection to
   `GatewayError::PayloadTooLarge` for a consistent body.
 - Cancellation tests use real (short) wall-clock delays rather than
@@ -97,10 +97,10 @@ milestone.
 
 ## Noted while building M4 (slice 2 — zero-copy streaming)
 
-- **Acceptance criterion 5 (FG-3010) not yet implemented.** In passthrough, if
+- **Acceptance criterion 5 (LM-3010) not yet implemented.** In passthrough, if
   the upstream closes cleanly WITHOUT a `[DONE]` terminator and without a
   transport error, `bytes_stream()` just ends: the gateway stops gracefully (no
-  hang, no panic) but emits no `data: {"error": {"code": "FG-3010"...}}` frame.
+  hang, no panic) but emits no `data: {"error": {"code": "LM-3010"...}}` frame.
   Detecting a missing `[DONE]` requires sniffing the tail bytes, which fights
   pure zero-copy — design it in slice 3 (e.g. a lightweight tail-watcher that
   only inspects frame boundaries, not JSON). No mid-stream error-frame test yet
@@ -109,7 +109,7 @@ milestone.
 - **Tools sur Gemini** : `translate_request` (google) ignore silencieusement
   `tools`/`tool_choice`, et le traducteur streaming ne lit que `parts[].text`
   (un `functionCall` serait avalé). Décider : mapper vers `functionDeclarations`
-  Gemini, ou rejeter explicitement (FG-2002) quand `tools` est présent sur un
+  Gemini, ou rejeter explicitement (LM-2002) quand `tools` est présent sur un
   modèle routé Google. Relevé en review M4.
 
 ## Noted while building M5
@@ -191,7 +191,7 @@ milestone.
   resilience policy (retry/timeouts/fallbacks) as well as the routing table,
   preserving circuit-breaker state. (Auth knobs + server bind still boot-time.)
 - **Key-material zeroization (DEBT-2)** — done. `MasterKey` wipes on drop and
-  the raw `FERROGATE_MASTER_KEY` string is zeroized after use.
+  the raw `LUMEN_MASTER_KEY` string is zeroized after use.
 - **Richer health probe (DEBT-3)** — done for TEI (`/health` liveness; non-2xx =
   down). Other kinds keep bare host-reachability (no reliable unauthenticated
   liveness endpoint); a per-kind probe for vendor APIs remains out of scope.

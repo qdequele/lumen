@@ -5,8 +5,8 @@
 //! the original order** with summed token usage. A single sub-batch failure
 //! fails the whole request (no partial results in v1).
 
-use ferrogate_core::ProviderError;
-use ferrogate_core::{EmbedInput, EmbedRequest, EmbedResponse, EmbedUsage, EmbeddingProvider};
+use lumen_core::ProviderError;
+use lumen_core::{EmbedInput, EmbedRequest, EmbedResponse, EmbedUsage, EmbeddingProvider};
 use futures::stream::{self, StreamExt, TryStreamExt};
 use tokio_util::sync::CancellationToken;
 

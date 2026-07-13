@@ -24,7 +24,7 @@
 
 use std::collections::HashMap;
 
-use ferrogate_core::{ChatChunk, ChatChunkChoice, ChatDelta, ProviderError, Usage};
+use lumen_core::{ChatChunk, ChatChunkChoice, ChatDelta, ProviderError, Usage};
 use serde::Deserialize;
 use serde_json::json;
 

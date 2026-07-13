@@ -11,10 +11,10 @@ mod common;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use ferrogate_providers::{http, Registry};
-use ferrogate_server::config::Config;
-use ferrogate_server::pricing::CostTable;
-use ferrogate_server::resilience::ResilienceRuntime;
+use lumen_providers::{http, Registry};
+use lumen_server::config::Config;
+use lumen_server::pricing::CostTable;
+use lumen_server::resilience::ResilienceRuntime;
 use figment::{
     providers::{Format, Toml},
     Figment,
@@ -175,7 +175,7 @@ async fn client_4xx_is_not_retried() {
 
     let base = spawn(&config_from(&single_provider_config(&upstream.uri()))).await;
     let resp = post_chat(&base, "gpt").await;
-    assert_eq!(resp.status(), 502); // upstream 4xx surfaces as FG-3003 (502)
+    assert_eq!(resp.status(), 502); // upstream 4xx surfaces as LM-3003 (502)
     assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
 }
 
@@ -208,7 +208,7 @@ async fn falls_back_to_second_provider_and_advertises_it() {
     assert_eq!(resp.status(), 200);
     assert_eq!(
         resp.headers()
-            .get("x-ferrogate-model-used")
+            .get("x-lumen-model-used")
             .and_then(|v| v.to_str().ok()),
         Some("claude-fb"),
         "response should name the fallback that served it"
@@ -322,16 +322,16 @@ async fn streaming_failure_after_first_chunk_is_not_retried() {
     assert_eq!(resp.status(), 200); // headers already sent before the failure
     assert_eq!(
         resp.headers()
-            .get("x-ferrogate-model-used")
+            .get("x-lumen-model-used")
             .and_then(|v| v.to_str().ok()),
         Some("gpt")
     );
     let body = resp.text().await.unwrap();
-    // Both chunks forwarded, then a clean FG-3010 terminal error frame.
+    // Both chunks forwarded, then a clean LM-3010 terminal error frame.
     assert!(body.contains("\"content\":\"a\""), "body: {body}");
     assert!(body.contains("\"content\":\"b\""), "body: {body}");
     assert!(
-        body.contains("FG-3010"),
+        body.contains("LM-3010"),
         "expected terminal error frame: {body}"
     );
     // Primary tried exactly once; the fallback's `.expect(0)` is verified on drop.
@@ -394,7 +394,7 @@ async fn health_stays_fast_under_upstream_429_storm() {
 
     // Every request completed with a fast failure, none hung. Under the storm
     // the breaker also trips (protecting the upstream), so a 503 (circuit open,
-    // FG-3020) is as valid as the raw 429 — both prove the gateway shed load
+    // LM-3020) is as valid as the raw 429 — both prove the gateway shed load
     // without an unbounded queue.
     let mut completed = 0;
     for task in tasks {

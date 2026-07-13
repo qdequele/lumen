@@ -5,7 +5,7 @@
 //! across providers. `reqwest::Client` uses rustls, never OpenSSL.
 
 use bytes::Bytes;
-use ferrogate_core::ProviderError;
+use lumen_core::ProviderError;
 use futures::stream::{BoxStream, StreamExt};
 use serde::Serialize;
 use std::future::Future;
@@ -23,7 +23,7 @@ pub fn build_client() -> reqwest::Client {
 }
 
 /// Build the process-wide HTTP client with an explicit connect timeout
-/// (FG-3012, client-wide — M6 §6.4) and an overall backstop.
+/// (LM-3012, client-wide — M6 §6.4) and an overall backstop.
 ///
 /// The `overall` cap is a safety net so a wedged upstream cannot pin a
 /// connection forever; the executor's total timeout (and cancellation on client
@@ -34,7 +34,7 @@ pub fn build_client_with(connect: Duration, overall: Duration) -> reqwest::Clien
     reqwest::Client::builder()
         .connect_timeout(connect)
         .timeout(overall)
-        .user_agent(concat!("ferrogate/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!("lumen/", env!("CARGO_PKG_VERSION")))
         .build()
         // Falls back to the default client if the builder somehow fails; the
         // default is always constructible, so this cannot panic in practice.
@@ -199,7 +199,7 @@ async fn send(
 pub(crate) fn map_transport(provider: &str, err: &reqwest::Error) -> ProviderError {
     if err.is_timeout() {
         // A timeout during connection establishment is distinct from a read
-        // timeout (FG-3012 vs FG-3005) so operators can tell a dead host from
+        // timeout (LM-3012 vs LM-3005) so operators can tell a dead host from
         // a slow one (M6 §6.4).
         if err.is_connect() {
             ProviderError::ConnectTimeout {

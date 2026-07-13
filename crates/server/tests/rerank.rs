@@ -1,14 +1,14 @@
 //! End-to-end HTTP tests for `POST /v1/rerank`: Cohere-format routing, alias
 //! resolution, gateway-side ordering / `top_n` clamp / document echo, upstream
-//! error propagation, and the FG-2010 empty-documents rejection. The upstream
+//! error propagation, and the LM-2010 empty-documents rejection. The upstream
 //! is a wiremock server speaking Cohere's v2 rerank schema.
 
 mod common;
 
 use std::sync::Arc;
 
-use ferrogate_core::Capability;
-use ferrogate_providers::{http, ModelSpec, ProviderKind, ProviderSpec, Registry};
+use lumen_core::Capability;
+use lumen_providers::{http, ModelSpec, ProviderKind, ProviderSpec, Registry};
 use serde_json::{json, Value};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -186,7 +186,7 @@ async fn empty_documents_is_400_fg2010() {
 
     assert_eq!(resp.status(), 400);
     let body: Value = resp.json().await.unwrap();
-    assert_eq!(body["error"]["code"], "FG-2010");
+    assert_eq!(body["error"]["code"], "LM-2010");
     assert_eq!(body["error"]["type"], "invalid_request");
     // No upstream call was made for a request rejected at the edge.
     assert_eq!(upstream.received_requests().await.unwrap().len(), 0);
@@ -206,7 +206,7 @@ async fn unknown_model_is_404_fg2001() {
 
     assert_eq!(resp.status(), 404);
     let body: Value = resp.json().await.unwrap();
-    assert_eq!(body["error"]["code"], "FG-2001");
+    assert_eq!(body["error"]["code"], "LM-2001");
 }
 
 #[tokio::test]
@@ -223,7 +223,7 @@ async fn embed_only_model_requested_for_rerank_is_400_fg2002() {
 
     assert_eq!(resp.status(), 400);
     let body: Value = resp.json().await.unwrap();
-    assert_eq!(body["error"]["code"], "FG-2002");
+    assert_eq!(body["error"]["code"], "LM-2002");
 }
 
 #[tokio::test]
@@ -246,6 +246,6 @@ async fn upstream_5xx_propagates_as_502_fg3003() {
 
     assert_eq!(resp.status(), 502);
     let body: Value = resp.json().await.unwrap();
-    assert_eq!(body["error"]["code"], "FG-3003");
+    assert_eq!(body["error"]["code"], "LM-3003");
     assert_eq!(body["error"]["type"], "upstream_error");
 }

@@ -5,7 +5,7 @@
 //! admits exactly **one** probe: success closes it, failure reopens it. State
 //! is pure in-memory and never touches a database or an `.await` while locked,
 //! so it is safe on the request hot path (pillar 1). Every transition is pushed
-//! to the `ferrogate_circuit_state` gauge (M6 §6.3) when a
+//! to the `lumen_circuit_state` gauge (M6 §6.3) when a
 //! [`ResilienceMetrics`] handle is supplied.
 //!
 //! Time is passed in as a [`tokio::time::Instant`] so the state machine is
@@ -14,7 +14,7 @@
 use std::sync::Mutex;
 
 use dashmap::DashMap;
-use ferrogate_telemetry::resilience::{
+use lumen_telemetry::resilience::{
     ResilienceMetrics, CIRCUIT_CLOSED, CIRCUIT_HALF_OPEN, CIRCUIT_OPEN,
 };
 use std::sync::Arc;

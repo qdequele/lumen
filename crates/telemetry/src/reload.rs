@@ -12,19 +12,19 @@ pub struct ReloadMetrics {
 }
 
 impl ReloadMetrics {
-    /// Register `ferrogate_config_reloads_total` and
-    /// `ferrogate_config_reload_failures_total`.
+    /// Register `lumen_config_reloads_total` and
+    /// `lumen_config_reload_failures_total`.
     ///
     /// # Errors
     ///
     /// [`prometheus::Error`] if a collector is registered twice.
     pub fn register(metrics: &Metrics) -> Result<Self, prometheus::Error> {
         let reloads_total = IntCounter::new(
-            "ferrogate_config_reloads_total",
+            "lumen_config_reloads_total",
             "Successful configuration hot reloads (atomic registry swaps).",
         )?;
         let reload_failures_total = IntCounter::new(
-            "ferrogate_config_reload_failures_total",
+            "lumen_config_reload_failures_total",
             "Configuration reloads rejected as invalid; the previous config was kept.",
         )?;
         let registry = metrics.registry();
@@ -59,7 +59,7 @@ mod tests {
         r.inc_failure();
         r.inc_failure();
         let out = metrics.encode_text();
-        assert!(out.contains("ferrogate_config_reloads_total 1"));
-        assert!(out.contains("ferrogate_config_reload_failures_total 2"));
+        assert!(out.contains("lumen_config_reloads_total 1"));
+        assert!(out.contains("lumen_config_reload_failures_total 2"));
     }
 }

@@ -1,4 +1,4 @@
-# Ferrogate config for the benchmark: one OpenAI-kind provider pointed at the
+# LUMEN config for the benchmark: one OpenAI-kind provider pointed at the
 # local mock. Auth off (measure the raw proxy path).
 [[providers]]
 name = "mock"
