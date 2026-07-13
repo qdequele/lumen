@@ -6,6 +6,51 @@ All notable changes to Ferrogate are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added — M6: résilience (retries, fallback, circuit breaker, timeouts, health)
+
+**M6 is complete.** The gateway now survives flaky upstreams without becoming
+flaky itself: retries, multi-provider fallback, a per-provider circuit breaker,
+per-phase timeouts and optional background health checks — none of it on a
+database path, and `/health` stays independent of provider health (the LiteLLM
+#15526 lesson: a 429 storm must not destabilise the gateway).
+
+- **Retries** (`[resilience]`): retryable upstream failures only (5xx,
+  connect/read timeout, 429 — *never* a client 4xx) with exponential backoff +
+  equal jitter (`retry_base_ms` 200, `retry_max_ms` 5000, `retry_max_attempts`
+  3), honouring an upstream `Retry-After` as a floor. The backoff maths are a
+  pure, unit-tested function fed a lock-free splitmix64 fraction — no
+  dependency, no blocking, no clock read on the hot path.
+- **Fallback chains** (§6.2): per-model `fallbacks = ["model-b", …]`, tried in
+  order once the primary's retries are spent or its circuit is open. Each
+  fallback must exist and serve every capability of the model it backs
+  (validated at boot). Responses carry `x-ferrogate-model-used` and
+  `usage_log.model_used` records which model actually served; metrics and cost
+  attribute to the served model.
+- **Circuit breaker** (§6.3): per (provider, model), Closed → Open (after
+  `circuit_failure_threshold` 5 consecutive faults) → Half-Open (after
+  `circuit_cooldown_ms` 30 000, exactly one probe) → Closed/Open. In-memory,
+  the lock never held across an await; state exported as
+  `ferrogate_circuit_state{provider,model}` (0/1/2). Open with no fallback left
+  → 503 `FG-3020` with `Retry-After`.
+- **Timeouts** (§6.4): `connect_timeout_ms` (5000, client-wide → `FG-3012`),
+  `first_token` (the M4 `server.first_token_timeout_ms`, 30 000 → `FG-3011`) and
+  `total_timeout_ms` (600 000 → `FG-3013`), each a distinct code. `first_token`
+  and `total` are overridable per provider; `connect` is client-wide (one
+  pooled HTTP client). All bounded by the executor's absolute total deadline.
+- **Streaming stays committed once it starts**: retry/fallback happen only while
+  *opening* the upstream byte stream; after the first frame the M4 guards
+  (FG-3010/3011, heartbeat) own the stream and never retry.
+- **Background health checks** (§6.5, `health_check_enabled` off by default):
+  a periodic probe of every provider with a configured `base_url` fills
+  `GET /health/providers` and `ferrogate_provider_up{provider}`; vendor-default
+  URLs report `unknown` (never probed). Entirely off the request path.
+- **Errors**: `FG-3012` (connect timeout, 504), `FG-3013` (total timeout, 504),
+  `FG-3020` (circuit open, 503). `ProviderError` gained `is_retryable` /
+  `is_provider_fault` classification shared by the retry loop and the breaker.
+- **ADR 005** records the execution model (one generic chain executor,
+  capability-specific resolution, breaker placement, streaming boundary, the
+  connect-per-provider and first-frame-peek simplifications deferred).
+
 ### Added — M5: auth, virtual keys, hard budgets & token accounting
 
 **M5 is complete.** The gateway can now be shared safely: keys, budgets that

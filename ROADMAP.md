@@ -55,12 +55,12 @@ le tokenizer précis opt-in (spawn_blocking) part en backlog — voir
 `docs/backlog.md` § M5.
 Spec : `specs/milestones/M5-auth-budgets.md`
 
-## M6 — Résilience
-- [ ] Retries avec backoff + jitter (honore Retry-After)
-- [ ] Chaînes de fallback multi-provider par modèle
-- [ ] Circuit breaker par provider
-- [ ] Timeouts configurables (connect, first-token, total)
-- [ ] Health checks providers en tâche de fond, JAMAIS dans le request path
+## M6 — Résilience ✅
+- [x] Retries avec backoff + jitter (honore Retry-After)
+- [x] Chaînes de fallback multi-provider par modèle
+- [x] Circuit breaker par provider
+- [x] Timeouts configurables (connect, first-token, total)
+- [x] Health checks providers en tâche de fond, JAMAIS dans le request path
 Spec : `specs/milestones/M6-resilience.md`
 
 ## M7 — Release

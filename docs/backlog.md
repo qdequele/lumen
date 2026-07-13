@@ -143,3 +143,24 @@ milestone.
 - **No zeroization of key material.** `MasterKey` and the raw env string are
   not zeroized on drop; the `zeroize` crate would close the residual-memory
   window. Low risk (single long-lived process), noted from the M5 review.
+
+## M6 (résilience) — deferred
+
+- **Per-provider connect timeout.** `connect` is a `reqwest::Client` setting and
+  the gateway shares one pooled client across providers, so the connect timeout
+  is process-wide. Per-provider connect would need one client per provider
+  (losing cross-provider pooling); `first_token` and `total` are already
+  per-provider. See ADR 005.
+- **First-frame-peek streaming retry.** Streaming retry/fallback happens only at
+  the *open* phase (send + status). A stream that opens 200 then errors on its
+  very first frame is treated as committed (clean SSE error frame, no retry).
+  Peeking the first frame before committing would let that case retry too —
+  more code, marginal benefit; deferred.
+- **Circuit-breaker map is unbounded by design.** One entry per (provider,
+  model) actually seen; bounded by the configured surface, never by client
+  input. If a future dynamic-model feature lets clients mint arbitrary model
+  ids, add an LRU cap.
+- **Health probe is a bare GET to `base_url`.** It proves reachability, not that
+  the model endpoint works (no auth, no real inference). A per-kind lightweight
+  liveness call (e.g. `GET /v1/models`) would be truer; deferred to keep the
+  probe provider-agnostic and free.
