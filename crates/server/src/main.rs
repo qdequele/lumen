@@ -20,10 +20,13 @@ use ferrogate_server::{
     health::{spawn_health_checks, ProbeTarget, ProviderHealth},
     lifecycle, log_startup,
     pricing::CostTable,
+    reload::spawn_config_reloader,
     resilience::ResilienceRuntime,
     state::AppState,
 };
-use ferrogate_telemetry::{logging::init_logging, Metrics, ResilienceMetrics, TokenMetrics};
+use ferrogate_telemetry::{
+    logging::init_logging, Metrics, ReloadMetrics, ResilienceMetrics, TokenMetrics,
+};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 
@@ -69,7 +72,7 @@ fn main() -> ExitCode {
     // Logging is initialised only after config parses, so the format is known.
     init_logging(config.log_format.into(), "info");
 
-    match run(config) {
+    match run(config, config_path) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             tracing::error!(error = %format!("{err:#}"), "server exited with error");
@@ -108,7 +111,7 @@ fn parse_args() -> Result<Option<PathBuf>, String> {
 }
 
 /// Build the app and serve until shutdown. Uses its own multi-thread runtime.
-fn run(config: Config) -> anyhow::Result<()> {
+fn run(config: Config, config_path: PathBuf) -> anyhow::Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -132,6 +135,8 @@ fn run(config: Config) -> anyhow::Result<()> {
             .context("failed to register token metrics")?;
         let resilience_metrics = ResilienceMetrics::register(&metrics)
             .context("failed to register resilience metrics")?;
+        let reload_metrics =
+            ReloadMetrics::register(&metrics).context("failed to register reload metrics")?;
         let resilience = Arc::new(ResilienceRuntime::from_config(
             &config,
             Some(resilience_metrics.clone()),
@@ -158,6 +163,14 @@ fn run(config: Config) -> anyhow::Result<()> {
             ferrogate_providers::Registry::build(provider_specs, client.clone())
                 .context("failed to build provider registry")?,
         );
+
+        // Config hot reload (M7 §7.3): SIGHUP or a config-file change re-validates
+        // and atomically swaps the routing table. A watcher-setup failure only
+        // disables reload — the server still runs — so it is logged, not fatal.
+        match spawn_config_reloader(config_path, Arc::clone(&registry), reload_metrics) {
+            Ok(_handle) => tracing::info!("config hot reload armed (SIGHUP + file watch)"),
+            Err(error) => tracing::warn!(%error, "config hot reload unavailable"),
+        }
 
         let health = boot_health(&config, &client, &resilience_metrics);
 

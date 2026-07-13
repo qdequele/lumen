@@ -18,6 +18,7 @@ pub mod lifecycle;
 pub mod metadata;
 pub mod models;
 pub mod pricing;
+pub mod reload;
 pub mod rerank;
 pub mod resilience;
 pub mod routes;

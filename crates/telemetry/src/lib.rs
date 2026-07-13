@@ -9,10 +9,12 @@
 
 pub mod logging;
 pub mod metrics;
+pub mod reload;
 pub mod resilience;
 pub mod tokens;
 
 pub use logging::init_logging;
 pub use metrics::Metrics;
+pub use reload::ReloadMetrics;
 pub use resilience::ResilienceMetrics;
 pub use tokens::{Direction, TokenMetrics};
