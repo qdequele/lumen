@@ -16,6 +16,18 @@ async fn health_returns_ok_json_even_without_any_api_keys() {
 }
 
 #[tokio::test]
+async fn responses_carry_default_security_headers() {
+    let base = common::spawn().await;
+    let resp = reqwest::get(format!("{base}/health")).await.unwrap();
+    let headers = resp.headers();
+    let get = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    assert_eq!(get("x-content-type-options"), Some("nosniff"));
+    assert_eq!(get("x-frame-options"), Some("DENY"));
+    assert_eq!(get("referrer-policy"), Some("no-referrer"));
+    assert!(get("content-security-policy").is_some_and(|v| v.starts_with("default-src 'none'")));
+}
+
+#[tokio::test]
 async fn every_response_carries_a_request_id() {
     let base = common::spawn().await;
 

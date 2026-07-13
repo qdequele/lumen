@@ -1,8 +1,11 @@
 //! Assembly of the axum application and its middleware stack.
 
 use crate::{admin, auth, chat, embeddings, health, models, rerank, routes, state::AppState};
+use axum::extract::Request;
+use axum::http::{header, HeaderValue};
+use axum::response::Response;
 use axum::{
-    middleware,
+    middleware::{self, Next},
     routing::{get, patch, post, put},
     Router,
 };
@@ -34,6 +37,8 @@ pub fn build_app(state: AppState, body_limit: usize) -> Router {
         .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
         .layer(TraceLayer::new_for_http().make_span_with(make_request_span))
         .layer(PropagateRequestIdLayer::x_request_id())
+        // Conservative default security headers on every response (M7 §7.4).
+        .layer(middleware::from_fn(security_headers))
         .layer(RequestBodyLimitLayer::new(body_limit));
 
     let api = Router::new()
@@ -67,6 +72,29 @@ pub fn build_app(state: AppState, body_limit: usize) -> Router {
     }
 
     app.with_state(state).layer(middleware_stack)
+}
+
+/// Conservative default security headers for every response (M7 §7.4).
+///
+/// Ferrogate is a JSON/SSE API, never a browser-rendered app, so the strictest
+/// values are safe: deny framing and sniffing, send no referrer, and lock the
+/// CSP to `default-src 'none'`. HSTS is deliberately *not* set — it depends on
+/// the deployment terminating TLS, so it is left to the operator's proxy.
+async fn security_headers(request: Request, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    for (name, value) in [
+        (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        (header::X_FRAME_OPTIONS, "DENY"),
+        (header::REFERRER_POLICY, "no-referrer"),
+        (
+            header::CONTENT_SECURITY_POLICY,
+            "default-src 'none'; frame-ancestors 'none'",
+        ),
+    ] {
+        headers.insert(name, HeaderValue::from_static(value));
+    }
+    response
 }
 
 /// Build the per-request tracing span. Only metadata — never the body or query.
