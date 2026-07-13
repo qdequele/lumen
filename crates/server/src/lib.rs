@@ -13,6 +13,7 @@ pub mod chat;
 pub mod config;
 pub mod embeddings;
 pub mod error;
+pub mod health;
 pub mod lifecycle;
 pub mod metadata;
 pub mod models;

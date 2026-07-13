@@ -1,6 +1,7 @@
 //! Shared application state handed to axum handlers.
 
 use crate::auth::AuthRuntime;
+use crate::health::ProviderHealth;
 use crate::pricing::CostTable;
 use crate::resilience::ResilienceRuntime;
 use ferrogate_auth::usage::UsageLogger;
@@ -56,6 +57,8 @@ pub struct AppState {
     /// Resilience runtime: circuit breakers, retry policy, timeouts, fallback
     /// chains (M6). All in-memory; never on a database path.
     pub resilience: Arc<ResilienceRuntime>,
+    /// Background provider-health registry (M6 §6.5), for `/health/providers`.
+    pub health: Arc<ProviderHealth>,
 }
 
 impl AppState {
@@ -73,6 +76,7 @@ impl AppState {
             usage: None,
             pricing: Arc::new(CostTable::default()),
             resilience: Arc::new(ResilienceRuntime::defaults()),
+            health: Arc::new(ProviderHealth::default()),
         }
     }
 
@@ -80,6 +84,13 @@ impl AppState {
     #[must_use]
     pub fn with_resilience(mut self, resilience: Arc<ResilienceRuntime>) -> Self {
         self.resilience = resilience;
+        self
+    }
+
+    /// Attach the provider-health registry (builder style).
+    #[must_use]
+    pub fn with_health(mut self, health: Arc<ProviderHealth>) -> Self {
+        self.health = health;
         self
     }
 

@@ -17,6 +17,7 @@ use ferrogate_server::{
     auth::{now_unix, AuthRuntime},
     build_app,
     config::Config,
+    health::{spawn_health_checks, ProbeTarget, ProviderHealth},
     lifecycle, log_startup,
     pricing::CostTable,
     resilience::ResilienceRuntime,
@@ -133,7 +134,7 @@ fn run(config: Config) -> anyhow::Result<()> {
             ResilienceMetrics::register(&metrics).context("failed to register resilience metrics")?;
         let resilience = Arc::new(ResilienceRuntime::from_config(
             &config,
-            Some(resilience_metrics),
+            Some(resilience_metrics.clone()),
         ));
 
         // The M5 auth stack: SQLite store, in-memory key state, usage writer,
@@ -154,14 +155,17 @@ fn run(config: Config) -> anyhow::Result<()> {
             Duration::from_millis(config.resilience.total_timeout_ms.saturating_add(30_000)),
         );
         let registry = Arc::new(
-            ferrogate_providers::Registry::build(provider_specs, client)
+            ferrogate_providers::Registry::build(provider_specs, client.clone())
                 .context("failed to build provider registry")?,
         );
+
+        let health = boot_health(&config, &client, &resilience_metrics);
 
         let mut state = AppState::new(metrics, registry, tokens)
             .with_guards(guards)
             .with_pricing(CostTable::from_config(&config))
-            .with_resilience(resilience);
+            .with_resilience(resilience)
+            .with_health(health);
         if let Some(runtime) = auth_runtime.clone() {
             state = state.with_auth(runtime);
         }
@@ -200,6 +204,47 @@ fn run(config: Config) -> anyhow::Result<()> {
         tracing::info!("shutdown complete");
         Ok(())
     })
+}
+
+/// Seed the provider-health registry (every provider `unknown`) and, when
+/// enabled, spawn the background probe task (M6 §6.5). Only providers with a
+/// configured `base_url` are probed; vendor-default URLs stay `unknown`.
+fn boot_health(
+    config: &Config,
+    client: &reqwest::Client,
+    resilience_metrics: &ResilienceMetrics,
+) -> Arc<ProviderHealth> {
+    let provider_names: Vec<String> = config.providers.iter().map(|p| p.name.clone()).collect();
+    let health = Arc::new(ProviderHealth::with_providers(&provider_names));
+    if !config.resilience.health_check_enabled {
+        return health;
+    }
+    let targets: Vec<ProbeTarget> = config
+        .providers
+        .iter()
+        .filter_map(|p| {
+            p.base_url.clone().map(|url| ProbeTarget {
+                name: p.name.clone(),
+                url,
+            })
+        })
+        .collect();
+    if targets.is_empty() {
+        tracing::warn!(
+            "health checks enabled but no provider has a configured base_url; providers on \
+             built-in vendor URLs report 'unknown' (never probed)"
+        );
+    } else {
+        spawn_health_checks(
+            client.clone(),
+            targets,
+            Arc::clone(&health),
+            Some(resilience_metrics.clone()),
+            Duration::from_millis(config.resilience.health_check_interval_ms),
+            Duration::from_millis(config.resilience.connect_timeout_ms),
+        );
+    }
+    health
 }
 
 /// Boot the M5 auth stack: master key, SQLite store, provider-key back-fill,

@@ -1,6 +1,6 @@
 //! Assembly of the axum application and its middleware stack.
 
-use crate::{admin, auth, chat, embeddings, models, rerank, routes, state::AppState};
+use crate::{admin, auth, chat, embeddings, health, models, rerank, routes, state::AppState};
 use axum::{
     middleware,
     routing::{get, patch, post, put},
@@ -24,7 +24,8 @@ use tracing::info_span;
 /// 4. reject bodies larger than `body_limit` bytes.
 ///
 /// Route groups:
-/// * `/health`, `/metrics` — operational, never authenticated, no I/O;
+/// * `/health`, `/health/providers`, `/metrics` — operational, never
+///   authenticated, no I/O (`/health` never depends on provider state);
 /// * `/v1/*` — the API surface; virtual-key auth when enabled (M5);
 /// * `/admin/*` — key management; mounted only when auth is enabled,
 ///   protected by the master key.
@@ -47,6 +48,9 @@ pub fn build_app(state: AppState, body_limit: usize) -> Router {
 
     let mut app = Router::new()
         .route("/health", get(routes::health))
+        // Separate from /health (which never depends on provider state): the
+        // observability view of background health checks (M6 §6.5).
+        .route("/health/providers", get(health::providers_health))
         .route("/metrics", get(routes::metrics))
         .merge(api);
 
