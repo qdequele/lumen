@@ -76,6 +76,13 @@ struct Inner {
     opened_at: Option<Instant>,
     /// Half-Open: a probe is in flight, so no other caller may probe.
     probe_in_flight: bool,
+    /// When the outstanding half-open probe was admitted. Used to auto-rearm:
+    /// a probe whose result never comes back (client disconnect, total-timeout,
+    /// or a non-provider-fault error that neither closes nor reopens the
+    /// breaker) would otherwise pin `probe_in_flight = true` forever. After a
+    /// cooldown with no resolution the probe is presumed lost and a fresh one
+    /// is admitted, so the breaker can never wedge shut.
+    probe_admitted_at: Option<Instant>,
 }
 
 /// One circuit breaker, keyed externally by (provider, model).
@@ -101,6 +108,7 @@ impl CircuitBreaker {
                 consecutive_failures: 0,
                 opened_at: None,
                 probe_in_flight: false,
+                probe_admitted_at: None,
             }),
             config,
             provider,
@@ -137,6 +145,7 @@ impl CircuitBreaker {
                 if now >= ready_at {
                     inner.state = CircuitState::HalfOpen;
                     inner.probe_in_flight = true;
+                    inner.probe_admitted_at = Some(now);
                     drop(inner);
                     self.report(CircuitState::HalfOpen);
                     Admission::Allowed
@@ -147,13 +156,21 @@ impl CircuitBreaker {
                 }
             }
             CircuitState::HalfOpen => {
-                if inner.probe_in_flight {
-                    // Another request is already probing; keep short-circuiting.
+                // A probe already in flight blocks others — unless it has been
+                // outstanding longer than the cooldown, in which case it is
+                // presumed lost (no on_success/on_failure ever ran) and a fresh
+                // probe is admitted so the breaker cannot wedge shut.
+                let expires_at = inner.probe_admitted_at.map(|t| t + self.config.cooldown);
+                // MSRV 1.80: `Option::is_none_or` is 1.82, so use `map_or`.
+                let stale = expires_at.map_or(true, |deadline| now >= deadline);
+                if inner.probe_in_flight && !stale {
                     Admission::Rejected {
-                        retry_after: self.config.cooldown,
+                        retry_after: expires_at
+                            .map_or(self.config.cooldown, |d| d.saturating_duration_since(now)),
                     }
                 } else {
                     inner.probe_in_flight = true;
+                    inner.probe_admitted_at = Some(now);
                     Admission::Allowed
                 }
             }
@@ -168,6 +185,7 @@ impl CircuitBreaker {
         inner.consecutive_failures = 0;
         inner.opened_at = None;
         inner.probe_in_flight = false;
+        inner.probe_admitted_at = None;
         drop(inner);
         if was != CircuitState::Closed {
             self.report(CircuitState::Closed);
@@ -184,6 +202,7 @@ impl CircuitBreaker {
                 inner.state = CircuitState::Open;
                 inner.opened_at = Some(now);
                 inner.probe_in_flight = false;
+                inner.probe_admitted_at = None;
                 drop(inner);
                 self.report(CircuitState::Open);
             }
@@ -333,6 +352,32 @@ mod tests {
         b.on_success();
         assert_eq!(b.state(), CircuitState::Closed);
         assert_eq!(b.admit(after), Admission::Allowed);
+    }
+
+    #[tokio::test]
+    async fn a_lost_probe_does_not_wedge_the_breaker_shut() {
+        // The probe is admitted but its result never comes back (client
+        // disconnect / total-timeout / non-fault error → neither on_success nor
+        // on_failure runs). Without auto-rearm the breaker would reject forever.
+        let b = breaker();
+        let t0 = Instant::now();
+        for _ in 0..5 {
+            b.on_failure(t0);
+        }
+        let probe_at = t0 + Duration::from_secs(31);
+        assert_eq!(b.admit(probe_at), Admission::Allowed); // probe admitted…
+                                                           // …and simply never resolved. A second probe within the cooldown is
+                                                           // still rejected (single-probe guarantee holds inside the window).
+        assert!(matches!(
+            b.admit(probe_at + Duration::from_secs(1)),
+            Admission::Rejected { .. }
+        ));
+        // But once the lost probe's own cooldown elapses, a fresh probe passes.
+        assert_eq!(
+            b.admit(probe_at + Duration::from_secs(31)),
+            Admission::Allowed,
+            "a lost probe must not pin the breaker shut"
+        );
     }
 
     #[tokio::test]

@@ -69,7 +69,6 @@ pub async fn chat(
     let chain = ferrogate_router::resolve_chat_chain(&state.registry, &chain_ids)?;
     let links = ferrogate_router::chat_links(&chain);
     let exec = state.resilience.exec_config(&client_model);
-    let guards = state.guards;
 
     // Admission BEFORE the upstream call (M5 §5.2): reserve the pre-call
     // estimate (prompt heuristic + `max_tokens`, or a default output
@@ -82,7 +81,7 @@ pub async fn chat(
     let estimated_cost = state
         .pricing
         .token_cost(&client_model, estimated_input, reserved_output);
-    let mut accounting = Accounting::begin(
+    let accounting = Accounting::begin(
         &state,
         &headers,
         key.as_deref(),
@@ -99,88 +98,126 @@ pub async fn chat(
     let cancel = CancellationToken::new();
     let guard = cancel.clone().drop_guard();
 
+    let ctx = ChatExec {
+        state: &state,
+        chain: &chain,
+        links: &links,
+        exec,
+        cancel: &cancel,
+        req: &req,
+        estimated_input,
+    };
     if req.stream {
-        // Zero-copy passthrough where the upstream speaks OpenAI SSE; typed
-        // providers translate event by event (ADR 004). The executor opens the
-        // stream with retry/fallback (spec 6.2: only before the first frame);
-        // an open failure surfaces here as a JSON error envelope, or a plain
-        // 504 if no upstream ever answered (headers are not sent yet).
-        let executed = ferrogate_router::executor::execute(
-            &links,
-            &state.resilience.breakers,
-            &exec,
-            &cancel,
-            |i| {
-                let provider = chain[i].route.provider.clone();
-                let cancel = cancel.clone();
-                let mut attempt_req = req.clone();
-                attempt_req.stream = true;
-                chain[i]
-                    .route
-                    .upstream_id
-                    .clone_into(&mut attempt_req.model);
-                async move { provider.chat_stream_bytes(attempt_req, cancel).await }
-            },
-        )
-        .await?;
-        // (an early return above drops `accounting`, refunding the reservation)
-        accounting.served_by(&executed.model_used, &executed.provider_used);
-
-        // A fresh first-frame deadline now that the stream is open (the open
-        // phase already had its own first-token budget). The M4 frame guards
-        // (FG-3010/3011, heartbeat) own the stream from here — no more retries.
-        let deadline = tokio::time::Instant::now() + exec.first_token;
-        let stream_accounting = StreamAccounting::new(accounting, estimated_input);
-        let body = Body::from_stream(to_event_stream(
-            executed.value,
-            executed.provider_used.clone(),
-            guard,
-            guards,
-            deadline,
-            Some(stream_accounting),
-        ));
-        Ok((
-            [
-                (header::CONTENT_TYPE, "text/event-stream"),
-                (header::CACHE_CONTROL, "no-cache"),
-            ],
-            model_used_headers(&executed.model_used),
-            body,
-        )
-            .into_response())
+        chat_streaming(&ctx, guard, accounting).await
     } else {
-        // Held across the await so a disconnect during the call cancels it.
-        let _guard = guard;
-        let executed = ferrogate_router::executor::execute(
-            &links,
-            &state.resilience.breakers,
-            &exec,
-            &cancel,
-            |i| {
-                let provider = chain[i].route.provider.clone();
-                let cancel = cancel.clone();
-                let mut attempt_req = req.clone();
-                chain[i]
-                    .route
-                    .upstream_id
-                    .clone_into(&mut attempt_req.model);
-                async move { provider.chat(attempt_req, cancel).await }
-            },
-        )
-        .await?;
-        // (an early return above drops `accounting`, refunding the reservation)
-        accounting.served_by(&executed.model_used, &executed.provider_used);
-        let mut response = executed.value;
-        let served_model = executed.model_used.clone();
-        settle_non_streaming(
-            accounting,
-            &state,
-            &served_model,
-            estimated_input,
-            &mut response,
-        );
-        Ok((model_used_headers(&served_model), Json(response)).into_response())
+        chat_non_streaming(&ctx, guard, accounting).await
     }
+}
+
+/// Everything the two chat execution paths share, bundled so the helpers stay
+/// under the argument-count lint.
+struct ChatExec<'a> {
+    state: &'a AppState,
+    chain: &'a [ferrogate_router::ChatChainLink],
+    links: &'a [ferrogate_router::executor::Link],
+    exec: ferrogate_router::executor::ExecConfig,
+    cancel: &'a CancellationToken,
+    req: &'a ChatRequest,
+    estimated_input: u64,
+}
+
+/// Streaming path: open the upstream byte stream with retry/fallback (only
+/// before the first frame, spec 6.2), then hand it to the M4 frame guards.
+/// Zero-copy passthrough where the upstream speaks OpenAI SSE; typed providers
+/// translate event by event (ADR 004). An open failure surfaces as a JSON error
+/// envelope (headers not sent yet).
+async fn chat_streaming(
+    ctx: &ChatExec<'_>,
+    guard: DropGuard,
+    mut accounting: Accounting,
+) -> Result<Response, ApiError> {
+    let executed = ferrogate_router::executor::execute(
+        ctx.links,
+        &ctx.state.resilience.breakers,
+        &ctx.exec,
+        ctx.cancel,
+        |i| {
+            let provider = ctx.chain[i].route.provider.clone();
+            let cancel = ctx.cancel.clone();
+            let mut attempt_req = ctx.req.clone();
+            attempt_req.stream = true;
+            ctx.chain[i]
+                .route
+                .upstream_id
+                .clone_into(&mut attempt_req.model);
+            async move { provider.chat_stream_bytes(attempt_req, cancel).await }
+        },
+    )
+    .await?;
+    // (an early return above drops `accounting`, refunding the reservation)
+    accounting.served_by(&executed.model_used, &executed.provider_used);
+
+    // A fresh first-frame deadline now that the stream is open (the open phase
+    // already had its own first-token budget). The M4 frame guards
+    // (FG-3010/3011, heartbeat) own the stream from here — no more retries.
+    let deadline = tokio::time::Instant::now() + ctx.exec.first_token;
+    let stream_accounting = StreamAccounting::new(accounting, ctx.estimated_input);
+    let body = Body::from_stream(to_event_stream(
+        executed.value,
+        executed.provider_used.clone(),
+        guard,
+        ctx.state.guards,
+        deadline,
+        Some(stream_accounting),
+    ));
+    Ok((
+        [
+            (header::CONTENT_TYPE, "text/event-stream"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        model_used_headers(&executed.model_used),
+        body,
+    )
+        .into_response())
+}
+
+/// Non-streaming path: one JSON completion across the chain, settled inline.
+async fn chat_non_streaming(
+    ctx: &ChatExec<'_>,
+    guard: DropGuard,
+    mut accounting: Accounting,
+) -> Result<Response, ApiError> {
+    // Held across the await so a disconnect during the call cancels it.
+    let _guard = guard;
+    let executed = ferrogate_router::executor::execute(
+        ctx.links,
+        &ctx.state.resilience.breakers,
+        &ctx.exec,
+        ctx.cancel,
+        |i| {
+            let provider = ctx.chain[i].route.provider.clone();
+            let cancel = ctx.cancel.clone();
+            let mut attempt_req = ctx.req.clone();
+            ctx.chain[i]
+                .route
+                .upstream_id
+                .clone_into(&mut attempt_req.model);
+            async move { provider.chat(attempt_req, cancel).await }
+        },
+    )
+    .await?;
+    // (an early return above drops `accounting`, refunding the reservation)
+    accounting.served_by(&executed.model_used, &executed.provider_used);
+    let mut response = executed.value;
+    let served_model = executed.model_used.clone();
+    settle_non_streaming(
+        accounting,
+        ctx.state,
+        &served_model,
+        ctx.estimated_input,
+        &mut response,
+    );
+    Ok((model_used_headers(&served_model), Json(response)).into_response())
 }
 
 /// Close the books on a non-streaming completion (ADR 003): upstream usage

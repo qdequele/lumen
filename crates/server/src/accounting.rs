@@ -274,9 +274,12 @@ impl StreamAccounting {
             return;
         };
         let (tokens_in, tokens_out, estimated) = self.sniffer.result(self.estimated_input);
+        // Bill at the model that actually served the stream (a fallback may
+        // differ from the requested model) — consistent with the non-streaming,
+        // embed and rerank paths.
         let cost = accounting
             .pricing()
-            .token_cost(&accounting.model, tokens_in, tokens_out);
+            .token_cost(accounting.model_used(), tokens_in, tokens_out);
         accounting.finish(&Outcome {
             tokens_in,
             tokens_out,
