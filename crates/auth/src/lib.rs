@@ -11,12 +11,14 @@
 //! * [`crypto`] — AES-256-GCM sealing of provider keys at rest.
 //! * [`store`] — the SQLite store (sqlx) with embedded migrations.
 //! * [`state`] — the in-memory key table the request path enforces against.
+//! * [`usage`] — the bounded-channel, batched usage-log writer.
 
 pub mod crypto;
 pub mod error;
 pub mod key;
 pub mod state;
 pub mod store;
+pub mod usage;
 
 pub use error::AuthError;
 
