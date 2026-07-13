@@ -40,10 +40,13 @@ jobs:
       - uses: actions/checkout@v4
 
       # Advisory database check (RUSTSEC) — fails on known vulnerabilities.
+      # Ignored advisories are transitive and not exploitable here; the
+      # rationale lives in deny.toml (kept in sync).
       - name: cargo audit
         uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          ignore: RUSTSEC-2023-0071,RUSTSEC-2024-0384
 
       # License policy + advisories + source pinning (see deny.toml).
       - name: cargo deny

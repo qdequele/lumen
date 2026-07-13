@@ -3,8 +3,19 @@
 
 [advisories]
 version = 2
-# Fail on known-vulnerable or yanked crates.
-yanked = "deny"
+# A yanked *transitive* crate we can't control (spin 0.9.8 via sqlx → flume) is
+# a warning, not a hard failure; direct deps are still reviewed.
+yanked = "warn"
+# Advisories consciously accepted, each transitive and not exploitable here:
+ignore = [
+    # `rsa` Marvin timing side-channel. `rsa` is a Cargo.lock-only artifact of
+    # sqlx's macro crate (MySQL path); it is NOT in our compiled graph
+    # (`cargo tree -i rsa` finds nothing) and LUMEN performs no RSA/MySQL ops.
+    "RUSTSEC-2023-0071",
+    # `instant` unmaintained — transitive via `notify` (config file-watch);
+    # used only for coarse timers. Bumps land when `notify` moves to `web-time`.
+    "RUSTSEC-2024-0384",
+]
 
 [licenses]
 version = 2
