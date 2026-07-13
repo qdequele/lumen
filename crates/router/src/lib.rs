@@ -10,6 +10,9 @@
 
 #![forbid(unsafe_code)]
 
+pub mod circuit;
+pub mod retry;
+
 use ferrogate_core::{Capability, GatewayError};
 use ferrogate_providers::{ChatRoute, EmbeddingRoute, Registry, RerankRoute};
 
