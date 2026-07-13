@@ -41,14 +41,18 @@ Note : l'estimation locale des tokens en streaming (usage amont absent →
 `usage_log` ; l'usage amont, lui, est déjà propagé (dernier chunk).
 Spec : `specs/milestones/M4-chat-streaming.md`
 
-## M5 — Auth, clés virtuelles & budgets durs
-- [ ] SQLite (sqlx) : clés virtuelles hashées, clés providers chiffrées au repos (AES-GCM)
-- [ ] Budgets DURS par clé, enforced DANS le chemin de requête avant l'appel amont
-- [ ] Quotas RPM/TPM par clé
-- [ ] Comptage coûts par capacité (tokens chat, tokens input embeddings, searches rerank)
-- [ ] Écriture des logs d'usage via channel borné → writer batché (jamais sync)
-- [ ] Estimation locale des tokens quand l'amont n'en renvoie pas (streaming inclus), marquée `estimated` (ADR 003)
-- [ ] Header de métadonnées par requête (`x-ferrogate-metadata`, style Cloudflare AI Gateway) → logs + `usage_log` + labels Prometheus via allowlist (ADR 002)
+## M5 — Auth, clés virtuelles & budgets durs ✅
+- [x] SQLite (sqlx) : clés virtuelles hashées, clés providers chiffrées au repos (AES-GCM)
+- [x] Budgets DURS par clé, enforced DANS le chemin de requête avant l'appel amont
+- [x] Quotas RPM/TPM par clé
+- [x] Comptage coûts par capacité (tokens chat, tokens input embeddings, searches rerank)
+- [x] Écriture des logs d'usage via channel borné → writer batché (jamais sync)
+- [x] Estimation locale des tokens quand l'amont n'en renvoie pas (streaming inclus), marquée `estimated` (ADR 003)
+- [x] Header de métadonnées par requête (`x-ferrogate-metadata`, style Cloudflare AI Gateway) → logs + `usage_log` + labels Prometheus via allowlist (ADR 002)
+
+Note : l'estimation locale = heuristique octets (inline, hot-path-safe) ;
+le tokenizer précis opt-in (spawn_blocking) part en backlog — voir
+`docs/backlog.md` § M5.
 Spec : `specs/milestones/M5-auth-budgets.md`
 
 ## M6 — Résilience

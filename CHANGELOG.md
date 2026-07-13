@@ -6,6 +6,65 @@ All notable changes to Ferrogate are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added — M5: auth, virtual keys, hard budgets & token accounting
+
+**M5 is complete.** The gateway can now be shared safely: keys, budgets that
+can NEVER be overrun, and a token count for every single request.
+
+- **Virtual keys** (`[auth]`, off by default): `fg-` + 32 random bytes,
+  stored as a BLAKE3 hash only (the keys are 256-bit random — a password KDF
+  would just burn hot-path CPU). Auth on all of `/v1/*`; unknown, disabled
+  and expired keys are one indistinguishable `FG-4004` (401). `/health` and
+  `/metrics` stay open.
+- **Hard budgets, enforced in memory** (M5 §5.2): the pre-call cost estimate
+  is *reserved* with an atomic CAS before the upstream call and settled to
+  the real usage after it — 50 concurrent requests against a budget for 10
+  admit exactly 10 (tested at both the atomic and the HTTP level). Refusals
+  happen BEFORE any upstream traffic: 402 `FG-4001` (budget), 429 `FG-4002`
+  (RPM) / `FG-4003` (TPM, with `Retry-After`). The DB is never consulted on
+  the request path; budgets flush to SQLite periodically (default 10 s — a
+  crash loses at most that much *accounting*, never allows an overrun) and
+  reload at boot, so an exhausted key stays exhausted across restarts.
+- **Token accounting always on** (ADR 003): every chat/embed/rerank call
+  yields a count — upstream usage when reported (`estimated=false`), else a
+  byte-heuristic estimate flagged `estimated: true` in the response body, in
+  `ferrogate_tokens_total{capability,model,provider,direction,estimated}`
+  and in `usage_log`. TEI's report-nothing embeddings now count > 0.
+  Streaming chat sniffs the final usage chunk with bounded state (no
+  response accumulation); rerank counts search units (upstream-billed or
+  derived, never silently zero). The opt-in accurate tokenizer stays in the
+  backlog — only the O(bytes) heuristic runs, inline and hot-path-safe.
+- **Cost counting** (§5.4b): per-model prices in config (`cost_per_1m_input`,
+  `cost_per_1m_output`, `cost_per_1k_searches`) feed both the budget
+  reservation and the `usage_log.cost` column. Unpriced models cost 0.
+- **Async usage log** (§5.3): bounded mpsc (default 10 000) → batched writer
+  (500 entries / 2 s); a full channel drops the entry and bumps
+  `ferrogate_usage_log_dropped_total` — the request path NEVER blocks on
+  logging. Background retention purge (default 30 days). No prompt/response
+  content is ever stored.
+- **Request metadata** (ADR 002): `x-ferrogate-metadata` (alias
+  `cf-aig-metadata`), a flat JSON object bounded at 16 keys / 64 B keys /
+  256 B values / 4 KiB, parsed once at the edge. Full object → structured
+  logs + `usage_log.metadata`; ONLY `telemetry.metadata_labels` allowlist
+  keys become Prometheus labels (default empty — client metadata can never
+  mint a time series). Malformed metadata never fails the request: dropped
+  with a warn + `ferrogate_metadata_rejected_total`.
+- **Admin API** (§5.5), mounted only when auth is on and gated by
+  `FERROGATE_MASTER_KEY` (64 hex chars, compared by hash): `POST/GET
+  /admin/keys`, `PATCH /admin/keys/{id}` (changes apply immediately, no
+  restart), and `PUT /admin/provider-keys/{name}` to store provider keys
+  AES-256-GCM-encrypted at rest (env vars remain the default; DB keys
+  back-fill env-less providers at boot). Key creation is the single moment
+  the plaintext exists.
+
+### Changed
+
+- **FG-4xxx codes realigned to the M5 spec** (they were placeholders, never
+  emitted): `FG-4001` = budget exhausted (402), `FG-4002` = RPM (429),
+  `FG-4003` = TPM (429), `FG-4004` = missing/invalid key (401).
+- `Usage`, `EmbedUsage` and `RerankUsage` gained an optional `estimated`
+  field, omitted unless the gateway estimated the counts (ADR 003).
+
 ### Added — M4 (final slice): streaming translation, tools, and stream guards
 
 **M4 is complete.** This slice closes every remaining criterion:

@@ -47,15 +47,19 @@ retried on a fallback (M6) before surfacing.
 | `FG-3010` | 502  | An upstream stream ended prematurely (no terminator).          |
 | `FG-3011` | 504  | An upstream produced no first token within the deadline.       |
 
-For `FG-3001` (and `FG-4003`), a `Retry-After` value may be advertised.
+For `FG-3001` (and `FG-4002`/`FG-4003`), a `Retry-After` value may be advertised.
 
-## Auth / budget errors — `FG-4xxx` · `type: invalid_request` *(M5)*
+## Auth / budget errors — `FG-4xxx` · `type: invalid_request`
+
+Codes pinned by the M5 spec. Enforcement happens in memory, **before** any
+upstream call — a rejected request never leaks spend to a provider.
 
 | Code      | HTTP | Meaning                                                        |
 |-----------|------|----------------------------------------------------------------|
-| `FG-4001` | 401  | Missing or invalid virtual key.                                |
-| `FG-4002` | 402  | The virtual key's hard budget is exhausted.                    |
-| `FG-4003` | 429  | A gateway-side quota (RPM/TPM) was exceeded.                    |
+| `FG-4001` | 402  | The virtual key's hard budget is exhausted.                    |
+| `FG-4002` | 429  | The key's requests-per-minute quota was exceeded.              |
+| `FG-4003` | 429  | The key's tokens-per-minute quota was exceeded.                |
+| `FG-4004` | 401  | Missing or invalid virtual key. Deliberately does not say *why* (unknown, disabled and expired are indistinguishable) so callers cannot probe key state. |
 
 ## Internal errors — `FG-5xxx` · `type: internal`
 
@@ -65,6 +69,3 @@ For `FG-3001` (and `FG-4003`), a `Retry-After` value may be advertised.
 
 Internal errors return an opaque `"internal error"` message to the client; the
 underlying detail is written only to the server logs, never the response.
-
-> Codes marked *(M5)* are defined now (the taxonomy is stable) but are only
-> emitted once the corresponding milestone lands.

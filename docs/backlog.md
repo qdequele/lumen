@@ -111,3 +111,28 @@ milestone.
   (un `functionCall` serait avalé). Décider : mapper vers `functionDeclarations`
   Gemini, ou rejeter explicitement (FG-2002) quand `tools` est présent sur un
   modèle routé Google. Relevé en review M4.
+
+## Noted while building M5
+
+- **Accurate per-model tokenizer deferred.** ADR 003's opt-in "accurate
+  tokenizer via `spawn_blocking`" is not implemented: the fallback is the
+  byte-heuristic only (O(bytes), inline, hot-path-safe). Adding `tokenizers`/
+  tiktoken is a heavy dependency for marginal v1 benefit; the config knob and
+  the `spawn_blocking` plumbing should land together when a user needs
+  billing-grade estimates. Until then `estimated=true` counts are heuristic.
+- **Streaming output estimation = data-frame count.** When a stream carries no
+  usage (rare: `include_usage` is auto-requested and translators always emit
+  usage), the output-token estimate is the number of `data:` frames (~1 token
+  per delta for OpenAI-style streams). Crude but honest (`estimated=true`).
+- **usage_log records successful requests only.** Refusals (401/402/429) and
+  upstream failures are visible in logs/metrics but produce no usage row (no
+  spend happened). If per-key rejection analytics matter, add a `status`-only
+  row path — the column already exists.
+- **Rejected requests still count toward RPM/TPM.** Quota bumps are not
+  unwound when a later admission step (budget) refuses the request. Standard
+  rate-limiter behaviour; documented here for the principle of least surprise.
+- **DB-stored provider keys are boot-time only.** `PUT /admin/provider-keys`
+  takes effect at the next restart; wire it into the M7 hot-reload path.
+- **Metadata values are stringified** in `usage_log.metadata` (JSON object of
+  strings). If typed filtering (numeric ranges) matters, store the original
+  JSON value instead.

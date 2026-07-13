@@ -32,6 +32,46 @@ first_token_timeout_ms = 30000
 sse_heartbeat_ms = 15000
 
 # ---------------------------------------------------------------------------
+# Auth: virtual keys, hard budgets, quotas, usage log (M5). Disabled by
+# default — the gateway is then an open proxy with no database at all.
+#
+# When enabled, the FERROGATE_MASTER_KEY env var is REQUIRED (64 hex chars =
+# 32 bytes). It is both the bearer token of the /admin API and the AES-256-GCM
+# key sealing provider keys stored at rest. Never logged, never stored.
+#
+# Enforcement is in memory on the request path (the DB is never consulted per
+# request): budget checks are an atomic reservation of the pre-call estimate,
+# settled to the real usage after the call. Refusals: 402 FG-4001 (budget),
+# 429 FG-4002 (RPM), 429 FG-4003 (TPM) — always BEFORE the upstream call.
+# ---------------------------------------------------------------------------
+[auth]
+enabled = false
+db_path = "ferrogate.db"          # SQLite file, created if missing
+flush_interval_ms = 10000         # memory→DB budget flush; a crash loses at
+                                  # most this much ACCOUNTING, never allows an
+                                  # overrun (enforcement is in memory)
+usage_channel_capacity = 10000    # bounded log channel; full = drop + counter
+usage_batch_max = 500             # write a batch at this many entries…
+usage_flush_ms = 2000             # …or at least this often
+retention_days = 30               # purge usage_log rows older than this
+
+# ---------------------------------------------------------------------------
+# Telemetry (ADR 002).
+#
+# Clients may send an `x-ferrogate-metadata` header (alias: `cf-aig-metadata`)
+# with a FLAT JSON object (≤ 16 keys, key ≤ 64 B, value ≤ 256 B, header ≤ 4 KiB)
+# of string/number/bool values. The full object is attached to structured logs
+# and the usage_log `metadata` column. It is opaque — never inspected — but it
+# IS logged: do not put secrets or prompt content in it.
+#
+# ONLY the keys listed here become Prometheus labels on the token counters;
+# everything else stays logs-only. Empty (the default) = client metadata can
+# never create a single new time series. Cardinality is your decision.
+# ---------------------------------------------------------------------------
+[telemetry]
+metadata_labels = []              # e.g. ["team", "env"]
+
+# ---------------------------------------------------------------------------
 # Providers
 #
 # Each `[[providers]]` block declares one upstream. `kind` selects the built-in
@@ -57,6 +97,10 @@ api_key_env = "OPENAI_API_KEY"
 id = "gpt-4o"
 upstream_id = "gpt-4o-2024-08-06"
 capabilities = ["chat"]
+# Optional prices (USD) — the source of cost counting and hard budgets (M5).
+# A model without prices costs 0: budgets then never bite on it.
+cost_per_1m_input = 2.5
+cost_per_1m_output = 10.0
 
 [[providers.models]]
 id = "text-embedding-3-small"
@@ -83,6 +127,8 @@ api_key_env = "COHERE_API_KEY"
 id = "rerank-english"
 upstream_id = "rerank-v3.5"
 capabilities = ["rerank"]
+# Rerank is billed in search units (1 unit ≈ one query over ≤ 100 documents).
+cost_per_1k_searches = 2.0
 
 # Versioned aliasing: a stable public id pinned to a specific upstream version.
 # Bump `upstream_id` to roll the model forward without changing client code.
