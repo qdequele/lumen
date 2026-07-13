@@ -80,7 +80,9 @@ pub async fn list_keys(
     Ok(Json(keys))
 }
 
-/// Patch a key: adjust budgets/limits, enable/disable. Unknown id → 404.
+/// Patch a key: adjust budgets/limits, enable/disable. An unknown id is a
+/// 400 `FG-1001` naming the id — the public taxonomy reserves 404 for
+/// unknown *models* (`FG-2001`) and has no admin-resource code.
 pub async fn patch_key(
     State(state): State<AppState>,
     Path(id): Path<String>,

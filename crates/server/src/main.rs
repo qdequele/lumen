@@ -133,11 +133,11 @@ fn run(config: Config) -> anyhow::Result<()> {
         // periodic budget flush and retention purge. All optional — the
         // gateway stays a stateless open proxy when auth is disabled.
         let mut provider_specs = config.provider_specs();
-        let (auth_runtime, usage_logger) = if config.auth.enabled {
-            let (runtime, logger) = boot_auth_stack(&config, &mut provider_specs).await?;
-            (Some(runtime), Some(logger))
+        let (auth_runtime, usage_logger, usage_writer) = if config.auth.enabled {
+            let (runtime, logger, writer) = boot_auth_stack(&config, &mut provider_specs).await?;
+            (Some(runtime), Some(logger), Some(writer))
         } else {
-            (None, None)
+            (None, None, None)
         };
 
         let client = ferrogate_providers::http::build_client();
@@ -171,6 +171,19 @@ fn run(config: Config) -> anyhow::Result<()> {
             }
         }
 
+        // Drain the usage writer: `serve` returning dropped the app (and with
+        // it every UsageLogger clone), which closes the channel; the writer
+        // then flushes what is buffered and exits. Bounded wait — shutdown
+        // must never hang on a sick database.
+        if let Some(writer) = usage_writer {
+            if tokio::time::timeout(Duration::from_secs(5), writer)
+                .await
+                .is_err()
+            {
+                tracing::warn!("usage writer did not drain within 5s; giving up");
+            }
+        }
+
         tracing::info!("shutdown complete");
         Ok(())
     })
@@ -182,7 +195,11 @@ fn run(config: Config) -> anyhow::Result<()> {
 async fn boot_auth_stack(
     config: &Config,
     provider_specs: &mut [ferrogate_providers::ProviderSpec],
-) -> anyhow::Result<(Arc<AuthRuntime>, ferrogate_auth::usage::UsageLogger)> {
+) -> anyhow::Result<(
+    Arc<AuthRuntime>,
+    ferrogate_auth::usage::UsageLogger,
+    tokio::task::JoinHandle<()>,
+)> {
     let master_value = std::env::var(MASTER_KEY_ENV).with_context(|| {
         format!("auth.enabled requires the {MASTER_KEY_ENV} env var (64 hex chars)")
     })?;
@@ -214,7 +231,7 @@ async fn boot_auth_stack(
     let keys = AuthState::load(entries);
     tracing::info!(key_count = keys.len(), "virtual keys loaded");
 
-    let (logger, _writer) = spawn_usage_writer(
+    let (logger, writer) = spawn_usage_writer(
         store.clone(),
         UsageWriterConfig {
             capacity: config.auth.usage_channel_capacity,
@@ -265,5 +282,5 @@ async fn boot_auth_stack(
         }
     });
 
-    Ok((runtime, logger))
+    Ok((runtime, logger, writer))
 }

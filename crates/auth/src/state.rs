@@ -124,6 +124,10 @@ impl KeyEntry {
     /// still count toward the quotas (they did hit the gateway); a refused
     /// request never reserves budget.
     ///
+    /// The TPM window is debited with the pre-call **estimate** and never
+    /// adjusted afterwards (unlike the budget): conservative by design —
+    /// a quota can throttle early but can never be overrun.
+    ///
     /// # Errors
     ///
     /// [`GatewayError::QuotaExceeded`] (429) or
@@ -262,15 +266,18 @@ impl AuthState {
         entry.usable(now).then(|| Arc::clone(&entry))
     }
 
-    /// Insert a brand-new key (admin create / boot load).
+    /// Insert a brand-new key (admin create / boot load). Holding the
+    /// `by_id` entry across the decision keeps two concurrent upserts of the
+    /// same id from installing divergent entries in the two maps.
     pub fn upsert(&self, hash: String, record: &VirtualKeyRecord) {
-        if let Some(existing) = self.by_id.get(&record.id) {
-            existing.apply_limits(record);
-            return;
+        match self.by_id.entry(record.id.clone()) {
+            dashmap::Entry::Occupied(existing) => existing.get().apply_limits(record),
+            dashmap::Entry::Vacant(slot) => {
+                let entry = Arc::new(KeyEntry::from_record(record));
+                self.by_hash.insert(hash, Arc::clone(&entry));
+                slot.insert(entry);
+            }
         }
-        let entry = Arc::new(KeyEntry::from_record(record));
-        self.by_id.insert(record.id.clone(), Arc::clone(&entry));
-        self.by_hash.insert(hash, entry);
     }
 
     /// Apply an admin update to an existing key (by id). Spend is preserved;

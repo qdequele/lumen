@@ -55,6 +55,17 @@ pub fn now_unix() -> i64 {
         .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
 }
 
+/// Constant-time string equality. Comparing BLAKE3 *hashes* already makes a
+/// timing oracle useless (it leaks the hash, not a preimage), but there is no
+/// reason to leak even that.
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    a.len() == b.len()
+        && a.bytes()
+            .zip(b.bytes())
+            .fold(0_u8, |acc, (x, y)| acc | (x ^ y))
+            == 0
+}
+
 /// Extract the value of a `Bearer` authorization header.
 fn bearer(request: &Request) -> Option<&str> {
     request
@@ -98,7 +109,8 @@ pub async fn require_master_key(
         // No auth runtime → no admin surface.
         return crate::error::ApiError::from(GatewayError::Unauthorized).into_response();
     };
-    let authorized = bearer(&request).is_some_and(|token| hash_key(token) == auth.admin_token_hash);
+    let authorized = bearer(&request)
+        .is_some_and(|token| constant_time_eq(&hash_key(token), &auth.admin_token_hash));
     if authorized {
         next.run(request).await
     } else {

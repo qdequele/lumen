@@ -133,6 +133,25 @@ impl Accounting {
             reservation.settle(usd_to_micro(outcome.cost));
         }
 
+        let metadata_json = self.metadata.as_ref().map(RequestMetadata::to_json);
+
+        // ADR 002 sink 1, log half: the full metadata rides the structured
+        // usage event (labels only — never prompt or response content).
+        tracing::debug!(
+            target: "ferrogate::usage",
+            capability = self.capability,
+            model = %self.model,
+            provider = %self.provider,
+            key_id = self.key_id.as_deref().unwrap_or("-"),
+            tokens_in = outcome.tokens_in,
+            tokens_out = outcome.tokens_out,
+            estimated = outcome.estimated,
+            cost = outcome.cost,
+            status = outcome.status,
+            metadata = metadata_json.as_deref().unwrap_or("{}"),
+            "request usage"
+        );
+
         let allowlist = self.tokens.metadata_labels();
         let values: Vec<&str> = match &self.metadata {
             Some(meta) => meta.label_values(allowlist),
@@ -180,7 +199,7 @@ impl Accounting {
                 cost: outcome.cost,
                 latency_ms: i64::try_from(self.started.elapsed().as_millis()).unwrap_or(i64::MAX),
                 status: outcome.status,
-                metadata: self.metadata.as_ref().map(RequestMetadata::to_json),
+                metadata: metadata_json,
                 ts: now_unix(),
             };
             if !logger.log(record) {
@@ -217,8 +236,17 @@ impl StreamAccounting {
         self.sniffer.scan(frame);
     }
 
-    /// Close the record (idempotent; also runs from `Drop`).
+    /// Close the record with a 200 outcome (clean end or client disconnect —
+    /// the HTTP status the client saw). Idempotent; also runs from `Drop`.
     pub fn finalize(&mut self) {
+        self.finalize_with_status(200);
+    }
+
+    /// Close the record with the terminal outcome of the stream: 200 for a
+    /// clean end, the gateway error's status (502/504/…) when the stream was
+    /// cut short by an in-band error frame — so `usage_log.status` reflects
+    /// what actually happened, not the initial response headers.
+    pub fn finalize_with_status(&mut self, status: u16) {
         let Some(accounting) = self.accounting.take() else {
             return;
         };
@@ -232,7 +260,7 @@ impl StreamAccounting {
             estimated,
             search_units: None,
             cost,
-            status: 200,
+            status,
         });
     }
 }
@@ -247,14 +275,16 @@ impl Drop for StreamAccounting {
 /// stream itself is untouched — we only lose the ability to read its usage).
 const MAX_SNIFFED_LINE: usize = 256 * 1024;
 
-/// Scans forwarded SSE bytes, line by line, retaining ONLY the latest `data:`
-/// payload that mentions `"usage"` plus a frame count — bounded state, no
-/// response accumulation (ADR 004), no serde work per chunk.
+/// Scans forwarded SSE bytes, line by line, retaining ONLY the latest valid
+/// top-level usage object plus a frame count — bounded state, no response
+/// accumulation (ADR 004), and serde only on the rare candidate lines.
 #[derive(Debug, Default)]
 struct UsageSniffer {
     partial: Vec<u8>,
     discarding: bool,
-    last_usage_payload: Option<Vec<u8>>,
+    /// `(prompt_tokens, completion_tokens)` from the last frame carrying a
+    /// genuine top-level `usage` object.
+    upstream_usage: Option<(u64, u64)>,
     data_frames: u64,
 }
 
@@ -299,8 +329,13 @@ impl UsageSniffer {
             };
             if payload != b"[DONE]" && !payload.is_empty() {
                 self.data_frames += 1;
+                // serde runs only on candidate lines (usually exactly one
+                // per stream); a content frame that merely CONTAINS the text
+                // "usage" fails the parse and cannot shadow the real chunk.
                 if contains(payload, b"\"usage\"") {
-                    self.last_usage_payload = Some(payload.to_vec());
+                    if let Some(parsed) = parse_usage(payload) {
+                        self.upstream_usage = Some(parsed);
+                    }
                 }
             }
         }
@@ -312,19 +347,24 @@ impl UsageSniffer {
     /// and the data-frame count (streaming deltas are roughly one token each)
     /// — honestly flagged estimated, never a silent zero.
     fn result(&self, estimated_input: u64) -> (u64, u64, bool) {
-        if let Some(payload) = &self.last_usage_payload {
-            if let Ok(value) = serde_json::from_slice::<Value>(payload) {
-                if let Some(usage) = value.get("usage").filter(|u| u.is_object()) {
-                    let prompt = usage.get("prompt_tokens").and_then(Value::as_u64);
-                    let completion = usage.get("completion_tokens").and_then(Value::as_u64);
-                    if prompt.is_some() || completion.is_some() {
-                        return (prompt.unwrap_or(0), completion.unwrap_or(0), false);
-                    }
-                }
-            }
+        match self.upstream_usage {
+            Some((prompt, completion)) => (prompt, completion, false),
+            None => (estimated_input, self.data_frames, true),
         }
-        (estimated_input, self.data_frames, true)
     }
+}
+
+/// Extract `(prompt_tokens, completion_tokens)` from one SSE payload iff it
+/// carries a genuine top-level `usage` object with at least one count.
+fn parse_usage(payload: &[u8]) -> Option<(u64, u64)> {
+    let value = serde_json::from_slice::<Value>(payload).ok()?;
+    let usage = value.get("usage").filter(|u| u.is_object())?;
+    let prompt = usage.get("prompt_tokens").and_then(Value::as_u64);
+    let completion = usage.get("completion_tokens").and_then(Value::as_u64);
+    if prompt.is_none() && completion.is_none() {
+        return None;
+    }
+    Some((prompt.unwrap_or(0), completion.unwrap_or(0)))
 }
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
@@ -371,6 +411,18 @@ mod tests {
         // usage chunk arrives later and wins (last occurrence).
         s.scan(b"data: {\"choices\":[{\"delta\":{\"content\":\"\\\"usage\\\" is fun\"}}]}\n\n");
         s.scan(b"data: {\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":6}}\n\n");
+        assert_eq!(s.result(99), (5, 6, false));
+    }
+
+    #[test]
+    fn content_frame_mentioning_usage_after_the_real_chunk_does_not_degrade_it() {
+        // Translated providers may emit the usage chunk before message_stop;
+        // a later content-ish frame containing the text "usage" must not
+        // shadow the real counts back into an estimate.
+        let mut s = UsageSniffer::default();
+        s.scan(b"data: {\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":6}}\n\n");
+        s.scan(b"data: {\"choices\":[{\"delta\":{\"content\":\"my \\\"usage\\\" story\"}}]}\n\n");
+        s.scan(b"data: [DONE]\n\n");
         assert_eq!(s.result(99), (5, 6, false));
     }
 

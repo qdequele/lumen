@@ -36,8 +36,9 @@ pub struct ModelSpec {
 }
 
 /// A provider instance to build. `api_key` is already resolved from the
-/// environment by the caller (or `None` for keyless providers).
-#[derive(Debug, Clone)]
+/// environment (or, since M5, decrypted from the store) by the caller —
+/// `None` for keyless providers.
+#[derive(Clone)]
 pub struct ProviderSpec {
     /// Unique provider name (used to attribute upstream errors).
     pub name: String,
@@ -49,6 +50,20 @@ pub struct ProviderSpec {
     pub base_url: Option<String>,
     /// Models this provider serves.
     pub models: Vec<ModelSpec>,
+}
+
+// Manual Debug: the spec carries a RESOLVED key value, and a future
+// `debug!(?spec)` must never be able to leak it (CLAUDE.md rule 5).
+impl std::fmt::Debug for ProviderSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProviderSpec")
+            .field("name", &self.name)
+            .field("kind", &self.kind)
+            .field("api_key", &self.api_key.as_ref().map(|_| "REDACTED"))
+            .field("base_url", &self.base_url)
+            .field("models", &self.models)
+            .finish()
+    }
 }
 
 /// Failure while building the registry.
@@ -494,6 +509,14 @@ fn build_providers(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_spec_debug_never_shows_the_key() {
+        let s = spec(ProviderKind::Openai, "openai", None, Vec::new());
+        let dbg = format!("{s:?}");
+        assert!(!dbg.contains("sk-test-xxx"), "leaked: {dbg}");
+        assert!(dbg.contains("REDACTED"));
+    }
 
     fn spec(
         kind: ProviderKind,

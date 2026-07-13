@@ -136,3 +136,10 @@ milestone.
 - **Metadata values are stringified** in `usage_log.metadata` (JSON object of
   strings). If typed filtering (numeric ranges) matters, store the original
   JSON value instead.
+- **TPM debits the pre-call estimate, never adjusted.** Unlike the budget
+  (reserved then settled to real usage), the tokens-per-minute window keeps the
+  estimate (`max_tokens` or the 2048 default when absent). Conservative — can
+  throttle early, can never overrun. Adjust post-call if it starves real users.
+- **No zeroization of key material.** `MasterKey` and the raw env string are
+  not zeroized on drop; the `zeroize` crate would close the residual-memory
+  window. Low risk (single long-lived process), noted from the M5 review.

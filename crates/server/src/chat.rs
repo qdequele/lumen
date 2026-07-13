@@ -266,10 +266,14 @@ impl EventStreamState {
         self.tail = window.split_off(window.len() - keep);
     }
 
-    /// Close the accounting record (idempotent; Drop is the safety net).
-    fn settle_accounting(&mut self) {
+    /// Close the accounting record with the stream's terminal outcome, so
+    /// `usage_log.status` reflects what actually happened (200 = clean end,
+    /// 502/504 = in-band error frame). Idempotent; Drop is the safety net
+    /// for client disconnects (which finalize as 200 — the status the
+    /// client's response actually carried).
+    fn settle_accounting(&mut self, status: u16) {
         if let Some(mut accounting) = self.accounting.take() {
-            accounting.finalize();
+            accounting.finalize_with_status(status);
         }
     }
 }
@@ -347,28 +351,32 @@ fn to_event_stream(
             Step::Item(Some(Err(e))) => {
                 // Mid-stream provider error: terminal error frame, then done.
                 s.ended = true;
-                s.settle_accounting();
-                error_frame(&GatewayError::from_provider(&s.provider, e))
+                let error = GatewayError::from_provider(&s.provider, e);
+                s.settle_accounting(error.http_status());
+                error_frame(&error)
             }
             Step::Item(None) => {
                 s.ended = true;
-                s.settle_accounting();
                 if s.saw_done {
                     // Clean upstream termination — nothing left to add.
+                    s.settle_accounting(200);
                     return None;
                 }
                 // The upstream died without its terminator (criterion 5).
-                error_frame(&GatewayError::UpstreamStreamInterrupted {
+                let error = GatewayError::UpstreamStreamInterrupted {
                     provider: s.provider.clone(),
-                })
+                };
+                s.settle_accounting(error.http_status());
+                error_frame(&error)
             }
             Step::Ping => Bytes::from_static(b": ping\n\n"),
             Step::FirstTokenTimeout => {
                 s.ended = true;
-                s.settle_accounting();
-                error_frame(&GatewayError::UpstreamFirstTokenTimeout {
+                let error = GatewayError::UpstreamFirstTokenTimeout {
                     provider: s.provider.clone(),
-                })
+                };
+                s.settle_accounting(error.http_status());
+                error_frame(&error)
             }
         };
         Some((Ok::<Bytes, Infallible>(frame), s))
