@@ -1,0 +1,7 @@
+# LiteLLM config for the benchmark: same mock upstream, same model id.
+model_list:
+  - model_name: gpt-4o
+    litellm_params:
+      model: openai/gpt-4o
+      api_base: http://mock-upstream:1080
+      api_key: os.environ/OPENAI_API_KEY

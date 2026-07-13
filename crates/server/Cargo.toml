@@ -53,6 +53,12 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "
 figment = { workspace = true, features = ["test"] }
 wiremock = { workspace = true }
 serde_json = { workspace = true }
+criterion = { workspace = true }
+async-trait = { workspace = true }
+
+[[bench]]
+name = "gateway_overhead"
+harness = false
 
 [lints]
 workspace = true

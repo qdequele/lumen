@@ -1,0 +1,48 @@
+# Reproducible head-to-head: Ferrogate vs LiteLLM in front of the SAME local
+# mock upstream, driven by k6 (M7 §7.1). Run:
+#
+#   docker compose -f bench/compose.yaml up -d --build
+#   OPENAI_API_KEY=sk-mock TARGET=http://localhost:8080 k6 run bench/k6-added-latency.js   # ferrogate
+#   OPENAI_API_KEY=sk-mock TARGET=http://localhost:4000 k6 run bench/k6-added-latency.js   # litellm
+#   OPENAI_API_KEY=sk-mock TARGET=http://localhost:1080 k6 run bench/k6-added-latency.js   # direct (baseline)
+#
+# Added latency = gateway p50/p99 − direct p50/p99. Record RAM with
+# `docker stats --no-stream ferrogate litellm`. See bench/README.md.
+
+services:
+  # A zero-logic OpenAI-compatible upstream: constant response, ~0 ms compute,
+  # so the measured latency is transport + proxy overhead, not model time.
+  mock-upstream:
+    image: mockserver/mockserver:5.15.0
+    ports:
+      - "1080:1080"
+    environment:
+      MOCKSERVER_INITIALIZATION_JSON_PATH: /config/mock.json
+    volumes:
+      - ./mock-upstream.json:/config/mock.json:ro
+
+  ferrogate:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      OPENAI_API_KEY: sk-mock
+    command: ["--config", "/config.toml"]
+    volumes:
+      - ./ferrogate-bench.toml:/config.toml:ro
+    depends_on:
+      - mock-upstream
+
+  litellm:
+    image: ghcr.io/berriai/litellm:main-latest
+    ports:
+      - "4000:4000"
+    environment:
+      OPENAI_API_KEY: sk-mock
+    command: ["--config", "/config.yaml"]
+    volumes:
+      - ./litellm-bench.yaml:/config.yaml:ro
+    depends_on:
+      - mock-upstream

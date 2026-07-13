@@ -1,0 +1,13 @@
+[
+  {
+    "httpRequest": { "method": "POST", "path": "/chat/completions" },
+    "httpResponse": {
+      "headers": { "content-type": ["application/json"] },
+      "body": {
+        "id": "chatcmpl-bench", "object": "chat.completion", "created": 1, "model": "gpt-4o",
+        "choices": [{ "index": 0, "message": { "role": "assistant", "content": "ok" }, "finish_reason": "stop" }],
+        "usage": { "prompt_tokens": 10, "completion_tokens": 1, "total_tokens": 11 }
+      }
+    }
+  }
+]

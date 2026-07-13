@@ -1,0 +1,12 @@
+# Ferrogate config for the benchmark: one OpenAI-kind provider pointed at the
+# local mock. Auth off (measure the raw proxy path).
+[[providers]]
+name = "mock"
+kind = "openai"
+api_key_env = "OPENAI_API_KEY"
+base_url = "http://mock-upstream:1080"
+
+[[providers.models]]
+id = "gpt-4o"
+upstream_id = "gpt-4o"
+capabilities = ["chat"]
