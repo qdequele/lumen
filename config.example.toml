@@ -72,6 +72,55 @@ retention_days = 30               # purge usage_log rows older than this
 metadata_labels = []              # e.g. ["team", "env"]
 
 # ---------------------------------------------------------------------------
+# Resilience: retries, fallbacks, circuit breaker, timeouts, health checks (M6).
+#
+# Every value below is the built-in default — the whole section is optional.
+# Retries and the circuit breaker are always active with these defaults; only
+# per-model `fallbacks` (see the model blocks below) and background health
+# checks are opt-in. None of this ever touches the DB on the request path, and
+# an upstream 429 storm can never destabilise the gateway itself.
+# ---------------------------------------------------------------------------
+[resilience]
+# Retries — applied ONLY to retryable upstream failures (5xx, connect/read
+# timeout, 429). A client 4xx is NEVER retried (a fallback would reject it too).
+# Backoff is exponential with equal jitter, and honours an upstream
+# `Retry-After` as a floor. While streaming, a retry happens only if no chunk
+# has yet reached the client.
+retry_max_attempts = 3            # total attempts per provider incl. the first
+                                  # (set to 1 to disable retries); must not be 0
+retry_base_ms = 200               # base backoff wait after the first failure
+retry_max_ms = 5000               # ceiling on the exponential backoff term
+
+# Circuit breaker — per (provider, model). After N consecutive provider-fault
+# failures the circuit opens; while open the model is skipped straight to its
+# next fallback, or answered with 503 FG-3020 (+ Retry-After) when none remains.
+# After the cooldown, a single half-open probe decides whether to close again.
+# State is exported as ferrogate_circuit_state{provider,model}
+# (0 = closed, 1 = open, 2 = half-open).
+circuit_failure_threshold = 5     # consecutive failures that trip it open
+circuit_cooldown_ms = 30000       # time spent open before a half-open probe
+
+# Timeouts. `connect` is client-wide (one pooled HTTP client, so there is no
+# per-provider connect override). The first-token timeout lives in [server]
+# (server.first_token_timeout_ms); the total timeout is here. BOTH the
+# first-token and total timeouts can be overridden per provider (see the
+# ollama-local block below). Each timeout maps to a distinct 504 for debugging:
+# FG-3012 connect, FG-3011 first-token, FG-3013 total (the whole request —
+# all retries and fallbacks together).
+connect_timeout_ms = 5000         # TCP + TLS connection establishment
+total_timeout_ms = 600000         # absolute per-request deadline (10 minutes)
+
+# Background health checks (OFF by default). When enabled, a periodic task
+# probes every provider that has a configured `base_url` (self-hosted TEI /
+# Ollama, or any explicit override) and publishes the result at
+# GET /health/providers and on ferrogate_provider_up{provider}. Providers on a
+# built-in vendor URL report `unknown` (never probed — the gateway hardcodes no
+# vendor endpoints). The gateway's own /health stays independent of provider
+# health and does no I/O.
+health_check_enabled = false
+health_check_interval_ms = 30000  # probe cadence (must not be 0 when enabled)
+
+# ---------------------------------------------------------------------------
 # Providers
 #
 # Each `[[providers]]` block declares one upstream. `kind` selects the built-in
@@ -101,16 +150,44 @@ capabilities = ["chat"]
 # A model without prices costs 0: budgets then never bite on it.
 cost_per_1m_input = 2.5
 cost_per_1m_output = 10.0
+# Fallback chain: if this provider exhausts its retries or its circuit is open,
+# try these models IN ORDER. Each must exist below and serve every capability
+# declared above (here "chat"), which is validated at boot. Whichever model
+# actually serves the request is reported in the x-ferrogate-model-used
+# response header and the usage_log.model_used column.
+fallbacks = ["claude-3-5-sonnet"]
 
 [[providers.models]]
 id = "text-embedding-3-small"
 capabilities = ["embed"]
+
+# Anthropic: chat (bidirectional OpenAI <-> Anthropic translation). Configured
+# here as gpt-4o's fallback — the same capability from a different vendor, so a
+# single-vendor outage doesn't take chat down.
+[[providers]]
+name = "anthropic"
+kind = "anthropic"
+api_key_env = "ANTHROPIC_API_KEY"
+
+[[providers.models]]
+id = "claude-3-5-sonnet"
+upstream_id = "claude-3-5-sonnet-20241022"
+capabilities = ["chat"]
+cost_per_1m_input = 3.0
+cost_per_1m_output = 15.0
 
 # Ollama: local, keyless. Requires a base_url.
 [[providers]]
 name = "ollama-local"
 kind = "ollama"
 base_url = "http://localhost:11434"
+# Per-provider timeout overrides (optional). A local model can take a while to
+# load into VRAM on its first call, so relax the first-token and total windows
+# for THIS provider only; they fall back to [server].first_token_timeout_ms and
+# [resilience].total_timeout_ms when unset. `connect` is client-wide and cannot
+# be overridden per provider. Applies to every model this provider serves.
+first_token_timeout_ms = 60000
+total_timeout_ms = 120000
 
 [[providers.models]]
 id = "nomic-embed"
@@ -129,6 +206,10 @@ upstream_id = "rerank-v3.5"
 capabilities = ["rerank"]
 # Rerank is billed in search units (1 unit ≈ one query over ≤ 100 documents).
 cost_per_1k_searches = 2.0
+# A multi-hop fallback chain across three rerank vendors: if Cohere is down,
+# try Jina, then Voyage. All three serve "rerank", so a rerank request survives
+# any single vendor outage.
+fallbacks = ["jina-rerank", "voyage-rerank"]
 
 # Versioned aliasing: a stable public id pinned to a specific upstream version.
 # Bump `upstream_id` to roll the model forward without changing client code.

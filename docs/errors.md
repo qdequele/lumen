@@ -55,6 +55,30 @@ advertised. The three timeouts (`FG-3011` first-token, `FG-3012` connect,
 `FG-3013` total) are distinct codes purely for debugging — see M6 §6.4 and
 `docs/adr/005-resilience-execution.md`.
 
+### How resilience shapes these codes (M6)
+
+The `3xxx` codes are what a client sees only *after* the resilience machinery
+has given up. Before surfacing, a retryable failure (`FG-3001` 429,
+`FG-3003` 5xx, `FG-3005`/`FG-3012` timeouts) is retried with exponential
+backoff, then the request fails over to the model's configured `fallbacks`.
+The mapping between a failure and the code that eventually surfaces:
+
+- **`FG-3020` (503)** — the primary's circuit is open and no fallback remained.
+  Skipping an open circuit is instant (no upstream call), and the response
+  carries a `Retry-After` equal to the cooldown remainder.
+- **`FG-3004` (503)** — every link in the fallback chain was tried and failed
+  (retries exhausted or circuits open all the way down).
+- **`FG-3013` (504)** — the total per-request deadline elapsed while retrying or
+  failing over; it bounds *all* attempts together, so a slow chain fails here
+  rather than hanging.
+- **`FG-3011` / `FG-3012` (504)** — first-token and connect timeouts; each is a
+  retryable failure on its own before it surfaces.
+
+A hard upstream client error (a 4xx bad request) is **never** retried or failed
+over — a different provider would reject it too — and surfaces immediately.
+Whichever model ultimately served a successful request is reported in the
+`x-ferrogate-model-used` response header.
+
 ## Auth / budget errors — `FG-4xxx` · `type: invalid_request`
 
 Codes pinned by the M5 spec. Enforcement happens in memory, **before** any
