@@ -1,0 +1,83 @@
+name: Release
+
+# Cut a release on a semver tag: static musl binaries (x86_64 + aarch64) attached
+# to the GitHub Release, and a multi-arch distroless image pushed to GHCR (M7 §7.2).
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write # attach binaries to the release
+  packages: write # push the image to GHCR
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  binaries:
+    name: static binary (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # `cross` gives a musl-capable linker for both targets without host setup.
+      - name: Install cross
+        run: cargo install cross --locked
+
+      - name: Build release binary
+        run: cross build --release --bin ferrogate --target ${{ matrix.target }}
+
+      - name: Package
+        run: |
+          bin="target/${{ matrix.target }}/release/ferrogate"
+          size=$(stat -c%s "$bin")
+          echo "binary size: $size bytes"
+          # Fail the release if the stripped binary blows past the 25 MB budget.
+          test "$size" -lt 26214400 || { echo "binary exceeds 25 MB"; exit 1; }
+          tar -czf "ferrogate-${{ matrix.target }}.tar.gz" -C "target/${{ matrix.target }}/release" ferrogate
+
+      - name: Attach to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ferrogate-${{ matrix.target }}.tar.gz
+
+  image:
+    name: multi-arch image → GHCR
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU (for arm64 emulation)
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push (amd64 + arm64)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}:${{ github.ref_name }}
+            ghcr.io/${{ github.repository }}:latest
