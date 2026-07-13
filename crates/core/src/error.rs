@@ -31,9 +31,16 @@ pub enum ProviderError {
         retryable: bool,
     },
 
-    /// The upstream did not respond within the configured timeout.
+    /// The upstream did not respond within the configured timeout (read /
+    /// overall). Distinct from [`ConnectTimeout`](ProviderError::ConnectTimeout).
     #[error("provider '{provider}' timed out")]
     Timeout { provider: String },
+
+    /// The gateway could not establish a connection to the upstream within the
+    /// connect timeout — the TCP/TLS handshake never completed. Distinct from a
+    /// read timeout so operators can tell a dead host from a slow one (FG-3012).
+    #[error("provider '{provider}' connection timed out")]
+    ConnectTimeout { provider: String },
 
     /// The upstream could not be reached at all (DNS failure, connection
     /// refused, TLS error) — distinct from an HTTP error status.
@@ -55,6 +62,48 @@ pub enum ProviderError {
         /// The upstream `Retry-After`, if provided.
         retry_after: Option<Duration>,
     },
+}
+
+impl ProviderError {
+    /// Whether retrying this call (on the same provider, or a fallback) may
+    /// succeed. Retryable: 5xx upstream, connect/read timeouts, unreachable
+    /// host, 429. Never retryable: a client-fault 4xx, a schema/translation
+    /// error (deterministic), or a cancellation (M6 §6.1 — never retry 4xx).
+    #[must_use]
+    pub const fn is_retryable(&self) -> bool {
+        match self {
+            ProviderError::Upstream { retryable, .. } => *retryable,
+            ProviderError::Timeout { .. }
+            | ProviderError::ConnectTimeout { .. }
+            | ProviderError::Unavailable { .. }
+            | ProviderError::RateLimited { .. } => true,
+            ProviderError::Cancelled | ProviderError::Translation(_) => false,
+        }
+    }
+
+    /// Whether this failure indicates the *provider* is unhealthy and should
+    /// count against its circuit breaker. A deterministic client/translation
+    /// error or a cancellation says nothing about provider health.
+    #[must_use]
+    pub const fn is_provider_fault(&self) -> bool {
+        match self {
+            ProviderError::Upstream { retryable, .. } => *retryable,
+            ProviderError::Timeout { .. }
+            | ProviderError::ConnectTimeout { .. }
+            | ProviderError::Unavailable { .. }
+            | ProviderError::RateLimited { .. } => true,
+            ProviderError::Cancelled | ProviderError::Translation(_) => false,
+        }
+    }
+
+    /// The upstream `Retry-After` hint, if this error carried one (429).
+    #[must_use]
+    pub const fn retry_after(&self) -> Option<Duration> {
+        match self {
+            ProviderError::RateLimited { retry_after, .. } => *retry_after,
+            _ => None,
+        }
+    }
 }
 
 /// Which gateway-side per-key quota tripped (distinct stable codes: RPM is
@@ -150,6 +199,25 @@ pub enum GatewayError {
     #[error("upstream provider '{provider}' produced no first token in time")]
     UpstreamFirstTokenTimeout { provider: String },
 
+    /// The connection to an upstream could not be established within the
+    /// connect timeout (M6 §6.4). Distinct from a read timeout for debugging.
+    #[error("upstream provider '{provider}' connection timed out")]
+    UpstreamConnectTimeout { provider: String },
+
+    /// The whole request (all retries and fallbacks) exceeded the configured
+    /// total timeout (M6 §6.4). Names the provider tried last.
+    #[error("request to upstream provider '{provider}' exceeded the total timeout")]
+    UpstreamTotalTimeout { provider: String },
+
+    /// The circuit breaker for a provider is open and no fallback remained
+    /// (M6 §6.3). Advertises the cooldown remainder as `Retry-After`.
+    #[error("upstream provider '{provider}' circuit is open")]
+    CircuitOpen {
+        provider: String,
+        /// How long until the breaker will admit a probe again.
+        retry_after: Option<Duration>,
+    },
+
     // ---- Auth / budget errors (FG-4xxx, codes pinned by the M5 spec) --------
     /// The virtual key's hard budget is exhausted. Enforced *before* any
     /// upstream call, so a rejected request never leaks spend.
@@ -192,6 +260,9 @@ impl GatewayError {
             GatewayError::UpstreamTimeout { .. } => "FG-3005",
             GatewayError::UpstreamStreamInterrupted { .. } => "FG-3010",
             GatewayError::UpstreamFirstTokenTimeout { .. } => "FG-3011",
+            GatewayError::UpstreamConnectTimeout { .. } => "FG-3012",
+            GatewayError::UpstreamTotalTimeout { .. } => "FG-3013",
+            GatewayError::CircuitOpen { .. } => "FG-3020",
             GatewayError::BudgetExceeded => "FG-4001",
             GatewayError::QuotaExceeded {
                 quota: QuotaKind::Rpm,
@@ -222,9 +293,11 @@ impl GatewayError {
             GatewayError::Upstream { .. }
             | GatewayError::UpstreamInvalidResponse { .. }
             | GatewayError::UpstreamStreamInterrupted { .. } => 502,
-            GatewayError::UpstreamUnavailable { .. } => 503,
+            GatewayError::UpstreamUnavailable { .. } | GatewayError::CircuitOpen { .. } => 503,
             GatewayError::UpstreamTimeout { .. }
-            | GatewayError::UpstreamFirstTokenTimeout { .. } => 504,
+            | GatewayError::UpstreamFirstTokenTimeout { .. }
+            | GatewayError::UpstreamConnectTimeout { .. }
+            | GatewayError::UpstreamTotalTimeout { .. } => 504,
         }
     }
 
@@ -246,6 +319,9 @@ impl GatewayError {
             | GatewayError::UpstreamTimeout { .. }
             | GatewayError::UpstreamStreamInterrupted { .. }
             | GatewayError::UpstreamFirstTokenTimeout { .. }
+            | GatewayError::UpstreamConnectTimeout { .. }
+            | GatewayError::UpstreamTotalTimeout { .. }
+            | GatewayError::CircuitOpen { .. }
             | GatewayError::UpstreamRateLimited { .. } => ErrorType::UpstreamError,
             GatewayError::Internal(_) => ErrorType::Internal,
         }
@@ -256,7 +332,8 @@ impl GatewayError {
     pub fn retry_after(&self) -> Option<Duration> {
         match self {
             GatewayError::QuotaExceeded { retry_after, .. }
-            | GatewayError::UpstreamRateLimited { retry_after, .. } => *retry_after,
+            | GatewayError::UpstreamRateLimited { retry_after, .. }
+            | GatewayError::CircuitOpen { retry_after, .. } => *retry_after,
             _ => None,
         }
     }
@@ -299,6 +376,9 @@ impl GatewayError {
                 status,
             },
             ProviderError::Timeout { provider: p } => GatewayError::UpstreamTimeout {
+                provider: p_or(provider, p),
+            },
+            ProviderError::ConnectTimeout { provider: p } => GatewayError::UpstreamConnectTimeout {
                 provider: p_or(provider, p),
             },
             ProviderError::Unavailable { provider: p } => GatewayError::UpstreamUnavailable {
@@ -435,6 +515,126 @@ mod tests {
         );
         assert_eq!(GatewayError::Unauthorized.code(), "FG-4004");
         assert_eq!(GatewayError::Internal("boom".into()).code(), "FG-5001");
+        // Resilience codes (M6).
+        assert_eq!(
+            GatewayError::UpstreamConnectTimeout {
+                provider: "openai".into()
+            }
+            .code(),
+            "FG-3012"
+        );
+        assert_eq!(
+            GatewayError::UpstreamTotalTimeout {
+                provider: "openai".into()
+            }
+            .code(),
+            "FG-3013"
+        );
+        assert_eq!(
+            GatewayError::CircuitOpen {
+                provider: "openai".into(),
+                retry_after: None
+            }
+            .code(),
+            "FG-3020"
+        );
+    }
+
+    #[test]
+    fn resilience_statuses_and_types_follow_the_taxonomy() {
+        // Connect and total timeouts are 504 upstream errors, never a 500/401.
+        for err in [
+            GatewayError::UpstreamConnectTimeout {
+                provider: "p".into(),
+            },
+            GatewayError::UpstreamTotalTimeout {
+                provider: "p".into(),
+            },
+        ] {
+            assert_eq!(err.http_status(), 504);
+            assert_eq!(err.error_type(), ErrorType::UpstreamError);
+        }
+        // An open circuit is a 503 that advertises when to retry.
+        let open = GatewayError::CircuitOpen {
+            provider: "p".into(),
+            retry_after: Some(Duration::from_secs(30)),
+        };
+        assert_eq!(open.http_status(), 503);
+        assert_eq!(open.error_type(), ErrorType::UpstreamError);
+        assert_eq!(open.retry_after(), Some(Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn connect_timeout_maps_to_fg_3012_and_names_provider() {
+        let ge = GatewayError::from_provider(
+            "openai",
+            ProviderError::ConnectTimeout {
+                provider: String::new(),
+            },
+        );
+        assert_eq!(ge.code(), "FG-3012");
+        assert_eq!(ge.http_status(), 504);
+        match ge {
+            GatewayError::UpstreamConnectTimeout { provider } => assert_eq!(&provider, "openai"),
+            other => panic!("expected UpstreamConnectTimeout, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn provider_error_retry_classification() {
+        // Retryable and provider-fault: 5xx, timeouts, unreachable, 429.
+        for err in [
+            ProviderError::Upstream {
+                provider: "p".into(),
+                status: 503,
+                retryable: true,
+            },
+            ProviderError::Timeout {
+                provider: "p".into(),
+            },
+            ProviderError::ConnectTimeout {
+                provider: "p".into(),
+            },
+            ProviderError::Unavailable {
+                provider: "p".into(),
+            },
+            ProviderError::RateLimited {
+                provider: "p".into(),
+                retry_after: None,
+            },
+        ] {
+            assert!(err.is_retryable(), "{err:?} should be retryable");
+            assert!(err.is_provider_fault(), "{err:?} should fault the breaker");
+        }
+        // Never retryable, never a provider-health signal.
+        for err in [
+            ProviderError::Upstream {
+                provider: "p".into(),
+                status: 400,
+                retryable: false,
+            },
+            ProviderError::Translation("bad json".into()),
+            ProviderError::Cancelled,
+        ] {
+            assert!(!err.is_retryable(), "{err:?} must not be retried");
+            assert!(!err.is_provider_fault(), "{err:?} must not fault the breaker");
+        }
+    }
+
+    #[test]
+    fn provider_rate_limit_retry_after_is_exposed() {
+        let err = ProviderError::RateLimited {
+            provider: "p".into(),
+            retry_after: Some(Duration::from_secs(3)),
+        };
+        assert_eq!(err.retry_after(), Some(Duration::from_secs(3)));
+        assert_eq!(
+            ProviderError::Timeout {
+                provider: "p".into()
+            }
+            .retry_after(),
+            None
+        );
     }
 
     #[test]

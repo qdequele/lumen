@@ -189,8 +189,17 @@ async fn send(
 /// from an unreachable upstream. Never embeds the URL or any request detail.
 pub(crate) fn map_transport(provider: &str, err: &reqwest::Error) -> ProviderError {
     if err.is_timeout() {
-        ProviderError::Timeout {
-            provider: provider.to_owned(),
+        // A timeout during connection establishment is distinct from a read
+        // timeout (FG-3012 vs FG-3005) so operators can tell a dead host from
+        // a slow one (M6 §6.4).
+        if err.is_connect() {
+            ProviderError::ConnectTimeout {
+                provider: provider.to_owned(),
+            }
+        } else {
+            ProviderError::Timeout {
+                provider: provider.to_owned(),
+            }
         }
     } else {
         ProviderError::Unavailable {

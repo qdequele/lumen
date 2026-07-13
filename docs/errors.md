@@ -45,9 +45,15 @@ retried on a fallback (M6) before surfacing.
 | `FG-3004` | 503  | No healthy upstream available (circuit open / fallbacks spent).|
 | `FG-3005` | 504  | An upstream provider timed out.                                |
 | `FG-3010` | 502  | An upstream stream ended prematurely (no terminator).          |
-| `FG-3011` | 504  | An upstream produced no first token within the deadline.       |
+| `FG-3011` | 504  | An upstream produced no first token within the first-token deadline. |
+| `FG-3012` | 504  | The connection to an upstream could not be established within the connect timeout. |
+| `FG-3013` | 504  | The whole request (all retries + fallbacks) exceeded the total timeout. |
+| `FG-3020` | 503  | The provider's circuit breaker is open and no fallback remained. |
 
-For `FG-3001` (and `FG-4002`/`FG-4003`), a `Retry-After` value may be advertised.
+For `FG-3001`, `FG-3020` (and `FG-4002`/`FG-4003`), a `Retry-After` value may be
+advertised. The three timeouts (`FG-3011` first-token, `FG-3012` connect,
+`FG-3013` total) are distinct codes purely for debugging — see M6 §6.4 and
+`docs/adr/005-resilience-execution.md`.
 
 ## Auth / budget errors — `FG-4xxx` · `type: invalid_request`
 
