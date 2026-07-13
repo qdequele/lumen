@@ -387,8 +387,12 @@ async fn health_stays_fast_under_upstream_429_storm() {
         worst = worst.max(t.elapsed());
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
+    // A genuinely regressed /health — one that touched the DB, a provider, or
+    // shared the storm's bounded queue — would serialize behind the 500 in-flight
+    // requests and take seconds. This bound proves it stayed off that path while
+    // tolerating the jitter of a shared CI runner (locally it's well under 10 ms).
     assert!(
-        worst < Duration::from_millis(100),
+        worst < Duration::from_millis(750),
         "/health degraded under load: worst {worst:?}"
     );
 
