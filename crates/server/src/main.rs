@@ -286,7 +286,8 @@ async fn boot_auth_stack(
     tokio::task::JoinHandle<()>,
     std::collections::HashMap<String, String>,
 )> {
-    let master_value = std::env::var(MASTER_KEY_ENV).with_context(|| {
+    use zeroize::Zeroize;
+    let mut master_value = std::env::var(MASTER_KEY_ENV).with_context(|| {
         format!("auth.enabled requires the {MASTER_KEY_ENV} env var (64 hex chars)")
     })?;
     let master = MasterKey::from_env_value(&master_value)
@@ -336,6 +337,9 @@ async fn boot_auth_stack(
         admin_token_hash: hash_key(&master_value),
         master: Some(master),
     });
+    // The raw master key is now only needed as the redacted `MasterKey` bytes
+    // (zeroized on drop) and the one-way admin hash; wipe the clear copy.
+    master_value.zeroize();
 
     // Periodic budget flush: memory → DB. A crash loses at most one interval
     // of *accounting*; enforcement lives in memory and is reloaded from the

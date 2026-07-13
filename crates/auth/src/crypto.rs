@@ -15,6 +15,9 @@ use std::fmt;
 const NONCE_LEN: usize = 12;
 
 /// The 32-byte master key used to seal provider keys at rest.
+///
+/// Wiped from memory on drop (defence in depth against residual-memory
+/// exposure in a core dump or after shutdown — DEBT-2).
 pub struct MasterKey([u8; 32]);
 
 impl fmt::Debug for MasterKey {
@@ -22,6 +25,16 @@ impl fmt::Debug for MasterKey {
         f.write_str("MasterKey(REDACTED)")
     }
 }
+
+impl Drop for MasterKey {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.0.zeroize();
+    }
+}
+
+// The `Drop` above wipes the key bytes, upholding the `ZeroizeOnDrop` contract.
+impl zeroize::ZeroizeOnDrop for MasterKey {}
 
 impl MasterKey {
     /// Parse the `FERROGATE_MASTER_KEY` env value: exactly 64 hex characters.
@@ -98,6 +111,13 @@ mod tests {
 
     fn master(fill: char) -> MasterKey {
         MasterKey::from_env_value(&fill.to_string().repeat(64)).expect("valid key")
+    }
+
+    #[test]
+    fn master_key_is_zeroize_on_drop() {
+        // Compile-time proof that the key wipes itself on drop (DEBT-2).
+        fn assert_zod<T: zeroize::ZeroizeOnDrop>() {}
+        assert_zod::<MasterKey>();
     }
 
     #[test]
