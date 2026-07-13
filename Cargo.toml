@@ -61,6 +61,13 @@ notify = "7"
 
 # Concurrency / data structures
 arc-swap = "1"
+dashmap = "6"
+
+# Storage & crypto (M5: virtual keys, budgets, usage log)
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros", "derive"] }
+blake3 = "1"
+aes-gcm = "0.10"
+rand = "0.9"
 
 # Testing
 wiremock = "0.6"

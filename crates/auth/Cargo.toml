@@ -15,9 +15,17 @@ path = "src/lib.rs"
 [dependencies]
 ferrogate-core = { workspace = true }
 tracing = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+sqlx = { workspace = true }
+blake3 = { workspace = true }
+aes-gcm = { workspace = true }
+rand = { workspace = true }
+tokio = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
+serde_json = { workspace = true }
 
 [lints]
 workspace = true
