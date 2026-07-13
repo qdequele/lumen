@@ -95,6 +95,23 @@ failure means nothing was forwarded, a post-open failure becomes a clean SSE
 error frame. (A 2xx-then-immediate-error is deliberately treated as committed —
 not retried — since the upstream accepted the request.)
 
+One consequence, recorded explicitly: the circuit breaker for a streaming call
+only ever sees the **open** phase. `on_success` fires as soon as the byte stream
+opens, so a provider that opens cleanly but then dies mid-stream every time
+(FG-3010, handled by the frame guards and never surfaced back to the breaker)
+will *not* trip its circuit. This is the accepted trade-off of the open-phase
+boundary; the frame guards still give the client a clean terminal error each
+time.
+
+**Half-open cannot wedge.** A half-open probe is normally resolved by
+`on_success`/`on_failure`, but a probe whose result never returns (client
+disconnect, the total-timeout firing mid-probe, or a non-provider-fault error
+that does neither) must not pin the breaker shut. The breaker records when a
+probe was admitted and **auto-rearms**: a probe still outstanding after a full
+cooldown is presumed lost and a fresh one is admitted. The single-probe
+guarantee therefore holds *within* a cooldown window, and recovery is always
+self-healing.
+
 ### Timeouts and new error codes
 
 Three timeouts, global defaults with per-model overrides:
