@@ -1760,9 +1760,13 @@ name = "router"
 version = "0.1.0"
 dependencies = [
  "core",
+ "dashmap",
+ "futures",
  "providers",
  "reqwest",
+ "telemetry",
  "tokio",
+ "tokio-util",
  "tracing",
 ]
 

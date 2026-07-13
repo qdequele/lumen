@@ -42,6 +42,13 @@ pub enum ProviderError {
     #[error("provider '{provider}' connection timed out")]
     ConnectTimeout { provider: String },
 
+    /// The upstream produced no first sign of life (response headers, or the
+    /// first SSE frame) within the first-token deadline (M6 §6.4). Imposed by
+    /// the gateway, but modelled here so it flows through the retry/fallback
+    /// executor like any other retryable timeout; surfaces as FG-3011.
+    #[error("provider '{provider}' produced no first token in time")]
+    FirstTokenTimeout { provider: String },
+
     /// The upstream could not be reached at all (DNS failure, connection
     /// refused, TLS error) — distinct from an HTTP error status.
     #[error("provider '{provider}' is unreachable")]
@@ -75,6 +82,7 @@ impl ProviderError {
             ProviderError::Upstream { retryable, .. } => *retryable,
             ProviderError::Timeout { .. }
             | ProviderError::ConnectTimeout { .. }
+            | ProviderError::FirstTokenTimeout { .. }
             | ProviderError::Unavailable { .. }
             | ProviderError::RateLimited { .. } => true,
             ProviderError::Cancelled | ProviderError::Translation(_) => false,
@@ -90,6 +98,7 @@ impl ProviderError {
             ProviderError::Upstream { retryable, .. } => *retryable,
             ProviderError::Timeout { .. }
             | ProviderError::ConnectTimeout { .. }
+            | ProviderError::FirstTokenTimeout { .. }
             | ProviderError::Unavailable { .. }
             | ProviderError::RateLimited { .. } => true,
             ProviderError::Cancelled | ProviderError::Translation(_) => false,
@@ -381,6 +390,11 @@ impl GatewayError {
             ProviderError::ConnectTimeout { provider: p } => GatewayError::UpstreamConnectTimeout {
                 provider: p_or(provider, p),
             },
+            ProviderError::FirstTokenTimeout { provider: p } => {
+                GatewayError::UpstreamFirstTokenTimeout {
+                    provider: p_or(provider, p),
+                }
+            }
             ProviderError::Unavailable { provider: p } => GatewayError::UpstreamUnavailable {
                 provider: p_or(provider, p),
             },
@@ -593,6 +607,9 @@ mod tests {
                 provider: "p".into(),
             },
             ProviderError::ConnectTimeout {
+                provider: "p".into(),
+            },
+            ProviderError::FirstTokenTimeout {
                 provider: "p".into(),
             },
             ProviderError::Unavailable {
