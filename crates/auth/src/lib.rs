@@ -10,10 +10,12 @@
 //! * [`key`] — virtual-key generation and hashing (plaintext never stored).
 //! * [`crypto`] — AES-256-GCM sealing of provider keys at rest.
 //! * [`store`] — the SQLite store (sqlx) with embedded migrations.
+//! * [`state`] — the in-memory key table the request path enforces against.
 
 pub mod crypto;
 pub mod error;
 pub mod key;
+pub mod state;
 pub mod store;
 
 pub use error::AuthError;
