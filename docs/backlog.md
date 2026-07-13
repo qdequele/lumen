@@ -164,3 +164,21 @@ milestone.
   the model endpoint works (no auth, no real inference). A per-kind lightweight
   liveness call (e.g. `GET /v1/models`) would be truer; deferred to keep the
   probe provider-agnostic and free.
+
+## M7 (release) — deferred
+
+- **Hot reload swaps the routing table only.** SIGHUP / file-watch re-validate
+  the config and atomically swap the provider registry (ArcSwap). Server bind
+  address, `[auth]`, `[resilience]` and pricing are read once at boot; changing
+  them still needs a restart. Extending the swap to those is a follow-up.
+- **Hot reload re-resolves provider keys from the environment only.** DB-stored
+  provider keys (`PUT /admin/provider-keys`) are still applied at boot, not on
+  reload (same limitation already noted for M5).
+- **Anthropic/Gemini translation fuzzing** goes only as deep as the shared SSE
+  parser today. Fuzzing the `translate_request`/`translate_response`/stream
+  translators directly needs a small public (or `#[cfg(fuzzing)]`) shim over the
+  currently-private functions.
+- **Loaded throughput vs LiteLLM not measured in-repo.** The in-process overhead
+  (~3 µs) is benchmarked; the full p50/p99/RAM/req·s head-to-head is a
+  reproducible `bench/` harness (docker-compose + k6) run by the operator, not
+  captured as a committed baseline.

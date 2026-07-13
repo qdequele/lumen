@@ -32,3 +32,21 @@ jobs:
 
       - name: Tests
         run: cargo test --workspace
+
+  supply-chain:
+    name: audit · deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Advisory database check (RUSTSEC) — fails on known vulnerabilities.
+      - name: cargo audit
+        uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # License policy + advisories + source pinning (see deny.toml).
+      - name: cargo deny
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories licenses sources
