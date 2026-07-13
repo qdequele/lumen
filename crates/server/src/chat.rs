@@ -66,17 +66,24 @@ pub async fn chat(
         // providers translate event by event (ADR 004). Errors before the
         // first frame surface here as a JSON error envelope; if the upstream
         // never answers the request at all, the first-token timeout turns
-        // into a plain 504 (headers are not sent yet at this point).
-        let opened = tokio::time::timeout(
-            guards.first_token_timeout,
-            route.provider.chat_stream_bytes(req, cancel),
-        )
-        .await
-        .map_err(|_| GatewayError::UpstreamFirstTokenTimeout {
-            provider: provider_name.clone(),
-        })?;
+        // into a plain 504 (headers are not sent yet at this point). ONE
+        // absolute deadline covers both phases (response headers, then first
+        // SSE frame) so the configured window is a true end-to-end bound.
+        let deadline = tokio::time::Instant::now() + guards.first_token_timeout;
+        let opened =
+            tokio::time::timeout_at(deadline, route.provider.chat_stream_bytes(req, cancel))
+                .await
+                .map_err(|_| GatewayError::UpstreamFirstTokenTimeout {
+                    provider: provider_name.clone(),
+                })?;
         let byte_stream = opened.map_err(|e| GatewayError::from_provider(&provider_name, e))?;
-        let body = Body::from_stream(to_event_stream(byte_stream, provider_name, guard, guards));
+        let body = Body::from_stream(to_event_stream(
+            byte_stream,
+            provider_name,
+            guard,
+            guards,
+            deadline,
+        ));
         Ok((
             [
                 (header::CONTENT_TYPE, "text/event-stream"),
@@ -101,8 +108,11 @@ pub async fn chat(
     }
 }
 
-/// The `data: [DONE]` marker scanned for in forwarded frames.
-const DONE_MARKER: &[u8] = b"data: [DONE]";
+/// The `data: [DONE]` marker scanned for in forwarded frames. Anchored on a
+/// line start (`\n`): a raw `0x0A` cannot appear inside a JSON string (serde
+/// escapes it as the two characters `\n`), so model content that literally
+/// says "data: [DONE]" inside a delta can never spoof the terminator.
+const DONE_MARKER: &[u8] = b"\ndata: [DONE]";
 
 /// One SSE frame carrying the standard JSON error envelope.
 fn error_frame(error: &GatewayError) -> Bytes {
@@ -173,17 +183,20 @@ fn to_event_stream(
     provider_name: String,
     guard: DropGuard,
     guards: StreamGuards,
+    first_frame_deadline: tokio::time::Instant,
 ) -> impl futures::Stream<Item = Result<Bytes, Infallible>> {
     let state = EventStreamState {
         inner: stream,
         provider: provider_name,
         _cancel_on_drop: guard,
         guards,
-        first_frame_deadline: tokio::time::Instant::now() + guards.first_token_timeout,
+        first_frame_deadline,
         got_first_frame: false,
         saw_done: false,
         ended: false,
-        tail: Vec::new(),
+        // Seeded with a virtual line start so a `[DONE]` opening the very
+        // first frame still matches the line-anchored marker.
+        tail: vec![b'\n'],
     };
 
     futures::stream::unfold(state, |mut s| async move {
@@ -264,6 +277,15 @@ mod tests {
         CancellationToken::new().drop_guard()
     }
 
+    /// Wrap a stream with guards, deadline = now + first_token_timeout.
+    fn wrap(
+        stream: BoxStream<'static, Result<Bytes, ProviderError>>,
+        g: StreamGuards,
+    ) -> impl futures::Stream<Item = Result<Bytes, Infallible>> {
+        let deadline = tokio::time::Instant::now() + g.first_token_timeout;
+        to_event_stream(stream, "p".to_owned(), drop_guard(), g, deadline)
+    }
+
     fn frames(
         items: Vec<Result<Bytes, ProviderError>>,
     ) -> BoxStream<'static, Result<Bytes, ProviderError>> {
@@ -284,13 +306,11 @@ mod tests {
 
     #[tokio::test]
     async fn forwards_frames_verbatim_and_adds_nothing_after_done() {
-        let out = collect(to_event_stream(
+        let out = collect(wrap(
             frames(vec![
                 Ok(Bytes::from_static(b"data: {\"x\":1}\n\n")),
                 Ok(Bytes::from_static(b"data: [DONE]\n\n")),
             ]),
-            "p".to_owned(),
-            drop_guard(),
             guards(30_000, 15_000),
         ))
         .await;
@@ -299,10 +319,8 @@ mod tests {
 
     #[tokio::test]
     async fn missing_done_terminator_appends_fg_3010_error_frame() {
-        let out = collect(to_event_stream(
+        let out = collect(wrap(
             frames(vec![Ok(Bytes::from_static(b"data: {\"x\":1}\n\n"))]),
-            "p".to_owned(),
-            drop_guard(),
             guards(30_000, 15_000),
         ))
         .await;
@@ -313,13 +331,11 @@ mod tests {
 
     #[tokio::test]
     async fn done_marker_split_across_frames_is_still_detected() {
-        let out = collect(to_event_stream(
+        let out = collect(wrap(
             frames(vec![
                 Ok(Bytes::from_static(b"data: {\"x\":1}\n\ndata: [DO")),
                 Ok(Bytes::from_static(b"NE]\n\n")),
             ]),
-            "p".to_owned(),
-            drop_guard(),
             guards(30_000, 15_000),
         ))
         .await;
@@ -329,8 +345,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn done_marker_inside_model_content_does_not_suppress_fg_3010() {
+        // The MODEL's own text contains "data: [DONE]" (inside a JSON string,
+        // mid-line). Only a line-anchored terminator counts: when the upstream
+        // then dies without a real [DONE], FG-3010 must still fire.
+        let out = collect(wrap(
+            frames(vec![Ok(Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"data: [DONE]\"}}]}\n\n",
+            ))]),
+            guards(30_000, 15_000),
+        ))
+        .await;
+        assert_eq!(out.len(), 2, "got: {out:?}");
+        assert!(out[1].contains("FG-3010"), "got: {}", out[1]);
+    }
+
+    #[tokio::test]
+    async fn done_marker_as_the_very_first_frame_is_recognised() {
+        // The seeded virtual line start must let a stream whose first bytes
+        // are the terminator itself end cleanly.
+        let out = collect(wrap(
+            frames(vec![Ok(Bytes::from_static(b"data: [DONE]\n\n"))]),
+            guards(30_000, 15_000),
+        ))
+        .await;
+        assert_eq!(out, vec!["data: [DONE]\n\n"]);
+    }
+
+    #[tokio::test]
     async fn mid_stream_provider_error_becomes_terminal_error_frame() {
-        let out = collect(to_event_stream(
+        let out = collect(wrap(
             frames(vec![
                 Ok(Bytes::from_static(b"data: {\"x\":1}\n\n")),
                 Err(ProviderError::Unavailable {
@@ -339,8 +383,6 @@ mod tests {
                 // Anything after the error must not be forwarded.
                 Ok(Bytes::from_static(b"data: {\"x\":2}\n\n")),
             ]),
-            "p".to_owned(),
-            drop_guard(),
             guards(30_000, 15_000),
         ))
         .await;
@@ -352,13 +394,7 @@ mod tests {
     async fn silent_upstream_gets_heartbeat_pings_then_first_token_timeout() {
         // First-token window of 40 ms with a 15 ms heartbeat: two pings
         // (15, 30), then FG-3011 at 40. Paused time makes this exact.
-        let out = collect(to_event_stream(
-            stream::pending().boxed(),
-            "p".to_owned(),
-            drop_guard(),
-            guards(40, 15),
-        ))
-        .await;
+        let out = collect(wrap(stream::pending().boxed(), guards(40, 15))).await;
         assert_eq!(out.len(), 3, "got: {out:?}");
         assert_eq!(out[0], ": ping\n\n");
         assert_eq!(out[1], ": ping\n\n");
@@ -373,7 +409,7 @@ mod tests {
         let idle = stream::iter(vec![Ok(Bytes::from_static(b"data: {\"x\":1}\n\n"))])
             .chain(stream::pending())
             .boxed();
-        let wrapped = to_event_stream(idle, "p".to_owned(), drop_guard(), guards(50, 15));
+        let wrapped = wrap(idle, guards(50, 15));
         let out: Vec<String> = collect(wrapped.take(4)).await;
         assert_eq!(out[0], "data: {\"x\":1}\n\n");
         assert!(out[1..].iter().all(|f| f == ": ping\n\n"), "got: {out:?}");

@@ -49,11 +49,6 @@ impl SseParser {
     /// Returns [`ProviderError::Translation`] if a single event exceeds
     /// [`MAX_EVENT_BYTES`] without terminating.
     pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<SseEvent>, ProviderError> {
-        if self.buffer.len().saturating_add(chunk.len()) > MAX_EVENT_BYTES {
-            return Err(ProviderError::Translation(
-                "SSE event exceeds the maximum buffered size".to_owned(),
-            ));
-        }
         self.buffer.extend_from_slice(chunk);
 
         let mut events = Vec::new();
@@ -64,6 +59,15 @@ impl SseParser {
             if let Some(event) = parse_event(&raw[..end]) {
                 events.push(event);
             }
+        }
+
+        // The cap applies to what is left INCOMPLETE after draining: a large
+        // transport chunk made of many small complete events is fine; a single
+        // never-terminating event is not.
+        if self.buffer.len() > MAX_EVENT_BYTES {
+            return Err(ProviderError::Translation(
+                "SSE event exceeds the maximum buffered size".to_owned(),
+            ));
         }
         Ok(events)
     }
@@ -195,6 +199,16 @@ mod tests {
         assert!(push_str(&mut p, "data: more").is_empty());
         let events = push_str(&mut p, "\n\n");
         assert_eq!(events[0].data, "pending\nmore");
+    }
+
+    #[test]
+    fn large_chunk_of_many_small_complete_events_is_accepted() {
+        // The cap targets one runaway event, not the transport chunk size.
+        let mut p = SseParser::new();
+        let one = "data: x\n\n";
+        let big = one.repeat(MAX_EVENT_BYTES / one.len() + 1);
+        let events = p.push(big.as_bytes()).expect("complete events drain");
+        assert_eq!(events.len(), MAX_EVENT_BYTES / one.len() + 1);
     }
 
     #[test]

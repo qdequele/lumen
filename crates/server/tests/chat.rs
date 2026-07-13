@@ -14,7 +14,7 @@ use std::time::Duration;
 use ferrogate_core::Capability;
 use ferrogate_providers::{http, ModelSpec, ProviderKind, ProviderSpec, Registry};
 use serde_json::{json, Value};
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const LIMIT: usize = 10 * 1024 * 1024;
@@ -655,6 +655,7 @@ async fn gemini_streaming_translates_fragments_to_openai_chunks() {
         .and(path(
             "/v1beta/models/gemini-2.0-flash:streamGenerateContent",
         ))
+        .and(query_param("alt", "sse"))
         .respond_with(
             ResponseTemplate::new(200)
                 .insert_header("content-type", "text/event-stream")

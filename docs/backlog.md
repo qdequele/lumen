@@ -105,3 +105,9 @@ milestone.
   pure zero-copy — design it in slice 3 (e.g. a lightweight tail-watcher that
   only inspects frame boundaries, not JSON). No mid-stream error-frame test yet
   either. Tracked as slice-3 work.
+
+- **Tools sur Gemini** : `translate_request` (google) ignore silencieusement
+  `tools`/`tool_choice`, et le traducteur streaming ne lit que `parts[].text`
+  (un `functionCall` serait avalé). Décider : mapper vers `functionDeclarations`
+  Gemini, ou rejeter explicitement (FG-2002) quand `tools` est présent sur un
+  modèle routé Google. Relevé en review M4.
