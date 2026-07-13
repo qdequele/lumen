@@ -57,6 +57,25 @@ pub enum ProviderError {
     },
 }
 
+/// Which gateway-side per-key quota tripped (distinct stable codes: RPM is
+/// `FG-4002`, TPM is `FG-4003` — pinned by the M5 spec).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuotaKind {
+    /// Requests per minute.
+    Rpm,
+    /// Tokens per minute.
+    Tpm,
+}
+
+impl std::fmt::Display for QuotaKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            QuotaKind::Rpm => "requests-per-minute",
+            QuotaKind::Tpm => "tokens-per-minute",
+        })
+    }
+}
+
 /// Coarse client-facing error category. Serialized as the `type` field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -131,18 +150,24 @@ pub enum GatewayError {
     #[error("upstream provider '{provider}' produced no first token in time")]
     UpstreamFirstTokenTimeout { provider: String },
 
-    // ---- Auth / budget errors (FG-4xxx) -------------------------------------
-    /// Missing or invalid virtual key.
-    #[error("authentication required")]
-    Unauthorized,
-
-    /// The virtual key's hard budget is exhausted.
+    // ---- Auth / budget errors (FG-4xxx, codes pinned by the M5 spec) --------
+    /// The virtual key's hard budget is exhausted. Enforced *before* any
+    /// upstream call, so a rejected request never leaks spend.
     #[error("budget exceeded for this key")]
     BudgetExceeded,
 
-    /// A gateway-side quota (RPM/TPM) was exceeded.
-    #[error("rate limit exceeded")]
-    RateLimited { retry_after: Option<Duration> },
+    /// A gateway-side per-key quota (RPM or TPM) was exceeded.
+    #[error("{quota} quota exceeded for this key")]
+    QuotaExceeded {
+        quota: QuotaKind,
+        retry_after: Option<Duration>,
+    },
+
+    /// Missing or invalid virtual key. Deliberately does not say *why* the
+    /// key is invalid (unknown / disabled / expired) — that would let a
+    /// caller probe key state.
+    #[error("authentication required")]
+    Unauthorized,
 
     // ---- Internal errors (FG-5xxx) ------------------------------------------
     /// An internal gateway malfunction. The detail is logged, never returned.
@@ -167,9 +192,16 @@ impl GatewayError {
             GatewayError::UpstreamTimeout { .. } => "FG-3005",
             GatewayError::UpstreamStreamInterrupted { .. } => "FG-3010",
             GatewayError::UpstreamFirstTokenTimeout { .. } => "FG-3011",
-            GatewayError::Unauthorized => "FG-4001",
-            GatewayError::BudgetExceeded => "FG-4002",
-            GatewayError::RateLimited { .. } => "FG-4003",
+            GatewayError::BudgetExceeded => "FG-4001",
+            GatewayError::QuotaExceeded {
+                quota: QuotaKind::Rpm,
+                ..
+            } => "FG-4002",
+            GatewayError::QuotaExceeded {
+                quota: QuotaKind::Tpm,
+                ..
+            } => "FG-4003",
+            GatewayError::Unauthorized => "FG-4004",
             GatewayError::Internal(_) => "FG-5001",
         }
     }
@@ -185,7 +217,7 @@ impl GatewayError {
             GatewayError::BudgetExceeded => 402,
             GatewayError::ModelNotFound(_) => 404,
             GatewayError::PayloadTooLarge { .. } => 413,
-            GatewayError::RateLimited { .. } | GatewayError::UpstreamRateLimited { .. } => 429,
+            GatewayError::QuotaExceeded { .. } | GatewayError::UpstreamRateLimited { .. } => 429,
             GatewayError::Internal(_) => 500,
             GatewayError::Upstream { .. }
             | GatewayError::UpstreamInvalidResponse { .. }
@@ -207,7 +239,7 @@ impl GatewayError {
             | GatewayError::PayloadTooLarge { .. }
             | GatewayError::Unauthorized
             | GatewayError::BudgetExceeded
-            | GatewayError::RateLimited { .. } => ErrorType::InvalidRequest,
+            | GatewayError::QuotaExceeded { .. } => ErrorType::InvalidRequest,
             GatewayError::Upstream { .. }
             | GatewayError::UpstreamInvalidResponse { .. }
             | GatewayError::UpstreamUnavailable { .. }
@@ -223,7 +255,7 @@ impl GatewayError {
     #[must_use]
     pub fn retry_after(&self) -> Option<Duration> {
         match self {
-            GatewayError::RateLimited { retry_after }
+            GatewayError::QuotaExceeded { retry_after, .. }
             | GatewayError::UpstreamRateLimited { retry_after, .. } => *retry_after,
             _ => None,
         }
@@ -383,7 +415,25 @@ mod tests {
             .code(),
             "FG-3011"
         );
-        assert_eq!(GatewayError::Unauthorized.code(), "FG-4001");
+        // Auth / budget codes (pinned by the M5 spec).
+        assert_eq!(GatewayError::BudgetExceeded.code(), "FG-4001");
+        assert_eq!(
+            GatewayError::QuotaExceeded {
+                quota: QuotaKind::Rpm,
+                retry_after: None
+            }
+            .code(),
+            "FG-4002"
+        );
+        assert_eq!(
+            GatewayError::QuotaExceeded {
+                quota: QuotaKind::Tpm,
+                retry_after: None
+            }
+            .code(),
+            "FG-4003"
+        );
+        assert_eq!(GatewayError::Unauthorized.code(), "FG-4004");
         assert_eq!(GatewayError::Internal("boom".into()).code(), "FG-5001");
     }
 

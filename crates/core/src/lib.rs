@@ -29,7 +29,7 @@ pub use chat::{
     Usage,
 };
 pub use embed::{EmbedData, EmbedInput, EmbedRequest, EmbedResponse, EmbedUsage};
-pub use error::{ErrorBody, ErrorEnvelope, ErrorType, GatewayError, ProviderError};
+pub use error::{ErrorBody, ErrorEnvelope, ErrorType, GatewayError, ProviderError, QuotaKind};
 pub use provider::{ChatProvider, EmbeddingProvider, RerankProvider};
 pub use rerank::{
     RerankDocument, RerankRequest, RerankResponse, RerankResult, RerankResultDocument, RerankUsage,
