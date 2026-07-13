@@ -18,6 +18,7 @@ pub mod metadata;
 pub mod models;
 pub mod pricing;
 pub mod rerank;
+pub mod resilience;
 pub mod routes;
 pub mod state;
 

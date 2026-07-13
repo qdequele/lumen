@@ -25,6 +25,7 @@ fn usage(key_id: &str, ts: i64) -> UsageRecord {
     UsageRecord {
         key_id: Some(key_id.to_owned()),
         model: "gpt-test".to_owned(),
+        model_used: "gpt-test".to_owned(),
         capability: "chat".to_owned(),
         tokens_in: 12,
         tokens_out: 34,

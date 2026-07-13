@@ -40,9 +40,16 @@ use crate::accounting::{Accounting, Outcome, StreamAccounting, Target};
 use crate::auth::AuthedKey;
 use crate::error::ApiError;
 use crate::pricing::DEFAULT_RESERVED_OUTPUT_TOKENS;
+use crate::resilience::model_used_headers;
 use crate::state::{AppState, StreamGuards};
 
 /// Handle a chat completion request (streaming or not, per `stream`).
+///
+/// Both modes run through the M6 resilience executor: the requested model plus
+/// its configured fallbacks are tried in turn with retries, circuit breaking
+/// and the per-model timeouts (ADR 005). For streaming, retry/fallback happen
+/// only while *opening* the upstream byte stream — once the first frame is
+/// forwarded the request is committed and the M4 frame guards take over.
 pub async fn chat(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -50,17 +57,18 @@ pub async fn chat(
     payload: Result<Json<ChatRequest>, JsonRejection>,
 ) -> Result<Response, ApiError> {
     // Malformed body → FG-1001 in our envelope (not axum's plain-text default).
-    let Json(mut req) = payload.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
+    let Json(req) = payload.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
 
     if req.messages.is_empty() {
         return Err(GatewayError::InvalidRequest("`messages` must not be empty".to_owned()).into());
     }
 
-    // Resolve the client-facing model id to a provider + upstream id.
+    // Resolve the requested model to a fallback chain (M6 §6.2).
     let client_model = req.model.clone();
-    let route = ferrogate_router::resolve_chat(&state.registry, &req.model)?;
-    req.model = route.upstream_id.clone();
-    let provider_name = route.provider_name.clone();
+    let chain_ids = state.resilience.chain_ids(&client_model);
+    let chain = ferrogate_router::resolve_chat_chain(&state.registry, &chain_ids)?;
+    let links = ferrogate_router::chat_links(&chain);
+    let exec = state.resilience.exec_config(&client_model);
     let guards = state.guards;
 
     // Admission BEFORE the upstream call (M5 §5.2): reserve the pre-call
@@ -74,14 +82,14 @@ pub async fn chat(
     let estimated_cost = state
         .pricing
         .token_cost(&client_model, estimated_input, reserved_output);
-    let accounting = Accounting::begin(
+    let mut accounting = Accounting::begin(
         &state,
         &headers,
         key.as_deref(),
         Target {
             capability: "chat",
             model: &client_model,
-            provider: &route.provider_name,
+            provider: &chain[0].route.provider_name,
         },
         estimated_input + reserved_output,
         estimated_cost,
@@ -93,27 +101,36 @@ pub async fn chat(
 
     if req.stream {
         // Zero-copy passthrough where the upstream speaks OpenAI SSE; typed
-        // providers translate event by event (ADR 004). Errors before the
-        // first frame surface here as a JSON error envelope; if the upstream
-        // never answers the request at all, the first-token timeout turns
-        // into a plain 504 (headers are not sent yet at this point). ONE
-        // absolute deadline covers both phases (response headers, then first
-        // SSE frame) so the configured window is a true end-to-end bound.
-        let deadline = tokio::time::Instant::now() + guards.first_token_timeout;
-        let opened =
-            tokio::time::timeout_at(deadline, route.provider.chat_stream_bytes(req, cancel))
-                .await
-                .map_err(|_| GatewayError::UpstreamFirstTokenTimeout {
-                    provider: provider_name.clone(),
-                })?;
-        let byte_stream = opened.map_err(|e| GatewayError::from_provider(&provider_name, e))?;
-        // Accounting rides inside the stream: the sniffer reads the final
-        // usage chunk (or falls back to estimates) and settles when the
-        // stream ends — including on client disconnect, via its Drop.
+        // providers translate event by event (ADR 004). The executor opens the
+        // stream with retry/fallback (spec 6.2: only before the first frame);
+        // an open failure surfaces here as a JSON error envelope, or a plain
+        // 504 if no upstream ever answered (headers are not sent yet).
+        let executed = ferrogate_router::executor::execute(
+            &links,
+            &state.resilience.breakers,
+            &exec,
+            &cancel,
+            |i| {
+                let provider = chain[i].route.provider.clone();
+                let cancel = cancel.clone();
+                let mut attempt_req = req.clone();
+                attempt_req.stream = true;
+                chain[i].route.upstream_id.clone_into(&mut attempt_req.model);
+                async move { provider.chat_stream_bytes(attempt_req, cancel).await }
+            },
+        )
+        .await?;
+        // (an early return above drops `accounting`, refunding the reservation)
+        accounting.served_by(&executed.model_used, &executed.provider_used);
+
+        // A fresh first-frame deadline now that the stream is open (the open
+        // phase already had its own first-token budget). The M4 frame guards
+        // (FG-3010/3011, heartbeat) own the stream from here — no more retries.
+        let deadline = tokio::time::Instant::now() + exec.first_token;
         let stream_accounting = StreamAccounting::new(accounting, estimated_input);
         let body = Body::from_stream(to_event_stream(
-            byte_stream,
-            provider_name,
+            executed.value,
+            executed.provider_used.clone(),
             guard,
             guards,
             deadline,
@@ -124,30 +141,33 @@ pub async fn chat(
                 (header::CONTENT_TYPE, "text/event-stream"),
                 (header::CACHE_CONTROL, "no-cache"),
             ],
+            model_used_headers(&executed.model_used),
             body,
         )
             .into_response())
     } else {
         // Held across the await so a disconnect during the call cancels it.
         let _guard = guard;
-        // Non-streaming has no observable "first token": the whole upstream
-        // call gets the window (per-phase refinement lands in M6).
-        let mut response =
-            tokio::time::timeout(guards.first_token_timeout, route.provider.chat(req, cancel))
-                .await
-                .map_err(|_| GatewayError::UpstreamFirstTokenTimeout {
-                    provider: provider_name.clone(),
-                })?
-                .map_err(|e| GatewayError::from_provider(&provider_name, e))?;
+        let executed = ferrogate_router::executor::execute(
+            &links,
+            &state.resilience.breakers,
+            &exec,
+            &cancel,
+            |i| {
+                let provider = chain[i].route.provider.clone();
+                let cancel = cancel.clone();
+                let mut attempt_req = req.clone();
+                chain[i].route.upstream_id.clone_into(&mut attempt_req.model);
+                async move { provider.chat(attempt_req, cancel).await }
+            },
+        )
+        .await?;
         // (an early return above drops `accounting`, refunding the reservation)
-        settle_non_streaming(
-            accounting,
-            &state,
-            &client_model,
-            estimated_input,
-            &mut response,
-        );
-        Ok(Json(response).into_response())
+        accounting.served_by(&executed.model_used, &executed.provider_used);
+        let mut response = executed.value;
+        let served_model = executed.model_used.clone();
+        settle_non_streaming(accounting, &state, &served_model, estimated_input, &mut response);
+        Ok((model_used_headers(&served_model), Json(response)).into_response())
     }
 }
 

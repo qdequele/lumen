@@ -39,6 +39,96 @@ pub struct Config {
     /// Telemetry knobs (metadata label allowlist, ADR 002).
     #[serde(default)]
     pub telemetry: TelemetryConfig,
+    /// Resilience knobs: retries, circuit breaker, timeouts, health checks (M6).
+    #[serde(default)]
+    pub resilience: ResilienceConfig,
+}
+
+/// Retries, circuit breaker, timeouts and background health checks (M6).
+///
+/// `first_token` is not here — it stays [`ServerConfig::first_token_timeout_ms`]
+/// (its M4 home) and can be overridden per provider. `connect` is a client-wide
+/// setting (one pooled HTTP client), so it has no per-provider override.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResilienceConfig {
+    /// Total attempts per provider, including the first (`1` disables retries).
+    #[serde(default = "default_retry_max_attempts")]
+    pub retry_max_attempts: u32,
+    /// Base backoff delay in ms (pre-jitter wait after the first failure).
+    #[serde(default = "default_retry_base_ms")]
+    pub retry_base_ms: u64,
+    /// Ceiling on the exponential backoff term in ms.
+    #[serde(default = "default_retry_max_ms")]
+    pub retry_max_ms: u64,
+    /// Consecutive provider-fault failures that trip a circuit open.
+    #[serde(default = "default_circuit_failure_threshold")]
+    pub circuit_failure_threshold: u32,
+    /// How long a circuit stays open before a half-open probe, in ms.
+    #[serde(default = "default_circuit_cooldown_ms")]
+    pub circuit_cooldown_ms: u64,
+    /// Connection-establishment timeout in ms (client-wide).
+    #[serde(default = "default_connect_timeout_ms")]
+    pub connect_timeout_ms: u64,
+    /// Overall per-request timeout in ms (all retries + fallbacks together).
+    #[serde(default = "default_total_timeout_ms")]
+    pub total_timeout_ms: u64,
+    /// Enable the background provider health-check probe (default off).
+    #[serde(default)]
+    pub health_check_enabled: bool,
+    /// How often the health-check probe runs, in ms.
+    #[serde(default = "default_health_check_interval_ms")]
+    pub health_check_interval_ms: u64,
+}
+
+impl Default for ResilienceConfig {
+    fn default() -> Self {
+        Self {
+            retry_max_attempts: default_retry_max_attempts(),
+            retry_base_ms: default_retry_base_ms(),
+            retry_max_ms: default_retry_max_ms(),
+            circuit_failure_threshold: default_circuit_failure_threshold(),
+            circuit_cooldown_ms: default_circuit_cooldown_ms(),
+            connect_timeout_ms: default_connect_timeout_ms(),
+            total_timeout_ms: default_total_timeout_ms(),
+            health_check_enabled: false,
+            health_check_interval_ms: default_health_check_interval_ms(),
+        }
+    }
+}
+
+impl ResilienceConfig {
+    /// Validate the knobs: everything that must be non-zero (M6 §6.1/6.3/6.4).
+    fn validate(&self, path_label: &str) -> Result<(), ConfigError> {
+        let err = |message: String| ConfigError::Validation {
+            path: path_label.to_owned(),
+            message,
+        };
+        let checks: [(&str, u64); 7] = [
+            ("resilience.retry_max_attempts", u64::from(self.retry_max_attempts)),
+            ("resilience.retry_base_ms", self.retry_base_ms),
+            ("resilience.retry_max_ms", self.retry_max_ms),
+            (
+                "resilience.circuit_failure_threshold",
+                u64::from(self.circuit_failure_threshold),
+            ),
+            ("resilience.circuit_cooldown_ms", self.circuit_cooldown_ms),
+            ("resilience.connect_timeout_ms", self.connect_timeout_ms),
+            ("resilience.total_timeout_ms", self.total_timeout_ms),
+        ];
+        for (field, value) in checks {
+            if value == 0 {
+                return Err(err(format!("{field} must not be 0")));
+            }
+        }
+        if self.health_check_enabled && self.health_check_interval_ms == 0 {
+            return Err(err(
+                "resilience.health_check_interval_ms must not be 0 when health checks are enabled"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Virtual-key auth, hard budgets and usage logging (M5).
@@ -183,6 +273,14 @@ pub struct ProviderConfig {
     /// Override the provider's default base URL (required for self-hosted).
     #[serde(default)]
     pub base_url: Option<String>,
+    /// Per-provider first-token timeout override in ms (else the global
+    /// [`ServerConfig::first_token_timeout_ms`]).
+    #[serde(default)]
+    pub first_token_timeout_ms: Option<u64>,
+    /// Per-provider total timeout override in ms (else the global
+    /// [`ResilienceConfig::total_timeout_ms`]).
+    #[serde(default)]
+    pub total_timeout_ms: Option<u64>,
     /// Models this provider exposes.
     #[serde(default)]
     pub models: Vec<ModelConfig>,
@@ -208,6 +306,11 @@ pub struct ModelConfig {
     /// Price per **thousand rerank searches**, USD.
     #[serde(default)]
     pub cost_per_1k_searches: Option<f64>,
+    /// Ordered fallback model ids tried, in turn, after this model's provider
+    /// exhausts its retries or its circuit is open (M6 §6.2). Each must exist
+    /// and serve every capability this model declares (validated at boot).
+    #[serde(default)]
+    pub fallbacks: Vec<String>,
 }
 
 impl ModelConfig {
@@ -280,6 +383,30 @@ const fn default_usage_flush_ms() -> u64 {
 }
 const fn default_retention_days() -> u32 {
     30
+}
+const fn default_retry_max_attempts() -> u32 {
+    3
+}
+const fn default_retry_base_ms() -> u64 {
+    200
+}
+const fn default_retry_max_ms() -> u64 {
+    5_000
+}
+const fn default_circuit_failure_threshold() -> u32 {
+    5
+}
+const fn default_circuit_cooldown_ms() -> u64 {
+    30_000
+}
+const fn default_connect_timeout_ms() -> u64 {
+    5_000
+}
+const fn default_total_timeout_ms() -> u64 {
+    600_000
+}
+const fn default_health_check_interval_ms() -> u64 {
+    30_000
 }
 
 impl Default for ServerConfig {
@@ -398,6 +525,21 @@ impl Config {
         }
 
         self.telemetry.validate(path_label)?;
+        self.resilience.validate(path_label)?;
+
+        for provider in &self.providers {
+            for (field, value) in [
+                ("first_token_timeout_ms", provider.first_token_timeout_ms),
+                ("total_timeout_ms", provider.total_timeout_ms),
+            ] {
+                if value == Some(0) {
+                    return Err(err(format!(
+                        "provider '{}': {field} must not be 0",
+                        provider.name
+                    )));
+                }
+            }
+        }
 
         let mut provider_names = HashSet::new();
         // model id -> the provider that first declared it, so a collision can
@@ -445,7 +587,91 @@ impl Config {
                 }
             }
         }
+
+        self.validate_fallbacks(&err)?;
         Ok(())
+    }
+
+    /// Validate every model's fallback chain (M6 §6.2): each fallback id must
+    /// exist, differ from the model itself, and serve every capability the
+    /// model declares (so any request routed to the model can fall over to it).
+    fn validate_fallbacks(
+        &self,
+        err: &impl Fn(String) -> ConfigError,
+    ) -> Result<(), ConfigError> {
+        // model id -> its declared capabilities, across all providers.
+        let mut caps: HashMap<&str, &[Capability]> = HashMap::new();
+        for provider in &self.providers {
+            for model in &provider.models {
+                caps.insert(model.id.as_str(), &model.capabilities);
+            }
+        }
+        for provider in &self.providers {
+            for model in &provider.models {
+                for fallback in &model.fallbacks {
+                    if fallback == &model.id {
+                        return Err(err(format!(
+                            "model '{}' lists itself as a fallback",
+                            model.id
+                        )));
+                    }
+                    let Some(fallback_caps) = caps.get(fallback.as_str()) else {
+                        return Err(err(format!(
+                            "model '{}' has an unknown fallback '{fallback}'",
+                            model.id
+                        )));
+                    };
+                    if let Some(missing) = model
+                        .capabilities
+                        .iter()
+                        .find(|c| !fallback_caps.contains(c))
+                    {
+                        return Err(err(format!(
+                            "fallback '{fallback}' for model '{}' does not serve capability \
+                             '{missing}' (a fallback must serve every capability of the model \
+                             it backs)",
+                            model.id
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The ordered fallback chain for each model id (primary first), derived
+    /// from `fallbacks`. Models without fallbacks are omitted.
+    #[must_use]
+    pub fn fallback_map(&self) -> HashMap<String, Vec<String>> {
+        let mut map = HashMap::new();
+        for provider in &self.providers {
+            for model in &provider.models {
+                if !model.fallbacks.is_empty() {
+                    map.insert(model.id.clone(), model.fallbacks.clone());
+                }
+            }
+        }
+        map
+    }
+
+    /// Per-model timeout overrides (first-token, total) inherited from the
+    /// owning provider. Models whose provider sets no override are omitted
+    /// (the caller applies the global defaults).
+    #[must_use]
+    pub fn model_timeout_overrides(&self) -> HashMap<String, (Option<u64>, Option<u64>)> {
+        let mut map = HashMap::new();
+        for provider in &self.providers {
+            if provider.first_token_timeout_ms.is_none() && provider.total_timeout_ms.is_none() {
+                continue;
+            }
+            for model in &provider.models {
+                map.insert(
+                    model.id.clone(),
+                    (provider.first_token_timeout_ms, provider.total_timeout_ms),
+                );
+            }
+        }
+        map
     }
 
     /// Build the provider specs used to construct the registry, resolving each
@@ -744,6 +970,117 @@ mod tests {
                 "example should demo {kind:?}"
             );
         }
+    }
+
+    #[test]
+    fn resilience_defaults_are_sane_and_off() {
+        let cfg = load_str("").unwrap();
+        assert_eq!(cfg.resilience.retry_max_attempts, 3);
+        assert_eq!(cfg.resilience.retry_base_ms, 200);
+        assert_eq!(cfg.resilience.retry_max_ms, 5_000);
+        assert_eq!(cfg.resilience.circuit_failure_threshold, 5);
+        assert_eq!(cfg.resilience.circuit_cooldown_ms, 30_000);
+        assert_eq!(cfg.resilience.connect_timeout_ms, 5_000);
+        assert_eq!(cfg.resilience.total_timeout_ms, 600_000);
+        assert!(!cfg.resilience.health_check_enabled);
+    }
+
+    #[test]
+    fn resilience_rejects_zero_knobs() {
+        let err = load_str("[resilience]\nretry_max_attempts = 0\n").unwrap_err();
+        assert!(err.to_string().contains("retry_max_attempts"));
+        let err = load_str("[resilience]\ntotal_timeout_ms = 0\n").unwrap_err();
+        assert!(err.to_string().contains("total_timeout_ms"));
+    }
+
+    #[test]
+    fn valid_fallback_chain_parses_and_maps() {
+        let toml = r#"
+            [[providers]]
+            name = "openai"
+            kind = "openai"
+            [[providers.models]]
+            id = "gpt"
+            capabilities = ["chat"]
+            fallbacks = ["claude"]
+
+            [[providers]]
+            name = "anthropic"
+            kind = "anthropic"
+            [[providers.models]]
+            id = "claude"
+            capabilities = ["chat"]
+        "#;
+        let cfg = load_str(toml).unwrap();
+        let map = cfg.fallback_map();
+        assert_eq!(map.get("gpt"), Some(&vec!["claude".to_owned()]));
+        assert!(!map.contains_key("claude"));
+    }
+
+    #[test]
+    fn fallback_to_unknown_model_is_rejected() {
+        let toml = r#"
+            [[providers]]
+            name = "openai"
+            kind = "openai"
+            [[providers.models]]
+            id = "gpt"
+            capabilities = ["chat"]
+            fallbacks = ["ghost"]
+        "#;
+        let err = load_str(toml).unwrap_err();
+        assert!(err.to_string().contains("ghost"), "{err}");
+    }
+
+    #[test]
+    fn fallback_missing_a_capability_is_rejected() {
+        // The fallback serves only embed, but the model needs chat.
+        let toml = r#"
+            [[providers]]
+            name = "openai"
+            kind = "openai"
+            [[providers.models]]
+            id = "gpt"
+            capabilities = ["chat"]
+            fallbacks = ["embed-only"]
+            [[providers.models]]
+            id = "embed-only"
+            capabilities = ["embed"]
+        "#;
+        let err = load_str(toml).unwrap_err();
+        assert!(err.to_string().contains("capability"), "{err}");
+    }
+
+    #[test]
+    fn self_fallback_is_rejected() {
+        let toml = r#"
+            [[providers]]
+            name = "openai"
+            kind = "openai"
+            [[providers.models]]
+            id = "gpt"
+            capabilities = ["chat"]
+            fallbacks = ["gpt"]
+        "#;
+        let err = load_str(toml).unwrap_err();
+        assert!(err.to_string().contains("itself"), "{err}");
+    }
+
+    #[test]
+    fn per_provider_timeout_overrides_parse_and_map() {
+        let toml = r#"
+            [[providers]]
+            name = "slowvendor"
+            kind = "openai"
+            first_token_timeout_ms = 60000
+            total_timeout_ms = 120000
+            [[providers.models]]
+            id = "gpt"
+            capabilities = ["chat"]
+        "#;
+        let cfg = load_str(toml).unwrap();
+        let overrides = cfg.model_timeout_overrides();
+        assert_eq!(overrides.get("gpt"), Some(&(Some(60_000), Some(120_000))));
     }
 
     #[test]

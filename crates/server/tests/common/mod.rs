@@ -5,6 +5,7 @@
 #![allow(dead_code)]
 
 use ferrogate_providers::{http, Registry};
+use ferrogate_server::resilience::ResilienceRuntime;
 use ferrogate_server::{build_app, serve, AppState, StreamGuards};
 use ferrogate_telemetry::{Metrics, TokenMetrics};
 use std::sync::Arc;
@@ -30,7 +31,14 @@ pub async fn spawn_with_guards(
     body_limit: usize,
     guards: StreamGuards,
 ) -> String {
-    spawn_state(base_state(registry).with_guards(guards), body_limit).await
+    // Align the executor's first-token timeout with the guard the test set, so
+    // the FG-3011 tests still exercise their short window (the executor now owns
+    // the first-token deadline, M6).
+    let resilience = Arc::new(ResilienceRuntime::defaults().with_first_token(guards.first_token_timeout));
+    let state = base_state(registry)
+        .with_guards(guards)
+        .with_resilience(resilience);
+    spawn_state(state, body_limit).await
 }
 
 /// Spawn the app from a fully-built state (auth/pricing/usage attached by the

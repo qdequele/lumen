@@ -9,14 +9,16 @@
 use axum::extract::rejection::JsonRejection;
 use axum::extract::State;
 use axum::http::HeaderMap;
+use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
-use ferrogate_core::{tokens, EmbedResponse, GatewayError};
+use ferrogate_core::{tokens, GatewayError};
 use ferrogate_providers::batch;
 use tokio_util::sync::CancellationToken;
 
 use crate::accounting::{Accounting, Outcome, Target};
 use crate::auth::AuthedKey;
 use crate::error::ApiError;
+use crate::resilience::model_used_headers;
 use crate::state::AppState;
 
 /// Handle an embeddings request.
@@ -25,32 +27,36 @@ pub async fn embeddings(
     headers: HeaderMap,
     key: Option<Extension<AuthedKey>>,
     payload: Result<Json<ferrogate_core::EmbedRequest>, JsonRejection>,
-) -> Result<Json<EmbedResponse>, ApiError> {
+) -> Result<Response, ApiError> {
     // Malformed request body → FG-1001 in our standard envelope (not axum's
     // default plain-text rejection).
-    let Json(mut req) = payload.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
+    let Json(req) = payload.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
 
     if req.input.is_empty() {
         return Err(GatewayError::InvalidRequest("`input` must not be empty".to_owned()).into());
     }
 
-    // Resolve the client-facing model id to a provider + upstream id.
+    // Resolve the requested model to a fallback chain (primary + configured
+    // fallbacks), each re-resolved for the embed capability (M6 §6.2).
     let client_model = req.model.clone();
-    let route = ferrogate_router::resolve_embedding(&state.registry, &req.model)?;
-    req.model = route.upstream_id.clone();
+    let chain_ids = state.resilience.chain_ids(&client_model);
+    let chain = ferrogate_router::resolve_embedding_chain(&state.registry, &chain_ids)?;
+    let links = ferrogate_router::embedding_links(&chain);
+    let exec = state.resilience.exec_config(&client_model);
 
     // Admission BEFORE the upstream call: the pre-call estimate is reserved
-    // atomically against the key's budget and quotas (M5 §5.2).
+    // atomically against the key's budget and quotas (M5 §5.2). The provider
+    // label is corrected to the one that actually serves (M6) after execution.
     let estimated_input = tokens::estimate_embed_input(&req);
     let estimated_cost = state.pricing.token_cost(&client_model, estimated_input, 0);
-    let accounting = Accounting::begin(
+    let mut accounting = Accounting::begin(
         &state,
         &headers,
         key.as_deref(),
         Target {
             capability: "embed",
             model: &client_model,
-            provider: &route.provider_name,
+            provider: &chain[0].route.provider_name,
         },
         estimated_input,
         estimated_cost,
@@ -62,15 +68,35 @@ pub async fn embeddings(
     let cancel = CancellationToken::new();
     let _guard = cancel.clone().drop_guard();
 
-    let mut response = batch::embed_batched(
-        route.provider.as_ref(),
-        req,
+    // Execute across the chain with retries, fallback, circuit breaking and the
+    // per-model timeouts. A fresh request clone (per attempt/link) carries that
+    // link's upstream id.
+    let executed = ferrogate_router::executor::execute(
+        &links,
+        &state.resilience.breakers,
+        &exec,
         &cancel,
-        batch::DEFAULT_CONCURRENCY,
+        |i| {
+            let provider = chain[i].route.provider.clone();
+            let cancel = cancel.clone();
+            let mut attempt_req = req.clone();
+            chain[i].route.upstream_id.clone_into(&mut attempt_req.model);
+            async move {
+                batch::embed_batched(
+                    provider.as_ref(),
+                    attempt_req,
+                    &cancel,
+                    batch::DEFAULT_CONCURRENCY,
+                )
+                .await
+            }
+        },
     )
-    .await
-    .map_err(|e| GatewayError::from_provider(&route.provider_name, e))?;
+    .await?;
     // (an early return above drops `accounting`, refunding the reservation)
+
+    let mut response = executed.value;
+    accounting.served_by(&executed.model_used, &executed.provider_used);
 
     // ADR 003: upstream usage when reported, else the local estimate — never
     // a silent zero (e.g. TEI reports nothing).
@@ -85,7 +111,9 @@ pub async fn embeddings(
         response.usage.total_tokens = response.usage.prompt_tokens;
         response.usage.estimated = Some(true);
     }
-    let cost = state.pricing.token_cost(&client_model, tokens_in, 0);
+    let cost = state
+        .pricing
+        .token_cost(&executed.model_used, tokens_in, 0);
     accounting.finish(&Outcome {
         tokens_in,
         tokens_out: 0,
@@ -95,5 +123,5 @@ pub async fn embeddings(
         status: 200,
     });
 
-    Ok(Json(response))
+    Ok((model_used_headers(&executed.model_used), Json(response)).into_response())
 }

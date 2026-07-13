@@ -77,8 +77,11 @@ pub struct KeyPatch {
 pub struct UsageRecord {
     /// The virtual key that made the call; `None` when auth is disabled.
     pub key_id: Option<String>,
-    /// Client-facing model id.
+    /// Client-facing model id the client requested.
     pub model: String,
+    /// Model that actually served the request — the same as `model` unless a
+    /// fallback fired (M6 §6.2).
+    pub model_used: String,
     /// `chat` | `embed` | `rerank`.
     pub capability: String,
     /// Input/prompt tokens.
@@ -300,11 +303,12 @@ impl KeyStore {
         for rec in batch {
             sqlx::query(
                 "INSERT INTO usage_log \
-                 (key_id, model, capability, tokens_in, tokens_out, search_units, estimated, cost, latency_ms, status, metadata, ts) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 (key_id, model, model_used, capability, tokens_in, tokens_out, search_units, estimated, cost, latency_ms, status, metadata, ts) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(&rec.key_id)
             .bind(&rec.model)
+            .bind(&rec.model_used)
             .bind(&rec.capability)
             .bind(rec.tokens_in)
             .bind(rec.tokens_out)
@@ -398,7 +402,7 @@ impl KeyStore {
                     "SELECT quote(id)||'|'||quote(key_hash)||'|'||quote(name)||'|'||quote(budget_max)||'|'||quote(budget_spent)||'|'||quote(rpm_limit)||'|'||quote(tpm_limit)||'|'||quote(expires_at)||'|'||quote(disabled)||'|'||quote(created_at) AS r FROM virtual_keys"
                 }
                 _ => {
-                    "SELECT quote(id)||'|'||quote(key_id)||'|'||quote(model)||'|'||quote(capability)||'|'||quote(tokens_in)||'|'||quote(tokens_out)||'|'||quote(search_units)||'|'||quote(estimated)||'|'||quote(cost)||'|'||quote(latency_ms)||'|'||quote(status)||'|'||coalesce(metadata,'')||'|'||quote(ts) AS r FROM usage_log"
+                    "SELECT quote(id)||'|'||quote(key_id)||'|'||quote(model)||'|'||quote(model_used)||'|'||quote(capability)||'|'||quote(tokens_in)||'|'||quote(tokens_out)||'|'||quote(search_units)||'|'||quote(estimated)||'|'||quote(cost)||'|'||quote(latency_ms)||'|'||quote(status)||'|'||coalesce(metadata,'')||'|'||quote(ts) AS r FROM usage_log"
                 }
             };
             for row in sqlx::query(sql).fetch_all(&self.pool).await? {

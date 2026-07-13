@@ -14,17 +14,26 @@ use tokio_util::sync::CancellationToken;
 
 use crate::mapping::{classify_status, parse_retry_after};
 
-/// Build the process-wide HTTP client.
-///
-/// Timeouts here are coarse startup defaults; fine-grained per-phase timeouts
-/// (connect / first-token / total) arrive in M6.
+/// Build the process-wide HTTP client with default timeouts (10 s connect,
+/// 300 s overall). Prefer [`build_client_with`] to honour the operator's
+/// resilience config (M6).
 #[must_use]
 pub fn build_client() -> reqwest::Client {
+    build_client_with(Duration::from_secs(10), Duration::from_secs(300))
+}
+
+/// Build the process-wide HTTP client with an explicit connect timeout
+/// (FG-3012, client-wide — M6 §6.4) and an overall backstop.
+///
+/// The `overall` cap is a safety net so a wedged upstream cannot pin a
+/// connection forever; the executor's total timeout (and cancellation on client
+/// disconnect) normally fire first. One pooled client is shared across all
+/// providers, so the connect timeout is necessarily process-wide.
+#[must_use]
+pub fn build_client_with(connect: Duration, overall: Duration) -> reqwest::Client {
     reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(10))
-        // A generous overall cap so a wedged upstream cannot pin a connection
-        // forever; cancellation (client disconnect) aborts sooner than this.
-        .timeout(Duration::from_secs(300))
+        .connect_timeout(connect)
+        .timeout(overall)
         .user_agent(concat!("ferrogate/", env!("CARGO_PKG_VERSION")))
         .build()
         // Falls back to the default client if the builder somehow fails; the

@@ -53,8 +53,12 @@ pub struct Target<'a> {
 /// Open accounting for one admitted request.
 pub struct Accounting {
     capability: &'static str,
-    /// Client-facing model id (the aliased id, not the upstream one).
+    /// Client-facing model id the client requested (the aliased id).
     model: String,
+    /// Model that actually served the request (a fallback may differ). Set via
+    /// [`served_by`](Accounting::served_by) after the executor resolves it;
+    /// defaults to the requested model.
+    model_used: String,
     provider: String,
     key_id: Option<String>,
     reservation: Option<Reservation>,
@@ -108,6 +112,7 @@ impl Accounting {
         Ok(Self {
             capability: target.capability,
             model: target.model.to_owned(),
+            model_used: target.model.to_owned(),
             provider: target.provider.to_owned(),
             key_id,
             reservation,
@@ -123,6 +128,20 @@ impl Accounting {
     #[must_use]
     pub fn pricing(&self) -> &CostTable {
         &self.pricing
+    }
+
+    /// Record which provider/model actually served the request (M6): a fallback
+    /// may differ from the primary. Drives the token-metric `model`/`provider`
+    /// labels, the cost model and `usage_log.model_used`.
+    pub fn served_by(&mut self, model_used: &str, provider: &str) {
+        model_used.clone_into(&mut self.model_used);
+        provider.clone_into(&mut self.provider);
+    }
+
+    /// The model that served the request (for the caller's cost calculation).
+    #[must_use]
+    pub fn model_used(&self) -> &str {
+        &self.model_used
     }
 
     /// Close the record: settle the budget reservation at the real cost,
@@ -141,6 +160,7 @@ impl Accounting {
             target: "ferrogate::usage",
             capability = self.capability,
             model = %self.model,
+            model_used = %self.model_used,
             provider = %self.provider,
             key_id = self.key_id.as_deref().unwrap_or("-"),
             tokens_in = outcome.tokens_in,
@@ -158,10 +178,12 @@ impl Accounting {
             None => crate::metadata::empty_label_values(allowlist),
         };
 
+        // Metrics attribute tokens to the model/provider that actually served
+        // the request (== requested unless a fallback fired).
         self.tokens.add_tokens(
             &TokenSample {
                 capability: self.capability,
-                model: &self.model,
+                model: &self.model_used,
                 provider: &self.provider,
                 direction: Direction::Input,
                 estimated: outcome.estimated,
@@ -172,7 +194,7 @@ impl Accounting {
         self.tokens.add_tokens(
             &TokenSample {
                 capability: self.capability,
-                model: &self.model,
+                model: &self.model_used,
                 provider: &self.provider,
                 direction: Direction::Output,
                 estimated: outcome.estimated,
@@ -182,13 +204,14 @@ impl Accounting {
         );
         if let Some(units) = outcome.search_units {
             self.tokens
-                .add_search_units(&self.model, &self.provider, &values, units);
+                .add_search_units(&self.model_used, &self.provider, &values, units);
         }
 
         if let Some(logger) = &self.usage {
             let record = UsageRecord {
                 key_id: self.key_id.clone(),
                 model: self.model.clone(),
+                model_used: self.model_used.clone(),
                 capability: self.capability.to_owned(),
                 tokens_in: i64::try_from(outcome.tokens_in).unwrap_or(i64::MAX),
                 tokens_out: i64::try_from(outcome.tokens_out).unwrap_or(i64::MAX),

@@ -2,6 +2,7 @@
 
 use crate::auth::AuthRuntime;
 use crate::pricing::CostTable;
+use crate::resilience::ResilienceRuntime;
 use ferrogate_auth::usage::UsageLogger;
 use ferrogate_providers::Registry;
 use ferrogate_telemetry::{Metrics, TokenMetrics};
@@ -52,6 +53,9 @@ pub struct AppState {
     pub usage: Option<UsageLogger>,
     /// Per-model price table (M5 cost counting).
     pub pricing: Arc<CostTable>,
+    /// Resilience runtime: circuit breakers, retry policy, timeouts, fallback
+    /// chains (M6). All in-memory; never on a database path.
+    pub resilience: Arc<ResilienceRuntime>,
 }
 
 impl AppState {
@@ -68,7 +72,15 @@ impl AppState {
             auth: None,
             usage: None,
             pricing: Arc::new(CostTable::default()),
+            resilience: Arc::new(ResilienceRuntime::defaults()),
         }
+    }
+
+    /// Attach the resilience runtime (builder style).
+    #[must_use]
+    pub fn with_resilience(mut self, resilience: Arc<ResilienceRuntime>) -> Self {
+        self.resilience = resilience;
+        self
     }
 
     /// Replace the stream guard timings (builder style).

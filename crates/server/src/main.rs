@@ -19,9 +19,10 @@ use ferrogate_server::{
     config::Config,
     lifecycle, log_startup,
     pricing::CostTable,
+    resilience::ResilienceRuntime,
     state::AppState,
 };
-use ferrogate_telemetry::{logging::init_logging, Metrics, TokenMetrics};
+use ferrogate_telemetry::{logging::init_logging, Metrics, ResilienceMetrics, TokenMetrics};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 
@@ -128,6 +129,12 @@ fn run(config: Config) -> anyhow::Result<()> {
         let metrics = Metrics::new();
         let tokens = TokenMetrics::register(&metrics, &config.telemetry.metadata_labels)
             .context("failed to register token metrics")?;
+        let resilience_metrics =
+            ResilienceMetrics::register(&metrics).context("failed to register resilience metrics")?;
+        let resilience = Arc::new(ResilienceRuntime::from_config(
+            &config,
+            Some(resilience_metrics),
+        ));
 
         // The M5 auth stack: SQLite store, in-memory key state, usage writer,
         // periodic budget flush and retention purge. All optional — the
@@ -140,7 +147,12 @@ fn run(config: Config) -> anyhow::Result<()> {
             (None, None, None)
         };
 
-        let client = ferrogate_providers::http::build_client();
+        // Connect timeout is client-wide (one pooled client); the overall cap
+        // is a backstop above the executor's total timeout (M6 §6.4).
+        let client = ferrogate_providers::http::build_client_with(
+            Duration::from_millis(config.resilience.connect_timeout_ms),
+            Duration::from_millis(config.resilience.total_timeout_ms.saturating_add(30_000)),
+        );
         let registry = Arc::new(
             ferrogate_providers::Registry::build(provider_specs, client)
                 .context("failed to build provider registry")?,
@@ -148,7 +160,8 @@ fn run(config: Config) -> anyhow::Result<()> {
 
         let mut state = AppState::new(metrics, registry, tokens)
             .with_guards(guards)
-            .with_pricing(CostTable::from_config(&config));
+            .with_pricing(CostTable::from_config(&config))
+            .with_resilience(resilience);
         if let Some(runtime) = auth_runtime.clone() {
             state = state.with_auth(runtime);
         }
