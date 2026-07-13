@@ -5,9 +5,9 @@
 //! the original order** with summed token usage. A single sub-batch failure
 //! fails the whole request (no partial results in v1).
 
+use futures::stream::{self, StreamExt, TryStreamExt};
 use lumen_core::ProviderError;
 use lumen_core::{EmbedInput, EmbedRequest, EmbedResponse, EmbedUsage, EmbeddingProvider};
-use futures::stream::{self, StreamExt, TryStreamExt};
 use tokio_util::sync::CancellationToken;
 
 /// Default number of sub-batches sent concurrently.

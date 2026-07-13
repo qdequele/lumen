@@ -8,6 +8,8 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
+use figment::providers::{Format, Toml};
+use figment::Figment;
 use lumen_auth::crypto::MasterKey;
 use lumen_auth::key::hash_key;
 use lumen_auth::state::AuthState;
@@ -20,8 +22,6 @@ use lumen_server::config::Config;
 use lumen_server::pricing::CostTable;
 use lumen_server::AppState;
 use lumen_telemetry::{Metrics, TokenMetrics};
-use figment::providers::{Format, Toml};
-use figment::Figment;
 use serde_json::{json, Value};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -755,10 +755,7 @@ async fn metadata_lands_in_usage_log_and_only_allowlisted_keys_become_labels() {
         .client
         .post(format!("{}/v1/embeddings", h.base))
         .bearer_auth(&key)
-        .header(
-            "x-lumen-metadata",
-            r#"{"team":"search","user_dim":"u-42"}"#,
-        )
+        .header("x-lumen-metadata", r#"{"team":"search","user_dim":"u-42"}"#)
         .json(&embed_body())
         .send()
         .await

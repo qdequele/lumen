@@ -9,13 +9,13 @@
 //! The actual secret is read from the environment at provider-construction
 //! time, so deriving `Debug` on these structs cannot leak a key.
 
-use lumen_core::Capability;
-use lumen_providers::{ModelSpec, ProviderKind, ProviderSpec};
-use lumen_telemetry::logging::LogFormat;
 use figment::{
     providers::{Env, Format, Toml},
     Figment,
 };
+use lumen_core::Capability;
+use lumen_providers::{ModelSpec, ProviderKind, ProviderSpec};
+use lumen_telemetry::logging::LogFormat;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;

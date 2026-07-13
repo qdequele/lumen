@@ -14,10 +14,8 @@
 //!   (LM-3010 — the server appends the error frame).
 
 use bytes::Bytes;
-use lumen_core::{
-    ChatChunk, ChatChunkChoice, ChatDelta, ChatRequest, ChatResponse, ProviderError,
-};
 use futures::stream::{self, BoxStream, StreamExt};
+use lumen_core::{ChatChunk, ChatChunkChoice, ChatDelta, ChatRequest, ChatResponse, ProviderError};
 
 use crate::sse::{SseEvent, SseParser};
 

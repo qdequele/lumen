@@ -6,11 +6,11 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures::stream::BoxStream;
 use lumen_core::{
     ChatChunk, ChatProvider, ChatRequest, ChatResponse, EmbedRequest, EmbedResponse,
     EmbeddingProvider, ProviderError,
 };
-use futures::stream::BoxStream;
 use std::fmt;
 use tokio_util::sync::CancellationToken;
 

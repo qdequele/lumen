@@ -88,6 +88,46 @@ fn openai_chat_body(model: &str) -> Value {
 }
 
 #[tokio::test]
+async fn openai_compatible_kind_routes_through_the_openai_path() {
+    // A new OpenAI-compatible kind (Groq) pointed at a mock via base_url must
+    // route exactly like the OpenAI kind — proving the shared provider wiring.
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_chat_body("llama-3.3-70b")))
+        .mount(&upstream)
+        .await;
+
+    let specs = vec![ProviderSpec {
+        name: "groq".to_owned(),
+        kind: ProviderKind::Groq,
+        api_key: Some("gsk-test".to_owned()),
+        base_url: Some(upstream.uri()), // override the built-in api.groq.com default
+        models: vec![ModelSpec {
+            id: "fast".to_owned(),
+            upstream_id: "llama-3.3-70b".to_owned(),
+            capabilities: vec![Capability::Chat],
+        }],
+    }];
+    let registry = Arc::new(Registry::build(specs, http::build_client()).expect("registry builds"));
+    let base = common::spawn_with(registry, LIMIT).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&json!({ "model": "fast", "messages": [{ "role": "user", "content": "hi" }] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["object"], "chat.completion");
+    // Alias resolved to the upstream id, just like the OpenAI kind.
+    let requests = upstream.received_requests().await.unwrap();
+    let sent: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(sent["model"], "llama-3.3-70b");
+}
+
+#[tokio::test]
 async fn non_streaming_happy_path_resolves_alias_and_returns_openai_shape() {
     let upstream = MockServer::start().await;
     Mock::given(method("POST"))

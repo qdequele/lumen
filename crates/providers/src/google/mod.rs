@@ -17,11 +17,11 @@ mod stream;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures::stream::BoxStream;
 use lumen_core::{
     ChatChoice, ChatChunk, ChatMessage, ChatProvider, ChatRequest, ChatResponse, ProviderError,
     Usage,
 };
-use futures::stream::BoxStream;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use tokio_util::sync::CancellationToken;

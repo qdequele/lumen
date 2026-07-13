@@ -32,8 +32,8 @@ use axum::http::{header, HeaderMap};
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
 use bytes::Bytes;
-use lumen_core::{tokens, ChatRequest, GatewayError, ProviderError, Usage};
 use futures::stream::{BoxStream, StreamExt};
+use lumen_core::{tokens, ChatRequest, GatewayError, ProviderError, Usage};
 use tokio_util::sync::{CancellationToken, DropGuard};
 
 use crate::accounting::{Accounting, Outcome, StreamAccounting, Target};

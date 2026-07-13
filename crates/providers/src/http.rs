@@ -5,8 +5,8 @@
 //! across providers. `reqwest::Client` uses rustls, never OpenSSL.
 
 use bytes::Bytes;
-use lumen_core::ProviderError;
 use futures::stream::{BoxStream, StreamExt};
+use lumen_core::ProviderError;
 use serde::Serialize;
 use std::future::Future;
 use std::time::Duration;

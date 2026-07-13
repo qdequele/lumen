@@ -16,13 +16,13 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use criterion::{criterion_group, criterion_main, Criterion};
+use futures::stream::BoxStream;
 use lumen_core::{
     ChatChoice, ChatMessage, ChatProvider, ChatRequest, ChatResponse, ProviderError, Usage,
 };
 use lumen_router::circuit::{BreakerConfig, CircuitBreakers};
 use lumen_router::executor::{execute, ExecConfig, Link};
 use lumen_router::retry::RetryPolicy;
-use futures::stream::BoxStream;
 use tokio_util::sync::CancellationToken;
 
 /// A provider that returns a canned response with zero I/O — the constant part

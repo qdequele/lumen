@@ -152,9 +152,11 @@ non-empty (an empty list is rejected with `LM-2010`).
 
 ## Providers × capabilities
 
-Nine provider kinds. The `kind` string is what you put in a `[[providers]]`
-block. **Self-hosted** kinds are keyless and require a `base_url`; hosted kinds
-read their API key from the env var named by `api_key_env`.
+Twenty provider kinds: nine **native** integrations plus eleven
+**OpenAI-compatible** hosts. The `kind` string is what you put in a
+`[[providers]]` block. **Self-hosted** kinds are keyless and require a
+`base_url`; hosted kinds read their API key from the env var named by
+`api_key_env`.
 
 | `kind`      | Chat | Embed | Rerank | Auth                  | Notes                          |
 |-------------|:----:|:-----:|:------:|-----------------------|--------------------------------|
@@ -168,7 +170,14 @@ read their API key from the env var named by `api_key_env`.
 | `tei`       |      |  ✅   |   ✅   | keyless, **`base_url`** | self-hosted (Text Embeddings Inference) |
 | `ollama`    |      |  ✅   |        | keyless, **`base_url`** | self-hosted                    |
 
-Per-provider setup (env var, `base_url`, batch limits) is in
+**OpenAI-compatible hosts** (chat + embed, reusing the OpenAI path with a
+built-in base URL): `groq`, `together`, `fireworks`, `deepseek`, `openrouter`,
+`perplexity`, `xai`, `deepinfra`, `huggingface` (HF Inference router),
+`cloudflare` (Workers AI — `base_url` carries your account id), and `vllm` (any
+self-hosted OpenAI-compatible server: vLLM, llama.cpp, LM Studio, …). Anything
+else that speaks the OpenAI format works via `kind = "openai"` + a `base_url`.
+
+Per-provider setup (env var, `base_url`, defaults, batch limits) is in
 [`docs/providers.md`](docs/providers.md).
 
 ## Features

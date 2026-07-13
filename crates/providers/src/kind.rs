@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderKind {
+    // --- Native integrations (own request/response translation) --------------
     Openai,
     Anthropic,
     Cohere,
@@ -18,6 +19,24 @@ pub enum ProviderKind {
     Voyage,
     Mistral,
     Google,
+    // --- OpenAI-compatible hosts (served by the OpenAI provider with a
+    //     per-kind base URL; chat + embeddings). ------------------------------
+    Groq,
+    Together,
+    Fireworks,
+    Deepseek,
+    Openrouter,
+    Perplexity,
+    Xai,
+    Deepinfra,
+    /// Hugging Face Inference (the OpenAI-compatible router endpoint).
+    Huggingface,
+    /// Cloudflare Workers AI (OpenAI-compatible endpoint; `base_url` carries the
+    /// account id, so it is required).
+    Cloudflare,
+    /// A self-hosted OpenAI-compatible server (vLLM, llama.cpp, LM Studio, …);
+    /// `base_url` required, API key optional.
+    Vllm,
 }
 
 impl ProviderKind {
@@ -34,14 +53,68 @@ impl ProviderKind {
             ProviderKind::Voyage => "voyage",
             ProviderKind::Mistral => "mistral",
             ProviderKind::Google => "google",
+            ProviderKind::Groq => "groq",
+            ProviderKind::Together => "together",
+            ProviderKind::Fireworks => "fireworks",
+            ProviderKind::Deepseek => "deepseek",
+            ProviderKind::Openrouter => "openrouter",
+            ProviderKind::Perplexity => "perplexity",
+            ProviderKind::Xai => "xai",
+            ProviderKind::Deepinfra => "deepinfra",
+            ProviderKind::Huggingface => "huggingface",
+            ProviderKind::Cloudflare => "cloudflare",
+            ProviderKind::Vllm => "vllm",
+        }
+    }
+
+    /// Whether this kind is served by the OpenAI provider (OpenAI-compatible
+    /// `/chat/completions` + `/embeddings`).
+    #[must_use]
+    pub const fn is_openai_compatible(self) -> bool {
+        matches!(
+            self,
+            ProviderKind::Openai
+                | ProviderKind::Groq
+                | ProviderKind::Together
+                | ProviderKind::Fireworks
+                | ProviderKind::Deepseek
+                | ProviderKind::Openrouter
+                | ProviderKind::Perplexity
+                | ProviderKind::Xai
+                | ProviderKind::Deepinfra
+                | ProviderKind::Huggingface
+                | ProviderKind::Cloudflare
+                | ProviderKind::Vllm
+        )
+    }
+
+    /// The built-in base URL for OpenAI-compatible hosts, or `None` when the
+    /// operator must supply one (self-hosted vLLM, or Cloudflare whose URL
+    /// embeds the account id). `None` for native kinds (they own their URLs).
+    #[must_use]
+    pub const fn default_base_url(self) -> Option<&'static str> {
+        match self {
+            ProviderKind::Groq => Some("https://api.groq.com/openai/v1"),
+            ProviderKind::Together => Some("https://api.together.xyz/v1"),
+            ProviderKind::Fireworks => Some("https://api.fireworks.ai/inference/v1"),
+            ProviderKind::Deepseek => Some("https://api.deepseek.com/v1"),
+            ProviderKind::Openrouter => Some("https://openrouter.ai/api/v1"),
+            ProviderKind::Perplexity => Some("https://api.perplexity.ai"),
+            ProviderKind::Xai => Some("https://api.x.ai/v1"),
+            ProviderKind::Deepinfra => Some("https://api.deepinfra.com/v1/openai"),
+            ProviderKind::Huggingface => Some("https://router.huggingface.co/v1"),
+            _ => None,
         }
     }
 
     /// Whether this provider requires an API key to be configured.
     ///
-    /// Local, self-hosted providers (Ollama, TEI) are keyless.
+    /// Local, self-hosted providers (Ollama, TEI, vLLM) are keyless.
     #[must_use]
     pub const fn requires_api_key(self) -> bool {
-        !matches!(self, ProviderKind::Ollama | ProviderKind::Tei)
+        !matches!(
+            self,
+            ProviderKind::Ollama | ProviderKind::Tei | ProviderKind::Vllm
+        )
     }
 }

@@ -4,6 +4,21 @@ All notable changes to LUMEN are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added — OpenAI-compatible provider kinds
+
+- Eleven new `kind`s served by the OpenAI provider with a per-kind base URL:
+  `groq`, `together`, `fireworks`, `deepseek`, `openrouter`, `perplexity`,
+  `xai`, `deepinfra`, `huggingface` (the HF Inference router), `cloudflare`
+  (Workers AI — `base_url` carries the account id, so it is required), and
+  `vllm` (any self-hosted OpenAI-compatible server; `base_url` required, API key
+  optional). All serve chat + embeddings. `ProviderKind` gains
+  `default_base_url()` and `is_openai_compatible()`; a missing URL for the two
+  URL-required kinds is a boot error rather than a silent fall-through to
+  api.openai.com. Docs (`docs/providers.md`, README matrix) and registry +
+  server wiring tests included.
+
 ## [0.1.0] — 2026-07-13
 
 First tagged release. LUMEN is a universal, self-hostable LLM gateway in

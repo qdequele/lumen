@@ -195,3 +195,18 @@ milestone.
 - **Richer health probe (DEBT-3)** — done for TEI (`/health` liveness; non-2xx =
   down). Other kinds keep bare host-reachability (no reliable unauthenticated
   liveness endpoint); a per-kind probe for vendor APIs remains out of scope.
+
+## Provider coverage — next candidates (post-rename)
+
+- **Tier-2 clouds need dedicated kinds** (different auth/schema, not
+  OpenAI-compatible): Azure OpenAI (deployment routing + api-version), AWS
+  Bedrock (SigV4, per-model schemas), Google Vertex AI (GCP OAuth, regional
+  endpoints). Each is a `provider-integrator` task with wiremock tests.
+- **Cohere chat** (Command R/R+) — we ship Cohere embed+rerank; chat is a
+  distinct schema.
+- **Cloudflare Workers AI rerank** — the OpenAI-compatible `cloudflare` kind
+  covers chat+embed; bge-reranker uses the native `/ai/run/{model}` endpoint
+  with a Cloudflare-specific response, so rerank needs custom code.
+- **More rerankers**: Mixedbread (mxbai-rerank), Pinecone Rerank, NVIDIA NIM
+  rerank, Together LlamaRank — cheap differentiation for a first-class rerank
+  gateway.

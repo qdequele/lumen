@@ -1,6 +1,8 @@
 # Providers
 
-LUMEN ships nine built-in provider kinds. Each `[[providers]]` block in your
+LUMEN ships twenty built-in provider kinds — nine native integrations (their own
+request/response translation) plus eleven **OpenAI-compatible** hosts that reuse
+the OpenAI path with a per-kind base URL. Each `[[providers]]` block in your
 config selects one with a `kind` string and gives it a unique `name` (your own
 label). Each `[[providers.models]]` block under it exposes a model to clients:
 
@@ -45,6 +47,27 @@ Rules that apply to every provider:
 | `voyage`    |      |  ✅   |   ✅   | required      | optional       | 128               |
 | `tei`       |      |  ✅   |   ✅   | keyless       | **required**   | 32                |
 | `ollama`    |      |  ✅   |        | keyless       | **required**   | 512               |
+
+OpenAI-compatible hosts (chat + embed via the OpenAI path; a host that only
+serves chat simply has no embed models configured):
+
+| `kind`        | Chat | Embed | `api_key_env` | `base_url`   | Default base URL                          |
+|---------------|:----:|:-----:|:-------------:|:------------:|-------------------------------------------|
+| `groq`        |  ✅  |  ✅   | required      | optional     | `https://api.groq.com/openai/v1`          |
+| `together`    |  ✅  |  ✅   | required      | optional     | `https://api.together.xyz/v1`             |
+| `fireworks`   |  ✅  |  ✅   | required      | optional     | `https://api.fireworks.ai/inference/v1`   |
+| `deepseek`    |  ✅  |  ✅   | required      | optional     | `https://api.deepseek.com/v1`             |
+| `openrouter`  |  ✅  |  ✅   | required      | optional     | `https://openrouter.ai/api/v1`            |
+| `perplexity`  |  ✅  |  ✅   | required      | optional     | `https://api.perplexity.ai`               |
+| `xai`         |  ✅  |  ✅   | required      | optional     | `https://api.x.ai/v1`                     |
+| `deepinfra`   |  ✅  |  ✅   | required      | optional     | `https://api.deepinfra.com/v1/openai`     |
+| `huggingface` |  ✅  |  ✅   | required      | optional     | `https://router.huggingface.co/v1`        |
+| `cloudflare`  |  ✅  |  ✅   | required      | **required** | — (URL embeds your account id)            |
+| `vllm`        |  ✅  |  ✅   | keyless       | **required** | — (your self-hosted server)               |
+
+All OpenAI-compatible kinds use a 2048-input embed batch limit. Anything that
+speaks the OpenAI wire format but isn't listed can still be used via
+`kind = "openai"` with a `base_url` override.
 
 ---
 
@@ -240,6 +263,76 @@ capabilities = ["embed"]
 ```
 
 ---
+
+## OpenAI-compatible hosts
+
+`groq`, `together`, `fireworks`, `deepseek`, `openrouter`, `perplexity`, `xai`,
+`deepinfra` and `huggingface` all work the same way: set the `kind`, point
+`api_key_env` at the host's token, and (optionally) override `base_url`. The
+built-in default base URL is used otherwise.
+
+```toml
+[[providers]]
+name = "groq"
+kind = "groq"
+api_key_env = "GROQ_API_KEY"
+[[providers.models]]
+id = "fast"
+upstream_id = "llama-3.3-70b-versatile"
+capabilities = ["chat"]
+```
+
+### huggingface
+
+The OpenAI-compatible **Inference router** (`https://router.huggingface.co/v1`),
+distinct from the self-hosted `tei` kind. `api_key_env` holds a Hugging Face
+token; `upstream_id` is a routed model id (often `owner/model:provider`).
+
+```toml
+[[providers]]
+name = "hf"
+kind = "huggingface"
+api_key_env = "HF_TOKEN"
+[[providers.models]]
+id = "qwen"
+upstream_id = "Qwen/Qwen2.5-72B-Instruct"
+capabilities = ["chat"]
+```
+
+### cloudflare
+
+Cloudflare **Workers AI** via its OpenAI-compatible endpoint. `base_url` is
+**required** because it embeds your account id; `api_key_env` holds a Cloudflare
+API token. (Workers AI reranking uses a Cloudflare-specific endpoint and is not
+covered by this OpenAI-compatible kind yet — see `docs/backlog.md`.)
+
+```toml
+[[providers]]
+name = "cf"
+kind = "cloudflare"
+api_key_env = "CLOUDFLARE_API_TOKEN"
+base_url = "https://api.cloudflare.com/client/v4/accounts/YOUR_ACCOUNT_ID/ai/v1"
+[[providers.models]]
+id = "cf-llama"
+upstream_id = "@cf/meta/llama-3.1-8b-instruct"
+capabilities = ["chat"]
+```
+
+### vllm
+
+Any self-hosted OpenAI-compatible server (vLLM, llama.cpp `--api`, LM Studio,
+SGLang, LocalAI). `base_url` **required**, API key optional.
+
+```toml
+[[providers]]
+name = "local"
+kind = "vllm"
+base_url = "http://localhost:8000/v1"
+[[providers.models]]
+id = "local-llama"
+upstream_id = "meta-llama/Llama-3.1-8B-Instruct"
+capabilities = ["chat", "embed"]
+```
 
 ## Fallbacks across providers
 

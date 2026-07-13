@@ -37,9 +37,7 @@ use std::sync::Arc;
 /// # Errors
 /// Returns a [`RegistryError`](lumen_providers::RegistryError) if a provider
 /// spec is invalid (e.g. a keyless provider missing its required `base_url`).
-pub fn build_registry(
-    config: &Config,
-) -> Result<Arc<Registry>, lumen_providers::RegistryError> {
+pub fn build_registry(config: &Config) -> Result<Arc<Registry>, lumen_providers::RegistryError> {
     let client = lumen_providers::http::build_client();
     let registry = Registry::build(config.provider_specs(), client)?;
     Ok(Arc::new(registry))

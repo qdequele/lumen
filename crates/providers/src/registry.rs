@@ -368,18 +368,46 @@ fn build_providers(
     };
 
     match spec.kind {
-        ProviderKind::Openai => {
+        // OpenAI + every OpenAI-compatible host (Groq, Together, Fireworks,
+        // DeepSeek, OpenRouter, Perplexity, xAI, DeepInfra, Hugging Face router,
+        // Cloudflare Workers AI, self-hosted vLLM/llama.cpp/LM Studio) share the
+        // OpenAI provider; only the base URL differs. The base is the explicit
+        // override, else the kind's built-in default. Kinds with neither (vLLM,
+        // Cloudflare — its URL carries the account id) must not silently fall
+        // through to api.openai.com, so a missing URL is a build error.
+        ProviderKind::Openai
+        | ProviderKind::Groq
+        | ProviderKind::Together
+        | ProviderKind::Fireworks
+        | ProviderKind::Deepseek
+        | ProviderKind::Openrouter
+        | ProviderKind::Perplexity
+        | ProviderKind::Xai
+        | ProviderKind::Deepinfra
+        | ProviderKind::Huggingface
+        | ProviderKind::Cloudflare
+        | ProviderKind::Vllm => {
+            let base_url = spec
+                .base_url
+                .clone()
+                .or_else(|| spec.kind.default_base_url().map(str::to_owned));
+            if base_url.is_none() && spec.kind != ProviderKind::Openai {
+                return Err(RegistryError::MissingBaseUrl {
+                    name: spec.name.clone(),
+                    kind: spec.kind.as_str(),
+                });
+            }
             let chat: Arc<dyn ChatProvider> = Arc::new(OpenAiProvider::new(
                 client.clone(),
                 spec.name.clone(),
-                spec.base_url.clone(),
+                base_url.clone(),
                 spec.api_key.clone(),
             ));
-            // Same instance behind the embedding trait object.
+            // Same instance shape behind the embedding trait object.
             let embed: Arc<dyn EmbeddingProvider> = Arc::new(OpenAiProvider::new(
                 client.clone(),
                 spec.name.clone(),
-                spec.base_url.clone(),
+                base_url,
                 spec.api_key.clone(),
             ));
             Ok(BuiltProviders {
@@ -576,6 +604,69 @@ mod tests {
             reqwest::Client::new(),
         );
         assert!(matches!(result, Err(RegistryError::MissingBaseUrl { .. })));
+    }
+
+    #[test]
+    fn openai_compatible_kinds_build_with_their_default_base_url() {
+        // A hosted OpenAI-compatible kind resolves for chat + embed with no
+        // base_url configured (its built-in default is used).
+        for kind in [
+            ProviderKind::Groq,
+            ProviderKind::Together,
+            ProviderKind::Fireworks,
+            ProviderKind::Deepseek,
+            ProviderKind::Openrouter,
+            ProviderKind::Perplexity,
+            ProviderKind::Xai,
+            ProviderKind::Deepinfra,
+            ProviderKind::Huggingface,
+        ] {
+            assert!(
+                kind.default_base_url().is_some(),
+                "{kind:?} needs a default"
+            );
+            let reg = Registry::build(
+                vec![spec(
+                    kind,
+                    "p",
+                    None,
+                    vec![model("m", &[Capability::Chat, Capability::Embed])],
+                )],
+                reqwest::Client::new(),
+            )
+            .unwrap_or_else(|e| panic!("{kind:?} should build: {e}"));
+            assert!(reg.chat_route("m").is_some(), "{kind:?} chat");
+            assert!(reg.embedding_route("m").is_some(), "{kind:?} embed");
+        }
+    }
+
+    #[test]
+    fn vllm_and_cloudflare_require_a_base_url() {
+        // No built-in default and none configured → a clear build error rather
+        // than silently pointing at api.openai.com.
+        for kind in [ProviderKind::Vllm, ProviderKind::Cloudflare] {
+            assert!(kind.default_base_url().is_none(), "{kind:?} has no default");
+            let result = Registry::build(
+                vec![spec(kind, "p", None, vec![model("m", &[Capability::Chat])])],
+                reqwest::Client::new(),
+            );
+            assert!(
+                matches!(result, Err(RegistryError::MissingBaseUrl { .. })),
+                "{kind:?} without base_url must be MissingBaseUrl"
+            );
+        }
+        // With a base_url they build fine.
+        let reg = Registry::build(
+            vec![spec(
+                ProviderKind::Vllm,
+                "p",
+                Some("http://localhost:8000/v1"),
+                vec![model("m", &[Capability::Chat])],
+            )],
+            reqwest::Client::new(),
+        )
+        .expect("vllm with base_url builds");
+        assert!(reg.chat_route("m").is_some());
     }
 
     #[test]

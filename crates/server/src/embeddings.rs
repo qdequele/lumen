@@ -75,12 +75,8 @@ pub async fn embeddings(
     // Execute across the chain with retries, fallback, circuit breaking and the
     // per-model timeouts. A fresh request clone (per attempt/link) carries that
     // link's upstream id.
-    let executed = lumen_router::executor::execute(
-        &links,
-        &state.resilience.breakers,
-        &exec,
-        &cancel,
-        |i| {
+    let executed =
+        lumen_router::executor::execute(&links, &state.resilience.breakers, &exec, &cancel, |i| {
             let provider = chain[i].route.provider.clone();
             let cancel = cancel.clone();
             let mut attempt_req = req.clone();
@@ -97,9 +93,8 @@ pub async fn embeddings(
                 )
                 .await
             }
-        },
-    )
-    .await?;
+        })
+        .await?;
     // (an early return above drops `accounting`, refunding the reservation)
 
     let mut response = executed.value;

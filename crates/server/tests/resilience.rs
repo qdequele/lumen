@@ -11,14 +11,14 @@ mod common;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use lumen_providers::{http, Registry};
-use lumen_server::config::Config;
-use lumen_server::pricing::CostTable;
-use lumen_server::resilience::ResilienceRuntime;
 use figment::{
     providers::{Format, Toml},
     Figment,
 };
+use lumen_providers::{http, Registry};
+use lumen_server::config::Config;
+use lumen_server::pricing::CostTable;
+use lumen_server::resilience::ResilienceRuntime;
 use serde_json::{json, Value};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};

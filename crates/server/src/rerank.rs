@@ -72,12 +72,8 @@ pub async fn rerank_handler(
     let cancel = CancellationToken::new();
     let _guard = cancel.clone().drop_guard();
 
-    let executed = lumen_router::executor::execute(
-        &links,
-        &state.resilience.breakers,
-        &exec,
-        &cancel,
-        |i| {
+    let executed =
+        lumen_router::executor::execute(&links, &state.resilience.breakers, &exec, &cancel, |i| {
             let provider = chain[i].route.provider.clone();
             let cancel = cancel.clone();
             let mut attempt_req = req.clone();
@@ -86,9 +82,8 @@ pub async fn rerank_handler(
                 .upstream_id
                 .clone_into(&mut attempt_req.model);
             async move { rerank::rerank(provider.as_ref(), attempt_req, &cancel).await }
-        },
-    )
-    .await?;
+        })
+        .await?;
     // (an early return above drops `accounting`, refunding the reservation)
 
     let mut response = executed.value;
