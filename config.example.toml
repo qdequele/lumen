@@ -146,6 +146,11 @@ api_key_env = "OPENAI_API_KEY"
 id = "gpt-4o"
 upstream_id = "gpt-4o-2024-08-06"
 capabilities = ["chat"]
+# Input modalities this model accepts. Default is ["text"]; opt a model into
+# vision (image_url content parts in /v1/chat/completions) by adding "image".
+# An image part sent to a model without it is rejected with LM-2003 (400)
+# before any upstream call. See docs/providers.md#vision-image-input.
+# modalities = ["text", "image"]
 # Optional prices (USD) — the source of cost counting and hard budgets.
 # A model without prices costs 0: budgets then never bite on it.
 cost_per_1m_input = 2.5

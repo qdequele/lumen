@@ -251,6 +251,81 @@ async fn image_to_a_non_vision_model_is_rejected_with_lm_2003() {
     assert!(upstream.received_requests().await.unwrap().is_empty());
 }
 
+/// OpenAI-family conformance: a model declared vision-capable (`modalities`
+/// includes `"image"`) forwards the OpenAI content-parts array to the
+/// upstream byte-for-byte (no re-shaping), and — since this mock upstream
+/// reports no `usage` at all — the response still carries a non-zero,
+/// honestly-labelled `estimated` token count rather than a silent zero
+/// (ADR 003 §8: the text-only estimation fallback still fires for a vision
+/// request; only the image part contributes 0).
+#[tokio::test]
+async fn openai_family_forwards_image_parts_verbatim() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "c", "object": "chat.completion", "created": 0, "model": "gpt",
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": "a cat" },
+                "finish_reason": "stop"
+            }]
+            // Deliberately no "usage" — exercises the estimation fallback.
+        })))
+        .mount(&upstream)
+        .await;
+
+    let cfg = format!(
+        r#"
+        [[providers]]
+        name = "openai"
+        kind = "openai"
+        base_url = "{}"
+        [[providers.models]]
+        id = "gpt"
+        capabilities = ["chat"]
+        modalities = ["text", "image"]
+        "#,
+        upstream.uri()
+    );
+    let base = spawn(&config_from(&cfg)).await;
+
+    let body = json!({
+        "model": "gpt",
+        "messages": [{"role":"user","content":[
+            {"type":"text","text":"what is this?"},
+            {"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}
+        ]}]
+    });
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // The upstream received the image part unchanged — no stripping, no
+    // reshaping of the content-parts array.
+    let reqs = upstream.received_requests().await.unwrap();
+    let sent: Value = serde_json::from_slice(&reqs[0].body).unwrap();
+    assert_eq!(
+        sent["messages"][0]["content"][1]["image_url"]["url"],
+        "data:image/png;base64,AAAA"
+    );
+    assert_eq!(sent["messages"][0]["content"][0]["text"], "what is this?");
+
+    // No upstream usage → the local estimator ran, flagged honestly, never a
+    // silent zero. The image part contributes 0 to the estimate (ADR 003
+    // addendum): "what is this?" (13 bytes) => 4 text tokens + the 4-token
+    // per-message overhead = 8, exactly what a text-only message would yield
+    // — pinning this value proves the image part is NOT silently double- or
+    // mis-counted, not merely that the count is positive.
+    let got: Value = resp.json().await.unwrap();
+    assert_eq!(got["usage"]["estimated"], true);
+    assert_eq!(got["usage"]["prompt_tokens"], 8);
+}
+
 #[tokio::test]
 async fn empty_messages_is_400_fg1001() {
     let upstream = MockServer::start().await;

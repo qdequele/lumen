@@ -196,6 +196,20 @@ milestone.
   down). Other kinds keep bare host-reachability (no reliable unauthenticated
   liveness endpoint); a per-kind probe for vendor APIs remains out of scope.
 
+## Noted while building M8 (vision — image input to chat)
+
+- **Per-image token heuristic for the estimation fallback** (OpenAI tile
+  formula). The estimation fallback (upstream reports no `usage`) counts text
+  only; an image part contributes `0`. A per-image estimate needs decoded
+  pixel dimensions, which the gateway does not extract from a `data:` URI
+  today (out of scope — no image-byte inspection on the request path). See the
+  [ADR 003 addendum](adr/003-token-accounting.md#addendum-m8--vision--image-input).
+- **Anthropic/Gemini file/GCS image URIs.** Only inline base64 (`data:` URIs)
+  and, where the provider fetches it itself (Anthropic), remote `http(s)` URLs
+  are supported. Anthropic's `source: {type: "file", file_id: ...}` and
+  Gemini's GCS `fileUri` sources are not modelled; add if a caller needs
+  pre-uploaded-file references instead of inline bytes.
+
 ## Provider coverage — next candidates (post-rename)
 
 - **Tier-2 clouds need dedicated kinds** (different auth/schema, not
