@@ -90,6 +90,10 @@ arm64 vérifiée localement (`docker run`).
       (`/multimodalembeddings`), Jina (`input` objets)
 - [x] Comptage tokens : usage amont fiable ; estimation locale = texte seul
       (images = 0, marqué `estimated`) — ADR 003
+- [x] Comptage média (dimension de facturation) : nombre de médias + octets
+      DÉCODÉS par type, en compteurs Prometheus (`lumen_media_total`,
+      `lumen_media_bytes_total`), dans le log `lumen::usage` et `usage_log`
+      (colonnes `media_count`/`media_bytes`, migration 0003)
 Spec : `docs/superpowers/specs/2026-07-14-multimodal-embeddings-design.md`
 
 Note : exception consciente et bornée à la règle « ne jamais déréférencer une

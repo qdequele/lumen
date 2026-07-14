@@ -137,11 +137,15 @@ pub async fn embeddings(
         response.usage.estimated = Some(true);
     }
     let cost = pricing.token_cost(&executed.model_used, tokens_in, 0);
+    // M9: media accounting. `req.input`'s image parts are now `data:` URIs
+    // (resolved before execution), so this measures decoded bytes with no I/O.
+    let media = lumen_core::measure_media(&req.input);
     accounting.finish(&Outcome {
         tokens_in,
         tokens_out: 0,
         estimated,
         search_units: None,
+        media,
         cost,
         status: 200,
     });

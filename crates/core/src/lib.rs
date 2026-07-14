@@ -21,6 +21,7 @@ pub mod chat;
 pub mod content;
 pub mod embed;
 pub mod error;
+pub mod media;
 pub mod provider;
 pub mod rerank;
 pub mod tokens;
@@ -33,6 +34,7 @@ pub use chat::{
 pub use content::{ContentPart, ImageUrl};
 pub use embed::{EmbedData, EmbedInput, EmbedItem, EmbedRequest, EmbedResponse, EmbedUsage};
 pub use error::{ErrorBody, ErrorEnvelope, ErrorType, GatewayError, ProviderError, QuotaKind};
+pub use media::{measure_media, MediaTypeUsage, MediaUsage};
 pub use provider::{ChatProvider, EmbeddingProvider, RerankProvider};
 pub use rerank::{
     RerankDocument, RerankRequest, RerankResponse, RerankResult, RerankResultDocument, RerankUsage,

@@ -90,6 +90,10 @@ pub struct UsageRecord {
     pub tokens_out: i64,
     /// Rerank search units, when the provider bills in them.
     pub search_units: Option<i64>,
+    /// Number of media items (images, …) in the request (M9). 0 for text-only.
+    pub media_count: i64,
+    /// Total decoded media bytes in the request (M9). 0 for text-only.
+    pub media_bytes: i64,
     /// Whether the token counts were locally estimated (ADR 003).
     pub estimated: bool,
     /// Cost in USD derived from the configured price table.
@@ -303,8 +307,8 @@ impl KeyStore {
         for rec in batch {
             sqlx::query(
                 "INSERT INTO usage_log \
-                 (key_id, model, model_used, capability, tokens_in, tokens_out, search_units, estimated, cost, latency_ms, status, metadata, ts) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 (key_id, model, model_used, capability, tokens_in, tokens_out, search_units, media_count, media_bytes, estimated, cost, latency_ms, status, metadata, ts) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(&rec.key_id)
             .bind(&rec.model)
@@ -313,6 +317,8 @@ impl KeyStore {
             .bind(rec.tokens_in)
             .bind(rec.tokens_out)
             .bind(rec.search_units)
+            .bind(rec.media_count)
+            .bind(rec.media_bytes)
             .bind(rec.estimated)
             .bind(rec.cost)
             .bind(rec.latency_ms)

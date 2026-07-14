@@ -33,6 +33,14 @@ All notable changes to LUMEN are documented here. The format is based on
 - Token accounting (ADR 003) for multimodal: upstream `usage` is trusted; the
   local fallback estimates text parts only (images contribute 0, flagged
   `estimated`).
+- **Media accounting** as a billing dimension alongside tokens: each request's
+  media item count and total **decoded** bytes are measured (per top-level type)
+  and exported as Prometheus counters `lumen_media_total` and
+  `lumen_media_bytes_total` (labels `capability`/`model`/`provider`/`media_type`
+  + the metadata allowlist), added to the `lumen::usage` structured log, and
+  persisted to new `usage_log` columns `media_count` / `media_bytes` (migration
+  `0003`). Measured uniformly whether the image was a client `data:` URI or
+  gateway-fetched.
 
 ### Added — OpenAI-compatible provider kinds
 

@@ -266,6 +266,7 @@ fn settle_non_streaming(
         tokens_out,
         estimated,
         search_units: None,
+        media: lumen_core::MediaUsage::default(),
         cost,
         status: 200,
     });

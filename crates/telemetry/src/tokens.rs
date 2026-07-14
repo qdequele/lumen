@@ -13,12 +13,16 @@ use prometheus::{IntCounter, IntCounterVec, Opts};
 const TOKEN_LABELS: [&str; 5] = ["capability", "model", "provider", "direction", "estimated"];
 /// Base label names of `lumen_rerank_search_units_total`.
 const SEARCH_UNIT_LABELS: [&str; 2] = ["model", "provider"];
+/// Base label names of the media counters (M9).
+const MEDIA_LABELS: [&str; 4] = ["capability", "model", "provider", "media_type"];
 
 /// All M5 token/usage counters, registered against one [`Metrics`] registry.
 #[derive(Debug, Clone)]
 pub struct TokenMetrics {
     tokens_total: IntCounterVec,
     rerank_search_units_total: IntCounterVec,
+    media_total: IntCounterVec,
+    media_bytes_total: IntCounterVec,
     tokens_estimated_total: IntCounter,
     usage_log_dropped_total: IntCounter,
     metadata_rejected_total: IntCounter,
@@ -49,6 +53,11 @@ impl TokenMetrics {
             .copied()
             .chain(metadata_labels.iter().map(String::as_str))
             .collect();
+        let media_label_names: Vec<&str> = MEDIA_LABELS
+            .iter()
+            .copied()
+            .chain(metadata_labels.iter().map(String::as_str))
+            .collect();
 
         let tokens_total = IntCounterVec::new(
             Opts::new(
@@ -63,6 +72,20 @@ impl TokenMetrics {
                 "Rerank search units reported by upstream providers.",
             ),
             &unit_label_names,
+        )?;
+        let media_total = IntCounterVec::new(
+            Opts::new(
+                "lumen_media_total",
+                "Media items (images, …) processed, by capability/model/provider/media_type (M9). A billing dimension alongside tokens.",
+            ),
+            &media_label_names,
+        )?;
+        let media_bytes_total = IntCounterVec::new(
+            Opts::new(
+                "lumen_media_bytes_total",
+                "Decoded media bytes processed, by capability/model/provider/media_type (M9).",
+            ),
+            &media_label_names,
         )?;
         let tokens_estimated_total = IntCounter::new(
             "lumen_tokens_estimated_total",
@@ -80,6 +103,8 @@ impl TokenMetrics {
         let registry = metrics.registry();
         registry.register(Box::new(tokens_total.clone()))?;
         registry.register(Box::new(rerank_search_units_total.clone()))?;
+        registry.register(Box::new(media_total.clone()))?;
+        registry.register(Box::new(media_bytes_total.clone()))?;
         registry.register(Box::new(tokens_estimated_total.clone()))?;
         registry.register(Box::new(usage_log_dropped_total.clone()))?;
         registry.register(Box::new(metadata_rejected_total.clone()))?;
@@ -87,6 +112,8 @@ impl TokenMetrics {
         Ok(Self {
             tokens_total,
             rerank_search_units_total,
+            media_total,
+            media_bytes_total,
             tokens_estimated_total,
             usage_log_dropped_total,
             metadata_rejected_total,
@@ -140,6 +167,33 @@ impl TokenMetrics {
             .inc_by(count);
     }
 
+    /// Count `count` media items totalling `bytes` decoded bytes, for one
+    /// top-level `media_type` (M9). `metadata_values` aligns with
+    /// [`metadata_labels`](Self::metadata_labels). A zero count is a no-op (no
+    /// series created), mirroring the token counters.
+    pub fn add_media(
+        &self,
+        sample: &MediaSample<'_>,
+        metadata_values: &[&str],
+        count: u64,
+        bytes: u64,
+    ) {
+        if count == 0 {
+            return;
+        }
+        let mut values: Vec<&str> = vec![
+            sample.capability,
+            sample.model,
+            sample.provider,
+            sample.media_type,
+        ];
+        self.extend_metadata(&mut values, metadata_values);
+        self.media_total.with_label_values(&values).inc_by(count);
+        self.media_bytes_total
+            .with_label_values(&values)
+            .inc_by(bytes);
+    }
+
     /// One usage-log entry was dropped because the channel was full.
     pub fn inc_usage_dropped(&self) {
         self.usage_log_dropped_total.inc();
@@ -174,6 +228,19 @@ pub struct TokenSample<'a> {
     pub direction: Direction,
     /// Whether the count was locally estimated (ADR 003).
     pub estimated: bool,
+}
+
+/// One media observation's label set (everything but the metadata).
+#[derive(Debug, Clone, Copy)]
+pub struct MediaSample<'a> {
+    /// `chat` | `embed` | `rerank`.
+    pub capability: &'a str,
+    /// Client-facing model id.
+    pub model: &'a str,
+    /// Provider instance name.
+    pub provider: &'a str,
+    /// Top-level media type (`"image"`, `"audio"`, …).
+    pub media_type: &'a str,
 }
 
 /// Token direction label.
@@ -279,6 +346,44 @@ mod tests {
         tokens.add_tokens(&sample("chat", "m", "p", Direction::Input, false), &[""], 1);
         let out = metrics.encode_text();
         assert!(out.contains(r#"team="""#));
+    }
+
+    #[test]
+    fn media_counters_record_count_and_bytes() {
+        let (metrics, tokens) = setup(&[]);
+        tokens.add_media(
+            &MediaSample {
+                capability: "embed",
+                model: "voyage-mm",
+                provider: "voyage",
+                media_type: "image",
+            },
+            &[],
+            2,
+            2048,
+        );
+        let out = metrics.encode_text();
+        assert!(out.contains("lumen_media_total"));
+        assert!(out.contains("lumen_media_bytes_total"));
+        assert!(out.contains(r#"media_type="image""#));
+        assert!(out.contains(r#"capability="embed""#));
+    }
+
+    #[test]
+    fn zero_media_count_creates_no_series() {
+        let (metrics, tokens) = setup(&[]);
+        tokens.add_media(
+            &MediaSample {
+                capability: "embed",
+                model: "m",
+                provider: "p",
+                media_type: "image",
+            },
+            &[],
+            0,
+            0,
+        );
+        assert!(!metrics.encode_text().contains("lumen_media_total{"));
     }
 
     #[test]
