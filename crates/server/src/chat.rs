@@ -67,6 +67,7 @@ pub async fn chat(
     let client_model = req.model.clone();
     let chain_ids = state.resilience.chain_ids(&client_model);
     let chain = lumen_router::resolve_chat_chain(&state.registry, &chain_ids)?;
+    enforce_image_support(&state, &client_model, &chain, &req)?;
     let links = lumen_router::chat_links(&chain);
     let exec = state.resilience.exec_config(&client_model);
 
@@ -112,6 +113,46 @@ pub async fn chat(
     } else {
         chat_non_streaming(&ctx, guard, accounting).await
     }
+}
+
+/// Reject image inputs the resolved route cannot serve, before any upstream
+/// call: `LM-2003` if the model is not declared vision-capable, `LM-2004` if a
+/// remote image URL is bound for a provider that only takes inline base64.
+fn enforce_image_support(
+    state: &AppState,
+    client_model: &str,
+    chain: &[lumen_router::ChatChainLink],
+    req: &ChatRequest,
+) -> Result<(), GatewayError> {
+    let has_image = req.messages.iter().any(|m| {
+        m.content
+            .as_ref()
+            .is_some_and(lumen_core::MessageContent::has_image)
+    });
+    if !has_image {
+        return Ok(());
+    }
+    // LM-2003: model must declare the "image" modality.
+    let vision_ok = state
+        .registry
+        .modalities(client_model)
+        .is_some_and(|mods| mods.iter().any(|m| m == "image"));
+    if !vision_ok {
+        return Err(GatewayError::ImageInputNotSupported {
+            model: client_model.to_owned(),
+        });
+    }
+    // LM-2004: if the PRIMARY provider can't take a remote URL, reject one.
+    let has_remote_url = req.messages.iter().any(|m| {
+        matches!(m.content.as_ref(), Some(lumen_core::MessageContent::Parts(parts))
+            if parts.iter().any(|p| p.image_url.as_ref().is_some_and(lumen_core::ImageUrl::is_remote)))
+    });
+    if has_remote_url && !chain[0].route.provider.accepts_remote_image_url() {
+        return Err(GatewayError::ImageUrlNotSupported {
+            provider: chain[0].route.provider_name.clone(),
+        });
+    }
+    Ok(())
 }
 
 /// Everything the two chat execution paths share, bundled so the helpers stay
@@ -244,8 +285,8 @@ fn settle_non_streaming(
             .map(|c| {
                 c.message
                     .content
-                    .as_deref()
-                    .map_or(0, tokens::estimate_text)
+                    .as_ref()
+                    .map_or(0, |c| tokens::estimate_text(&c.text()))
             })
             .sum();
         (estimated_input, output, true)

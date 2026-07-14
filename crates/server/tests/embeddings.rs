@@ -26,11 +26,13 @@ fn registry_for(upstream: &str) -> Arc<Registry> {
                 id: "embed-small".to_owned(),
                 upstream_id: "text-embedding-3-small".to_owned(),
                 capabilities: vec![Capability::Embed],
+                modalities: vec!["text".to_owned()],
             },
             ModelSpec {
                 id: "chat-only".to_owned(),
                 upstream_id: "gpt-4o".to_owned(),
                 capabilities: vec![Capability::Chat],
+                modalities: vec!["text".to_owned()],
             },
         ],
     }];

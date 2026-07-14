@@ -174,6 +174,16 @@ pub enum GatewayError {
     #[error("`documents` must not be empty")]
     EmptyDocuments,
 
+    /// An image content part was sent to a model whose declared `modalities`
+    /// do not include `"image"`. Rejected before any upstream call.
+    #[error("model '{model}' does not accept image input")]
+    ImageInputNotSupported { model: String },
+
+    /// The resolved provider only accepts inline base64 image data; a remote
+    /// image URL was supplied (Gemini). The gateway never fetches the URL.
+    #[error("provider '{provider}' requires inline base64 image data; remote image URLs are not supported")]
+    ImageUrlNotSupported { provider: String },
+
     // ---- Upstream errors (LM-3xxx) ------------------------------------------
     /// An upstream provider rate limited the request (HTTP 429).
     #[error("upstream provider '{provider}' rate limited the request")]
@@ -262,6 +272,8 @@ impl GatewayError {
             GatewayError::ModelNotFound(_) => "LM-2001",
             GatewayError::UnsupportedCapability { .. } => "LM-2002",
             GatewayError::EmptyDocuments => "LM-2010",
+            GatewayError::ImageInputNotSupported { .. } => "LM-2003",
+            GatewayError::ImageUrlNotSupported { .. } => "LM-2004",
             GatewayError::UpstreamRateLimited { .. } => "LM-3001",
             GatewayError::UpstreamInvalidResponse { .. } => "LM-3002",
             GatewayError::Upstream { .. } => "LM-3003",
@@ -292,7 +304,9 @@ impl GatewayError {
         match self {
             GatewayError::InvalidRequest(_)
             | GatewayError::UnsupportedCapability { .. }
-            | GatewayError::EmptyDocuments => 400,
+            | GatewayError::EmptyDocuments
+            | GatewayError::ImageInputNotSupported { .. }
+            | GatewayError::ImageUrlNotSupported { .. } => 400,
             GatewayError::Unauthorized => 401,
             GatewayError::BudgetExceeded => 402,
             GatewayError::ModelNotFound(_) => 404,
@@ -318,6 +332,8 @@ impl GatewayError {
             | GatewayError::ModelNotFound(_)
             | GatewayError::UnsupportedCapability { .. }
             | GatewayError::EmptyDocuments
+            | GatewayError::ImageInputNotSupported { .. }
+            | GatewayError::ImageUrlNotSupported { .. }
             | GatewayError::PayloadTooLarge { .. }
             | GatewayError::Unauthorized
             | GatewayError::BudgetExceeded
@@ -455,6 +471,9 @@ mod tests {
     use super::*;
 
     #[test]
+    // One flat table pinning every stable LM-XXXX code; splitting it would
+    // only scatter the mapping this test exists to keep in one place.
+    #[allow(clippy::too_many_lines)]
     fn error_codes_are_stable() {
         assert_eq!(GatewayError::InvalidRequest("x".into()).code(), "LM-1001");
         assert_eq!(GatewayError::PayloadTooLarge { limit: 1 }.code(), "LM-1002");
@@ -494,6 +513,20 @@ mod tests {
         );
         // Empty rerank documents (pinned by the M3 spec).
         assert_eq!(GatewayError::EmptyDocuments.code(), "LM-2010");
+        assert_eq!(
+            GatewayError::ImageInputNotSupported {
+                model: "gpt".into()
+            }
+            .code(),
+            "LM-2003"
+        );
+        assert_eq!(
+            GatewayError::ImageUrlNotSupported {
+                provider: "google".into()
+            }
+            .code(),
+            "LM-2004"
+        );
         // Streaming upstream faults (M4).
         assert_eq!(
             GatewayError::UpstreamStreamInterrupted {

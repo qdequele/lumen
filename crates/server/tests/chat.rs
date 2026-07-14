@@ -31,11 +31,13 @@ fn openai_registry(upstream: &str) -> Arc<Registry> {
                 id: "gpt".to_owned(),
                 upstream_id: "gpt-4o-2024-08-06".to_owned(),
                 capabilities: vec![Capability::Chat],
+                modalities: vec!["text".to_owned()],
             },
             ModelSpec {
                 id: "embed-only".to_owned(),
                 upstream_id: "text-embedding-3-small".to_owned(),
                 capabilities: vec![Capability::Embed],
+                modalities: vec!["text".to_owned()],
             },
         ],
     }];
@@ -52,6 +54,7 @@ fn anthropic_registry(upstream: &str) -> Arc<Registry> {
             id: "claude".to_owned(),
             upstream_id: "claude-3-5-sonnet".to_owned(),
             capabilities: vec![Capability::Chat],
+            modalities: vec!["text".to_owned()],
         }],
     }];
     Arc::new(Registry::build(specs, http::build_client()).expect("registry builds"))
@@ -67,6 +70,7 @@ fn google_registry(upstream: &str) -> Arc<Registry> {
             id: "gemini".to_owned(),
             upstream_id: "gemini-2.0-flash".to_owned(),
             capabilities: vec![Capability::Chat],
+            modalities: vec!["text".to_owned()],
         }],
     }];
     Arc::new(Registry::build(specs, http::build_client()).expect("registry builds"))
@@ -107,6 +111,7 @@ async fn openai_compatible_kind_routes_through_the_openai_path() {
             id: "fast".to_owned(),
             upstream_id: "llama-3.3-70b".to_owned(),
             capabilities: vec![Capability::Chat],
+            modalities: vec!["text".to_owned()],
         }],
     }];
     let registry = Arc::new(Registry::build(specs, http::build_client()).expect("registry builds"));
@@ -192,6 +197,34 @@ async fn embed_only_model_requested_for_chat_is_400_fg2002() {
     assert_eq!(resp.status(), 400);
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["error"]["code"], "LM-2002");
+}
+
+#[tokio::test]
+async fn image_to_a_non_vision_model_is_rejected_with_lm_2003() {
+    // Upstream must never be called; mount nothing that would 200.
+    let upstream = MockServer::start().await;
+    // "gpt" declares default modalities (text only, see openai_registry), so
+    // an image content part is rejected pre-flight.
+    let base = common::spawn_with(openai_registry(&upstream.uri()), LIMIT).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&json!({
+            "model": "gpt",
+            "messages": [{"role":"user","content":[
+                {"type":"text","text":"hi"},
+                {"type":"image_url","image_url":{"url":"https://example.com/x.png"}}
+            ]}]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 400);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "LM-2003");
+    // The upstream was never contacted.
+    assert!(upstream.received_requests().await.unwrap().is_empty());
 }
 
 #[tokio::test]

@@ -33,6 +33,8 @@ pub struct ModelSpec {
     pub upstream_id: String,
     /// Declared capabilities.
     pub capabilities: Vec<Capability>,
+    /// Declared input modalities (e.g. `["text","image"]`).
+    pub modalities: Vec<String>,
 }
 
 /// A provider instance to build. `api_key` is already resolved from the
@@ -168,6 +170,8 @@ pub struct LoadedModelSummary {
     pub owned_by: String,
     /// Capabilities it exposes.
     pub capabilities: Vec<Capability>,
+    /// Declared input modalities.
+    pub modalities: Vec<String>,
 }
 
 #[derive(Default)]
@@ -182,6 +186,8 @@ struct Inner {
     /// ones like chat). Lets the router tell "unknown model" apart from
     /// "known model, wrong capability".
     model_capabilities: HashMap<String, Vec<Capability>>,
+    /// model id -> declared modalities.
+    model_modalities: HashMap<String, Vec<String>>,
     /// Every exposed model, in configuration order, for `GET /v1/models`.
     models: Vec<LoadedModelSummary>,
 }
@@ -253,6 +259,12 @@ impl Registry {
         self.inner.load().model_capabilities.get(model_id).cloned()
     }
 
+    /// The modalities declared for a model id, if known.
+    #[must_use]
+    pub fn modalities(&self, model_id: &str) -> Option<Vec<String>> {
+        self.inner.load().model_modalities.get(model_id).cloned()
+    }
+
     /// Every exposed model, in configuration order (for `GET /v1/models`).
     #[must_use]
     pub fn list_models(&self) -> Vec<LoadedModelSummary> {
@@ -284,10 +296,17 @@ fn build_inner(specs: &[ProviderSpec], client: &reqwest::Client) -> Result<Inner
                 .or_default()
                 .extend(model.capabilities.iter().copied());
 
+            inner
+                .model_modalities
+                .entry(model.id.clone())
+                .or_default()
+                .extend(model.modalities.iter().cloned());
+
             inner.models.push(LoadedModelSummary {
                 id: model.id.clone(),
                 owned_by: spec.name.clone(),
                 capabilities: model.capabilities.clone(),
+                modalities: model.modalities.clone(),
             });
 
             if model.capabilities.contains(&Capability::Chat) {
@@ -566,6 +585,7 @@ mod tests {
             id: id.to_owned(),
             upstream_id: id.to_owned(),
             capabilities: caps.to_vec(),
+            modalities: vec!["text".to_owned()],
         }
     }
 
@@ -694,6 +714,7 @@ mod tests {
                     id: "friendly".to_owned(),
                     upstream_id: "text-embedding-3-small".to_owned(),
                     capabilities: vec![Capability::Embed],
+                    modalities: vec!["text".to_owned()],
                 }],
             )],
             reqwest::Client::new(),
