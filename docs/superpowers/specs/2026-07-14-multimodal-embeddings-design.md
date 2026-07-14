@@ -73,15 +73,20 @@ them in `chat.rs`; this milestone lands them first, in a shared module).
 /// survive round-trip verbatim rather than 400.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContentPart {
-    #[serde(rename = "type")]
+    /// `"type"` defaults to `"text"` when omitted, so `{"text":"hi"}` and
+    /// `{"image_url":{...}}` are valid without spelling out the type. Real
+    /// OpenAI-shaped parts (which always send `type`) still parse.
+    #[serde(rename = "type", default = "default_kind")]
     pub kind: String,                 // "text" | "image_url" | future
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub text: Option<String>,         // present when kind == "text"
+    pub text: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub image_url: Option<ImageUrl>,  // present when kind == "image_url"
+    pub image_url: Option<ImageUrl>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
+
+fn default_kind() -> String { "text".to_owned() }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImageUrl {
@@ -90,6 +95,15 @@ pub struct ImageUrl {
     pub detail: Option<String>,
 }
 ```
+
+**Part dispatch is by field presence, not `kind`.** Because `kind` now defaults
+to `"text"`, `kind` and the populated field can disagree (an untyped
+`{"image_url":{...}}` carries `kind == "text"`). Therefore image detection and
+provider translation dispatch on **which field is set**: a part is an image iff
+`image_url.is_some()`; otherwise it is text (`text`, else empty). `kind` is
+retained for round-trip fidelity and forward-compat (unknown part types keep
+their declared `kind` + `extra`), but it never drives the image-vs-text
+decision. `has_image()` is defined as "any part with `image_url.is_some()`".
 
 ### 3.2 Widened `EmbedInput` — `crates/core/src/embed.rs`
 
@@ -301,8 +315,11 @@ No image bytes, no internal IPs, and no secrets ever appear in an error message.
 ## 9. Testing (wiremock + mock image host, per the Definition of Done)
 
 - **Core serde:** text `Single`/`Batch` round-trip (regression); `Multi` with
-  text + image parts round-trips; an unknown part type survives verbatim via
-  `kind` + `extra`; `text_iter()` / `has_image()` unit tests; untagged order (a
+  text + image parts round-trips; a part with no `type` defaults to
+  `kind == "text"`; an untyped `{"image_url":{...}}` is still detected as an
+  image (dispatch by field presence, §3.1); an unknown part type survives
+  verbatim via `kind` + `extra`; `text_iter()` / `has_image()` unit tests;
+  untagged order (a
   string never parses as `Batch`/`Multi`; an all-strings array parses as
   `Batch`).
 - **Fetch guards (unit + wiremock image host):** private/loopback/link-local IP
