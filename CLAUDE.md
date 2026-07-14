@@ -111,5 +111,13 @@ cargo bench                           # benchmarks criterion (M7)
 - `perf-auditor`: tracks allocations, copies, runtime blocking
 - `docs-writer`: user docs, README, config examples
 
+## Issue labels (when triaging or filing GitHub issues)
+Classify along four independent axes. Apply one label from each relevant axis;
+`scope:` may be multiple or omitted. Full reference in `CONTRIBUTING.md`.
+- **Type**: `bug`, `enhancement`, `documentation`, `question` (+ `good first issue`, `help wanted`, `duplicate`/`invalid`/`wontfix`).
+- **`priority:`**: `high` (correctness/spec gap or high-demand) / `medium` / `low`.
+- **`area:`** (subsystem): `providers`, `streaming`, `tokenizer`, `observability`, `config`, `resilience`, `testing`, `vision`.
+- **`scope:`** (capability): `chat`, `embedding`, `reranking`. Apply one or more; omit for cross-cutting infra (config, resilience, tokenizer, testing, observability) not tied to a single capability.
+
 ## What we do NOT do (v1)
 Web UI, billing, semantic cache, guardrails/moderation, image/audio support, plugin system. Note the ideas in `docs/backlog.md` and move on.
