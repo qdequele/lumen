@@ -26,7 +26,7 @@ use lumen_server::{
     state::AppState,
 };
 use lumen_telemetry::{
-    logging::init_logging, Metrics, ReloadMetrics, ResilienceMetrics, TokenMetrics,
+    logging::init_logging, LatencyMetrics, Metrics, ReloadMetrics, ResilienceMetrics, TokenMetrics,
 };
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -151,6 +151,8 @@ fn run(config: Config, config_path: PathBuf) -> anyhow::Result<()> {
         let metrics = Metrics::new();
         let tokens = TokenMetrics::register(&metrics, &config.telemetry.metadata_labels)
             .context("failed to register token metrics")?;
+        let latency =
+            LatencyMetrics::register(&metrics).context("failed to register latency metrics")?;
         let resilience_metrics = ResilienceMetrics::register(&metrics)
             .context("failed to register resilience metrics")?;
         let reload_metrics =
@@ -207,7 +209,7 @@ fn run(config: Config, config_path: PathBuf) -> anyhow::Result<()> {
 
         let image_fetch = build_image_fetch_policy(&config);
 
-        let mut state = AppState::new(metrics, registry, tokens)
+        let mut state = AppState::new(metrics, registry, tokens, latency)
             .with_guards(guards)
             .with_pricing_cell(pricing)
             .with_resilience(resilience)

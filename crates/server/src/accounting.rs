@@ -18,6 +18,7 @@ use lumen_auth::store::UsageRecord;
 use lumen_auth::usage::UsageLogger;
 use lumen_core::GatewayError;
 use lumen_telemetry::tokens::{Direction, TokenMetrics, TokenSample};
+use lumen_telemetry::LatencyMetrics;
 use serde_json::Value;
 use std::sync::Arc;
 use std::time::Instant;
@@ -67,6 +68,7 @@ pub struct Accounting {
     reservation: Option<Reservation>,
     metadata: Option<RequestMetadata>,
     tokens: TokenMetrics,
+    latency: LatencyMetrics,
     usage: Option<UsageLogger>,
     pricing: Arc<CostTable>,
     started: Instant,
@@ -122,6 +124,7 @@ impl Accounting {
             reservation,
             metadata,
             tokens: state.tokens.clone(),
+            latency: state.latency.clone(),
             usage: state.usage.clone(),
             pricing,
             started: Instant::now(),
@@ -156,6 +159,10 @@ impl Accounting {
             reservation.settle(usd_to_micro(outcome.cost));
         }
 
+        // One clock read closes the record: the log event, the histogram and
+        // `usage_log.latency_ms` all report the same measurement. Streaming
+        // finishes when the stream ends, so this covers the full stream.
+        let elapsed = self.started.elapsed();
         let metadata_json = self.metadata.as_ref().map(RequestMetadata::to_json);
 
         // ADR 002 sink 1, log half: the full metadata rides the structured
@@ -173,9 +180,21 @@ impl Accounting {
             media_bytes = outcome.media.bytes,
             estimated = outcome.estimated,
             cost = outcome.cost,
+            latency_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
             status = outcome.status,
             metadata = metadata_json.as_deref().unwrap_or("{}"),
             "request usage"
+        );
+
+        // End-to-end latency attributed to the model/provider that actually
+        // served the request - the analytics counterpart of the HTTP-level
+        // histogram, which for streams only sees time-to-headers.
+        self.latency.observe_request(
+            self.capability,
+            &self.model_used,
+            &self.provider,
+            outcome.status,
+            elapsed.as_secs_f64(),
         );
 
         let allowlist = self.tokens.metadata_labels();
@@ -243,7 +262,7 @@ impl Accounting {
                 media_bytes: i64::try_from(outcome.media.bytes).unwrap_or(i64::MAX),
                 estimated: outcome.estimated,
                 cost: outcome.cost,
-                latency_ms: i64::try_from(self.started.elapsed().as_millis()).unwrap_or(i64::MAX),
+                latency_ms: i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX),
                 status: outcome.status,
                 metadata: metadata_json,
                 ts: now_unix(),

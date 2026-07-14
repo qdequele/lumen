@@ -8,7 +8,7 @@ use arc_swap::ArcSwap;
 use lumen_auth::usage::UsageLogger;
 use lumen_providers::image_fetch::ImageFetchPolicy;
 use lumen_providers::Registry;
-use lumen_telemetry::{Metrics, TokenMetrics};
+use lumen_telemetry::{LatencyMetrics, Metrics, TokenMetrics};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -50,6 +50,8 @@ pub struct AppState {
     pub guards: StreamGuards,
     /// Token-accounting counters (ADR 003) - always on.
     pub tokens: TokenMetrics,
+    /// Request-latency histograms (HTTP + per-capability) - always on.
+    pub latency: LatencyMetrics,
     /// Virtual-key auth runtime; `None` = auth disabled (open gateway).
     pub auth: Option<Arc<AuthRuntime>>,
     /// Usage-log channel; `None` = no usage database.
@@ -71,16 +73,23 @@ pub struct AppState {
 }
 
 impl AppState {
-    /// Create application state. `tokens` must be registered against
-    /// `metrics` (see [`TokenMetrics::register`]); auth, usage logging and
-    /// pricing are attached with the builder methods below.
+    /// Create application state. `tokens` and `latency` must be registered
+    /// against `metrics` (see [`TokenMetrics::register`] and
+    /// [`LatencyMetrics::register`]); auth, usage logging and pricing are
+    /// attached with the builder methods below.
     #[must_use]
-    pub fn new(metrics: Metrics, registry: Arc<Registry>, tokens: TokenMetrics) -> Self {
+    pub fn new(
+        metrics: Metrics,
+        registry: Arc<Registry>,
+        tokens: TokenMetrics,
+        latency: LatencyMetrics,
+    ) -> Self {
         Self {
             metrics,
             registry,
             guards: StreamGuards::default(),
             tokens,
+            latency,
             auth: None,
             usage: None,
             pricing: Arc::new(ArcSwap::from_pointee(CostTable::default())),

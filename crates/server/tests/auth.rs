@@ -202,7 +202,9 @@ async fn spawn_auth_with_store(
     let metrics = Metrics::new();
     let labels: Vec<String> = metadata_labels.iter().map(|&l| l.to_owned()).collect();
     let tokens = TokenMetrics::register(&metrics, &labels).expect("register token metrics");
-    let state = AppState::new(metrics, registry, tokens)
+    let latency =
+        lumen_telemetry::LatencyMetrics::register(&metrics).expect("register latency metrics");
+    let state = AppState::new(metrics, registry, tokens, latency)
         .with_pricing(dollar_pricing())
         .with_auth(Arc::clone(&runtime))
         .with_usage(logger);

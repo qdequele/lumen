@@ -6,6 +6,25 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added - Endpoint latency observability
+
+- **Every endpoint now measures and publishes its latency.** A new middleware
+  times each HTTP request (including `/health`, `/health/providers`,
+  `/metrics`, `/v1/models` and `/admin/*`) and exports
+  `lumen_http_request_duration_seconds{method,path,status}` - `path` is the
+  matched route template (or `"unmatched"`), never the raw URI, so cardinality
+  stays bounded and user data never reaches a label. Each request also emits a
+  `lumen::http` "request completed" log event carrying `latency_ms` inside the
+  request span. For streaming responses this layer measures
+  time-to-response-headers.
+- New `lumen_request_duration_seconds{capability,model,provider,status}`
+  histogram: end-to-end latency of accounted API calls (chat/embed/rerank),
+  attributed to the model/provider that actually served the request (fallbacks
+  included). Recorded when accounting closes, so streaming chat covers the
+  full stream - the Prometheus counterpart of `usage_log.latency_ms`.
+- The `lumen::usage` structured log event now includes `latency_ms`, from the
+  same clock read as the usage-log row and the histogram sample.
+
 ### Added - Multimodal embeddings + guarded image fetch (M9)
 
 - `POST /v1/embeddings` now accepts image inputs via OpenAI-style content parts:

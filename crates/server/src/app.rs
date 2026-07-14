@@ -1,7 +1,7 @@
 //! Assembly of the axum application and its middleware stack.
 
 use crate::{admin, auth, chat, embeddings, health, models, rerank, routes, state::AppState};
-use axum::extract::{Request, State};
+use axum::extract::{MatchedPath, Request, State};
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::{
@@ -27,9 +27,12 @@ use crate::error::ApiError;
 /// 2. open a tracing span per request - carrying method, path and request id,
 ///    but never the body or query string (user data is never logged);
 /// 3. propagate the request id onto the response;
-/// 4. rewrite a bare `413` from the body-limit layer below into the `LM-1002`
+/// 4. measure per-request latency: one histogram sample
+///    (`lumen_http_request_duration_seconds`) and one log event per request,
+///    for EVERY endpoint including `/health`, `/metrics` and `/admin/*`;
+/// 5. rewrite a bare `413` from the body-limit layer below into the `LM-1002`
 ///    envelope;
-/// 5. reject bodies larger than `body_limit` bytes.
+/// 6. reject bodies larger than `body_limit` bytes.
 ///
 /// Route groups:
 /// * `/health`, `/health/providers`, `/metrics` - operational, never
@@ -47,6 +50,9 @@ pub fn build_app(state: AppState) -> Router {
         .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
         .layer(TraceLayer::new_for_http().make_span_with(make_request_span))
         .layer(PropagateRequestIdLayer::x_request_id())
+        // Latency observability: every request - whatever the route - produces
+        // a histogram sample and a completion log event carrying latency_ms.
+        .layer(middleware::from_fn_with_state(state.clone(), track_latency))
         // Conservative default security headers on every response (M7 §7.4).
         .layer(middleware::from_fn(security_headers))
         // `RequestBodyLimitLayer` short-circuits an over-limit body with a bare
@@ -121,6 +127,66 @@ async fn map_body_limit_response(
         .into_response();
     }
     response
+}
+
+/// Measure and publish the latency of every request.
+///
+/// Emits, per request:
+/// * one `lumen_http_request_duration_seconds` sample, labelled with the
+///   method, the MATCHED route template (`/v1/chat/completions`, never the raw
+///   URI - bounded cardinality, and user data never reaches a label) and the
+///   response status;
+/// * one `lumen::http` log event carrying `latency_ms`, inside the request
+///   span (so it also carries the request id, method and path).
+///
+/// Requests that match no route are labelled `"unmatched"` rather than their
+/// raw path. For streaming responses this measures time-to-response-headers;
+/// the full-stream latency of API calls lands in
+/// `lumen_request_duration_seconds` when accounting closes. A client that
+/// disconnects before response headers drops this future - such a request
+/// produces no sample, consistent with cancellation propagation (rule 3).
+async fn track_latency(State(state): State<AppState>, request: Request, next: Next) -> Response {
+    // `Router::layer` middleware runs after route matching, so the matched
+    // route template is available on the request extensions. `MatchedPath` is
+    // `Arc<str>`-backed: cloning it keeps the template alive past `next.run`
+    // without allocating on the hot path.
+    let path = request.extensions().get::<MatchedPath>().cloned();
+    let method = method_label(request.method());
+    let started = std::time::Instant::now();
+
+    let response = next.run(request).await;
+
+    let elapsed = started.elapsed();
+    let status = response.status().as_u16();
+    state.latency.observe_http(
+        method,
+        path.as_ref().map_or("unmatched", MatchedPath::as_str),
+        status,
+        elapsed.as_secs_f64(),
+    );
+    tracing::debug!(
+        target: "lumen::http",
+        status,
+        latency_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+        "request completed"
+    );
+    response
+}
+
+/// Normalise the HTTP method to a closed label set. Hyper accepts arbitrary
+/// extension methods, so labelling the raw string would hand unauthenticated
+/// clients an unbounded-cardinality lever; anything non-standard is `"other"`.
+fn method_label(method: &axum::http::Method) -> &'static str {
+    match *method {
+        axum::http::Method::GET => "GET",
+        axum::http::Method::POST => "POST",
+        axum::http::Method::PUT => "PUT",
+        axum::http::Method::PATCH => "PATCH",
+        axum::http::Method::DELETE => "DELETE",
+        axum::http::Method::HEAD => "HEAD",
+        axum::http::Method::OPTIONS => "OPTIONS",
+        _ => "other",
+    }
 }
 
 /// Conservative default security headers for every response (M7 §7.4).
