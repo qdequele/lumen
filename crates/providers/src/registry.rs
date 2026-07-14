@@ -6,7 +6,7 @@
 //! The inner table lives behind an [`ArcSwap`] so a future hot reload (M7) can
 //! atomically swap the whole routing table without locking the request path.
 //! API keys are resolved from the environment by the caller (the server) and
-//! passed in already — the registry never reads env vars or holds config.
+//! passed in already - the registry never reads env vars or holds config.
 
 use arc_swap::ArcSwap;
 use lumen_core::{Capability, ChatProvider, EmbeddingProvider, RerankProvider};
@@ -25,7 +25,7 @@ use crate::tei::TeiProvider;
 use crate::voyage::VoyageProvider;
 
 /// A model exposed by a provider, with its upstream id and capabilities.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ModelSpec {
     /// Client-facing model id.
     pub id: String,
@@ -33,21 +33,12 @@ pub struct ModelSpec {
     pub upstream_id: String,
     /// Declared capabilities.
     pub capabilities: Vec<Capability>,
-    /// Declared input modalities (`"text"`, `"image"`, …). An empty list means
-    /// text-only. Only `"image"` is currently acted on (M9 enforcement).
+    /// Declared input modalities (e.g. `["text","image"]`).
     pub modalities: Vec<String>,
 }
 
-impl ModelSpec {
-    /// Whether this model declares image input support.
-    #[must_use]
-    pub fn supports_image(&self) -> bool {
-        self.modalities.iter().any(|m| m == "image")
-    }
-}
-
 /// A provider instance to build. `api_key` is already resolved from the
-/// environment (or, since M5, decrypted from the store) by the caller —
+/// environment (or, since M5, decrypted from the store) by the caller -
 /// `None` for keyless providers.
 #[derive(Clone)]
 pub struct ProviderSpec {
@@ -179,8 +170,7 @@ pub struct LoadedModelSummary {
     pub owned_by: String,
     /// Capabilities it exposes.
     pub capabilities: Vec<Capability>,
-    /// Declared input modalities (`"text"` by default). Surfaced in
-    /// `GET /v1/models`.
+    /// Declared input modalities.
     pub modalities: Vec<String>,
 }
 
@@ -196,7 +186,7 @@ struct Inner {
     /// ones like chat). Lets the router tell "unknown model" apart from
     /// "known model, wrong capability".
     model_capabilities: HashMap<String, Vec<Capability>>,
-    /// model id -> declared input modalities (M9). Absent = text-only.
+    /// model id -> declared modalities.
     model_modalities: HashMap<String, Vec<String>>,
     /// Every exposed model, in configuration order, for `GET /v1/models`.
     models: Vec<LoadedModelSummary>,
@@ -231,7 +221,7 @@ impl Registry {
         })
     }
 
-    /// Atomically replace the routing table (hot reload — M7).
+    /// Atomically replace the routing table (hot reload - M7).
     #[allow(clippy::needless_pass_by_value)]
     pub fn reload(&self, specs: Vec<ProviderSpec>) -> Result<(), RegistryError> {
         let inner = build_inner(&specs, &self.client)?;
@@ -269,15 +259,10 @@ impl Registry {
         self.inner.load().model_capabilities.get(model_id).cloned()
     }
 
-    /// Whether the model declares image input support (M9). Unknown models and
-    /// text-only models return `false`.
+    /// The modalities declared for a model id, if known.
     #[must_use]
-    pub fn model_supports_image(&self, model_id: &str) -> bool {
-        self.inner
-            .load()
-            .model_modalities
-            .get(model_id)
-            .is_some_and(|mods| mods.iter().any(|m| m == "image"))
+    pub fn modalities(&self, model_id: &str) -> Option<Vec<String>> {
+        self.inner.load().model_modalities.get(model_id).cloned()
     }
 
     /// Every exposed model, in configuration order (for `GET /v1/models`).
@@ -311,22 +296,17 @@ fn build_inner(specs: &[ProviderSpec], client: &reqwest::Client) -> Result<Inner
                 .or_default()
                 .extend(model.capabilities.iter().copied());
 
-            // Normalize an unset modality list to text-only, so the map and the
-            // `/v1/models` listing always report at least `["text"]`.
-            let modalities = if model.modalities.is_empty() {
-                vec!["text".to_owned()]
-            } else {
-                model.modalities.clone()
-            };
             inner
                 .model_modalities
-                .insert(model.id.clone(), modalities.clone());
+                .entry(model.id.clone())
+                .or_default()
+                .extend(model.modalities.iter().cloned());
 
             inner.models.push(LoadedModelSummary {
                 id: model.id.clone(),
                 owned_by: spec.name.clone(),
                 capabilities: model.capabilities.clone(),
-                modalities,
+                modalities: model.modalities.clone(),
             });
 
             if model.capabilities.contains(&Capability::Chat) {
@@ -412,7 +392,7 @@ fn build_providers(
         // Cloudflare Workers AI, self-hosted vLLM/llama.cpp/LM Studio) share the
         // OpenAI provider; only the base URL differs. The base is the explicit
         // override, else the kind's built-in default. Kinds with neither (vLLM,
-        // Cloudflare — its URL carries the account id) must not silently fall
+        // Cloudflare - its URL carries the account id) must not silently fall
         // through to api.openai.com, so a missing URL is a build error.
         ProviderKind::Openai
         | ProviderKind::Groq
@@ -605,7 +585,7 @@ mod tests {
             id: id.to_owned(),
             upstream_id: id.to_owned(),
             capabilities: caps.to_vec(),
-            modalities: Vec::new(),
+            modalities: vec!["text".to_owned()],
         }
     }
 
@@ -734,7 +714,7 @@ mod tests {
                     id: "friendly".to_owned(),
                     upstream_id: "text-embedding-3-small".to_owned(),
                     capabilities: vec![Capability::Embed],
-                    modalities: Vec::new(),
+                    modalities: vec!["text".to_owned()],
                 }],
             )],
             reqwest::Client::new(),

@@ -25,7 +25,7 @@ pub async fn spawn_with(registry: Arc<Registry>, body_limit: usize) -> String {
 }
 
 /// Spawn the app with explicit stream guard timings (first-token timeout,
-/// heartbeat interval) — for the LM-3011 tests, which need a short window.
+/// heartbeat interval) - for the LM-3011 tests, which need a short window.
 pub async fn spawn_with_guards(
     registry: Arc<Registry>,
     body_limit: usize,
@@ -44,12 +44,17 @@ pub async fn spawn_with_guards(
 
 /// Spawn the app from a fully-built state (auth/pricing/usage attached by the
 /// caller); returns its base URL.
+///
+/// `body_limit` is applied onto `state` here (the single place it's threaded
+/// through to `build_app`), so `AppState.body_limit` - surfaced in the
+/// `LM-1002` message - can never drift from the limit `build_app` actually
+/// enforces.
 pub async fn spawn_state(state: AppState, body_limit: usize) -> String {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind ephemeral port");
     let addr = listener.local_addr().expect("read local addr");
-    let app = build_app(state, body_limit);
+    let app = build_app(state.with_body_limit(body_limit));
 
     // `pending()` shutdown = never shut down for the lifetime of the test.
     tokio::spawn(async move {
@@ -65,7 +70,7 @@ pub async fn spawn_state(state: AppState, body_limit: usize) -> String {
     format!("http://{addr}")
 }
 
-/// An empty registry (no providers) — for tests that don't hit `/v1/*`.
+/// An empty registry (no providers) - for tests that don't hit `/v1/*`.
 #[must_use]
 pub fn empty_registry() -> Arc<Registry> {
     Arc::new(Registry::build(Vec::new(), http::build_client()).expect("empty registry builds"))

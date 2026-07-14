@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 /// A document to rerank: either a bare string or `{ "text": "..." }`.
 ///
 /// Both forms carry only text in v1 (Cohere also allows arbitrary objects with
-/// a `rank_fields` selector — intentionally out of scope, see `docs/backlog.md`).
+/// a `rank_fields` selector - intentionally out of scope, see `docs/backlog.md`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum RerankDocument {

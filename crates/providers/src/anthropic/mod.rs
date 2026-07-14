@@ -1,4 +1,4 @@
-//! Anthropic provider — chat completions with bidirectional translation.
+//! Anthropic provider - chat completions with bidirectional translation.
 //!
 //! Anthropic's Messages API (`POST /v1/messages`) differs from OpenAI in
 //! several ways this module bridges:
@@ -9,7 +9,7 @@
 //! * responses are `content` blocks with a `stop_reason` and
 //!   `input_tokens`/`output_tokens` usage;
 //! * streaming is typed SSE events, translated chunk by chunk in [`stream`]
-//!   (bounded state — the response text is never accumulated).
+//!   (bounded state - the response text is never accumulated).
 
 mod stream;
 
@@ -17,8 +17,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::BoxStream;
 use lumen_core::{
-    ChatChoice, ChatChunk, ChatMessage, ChatProvider, ChatRequest, ChatResponse, ProviderError,
-    Usage,
+    ChatChoice, ChatChunk, ChatMessage, ChatProvider, ChatRequest, ChatResponse, ImageUrl,
+    MessageContent, ProviderError, Usage,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -180,7 +180,11 @@ fn translate_request(req: &ChatRequest, stream: bool) -> AnthropicRequest {
     let mut system_parts: Vec<String> = Vec::new();
     let mut messages: Vec<AnthropicMessage> = Vec::new();
     for m in &req.messages {
-        let text = m.content.clone().unwrap_or_default();
+        let text = m
+            .content
+            .as_ref()
+            .map(|c| c.text().into_owned())
+            .unwrap_or_default();
         match m.role.as_str() {
             "system" => {
                 if !text.is_empty() {
@@ -232,7 +236,7 @@ fn translate_request(req: &ChatRequest, stream: bool) -> AnthropicRequest {
             }
             role => messages.push(AnthropicMessage {
                 role: role.to_owned(),
-                content: serde_json::Value::String(text),
+                content: anthropic_content(m.content.as_ref(), &text),
             }),
         }
     }
@@ -258,6 +262,45 @@ fn translate_request(req: &ChatRequest, stream: bool) -> AnthropicRequest {
         tools: translate_tools(req),
         tool_choice: req.extra.get("tool_choice").and_then(translate_tool_choice),
         stream,
+    }
+}
+
+/// Build an Anthropic message `content`: a plain string when there are no
+/// images, else an array of `text`/`image` blocks (order preserved).
+fn anthropic_content(content: Option<&MessageContent>, text: &str) -> serde_json::Value {
+    match content {
+        Some(MessageContent::Parts(parts)) if parts.iter().any(|p| p.image_url.is_some()) => {
+            let mut blocks = Vec::with_capacity(parts.len());
+            for p in parts {
+                if let Some(img) = &p.image_url {
+                    blocks.push(anthropic_image_block(img));
+                } else if p.kind == "text" {
+                    if let Some(t) = &p.text {
+                        blocks.push(json!({ "type": "text", "text": t }));
+                    }
+                }
+            }
+            serde_json::Value::Array(blocks)
+        }
+        // No images (string, text-only parts, or none): a plain string.
+        _ => serde_json::Value::String(text.to_owned()),
+    }
+}
+
+/// Translate one OpenAI `image_url` into an Anthropic image source block.
+/// `data:` URIs become a `base64` source; remote URLs a `url` source (Anthropic
+/// fetches it). The gateway never fetches the URL itself.
+fn anthropic_image_block(image: &ImageUrl) -> serde_json::Value {
+    if let Some(data) = image.as_data_uri() {
+        json!({
+            "type": "image",
+            "source": { "type": "base64", "media_type": data.media_type, "data": data.base64_data },
+        })
+    } else {
+        json!({
+            "type": "image",
+            "source": { "type": "url", "url": image.url },
+        })
     }
 }
 
@@ -357,7 +400,7 @@ fn translate_response(resp: AnthropicResponse, requested_model: &str) -> ChatRes
     let content = if content.is_empty() && !extra.is_empty() {
         None
     } else {
-        Some(content)
+        Some(MessageContent::Text(content))
     };
 
     let model = if resp.model.is_empty() {
@@ -486,7 +529,7 @@ mod tests {
     fn msg(role: &str, content: &str) -> ChatMessage {
         ChatMessage {
             role: role.to_owned(),
-            content: Some(content.to_owned()),
+            content: Some(MessageContent::Text(content.to_owned())),
             name: None,
             extra: serde_json::Map::new(),
         }
@@ -545,8 +588,12 @@ mod tests {
         let out = translate_response(resp, "claude-x");
         assert_eq!(out.object, "chat.completion");
         assert_eq!(
-            out.choices[0].message.content.as_deref(),
-            Some("Hello world")
+            out.choices[0]
+                .message
+                .content
+                .as_ref()
+                .map(|c| c.text().into_owned()),
+            Some("Hello world".to_owned())
         );
         assert_eq!(out.choices[0].finish_reason.as_deref(), Some("length"));
         let usage = out.usage.unwrap();
@@ -602,7 +649,7 @@ mod tests {
                 },
                 ChatMessage {
                     role: "tool".to_owned(),
-                    content: Some("18°C, sunny".to_owned()),
+                    content: Some(MessageContent::Text("18°C, sunny".to_owned())),
                     name: None,
                     extra: tool_extra,
                 },
@@ -658,7 +705,7 @@ mod tests {
             extra.insert("tool_call_id".to_owned(), json!(id));
             ChatMessage {
                 role: "tool".to_owned(),
-                content: Some(text.to_owned()),
+                content: Some(MessageContent::Text(text.to_owned())),
                 name: None,
                 extra,
             }
@@ -749,5 +796,107 @@ mod tests {
             Some("tool_calls")
         );
         assert_eq!(map_finish_reason(None), None);
+    }
+
+    #[test]
+    fn data_uri_image_becomes_a_base64_source_block() {
+        use lumen_core::{ChatMessage, ChatRequest, ContentPart, ImageUrl, MessageContent};
+        let req = ChatRequest {
+            model: "claude".to_owned(),
+            messages: vec![ChatMessage {
+                role: "user".to_owned(),
+                content: Some(MessageContent::Parts(vec![
+                    ContentPart {
+                        kind: "text".to_owned(),
+                        text: Some("describe".to_owned()),
+                        image_url: None,
+                        extra: serde_json::Map::new(),
+                    },
+                    ContentPart {
+                        kind: "image_url".to_owned(),
+                        text: None,
+                        image_url: Some(ImageUrl {
+                            url: "data:image/png;base64,AAAA".to_owned(),
+                            detail: None,
+                        }),
+                        extra: serde_json::Map::new(),
+                    },
+                ])),
+                name: None,
+                extra: serde_json::Map::new(),
+            }],
+            temperature: None,
+            top_p: None,
+            max_tokens: None,
+            n: None,
+            stop: None,
+            stream: false,
+            extra: serde_json::Map::new(),
+        };
+        let body = serde_json::to_value(translate_request(&req, false)).unwrap();
+        let blocks = &body["messages"][0]["content"];
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(blocks[0]["text"], "describe");
+        assert_eq!(blocks[1]["type"], "image");
+        assert_eq!(blocks[1]["source"]["type"], "base64");
+        assert_eq!(blocks[1]["source"]["media_type"], "image/png");
+        assert_eq!(blocks[1]["source"]["data"], "AAAA");
+    }
+
+    #[test]
+    fn remote_url_image_becomes_a_url_source_block() {
+        use lumen_core::{ChatMessage, ChatRequest, ContentPart, ImageUrl, MessageContent};
+        let req = ChatRequest {
+            model: "claude".to_owned(),
+            messages: vec![ChatMessage {
+                role: "user".to_owned(),
+                content: Some(MessageContent::Parts(vec![ContentPart {
+                    kind: "image_url".to_owned(),
+                    text: None,
+                    image_url: Some(ImageUrl {
+                        url: "https://ex.com/c.png".to_owned(),
+                        detail: None,
+                    }),
+                    extra: serde_json::Map::new(),
+                }])),
+                name: None,
+                extra: serde_json::Map::new(),
+            }],
+            temperature: None,
+            top_p: None,
+            max_tokens: None,
+            n: None,
+            stop: None,
+            stream: false,
+            extra: serde_json::Map::new(),
+        };
+        let body = serde_json::to_value(translate_request(&req, false)).unwrap();
+        let block = &body["messages"][0]["content"][0];
+        assert_eq!(block["type"], "image");
+        assert_eq!(block["source"]["type"], "url");
+        assert_eq!(block["source"]["url"], "https://ex.com/c.png");
+    }
+
+    #[test]
+    fn text_only_message_stays_a_plain_string() {
+        use lumen_core::{ChatMessage, ChatRequest, MessageContent};
+        let req = ChatRequest {
+            model: "claude".to_owned(),
+            messages: vec![ChatMessage {
+                role: "user".to_owned(),
+                content: Some(MessageContent::Text("hello".to_owned())),
+                name: None,
+                extra: serde_json::Map::new(),
+            }],
+            temperature: None,
+            top_p: None,
+            max_tokens: None,
+            n: None,
+            stop: None,
+            stream: false,
+            extra: serde_json::Map::new(),
+        };
+        let body = serde_json::to_value(translate_request(&req, false)).unwrap();
+        assert_eq!(body["messages"][0]["content"], "hello");
     }
 }

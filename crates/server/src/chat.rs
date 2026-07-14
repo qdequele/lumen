@@ -1,4 +1,4 @@
-//! `POST /v1/chat/completions` — non-streaming JSON and streaming SSE.
+//! `POST /v1/chat/completions` - non-streaming JSON and streaming SSE.
 //!
 //! Flow: validate → route (model → provider) → chat / chat_stream. A per-request
 //! [`CancellationToken`] is cancelled when the client disconnects, aborting the
@@ -13,14 +13,14 @@
 //!
 //! The streaming body is wrapped in three guards (see [`to_event_stream`]):
 //!
-//! * **first-token timeout** — no first frame within the configured window →
+//! * **first-token timeout** - no first frame within the configured window →
 //!   LM-3011 error frame (or a plain 504 when the upstream never even answered
 //!   the request);
-//! * **missing terminator** — the upstream ends the stream without ever sending
+//! * **missing terminator** - the upstream ends the stream without ever sending
 //!   `data: [DONE]` → LM-3010 error frame (the terminator only ever comes from
 //!   the provider byte stream: verbatim upstream for passthrough, translated
-//!   terminal event otherwise — the server never fabricates it);
-//! * **heartbeat** — a `: ping` SSE comment on idle streams so intermediaries
+//!   terminal event otherwise - the server never fabricates it);
+//! * **heartbeat** - a `: ping` SSE comment on idle streams so intermediaries
 //!   don't reap a slow upstream.
 
 use std::convert::Infallible;
@@ -48,7 +48,7 @@ use crate::state::{AppState, StreamGuards};
 /// Both modes run through the M6 resilience executor: the requested model plus
 /// its configured fallbacks are tried in turn with retries, circuit breaking
 /// and the per-model timeouts (ADR 005). For streaming, retry/fallback happen
-/// only while *opening* the upstream byte stream — once the first frame is
+/// only while *opening* the upstream byte stream - once the first frame is
 /// forwarded the request is committed and the M4 frame guards take over.
 pub async fn chat(
     State(state): State<AppState>,
@@ -57,6 +57,13 @@ pub async fn chat(
     payload: Result<Json<ChatRequest>, JsonRejection>,
 ) -> Result<Response, ApiError> {
     // Malformed body → LM-1001 in our envelope (not axum's plain-text default).
+    //
+    // An over-limit body never reaches here: `RequestBodyLimitLayer` (see
+    // `app.rs`) short-circuits at the tower layer with a bare 413 before axum's
+    // routing/extraction runs, so `JsonRejection` never surfaces
+    // `PAYLOAD_TOO_LARGE` - verified empirically (a debug probe in this
+    // `map_err` never fired for an over-limit request). `app::map_body_limit_response`
+    // rewrites that bare 413 into the `LM-1002` envelope instead.
     let Json(req) = payload.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
 
     if req.messages.is_empty() {
@@ -67,6 +74,7 @@ pub async fn chat(
     let client_model = req.model.clone();
     let chain_ids = state.resilience.chain_ids(&client_model);
     let chain = lumen_router::resolve_chat_chain(&state.registry, &chain_ids)?;
+    enforce_image_support(&state, &client_model, &chain, &req)?;
     let links = lumen_router::chat_links(&chain);
     let exec = state.resilience.exec_config(&client_model);
 
@@ -114,6 +122,46 @@ pub async fn chat(
     }
 }
 
+/// Reject image inputs the resolved route cannot serve, before any upstream
+/// call: `LM-2003` if the model is not declared vision-capable, `LM-2004` if a
+/// remote image URL is bound for a provider that only takes inline base64.
+fn enforce_image_support(
+    state: &AppState,
+    client_model: &str,
+    chain: &[lumen_router::ChatChainLink],
+    req: &ChatRequest,
+) -> Result<(), GatewayError> {
+    let has_image = req.messages.iter().any(|m| {
+        m.content
+            .as_ref()
+            .is_some_and(lumen_core::MessageContent::has_image)
+    });
+    if !has_image {
+        return Ok(());
+    }
+    // LM-2003: model must declare the "image" modality.
+    let vision_ok = state
+        .registry
+        .modalities(client_model)
+        .is_some_and(|mods| mods.iter().any(|m| m == "image"));
+    if !vision_ok {
+        return Err(GatewayError::ImageInputNotSupported {
+            model: client_model.to_owned(),
+        });
+    }
+    // LM-2004: if the PRIMARY provider can't take a remote URL, reject one.
+    let has_remote_url = req.messages.iter().any(|m| {
+        matches!(m.content.as_ref(), Some(lumen_core::MessageContent::Parts(parts))
+            if parts.iter().any(|p| p.image_url.as_ref().is_some_and(lumen_core::ImageUrl::is_remote)))
+    });
+    if has_remote_url && !chain[0].route.provider.accepts_remote_image_url() {
+        return Err(GatewayError::ImageUrlNotSupported {
+            provider: chain[0].route.provider_name.clone(),
+        });
+    }
+    Ok(())
+}
+
 /// Everything the two chat execution paths share, bundled so the helpers stay
 /// under the argument-count lint.
 struct ChatExec<'a> {
@@ -159,7 +207,7 @@ async fn chat_streaming(
 
     // A fresh first-frame deadline now that the stream is open (the open phase
     // already had its own first-token budget). The M4 frame guards
-    // (LM-3010/3011, heartbeat) own the stream from here — no more retries.
+    // (LM-3010/3011, heartbeat) own the stream from here - no more retries.
     let deadline = tokio::time::Instant::now() + ctx.exec.first_token;
     let stream_accounting = StreamAccounting::new(accounting, ctx.estimated_input);
     let body = Body::from_stream(to_event_stream(
@@ -220,7 +268,7 @@ async fn chat_non_streaming(
 }
 
 /// Close the books on a non-streaming completion (ADR 003): upstream usage
-/// when reported, else local estimates — never a silent zero. The estimate is
+/// when reported, else local estimates - never a silent zero. The estimate is
 /// surfaced (flagged) in the response body too.
 fn settle_non_streaming(
     accounting: Accounting,
@@ -244,8 +292,8 @@ fn settle_non_streaming(
             .map(|c| {
                 c.message
                     .content
-                    .as_deref()
-                    .map_or(0, tokens::estimate_text)
+                    .as_ref()
+                    .map_or(0, |c| tokens::estimate_text(&c.text()))
             })
             .sum();
         (estimated_input, output, true)
@@ -337,7 +385,7 @@ impl EventStreamState {
     /// Close the accounting record with the stream's terminal outcome, so
     /// `usage_log.status` reflects what actually happened (200 = clean end,
     /// 502/504 = in-band error frame). Idempotent; Drop is the safety net
-    /// for client disconnects (which finalize as 200 — the status the
+    /// for client disconnects (which finalize as 200 - the status the
     /// client's response actually carried).
     fn settle_accounting(&mut self, status: u16) {
         if let Some(mut accounting) = self.accounting.take() {
@@ -350,7 +398,7 @@ impl EventStreamState {
 ///
 /// The provider's byte stream carries complete SSE framing and its own terminal
 /// `data: [DONE]\n\n` (verbatim from the upstream for passthrough, or emitted
-/// by the translator on a genuine upstream terminal event — ADR 004), so the
+/// by the translator on a genuine upstream terminal event - ADR 004), so the
 /// server does not re-frame and never fabricates the terminator. On top of
 /// verbatim forwarding this wrapper adds the three guards described in the
 /// module docs (LM-3011 first-token timeout, LM-3010 missing terminator,
@@ -426,7 +474,7 @@ fn to_event_stream(
             Step::Item(None) => {
                 s.ended = true;
                 if s.saw_done {
-                    // Clean upstream termination — nothing left to add.
+                    // Clean upstream termination - nothing left to add.
                     s.settle_accounting(200);
                     return None;
                 }

@@ -1,107 +1,122 @@
-# ROADMAP — LUMEN
+# ROADMAP - LUMEN
 
-> Instruction pour Claude Code : traite les milestones DANS L'ORDRE. Le milestone courant = premier non coché. Lis sa spec dans `specs/milestones/` avant tout code. Coche les cases ici ET dans la spec au fur et à mesure. Ne commence jamais un milestone si le précédent a des tests rouges.
+> Instruction for Claude Code: process the milestones IN ORDER. The current milestone = first unchecked. Read its spec in `specs/milestones/` before any code. Check the boxes here AND in the spec as you go. Never start a milestone if the previous one has red tests.
 
-> **Promesse transverse — comptage des tokens (ADR 003) :** CHAQUE requête de CHAQUE capacité (chat/embed/rerank) produit un compte de tokens, jamais zéro par défaut : usage amont si présent, sinon estimation locale marquée `estimated`. Exposé en réponse, en compteurs Prometheus et dans `usage_log` (M5). C'est une raison d'être centrale du projet.
+> **Cross-cutting promise - token counting (ADR 003):** EVERY request of EVERY capability (chat/embed/rerank) produces a token count, never zero by default: upstream usage if present, otherwise a local estimate marked `estimated`. Exposed in the response, in Prometheus counters, and in `usage_log` (M5). It is a central reason for being of the project.
 
-## M1 — Squelette & fondations ✅
-- [x] Workspace Cargo 6 crates (core, providers, router, auth, telemetry, server)
-- [x] Types et traits de capacités dans core (ChatProvider, EmbeddingProvider, RerankProvider)
-- [x] Serveur axum : /health, /metrics (stub), graceful shutdown
-- [x] Config figment (TOML + env) + config.example.toml
-- [x] Taxonomie d'erreurs LM-XXXX + réponse JSON d'erreur standard
-- [x] CI GitHub Actions : fmt + clippy -D warnings + tests
-Spec : `specs/milestones/M1-skeleton.md`
+## M1 - Skeleton & foundations ✅
+- [x] Cargo workspace, 6 crates (core, providers, router, auth, telemetry, server)
+- [x] Capability types and traits in core (ChatProvider, EmbeddingProvider, RerankProvider)
+- [x] axum server: /health, /metrics (stub), graceful shutdown
+- [x] figment config (TOML + env) + config.example.toml
+- [x] LM-XXXX error taxonomy + standard JSON error response
+- [x] GitHub Actions CI: fmt + clippy -D warnings + tests
+Spec: `specs/milestones/M1-skeleton.md`
 
-## M2 — Embeddings (premier chemin complet) ✅
-- [x] POST /v1/embeddings format OpenAI
-- [x] Provider OpenAI embeddings + provider Ollama embeddings
-- [x] Batching automatique (découpage selon max_batch_size, réassemblage ordonné)
-- [x] Router : résolution (capacité, modèle) → provider depuis la config
-- [x] Cancellation de bout en bout testée
-Spec : `specs/milestones/M2-embeddings.md`
+## M2 - Embeddings (first complete path) ✅
+- [x] POST /v1/embeddings OpenAI format
+- [x] OpenAI embeddings provider + Ollama embeddings provider
+- [x] Automatic batching (splitting by max_batch_size, ordered reassembly)
+- [x] Router: (capability, model) → provider resolution from the config
+- [x] End-to-end cancellation tested
+Spec: `specs/milestones/M2-embeddings.md`
 
-## M3 — Reranking + découverte de modèles ✅
-- [x] POST /v1/rerank format Cohere
-- [x] Providers : Cohere (embed+rerank), Jina (embed+rerank), TEI self-hosted (embed+rerank), Voyage (embed+rerank)
-- [x] GET /v1/models avec capabilities par modèle
-- [x] Aliasing de modèles versionné dans la config (les IDs n'appartiennent qu'à l'utilisateur)
-Spec : `specs/milestones/M3-rerank-models.md`
+## M3 - Reranking + model discovery ✅
+- [x] POST /v1/rerank Cohere format
+- [x] Providers: Cohere (embed+rerank), Jina (embed+rerank), TEI self-hosted (embed+rerank), Voyage (embed+rerank)
+- [x] GET /v1/models with capabilities per model
+- [x] Versioned model aliasing in the config (IDs belong to the user alone)
+Spec: `specs/milestones/M3-rerank-models.md`
 
-## M4 — Chat + streaming SSE
-- [x] POST /v1/chat/completions non-streaming, format OpenAI
-- [x] Streaming SSE zero-copy (passthrough Bytes quand schéma identique)
-- [x] Provider Anthropic avec traduction bidirectionnelle (messages, system, tool_use, usage)
-- [x] Providers Mistral + Google (Gemini), streaming inclus
-- [x] Déconnexion client → abort amont, testé
-- [x] Gardes de stream : first-token timeout (LM-3011), amont mort sans `[DONE]` (LM-3010), heartbeat `: ping`
+## M4 - Chat + SSE streaming
+- [x] POST /v1/chat/completions non-streaming, OpenAI format
+- [x] Zero-copy SSE streaming (Bytes passthrough when the schema is identical)
+- [x] Anthropic provider with bidirectional translation (messages, system, tool_use, usage)
+- [x] Mistral + Google (Gemini) providers, streaming included
+- [x] Client disconnect → upstream abort, tested
+- [x] Stream guards: first-token timeout (LM-3011), upstream dead without `[DONE]` (LM-3010), heartbeat `: ping`
 
-Note : l'estimation locale des tokens en streaming (usage amont absent →
-`estimated=true`, ADR 003) part en M5 avec les compteurs Prometheus et
-`usage_log` ; l'usage amont, lui, est déjà propagé (dernier chunk).
-Spec : `specs/milestones/M4-chat-streaming.md`
+Note: local token estimation in streaming (upstream usage absent →
+`estimated=true`, ADR 003) ships in M5 along with the Prometheus counters and
+`usage_log`; upstream usage itself is already propagated (last chunk).
+Spec: `specs/milestones/M4-chat-streaming.md`
 
-## M5 — Auth, clés virtuelles & budgets durs ✅
-- [x] SQLite (sqlx) : clés virtuelles hashées, clés providers chiffrées au repos (AES-GCM)
-- [x] Budgets DURS par clé, enforced DANS le chemin de requête avant l'appel amont
-- [x] Quotas RPM/TPM par clé
-- [x] Comptage coûts par capacité (tokens chat, tokens input embeddings, searches rerank)
-- [x] Écriture des logs d'usage via channel borné → writer batché (jamais sync)
-- [x] Estimation locale des tokens quand l'amont n'en renvoie pas (streaming inclus), marquée `estimated` (ADR 003)
-- [x] Header de métadonnées par requête (`x-lumen-metadata`, style Cloudflare AI Gateway) → logs + `usage_log` + labels Prometheus via allowlist (ADR 002)
+## M5 - Auth, virtual keys & hard budgets ✅
+- [x] SQLite (sqlx): hashed virtual keys, provider keys encrypted at rest (AES-GCM)
+- [x] HARD budgets per key, enforced IN the request path before the upstream call
+- [x] RPM/TPM quotas per key
+- [x] Cost counting per capability (chat tokens, embeddings input tokens, rerank searches)
+- [x] Usage log writes via bounded channel → batched writer (never sync)
+- [x] Local token estimation when the upstream returns none (streaming included), marked `estimated` (ADR 003)
+- [x] Per-request metadata header (`x-lumen-metadata`, Cloudflare AI Gateway style) → logs + `usage_log` + Prometheus labels via allowlist (ADR 002)
 
-Note : l'estimation locale = heuristique octets (inline, hot-path-safe) ;
-le tokenizer précis opt-in (spawn_blocking) part en backlog — voir
+Note: local estimation = byte heuristic (inline, hot-path-safe);
+the precise opt-in tokenizer (spawn_blocking) ships in the backlog - see
 `docs/backlog.md` § M5.
-Spec : `specs/milestones/M5-auth-budgets.md`
+Spec: `specs/milestones/M5-auth-budgets.md`
 
-## M6 — Résilience ✅
-- [x] Retries avec backoff + jitter (honore Retry-After)
-- [x] Chaînes de fallback multi-provider par modèle
-- [x] Circuit breaker par provider
-- [x] Timeouts configurables (connect, first-token, total)
-- [x] Health checks providers en tâche de fond, JAMAIS dans le request path
-Spec : `specs/milestones/M6-resilience.md`
+## M6 - Resilience ✅
+- [x] Retries with backoff + jitter (honors Retry-After)
+- [x] Multi-provider fallback chains per model
+- [x] Circuit breaker per provider
+- [x] Configurable timeouts (connect, first-token, total)
+- [x] Provider health checks in the background, NEVER in the request path
+Spec: `specs/milestones/M6-resilience.md`
 
-## M7 — Release ✅
-- [x] Benchmarks criterion + comparatif public vs LiteLLM (latence ajoutée, RAM, throughput)
-- [x] Dockerfile distroless multi-arch < 20 Mo, binaire statique musl
-- [x] Hot reload de config sans drop de connexions
-- [x] Docs complètes (README, quickstart, guides providers, errors.md)
-- [x] cargo-audit + cargo-deny dans la CI
-Spec : `specs/milestones/M7-release.md`
+## M7 - Release ✅
+- [x] criterion benchmarks + public comparison vs LiteLLM (added latency, RAM, throughput)
+- [x] Multi-arch distroless Dockerfile < 20 MB, static musl binary
+- [x] Config hot reload without dropping connections
+- [x] Complete docs (README, quickstart, provider guides, errors.md)
+- [x] cargo-audit + cargo-deny in CI
+Spec: `specs/milestones/M7-release.md`
 
-Note : overhead hors réseau mesuré (~3 µs médian, image 10,6 Mo, RSS idle
-8,8 Mo) ; le comparatif chargé vs LiteLLM est fourni comme harnais reproductible
-(`bench/`) — voir `docs/perf-baseline.md`. cargo-audit/deny/fuzz câblés en CI
-(binaires non installés dans l'environnement de dev). Image amd64 via buildx CI ;
-arm64 vérifiée localement (`docker run`).
+Note: off-network overhead measured (~3 µs median, 10.6 MB image, idle RSS
+8.8 MB); the loaded comparison vs LiteLLM is provided as a reproducible harness
+(`bench/`) - see `docs/perf-baseline.md`. cargo-audit/deny/fuzz wired into CI
+(binaries not installed in the dev environment). amd64 image via buildx CI;
+arm64 verified locally (`docker run`).
 
-## M9 — Embeddings multimodales + fetch d'images gardé ✅
-- [x] `EmbedInput` élargi aux content-parts (texte + image, mixables), types
-      partagés `ContentPart`/`ImageUrl` dans `crates/core/src/content.rs`
-- [x] `modalities` par modèle (défaut `["text"]`), exposé dans `GET /v1/models`,
-      enforcement `LM-2003` (image → modèle non multimodal) avant l'amont
-- [x] Fetch serveur opt-in et gardé (`[image_fetch]`, off par défaut) : blocage
-      IP privées non configurable + pinning (anti DNS-rebinding), allowlists
-      scheme/host/prefix, cap de taille streamé, timeout, MIME `image/*`,
-      re-validation des redirections, annulation. `LM-2005/2006/2007`
-- [x] Traduction multimodale Cohere (embed-v4 `inputs`), Voyage
-      (`/multimodalembeddings`), Jina (`input` objets)
-- [x] Comptage tokens : usage amont fiable ; estimation locale = texte seul
-      (images = 0, marqué `estimated`) — ADR 003
-- [x] Comptage média (dimension de facturation) : nombre de médias + octets
-      DÉCODÉS par type, en compteurs Prometheus (`lumen_media_total`,
-      `lumen_media_bytes_total`), dans le log `lumen::usage` et `usage_log`
-      (colonnes `media_count`/`media_bytes`, migration 0003)
-Spec : `docs/superpowers/specs/2026-07-14-multimodal-embeddings-design.md`
+## M8 - Vision (image input to chat) ✅
+- [x] Core types: `MessageContent`/`ContentPart`/`ImageUrl` (`content` is a string OR an array of parts), `text()`/`has_image()`
+- [x] Per-model `modalities` config (default `["text"]`), exposed in `GET /v1/models`
+- [x] Pre-flight enforcement: an image to a non-vision model → `LM-2003` (400), before any upstream call
+- [x] Anthropic translation (`image` base64/url blocks) and Gemini (`inline_data`); a remote URL to Gemini → `LM-2004` (400), the gateway never fetches upstream
+- [x] OpenAI-family (+ `vllm`): verbatim passthrough of parts, conformance-tested
+- [x] Configurable request body-size limit → `LM-1002` (413) envelope on all routes
+- [x] Token counting (ADR 003): upstream usage is authoritative; text-only estimation fallback (image = 0), always `estimated`
 
-Note : exception consciente et bornée à la règle « ne jamais déréférencer une
-URL » — opt-in, hors hot-path streaming, timeout. La vision chat (M8) conserve
-le « never fetch ».
+Note: a per-image token heuristic (OpenAI tile formula) and file/GCS URIs
+(Anthropic/Gemini) are deferred - see `docs/backlog.md`.
+Spec: `docs/superpowers/specs/2026-07-14-vision-image-input-design.md`.
 
-## Backlog v2 (ne pas implémenter)
-UI admin, cache sémantique, audio (STT/TTS), génération/sortie d'images,
-guardrails, rate limiting distribué (Redis), OTLP tracing, plugin WASM.
-Multimodal *chat* (vision) : voir le plan M8.
-Heuristique de tokens par image pour l'estimation de secours (M9).
+## M9 - Multimodal embeddings + guarded image fetch ✅
+- [x] `EmbedInput` widened to content-parts (text + image, mixable), reusing the
+      shared `ContentPart`/`ImageUrl` from `crates/core/src/chat.rs` (M8)
+- [x] Per-model `modalities` reused for embeddings; image to a non-image model →
+      `LM-2003` before the upstream call, checked across the whole fallback chain
+- [x] Opt-in guarded server fetch (`[image_fetch]`, off by default): non-configurable
+      private-IP block + connection pinning (DNS-rebinding safe), scheme/host/prefix
+      allowlists, streamed size cap, timeout, `image/*` MIME, redirect re-validation,
+      per-request count cap, cancellation. `LM-2005/2006/2007`
+- [x] Multimodal translation: Cohere (embed-v4 `inputs`), Voyage
+      (`/multimodalembeddings`), Jina (object `input`)
+- [x] Token counting (ADR 003): upstream usage trusted; local estimate is text-only
+      (images = 0, flagged `estimated`)
+- [x] Media accounting (billing dimension): media count + DECODED bytes per type in
+      Prometheus (`lumen_media_total`, `lumen_media_bytes_total`), the `lumen::usage`
+      log, and `usage_log` (`media_count`/`media_bytes` columns, migration 0003)
+Spec: `docs/superpowers/specs/2026-07-14-multimodal-embeddings-design.md`
+
+Note: a conscious, bounded exception to the "never dereference a URL" rule -
+opt-in, off the streaming hot path, time-bounded. Chat vision (M8) keeps
+"never fetch".
+
+## Backlog v2 (do not implement)
+Admin UI, semantic cache, audio (STT/TTS), image generation/output, guardrails, distributed rate limiting (Redis), OTLP tracing, WASM plugin.
+
+Note: M8 shipped the first, narrowest slice of the "multimodal (images/audio)"
+non-goal - image input to chat only (see above). M9 added image input to
+embeddings with an opt-in guarded fetch. Image output and audio (input and
+output) remain out of scope. A per-image token heuristic for the estimation
+fallback (M9) is also deferred.

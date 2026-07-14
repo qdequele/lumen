@@ -2,7 +2,7 @@
 //!
 //! When enabled, remote `http(s)` image URLs in a multimodal embedding request
 //! are fetched, base64-encoded, and rewritten in place to `data:` URIs *before*
-//! provider translation — so providers only ever receive inline bytes. Fetching
+//! provider translation - so providers only ever receive inline bytes. Fetching
 //! is **off by default**; when on it is bounded by SSRF and resource guards
 //! (private-IP block, scheme/host/prefix allowlists, size cap, timeout, MIME
 //! allowlist), see [`ImageFetchPolicy`].
@@ -39,8 +39,8 @@ pub struct ImageFetchPolicy {
     /// **Test-only** escape hatch that disables the private-IP block. It is
     /// never deserialized from config and the server always constructs the
     /// policy with this `false`; only unit/integration tests set it `true`
-    /// (their mock host binds loopback). Keeping it here — rather than a
-    /// `#[cfg(test)]` field — lets the cross-crate integration tests build the
+    /// (their mock host binds loopback). Keeping it here - rather than a
+    /// `#[cfg(test)]` field - lets the cross-crate integration tests build the
     /// struct without a test-only build of this crate.
     pub allow_private_ips: bool,
 }
@@ -86,12 +86,12 @@ fn is_data_uri(url: &str) -> bool {
 /// fetch, so this stage cannot be turned into an unbounded fan-out.
 ///
 /// # Errors
-/// - [`GatewayError::ImageFetchDisabled`] (`LM-2005`) — a remote URL while
+/// - [`GatewayError::ImageFetchDisabled`] (`LM-2005`) - a remote URL while
 ///   `policy.enabled` is `false`.
-/// - [`GatewayError::ImageUrlRejected`] (`LM-2006`) — a guard rejected the URL
+/// - [`GatewayError::ImageUrlRejected`] (`LM-2006`) - a guard rejected the URL
 ///   (scheme, host/prefix allowlist, private IP, size cap, non-image type) or
 ///   the request exceeded [`MAX_IMAGES_PER_REQUEST`].
-/// - [`GatewayError::ImageFetchFailed`] (`LM-2007`) — the remote host failed,
+/// - [`GatewayError::ImageFetchFailed`] (`LM-2007`) - the remote host failed,
 ///   timed out, or the DNS lookup failed.
 pub async fn resolve_image_parts(
     input: &mut EmbedInput,
@@ -102,7 +102,7 @@ pub async fn resolve_image_parts(
         return Ok(());
     };
 
-    // Phase 1 — gather remote image URLs in traversal order (immutable walk).
+    // Phase 1 - gather remote image URLs in traversal order (immutable walk).
     // A remote URL while fetching is disabled fails fast here.
     let mut remote: Vec<String> = Vec::new();
     for item in items.iter() {
@@ -127,11 +127,11 @@ pub async fn resolve_image_parts(
         return Err(GatewayError::ImageUrlRejected);
     }
 
-    // Phase 2 — fetch concurrently, preserving order, short-circuiting on the
+    // Phase 2 - fetch concurrently, preserving order, short-circuiting on the
     // first error (which cancels the remaining in-flight fetches).
     let fetched = fetch_all(&remote, policy, cancel).await?;
 
-    // Phase 3 — write the results back in the same traversal order.
+    // Phase 3 - write the results back in the same traversal order.
     let mut results = fetched.into_iter();
     for item in items.iter_mut() {
         if let EmbedItem::Parts(parts) = item {
@@ -292,7 +292,7 @@ async fn resolve_vetted_addr(
 ) -> Result<std::net::SocketAddr, GatewayError> {
     let allow_private = policy.allow_private_ips;
     let host_owned = host.to_owned();
-    // std DNS resolution is blocking — keep it off the runtime. Bound it by the
+    // std DNS resolution is blocking - keep it off the runtime. Bound it by the
     // per-fetch timeout and honor cancellation so a slow resolver cannot exceed
     // the budget or ignore a client disconnect.
     let lookup = tokio::task::spawn_blocking(move || {
@@ -355,7 +355,7 @@ async fn read_capped(
 
 /// Whether an IP address is a routable public address. Any loopback, private,
 /// link-local, unique-local, unspecified, shared, documentation, or multicast
-/// address returns `false` — the SSRF block that cannot be disabled.
+/// address returns `false` - the SSRF block that cannot be disabled.
 #[must_use]
 pub(crate) fn is_public_ip(ip: &IpAddr) -> bool {
     match ip {
@@ -376,7 +376,7 @@ pub(crate) fn is_public_ip(ip: &IpAddr) -> bool {
                 || o[0] >= 224)
         }
         IpAddr::V6(v6) => {
-            // IPv4-mapped (::ffff:a.b.c.d) — classify by the embedded v4.
+            // IPv4-mapped (::ffff:a.b.c.d) - classify by the embedded v4.
             if let Some(v4) = v6.to_ipv4_mapped() {
                 return is_public_ip(&IpAddr::V4(v4));
             }
@@ -390,7 +390,7 @@ pub(crate) fn is_public_ip(ip: &IpAddr) -> bool {
                 // ff00::/8 multicast.
                 || (seg[0] & 0xff00) == 0xff00
                 // Transition ranges that embed an IPv4 address an attacker
-                // could aim at an internal host — rejected outright (they are
+                // could aim at an internal host - rejected outright (they are
                 // deprecated/rare as public unicast, so the block is safe):
                 //   ::/96      IPv4-compatible (first 96 bits zero)
                 //   2002::/16  6to4

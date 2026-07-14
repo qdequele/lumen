@@ -2,23 +2,22 @@
 //!
 //! This crate is deliberately free of any web framework, HTTP client or
 //! database dependency: it defines the vocabulary the rest of the workspace
-//! speaks. Three capabilities are first-class citizens — chat, embeddings and
-//! reranking — each with its own request/response types and provider trait.
+//! speaks. Three capabilities are first-class citizens - chat, embeddings and
+//! reranking - each with its own request/response types and provider trait.
 //!
 //! # Modules
-//! * [`chat`] — OpenAI `chat/completions` request/response/chunk types.
-//! * [`embed`] — OpenAI `embeddings` types.
-//! * [`rerank`] — Cohere `rerank` types.
-//! * [`provider`] — the [`ChatProvider`], [`EmbeddingProvider`] and
+//! * [`chat`] - OpenAI `chat/completions` request/response/chunk types.
+//! * [`embed`] - OpenAI `embeddings` types.
+//! * [`rerank`] - Cohere `rerank` types.
+//! * [`provider`] - the [`ChatProvider`], [`EmbeddingProvider`] and
 //!   [`RerankProvider`] traits.
-//! * [`error`] — the [`ProviderError`] / [`GatewayError`] taxonomy.
-//! * [`capability`] — the [`Capability`] enum.
+//! * [`error`] - the [`ProviderError`] / [`GatewayError`] taxonomy.
+//! * [`capability`] - the [`Capability`] enum.
 
 #![forbid(unsafe_code)]
 
 pub mod capability;
 pub mod chat;
-pub mod content;
 pub mod embed;
 pub mod error;
 pub mod media;
@@ -29,9 +28,8 @@ pub mod tokens;
 pub use capability::Capability;
 pub use chat::{
     ChatChoice, ChatChunk, ChatChunkChoice, ChatDelta, ChatMessage, ChatRequest, ChatResponse,
-    Usage,
+    ContentPart, DataUri, ImageUrl, MessageContent, Usage,
 };
-pub use content::{ContentPart, ImageUrl};
 pub use embed::{EmbedData, EmbedInput, EmbedItem, EmbedRequest, EmbedResponse, EmbedUsage};
 pub use error::{ErrorBody, ErrorEnvelope, ErrorType, GatewayError, ProviderError, QuotaKind};
 pub use media::{measure_media, MediaTypeUsage, MediaUsage};

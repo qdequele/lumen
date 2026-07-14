@@ -4,7 +4,7 @@
 //! migrations applied, exactly as the server does at boot.
 
 // Exact float literals stored and read back unchanged through SQLite REAL
-// columns — strict equality is the correct assertion here.
+// columns - strict equality is the correct assertion here.
 #![allow(clippy::float_cmp)]
 
 use lumen_auth::crypto::MasterKey;
@@ -66,7 +66,7 @@ async fn create_key_returns_plaintext_once_and_stores_only_the_hash() {
     assert!(!fetched.disabled);
 
     // Acceptance criterion 5 (DB half): the plaintext key appears nowhere in
-    // the database — not in the keys table, not anywhere else.
+    // the database - not in the keys table, not anywhere else.
     assert!(
         !store.debug_dump().await.expect("dump").contains(revealed),
         "plaintext virtual key must never be stored"
@@ -139,7 +139,7 @@ async fn patch_of_unknown_key_returns_none() {
 #[tokio::test]
 async fn persist_budgets_survives_reload() {
     // Acceptance criterion 6: spent budgets flushed to the DB are what a
-    // restarted gateway reloads — an exhausted key stays exhausted.
+    // restarted gateway reloads - an exhausted key stays exhausted.
     let store = KeyStore::in_memory().await.expect("open store");
     let (_, record) = store.create_key(new_key("spender")).await.expect("create");
 

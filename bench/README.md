@@ -6,11 +6,11 @@ See `docs/perf-baseline.md` for methodology and the recorded in-process numbers.
 
 ## Layout
 
-- `compose.yaml` — mock upstream (mockserver, ~0 ms), LUMEN, and LiteLLM,
+- `compose.yaml` - mock upstream (mockserver, ~0 ms), LUMEN, and LiteLLM,
   all pointed at the mock.
-- `mock-upstream.json` — the constant OpenAI-shaped `/chat/completions` response.
-- `lumen-bench.toml` / `litellm-bench.yaml` — matching single-model configs.
-- `k6-added-latency.js` — 50-VU, 30 s constant load reporting p50/p95/p99.
+- `mock-upstream.json` - the constant OpenAI-shaped `/chat/completions` response.
+- `lumen-bench.toml` / `litellm-bench.yaml` - matching single-model configs.
+- `k6-added-latency.js` - 50-VU, 30 s constant load reporting p50/p95/p99.
 
 ## Run
 
@@ -36,9 +36,9 @@ docker stats --no-stream mock-upstream lumen litellm
 - **Throughput** = k6's `http_reqs` rate (req/s) for each target.
 
 The mock returns instantly, so absolute latencies are tiny and dominated by
-transport — which is exactly the point: it exposes the proxy's own overhead
+transport - which is exactly the point: it exposes the proxy's own overhead
 rather than hiding it behind model latency.
 
 > Note: `docker compose up` pulls the LiteLLM image and builds LUMEN; the
-> first run needs network and a few minutes. The numbers are hardware-specific —
+> first run needs network and a few minutes. The numbers are hardware-specific -
 > record your environment alongside them (see `docs/perf-baseline.md`).

@@ -4,7 +4,7 @@
 //! variables (nested keys use `__`, e.g. `LUMEN_SERVER__PORT=9090`).
 //!
 //! # Secrets
-//! API keys are NEVER stored in this config — only the *name* of the
+//! API keys are NEVER stored in this config - only the *name* of the
 //! environment variable that holds each key (`api_key_env = "OPENAI_API_KEY"`).
 //! The actual secret is read from the environment at provider-construction
 //! time, so deriving `Debug` on these structs cannot leak a key.
@@ -49,7 +49,7 @@ pub struct Config {
 
 /// Retries, circuit breaker, timeouts and background health checks (M6).
 ///
-/// `first_token` is not here — it stays [`ServerConfig::first_token_timeout_ms`]
+/// `first_token` is not here - it stays [`ServerConfig::first_token_timeout_ms`]
 /// (its M4 home) and can be overridden per provider. `connect` is a client-wide
 /// setting (one pooled HTTP client), so it has no per-provider override.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -200,7 +200,7 @@ pub struct TelemetryConfig {
     pub metadata_labels: Vec<String>,
 }
 
-/// Base label names already used by the token counters — an allowlisted
+/// Base label names already used by the token counters - an allowlisted
 /// metadata key may not shadow them.
 const RESERVED_LABELS: [&str; 5] = ["capability", "model", "provider", "direction", "estimated"];
 
@@ -322,7 +322,7 @@ impl ImageFetchConfig {
         }
     }
 
-    /// Whether fetching is enabled with no host/prefix allowlist — worth a
+    /// Whether fetching is enabled with no host/prefix allowlist - worth a
     /// startup warning (only the scheme and private-IP guards then apply).
     #[must_use]
     pub fn is_unrestricted(&self) -> bool {
@@ -369,9 +369,9 @@ pub struct ModelConfig {
     pub upstream_id: Option<String>,
     /// Capabilities this model serves.
     pub capabilities: Vec<Capability>,
-    /// Declared input modalities. Defaults to `["text"]`; add `"image"` to make
-    /// the model accept image content parts (M9). A plain `Vec<String>` (not an
-    /// enum) so future modalities parse without a schema bump.
+    /// Modalities this model accepts as input. Defaults to `["text"]`; add
+    /// `"image"` to allow image content parts on chat (vision) and embeddings.
+    /// Unknown modalities parse but are ignored in this release.
     #[serde(default = "default_modalities")]
     pub modalities: Vec<String>,
     /// Price per **million input tokens**, USD (M5 cost counting).

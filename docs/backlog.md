@@ -1,7 +1,7 @@
 # Backlog
 
 Ideas surfaced during development that are intentionally out of scope for v1
-(see `CLAUDE.md` → "Ce qu'on ne fait PAS (v1)" and `ROADMAP.md` → "Backlog v2").
+(see `CLAUDE.md` → "What we do NOT do (v1)" and `ROADMAP.md` → "Backlog v2").
 Recorded here so they are not lost, and so we don't gold-plate the current
 milestone.
 
@@ -18,14 +18,14 @@ milestone.
 ## Noted while building M1
 
 - Token-array inputs for `/v1/embeddings` (`input` as arrays of token ids) are
-  not modelled — only string and string-batch. Add if a provider needs it.
+  not modelled - only string and string-batch. Add if a provider needs it.
 - Rerank `documents` accepts only strings; Cohere also allows objects. Reduce
   object documents to text at the edge when a provider requires it.
 - Config: consider a `--check-config` subcommand that validates and exits, for
   CI / deploy pipelines, once the CLI surface grows.
 - Error taxonomy (revisit in M4): `ProviderError::Cancelled` currently maps to
   `GatewayError::Internal` (500 / `internal`). Once real streaming/provider
-  calls exist, a client-initiated cancel should not inflate `internal` metrics —
+  calls exist, a client-initiated cancel should not inflate `internal` metrics -
   consider a dedicated non-5xx variant that isn't alerted on.
 - `error_type()` collapses 401/402/429 into `invalid_request` because the public
   taxonomy only has three `type`s. Fine per `CLAUDE.md`, but note it's coarse.
@@ -49,7 +49,7 @@ milestone.
 - Cancellation tests use real (short) wall-clock delays rather than
   `tokio(start_paused)`; robust today but revisit if they flake under CI load.
   The HTTP-level disconnect test asserts the server stays responsive and the
-  upstream got the request — the actual upstream abort is proven at the provider
+  upstream got the request - the actual upstream abort is proven at the provider
   layer (conformance `scenario_cancellation_aborts_upstream`).
 
 ## Noted while building M3
@@ -62,7 +62,7 @@ milestone.
   M5 cost counting, widen `RerankUsage` (e.g. add `total_tokens`) rather than
   overloading `search_units`.
 - Rerank `documents` accept string or `{text}` only. Cohere also allows
-  arbitrary objects with a `rank_fields` selector — out of scope; reduce to text
+  arbitrary objects with a `rank_fields` selector - out of scope; reduce to text
   at the edge if a provider needs it.
 - TEI serves one model per process and ignores the request `model`/`top_n`; the
   gateway truncates to `top_n` after sorting. The configured `upstream_id` is
@@ -72,12 +72,12 @@ milestone.
   (Cohere 96, Jina/Voyage/OpenAI-style large, TEI 32). Revisit against real
   provider limits; embeddings batching already exercises these.
 
-## Noted while building M4 (slice 1 — non-streaming chat)
+## Noted while building M4 (slice 1 - non-streaming chat)
 
 - **Streaming disconnect test is a no-hang assertion, not an abort assertion.**
   `streaming_client_disconnect_does_not_hang_server` proves the server stays
   responsive but not that the upstream connection was actually closed (M4
-  acceptance criterion 2: "amont fermé en < 100 ms"). And because the interim
+  acceptance criterion 2: "upstream closed in < 100 ms"). And because the interim
   single-shot `chat_stream` awaits the full `chat()` before the guard is moved
   into the SSE body, the moved-guard path is not exercised. Strengthen in the
   streaming slice: assert via wiremock that the upstream request was aborted,
@@ -95,22 +95,27 @@ milestone.
 - Interim single-shot emits `[DONE]` even after a mid-stream error frame.
   Harmless with one item; real streaming must terminate after an error.
 
-## Noted while building M4 (slice 2 — zero-copy streaming)
+## Noted while building M4 (slice 2 - zero-copy streaming)
 
-- **Acceptance criterion 5 (LM-3010) not yet implemented.** In passthrough, if
-  the upstream closes cleanly WITHOUT a `[DONE]` terminator and without a
-  transport error, `bytes_stream()` just ends: the gateway stops gracefully (no
-  hang, no panic) but emits no `data: {"error": {"code": "LM-3010"...}}` frame.
-  Detecting a missing `[DONE]` requires sniffing the tail bytes, which fights
-  pure zero-copy — design it in slice 3 (e.g. a lightweight tail-watcher that
-  only inspects frame boundaries, not JSON). No mid-stream error-frame test yet
-  either. Tracked as slice-3 work.
+- ~~**Acceptance criterion 5 (LM-3010) not yet implemented.**~~ **Resolved**
+  (commit `076b909`, slice 3). When the upstream closes without a `[DONE]`
+  terminator and without a transport error, the gateway now appends a terminal
+  `data: {"error": {"code": "LM-3010"...}}` frame then closes cleanly. The
+  lightweight tail-watcher (`EventStreamState::scan_frame` in
+  `crates/server/src/chat.rs`) inspects only frame boundaries - it matches a
+  line-anchored `\ndata: [DONE]` marker and keeps at most `DONE_MARKER.len() - 1`
+  trailing bytes, so a terminator split across two frames is still detected and
+  model content that merely contains the text can never spoof it. Covered by the
+  unit guard tests in that module and the end-to-end wiremock test
+  `upstream_stream_without_done_yields_fg3010_error_frame` (passthrough), plus
+  the mid-stream error-frame tests (`mid_stream_provider_error_becomes_terminal_error_frame`
+  and `resilience.rs`).
 
-- **Tools sur Gemini** : `translate_request` (google) ignore silencieusement
-  `tools`/`tool_choice`, et le traducteur streaming ne lit que `parts[].text`
-  (un `functionCall` serait avalé). Décider : mapper vers `functionDeclarations`
-  Gemini, ou rejeter explicitement (LM-2002) quand `tools` est présent sur un
-  modèle routé Google. Relevé en review M4.
+- **Tools on Gemini**: `translate_request` (google) silently ignores
+  `tools`/`tool_choice`, and the streaming translator reads only `parts[].text`
+  (a `functionCall` would be swallowed). Decide: map to Gemini
+  `functionDeclarations`, or reject explicitly (LM-2002) when `tools` is present
+  on a Google-routed model. Noted in the M4 review.
 
 ## Noted while building M5
 
@@ -127,7 +132,7 @@ milestone.
 - **usage_log records successful requests only.** Refusals (401/402/429) and
   upstream failures are visible in logs/metrics but produce no usage row (no
   spend happened). If per-key rejection analytics matter, add a `status`-only
-  row path — the column already exists.
+  row path - the column already exists.
 - **Rejected requests still count toward RPM/TPM.** Quota bumps are not
   unwound when a later admission step (budget) refuses the request. Standard
   rate-limiter behaviour; documented here for the principle of least surprise.
@@ -138,13 +143,13 @@ milestone.
   JSON value instead.
 - **TPM debits the pre-call estimate, never adjusted.** Unlike the budget
   (reserved then settled to real usage), the tokens-per-minute window keeps the
-  estimate (`max_tokens` or the 2048 default when absent). Conservative — can
+  estimate (`max_tokens` or the 2048 default when absent). Conservative - can
   throttle early, can never overrun. Adjust post-call if it starves real users.
 - **No zeroization of key material.** `MasterKey` and the raw env string are
   not zeroized on drop; the `zeroize` crate would close the residual-memory
   window. Low risk (single long-lived process), noted from the M5 review.
 
-## M6 (résilience) — deferred
+## M6 (resilience) - deferred
 
 - **Per-provider connect timeout.** `connect` is a `reqwest::Client` setting and
   the gateway shares one pooled client across providers, so the connect timeout
@@ -154,7 +159,7 @@ milestone.
 - **First-frame-peek streaming retry.** Streaming retry/fallback happens only at
   the *open* phase (send + status). A stream that opens 200 then errors on its
   very first frame is treated as committed (clean SSE error frame, no retry).
-  Peeking the first frame before committing would let that case retry too —
+  Peeking the first frame before committing would let that case retry too -
   more code, marginal benefit; deferred.
 - **Circuit-breaker map is unbounded by design.** One entry per (provider,
   model) actually seen; bounded by the configured surface, never by client
@@ -165,7 +170,7 @@ milestone.
   liveness call (e.g. `GET /v1/models`) would be truer; deferred to keep the
   probe provider-agnostic and free.
 
-## M7 (release) — deferred
+## M7 (release) - deferred
 
 - **Hot reload swaps the routing table only.** SIGHUP / file-watch re-validate
   the config and atomically swap the provider registry (ArcSwap). Server bind
@@ -175,7 +180,7 @@ milestone.
   reload re-reads provider keys from the environment and re-applies the DB-key
   snapshot captured at boot (so a reload never strips a stored key). *Rotating*
   a DB-stored key (`PUT /admin/provider-keys`) after boot still needs a restart
-  to take effect — the snapshot is boot-time.
+  to take effect - the snapshot is boot-time.
 - **Anthropic/Gemini translation fuzzing** goes only as deep as the shared SSE
   parser today. Fuzzing the `translate_request`/`translate_response`/stream
   translators directly needs a small public (or `#[cfg(fuzzing)]`) shim over the
@@ -187,26 +192,57 @@ milestone.
 
 ## Backlog debt paid down (post-v0.1.0)
 
-- **Full-config hot reload (DEBT-1)** — done. Reload now swaps pricing and the
+- **Full-config hot reload (DEBT-1)** - done. Reload now swaps pricing and the
   resilience policy (retry/timeouts/fallbacks) as well as the routing table,
   preserving circuit-breaker state. (Auth knobs + server bind still boot-time.)
-- **Key-material zeroization (DEBT-2)** — done. `MasterKey` wipes on drop and
+- **Key-material zeroization (DEBT-2)** - done. `MasterKey` wipes on drop and
   the raw `LUMEN_MASTER_KEY` string is zeroized after use.
-- **Richer health probe (DEBT-3)** — done for TEI (`/health` liveness; non-2xx =
+- **Richer health probe (DEBT-3)** - done for TEI (`/health` liveness; non-2xx =
   down). Other kinds keep bare host-reachability (no reliable unauthenticated
   liveness endpoint); a per-kind probe for vendor APIs remains out of scope.
 
-## Provider coverage — next candidates (post-rename)
+## Noted while building M8 (vision - image input to chat)
+
+- **Per-image token heuristic for the estimation fallback** (OpenAI tile
+  formula). The estimation fallback (upstream reports no `usage`) counts text
+  only; an image part contributes `0`. A per-image estimate needs decoded
+  pixel dimensions, which the gateway does not extract from a `data:` URI
+  today (out of scope - no image-byte inspection on the request path). See the
+  [ADR 003 addendum](adr/003-token-accounting.md#addendum-m8--vision--image-input).
+- **Anthropic/Gemini file/GCS image URIs.** Only inline base64 (`data:` URIs)
+  and, where the provider fetches it itself (Anthropic), remote `http(s)` URLs
+  are supported. Anthropic's `source: {type: "file", file_id: ...}` and
+  Gemini's GCS `fileUri` sources are not modelled; add if a caller needs
+  pre-uploaded-file references instead of inline bytes.
+
+## Provider coverage - next candidates (post-rename)
 
 - **Tier-2 clouds need dedicated kinds** (different auth/schema, not
   OpenAI-compatible): Azure OpenAI (deployment routing + api-version), AWS
   Bedrock (SigV4, per-model schemas), Google Vertex AI (GCP OAuth, regional
   endpoints). Each is a `provider-integrator` task with wiremock tests.
-- **Cohere chat** (Command R/R+) — we ship Cohere embed+rerank; chat is a
+- **Cohere chat** (Command R/R+) - we ship Cohere embed+rerank; chat is a
   distinct schema.
-- **Cloudflare Workers AI rerank** — the OpenAI-compatible `cloudflare` kind
+- **Cloudflare Workers AI rerank** - the OpenAI-compatible `cloudflare` kind
   covers chat+embed; bge-reranker uses the native `/ai/run/{model}` endpoint
   with a Cloudflare-specific response, so rerank needs custom code.
 - **More rerankers**: Mixedbread (mxbai-rerank), Pinecone Rerank, NVIDIA NIM
-  rerank, Together LlamaRank — cheap differentiation for a first-class rerank
+  rerank, Together LlamaRank - cheap differentiation for a first-class rerank
   gateway.
+
+## Noted while building M8 (vision / image input)
+
+- **`LM-2004` pre-flight is primary-only.** A remote `http(s)` image URL is
+  rejected up front (`LM-2004`, 400) only when the model's *primary* provider
+  can't fetch it (Gemini). If the primary accepts URLs (OpenAI) but a Gemini
+  model is a *fallback*, a fail-over to Gemini surfaces as `LM-3002` (502,
+  translation error) rather than a client 4xx - safe (never fetched, no retry
+  loop) but a soft break of the 4xx/5xx separation (rule 8). Options if it ever
+  bites: scan the whole chain in the pre-flight (rejects some primary-servable
+  requests), or add a dedicated client-input `ProviderError` mapped to a 4xx.
+- **Per-image token heuristic for the estimation fallback.** When an upstream
+  reports no usage, image parts currently count `0` (text-only estimate). Add a
+  tile-based heuristic (OpenAI's ~85 base + 170/tile by resolution) so vision
+  requests aren't under-counted on no-usage upstreams.
+- **Provider-native image URI forms.** Anthropic/Gemini file & GCS URI image
+  sources (beyond inline base64 + remote URL) are not modelled.

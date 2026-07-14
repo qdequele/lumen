@@ -1,4 +1,4 @@
-//! `POST /v1/embeddings` — the first complete request path.
+//! `POST /v1/embeddings` - the first complete request path.
 //!
 //! Flow: validate → route (model → provider) → admit (budget/quota, memory
 //! only) → embed (with automatic batching) → account (tokens, cost, usage
@@ -45,16 +45,18 @@ pub async fn embeddings(
     let exec = state.resilience.exec_config(&client_model);
 
     // M9 enforcement (fail fast): image input requires EVERY model in the
-    // resolved chain (primary + fallbacks) to declare the "image" modality —
+    // resolved chain (primary + fallbacks) to declare the "image" modality,
     // otherwise a fallback hop could route image content to a text-only model.
     // Rejected before any upstream call with a clear LM-2003 naming the
-    // offending model.
+    // offending model. Shares `ImageInputNotSupported` with chat vision (M8).
     if req.input.has_image() {
-        if let Some(bad) = chain_ids
-            .iter()
-            .find(|id| !state.registry.model_supports_image(id))
-        {
-            return Err(GatewayError::ImageModelUnsupported { model: bad.clone() }.into());
+        if let Some(bad) = chain_ids.iter().find(|id| {
+            !state
+                .registry
+                .modalities(id)
+                .is_some_and(|mods| mods.iter().any(|m| m == "image"))
+        }) {
+            return Err(GatewayError::ImageInputNotSupported { model: bad.clone() }.into());
         }
     }
 
@@ -123,7 +125,7 @@ pub async fn embeddings(
     let mut response = executed.value;
     accounting.served_by(&executed.model_used, &executed.provider_used);
 
-    // ADR 003: upstream usage when reported, else the local estimate — never
+    // ADR 003: upstream usage when reported, else the local estimate - never
     // a silent zero (e.g. TEI reports nothing).
     let (tokens_in, estimated) = if response.usage.prompt_tokens > 0 {
         (u64::from(response.usage.prompt_tokens), false)

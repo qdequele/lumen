@@ -1,40 +1,40 @@
-# M2 — Embeddings : premier chemin de requête complet
+# M2 - Embeddings: first complete request path
 
-## Objectif
-`POST /v1/embeddings` fonctionne de bout en bout avec OpenAI et Ollama, batching automatique, cancellation propagée. C'est le milestone qui établit TOUS les patterns (provider, router, tests) — le plus important du projet.
+## Objective
+`POST /v1/embeddings` works end-to-end with OpenAI and Ollama, automatic batching, propagated cancellation. This is the milestone that establishes ALL the patterns (provider, router, tests) - the most important one in the project.
 
-## Tâches
+## Tasks
 
 ### 2.1 Registry & router
-- [x] `crates/providers/src/registry.rs` : construit les instances de providers depuis la config, expose `get(capability, model_id) -> Option<Arc<dyn ...>>`
-- [x] `crates/router` : résout le modèle demandé → provider, renvoie LM-2001 (modèle inconnu) ou LM-2002 (modèle sans cette capacité) sinon
-- [x] Registry derrière `ArcSwap` (préparation du hot reload M7)
+- [x] `crates/providers/src/registry.rs`: builds provider instances from the config, exposes `get(capability, model_id) -> Option<Arc<dyn ...>>`
+- [x] `crates/router`: resolves the requested model → provider, otherwise returns LM-2001 (unknown model) or LM-2002 (model lacking that capability)
+- [x] Registry behind `ArcSwap` (preparation for M7 hot reload)
 
-### 2.2 Provider OpenAI (embeddings)
-- [x] `providers/src/openai/` : client reqwest partagé (pool), `embed()` avec traduction minimale (passthrough quasi direct)
-- [x] Gestion `encoding_format` (float | base64), `dimensions`
-- [x] Mapping erreurs : 401→Upstream fatal, 429→RateLimited(retry_after), 5xx→Upstream retryable
+### 2.2 OpenAI provider (embeddings)
+- [x] `providers/src/openai/`: shared reqwest client (pool), `embed()` with minimal translation (near-direct passthrough)
+- [x] Handling of `encoding_format` (float | base64), `dimensions`
+- [x] Error mapping: 401→Upstream fatal, 429→RateLimited(retry_after), 5xx→Upstream retryable
 - [x] `max_batch_size()` = 2048 inputs
 
-### 2.3 Provider Ollama (embeddings)
-- [x] `providers/src/ollama/` : API `/api/embed`, traduction schéma Ollama ↔ interne
-- [x] Pas de clé API requise (base_url local) — le code doit accepter les providers sans auth
+### 2.3 Ollama provider (embeddings)
+- [x] `providers/src/ollama/`: `/api/embed` API, Ollama ↔ internal schema translation
+- [x] No API key required (local base_url) - the code must accept providers without auth
 
 ### 2.4 Batching
-- [x] Si `inputs.len() > provider.max_batch_size()` : découper, exécuter les sous-batches en parallèle (concurrence bornée, défaut 4), réassembler DANS L'ORDRE, sommer les usages
-- [x] Échec d'un sous-batch = échec de la requête entière avec erreur du sous-batch fautif (pas de résultat partiel en v1)
+- [x] If `inputs.len() > provider.max_batch_size()`: split, run the sub-batches in parallel (bounded concurrency, default 4), reassemble IN ORDER, sum the usages
+- [x] Failure of one sub-batch = failure of the entire request with the error from the offending sub-batch (no partial result in v1)
 
-### 2.5 Handler HTTP
-- [x] `POST /v1/embeddings` : validation → router → provider → réponse format OpenAI
-- [x] `CancellationToken` créé par requête, annulé quand la connexion client se ferme (axum : détection via le body/extension), passé jusqu'au `reqwest` (via `select!`)
+### 2.5 HTTP handler
+- [x] `POST /v1/embeddings`: validation → router → provider → OpenAI-format response
+- [x] `CancellationToken` created per request, cancelled when the client connection closes (axum: detection via the body/extension), passed all the way to `reqwest` (via `select!`)
 
-## Critères d'acceptation
-1. Test wiremock : requête 5000 inputs, provider avec max_batch 2048 → exactement 3 appels amont, réponse avec 5000 embeddings dans l'ordre d'origine, usage sommé.
-2. Test cancellation : le client drop la connexion pendant l'appel amont → wiremock enregistre la requête amont comme interrompue / le token est annulé avant la fin (assert sur compteur + délai simulé avec start_paused).
-3. Test : modèle inconnu → 404 LM-2001 ; modèle chat-only demandé en embedding → 400 LM-2002.
-4. Test : amont répond 429 avec Retry-After → réponse 429 au client avec le header propagé et code LM-3001.
-5. Test : amont répond du JSON malformé → 502 LM-3002 (jamais 500, jamais de panic).
-6. Ollama et OpenAI passent la MÊME suite de tests génériques (macro ou fonction générique de suite de conformité) — ce harnais servira à tous les providers suivants.
+## Acceptance criteria
+1. wiremock test: request with 5000 inputs, provider with max_batch 2048 → exactly 3 upstream calls, response with 5000 embeddings in the original order, summed usage.
+2. Cancellation test: the client drops the connection during the upstream call → wiremock records the upstream request as interrupted / the token is cancelled before completion (assert on counter + simulated delay with start_paused).
+3. Test: unknown model → 404 LM-2001; chat-only model requested for embedding → 400 LM-2002.
+4. Test: upstream responds 429 with Retry-After → 429 response to the client with the header propagated and code LM-3001.
+5. Test: upstream responds with malformed JSON → 502 LM-3002 (never 500, never a panic).
+6. Ollama and OpenAI pass the SAME generic test suite (macro or generic conformance-suite function) - this harness will serve all subsequent providers.
 
-## Pattern à établir (réutilisé partout ensuite)
-Suite de conformité générique : `fn conformance_suite<P: EmbeddingProvider>(provider: P, mock: MockServer)` exécutée pour chaque provider. Tout nouveau provider DOIT la passer.
+## Pattern to establish (reused everywhere afterwards)
+Generic conformance suite: `fn conformance_suite<P: EmbeddingProvider>(provider: P, mock: MockServer)` run for each provider. Every new provider MUST pass it.

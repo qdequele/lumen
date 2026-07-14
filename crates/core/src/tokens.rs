@@ -1,4 +1,4 @@
-//! Cheap local token estimation — the ADR 003 fallback.
+//! Cheap local token estimation - the ADR 003 fallback.
 //!
 //! When an upstream reports usage, that value wins (`estimated = false`) and
 //! nothing here runs. When it doesn't (TEI reports nothing; some streams omit
@@ -31,12 +31,12 @@ pub fn estimate_text(text: &str) -> u64 {
 
 /// Estimate the prompt tokens of a chat request: content of every message
 /// plus a fixed per-message overhead. Tool definitions and other `extra`
-/// payloads are deliberately ignored — cheap and predictable beats complete.
+/// payloads are deliberately ignored - cheap and predictable beats complete.
 #[must_use]
 pub fn estimate_chat_prompt(req: &ChatRequest) -> u64 {
     req.messages
         .iter()
-        .map(|m| PER_MESSAGE_OVERHEAD + m.content.as_deref().map_or(0, estimate_text))
+        .map(|m| PER_MESSAGE_OVERHEAD + m.content.as_ref().map_or(0, |c| estimate_text(&c.text())))
         .sum()
 }
 
@@ -65,7 +65,7 @@ mod tests {
     fn msg(content: &str) -> ChatMessage {
         ChatMessage {
             role: "user".to_owned(),
-            content: Some(content.to_owned()),
+            content: Some(crate::chat::MessageContent::Text(content.to_owned())),
             name: None,
             extra: serde_json::Map::new(),
         }

@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::content::ContentPart;
+use crate::chat::ContentPart;
 
 /// Input to an embedding request: a single string, a text batch, or a
 /// multimodal batch of content-parts items.
@@ -26,7 +26,7 @@ pub enum EmbedInput {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum EmbedItem {
-    /// A bare string item (tried first — untagged order matters).
+    /// A bare string item (tried first - untagged order matters).
     Text(String),
     /// An array of typed content parts.
     Parts(Vec<ContentPart>),

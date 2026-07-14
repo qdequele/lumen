@@ -1,8 +1,8 @@
 //! Error type for the auth/storage layer.
 //!
-//! These are *internal* errors: the server maps them to `LM-5001` (opaque 500)
-//! — never to a misleading 401 during a gateway malfunction. Variants never
-//! embed key material.
+//! These are *internal* errors: the server maps them to `LM-5001` (opaque
+//! 500) - never to a misleading 401 during a gateway malfunction. Variants
+//! never embed key material.
 
 /// An auth/storage failure.
 #[derive(Debug, thiserror::Error)]
@@ -20,7 +20,7 @@ pub enum AuthError {
     InvalidMasterKey(&'static str),
 
     /// Decryption failed: wrong master key or corrupted ciphertext.
-    /// Carries no detail by design — there is nothing safe to say.
+    /// Carries no detail by design - there is nothing safe to say.
     #[error("provider key decryption failed")]
     Decrypt,
 }

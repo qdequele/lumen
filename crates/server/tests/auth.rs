@@ -34,7 +34,7 @@ fn master() -> String {
 }
 
 /// One registry over a single wiremock server: OpenAI (chat + embeddings),
-/// Cohere (rerank) and TEI (keyless embeddings) — the paths never collide.
+/// Cohere (rerank) and TEI (keyless embeddings) - the paths never collide.
 fn full_registry(upstream: &str) -> Arc<Registry> {
     let specs = vec![
         ProviderSpec {
@@ -47,13 +47,13 @@ fn full_registry(upstream: &str) -> Arc<Registry> {
                     id: "gpt".to_owned(),
                     upstream_id: "gpt-4o-2024-08-06".to_owned(),
                     capabilities: vec![Capability::Chat],
-                    modalities: Vec::new(),
+                    modalities: vec!["text".to_owned()],
                 },
                 ModelSpec {
                     id: "embed-small".to_owned(),
                     upstream_id: "text-embedding-3-small".to_owned(),
                     capabilities: vec![Capability::Embed],
-                    modalities: Vec::new(),
+                    modalities: vec!["text".to_owned()],
                 },
             ],
         },
@@ -66,7 +66,7 @@ fn full_registry(upstream: &str) -> Arc<Registry> {
                 id: "rerank-fast".to_owned(),
                 upstream_id: "rerank-v3.5".to_owned(),
                 capabilities: vec![Capability::Rerank],
-                modalities: Vec::new(),
+                modalities: vec!["text".to_owned()],
             }],
         },
         ProviderSpec {
@@ -78,7 +78,7 @@ fn full_registry(upstream: &str) -> Arc<Registry> {
                 id: "tei-embed".to_owned(),
                 upstream_id: "tei-model".to_owned(),
                 capabilities: vec![Capability::Embed],
-                modalities: Vec::new(),
+                modalities: vec!["text".to_owned()],
             }],
         },
     ];
@@ -176,7 +176,7 @@ async fn spawn_auth(registry: Arc<Registry>, metadata_labels: &[&str]) -> Harnes
     spawn_auth_with_store(registry, metadata_labels, store).await
 }
 
-/// Same, but around an existing store — the "restart" scenario.
+/// Same, but around an existing store - the "restart" scenario.
 async fn spawn_auth_with_store(
     registry: Arc<Registry>,
     metadata_labels: &[&str],
@@ -508,8 +508,8 @@ async fn tpm_quota_is_429_fg4003() {
 
 #[tokio::test]
 async fn dead_usage_writer_never_blocks_requests_and_drops_are_counted() {
-    // Criteria 3 + 4 (HTTP level): with the writer killed — the extreme
-    // stand-in for a locked/unavailable DB — every log entry is dropped and
+    // Criteria 3 + 4 (HTTP level): with the writer killed - the extreme
+    // stand-in for a locked/unavailable DB - every log entry is dropped and
     // counted, and requests keep flowing at full speed. The full-but-alive
     // channel variant is covered deterministically by the auth crate's
     // `full_channel_drops_instead_of_blocking` unit test.
@@ -590,7 +590,7 @@ async fn tei_embeddings_without_upstream_usage_are_estimated_never_zero() {
         .expect("send");
     assert_eq!(resp.status(), 200);
     let body: Value = resp.json().await.expect("json");
-    // The response surfaces the (flagged) estimate — never a silent zero.
+    // The response surfaces the (flagged) estimate - never a silent zero.
     assert!(body["usage"]["prompt_tokens"].as_u64().expect("tokens") > 0);
     assert_eq!(body["usage"]["estimated"], true);
 

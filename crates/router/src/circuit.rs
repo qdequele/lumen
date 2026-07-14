@@ -118,7 +118,7 @@ impl CircuitBreaker {
     }
 
     /// Lock, recovering from a poisoned mutex rather than panicking (a panic in
-    /// the request path is forbidden — CLAUDE.md rule 1). The guarded data is
+    /// the request path is forbidden - CLAUDE.md rule 1). The guarded data is
     /// plain counters, so an inconsistent state after a panic is harmless.
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
         self.inner
@@ -156,7 +156,7 @@ impl CircuitBreaker {
                 }
             }
             CircuitState::HalfOpen => {
-                // A probe already in flight blocks others — unless it has been
+                // A probe already in flight blocks others - unless it has been
                 // outstanding longer than the cooldown, in which case it is
                 // presumed lost (no on_success/on_failure ever ran) and a fresh
                 // probe is admitted so the breaker cannot wedge shut.

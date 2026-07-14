@@ -1,4 +1,4 @@
-# M9 — Multimodal embeddings + guarded image fetch
+# M9 - Multimodal embeddings + guarded image fetch
 
 **Status:** approved design, pre-implementation
 **Date:** 2026-07-14
@@ -62,7 +62,7 @@ variant.
 
 ## 3. Core type changes
 
-### 3.1 Shared content parts — `crates/core/src/content.rs` (NEW)
+### 3.1 Shared content parts - `crates/core/src/content.rs` (NEW)
 
 Extracted so M8 chat vision reuses the identical types (M8's design sketches
 them in `chat.rs`; this milestone lands them first, in a shared module).
@@ -105,16 +105,16 @@ retained for round-trip fidelity and forward-compat (unknown part types keep
 their declared `kind` + `extra`), but it never drives the image-vs-text
 decision. `has_image()` is defined as "any part with `image_url.is_some()`".
 
-### 3.2 Widened `EmbedInput` — `crates/core/src/embed.rs`
+### 3.2 Widened `EmbedInput` - `crates/core/src/embed.rs`
 
 ```rust
 /// Input to an embedding request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum EmbedInput {
-    /// `"input": "hello"` — unchanged text fast path.
+    /// `"input": "hello"` - unchanged text fast path.
     Single(String),
-    /// `"input": ["a","b"]` — unchanged text fast path.
+    /// `"input": ["a","b"]` - unchanged text fast path.
     Batch(Vec<String>),
     /// `"input": ["a", [{"type":"text",...},{"type":"image_url",...}], ...]`
     /// A heterogeneous batch; each item is text or an array of content parts.
@@ -140,12 +140,12 @@ Serde untagged tries variants in declaration order and this ordering is asserted
 by a regression test.
 
 **Helpers on `EmbedInput`:**
-- `fn len(&self) -> usize` — item count (unchanged semantics; `Multi` → number
+- `fn len(&self) -> usize` - item count (unchanged semantics; `Multi` → number
   of items).
 - `fn is_empty(&self) -> bool`.
-- `fn text_iter(&self) -> impl Iterator<Item = &str>` — concatenated text across
+- `fn text_iter(&self) -> impl Iterator<Item = &str>` - concatenated text across
   all items (image parts contribute nothing); used by `estimate_embed_input`.
-- `fn has_image(&self) -> bool` — any `image_url` part present. Used by
+- `fn has_image(&self) -> bool` - any `image_url` part present. Used by
   enforcement.
 - The existing `iter(&self) -> impl Iterator<Item = &str>` stays for the
   text-only paths; on `Multi` it yields each item's concatenated text.
@@ -156,7 +156,7 @@ OpenAI-compatible passthrough providers (Voyage, Jina, OpenAI, Ollama, TEI) all
 compile and behave unchanged for text requests. New code paths are only entered
 when `Multi` is present. `estimate_embed_input` switches to `text_iter()`.
 
-## 4. Guarded image fetch — `crates/providers/src/image_fetch.rs` (NEW)
+## 4. Guarded image fetch - `crates/providers/src/image_fetch.rs` (NEW)
 
 A resolution stage invoked by the embeddings handler **before** batching and
 provider translation. It walks every `ContentPart` with `kind == "image_url"`:
@@ -178,42 +178,42 @@ translation (§5) never sees a remote URL.
 A remote URL is fetched only if **all** hold:
 
 1. **Scheme** ∈ `allowed_schemes` (default `["https"]`; `"http"` opt-in).
-2. **Host allowlist** — `allowed_hosts` empty, or the parsed URL host matches an
+2. **Host allowlist** - `allowed_hosts` empty, or the parsed URL host matches an
    entry: exact match, or a leading-dot suffix entry (`.mycompany.com` matches
    `assets.mycompany.com` and `mycompany.com`). Matching is on the parsed host
    component only, never a substring of the raw URL (so
    `https://evil.com/?x=cdn.example.com` cannot slip through).
-3. **Prefix allowlist** — `allowed_url_prefixes` empty, or the URL string starts
+3. **Prefix allowlist** - `allowed_url_prefixes` empty, or the URL string starts
    with one of the configured prefixes.
-4. **Private-IP block (always on, non-configurable)** — resolve the host's DNS;
+4. **Private-IP block (always on, non-configurable)** - resolve the host's DNS;
    if **any** resolved address is loopback, private (RFC 1918), link-local
    (169.254/16, fe80::/10), unique-local (fc00::/7), unspecified, or otherwise
    non-global, reject. The connection is **pinned to a vetted resolved IP**
    (via `reqwest`'s `resolve`/pre-resolved address) so a second DNS lookup at
    connect time cannot rebind to an internal address (DNS-rebinding safe).
-5. **Size cap** — `max_bytes` (default 10 MiB). Enforced while streaming the
+5. **Size cap** - `max_bytes` (default 10 MiB). Enforced while streaming the
    body; a declared or observed over-limit body is rejected without buffering
    the whole payload. A `Content-Length` over the cap is rejected before
    reading.
-6. **MIME allowlist** — response `Content-Type` must be `image/*`; the concrete
+6. **MIME allowlist** - response `Content-Type` must be `image/*`; the concrete
    subtype becomes the `data:` URI media type. A missing/again non-image type
    → `LM-2006`.
 
 Additional properties:
-- **Timeout** — `timeout_ms` (default 5000) bounds the whole fetch.
-- **Cancellation** — the fetch honors the request `CancellationToken`; a client
+- **Timeout** - `timeout_ms` (default 5000) bounds the whole fetch.
+- **Cancellation** - the fetch honors the request `CancellationToken`; a client
   disconnect aborts in-flight fetches (consistent with the M4 guarantee).
-- **Bounded concurrency + count cap** — images within one request are fetched
+- **Bounded concurrency + count cap** - images within one request are fetched
   concurrently with a small bound (`FETCH_CONCURRENCY` = 4), and the number of
   remote images per request is capped (`MAX_IMAGES_PER_REQUEST` = 32); an
   over-limit request is rejected (`LM-2006`) *before* any fetch, so this stage
   cannot become an unbounded fan-out after budget admission. Wall-clock is thus
   bounded to roughly `ceil(N / 4) * timeout`.
-- **No redirects to internal targets** — redirects are followed only if the
+- **No redirects to internal targets** - redirects are followed only if the
   redirect target re-passes guards 1–4; otherwise the fetch fails `LM-2006`.
   (Implemented by disabling automatic redirects and validating each hop, or an
   equivalent redirect policy.)
-- **No secrets / no internal detail** — the client-facing error carries only the
+- **No secrets / no internal detail** - the client-facing error carries only the
   coarse `LM-2006`/`LM-2007` category; the specific rejected address or reason
   is logged server-side at `debug`, never returned or logged at info+ with URL
   query strings.
@@ -285,7 +285,7 @@ allowed_url_prefixes = []     # e.g. ["https://cdn.example.com/images/"]; empty 
 - **Startup warning:** if `enabled = true` while both `allowed_hosts` and
   `allowed_url_prefixes` are empty, log a `warn` at startup ("image fetch enabled
   with no host/prefix allowlist; only scheme and private-IP guards apply"). Not
-  an error — the private-IP block still holds.
+  an error - the private-IP block still holds.
 - `server.max_body_bytes` (introduced by M8, default 32 MiB) also applies to the
   embeddings route, since inline `data:` URIs and fetched images inflate the JSON
   body. If M8 has not yet landed, this milestone adds `server.max_body_bytes`
@@ -301,8 +301,8 @@ allowed_url_prefixes = []     # e.g. ["https://cdn.example.com/images/"]; empty 
 | `LM-2007` | 502 | The upstream image host failed or timed out during a permitted fetch. |
 
 Reused:
-- `LM-1001` (400) — malformed content parts / malformed `data:` URI.
-- `LM-1002` (413) — request body exceeded `server.max_body_bytes`.
+- `LM-1001` (400) - malformed content parts / malformed `data:` URI.
+- `LM-1002` (413) - request body exceeded `server.max_body_bytes`.
 
 No image bytes, no internal IPs, and no secrets ever appear in an error message.
 
@@ -347,20 +347,20 @@ No image bytes, no internal IPs, and no secrets ever appear in an error message.
 
 ## 10. Milestone breakdown (tests-first, one atomic commit each)
 
-1. **Core types** — `content.rs` (`ContentPart`/`ImageUrl`), widen `EmbedInput`
+1. **Core types** - `content.rs` (`ContentPart`/`ImageUrl`), widen `EmbedInput`
    with `Multi`/`EmbedItem`, `text_iter()`/`has_image()`; serde round-trip +
    regression + untagged-order tests. Update `estimate_embed_input` to
    `text_iter()`.
-2. **Config + routing** — `modalities` config field, `/v1/models` exposure,
+2. **Config + routing** - `modalities` config field, `/v1/models` exposure,
    `[image_fetch]` config block + startup warning, enforcement (`LM-2003`) +
    tests.
-3. **Guarded fetch** — `image_fetch.rs` with all §4.1 guards, `data:`-URI
+3. **Guarded fetch** - `image_fetch.rs` with all §4.1 guards, `data:`-URI
    rewrite, `LM-2005/2006/2007`, cancellation; unit + mock-host tests.
-4. **Cohere multimodal translation** — `/v2/embed` `inputs` content array +
+4. **Cohere multimodal translation** - `/v2/embed` `inputs` content array +
    tests.
-5. **Voyage + Jina multimodal translation** — `/v1/multimodalembeddings` and
+5. **Voyage + Jina multimodal translation** - `/v1/multimodalembeddings` and
    Jina `input` list + tests; batching (`batch.rs`) extension for `Multi`.
-6. **Finish** — accounting addendum, body-limit wiring if M8 hasn't landed,
+6. **Finish** - accounting addendum, body-limit wiring if M8 hasn't landed,
    conformance suite, gate (`cargo test --workspace && cargo clippy --workspace
    --all-targets -- -D warnings && cargo fmt --check`), code-reviewer,
    docs-writer (README matrix, `docs/providers.md`, `docs/errors.md`,
@@ -369,10 +369,10 @@ No image bytes, no internal IPs, and no secrets ever appear in an error message.
 
 ## 11. Open questions / accepted defaults
 
-- `image_fetch.enabled` default = **false** (opt-in) — accepted.
+- `image_fetch.enabled` default = **false** (opt-in) - accepted.
 - `image_fetch.max_bytes` default = **10 MiB**, `timeout_ms` = **5000**,
-  `allowed_schemes` = **["https"]** — accepted.
+  `allowed_schemes` = **["https"]** - accepted.
 - Empty `allowed_hosts`/`allowed_url_prefixes` with fetch enabled = allow any
-  public host (private-IP block still on) + startup `warn` — accepted.
-- No server-side image resize/re-encode — accepted non-goal.
-- Fetch stage not reused for M8 chat vision in this slice — accepted.
+  public host (private-IP block still on) + startup `warn` - accepted.
+- No server-side image resize/re-encode - accepted non-goal.
+- Fetch stage not reused for M8 chat vision in this slice - accepted.

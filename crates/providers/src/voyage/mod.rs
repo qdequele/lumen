@@ -1,4 +1,4 @@
-//! Voyage AI provider — embeddings and reranking.
+//! Voyage AI provider - embeddings and reranking.
 //!
 //! Voyage's embeddings endpoint is OpenAI-compatible (near-passthrough). Its
 //! rerank endpoint differs from Cohere's in two field names: the request uses

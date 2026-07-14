@@ -4,8 +4,8 @@
 //! object of `string → string | number | bool`, parsed once here at the edge.
 //! It feeds two sinks with different rules:
 //!
-//! * **logs / `usage_log`** — the whole (bounded) object;
-//! * **Prometheus** — ONLY the keys in the operator's allowlist
+//! * **logs / `usage_log`** - the whole (bounded) object;
+//! * **Prometheus** - ONLY the keys in the operator's allowlist
 //!   (`telemetry.metadata_labels`), everything else stays logs-only.
 //!
 //! Malformed, oversized or wrong-typed metadata is dropped with a `warn!` and
@@ -112,7 +112,7 @@ impl RequestMetadata {
     }
 
     /// Label values aligned with the allowlist order; absent keys become `""`
-    /// (ADR 002 sink 2 — only allowlisted keys ever reach Prometheus).
+    /// (ADR 002 sink 2 - only allowlisted keys ever reach Prometheus).
     #[must_use]
     pub fn label_values<'a>(&'a self, allowlist: &[String]) -> Vec<&'a str> {
         allowlist

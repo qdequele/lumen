@@ -14,7 +14,7 @@ use std::str::FromStr;
 use std::time::Duration;
 
 /// One virtual-key row, as loaded from the database. Never carries the
-/// plaintext key — only its hash identifies it, and even that stays private
+/// plaintext key - only its hash identifies it, and even that stays private
 /// to the store.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, sqlx::FromRow)]
 pub struct VirtualKeyRecord {
@@ -54,7 +54,7 @@ pub struct NewKey {
 }
 
 /// A partial update: `None` fields are left unchanged (fields cannot be
-/// cleared back to NULL through a patch — create a new key instead).
+/// cleared back to NULL through a patch - create a new key instead).
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 pub struct KeyPatch {
     /// New label.
@@ -71,7 +71,7 @@ pub struct KeyPatch {
     pub disabled: Option<bool>,
 }
 
-/// One usage-log entry (M5 §5.3 / ADR 003). No prompt or response content —
+/// One usage-log entry (M5 §5.3 / ADR 003). No prompt or response content -
 /// counts, cost and labels only.
 #[derive(Debug, Clone)]
 pub struct UsageRecord {
@@ -79,7 +79,7 @@ pub struct UsageRecord {
     pub key_id: Option<String>,
     /// Client-facing model id the client requested.
     pub model: String,
-    /// Model that actually served the request — the same as `model` unless a
+    /// Model that actually served the request - the same as `model` unless a
     /// fallback fired (M6 §6.2).
     pub model_used: String,
     /// `chat` | `embed` | `rerank`.
@@ -115,8 +115,8 @@ pub struct KeyStore {
 }
 
 impl KeyStore {
-    /// Open (creating if missing) the database at `url` — e.g.
-    /// `sqlite:///var/lib/lumen/lumen.db` — and apply embedded
+    /// Open (creating if missing) the database at `url` - e.g.
+    /// `sqlite:///var/lib/lumen/lumen.db` - and apply embedded
     /// migrations.
     pub async fn connect(url: &str) -> Result<Self, AuthError> {
         let options = SqliteConnectOptions::from_str(url)?
@@ -133,8 +133,8 @@ impl KeyStore {
     /// Open a fresh in-memory database (tests and ephemeral runs).
     ///
     /// A single never-recycled connection: each new SQLite `:memory:`
-    /// connection is a *different* empty database, so pooling more than one —
-    /// or letting the pool close an idle one — would silently lose all data.
+    /// connection is a *different* empty database, so pooling more than one -
+    /// or letting the pool close an idle one - would silently lose all data.
     pub async fn in_memory() -> Result<Self, AuthError> {
         let options = SqliteConnectOptions::from_str("sqlite::memory:")?;
         let pool = SqlitePoolOptions::new()
@@ -154,7 +154,7 @@ impl KeyStore {
     // ---- Virtual keys -------------------------------------------------------
 
     /// Create a virtual key. The returned [`PlaintextKey`] is the only copy of
-    /// the clear key that will ever exist — the database gets its hash.
+    /// the clear key that will ever exist - the database gets its hash.
     pub async fn create_key(
         &self,
         params: NewKey,
@@ -203,7 +203,7 @@ impl KeyStore {
         Ok(record)
     }
 
-    /// Every key **with its hash** — exclusively for building the in-memory
+    /// Every key **with its hash** - exclusively for building the in-memory
     /// [`AuthState`](crate::state::AuthState) at boot. The hash never leaves
     /// the auth layer.
     pub async fn load_auth_entries(&self) -> Result<Vec<(String, VirtualKeyRecord)>, AuthError> {
@@ -232,7 +232,7 @@ impl KeyStore {
         Ok(entries)
     }
 
-    /// Every key, hash included nowhere — for boot loading and the admin API.
+    /// Every key, hash included nowhere - for boot loading and the admin API.
     pub async fn list_keys(&self) -> Result<Vec<VirtualKeyRecord>, AuthError> {
         let records = sqlx::query_as::<_, VirtualKeyRecord>(
             "SELECT id, name, budget_max, budget_spent, rpm_limit, tpm_limit, expires_at, disabled, created_at \
@@ -283,7 +283,7 @@ impl KeyStore {
         Ok(record)
     }
 
-    /// Persist absolute spent amounts `(key id, spent USD)` — the periodic
+    /// Persist absolute spent amounts `(key id, spent USD)` - the periodic
     /// flush of in-memory counters. One transaction for the whole batch.
     pub async fn persist_budgets(&self, spent: &[(String, f64)]) -> Result<(), AuthError> {
         let mut tx = self.pool.begin().await?;
@@ -374,7 +374,7 @@ impl KeyStore {
     }
 
     /// Load and decrypt a provider key. `Ok(None)` when absent; an error when
-    /// present but undecryptable (wrong master key / corruption) — that must
+    /// present but undecryptable (wrong master key / corruption) - that must
     /// fail loudly, not silently behave like a missing key.
     pub async fn load_provider_key(
         &self,
@@ -395,7 +395,7 @@ impl KeyStore {
 
     // ---- Diagnostics --------------------------------------------------------
 
-    /// Render every stored row as text — a **test/diagnostic** helper backing
+    /// Render every stored row as text - a **test/diagnostic** helper backing
     /// the "no plaintext secret at rest" assertions. Never call this from a
     /// request path.
     pub async fn debug_dump(&self) -> Result<String, AuthError> {

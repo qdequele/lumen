@@ -3,7 +3,7 @@
 //! The default mode for provider keys remains environment variables; storing
 //! them in the database is opt-in and always encrypted with a master key from
 //! `LUMEN_MASTER_KEY` (64 hex chars = 32 bytes). The master key itself is
-//! never persisted and never printed — `MasterKey`'s `Debug` is redacted.
+//! never persisted and never printed - `MasterKey`'s `Debug` is redacted.
 
 use crate::AuthError;
 use aes_gcm::aead::{Aead, KeyInit};
@@ -17,7 +17,7 @@ const NONCE_LEN: usize = 12;
 /// The 32-byte master key used to seal provider keys at rest.
 ///
 /// Wiped from memory on drop (defence in depth against residual-memory
-/// exposure in a core dump or after shutdown — DEBT-2).
+/// exposure in a core dump or after shutdown - DEBT-2).
 pub struct MasterKey([u8; 32]);
 
 impl fmt::Debug for MasterKey {
@@ -81,7 +81,7 @@ impl MasterKey {
     ///
     /// # Errors
     ///
-    /// [`AuthError::Decrypt`] on a wrong key or tampered data — deliberately
+    /// [`AuthError::Decrypt`] on a wrong key or tampered data - deliberately
     /// detail-free.
     pub fn open(&self, sealed: &[u8]) -> Result<Vec<u8>, AuthError> {
         if sealed.len() <= NONCE_LEN {

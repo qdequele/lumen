@@ -4,7 +4,7 @@ use prometheus::{Encoder, Registry, TextEncoder};
 
 /// Holds the process-wide Prometheus [`Registry`].
 ///
-/// Cloning is cheap — the inner registry is reference-counted — so `Metrics`
+/// Cloning is cheap - the inner registry is reference-counted - so `Metrics`
 /// can be stored in axum state and shared across handlers.
 #[derive(Debug, Clone)]
 pub struct Metrics {

@@ -26,13 +26,13 @@ fn registry_for(upstream: &str) -> Arc<Registry> {
                 id: "embed-small".to_owned(),
                 upstream_id: "text-embedding-3-small".to_owned(),
                 capabilities: vec![Capability::Embed],
-                modalities: Vec::new(),
+                modalities: vec!["text".to_owned()],
             },
             ModelSpec {
                 id: "chat-only".to_owned(),
                 upstream_id: "gpt-4o".to_owned(),
                 capabilities: vec![Capability::Chat],
-                modalities: Vec::new(),
+                modalities: vec!["text".to_owned()],
             },
             ModelSpec {
                 id: "embed-image".to_owned(),
@@ -307,7 +307,7 @@ async fn client_disconnect_during_slow_upstream_does_not_hang_server() {
 
     let base = common::spawn_with(registry_for(&upstream.uri()), LIMIT).await;
 
-    // Client gives up after 200ms — well before the 3s upstream delay. This
+    // Client gives up after 200ms - well before the 3s upstream delay. This
     // drops the connection, which drops the handler future and cancels the
     // upstream call.
     let result = reqwest::Client::new()

@@ -92,7 +92,7 @@ async fn full_channel_drops_instead_of_blocking() {
 
     assert!(logger.log(record("kept-1")));
     assert!(logger.log(record("kept-2")));
-    // Channel full — dropped, and we got an immediate answer (criterion 4).
+    // Channel full - dropped, and we got an immediate answer (criterion 4).
     assert!(!logger.log(record("dropped")));
 }
 

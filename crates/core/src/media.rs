@@ -1,7 +1,7 @@
 //! Media accounting for multimodal inputs (M9).
 //!
 //! Counts the media items in an embedding request and their **decoded** size in
-//! bytes — a billing dimension alongside tokens. Measurement runs *after* the
+//! bytes - a billing dimension alongside tokens. Measurement runs *after* the
 //! image-fetch stage, when every image part is an inline `data:` URI (whether
 //! the client supplied it or the gateway fetched it), so the size is always
 //! available at the gateway with no extra I/O.
@@ -133,7 +133,7 @@ fn top_level_type(mediatype: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::content::{ContentPart, ImageUrl};
+    use crate::chat::{ContentPart, ImageUrl};
     use base64::Engine;
 
     fn image_part(url: &str) -> ContentPart {

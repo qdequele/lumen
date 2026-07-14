@@ -6,15 +6,15 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ## [Unreleased]
 
-### Added — Multimodal embeddings + guarded image fetch (M9)
+### Added - Multimodal embeddings + guarded image fetch (M9)
 
 - `POST /v1/embeddings` now accepts image inputs via OpenAI-style content parts:
   `input` may be an array whose items are strings or arrays of typed parts
   (`{"type":"text",...}` / `{"type":"image_url",...}`), mixable per item. The
   part `type` defaults to `"text"`, and text-vs-image is decided by which field
   is present, not by `type`. Text-only `input` (string or string array) is
-  unchanged. Shared `ContentPart`/`ImageUrl` types live in
-  `crates/core/src/content.rs` (M8 chat vision will reuse them).
+  unchanged. Reuses the shared `ContentPart`/`ImageUrl` types from
+  `crates/core/src/chat.rs` (introduced by M8 chat vision).
 - Per-model `modalities` config (default `["text"]`), surfaced in
   `GET /v1/models`. Image input to a model without `"image"` fails fast with
   `LM-2003` (400) before any upstream call.
@@ -42,12 +42,42 @@ All notable changes to LUMEN are documented here. The format is based on
   `0003`). Measured uniformly whether the image was a client `data:` URI or
   gateway-fetched.
 
-### Added — OpenAI-compatible provider kinds
+### Added - Vision (image input to chat)
+
+- `POST /v1/chat/completions` accepts OpenAI's content-parts message shape
+  (`content` as a string *or* an array of `{"type":"text"|"image_url",...}`
+  parts); unknown future part types (e.g. `input_audio`) survive round-trip
+  verbatim rather than erroring. `MessageContent`/`ContentPart`/`ImageUrl` land
+  in `crates/core/src/chat.rs`.
+- Per-model opt-in: `modalities = ["text", "image"]` in `[[providers.models]]`
+  (default `["text"]`), surfaced in `GET /v1/models`. An image part sent to a
+  model that hasn't opted in is rejected with the new `LM-2003` (400) before
+  any upstream call.
+- **Provider translation:** OpenAI-family kinds (+ `vllm`) forward image parts
+  verbatim; **Anthropic** translates `image_url` to `image` source blocks
+  (base64 or `url`, both directions); **Gemini** translates to `inline_data`
+  (base64 only) - a remote image URL routed to Gemini is rejected with the new
+  `LM-2004` (400) rather than the gateway fetching it itself. LUMEN never
+  dereferences a user-supplied image URL (SSRF-safety + the latency pillar);
+  only providers that fetch remote URLs themselves (OpenAI, Anthropic) may
+  receive one.
+- **Accounting** (ADR 003 addendum): upstream-reported `usage` already folds in
+  image tokens and is trusted as-is; the local estimation fallback counts text
+  only (`MessageContent::text()`), so an image part contributes `0` to an
+  estimate - the response is still honestly flagged `"estimated": true`, never
+  a silent zero. A per-image token heuristic is deferred (`docs/backlog.md`).
+- `LM-1002` request-body-size envelope (previously a raw 413) now wraps every
+  route, including chat - base64-inlined images can be large.
+- Docs: `docs/errors.md` (`LM-2003`/`LM-2004`), a new "Vision (image input)"
+  section in `docs/providers.md`, README capability note, and a commented
+  `modalities` example in `config.example.toml`.
+
+### Added - OpenAI-compatible provider kinds
 
 - Eleven new `kind`s served by the OpenAI provider with a per-kind base URL:
   `groq`, `together`, `fireworks`, `deepseek`, `openrouter`, `perplexity`,
   `xai`, `deepinfra`, `huggingface` (the HF Inference router), `cloudflare`
-  (Workers AI — `base_url` carries the account id, so it is required), and
+  (Workers AI - `base_url` carries the account id, so it is required), and
   `vllm` (any self-hosted OpenAI-compatible server; `base_url` required, API key
   optional). All serve chat + embeddings. `ProviderKind` gains
   `default_base_url()` and `is_openai_compatible()`; a missing URL for the two
@@ -55,16 +85,16 @@ All notable changes to LUMEN are documented here. The format is based on
   api.openai.com. Docs (`docs/providers.md`, README matrix) and registry +
   server wiring tests included.
 
-## [0.1.0] — 2026-07-13
+## [0.1.0] - 2026-07-13
 
 First tagged release. LUMEN is a universal, self-hostable LLM gateway in
-Rust — chat, embeddings and reranking as first-class capabilities behind one
+Rust - chat, embeddings and reranking as first-class capabilities behind one
 OpenAI/Cohere-compatible surface, with a measured **~3 µs** added CPU per
 request off-network, **~8.8 MB** idle RAM, hard budgets, end-to-end
-cancellation, and zero telemetry. See the milestone entries below (M1–M7) for
-the full feature history.
+cancellation, and zero telemetry. See the entries below for the full feature
+history.
 
-### Added — M7: release (hot reload, packaging, security, benchmarks)
+### Added - Release (hot reload, packaging, security, benchmarks)
 
 - **Config hot reload** (§7.3): `SIGHUP` or a config-file change re-validates and
   atomically swaps the provider routing table via the registry's ArcSwap;
@@ -89,19 +119,19 @@ the full feature history.
 - **New metrics**: `lumen_config_reloads_total`,
   `lumen_config_reload_failures_total`.
 
-### Added — M6: résilience (retries, fallback, circuit breaker, timeouts, health)
+### Added - Resilience (retries, fallback, circuit breaker, timeouts, health)
 
-**M6 is complete.** The gateway now survives flaky upstreams without becoming
+The gateway now survives flaky upstreams without becoming
 flaky itself: retries, multi-provider fallback, a per-provider circuit breaker,
-per-phase timeouts and optional background health checks — none of it on a
+per-phase timeouts and optional background health checks - none of it on a
 database path, and `/health` stays independent of provider health (the LiteLLM
 #15526 lesson: a 429 storm must not destabilise the gateway).
 
 - **Retries** (`[resilience]`): retryable upstream failures only (5xx,
-  connect/read timeout, 429 — *never* a client 4xx) with exponential backoff +
+  connect/read timeout, 429 - *never* a client 4xx) with exponential backoff +
   equal jitter (`retry_base_ms` 200, `retry_max_ms` 5000, `retry_max_attempts`
   3), honouring an upstream `Retry-After` as a floor. The backoff maths are a
-  pure, unit-tested function fed a lock-free splitmix64 fraction — no
+  pure, unit-tested function fed a lock-free splitmix64 fraction - no
   dependency, no blocking, no clock read on the hot path.
 - **Fallback chains** (§6.2): per-model `fallbacks = ["model-b", …]`, tried in
   order once the primary's retries are spent or its circuit is open. Each
@@ -116,12 +146,12 @@ database path, and `/health` stays independent of provider health (the LiteLLM
   `lumen_circuit_state{provider,model}` (0/1/2). Open with no fallback left
   → 503 `LM-3020` with `Retry-After`.
 - **Timeouts** (§6.4): `connect_timeout_ms` (5000, client-wide → `LM-3012`),
-  `first_token` (the M4 `server.first_token_timeout_ms`, 30 000 → `LM-3011`) and
+  `first_token` (the `server.first_token_timeout_ms`, 30 000 → `LM-3011`) and
   `total_timeout_ms` (600 000 → `LM-3013`), each a distinct code. `first_token`
   and `total` are overridable per provider; `connect` is client-wide (one
   pooled HTTP client). All bounded by the executor's absolute total deadline.
 - **Streaming stays committed once it starts**: retry/fallback happen only while
-  *opening* the upstream byte stream; after the first frame the M4 guards
+  *opening* the upstream byte stream; after the first frame the stream guards
   (LM-3010/3011, heartbeat) own the stream and never retry.
 - **Background health checks** (§6.5, `health_check_enabled` off by default):
   a periodic probe of every provider with a configured `base_url` fills
@@ -134,47 +164,47 @@ database path, and `/health` stays independent of provider health (the LiteLLM
   capability-specific resolution, breaker placement, streaming boundary, the
   connect-per-provider and first-frame-peek simplifications deferred).
 
-### Added — M5: auth, virtual keys, hard budgets & token accounting
+### Added - Auth, virtual keys, hard budgets & token accounting
 
-**M5 is complete.** The gateway can now be shared safely: keys, budgets that
+The gateway can now be shared safely: keys, budgets that
 can NEVER be overrun, and a token count for every single request.
 
 - **Virtual keys** (`[auth]`, off by default): `fg-` + 32 random bytes,
-  stored as a BLAKE3 hash only (the keys are 256-bit random — a password KDF
+  stored as a BLAKE3 hash only (the keys are 256-bit random - a password KDF
   would just burn hot-path CPU). Auth on all of `/v1/*`; unknown, disabled
   and expired keys are one indistinguishable `LM-4004` (401). `/health` and
   `/metrics` stay open.
-- **Hard budgets, enforced in memory** (M5 §5.2): the pre-call cost estimate
+- **Hard budgets, enforced in memory** (§5.2): the pre-call cost estimate
   is *reserved* with an atomic CAS before the upstream call and settled to
-  the real usage after it — 50 concurrent requests against a budget for 10
+  the real usage after it - 50 concurrent requests against a budget for 10
   admit exactly 10 (tested at both the atomic and the HTTP level). Refusals
   happen BEFORE any upstream traffic: 402 `LM-4001` (budget), 429 `LM-4002`
   (RPM) / `LM-4003` (TPM, with `Retry-After`). The DB is never consulted on
-  the request path; budgets flush to SQLite periodically (default 10 s — a
+  the request path; budgets flush to SQLite periodically (default 10 s - a
   crash loses at most that much *accounting*, never allows an overrun) and
   reload at boot, so an exhausted key stays exhausted across restarts.
 - **Token accounting always on** (ADR 003): every chat/embed/rerank call
-  yields a count — upstream usage when reported (`estimated=false`), else a
+  yields a count - upstream usage when reported (`estimated=false`), else a
   byte-heuristic estimate flagged `estimated: true` in the response body, in
   `lumen_tokens_total{capability,model,provider,direction,estimated}`
   and in `usage_log`. TEI's report-nothing embeddings now count > 0.
   Streaming chat sniffs the final usage chunk with bounded state (no
   response accumulation); rerank counts search units (upstream-billed or
   derived, never silently zero). The opt-in accurate tokenizer stays in the
-  backlog — only the O(bytes) heuristic runs, inline and hot-path-safe.
+  backlog - only the O(bytes) heuristic runs, inline and hot-path-safe.
 - **Cost counting** (§5.4b): per-model prices in config (`cost_per_1m_input`,
   `cost_per_1m_output`, `cost_per_1k_searches`) feed both the budget
   reservation and the `usage_log.cost` column. Unpriced models cost 0.
 - **Async usage log** (§5.3): bounded mpsc (default 10 000) → batched writer
   (500 entries / 2 s); a full channel drops the entry and bumps
-  `lumen_usage_log_dropped_total` — the request path NEVER blocks on
+  `lumen_usage_log_dropped_total` - the request path NEVER blocks on
   logging. Background retention purge (default 30 days). No prompt/response
   content is ever stored.
 - **Request metadata** (ADR 002): `x-lumen-metadata` (alias
   `cf-aig-metadata`), a flat JSON object bounded at 16 keys / 64 B keys /
   256 B values / 4 KiB, parsed once at the edge. Full object → structured
   logs + `usage_log.metadata`; ONLY `telemetry.metadata_labels` allowlist
-  keys become Prometheus labels (default empty — client metadata can never
+  keys become Prometheus labels (default empty - client metadata can never
   mint a time series). Malformed metadata never fails the request: dropped
   with a warn + `lumen_metadata_rejected_total`.
 - **Admin API** (§5.5), mounted only when auth is on and gated by
@@ -187,15 +217,15 @@ can NEVER be overrun, and a token count for every single request.
 
 ### Changed
 
-- **LM-4xxx codes realigned to the M5 spec** (they were placeholders, never
+- **LM-4xxx codes realigned to the spec** (they were placeholders, never
   emitted): `LM-4001` = budget exhausted (402), `LM-4002` = RPM (429),
   `LM-4003` = TPM (429), `LM-4004` = missing/invalid key (401).
 - `Usage`, `EmbedUsage` and `RerankUsage` gained an optional `estimated`
   field, omitted unless the gateway estimated the counts (ADR 003).
 
-### Added — M4 (final slice): streaming translation, tools, and stream guards
+### Added - Streaming translation, tools, and stream guards
 
-**M4 is complete.** This slice closes every remaining criterion:
+This closes every remaining streaming criterion:
 
 - **Incremental SSE parser** (`providers::sse`): reassembles upstream events
   fragmented across TCP packets (LF and CRLF, multi-line `data:`, comments
@@ -204,7 +234,7 @@ can NEVER be overrun, and a token count for every single request.
   `content_block_start/delta`, `message_delta`, `message_stop`) → OpenAI
   chunks, including streamed **tool_use** (`input_json_delta` → `tool_calls`
   argument deltas, OpenAI indices allocated in order of appearance). Bounded
-  state — the response text is never accumulated. In-stream `error` events
+  state - the response text is never accumulated. In-stream `error` events
   propagate only the upstream error *type*, never message bodies.
 - **Anthropic tools, both directions** (criterion 3): OpenAI `tools` →
   Anthropic `tools` (+ `tool_choice` mapping), assistant `tool_calls` →
@@ -218,37 +248,37 @@ can NEVER be overrun, and a token count for every single request.
   - *first-token timeout* (`first_token_timeout_ms`, default 30 s) → LM-3011:
     a plain 504 when the upstream never answered, an SSE error frame when the
     stream had started; non-streaming applies the window to the whole upstream
-    call (per-phase timeouts land in M6);
+    call (per-phase timeouts come later);
   - *missing terminator* → LM-3010 error frame when the upstream dies without
-    `data: [DONE]` (criterion 5) — detection survives a `[DONE]` split across
+    `data: [DONE]` (criterion 5) - detection survives a `[DONE]` split across
     frame boundaries; the gateway never fabricates the terminator itself;
   - *heartbeat* (`sse_heartbeat_ms`, default 15 s): `: ping` comments on idle
     streams so proxies don't reap slow upstreams.
 - **Streaming usage (ADR 003), upstream half**: passthrough requests
   `stream_options.include_usage`; translated providers emit full usage in the
-  final chunk. The local-estimation fallback (`estimated=true`) moves to M5
+  final chunk. The local-estimation fallback (`estimated=true`) lands later
   with the Prometheus counters and `usage_log`.
 
-### Added — M4 (slice 3, partial): Google Gemini + Mistral embeddings
+### Added - Google Gemini + Mistral embeddings
 
 - **Google Gemini** chat provider (non-streaming) with bidirectional
   translation: OpenAI messages → `contents` (assistant→`model`, system hoisted
   to `systemInstruction`), params → `generationConfig`, response `candidates`/
   `finishReason`/`usageMetadata` → OpenAI shape. Auth via `x-goog-api-key`
   header; the model rides in the URL path, the key never does.
-- **Mistral embeddings** (`EmbeddingProvider`, OpenAI-compatible passthrough) —
+- **Mistral embeddings** (`EmbeddingProvider`, OpenAI-compatible passthrough) -
   Mistral now serves both chat and embeddings; added to the embeddings
   conformance suite.
 
-  *Still remaining to complete M4:* Anthropic + Gemini streaming-event
+  *Still remaining:* Anthropic + Gemini streaming-event
   translation (criterion 4), first-token timeout LM-3011 (criterion 6),
   upstream-closes-without-`[DONE]` → LM-3010 (criterion 5), SSE heartbeat, and
   streaming token estimation (ADR 003).
 
-### Added — M4 (slice 2): zero-copy SSE streaming
+### Added - Zero-copy SSE streaming
 
 - Real incremental streaming for `stream=true`: the gateway forwards the
-  upstream SSE bytes **verbatim** — no per-chunk `serde` round trip (ADR 004).
+  upstream SSE bytes **verbatim** - no per-chunk `serde` round trip (ADR 004).
   New `ChatProvider::chat_stream_bytes` (default serializes the typed
   `chat_stream`; OpenAI/Mistral override it to pipe `reqwest`'s `bytes_stream`
   via the shared `http::open_stream`). The server writes a raw `Bytes` body
@@ -257,11 +287,11 @@ can NEVER be overrun, and a token count for every single request.
   Proven byte-identical over 100 chunks; `stream_options.include_usage` is
   requested automatically without overriding a client's choice.
 
-  *Still deferred to slice 3:* Anthropic streaming-event translation, Google
+  *Still deferred:* Anthropic streaming-event translation, Google
   Gemini, Mistral embeddings, first-token timeout (LM-3011), SSE heartbeat, and
   streaming token sniffing/estimation (ADR 003).
 
-### Added — M4 (slice 1): chat completions (non-streaming)
+### Added - Chat completions (non-streaming)
 
 - `POST /v1/chat/completions`: non-streaming JSON end to end (validate → route →
   provider → OpenAI-shaped response), and a functional streaming SSE path
@@ -278,7 +308,7 @@ can NEVER be overrun, and a token count for every single request.
 - Reserved streaming error codes `LM-3010` (upstream stream interrupted, 502)
   and `LM-3011` (first-token timeout, 504) in the taxonomy and `docs/errors.md`.
 
-  *Deferred to the M4 streaming slice:* zero-copy incremental SSE passthrough,
+  *Deferred to the streaming work:* zero-copy incremental SSE passthrough,
   Anthropic streaming-event translation, Google Gemini, Mistral embeddings, the
   first-token timeout, and streaming token estimation (ADR 003).
 
@@ -287,11 +317,11 @@ can NEVER be overrun, and a token count for every single request.
 - `http::post_json` gained a header-based sibling `post_json_with_headers` (for
   Anthropic's non-bearer auth); the two share one send/classify core.
 
-### Added — M3: reranking & model discovery
+### Added - Reranking & model discovery
 
 - `POST /v1/rerank` (Cohere wire format): `documents` accept bare strings or
   `{ "text": ... }` objects; the gateway guarantees the client-facing invariants
-  regardless of upstream behaviour — results sorted by descending
+  regardless of upstream behaviour - results sorted by descending
   `relevance_score`, `top_n` clamped to the document count then truncated,
   `document` echoed only when `return_documents` is set (off by default). Empty
   `documents` is rejected with `LM-2010` (400) before any upstream call.
@@ -300,7 +330,7 @@ can NEVER be overrun, and a token count for every single request.
   (OpenAI-compatible embed, Cohere-shaped rerank), **TEI** (self-hosted, keyless,
   bare-array `/embed` and `/rerank`), and **Voyage** (`top_k`/`data[]` rerank).
 - A generic **rerank conformance suite** all four providers pass identically
-  (ordering, 429/`Retry-After`, 5xx, malformed response, cancellation) — the
+  (ordering, 429/`Retry-After`, 5xx, malformed response, cancellation) - the
   rerank counterpart of the embeddings harness.
 - `GET /v1/models`: OpenAI-shaped list extended with a `capabilities` array,
   reflecting only the operator's configuration (no upstream introspection); a
@@ -313,16 +343,16 @@ can NEVER be overrun, and a token count for every single request.
 
 - Adopted a session-start dependency-freshness step (`rustup update` +
   `cargo outdated`); documented in the work loop. Toolchain moved to Rust
-  **1.97.0** (from 1.95.0) — clippy pedantic and the full suite stay green.
+  **1.97.0** (from 1.95.0) - clippy pedantic and the full suite stay green.
 - Planned a Cloudflare-style per-request metadata header
   (`x-lumen-metadata`) for logs, `usage_log` and cardinality-bounded
-  Prometheus labels — design in ADR 002, tasks folded into the M5 spec.
+  Prometheus labels - design in ADR 002, tasks folded into a later change.
 - Elevated **token accounting** to a first-class, always-on promise: every
   request of every capability yields a token count (upstream usage when present,
-  else a labelled local estimate — never a silent zero, e.g. TEI), surfaced in
+  else a labelled local estimate - never a silent zero, e.g. TEI), surfaced in
   the response, Prometheus counters and `usage_log`. Design in ADR 003; tasks
-  threaded through M4 (streaming extraction) and M5 (counters, estimation,
-  storage), and added to the mission pillars and ROADMAP.
+  threaded through the streaming work (extraction) and the auth/budgets work
+  (counters, estimation, storage), and added to the mission pillars and ROADMAP.
 
 ### Changed
 
@@ -332,7 +362,7 @@ can NEVER be overrun, and a token count for every single request.
 - Added `LM-2010` (empty rerank `documents`, 400) to the taxonomy and
   `docs/errors.md`, and a `Voyage` variant to `ProviderKind`.
 
-### Added — M2: embeddings (first complete request path)
+### Added - Embeddings (first complete request path)
 
 - `POST /v1/embeddings` end to end (OpenAI wire format): validate → route →
   provider → response, with the client model id resolved to its upstream alias.
@@ -340,8 +370,8 @@ can NEVER be overrun, and a token count for every single request.
   provider, both driven by a shared, pooled rustls HTTP client.
 - A generic embeddings **conformance suite** that both providers pass
   identically (nominal, batching-in-order, 429/`Retry-After`, 5xx, malformed
-  response, cancellation) — the reusable harness every future provider must pass.
-- Provider **registry** behind `ArcSwap` (ready for M7 hot reload) that builds
+  response, cancellation) - the reusable harness every future provider must pass.
+- Provider **registry** behind `ArcSwap` (ready for hot reload) that builds
   instances from config-derived specs and resolves `(capability, model)`; the
   **router** turns misses into `LM-2001` (unknown model, 404) or `LM-2002`
   (capability mismatch, 400).
@@ -353,7 +383,7 @@ can NEVER be overrun, and a token count for every single request.
 
 ### Changed
 
-- Error taxonomy realigned to the codes pinned by the M2 spec: `1xxx` request,
+- Error taxonomy realigned to the codes pinned by the spec: `1xxx` request,
   `2xxx` routing (`LM-2001`/`LM-2002`), `3xxx` upstream (`LM-3001` rate-limited,
   `LM-3002` malformed-response → 502, plus generic/unavailable/timeout), `4xxx`
   auth/budget, `5xxx` internal. Added a `ProviderError::Unavailable` variant for
@@ -361,7 +391,7 @@ can NEVER be overrun, and a token count for every single request.
 - `ProviderKind` moved from the server config into the `providers` crate (it is
   the registry's construction discriminant); crate package names stay bare.
 
-### Added — M1: skeleton & foundations
+### Added - Skeleton & foundations
 
 - Cargo workspace with six crates (`core`, `providers`, `router`, `auth`,
   `telemetry`, `server`), release profile tuned for a small, fast binary
@@ -375,7 +405,7 @@ can NEVER be overrun, and a token count for every single request.
   JSON error envelope.
 - `telemetry`: a Prometheus registry wrapper and structured-logging setup.
 - `server`: axum binary with `GET /health` (no I/O, always 200 while alive) and
-  `GET /metrics`; per-request `x-request-id`, tracing spans (metadata only —
+  `GET /metrics`; per-request `x-request-id`, tracing spans (metadata only -
   never body or query string), and a configurable body-size limit; bounded
   graceful shutdown on SIGINT/SIGTERM (30 s drain).
 - Configuration via figment (TOML + `LUMEN_*` env overrides) with

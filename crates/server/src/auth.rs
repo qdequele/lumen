@@ -1,7 +1,7 @@
 //! Virtual-key authentication for the `/v1` surface (M5 §5.2).
 //!
 //! The middleware resolves the presented bearer key against the in-memory
-//! [`AuthState`] — a hash lookup, no database — and stores the live
+//! [`AuthState`] - a hash lookup, no database - and stores the live
 //! [`KeyEntry`] in request extensions for the handlers' budget/quota
 //! admission. Unknown, disabled and expired keys are indistinguishable to the
 //! caller (LM-4004, 401). When auth is disabled in config the middleware is a
@@ -22,7 +22,7 @@ use std::sync::Arc;
 pub struct AuthRuntime {
     /// The in-memory key table the request path enforces against.
     pub keys: AuthState,
-    /// The SQLite store (admin API, flushes, usage log) — never consulted on
+    /// The SQLite store (admin API, flushes, usage log) - never consulted on
     /// the request path.
     pub store: KeyStore,
     /// BLAKE3 hash of the `LUMEN_MASTER_KEY` value; the admin API

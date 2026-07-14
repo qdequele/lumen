@@ -35,6 +35,29 @@ jobs:
       - name: Tests
         run: cargo test --workspace
 
+  no-em-dashes:
+    name: no em-dashes
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      # Reject the U+2014 em-dash in tracked text. House style: use hyphens,
+      # commas, colons, parentheses, or restructure. Cargo.lock and LICENSE
+      # are excluded (generated / legal text we do not edit).
+      - name: Reject em-dashes
+        run: |
+          hits=$(git ls-files -- '*.md' '*.rs' '*.toml' '*.yml' '*.yaml' '*.txt' \
+            ':!Cargo.lock' ':!LICENSE' \
+            | xargs -r perl -CSD -ne 'print "$ARGV:$.: $_" if /\x{2014}/; close ARGV if eof;')
+          if [ -n "$hits" ]; then
+            echo "::error::Em-dashes (U+2014) are not allowed. Use hyphens, commas, colons, or restructure." >&2
+            printf '%s\n' "$hits" >&2
+            exit 1
+          fi
+          echo "No em-dashes found."
+
   supply-chain:
     name: audit · deny
     runs-on: ubuntu-latest
@@ -47,7 +70,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Advisory database check (RUSTSEC) — fails on known vulnerabilities.
+      # Advisory database check (RUSTSEC) - fails on known vulnerabilities.
       # Ignored advisories are transitive and not exploitable here; the
       # rationale lives in deny.toml (kept in sync).
       - name: cargo audit

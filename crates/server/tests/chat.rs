@@ -11,13 +11,37 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
+use figment::{
+    providers::{Format, Toml},
+    Figment,
+};
 use lumen_core::Capability;
 use lumen_providers::{http, ModelSpec, ProviderKind, ProviderSpec, Registry};
+use lumen_server::config::Config;
 use serde_json::{json, Value};
 use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const LIMIT: usize = 10 * 1024 * 1024;
+
+/// Parse a TOML snippet into a full [`Config`] (defaults fill the rest).
+fn config_from(toml: &str) -> Config {
+    Figment::new()
+        .merge(Toml::string(toml))
+        .extract::<Config>()
+        .expect("valid test config")
+}
+
+/// Spawn the full app from a config. `spawn_state` applies
+/// `config.server.body_limit` onto the state (for the `LM-1002` message) and
+/// into the body-size-limit layer from the same value.
+async fn spawn(config: &Config) -> String {
+    let registry = Arc::new(
+        Registry::build(config.provider_specs(), http::build_client()).expect("registry builds"),
+    );
+    let state = common::base_state(registry);
+    common::spawn_state(state, config.server.body_limit).await
+}
 
 /// One OpenAI-kind provider (chat + an embed-only model) pointed at `upstream`.
 fn openai_registry(upstream: &str) -> Arc<Registry> {
@@ -31,13 +55,13 @@ fn openai_registry(upstream: &str) -> Arc<Registry> {
                 id: "gpt".to_owned(),
                 upstream_id: "gpt-4o-2024-08-06".to_owned(),
                 capabilities: vec![Capability::Chat],
-                modalities: Vec::new(),
+                modalities: vec!["text".to_owned()],
             },
             ModelSpec {
                 id: "embed-only".to_owned(),
                 upstream_id: "text-embedding-3-small".to_owned(),
                 capabilities: vec![Capability::Embed],
-                modalities: Vec::new(),
+                modalities: vec!["text".to_owned()],
             },
         ],
     }];
@@ -54,7 +78,7 @@ fn anthropic_registry(upstream: &str) -> Arc<Registry> {
             id: "claude".to_owned(),
             upstream_id: "claude-3-5-sonnet".to_owned(),
             capabilities: vec![Capability::Chat],
-            modalities: Vec::new(),
+            modalities: vec!["text".to_owned()],
         }],
     }];
     Arc::new(Registry::build(specs, http::build_client()).expect("registry builds"))
@@ -70,7 +94,7 @@ fn google_registry(upstream: &str) -> Arc<Registry> {
             id: "gemini".to_owned(),
             upstream_id: "gemini-2.0-flash".to_owned(),
             capabilities: vec![Capability::Chat],
-            modalities: Vec::new(),
+            modalities: vec!["text".to_owned()],
         }],
     }];
     Arc::new(Registry::build(specs, http::build_client()).expect("registry builds"))
@@ -94,7 +118,7 @@ fn openai_chat_body(model: &str) -> Value {
 #[tokio::test]
 async fn openai_compatible_kind_routes_through_the_openai_path() {
     // A new OpenAI-compatible kind (Groq) pointed at a mock via base_url must
-    // route exactly like the OpenAI kind — proving the shared provider wiring.
+    // route exactly like the OpenAI kind - proving the shared provider wiring.
     let upstream = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
@@ -111,7 +135,7 @@ async fn openai_compatible_kind_routes_through_the_openai_path() {
             id: "fast".to_owned(),
             upstream_id: "llama-3.3-70b".to_owned(),
             capabilities: vec![Capability::Chat],
-            modalities: Vec::new(),
+            modalities: vec!["text".to_owned()],
         }],
     }];
     let registry = Arc::new(Registry::build(specs, http::build_client()).expect("registry builds"));
@@ -197,6 +221,109 @@ async fn embed_only_model_requested_for_chat_is_400_fg2002() {
     assert_eq!(resp.status(), 400);
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["error"]["code"], "LM-2002");
+}
+
+#[tokio::test]
+async fn image_to_a_non_vision_model_is_rejected_with_lm_2003() {
+    // Upstream must never be called; mount nothing that would 200.
+    let upstream = MockServer::start().await;
+    // "gpt" declares default modalities (text only, see openai_registry), so
+    // an image content part is rejected pre-flight.
+    let base = common::spawn_with(openai_registry(&upstream.uri()), LIMIT).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&json!({
+            "model": "gpt",
+            "messages": [{"role":"user","content":[
+                {"type":"text","text":"hi"},
+                {"type":"image_url","image_url":{"url":"https://example.com/x.png"}}
+            ]}]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 400);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "LM-2003");
+    // The upstream was never contacted.
+    assert!(upstream.received_requests().await.unwrap().is_empty());
+}
+
+/// OpenAI-family conformance: a model declared vision-capable (`modalities`
+/// includes `"image"`) forwards the OpenAI content-parts array to the
+/// upstream byte-for-byte (no re-shaping), and - since this mock upstream
+/// reports no `usage` at all - the response still carries a non-zero,
+/// honestly-labelled `estimated` token count rather than a silent zero
+/// (ADR 003 §8: the text-only estimation fallback still fires for a vision
+/// request; only the image part contributes 0).
+#[tokio::test]
+async fn openai_family_forwards_image_parts_verbatim() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "c", "object": "chat.completion", "created": 0, "model": "gpt",
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": "a cat" },
+                "finish_reason": "stop"
+            }]
+            // Deliberately no "usage" - exercises the estimation fallback.
+        })))
+        .mount(&upstream)
+        .await;
+
+    let cfg = format!(
+        r#"
+        [[providers]]
+        name = "openai"
+        kind = "openai"
+        base_url = "{}"
+        [[providers.models]]
+        id = "gpt"
+        capabilities = ["chat"]
+        modalities = ["text", "image"]
+        "#,
+        upstream.uri()
+    );
+    let base = spawn(&config_from(&cfg)).await;
+
+    let body = json!({
+        "model": "gpt",
+        "messages": [{"role":"user","content":[
+            {"type":"text","text":"what is this?"},
+            {"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}
+        ]}]
+    });
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // The upstream received the image part unchanged - no stripping, no
+    // reshaping of the content-parts array.
+    let reqs = upstream.received_requests().await.unwrap();
+    let sent: Value = serde_json::from_slice(&reqs[0].body).unwrap();
+    assert_eq!(
+        sent["messages"][0]["content"][1]["image_url"]["url"],
+        "data:image/png;base64,AAAA"
+    );
+    assert_eq!(sent["messages"][0]["content"][0]["text"], "what is this?");
+
+    // No upstream usage → the local estimator ran, flagged honestly, never a
+    // silent zero. The image part contributes 0 to the estimate (ADR 003
+    // addendum): "what is this?" (13 bytes) => 4 text tokens + the 4-token
+    // per-message overhead = 8, exactly what a text-only message would
+    // yield - pinning this value proves the image part is NOT silently
+    // double- or mis-counted, not merely that the count is positive.
+    let got: Value = resp.json().await.unwrap();
+    assert_eq!(got["usage"]["estimated"], true);
+    assert_eq!(got["usage"]["prompt_tokens"], 8);
 }
 
 #[tokio::test]
@@ -740,7 +867,7 @@ async fn gemini_streaming_translates_fragments_to_openai_chunks() {
 #[tokio::test]
 async fn upstream_stream_without_done_yields_fg3010_error_frame() {
     let upstream = MockServer::start().await;
-    // Two valid chunks, then the body just ends — no `data: [DONE]`.
+    // Two valid chunks, then the body just ends - no `data: [DONE]`.
     let truncated: String = upstream_sse_body(2)
         .strip_suffix("data: [DONE]\n\n")
         .unwrap()
@@ -771,7 +898,7 @@ async fn upstream_stream_without_done_yields_fg3010_error_frame() {
     let text = resp.text().await.unwrap();
 
     // Both real chunks were forwarded, then a terminal LM-3010 error frame
-    // (criterion 5) — and the stream ended cleanly, no hang.
+    // (criterion 5) - and the stream ended cleanly, no hang.
     assert_eq!(text.matches("chat.completion.chunk").count(), 2);
     assert!(!text.contains("data: [DONE]"));
     let frames = sse_data_frames(&text);
@@ -848,4 +975,58 @@ async fn first_token_timeout_streaming_before_headers_is_504_fg3011() {
     assert_eq!(resp.status(), 504);
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["error"]["code"], "LM-3011");
+}
+
+#[tokio::test]
+async fn oversized_body_returns_lm_1002_envelope() {
+    let upstream = wiremock::MockServer::start().await;
+    let cfg = format!(
+        r#"
+        [server]
+        body_limit = 256
+
+        [[providers]]
+        name = "openai"
+        kind = "openai"
+        base_url = "{}"
+        [[providers.models]]
+        id = "gpt"
+        capabilities = ["chat"]
+        "#,
+        upstream.uri()
+    );
+    let base = spawn(&config_from(&cfg)).await;
+
+    let big = "x".repeat(4096);
+    let body = serde_json::json!({ "model": "gpt", "messages": [{"role":"user","content": big}] });
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 413);
+    let json: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(json["error"]["code"], "LM-1002");
+}
+
+/// A syntactically-invalid but under-limit body must still map to `LM-1001`
+/// (400) - the `LM-1002` middleware only rewrites bare `413`s, so this must
+/// not regress.
+#[tokio::test]
+async fn malformed_json_body_is_still_lm_1001() {
+    let upstream = MockServer::start().await;
+    let base = common::spawn_with(openai_registry(&upstream.uri()), LIMIT).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .header("content-type", "application/json")
+        .body("{ not valid json")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 400);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "LM-1001");
 }

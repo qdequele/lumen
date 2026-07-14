@@ -30,7 +30,7 @@ pub async fn embed_batched(
     }
 
     // Consume the request, MOVING the input items into sub-batches rather
-    // than cloning them (the payload can be large — pillar 1: no avoidable
+    // than cloning them (the payload can be large - pillar 1: no avoidable
     // copies on the request path). Request-level options are small and cloned.
     let EmbedRequest {
         model,

@@ -211,7 +211,7 @@ async fn too_many_remote_images_is_rejected_before_fetching() {
         .mount(&host)
         .await;
 
-    // 33 remote image parts — over the per-request cap (32).
+    // 33 remote image parts - over the per-request cap (32).
     let parts: Vec<ContentPart> = (0..33)
         .map(|i| ContentPart {
             kind: "image_url".to_owned(),

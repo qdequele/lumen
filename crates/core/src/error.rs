@@ -2,8 +2,8 @@
 //!
 //! Two layers:
 //!
-//! * [`ProviderError`] — what a provider returns. Never contains secrets.
-//! * [`GatewayError`] — what the gateway returns to the client. Carries a
+//! * [`ProviderError`] - what a provider returns. Never contains secrets.
+//! * [`GatewayError`] - what the gateway returns to the client. Carries a
 //!   stable `LM-XXXX` code (documented in `docs/errors.md`), an HTTP status,
 //!   and a coarse [`ErrorType`].
 //!
@@ -37,7 +37,7 @@ pub enum ProviderError {
     Timeout { provider: String },
 
     /// The gateway could not establish a connection to the upstream within the
-    /// connect timeout — the TCP/TLS handshake never completed. Distinct from a
+    /// connect timeout - the TCP/TLS handshake never completed. Distinct from a
     /// read timeout so operators can tell a dead host from a slow one (LM-3012).
     #[error("provider '{provider}' connection timed out")]
     ConnectTimeout { provider: String },
@@ -50,7 +50,7 @@ pub enum ProviderError {
     FirstTokenTimeout { provider: String },
 
     /// The upstream could not be reached at all (DNS failure, connection
-    /// refused, TLS error) — distinct from an HTTP error status.
+    /// refused, TLS error) - distinct from an HTTP error status.
     #[error("provider '{provider}' is unreachable")]
     Unavailable { provider: String },
 
@@ -75,7 +75,7 @@ impl ProviderError {
     /// Whether retrying this call (on the same provider, or a fallback) may
     /// succeed. Retryable: 5xx upstream, connect/read timeouts, unreachable
     /// host, 429. Never retryable: a client-fault 4xx, a schema/translation
-    /// error (deterministic), or a cancellation (M6 §6.1 — never retry 4xx).
+    /// error (deterministic), or a cancellation (M6 §6.1 - never retry 4xx).
     #[must_use]
     pub const fn is_retryable(&self) -> bool {
         match self {
@@ -116,7 +116,7 @@ impl ProviderError {
 }
 
 /// Which gateway-side per-key quota tripped (distinct stable codes: RPM is
-/// `LM-4002`, TPM is `LM-4003` — pinned by the M5 spec).
+/// `LM-4002`, TPM is `LM-4003` - pinned by the M5 spec).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuotaKind {
     /// Requests per minute.
@@ -174,27 +174,33 @@ pub enum GatewayError {
     #[error("`documents` must not be empty")]
     EmptyDocuments,
 
-    /// Image input was sent to a model whose declared `modalities` do not
-    /// include `"image"` (M9). Fail-fast before any upstream call.
+    /// An image content part was sent to a model whose declared `modalities`
+    /// do not include `"image"`. Rejected before any upstream call. Shared by
+    /// chat vision (M8) and multimodal embeddings (M9).
     #[error("model '{model}' does not accept image input")]
-    ImageModelUnsupported { model: String },
+    ImageInputNotSupported { model: String },
 
-    /// A remote image URL was supplied but server-side image fetching is
-    /// disabled (M9). The operator must enable `[image_fetch]` or the client
-    /// must inline the image as a `data:` URI.
+    /// The resolved provider only accepts inline base64 image data; a remote
+    /// image URL was supplied (Gemini). The gateway never fetches the URL.
+    #[error("provider '{provider}' requires inline base64 image data; remote image URLs are not supported")]
+    ImageUrlNotSupported { provider: String },
+
+    /// A remote image URL was supplied to `/v1/embeddings` but server-side image
+    /// fetching is disabled (M9). The operator must enable `[image_fetch]` or
+    /// the client must inline the image as a `data:` URI.
     #[error("remote image fetching is disabled; inline the image as a data: URI")]
     ImageFetchDisabled,
 
     /// A remote image URL was rejected by a fetch guard (scheme, host/prefix
     /// allowlist, private-IP block, size cap, non-image content type, or the
-    /// per-request image count cap). The reason may be logged server-side at
-    /// `debug`, but is never returned — it must not leak internal network
+    /// per-request image count cap) (M9). The reason may be logged server-side
+    /// at `debug`, but is never returned: it must not leak internal network
     /// topology.
     #[error("image URL rejected by fetch policy")]
     ImageUrlRejected,
 
     /// A permitted image fetch failed at the remote host (network error,
-    /// timeout, or error status). The remote host's fault → 502.
+    /// timeout, or error status) (M9). The remote host's fault, so 502.
     #[error("failed to fetch a remote image")]
     ImageFetchFailed,
 
@@ -207,7 +213,7 @@ pub enum GatewayError {
     },
 
     /// An upstream provider returned a response the gateway could not parse
-    /// (malformed / schema mismatch). The upstream's fault, so 502 — never 500.
+    /// (malformed / schema mismatch). The upstream's fault, so 502 - never 500.
     #[error("upstream provider '{provider}' returned an unparseable response")]
     UpstreamInvalidResponse { provider: String },
 
@@ -265,7 +271,7 @@ pub enum GatewayError {
     },
 
     /// Missing or invalid virtual key. Deliberately does not say *why* the
-    /// key is invalid (unknown / disabled / expired) — that would let a
+    /// key is invalid (unknown / disabled / expired) - that would let a
     /// caller probe key state.
     #[error("authentication required")]
     Unauthorized,
@@ -285,7 +291,8 @@ impl GatewayError {
             GatewayError::PayloadTooLarge { .. } => "LM-1002",
             GatewayError::ModelNotFound(_) => "LM-2001",
             GatewayError::UnsupportedCapability { .. } => "LM-2002",
-            GatewayError::ImageModelUnsupported { .. } => "LM-2003",
+            GatewayError::ImageInputNotSupported { .. } => "LM-2003",
+            GatewayError::ImageUrlNotSupported { .. } => "LM-2004",
             GatewayError::ImageFetchDisabled => "LM-2005",
             GatewayError::ImageUrlRejected => "LM-2006",
             GatewayError::ImageFetchFailed => "LM-2007",
@@ -320,10 +327,11 @@ impl GatewayError {
         match self {
             GatewayError::InvalidRequest(_)
             | GatewayError::UnsupportedCapability { .. }
-            | GatewayError::ImageModelUnsupported { .. }
+            | GatewayError::EmptyDocuments
+            | GatewayError::ImageInputNotSupported { .. }
+            | GatewayError::ImageUrlNotSupported { .. }
             | GatewayError::ImageFetchDisabled
-            | GatewayError::ImageUrlRejected
-            | GatewayError::EmptyDocuments => 400,
+            | GatewayError::ImageUrlRejected => 400,
             GatewayError::Unauthorized => 401,
             GatewayError::BudgetExceeded => 402,
             GatewayError::ModelNotFound(_) => 404,
@@ -349,7 +357,8 @@ impl GatewayError {
             GatewayError::InvalidRequest(_)
             | GatewayError::ModelNotFound(_)
             | GatewayError::UnsupportedCapability { .. }
-            | GatewayError::ImageModelUnsupported { .. }
+            | GatewayError::ImageInputNotSupported { .. }
+            | GatewayError::ImageUrlNotSupported { .. }
             | GatewayError::ImageFetchDisabled
             | GatewayError::ImageUrlRejected
             | GatewayError::EmptyDocuments
@@ -491,6 +500,9 @@ mod tests {
     use super::*;
 
     #[test]
+    // One flat table pinning every stable LM-XXXX code; splitting it would
+    // only scatter the mapping this test exists to keep in one place.
+    #[allow(clippy::too_many_lines)]
     fn error_codes_are_stable() {
         assert_eq!(GatewayError::InvalidRequest("x".into()).code(), "LM-1001");
         assert_eq!(GatewayError::PayloadTooLarge { limit: 1 }.code(), "LM-1002");
@@ -530,14 +542,26 @@ mod tests {
         );
         // Empty rerank documents (pinned by the M3 spec).
         assert_eq!(GatewayError::EmptyDocuments.code(), "LM-2010");
-        // Vision / image-fetch codes (M9).
+        // Vision (M8) + multimodal-embeddings image-fetch (M9) codes.
         assert_eq!(
-            GatewayError::ImageModelUnsupported { model: "m".into() }.code(),
+            GatewayError::ImageInputNotSupported {
+                model: "gpt".into()
+            }
+            .code(),
             "LM-2003"
         );
-        let unsupported = GatewayError::ImageModelUnsupported { model: "m".into() };
-        assert_eq!(unsupported.http_status(), 400);
-        assert_eq!(unsupported.error_type(), ErrorType::InvalidRequest);
+        assert_eq!(
+            GatewayError::ImageUrlNotSupported {
+                provider: "google".into()
+            }
+            .code(),
+            "LM-2004"
+        );
+        assert_eq!(GatewayError::ImageFetchDisabled.code(), "LM-2005");
+        assert_eq!(GatewayError::ImageUrlRejected.code(), "LM-2006");
+        assert_eq!(GatewayError::ImageFetchFailed.code(), "LM-2007");
+        assert_eq!(GatewayError::ImageUrlRejected.http_status(), 400);
+        assert_eq!(GatewayError::ImageFetchFailed.http_status(), 502);
         // Streaming upstream faults (M4).
         assert_eq!(
             GatewayError::UpstreamStreamInterrupted {

@@ -1,15 +1,15 @@
-# Fuzzing (M7 §7.4)
+# Fuzzing
 
 Light fuzzing of the untrusted-input parsers, run weekly in CI (10 min/target)
 and on demand locally.
 
 ## Targets
 
-- `sse_parser` — the incremental SSE parser (`SseParser::push`), the shared
+- `sse_parser` - the incremental SSE parser (`SseParser::push`), the shared
   byte→event boundary used by both passthrough and translating providers. This
   is the riskiest parsing surface; the Anthropic/Gemini stream translators
   consume its output.
-- `chat_request` — deserializing + re-serializing an OpenAI `ChatRequest`,
+- `chat_request` - deserializing + re-serializing an OpenAI `ChatRequest`,
   exercising the `extra` (unknown-field) passthrough flatten.
 
 ## Run locally

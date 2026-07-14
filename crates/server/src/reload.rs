@@ -10,13 +10,13 @@
 //!
 //! Scope: the reload swaps the **routing table** (providers, models, aliases,
 //! fallbacks resolve against it). Server bind address, auth, pricing and the
-//! resilience runtime are read once at boot and are *not* hot-reloaded — those
+//! resilience runtime are read once at boot and are *not* hot-reloaded - those
 //! still require a restart (noted in `docs/backlog.md`).
 //!
 //! Provider API keys are re-resolved from the environment on every reload (env
 //! stays the primary source). Keys that were back-filled from the encrypted DB
 //! at boot are preserved across reloads via a snapshot captured at boot and
-//! merged in here — so a reload never silently drops a DB-stored key and sends
+//! merged in here - so a reload never silently drops a DB-stored key and sends
 //! unauthenticated upstream requests. Rotating a DB key still needs a restart
 //! (the snapshot is boot-time; noted in `docs/backlog.md`).
 
@@ -46,7 +46,7 @@ pub enum ReloadError {
 
 /// The process-wide handles a reload swaps: the routing table, the price table
 /// and the resilience policy (the circuit breakers inside `resilience` are
-/// deliberately *not* swapped — their live state survives the reload). Bundled
+/// deliberately *not* swapped - their live state survives the reload). Bundled
 /// so the reload signature stays small and future config surfaces can join.
 pub struct ReloadTargets {
     /// The provider routing table (its own `ArcSwap` inside).
@@ -134,7 +134,7 @@ const DEBOUNCE: Duration = Duration::from_millis(250);
 /// # Errors
 /// Returns the `notify` error if the file watcher cannot be created or armed;
 /// the caller should log it and continue (hot reload via SIGHUP still works if
-/// the watcher fails — but here both share the watcher setup, so a failure
+/// the watcher fails - but here both share the watcher setup, so a failure
 /// disables both and is surfaced to the caller).
 pub fn spawn_config_reloader(
     path: PathBuf,
@@ -144,7 +144,7 @@ pub fn spawn_config_reloader(
 
     // Watch the parent directory (editors replace the file via rename, which a
     // watch on the file itself would miss), but only react to events that touch
-    // the config file — a neighbour file (e.g. the SQLite DB) must not trigger
+    // the config file - a neighbour file (e.g. the SQLite DB) must not trigger
     // a reload. Matching by file name avoids canonicalize races when the file
     // is briefly absent mid-rename.
     let config_name = path.file_name().map(std::ffi::OsStr::to_owned);
@@ -306,7 +306,7 @@ mod tests {
         write_config(&dir, TWO_MODELS);
         apply_reload(&path, &t).expect("valid reload");
 
-        // The new model is now routable — the swap took effect.
+        // The new model is now routable - the swap took effect.
         assert!(registry.embedding_route("embed").is_some());
         assert!(registry.knows_model("gpt"));
     }

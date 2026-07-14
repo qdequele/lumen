@@ -1,8 +1,8 @@
-//! Per-model cost table (M5 §5.4b) — a consumer of the ADR 003 token counts.
+//! Per-model cost table (M5 §5.4b) - a consumer of the ADR 003 token counts.
 //!
 //! Prices come from the operator's config (`cost_per_1m_input`,
 //! `cost_per_1m_output`, `cost_per_1k_searches` on each model). A model with
-//! no configured price costs 0 — budgets then only bite on priced models,
+//! no configured price costs 0 - budgets then only bite on priced models,
 //! which is the operator's deliberate choice.
 
 use crate::config::Config;

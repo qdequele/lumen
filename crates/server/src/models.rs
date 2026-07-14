@@ -1,7 +1,7 @@
-//! `GET /v1/models` — model discovery.
+//! `GET /v1/models` - model discovery.
 //!
 //! Lists every model the operator configured, in the OpenAI list shape extended
-//! with a `capabilities` array. It reflects ONLY the local configuration — the
+//! with a `capabilities` array. It reflects ONLY the local configuration - the
 //! gateway never introspects upstreams (spec 3.3), so this route touches no
 //! provider and does no I/O.
 
@@ -22,8 +22,7 @@ pub struct ModelEntry {
     pub owned_by: String,
     /// Capabilities this model serves (`chat` / `embed` / `rerank`).
     pub capabilities: Vec<&'static str>,
-    /// Input modalities this model accepts (`text`, `image`). Defaults to
-    /// `["text"]` (M9).
+    /// Input modalities this model accepts (`text`, `image`).
     pub modalities: Vec<String>,
 }
 
@@ -48,7 +47,7 @@ pub async fn models(State(state): State<AppState>) -> Json<ModelList> {
             object: "model",
             owned_by: m.owned_by,
             capabilities: m.capabilities.iter().map(|c| c.as_str()).collect(),
-            modalities: m.modalities,
+            modalities: m.modalities.clone(),
         })
         .collect();
 

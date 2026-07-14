@@ -3,7 +3,7 @@
 //! An **optional** (default off) periodic task probes each provider that has a
 //! configured `base_url` and records the result in an in-memory registry plus
 //! the `lumen_provider_up` gauge. The results are exposed at
-//! `/health/providers` purely for observability — the gateway's own `/health`
+//! `/health/providers` purely for observability - the gateway's own `/health`
 //! stays independent of provider health, and nothing here is ever consulted on
 //! the request path (the executor's live circuit breaker is the request-path
 //! signal). Providers that rely on a built-in vendor URL report `unknown`; the
@@ -52,7 +52,7 @@ impl ProviderStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HealthState {
-    /// The base URL answered (any HTTP status — the host is reachable).
+    /// The base URL answered (any HTTP status - the host is reachable).
     Up,
     /// The base URL could not be reached (transport error / timeout).
     Down,
@@ -61,7 +61,7 @@ pub enum HealthState {
 }
 
 /// In-memory registry of provider health, shared across the probe task and the
-/// `/health/providers` handler. Reads are a lock-free map lookup — safe to hit
+/// `/health/providers` handler. Reads are a lock-free map lookup - safe to hit
 /// often, and never on the request hot path anyway.
 #[derive(Debug, Default)]
 pub struct ProviderHealth {
@@ -95,7 +95,7 @@ impl ProviderHealth {
     }
 }
 
-/// `GET /health/providers` — the observability view of background health
+/// `GET /health/providers` - the observability view of background health
 /// checks. Always mounted (returns all-`unknown` when checks are disabled);
 /// deliberately separate from `/health`, which never depends on provider state.
 pub async fn providers_health(
@@ -105,7 +105,7 @@ pub async fn providers_health(
 }
 
 /// A provider to probe: its name, configured base URL, and kind (which decides
-/// the liveness endpoint — a real one where the kind exposes it, else the base
+/// the liveness endpoint - a real one where the kind exposes it, else the base
 /// URL for bare reachability).
 #[derive(Debug, Clone)]
 pub struct ProbeTarget {

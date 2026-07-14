@@ -1,4 +1,4 @@
-//! Google Gemini provider — chat completions with bidirectional translation.
+//! Google Gemini provider - chat completions with bidirectional translation.
 //!
 //! Gemini's `generateContent` API differs from OpenAI in several ways this
 //! module bridges:
@@ -11,7 +11,7 @@
 //! * generation params live under `generationConfig`;
 //! * responses are `candidates` with a `finishReason` and `usageMetadata`;
 //! * streaming events are partial responses, translated fragment by fragment
-//!   in [`stream`] (bounded state — the text is never accumulated).
+//!   in [`stream`] (bounded state - the text is never accumulated).
 
 mod stream;
 
@@ -19,8 +19,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::BoxStream;
 use lumen_core::{
-    ChatChoice, ChatChunk, ChatMessage, ChatProvider, ChatRequest, ChatResponse, ProviderError,
-    Usage,
+    ChatChoice, ChatChunk, ChatMessage, ChatProvider, ChatRequest, ChatResponse, MessageContent,
+    ProviderError, Usage,
 };
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -100,7 +100,34 @@ struct GeminiSystem {
 
 #[derive(Serialize)]
 struct GeminiPart {
-    text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text: Option<String>,
+    #[serde(rename = "inline_data", skip_serializing_if = "Option::is_none")]
+    inline_data: Option<GeminiInlineData>,
+}
+
+#[derive(Serialize)]
+struct GeminiInlineData {
+    mime_type: String,
+    data: String,
+}
+
+impl GeminiPart {
+    /// A plain text part.
+    fn text(s: String) -> Self {
+        Self {
+            text: Some(s),
+            inline_data: None,
+        }
+    }
+
+    /// An inline base64 image part (Gemini's only supported image input).
+    fn image(mime_type: String, data: String) -> Self {
+        Self {
+            text: None,
+            inline_data: Some(GeminiInlineData { mime_type, data }),
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -167,15 +194,24 @@ fn map_finish_reason(reason: Option<&str>) -> Option<String> {
 }
 
 /// Build the Gemini request body from an OpenAI-shaped [`ChatRequest`].
-fn translate_request(req: &ChatRequest) -> GeminiRequest {
+///
+/// # Errors
+/// Returns [`ProviderError::Translation`] if a message carries a remote
+/// (`http`/`https`) image URL - Gemini accepts only inline base64 image
+/// bytes, and the gateway never fetches a URL on the caller's behalf.
+fn translate_request(req: &ChatRequest) -> Result<GeminiRequest, ProviderError> {
     let mut system_parts: Vec<GeminiPart> = Vec::new();
     let mut contents: Vec<GeminiContent> = Vec::new();
     for m in &req.messages {
-        let text = m.content.clone().unwrap_or_default();
+        let text = m
+            .content
+            .as_ref()
+            .map(|c| c.text().into_owned())
+            .unwrap_or_default();
         match m.role.as_str() {
             "system" => {
                 if !text.is_empty() {
-                    system_parts.push(GeminiPart { text });
+                    system_parts.push(GeminiPart::text(text));
                 }
             }
             // OpenAI's `assistant` is Gemini's `model`; everything else → user.
@@ -185,7 +221,7 @@ fn translate_request(req: &ChatRequest) -> GeminiRequest {
                 } else {
                     "user".to_owned()
                 },
-                parts: vec![GeminiPart { text }],
+                parts: gemini_parts(m.content.as_ref(), &text)?,
             }),
         }
     }
@@ -202,7 +238,7 @@ fn translate_request(req: &ChatRequest) -> GeminiRequest {
         stop_sequences,
     };
 
-    GeminiRequest {
+    Ok(GeminiRequest {
         contents,
         system_instruction: if system_parts.is_empty() {
             None
@@ -212,6 +248,37 @@ fn translate_request(req: &ChatRequest) -> GeminiRequest {
             })
         },
         generation_config: Some(generation_config),
+    })
+}
+
+/// Build Gemini `parts` from a message: data-URI images become `inline_data`;
+/// a remote image URL is a translation error (Gemini takes only inline bytes,
+/// and the gateway never fetches the URL). Text-only content is one text part.
+fn gemini_parts(
+    content: Option<&MessageContent>,
+    text: &str,
+) -> Result<Vec<GeminiPart>, ProviderError> {
+    match content {
+        Some(MessageContent::Parts(parts)) if parts.iter().any(|p| p.image_url.is_some()) => {
+            let mut out = Vec::with_capacity(parts.len());
+            for p in parts {
+                if let Some(img) = &p.image_url {
+                    let data = img.as_data_uri().ok_or_else(|| {
+                        ProviderError::Translation(
+                            "Gemini requires inline base64 image data; remote image URLs are not supported"
+                                .to_owned(),
+                        )
+                    })?;
+                    out.push(GeminiPart::image(data.media_type, data.base64_data));
+                } else if p.kind == "text" {
+                    if let Some(t) = &p.text {
+                        out.push(GeminiPart::text(t.clone()));
+                    }
+                }
+            }
+            Ok(out)
+        }
+        _ => Ok(vec![GeminiPart::text(text.to_owned())]),
     }
 }
 
@@ -253,7 +320,7 @@ fn translate_response(resp: GeminiResponse, requested_model: &str) -> ChatRespon
             index: 0,
             message: ChatMessage {
                 role: "assistant".to_owned(),
-                content: Some(content),
+                content: Some(MessageContent::Text(content)),
                 name: None,
                 extra: serde_json::Map::new(),
             },
@@ -276,7 +343,7 @@ impl ChatProvider for GoogleProvider {
             "{}/v1beta/models/{}:generateContent",
             self.base_url, req.model
         );
-        let body = translate_request(&req);
+        let body = translate_request(&req)?;
         let headers = [("x-goog-api-key", self.api_key.as_deref().unwrap_or(""))];
 
         let bytes = post_json_with_headers(
@@ -314,6 +381,13 @@ impl ChatProvider for GoogleProvider {
         let items = self.open_translated_stream(req, cancel).await?;
         Ok(items_to_sse_bytes(items))
     }
+
+    /// Gemini accepts only inline base64 image bytes, never a fetchable URL -
+    /// the gateway must not fetch on the caller's behalf (LM-2004 pre-flight
+    /// in the handler; [`translate_request`] is the defensive fallback path).
+    fn accepts_remote_image_url(&self) -> bool {
+        false
+    }
 }
 
 impl GoogleProvider {
@@ -329,7 +403,7 @@ impl GoogleProvider {
             "{}/v1beta/models/{}:streamGenerateContent?alt=sse",
             self.base_url, req.model
         );
-        let body = translate_request(&req);
+        let body = translate_request(&req)?;
         let headers = [("x-goog-api-key", self.api_key.as_deref().unwrap_or(""))];
 
         let bytes = open_stream_with_headers(
@@ -356,7 +430,7 @@ mod tests {
     fn msg(role: &str, content: &str) -> ChatMessage {
         ChatMessage {
             role: role.to_owned(),
-            content: Some(content.to_owned()),
+            content: Some(MessageContent::Text(content.to_owned())),
             name: None,
             extra: serde_json::Map::new(),
         }
@@ -383,10 +457,13 @@ mod tests {
             msg("user", "hi"),
             msg("assistant", "hello"),
             msg("user", "more"),
-        ]));
+        ]))
+        .unwrap();
         assert_eq!(
-            out.system_instruction.as_ref().unwrap().parts[0].text,
-            "be brief"
+            out.system_instruction.as_ref().unwrap().parts[0]
+                .text
+                .as_deref(),
+            Some("be brief")
         );
         assert_eq!(out.contents.len(), 3);
         assert_eq!(out.contents[0].role, "user");
@@ -422,8 +499,12 @@ mod tests {
         };
         let out = translate_response(resp, "gemini-2.0");
         assert_eq!(
-            out.choices[0].message.content.as_deref(),
-            Some("Hello there")
+            out.choices[0]
+                .message
+                .content
+                .as_ref()
+                .map(|c| c.text().into_owned()),
+            Some("Hello there".to_owned())
         );
         assert_eq!(out.choices[0].finish_reason.as_deref(), Some("length"));
         assert_eq!(out.usage.unwrap().total_tokens, 11);
@@ -438,5 +519,80 @@ mod tests {
             Some("content_filter")
         );
         assert_eq!(map_finish_reason(None), None);
+    }
+
+    #[test]
+    fn data_uri_image_becomes_inline_data() {
+        use lumen_core::{ChatMessage, ChatRequest, ContentPart, ImageUrl, MessageContent};
+        let req = ChatRequest {
+            model: "gemini".to_owned(),
+            messages: vec![ChatMessage {
+                role: "user".to_owned(),
+                content: Some(MessageContent::Parts(vec![
+                    ContentPart {
+                        kind: "text".to_owned(),
+                        text: Some("what?".to_owned()),
+                        image_url: None,
+                        extra: serde_json::Map::new(),
+                    },
+                    ContentPart {
+                        kind: "image_url".to_owned(),
+                        text: None,
+                        image_url: Some(ImageUrl {
+                            url: "data:image/jpeg;base64, /9j/".to_owned().replace(' ', ""),
+                            detail: None,
+                        }),
+                        extra: serde_json::Map::new(),
+                    },
+                ])),
+                name: None,
+                extra: serde_json::Map::new(),
+            }],
+            temperature: None,
+            top_p: None,
+            max_tokens: None,
+            n: None,
+            stop: None,
+            stream: false,
+            extra: serde_json::Map::new(),
+        };
+        let body = serde_json::to_value(translate_request(&req).unwrap()).unwrap();
+        let parts = &body["contents"][0]["parts"];
+        assert_eq!(parts[0]["text"], "what?");
+        assert_eq!(parts[1]["inline_data"]["mime_type"], "image/jpeg");
+        assert_eq!(parts[1]["inline_data"]["data"], "/9j/");
+    }
+
+    #[test]
+    fn remote_url_image_is_a_translation_error() {
+        use lumen_core::{ChatMessage, ChatRequest, ContentPart, ImageUrl, MessageContent};
+        let req = ChatRequest {
+            model: "gemini".to_owned(),
+            messages: vec![ChatMessage {
+                role: "user".to_owned(),
+                content: Some(MessageContent::Parts(vec![ContentPart {
+                    kind: "image_url".to_owned(),
+                    text: None,
+                    image_url: Some(ImageUrl {
+                        url: "https://ex.com/c.png".to_owned(),
+                        detail: None,
+                    }),
+                    extra: serde_json::Map::new(),
+                }])),
+                name: None,
+                extra: serde_json::Map::new(),
+            }],
+            temperature: None,
+            top_p: None,
+            max_tokens: None,
+            n: None,
+            stop: None,
+            stream: false,
+            extra: serde_json::Map::new(),
+        };
+        assert!(matches!(
+            translate_request(&req),
+            Err(lumen_core::ProviderError::Translation(_))
+        ));
     }
 }

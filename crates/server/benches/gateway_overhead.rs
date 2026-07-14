@@ -3,9 +3,9 @@
 //! These measure the CPU work the gateway adds *per request, off the network*:
 //! the M6 resilience executor wrapping a provider call (circuit-breaker admit,
 //! retry loop, per-attempt timeout) and the JSON (de)serialization the OpenAI
-//! surface performs. No sockets are involved — the "provider" resolves
-//! instantly — so the numbers isolate gateway overhead from upstream/network
-//! latency, matching the "< 1 ms added p99 hors réseau" target.
+//! surface performs. No sockets are involved - the "provider" resolves
+//! instantly - so the numbers isolate gateway overhead from upstream/network
+//! latency, matching the "< 1 ms added p99 off-network" target.
 //!
 //! Run with `cargo bench -p server`. The full head-to-head vs LiteLLM under
 //! load lives in `bench/` (docker-compose + k6) and is documented in
@@ -18,14 +18,15 @@ use async_trait::async_trait;
 use criterion::{criterion_group, criterion_main, Criterion};
 use futures::stream::BoxStream;
 use lumen_core::{
-    ChatChoice, ChatMessage, ChatProvider, ChatRequest, ChatResponse, ProviderError, Usage,
+    ChatChoice, ChatMessage, ChatProvider, ChatRequest, ChatResponse, MessageContent,
+    ProviderError, Usage,
 };
 use lumen_router::circuit::{BreakerConfig, CircuitBreakers};
 use lumen_router::executor::{execute, ExecConfig, Link};
 use lumen_router::retry::RetryPolicy;
 use tokio_util::sync::CancellationToken;
 
-/// A provider that returns a canned response with zero I/O — the constant part
+/// A provider that returns a canned response with zero I/O - the constant part
 /// of the gateway pipeline under test.
 struct InstantProvider {
     response: ChatResponse,
@@ -71,11 +72,11 @@ fn sample_response() -> ChatResponse {
             index: 0,
             message: ChatMessage {
                 role: "assistant".to_owned(),
-                content: Some(
+                content: Some(MessageContent::Text(
                     "Consistency, availability and partition tolerance cannot all be \
                      guaranteed at once. Under a partition you must trade one for another."
                         .to_owned(),
-                ),
+                )),
                 name: None,
                 extra: serde_json::Map::new(),
             },
