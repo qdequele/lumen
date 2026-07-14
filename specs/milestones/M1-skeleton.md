@@ -1,4 +1,4 @@
-# M1 — Skeleton & foundations
+# M1 - Skeleton & foundations
 
 ## Objective
 A binary that starts up, serves /health and /metrics, loads its config, with the full crate structure and CI in place. No providers yet.
@@ -18,7 +18,7 @@ A binary that starts up, serves /health and /metrics, loads its config, with the
 - [x] `Capability` enum: `Chat | Embed | Rerank`
 
 ### 1.3 crates/server
-- [x] axum binary: `GET /health` (always responds 200 if the process is alive — no I/O), `GET /metrics` (empty Prometheus registry for now)
+- [x] axum binary: `GET /health` (always responds 200 if the process is alive - no I/O), `GET /metrics` (empty Prometheus registry for now)
 - [x] Graceful shutdown on SIGTERM/SIGINT: stop accepting, drain in-flight requests (30 s timeout)
 - [x] tower middleware: request-id, tracing span per request, body size limit (configurable, default 10 MB)
 

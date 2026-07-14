@@ -12,14 +12,14 @@ ignore = [
     # sqlx's macro crate (MySQL path); it is NOT in our compiled graph
     # (`cargo tree -i rsa` finds nothing) and LUMEN performs no RSA/MySQL ops.
     "RUSTSEC-2023-0071",
-    # `instant` unmaintained — transitive via `notify` (config file-watch);
+    # `instant` unmaintained - transitive via `notify` (config file-watch);
     # used only for coarse timers. Bumps land when `notify` moves to `web-time`.
     "RUSTSEC-2024-0384",
 ]
 
 [licenses]
 version = 2
-# Permissive licenses only — LUMEN ships as a single self-hostable binary,
+# Permissive licenses only - LUMEN ships as a single self-hostable binary,
 # so no copyleft that would impose obligations on operators.
 allow = [
     "MIT",
@@ -46,6 +46,6 @@ multiple-versions = "warn"
 wildcards = "deny"
 
 [sources]
-# Only crates.io — no git or unknown registries slip in unaudited.
+# Only crates.io - no git or unknown registries slip in unaudited.
 unknown-registry = "deny"
 unknown-git = "deny"

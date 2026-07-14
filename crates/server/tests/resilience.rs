@@ -275,7 +275,7 @@ async fn circuit_opens_then_probes_after_cooldown() {
 }
 
 // Criterion 4: a streaming failure after chunks were emitted is NOT retried or
-// failed over — the client gets a clean terminal SSE error frame.
+// failed over - the client gets a clean terminal SSE error frame.
 #[tokio::test]
 async fn streaming_failure_after_first_chunk_is_not_retried() {
     let primary = MockServer::start().await;
@@ -387,8 +387,8 @@ async fn health_stays_fast_under_upstream_429_storm() {
         worst = worst.max(t.elapsed());
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
-    // A genuinely regressed /health — one that touched the DB, a provider, or
-    // shared the storm's bounded queue — would serialize behind the 500 in-flight
+    // A genuinely regressed /health - one that touched the DB, a provider, or
+    // shared the storm's bounded queue - would serialize behind the 500 in-flight
     // requests and take seconds. This bound proves it stayed off that path while
     // tolerating the jitter of a shared CI runner (locally it's well under 10 ms).
     assert!(
@@ -398,7 +398,7 @@ async fn health_stays_fast_under_upstream_429_storm() {
 
     // Every request completed with a fast failure, none hung. Under the storm
     // the breaker also trips (protecting the upstream), so a 503 (circuit open,
-    // LM-3020) is as valid as the raw 429 — both prove the gateway shed load
+    // LM-3020) is as valid as the raw 429 - both prove the gateway shed load
     // without an unbounded queue.
     let mut completed = 0;
     for task in tasks {

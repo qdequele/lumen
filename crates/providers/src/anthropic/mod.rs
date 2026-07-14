@@ -1,4 +1,4 @@
-//! Anthropic provider — chat completions with bidirectional translation.
+//! Anthropic provider - chat completions with bidirectional translation.
 //!
 //! Anthropic's Messages API (`POST /v1/messages`) differs from OpenAI in
 //! several ways this module bridges:
@@ -9,7 +9,7 @@
 //! * responses are `content` blocks with a `stop_reason` and
 //!   `input_tokens`/`output_tokens` usage;
 //! * streaming is typed SSE events, translated chunk by chunk in [`stream`]
-//!   (bounded state — the response text is never accumulated).
+//!   (bounded state - the response text is never accumulated).
 
 mod stream;
 

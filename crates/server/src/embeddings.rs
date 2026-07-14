@@ -1,4 +1,4 @@
-//! `POST /v1/embeddings` — the first complete request path.
+//! `POST /v1/embeddings` - the first complete request path.
 //!
 //! Flow: validate → route (model → provider) → admit (budget/quota, memory
 //! only) → embed (with automatic batching) → account (tokens, cost, usage
@@ -100,7 +100,7 @@ pub async fn embeddings(
     let mut response = executed.value;
     accounting.served_by(&executed.model_used, &executed.provider_used);
 
-    // ADR 003: upstream usage when reported, else the local estimate — never
+    // ADR 003: upstream usage when reported, else the local estimate - never
     // a silent zero (e.g. TEI reports nothing).
     let (tokens_in, estimated) = if response.usage.prompt_tokens > 0 {
         (u64::from(response.usage.prompt_tokens), false)

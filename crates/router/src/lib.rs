@@ -84,7 +84,7 @@ pub struct RerankChainLink {
 }
 
 /// Resolve an ordered list of model ids (primary first, then its fallbacks) to
-/// a chat chain. The **primary** must resolve — its miss is the client-facing
+/// a chat chain. The **primary** must resolve - its miss is the client-facing
 /// error. A fallback that no longer resolves for chat is skipped with a warning
 /// (boot validation makes this unreachable in practice; this is defence in
 /// depth for a hot-reloaded table).

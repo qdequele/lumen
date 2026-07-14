@@ -4,7 +4,7 @@
 //! Cardinality is fixed by construction: the base labels are enums or
 //! operator-configured model/provider names, and metadata labels exist only
 //! for keys the operator explicitly allowlisted (`telemetry.metadata_labels`,
-//! default empty) — never for arbitrary client-supplied keys.
+//! default empty) - never for arbitrary client-supplied keys.
 
 use crate::metrics::Metrics;
 use prometheus::{IntCounter, IntCounterVec, Opts};

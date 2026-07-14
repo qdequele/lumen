@@ -1,4 +1,4 @@
-# M4 — Chat + SSE streaming
+# M4 - Chat + SSE streaming
 
 ## Objective
 Complete `/v1/chat/completions`, zero-copy streaming, Anthropic translation. The most technical milestone.
@@ -20,12 +20,12 @@ Complete `/v1/chat/completions`, zero-copy streaming, Anthropic translation. The
 ### 4.3 Anthropic provider (full translation)
 - [x] Request: OpenAI messages → Anthropic format (system extracted to `system`, consecutive tool_results merged into a single user message, OpenAI tools → Anthropic tools + tool_choice, max_tokens mandatory with a default)
 - [x] Response: content blocks → OpenAI message (tool_use → tool_calls, arguments re-encoded as a JSON string); stop_reason → finish_reason; usage mapped
-- [x] Streaming: Anthropic events (message_start, content_block_delta, message_delta...) → OpenAI chunks, chunk-by-chunk translation via an incremental SSE parser — bounded state, zero buffering of the full content
+- [x] Streaming: Anthropic events (message_start, content_block_delta, message_delta...) → OpenAI chunks, chunk-by-chunk translation via an incremental SSE parser - bounded state, zero buffering of the full content
 - [x] Streaming tool_use: content_block_start → tool_call opening, input_json_delta → OpenAI tool_calls delta (index allocated in order of appearance)
 
 ### 4.4 Mistral + Google providers
 - [x] Mistral: near-passthrough OpenAI (chat + embeddings)
-- [x] Google Gemini: `generateContent` (non-streaming) and `streamGenerateContent?alt=sse` (streaming) translated — contents/parts, systemInstruction, usageMetadata, finishReason.
+- [x] Google Gemini: `generateContent` (non-streaming) and `streamGenerateContent?alt=sse` (streaming) translated - contents/parts, systemInstruction, usageMetadata, finishReason.
 
 ## Acceptance criteria
 1. Streaming passthrough: wiremock test sending 100 chunks → the client receives 100 identical byte-for-byte chunks + [DONE]; assertion that no full deserialization takes place (counter in the test code or allocation benchmark).

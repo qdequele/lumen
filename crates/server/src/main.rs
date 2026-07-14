@@ -40,7 +40,7 @@ const MASTER_KEY_ENV: &str = "LUMEN_MASTER_KEY";
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
 const HELP: &str = "\
-lumen — universal LLM gateway
+lumen - universal LLM gateway
 
 USAGE:
     lumen [--config <PATH>]
@@ -144,7 +144,7 @@ fn run(config: Config, config_path: PathBuf) -> anyhow::Result<()> {
         ));
 
         // The M5 auth stack: SQLite store, in-memory key state, usage writer,
-        // periodic budget flush and retention purge. All optional — the
+        // periodic budget flush and retention purge. All optional - the
         // gateway stays a stateless open proxy when auth is disabled.
         let mut provider_specs = config.provider_specs();
         let (auth_runtime, usage_logger, usage_writer, key_backfill) = if config.auth.enabled {
@@ -173,7 +173,7 @@ fn run(config: Config, config_path: PathBuf) -> anyhow::Result<()> {
         // Config hot reload (M7 §7.3): SIGHUP or a config-file change re-validates
         // and atomically swaps the routing table, price table and resilience
         // policy (circuit-breaker state preserved). A watcher-setup failure only
-        // disables reload — the server still runs — so it is logged, not fatal.
+        // disables reload - the server still runs - so it is logged, not fatal.
         let reload_targets = ReloadTargets {
             registry: Arc::clone(&registry),
             pricing: Arc::clone(&pricing),
@@ -218,7 +218,7 @@ fn run(config: Config, config_path: PathBuf) -> anyhow::Result<()> {
 
         // Drain the usage writer: `serve` returning dropped the app (and with
         // it every UsageLogger clone), which closes the channel; the writer
-        // then flushes what is buffered and exits. Bounded wait — shutdown
+        // then flushes what is buffered and exits. Bounded wait - shutdown
         // must never hang on a sick database.
         if let Some(writer) = usage_writer {
             if tokio::time::timeout(Duration::from_secs(5), writer)

@@ -1,4 +1,4 @@
-# ADR 003 — Token accounting for every request, every capability
+# ADR 003 - Token accounting for every request, every capability
 
 - Status: accepted (core promise)
 - Date: 2026-07-12
@@ -7,13 +7,13 @@
 
 Token counting is a headline reason to run LUMEN: an operator fronting many
 providers wants one trustworthy answer to "how many tokens did this cost,
-per model / key / team / capability?" — without trusting each upstream to
+per model / key / team / capability?" - without trusting each upstream to
 report it and without leaking prompts to a third party to find out.
 
 The problem is that upstream usage reporting is **inconsistent**:
 
 - OpenAI/Cohere/Voyage embeddings report input tokens; **TEI reports none**
-  (its `/embed` is a bare vector array) — so a naive gateway shows `0` tokens
+  (its `/embed` is a bare vector array) - so a naive gateway shows `0` tokens
   for TEI embeddings.
 - Streaming chat only carries usage if the client sends
   `stream_options.include_usage` (and some providers still omit it).
@@ -34,9 +34,9 @@ Token accounting is a first-class, always-on output of every chat, embeddings
 and rerank call, produced by a two-tier strategy and surfaced in three places.
 
 ### Source, in priority order
-1. **Upstream-reported usage** — authoritative and free (already in the response
+1. **Upstream-reported usage** - authoritative and free (already in the response
    body / final SSE chunk). Always preferred. `estimated = false`.
-2. **Local estimation fallback** — when the upstream omits usage. `estimated =
+2. **Local estimation fallback** - when the upstream omits usage. `estimated =
    true`. Two levels:
    - default: a cheap, allocation-light **heuristic** (byte/char-based) that is
      safe to compute anywhere;
@@ -58,17 +58,17 @@ never a blocking BPE pass. Counting must **never fail or slow a request**.
   of `query + documents` for uniform observability (`estimated` when derived).
 
 ### Three surfaces
-1. **Response body** — OpenAI-compatible `usage` (chat/embeddings) unchanged.
-2. **Prometheus** — cumulative counters, low fixed cardinality:
+1. **Response body** - OpenAI-compatible `usage` (chat/embeddings) unchanged.
+2. **Prometheus** - cumulative counters, low fixed cardinality:
    `lumen_tokens_total{capability, model, provider, direction, estimated}`
    and `lumen_rerank_search_units_total{model, provider}`. Optional
    metadata-allowlist labels come from ADR 002 (never client-unbounded).
-3. **`usage_log`** — per-request `tokens_in`, `tokens_out`,
+3. **`usage_log`** - per-request `tokens_in`, `tokens_out`,
    `search_units`, `estimated`, alongside cost and metadata for later slicing.
 
 ## Consequences
 
-- Every call gets a token count regardless of provider — the TEI-reports-nothing
+- Every call gets a token count regardless of provider - the TEI-reports-nothing
   gap is closed by estimation, and the count is labelled honestly.
 - The latency pillar holds: passthrough is free; BPE estimation is off-hot-path
   and on the blocking pool.
@@ -79,7 +79,7 @@ never a blocking BPE pass. Counting must **never fail or slow a request**.
 - New error/counter surface: a `tokens_estimated_total` counter lets operators
   see how much of their accounting is measured vs estimated.
 
-## Addendum (M8 — vision / image input)
+## Addendum (M8 - vision / image input)
 
 Image content parts (`{"type":"image_url",...}`) do not change the priority
 order above; they sharpen what "estimation" means when tier 2 fires.
@@ -87,17 +87,17 @@ order above; they sharpen what "estimation" means when tier 2 fires.
 - **Upstream usage stays authoritative and untouched.** OpenAI, Anthropic and
   Gemini all fold image tokens into their reported `prompt_tokens`, so a vision
   request with upstream-reported usage is exactly as accurate as a text-only
-  one — no special-casing needed.
+  one - no special-casing needed.
 - **The local estimation fallback counts text only.** When the upstream omits
   usage, the heuristic estimator (`estimate_chat_prompt`, `crates/core/src/tokens.rs`)
-  sums `MessageContent::text()` per message — the concatenation of `text` parts.
+  sums `MessageContent::text()` per message - the concatenation of `text` parts.
   An image part contributes **0** to that sum; only the message's fixed
   per-message overhead is counted for an image-only message. The response is
   still flagged `"estimated": true`, so the client is never told a number is
   measured when it is not, but a vision-heavy request on a no-usage upstream is
   undercounted.
 - **A per-image token heuristic (e.g. OpenAI's tile-based formula) is
-  deferred** — see `docs/backlog.md`. It would need to know image dimensions
+  deferred** - see `docs/backlog.md`. It would need to know image dimensions
   (not always available: a `data:` URI encodes bytes, not decoded pixel
   dimensions, without a decode step this gateway does not perform) and is out
   of scope for this slice; the hot-path rule above (never decode/inspect image

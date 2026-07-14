@@ -118,7 +118,7 @@ fn openai_chat_body(model: &str) -> Value {
 #[tokio::test]
 async fn openai_compatible_kind_routes_through_the_openai_path() {
     // A new OpenAI-compatible kind (Groq) pointed at a mock via base_url must
-    // route exactly like the OpenAI kind — proving the shared provider wiring.
+    // route exactly like the OpenAI kind - proving the shared provider wiring.
     let upstream = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
@@ -253,8 +253,8 @@ async fn image_to_a_non_vision_model_is_rejected_with_lm_2003() {
 
 /// OpenAI-family conformance: a model declared vision-capable (`modalities`
 /// includes `"image"`) forwards the OpenAI content-parts array to the
-/// upstream byte-for-byte (no re-shaping), and — since this mock upstream
-/// reports no `usage` at all — the response still carries a non-zero,
+/// upstream byte-for-byte (no re-shaping), and - since this mock upstream
+/// reports no `usage` at all - the response still carries a non-zero,
 /// honestly-labelled `estimated` token count rather than a silent zero
 /// (ADR 003 §8: the text-only estimation fallback still fires for a vision
 /// request; only the image part contributes 0).
@@ -270,7 +270,7 @@ async fn openai_family_forwards_image_parts_verbatim() {
                 "message": { "role": "assistant", "content": "a cat" },
                 "finish_reason": "stop"
             }]
-            // Deliberately no "usage" — exercises the estimation fallback.
+            // Deliberately no "usage" - exercises the estimation fallback.
         })))
         .mount(&upstream)
         .await;
@@ -305,7 +305,7 @@ async fn openai_family_forwards_image_parts_verbatim() {
         .unwrap();
     assert_eq!(resp.status(), 200);
 
-    // The upstream received the image part unchanged — no stripping, no
+    // The upstream received the image part unchanged - no stripping, no
     // reshaping of the content-parts array.
     let reqs = upstream.received_requests().await.unwrap();
     let sent: Value = serde_json::from_slice(&reqs[0].body).unwrap();
@@ -318,9 +318,9 @@ async fn openai_family_forwards_image_parts_verbatim() {
     // No upstream usage → the local estimator ran, flagged honestly, never a
     // silent zero. The image part contributes 0 to the estimate (ADR 003
     // addendum): "what is this?" (13 bytes) => 4 text tokens + the 4-token
-    // per-message overhead = 8, exactly what a text-only message would yield
-    // — pinning this value proves the image part is NOT silently double- or
-    // mis-counted, not merely that the count is positive.
+    // per-message overhead = 8, exactly what a text-only message would
+    // yield - pinning this value proves the image part is NOT silently
+    // double- or mis-counted, not merely that the count is positive.
     let got: Value = resp.json().await.unwrap();
     assert_eq!(got["usage"]["estimated"], true);
     assert_eq!(got["usage"]["prompt_tokens"], 8);
@@ -867,7 +867,7 @@ async fn gemini_streaming_translates_fragments_to_openai_chunks() {
 #[tokio::test]
 async fn upstream_stream_without_done_yields_fg3010_error_frame() {
     let upstream = MockServer::start().await;
-    // Two valid chunks, then the body just ends — no `data: [DONE]`.
+    // Two valid chunks, then the body just ends - no `data: [DONE]`.
     let truncated: String = upstream_sse_body(2)
         .strip_suffix("data: [DONE]\n\n")
         .unwrap()
@@ -898,7 +898,7 @@ async fn upstream_stream_without_done_yields_fg3010_error_frame() {
     let text = resp.text().await.unwrap();
 
     // Both real chunks were forwarded, then a terminal LM-3010 error frame
-    // (criterion 5) — and the stream ended cleanly, no hang.
+    // (criterion 5) - and the stream ended cleanly, no hang.
     assert_eq!(text.matches("chat.completion.chunk").count(), 2);
     assert!(!text.contains("data: [DONE]"));
     let frames = sse_data_frames(&text);
@@ -1011,7 +1011,7 @@ async fn oversized_body_returns_lm_1002_envelope() {
 }
 
 /// A syntactically-invalid but under-limit body must still map to `LM-1001`
-/// (400) — the `LM-1002` middleware only rewrites bare `413`s, so this must
+/// (400) - the `LM-1002` middleware only rewrites bare `413`s, so this must
 /// not regress.
 #[tokio::test]
 async fn malformed_json_body_is_still_lm_1001() {

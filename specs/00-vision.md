@@ -1,4 +1,4 @@
-# Vision — why LUMEN exists
+# Vision - why LUMEN exists
 
 ## The problem
 Existing LLM gateways have documented structural flaws:
@@ -18,5 +18,5 @@ The dev/team who self-hosts, mixes cloud APIs (OpenAI, Anthropic, Cohere...) and
 ## Decision principles (when the spec is silent)
 1. When in doubt: the simplest solution that preserves the 4 pillars (performance, sovereignty, robustness, multi-capability).
 2. A feature that adds latency to the request path must be opt-in.
-3. OpenAI compatibility takes precedence over internal elegance — existing clients must work without modification.
+3. OpenAI compatibility takes precedence over internal elegance - existing clients must work without modification.
 4. Any user data (prompts, documents) is radioactive: never store it, log it, or transmit it anywhere other than to the chosen provider.

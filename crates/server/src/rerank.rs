@@ -1,4 +1,4 @@
-//! `POST /v1/rerank` — Cohere-format reranking.
+//! `POST /v1/rerank` - Cohere-format reranking.
 //!
 //! Flow: validate → route (model → provider) → admit (budget/quota, memory
 //! only) → rerank (with gateway-side ordering, `top_n` clamping and optional
@@ -90,7 +90,7 @@ pub async fn rerank_handler(
     accounting.served_by(&executed.model_used, &executed.provider_used);
 
     // ADR 003: upstream-billed search units when reported (Cohere), else the
-    // gateway derives them from the batch size — never a silent zero.
+    // gateway derives them from the batch size - never a silent zero.
     let (search_units, units_estimated) = if response.usage.search_units > 0 {
         (u64::from(response.usage.search_units), false)
     } else {

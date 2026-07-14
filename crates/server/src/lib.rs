@@ -46,7 +46,7 @@ pub fn build_registry(config: &Config) -> Result<Arc<Registry>, lumen_providers:
 /// Emit the startup log line and one line per loaded model.
 ///
 /// Only secret-free metadata is logged (model id, provider name, capabilities);
-/// API keys are never touched here — the config only holds env var *names*.
+/// API keys are never touched here - the config only holds env var *names*.
 pub fn log_startup(config: &Config) {
     let models = config.loaded_models();
     tracing::info!(

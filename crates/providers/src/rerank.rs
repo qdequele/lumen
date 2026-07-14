@@ -7,7 +7,7 @@
 //! * `top_n` is clamped to the document count (silently) before the upstream
 //!   call, and the result set is truncated to it afterwards (TEI, for instance,
 //!   has no `top_n` and returns every document);
-//! * results are sorted by descending `relevance_score` — the gateway never
+//! * results are sorted by descending `relevance_score` - the gateway never
 //!   trusts the upstream to have ordered them;
 //! * source document texts are echoed into `document` only when
 //!   `return_documents` was set (bandwidth-saving default is off).
@@ -29,7 +29,7 @@ pub async fn rerank(
 ) -> Result<RerankResponse, ProviderError> {
     let n_docs = req.documents.len();
 
-    // Clamp top_n to the document count (silent — spec 3.1). Done before the
+    // Clamp top_n to the document count (silent - spec 3.1). Done before the
     // upstream call so providers that honour top_n receive the clamped value.
     if let Some(top_n) = req.top_n {
         if top_n as usize > n_docs {

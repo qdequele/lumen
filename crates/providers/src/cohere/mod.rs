@@ -1,4 +1,4 @@
-//! Cohere provider (API v2) — embeddings and reranking.
+//! Cohere provider (API v2) - embeddings and reranking.
 //!
 //! Cohere's wire schema differs from the internal (OpenAI/Cohere-inspired)
 //! types in both directions, so this module translates:

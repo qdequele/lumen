@@ -2,7 +2,7 @@
 //!
 //! A virtual key is `fg-` + 32 cryptographically random bytes (hex). Only its
 //! BLAKE3 hash is ever stored: the keys are 256-bit uniform random, so a fast
-//! cryptographic hash gives full preimage resistance — a slow password KDF
+//! cryptographic hash gives full preimage resistance - a slow password KDF
 //! (argon2) exists for *low-entropy* secrets and would burn ~100 ms of CPU on
 //! every authenticated request for nothing (pillar 1).
 

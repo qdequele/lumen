@@ -1,4 +1,4 @@
-//! Mistral provider — chat completions and embeddings.
+//! Mistral provider - chat completions and embeddings.
 //!
 //! Both of Mistral's `chat/completions` and `embeddings` endpoints are
 //! OpenAI-compatible, so this is a near-passthrough (like [`crate::openai`]).

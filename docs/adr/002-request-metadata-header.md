@@ -1,4 +1,4 @@
-# ADR 002 — Per-request metadata header for logging & metrics
+# ADR 002 - Per-request metadata header for logging & metrics
 
 - Status: accepted (planned)
 - Date: 2026-07-12
@@ -19,7 +19,7 @@ LUMEN needs the same capability, feeding both:
 The tension is Prometheus **cardinality**. Prometheus label values multiply the
 number of time series; putting arbitrary client-supplied metadata (e.g. a
 `user_id`) onto metric labels is an unbounded-cardinality footgun that violates
-pillar 1 (~15 MB idle, < 1 ms p99) — a few thousand distinct users would blow up
+pillar 1 (~15 MB idle, < 1 ms p99) - a few thousand distinct users would blow up
 memory and scrape cost. Cloudflare sidesteps this by indexing metadata for
 **log search**, not by turning it into metric dimensions.
 
@@ -27,7 +27,7 @@ We also refuse to make an observability header able to fail a real request:
 rejecting a chat call because someone sent malformed metadata is user-hostile.
 
 And per the sovereignty pillar, metadata **is** logged, so it must never be
-treated as prompt content — it is operator/client labels only.
+treated as prompt content - it is operator/client labels only.
 
 ## Decision
 
@@ -45,12 +45,12 @@ typed value carried in request extensions.
 3. **Two sinks, different rules.**
    - **Logs / `usage_log`:** the full (bounded) object is attached to the
      request's structured log fields and stored in a `metadata` column on
-     `usage_log` for later filtering — the Cloudflare-style use case.
+     `usage_log` for later filtering - the Cloudflare-style use case.
    - **Prometheus:** ONLY keys named in a config **allowlist**
      (`telemetry.metadata_labels = ["env", "team"]`, default empty) become
      metric labels; every other key is logs-only. An allowlisted key absent
      from a given request gets the label value `""`. This makes metric
-     cardinality a deliberate, operator-bounded decision — never client-driven.
+     cardinality a deliberate, operator-bounded decision - never client-driven.
 
 4. **Never fails the request.** Missing, malformed, oversized or wrong-typed
    metadata is dropped with a `debug!`/`warn!` and a
@@ -62,7 +62,7 @@ typed value carried in request extensions.
 
 ## Consequences
 
-- Metric cardinality is capped by config, not by traffic — safe by default
+- Metric cardinality is capped by config, not by traffic - safe by default
   (empty allowlist = zero new label dimensions).
 - Full metadata is still available for rich filtering via `usage_log`, matching
   Cloudflare's log-search model.

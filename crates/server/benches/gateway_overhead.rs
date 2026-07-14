@@ -3,8 +3,8 @@
 //! These measure the CPU work the gateway adds *per request, off the network*:
 //! the M6 resilience executor wrapping a provider call (circuit-breaker admit,
 //! retry loop, per-attempt timeout) and the JSON (de)serialization the OpenAI
-//! surface performs. No sockets are involved — the "provider" resolves
-//! instantly — so the numbers isolate gateway overhead from upstream/network
+//! surface performs. No sockets are involved - the "provider" resolves
+//! instantly - so the numbers isolate gateway overhead from upstream/network
 //! latency, matching the "< 1 ms added p99 off-network" target.
 //!
 //! Run with `cargo bench -p server`. The full head-to-head vs LiteLLM under
@@ -26,7 +26,7 @@ use lumen_router::executor::{execute, ExecConfig, Link};
 use lumen_router::retry::RetryPolicy;
 use tokio_util::sync::CancellationToken;
 
-/// A provider that returns a canned response with zero I/O — the constant part
+/// A provider that returns a canned response with zero I/O - the constant part
 /// of the gateway pipeline under test.
 struct InstantProvider {
     response: ChatResponse,

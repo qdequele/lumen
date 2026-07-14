@@ -2,17 +2,17 @@
 //!
 //! This crate is deliberately free of any web framework, HTTP client or
 //! database dependency: it defines the vocabulary the rest of the workspace
-//! speaks. Three capabilities are first-class citizens — chat, embeddings and
-//! reranking — each with its own request/response types and provider trait.
+//! speaks. Three capabilities are first-class citizens - chat, embeddings and
+//! reranking - each with its own request/response types and provider trait.
 //!
 //! # Modules
-//! * [`chat`] — OpenAI `chat/completions` request/response/chunk types.
-//! * [`embed`] — OpenAI `embeddings` types.
-//! * [`rerank`] — Cohere `rerank` types.
-//! * [`provider`] — the [`ChatProvider`], [`EmbeddingProvider`] and
+//! * [`chat`] - OpenAI `chat/completions` request/response/chunk types.
+//! * [`embed`] - OpenAI `embeddings` types.
+//! * [`rerank`] - Cohere `rerank` types.
+//! * [`provider`] - the [`ChatProvider`], [`EmbeddingProvider`] and
 //!   [`RerankProvider`] traits.
-//! * [`error`] — the [`ProviderError`] / [`GatewayError`] taxonomy.
-//! * [`capability`] — the [`Capability`] enum.
+//! * [`error`] - the [`ProviderError`] / [`GatewayError`] taxonomy.
+//! * [`capability`] - the [`Capability`] enum.
 
 #![forbid(unsafe_code)]
 

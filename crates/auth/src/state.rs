@@ -3,11 +3,11 @@
 //! Loaded once at boot from the [store](crate::store), then consulted on
 //! every request without ever touching the database:
 //!
-//! * **authentication** — a BLAKE3 hash lookup in a [`DashMap`];
-//! * **hard budget** — a compare-and-swap *reservation* of the estimated cost
+//! * **authentication** - a BLAKE3 hash lookup in a [`DashMap`];
+//! * **hard budget** - a compare-and-swap *reservation* of the estimated cost
 //!   before the upstream call, adjusted to the real cost afterwards, so
 //!   concurrent requests can never overrun the budget between check and debit;
-//! * **RPM/TPM quotas** — per-minute windows packed into single atomics
+//! * **RPM/TPM quotas** - per-minute windows packed into single atomics
 //!   (window minute in the high 32 bits, count in the low 32), bumped with a
 //!   CAS loop.
 //!
@@ -87,7 +87,7 @@ impl KeyEntry {
     }
 
     /// Overwrite the adjustable fields from an (admin-updated) record. The
-    /// accrued spend is deliberately NOT overwritten — memory is the source
+    /// accrued spend is deliberately NOT overwritten - memory is the source
     /// of truth for spend after boot.
     fn apply_limits(&self, record: &VirtualKeyRecord) {
         self.budget_max_micro.store(
@@ -125,13 +125,13 @@ impl KeyEntry {
     /// request never reserves budget.
     ///
     /// The TPM window is debited with the pre-call **estimate** and never
-    /// adjusted afterwards (unlike the budget): conservative by design —
+    /// adjusted afterwards (unlike the budget): conservative by design -
     /// a quota can throttle early but can never be overrun.
     ///
     /// # Errors
     ///
     /// [`GatewayError::QuotaExceeded`] (429) or
-    /// [`GatewayError::BudgetExceeded`] (402) — all decided in memory,
+    /// [`GatewayError::BudgetExceeded`] (402) - all decided in memory,
     /// *before* any upstream call.
     pub fn admit(
         self: &Arc<Self>,
@@ -196,7 +196,7 @@ impl KeyEntry {
 ///
 /// [`settle`](Self::settle) replaces the reserved estimate with the real
 /// cost; dropping without settling refunds the whole reservation (the call
-/// failed or was cancelled — no spend happened).
+/// failed or was cancelled - no spend happened).
 #[derive(Debug)]
 pub struct Reservation {
     entry: Arc<KeyEntry>,
@@ -206,7 +206,7 @@ pub struct Reservation {
 
 impl Reservation {
     /// Commit the real cost of the call, releasing any over-reservation (or
-    /// charging the shortfall — the real cost wins even past the budget; the
+    /// charging the shortfall - the real cost wins even past the budget; the
     /// *next* request will be refused).
     pub fn settle(mut self, actual_cost_micro: i64) {
         let delta = actual_cost_micro.max(0) - self.reserved_micro;
@@ -259,7 +259,7 @@ impl AuthState {
     }
 
     /// Resolve a presented bearer key to its live entry. `None` for unknown,
-    /// disabled or expired keys — indistinguishable to the caller by design.
+    /// disabled or expired keys - indistinguishable to the caller by design.
     #[must_use]
     pub fn authenticate(&self, presented: &str, now: i64) -> Option<Arc<KeyEntry>> {
         let entry = self.by_hash.get(&hash_key(presented))?;

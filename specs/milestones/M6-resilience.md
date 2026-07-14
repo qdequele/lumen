@@ -1,18 +1,18 @@
-# M6 — Resilience
+# M6 - Resilience
 
 ## Objective
-Retries, fallbacks, circuit breaker, timeouts — without ever compromising the stability of the gateway itself under load (LiteLLM lesson #15526: cascade of k8s restarts under upstream 429s).
+Retries, fallbacks, circuit breaker, timeouts - without ever compromising the stability of the gateway itself under load (LiteLLM lesson #15526: cascade of k8s restarts under upstream 429s).
 
 ## Tasks
 
 ### 6.1 Retries
-- [x] Retry only on retryable `ProviderError` (5xx, connect timeout, 429) — never on client 4xx
+- [x] Retry only on retryable `ProviderError` (5xx, connect timeout, 429) - never on client 4xx
 - [x] Exponential backoff + jitter (default: base 200 ms, max 5 s, 3 attempts), honors `Retry-After` if it is longer
 - [x] Streaming: retry ONLY if no chunk has been emitted to the client yet
 - [x] Global retry budget per request (the total time stays bounded by the total timeout)
 
 ### 6.2 Fallback
-- [x] Config: `fallbacks = ["model-a", "model-b"]` per model — same capability required, validated at boot
+- [x] Config: `fallbacks = ["model-a", "model-b"]` per model - same capability required, validated at boot
 - [x] Fallback triggered after the current provider's retries are exhausted
 - [x] `x-lumen-model-used` response header + field in usage_log
 - [x] Same streaming rule: no fallback after the first emitted chunk
@@ -26,13 +26,13 @@ Retries, fallbacks, circuit breaker, timeouts — without ever compromising the 
 - [x] Three configurable timeouts per provider with global defaults: `connect` (5 s), `first_token` (30 s), `total` (600 s)
 - [x] Each timeout → a distinct error (LM-3011/3012/3013) for debugging
 
-Note: `connect` is a global client setting (a single shared HTTP client) —
+Note: `connect` is a global client setting (a single shared HTTP client) -
 no per-provider override; `first_token` and `total` are overridable per
 provider. LM-3011 = first-token, LM-3012 = connect, LM-3013 = total. See
 `docs/adr/005-resilience-execution.md`.
 
 ### 6.5 Background health checks
-- [x] Optional periodic task (default off) that probes the providers — results in memory + metric, NEVER consulted in the request path in a blocking way
+- [x] Optional periodic task (default off) that probes the providers - results in memory + metric, NEVER consulted in the request path in a blocking way
 - [x] The gateway's /health stays independent of provider health; add a separate `/health/providers` for observability
 
 ## Acceptance criteria

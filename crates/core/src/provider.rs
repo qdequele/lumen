@@ -3,7 +3,7 @@
 //! Every method that performs an upstream call takes a [`CancellationToken`].
 //! When the token fires (because the downstream client disconnected), the
 //! provider MUST abort its in-flight HTTP request so the upstream model stops
-//! generating — dropping the response body is not enough (lesson: LiteLLM
+//! generating - dropping the response body is not enough (lesson: LiteLLM
 //! issue #22805).
 
 use crate::chat::{ChatChunk, ChatRequest, ChatResponse};
@@ -41,7 +41,7 @@ pub trait ChatProvider: Send + Sync {
     /// frames including the terminal `data: [DONE]\n\n`.
     ///
     /// The default adapts [`chat_stream`](ChatProvider::chat_stream) by
-    /// serializing each typed chunk — correct for translating providers.
+    /// serializing each typed chunk - correct for translating providers.
     /// Passthrough providers (whose upstream already speaks OpenAI SSE) override
     /// this to forward upstream bytes verbatim with no per-chunk `serde` round
     /// trip (zero-copy; see ADR 004). Errors before the first frame surface as

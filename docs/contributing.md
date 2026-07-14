@@ -1,7 +1,7 @@
 # Contributing
 
 LUMEN is open to contributions. The canonical, always-current guide lives at
-the repository root — GitHub renders it in the pull-request and issue UI:
+the repository root - GitHub renders it in the pull-request and issue UI:
 
 ➡️ **[CONTRIBUTING.md on GitHub](https://github.com/qdequele/lumen/blob/main/CONTRIBUTING.md)**
 
@@ -11,7 +11,7 @@ process, and the full issue-label taxonomy.
 
 ## The label axes at a glance
 
-Issues are classified along four independent axes — one label from each
+Issues are classified along four independent axes - one label from each
 relevant axis; `scope:` may be multiple or omitted for cross-cutting work.
 
 | Axis | Labels |

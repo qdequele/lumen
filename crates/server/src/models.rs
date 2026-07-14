@@ -1,7 +1,7 @@
-//! `GET /v1/models` — model discovery.
+//! `GET /v1/models` - model discovery.
 //!
 //! Lists every model the operator configured, in the OpenAI list shape extended
-//! with a `capabilities` array. It reflects ONLY the local configuration — the
+//! with a `capabilities` array. It reflects ONLY the local configuration - the
 //! gateway never introspects upstreams (spec 3.3), so this route touches no
 //! provider and does no I/O.
 

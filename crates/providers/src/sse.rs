@@ -3,12 +3,12 @@
 //! Upstream SSE frames arrive fragmented across arbitrary TCP packet
 //! boundaries: one `Bytes` chunk may hold half an event, three events, or an
 //! event split in the middle of its `data:` line. This parser buffers only the
-//! **current incomplete event** (bounded — see [`MAX_EVENT_BYTES`]) and yields
+//! **current incomplete event** (bounded - see [`MAX_EVENT_BYTES`]) and yields
 //! complete events as they close, so translating providers (Anthropic, Google)
 //! can consume upstream streams without ever holding the full response in
 //! memory.
 //!
-//! Scope: exactly what LLM provider streams need — `event:` and `data:` fields
+//! Scope: exactly what LLM provider streams need - `event:` and `data:` fields
 //! (multi-line `data:` joined with `\n`), comment lines (`:`) ignored, LF and
 //! CRLF line endings. `id:`/`retry:` fields are ignored.
 
@@ -73,7 +73,7 @@ impl SseParser {
     }
 }
 
-/// Find the earliest event terminator — a line ending followed by an empty
+/// Find the earliest event terminator - a line ending followed by an empty
 /// line (`\n\n` or `\n\r\n`; the `\r` of a CRLF field line is stripped by
 /// `parse_event`). Returns `(event_end, terminator_len)`.
 fn find_event_end(buf: &[u8]) -> Option<(usize, usize)> {

@@ -1,4 +1,4 @@
-//! Cheap local token estimation — the ADR 003 fallback.
+//! Cheap local token estimation - the ADR 003 fallback.
 //!
 //! When an upstream reports usage, that value wins (`estimated = false`) and
 //! nothing here runs. When it doesn't (TEI reports nothing; some streams omit
@@ -31,7 +31,7 @@ pub fn estimate_text(text: &str) -> u64 {
 
 /// Estimate the prompt tokens of a chat request: content of every message
 /// plus a fixed per-message overhead. Tool definitions and other `extra`
-/// payloads are deliberately ignored — cheap and predictable beats complete.
+/// payloads are deliberately ignored - cheap and predictable beats complete.
 #[must_use]
 pub fn estimate_chat_prompt(req: &ChatRequest) -> u64 {
     req.messages

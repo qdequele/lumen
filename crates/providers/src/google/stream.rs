@@ -4,10 +4,10 @@
 //! `GenerateContentResponse` objects: each carries the next slice of candidate
 //! text in `candidates[0].content.parts[].text`; the final one adds a
 //! `finishReason` and cumulative `usageMetadata`. There is no explicit
-//! terminal event — the translator marks the stream done when it sees a
+//! terminal event - the translator marks the stream done when it sees a
 //! `finishReason`, so an upstream that dies earlier leaves no terminator
 //! (LM-3010 downstream). Translation state is bounded: a first-chunk flag and
-//! the ids only — content is never accumulated.
+//! the ids only - content is never accumulated.
 
 use lumen_core::{ChatChunk, ChatChunkChoice, ChatDelta, ProviderError, Usage};
 use serde::Deserialize;

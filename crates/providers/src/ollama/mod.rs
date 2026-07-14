@@ -1,4 +1,4 @@
-//! Ollama provider — local, keyless embeddings via `/api/embed`.
+//! Ollama provider - local, keyless embeddings via `/api/embed`.
 //!
 //! Ollama's embed schema differs from OpenAI's: the request is
 //! `{ "model", "input" }` and the response returns `embeddings` as an array of

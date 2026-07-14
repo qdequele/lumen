@@ -75,7 +75,7 @@ impl Accounting {
     ///
     /// # Errors
     ///
-    /// Budget/quota rejections from admission — decided in memory, BEFORE
+    /// Budget/quota rejections from admission - decided in memory, BEFORE
     /// any upstream call. Metadata problems never error (ADR 002): they are
     /// dropped with a warn + counter.
     pub fn begin(
@@ -156,7 +156,7 @@ impl Accounting {
         let metadata_json = self.metadata.as_ref().map(RequestMetadata::to_json);
 
         // ADR 002 sink 1, log half: the full metadata rides the structured
-        // usage event (labels only — never prompt or response content).
+        // usage event (labels only - never prompt or response content).
         tracing::debug!(
             target: "lumen::usage",
             capability = self.capability,
@@ -235,7 +235,7 @@ impl Accounting {
 }
 
 /// Streaming accounting: sniffs the forwarded SSE bytes for the final usage
-/// chunk and closes the [`Accounting`] when the stream ends — including on
+/// chunk and closes the [`Accounting`] when the stream ends - including on
 /// client disconnect (via `Drop`), where whatever was observed so far is
 /// settled instead of refunding tokens the upstream already produced.
 pub struct StreamAccounting {
@@ -260,7 +260,7 @@ impl StreamAccounting {
         self.sniffer.scan(frame);
     }
 
-    /// Close the record with a 200 outcome (clean end or client disconnect —
+    /// Close the record with a 200 outcome (clean end or client disconnect -
     /// the HTTP status the client saw). Idempotent; also runs from `Drop`.
     pub fn finalize(&mut self) {
         self.finalize_with_status(200);
@@ -268,7 +268,7 @@ impl StreamAccounting {
 
     /// Close the record with the terminal outcome of the stream: 200 for a
     /// clean end, the gateway error's status (502/504/…) when the stream was
-    /// cut short by an in-band error frame — so `usage_log.status` reflects
+    /// cut short by an in-band error frame - so `usage_log.status` reflects
     /// what actually happened, not the initial response headers.
     pub fn finalize_with_status(&mut self, status: u16) {
         let Some(accounting) = self.accounting.take() else {
@@ -276,7 +276,7 @@ impl StreamAccounting {
         };
         let (tokens_in, tokens_out, estimated) = self.sniffer.result(self.estimated_input);
         // Bill at the model that actually served the stream (a fallback may
-        // differ from the requested model) — consistent with the non-streaming,
+        // differ from the requested model) - consistent with the non-streaming,
         // embed and rerank paths.
         let cost = accounting
             .pricing()
@@ -299,11 +299,11 @@ impl Drop for StreamAccounting {
 }
 
 /// Maximum retained line length; SSE data lines beyond this are skipped (the
-/// stream itself is untouched — we only lose the ability to read its usage).
+/// stream itself is untouched - we only lose the ability to read its usage).
 const MAX_SNIFFED_LINE: usize = 256 * 1024;
 
 /// Scans forwarded SSE bytes, line by line, retaining ONLY the latest valid
-/// top-level usage object plus a frame count — bounded state, no response
+/// top-level usage object plus a frame count - bounded state, no response
 /// accumulation (ADR 004), and serde only on the rare candidate lines.
 #[derive(Debug, Default)]
 struct UsageSniffer {
@@ -371,8 +371,8 @@ impl UsageSniffer {
 
     /// `(tokens_in, tokens_out, estimated)`. Upstream usage from the last
     /// usage-bearing chunk wins; otherwise the pre-computed input estimate
-    /// and the data-frame count (streaming deltas are roughly one token each)
-    /// — honestly flagged estimated, never a silent zero.
+    /// and the data-frame count (streaming deltas are roughly one token
+    /// each) - honestly flagged estimated, never a silent zero.
     fn result(&self, estimated_input: u64) -> (u64, u64, bool) {
         match self.upstream_usage {
             Some((prompt, completion)) => (prompt, completion, false),
@@ -434,7 +434,7 @@ mod tests {
     #[test]
     fn spoofed_usage_in_content_is_overridden_by_the_real_final_chunk() {
         let mut s = UsageSniffer::default();
-        // Model content mentions "usage" — retained, but the real final
+        // Model content mentions "usage" - retained, but the real final
         // usage chunk arrives later and wins (last occurrence).
         s.scan(b"data: {\"choices\":[{\"delta\":{\"content\":\"\\\"usage\\\" is fun\"}}]}\n\n");
         s.scan(b"data: {\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":6}}\n\n");
