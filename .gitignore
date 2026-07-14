@@ -16,6 +16,10 @@
 .env
 .env.*
 
+# mdBook output
+/book
+/.tmp-mdbook
+
 # Editor / OS
 .DS_Store
 .idea/
