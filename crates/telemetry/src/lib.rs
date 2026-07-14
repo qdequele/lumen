@@ -7,12 +7,14 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod latency;
 pub mod logging;
 pub mod metrics;
 pub mod reload;
 pub mod resilience;
 pub mod tokens;
 
+pub use latency::LatencyMetrics;
 pub use logging::init_logging;
 pub use metrics::Metrics;
 pub use reload::ReloadMetrics;

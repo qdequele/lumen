@@ -7,7 +7,7 @@
 use lumen_providers::{http, Registry};
 use lumen_server::resilience::ResilienceRuntime;
 use lumen_server::{build_app, serve, AppState, StreamGuards};
-use lumen_telemetry::{Metrics, TokenMetrics};
+use lumen_telemetry::{LatencyMetrics, Metrics, TokenMetrics};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
@@ -16,7 +16,8 @@ use tokio::net::TcpListener;
 pub fn base_state(registry: Arc<Registry>) -> AppState {
     let metrics = Metrics::new();
     let tokens = TokenMetrics::register(&metrics, &[]).expect("register token metrics");
-    AppState::new(metrics, registry, tokens)
+    let latency = LatencyMetrics::register(&metrics).expect("register latency metrics");
+    AppState::new(metrics, registry, tokens, latency)
 }
 
 /// Spawn the app with a given registry and body limit; returns its base URL.
