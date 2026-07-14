@@ -371,6 +371,22 @@ def check_embed_guard_lm2005(model: str) -> None:
                f"expected 400 LM-2005, got HTTP {code} {err_code(body)} {err_msg(body)}")
 
 
+def check_latency_metrics() -> None:
+    """Every endpoint hit above must have latency histogram samples."""
+    code, text = http("GET", "/metrics")
+    lines = str(text).splitlines()
+    http_ok = any(l.startswith("lumen_http_request_duration_seconds_bucket{")
+                  and 'path="/v1/chat/completions"' in l for l in lines)
+    e2e_ok = any(l.startswith("lumen_request_duration_seconds_bucket{")
+                 and 'provider="' in l for l in lines)
+    if code == 200 and http_ok and e2e_ok:
+        report("PASS", "latency metrics",
+               "(http_request_duration by route + request_duration by provider/model)")
+    else:
+        report("FAIL", "latency metrics",
+               f"histograms missing on /metrics (route={http_ok}, e2e={e2e_ok})")
+
+
 def check_media_accounting() -> None:
     """The image embeds above must show up in the M9 media counters."""
     code, text = http("GET", "/metrics")
@@ -487,6 +503,10 @@ def main() -> int:
         check_media_accounting()
     else:
         report("SKIP", "media accounting", "(needs a successful cohere image embed)")
+    if passed > 3:
+        check_latency_metrics()
+    else:
+        report("SKIP", "latency metrics", "(no successful API call to measure)")
 
     # Multi-tenant metadata (ADR 002): the allowlisted keys must come back as
     # Prometheus labels on the token counters.

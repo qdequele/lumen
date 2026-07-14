@@ -126,6 +126,8 @@ per org over 24h:
 | Locally estimated share | `estimated="true"` slice + `lumen_tokens_estimated_total` |
 | Rerank search units | `lumen_rerank_search_units_total{model,provider}` |
 | Media items / decoded bytes | `lumen_media_total`, `lumen_media_bytes_total` (M9) |
+| API latency by endpoint (p50/p99), request rate by endpoint/status | `lumen_http_request_duration_seconds{method,path,status}` (path = matched route template) |
+| End-to-end latency by provider / model (p99) | `lumen_request_duration_seconds{capability,model,provider,status}` (streaming covers the whole stream) |
 | Circuit breaker timeline | `lumen_circuit_state{provider,model}` (0 closed / 1 open / 2 half-open) |
 | Provider health | `lumen_provider_up{provider}` (only providers with an explicit `base_url` are probed - here Cloudflare) |
 | Internals | `lumen_usage_log_dropped_total`, `lumen_metadata_rejected_total`, `lumen_config_reloads_total`, `lumen_config_reload_failures_total` |

@@ -1,7 +1,7 @@
 {
   "uid": "lumen-gateway",
   "title": "LUMEN Gateway",
-  "description": "Token consumption, per-provider usage, rerank/media accounting and resilience for the LUMEN gateway (metrics from /metrics, ADR 003).",
+  "description": "Token consumption, latency, per-provider usage, rerank/media accounting, multi-tenant attribution and resilience for the LUMEN gateway.",
   "tags": [
     "lumen"
   ],
@@ -14,7 +14,139 @@
   },
   "refresh": "5s",
   "schemaVersion": 39,
+  "templating": {
+    "list": [
+      {
+        "name": "provider",
+        "label": "Provider",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "query": {
+          "qryType": 1,
+          "query": "label_values(lumen_tokens_total, provider)",
+          "refId": "var-provider"
+        },
+        "refresh": 2,
+        "sort": 1,
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ],
+          "selected": true
+        },
+        "options": []
+      },
+      {
+        "name": "model",
+        "label": "Model",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "query": {
+          "qryType": 1,
+          "query": "label_values(lumen_tokens_total{provider=~\"$provider\"}, model)",
+          "refId": "var-model"
+        },
+        "refresh": 2,
+        "sort": 1,
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ],
+          "selected": true
+        },
+        "options": []
+      },
+      {
+        "name": "org_id",
+        "label": "Org",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "query": {
+          "qryType": 1,
+          "query": "label_values(lumen_tokens_total, org_id)",
+          "refId": "var-org_id"
+        },
+        "refresh": 2,
+        "sort": 1,
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ],
+          "selected": true
+        },
+        "options": []
+      },
+      {
+        "name": "scenario",
+        "label": "Scenario",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "query": {
+          "qryType": 1,
+          "query": "label_values(lumen_tokens_total, scenario)",
+          "refId": "var-scenario"
+        },
+        "refresh": 2,
+        "sort": 1,
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ],
+          "selected": true
+        },
+        "options": []
+      }
+    ]
+  },
   "panels": [
+    {
+      "type": "row",
+      "title": "Overview",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "panels": []
+    },
     {
       "type": "stat",
       "title": "Tokens (range)",
@@ -22,7 +154,7 @@
         "h": 4,
         "w": 4,
         "x": 0,
-        "y": 0
+        "y": 1
       },
       "datasource": {
         "type": "prometheus",
@@ -31,7 +163,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum(increase(lumen_tokens_total[$__range]))",
+          "expr": "sum(increase(lumen_tokens_total{provider=~\"$provider\",model=~\"$model\",org_id=~\"$org_id\",scenario=~\"$scenario\"}[$__range]))",
           "instant": true
         }
       ],
@@ -39,11 +171,11 @@
         "defaults": {
           "unit": "short",
           "decimals": 0,
+          "noValue": "0",
           "color": {
             "mode": "fixed",
             "fixedColor": "#0072B2"
-          },
-          "noValue": "0"
+          }
         },
         "overrides": []
       },
@@ -64,7 +196,7 @@
         "h": 4,
         "w": 4,
         "x": 4,
-        "y": 0
+        "y": 1
       },
       "datasource": {
         "type": "prometheus",
@@ -73,7 +205,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum(increase(lumen_tokens_total{direction=\"input\"}[$__range]))",
+          "expr": "sum(increase(lumen_tokens_total{direction=\"input\",provider=~\"$provider\",model=~\"$model\",org_id=~\"$org_id\",scenario=~\"$scenario\"}[$__range]))",
           "instant": true
         }
       ],
@@ -81,11 +213,11 @@
         "defaults": {
           "unit": "short",
           "decimals": 0,
+          "noValue": "0",
           "color": {
             "mode": "fixed",
             "fixedColor": "#0072B2"
-          },
-          "noValue": "0"
+          }
         },
         "overrides": []
       },
@@ -106,7 +238,7 @@
         "h": 4,
         "w": 4,
         "x": 8,
-        "y": 0
+        "y": 1
       },
       "datasource": {
         "type": "prometheus",
@@ -115,7 +247,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum(increase(lumen_tokens_total{direction=\"output\"}[$__range]))",
+          "expr": "sum(increase(lumen_tokens_total{direction=\"output\",provider=~\"$provider\",model=~\"$model\",org_id=~\"$org_id\",scenario=~\"$scenario\"}[$__range]))",
           "instant": true
         }
       ],
@@ -123,11 +255,11 @@
         "defaults": {
           "unit": "short",
           "decimals": 0,
+          "noValue": "0",
           "color": {
             "mode": "fixed",
             "fixedColor": "#E69F00"
-          },
-          "noValue": "0"
+          }
         },
         "overrides": []
       },
@@ -144,12 +276,11 @@
     {
       "type": "stat",
       "title": "Locally estimated share",
-      "description": "Share of tokens counted by the local estimator instead of upstream usage (ADR 003). 0% = every upstream reported usage.",
       "gridPos": {
         "h": 4,
         "w": 4,
         "x": 12,
-        "y": 0
+        "y": 1
       },
       "datasource": {
         "type": "prometheus",
@@ -158,7 +289,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "100 * (sum(increase(lumen_tokens_total{estimated=\"true\"}[$__range])) or vector(0)) / clamp_min(sum(increase(lumen_tokens_total[$__range])), 1)",
+          "expr": "100 * (sum(increase(lumen_tokens_total{estimated=\"true\",provider=~\"$provider\",model=~\"$model\",org_id=~\"$org_id\",scenario=~\"$scenario\"}[$__range])) or vector(0)) / clamp_min(sum(increase(lumen_tokens_total{provider=~\"$provider\",model=~\"$model\",org_id=~\"$org_id\",scenario=~\"$scenario\"}[$__range])), 1)",
           "instant": true
         }
       ],
@@ -195,7 +326,8 @@
         },
         "graphMode": "none",
         "colorMode": "value"
-      }
+      },
+      "description": "Share of tokens counted by the local estimator instead of upstream usage (ADR 003)."
     },
     {
       "type": "stat",
@@ -204,7 +336,7 @@
         "h": 4,
         "w": 4,
         "x": 16,
-        "y": 0
+        "y": 1
       },
       "datasource": {
         "type": "prometheus",
@@ -213,7 +345,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum(increase(lumen_rerank_search_units_total[$__range]))",
+          "expr": "sum(increase(lumen_rerank_search_units_total{provider=~\"$provider\",model=~\"$model\",org_id=~\"$org_id\",scenario=~\"$scenario\"}[$__range]))",
           "instant": true
         }
       ],
@@ -221,11 +353,11 @@
         "defaults": {
           "unit": "short",
           "decimals": 0,
+          "noValue": "0",
           "color": {
             "mode": "fixed",
             "fixedColor": "#CC79A7"
-          },
-          "noValue": "0"
+          }
         },
         "overrides": []
       },
@@ -242,12 +374,11 @@
     {
       "type": "stat",
       "title": "Media items (range)",
-      "description": "Images (and other media) processed on multimodal requests (M9).",
       "gridPos": {
         "h": 4,
         "w": 4,
         "x": 20,
-        "y": 0
+        "y": 1
       },
       "datasource": {
         "type": "prometheus",
@@ -256,7 +387,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum(increase(lumen_media_total[$__range]))",
+          "expr": "sum(increase(lumen_media_total{provider=~\"$provider\",model=~\"$model\",org_id=~\"$org_id\",scenario=~\"$scenario\"}[$__range]))",
           "instant": true
         }
       ],
@@ -264,11 +395,11 @@
         "defaults": {
           "unit": "short",
           "decimals": 0,
+          "noValue": "0",
           "color": {
             "mode": "fixed",
             "fixedColor": "#56B4E9"
-          },
-          "noValue": "0"
+          }
         },
         "overrides": []
       },
@@ -280,7 +411,20 @@
         },
         "graphMode": "none",
         "colorMode": "value"
-      }
+      },
+      "description": "Images (and other media) processed on multimodal requests (M9)."
+    },
+    {
+      "type": "row",
+      "title": "Token consumption",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 5
+      },
+      "panels": []
     },
     {
       "type": "timeseries",
@@ -289,7 +433,7 @@
         "h": 9,
         "w": 12,
         "x": 0,
-        "y": 4
+        "y": 6
       },
       "datasource": {
         "type": "prometheus",
@@ -298,9 +442,9 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (provider) (rate(lumen_tokens_total[$__rate_interval]))",
-          "legendFormat": "{{provider}}",
-          "range": true
+          "range": true,
+          "expr": "sum by (provider) (rate(lumen_tokens_total{provider=~\"$provider\",model=~\"$model\",org_id=~\"$org_id\",scenario=~\"$scenario\"}[$__rate_interval]))",
+          "legendFormat": "{{provider}}"
         }
       ],
       "fieldConfig": {
@@ -460,7 +604,7 @@
         "h": 9,
         "w": 12,
         "x": 12,
-        "y": 4
+        "y": 6
       },
       "datasource": {
         "type": "prometheus",
@@ -469,9 +613,9 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (model) (rate(lumen_tokens_total[$__rate_interval]))",
-          "legendFormat": "{{model}}",
-          "range": true
+          "range": true,
+          "expr": "sum by (model) (rate(lumen_tokens_total{provider=~\"$provider\",model=~\"$model\",org_id=~\"$org_id\",scenario=~\"$scenario\"}[$__rate_interval]))",
+          "legendFormat": "{{model}}"
         }
       ],
       "fieldConfig": {
@@ -507,10 +651,10 @@
       "type": "timeseries",
       "title": "Input vs output token rate",
       "gridPos": {
-        "h": 9,
+        "h": 8,
         "w": 8,
         "x": 0,
-        "y": 13
+        "y": 15
       },
       "datasource": {
         "type": "prometheus",
@@ -519,9 +663,9 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (direction) (rate(lumen_tokens_total[$__rate_interval]))",
-          "legendFormat": "{{direction}}",
-          "range": true
+          "range": true,
+          "expr": "sum by (direction) (rate(lumen_tokens_total{provider=~\"$provider\",model=~\"$model\",org_id=~\"$org_id\",scenario=~\"$scenario\"}[$__rate_interval]))",
+          "legendFormat": "{{direction}}"
         }
       ],
       "fieldConfig": {
@@ -582,10 +726,10 @@
       "type": "timeseries",
       "title": "Token rate by capability",
       "gridPos": {
-        "h": 9,
+        "h": 8,
         "w": 8,
         "x": 8,
-        "y": 13
+        "y": 15
       },
       "datasource": {
         "type": "prometheus",
@@ -594,9 +738,9 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (capability) (rate(lumen_tokens_total[$__rate_interval]))",
-          "legendFormat": "{{capability}}",
-          "range": true
+          "range": true,
+          "expr": "sum by (capability) (rate(lumen_tokens_total{provider=~\"$provider\",model=~\"$model\",org_id=~\"$org_id\",scenario=~\"$scenario\"}[$__rate_interval]))",
+          "legendFormat": "{{capability}}"
         }
       ],
       "fieldConfig": {
@@ -675,10 +819,10 @@
       "type": "piechart",
       "title": "Tokens by model (range)",
       "gridPos": {
-        "h": 9,
+        "h": 8,
         "w": 8,
         "x": 16,
-        "y": 13
+        "y": 15
       },
       "datasource": {
         "type": "prometheus",
@@ -687,9 +831,9 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (model) (increase(lumen_tokens_total[$__range]))",
-          "legendFormat": "{{model}}",
-          "instant": true
+          "instant": true,
+          "expr": "sum by (model) (increase(lumen_tokens_total{provider=~\"$provider\",model=~\"$model\",org_id=~\"$org_id\",scenario=~\"$scenario\"}[$__range]))",
+          "legendFormat": "{{model}}"
         }
       ],
       "fieldConfig": {
@@ -719,13 +863,25 @@
       }
     },
     {
+      "type": "row",
+      "title": "Latency",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 23
+      },
+      "panels": []
+    },
+    {
       "type": "timeseries",
-      "title": "Rerank search-unit rate by provider",
+      "title": "API latency by endpoint (p50 / p99)",
       "gridPos": {
         "h": 8,
-        "w": 6,
+        "w": 12,
         "x": 0,
-        "y": 22
+        "y": 24
       },
       "datasource": {
         "type": "prometheus",
@@ -734,9 +890,361 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (provider) (rate(lumen_rerank_search_units_total[$__rate_interval]))",
-          "legendFormat": "{{provider}}",
-          "range": true
+          "range": true,
+          "expr": "histogram_quantile(0.99, sum by (le, path) (rate(lumen_http_request_duration_seconds_bucket{path=~\"/v1/.*\"}[$__rate_interval])))",
+          "legendFormat": "p99 {{path}}"
+        },
+        {
+          "refId": "B",
+          "range": true,
+          "expr": "histogram_quantile(0.50, sum by (le, path) (rate(lumen_http_request_duration_seconds_bucket{path=~\"/v1/.*\"}[$__rate_interval])))",
+          "legendFormat": "p50 {{path}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 5,
+            "showPoints": "never"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "p50 .*"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    6,
+                    4
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "lumen_http_request_duration_seconds: every HTTP request, labelled with the matched route template. Includes upstream model time for /v1/* calls."
+    },
+    {
+      "type": "timeseries",
+      "title": "Request rate by endpoint / status",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 24
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "range": true,
+          "expr": "sum by (path, status) (rate(lumen_http_request_duration_seconds_count{path=~\"/v1/.*\"}[$__rate_interval]))",
+          "legendFormat": "{{path}} - {{status}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 15,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "normal"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "mean"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "Per-route throughput and error mix from the request-duration histogram count."
+    },
+    {
+      "type": "timeseries",
+      "title": "End-to-end latency by provider (p99)",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 32
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "range": true,
+          "expr": "histogram_quantile(0.99, sum by (le, provider) (rate(lumen_request_duration_seconds_bucket{provider=~\"$provider\",model=~\"$model\"}[$__rate_interval])))",
+          "legendFormat": "{{provider}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 5,
+            "showPoints": "never"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "openai"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#009E73"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "anthropic"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#E69F00"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "mistral"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#D55E00"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "google"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#0072B2"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "cohere"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#CC79A7"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "jina"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#56B4E9"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "voyage"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#F0E442"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "cloudflare"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#8C564B"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "lumen_request_duration_seconds: accounted API calls attributed to the provider that actually served them (streaming covers the whole stream)."
+    },
+    {
+      "type": "timeseries",
+      "title": "End-to-end latency by model (p99)",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 32
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "range": true,
+          "expr": "histogram_quantile(0.99, sum by (le, model) (rate(lumen_request_duration_seconds_bucket{provider=~\"$provider\",model=~\"$model\"}[$__rate_interval])))",
+          "legendFormat": "{{model}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 5,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "row",
+      "title": "Rerank & media (M9)",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 40
+      },
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Rerank search-unit rate by provider",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 41
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "range": true,
+          "expr": "sum by (provider) (rate(lumen_rerank_search_units_total{provider=~\"$provider\",model=~\"$model\",org_id=~\"$org_id\",scenario=~\"$scenario\"}[$__rate_interval]))",
+          "legendFormat": "{{provider}}"
         }
       ],
       "fieldConfig": {
@@ -816,9 +1324,9 @@
       "title": "Media item rate by type",
       "gridPos": {
         "h": 8,
-        "w": 6,
-        "x": 6,
-        "y": 22
+        "w": 8,
+        "x": 8,
+        "y": 41
       },
       "datasource": {
         "type": "prometheus",
@@ -827,9 +1335,9 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (media_type) (rate(lumen_media_total[$__rate_interval]))",
-          "legendFormat": "{{media_type}}",
-          "range": true
+          "range": true,
+          "expr": "sum by (media_type) (rate(lumen_media_total{provider=~\"$provider\",model=~\"$model\",org_id=~\"$org_id\",scenario=~\"$scenario\"}[$__rate_interval]))",
+          "legendFormat": "{{media_type}}"
         }
       ],
       "fieldConfig": {
@@ -860,9 +1368,9 @@
       "title": "Decoded media bytes rate",
       "gridPos": {
         "h": 8,
-        "w": 6,
-        "x": 12,
-        "y": 22
+        "w": 8,
+        "x": 16,
+        "y": 41
       },
       "datasource": {
         "type": "prometheus",
@@ -871,9 +1379,9 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (media_type) (rate(lumen_media_bytes_total[$__rate_interval]))",
-          "legendFormat": "{{media_type}}",
-          "range": true
+          "range": true,
+          "expr": "sum by (media_type) (rate(lumen_media_bytes_total{provider=~\"$provider\",model=~\"$model\",org_id=~\"$org_id\",scenario=~\"$scenario\"}[$__rate_interval]))",
+          "legendFormat": "{{media_type}}"
         }
       ],
       "fieldConfig": {
@@ -900,14 +1408,25 @@
       }
     },
     {
+      "type": "row",
+      "title": "Multi-tenant & metadata (ADR 002)",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 49
+      },
+      "panels": []
+    },
+    {
       "type": "timeseries",
-      "title": "Token rate by scenario (client metadata)",
-      "description": "Split on the allowlisted x-lumen-metadata key \"scenario\" (ADR 002). The smoke suite sends scenario=smoke, the traffic generator scenario=traffic.",
+      "title": "Token rate by org",
       "gridPos": {
         "h": 8,
         "w": 6,
-        "x": 18,
-        "y": 22
+        "x": 0,
+        "y": 50
       },
       "datasource": {
         "type": "prometheus",
@@ -916,9 +1435,155 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (scenario) (rate(lumen_tokens_total[$__rate_interval]))",
-          "legendFormat": "{{scenario}}",
-          "range": true
+          "range": true,
+          "expr": "sum by (org_id) (rate(lumen_tokens_total{org_id!=\"\",provider=~\"$provider\",model=~\"$model\",org_id=~\"$org_id\",scenario=~\"$scenario\"}[$__rate_interval]))",
+          "legendFormat": "{{org_id}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 25,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "normal"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "sum"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "Multi-tenant attribution via x-lumen-metadata org_id (allowlisted label)."
+    },
+    {
+      "type": "timeseries",
+      "title": "Token rate by team",
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 6,
+        "y": 50
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "range": true,
+          "expr": "sum by (org_id, team_id) (rate(lumen_tokens_total{team_id!=\"\",provider=~\"$provider\",model=~\"$model\",org_id=~\"$org_id\",scenario=~\"$scenario\"}[$__rate_interval]))",
+          "legendFormat": "{{org_id}} / {{team_id}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 25,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "normal"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "sum"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "bargauge",
+      "title": "Top projects by tokens (range)",
+      "description": "Per-project consumption over the dashboard range - the billing view of x-lumen-metadata project_id.",
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 12,
+        "y": 50
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "instant": true,
+          "expr": "topk(10, sum by (org_id, team_id, project_id) (increase(lumen_tokens_total{project_id!=\"\",provider=~\"$provider\",model=~\"$model\",org_id=~\"$org_id\",scenario=~\"$scenario\"}[$__range])))",
+          "legendFormat": "{{org_id}} / {{team_id}} / {{project_id}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "#0072B2"
+          },
+          "noValue": "no tenant traffic yet"
+        },
+        "overrides": []
+      },
+      "options": {
+        "displayMode": "gradient",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "showUnfilled": true
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Token rate by scenario",
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 18,
+        "y": 50
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "range": true,
+          "expr": "sum by (scenario) (rate(lumen_tokens_total{scenario!=\"\",provider=~\"$provider\",model=~\"$model\",org_id=~\"$org_id\",scenario=~\"$scenario\"}[$__rate_interval]))",
+          "legendFormat": "{{scenario}}"
         }
       ],
       "fieldConfig": {
@@ -945,7 +1610,20 @@
           "mode": "multi",
           "sort": "desc"
         }
-      }
+      },
+      "description": "smoke = test suite, traffic = load generator (x-lumen-metadata scenario key)."
+    },
+    {
+      "type": "row",
+      "title": "Resilience & gateway internals",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 58
+      },
+      "panels": []
     },
     {
       "type": "state-timeline",
@@ -955,7 +1633,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 30
+        "y": 59
       },
       "datasource": {
         "type": "prometheus",
@@ -964,9 +1642,9 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "lumen_circuit_state or label_replace(label_replace(vector(0), \"provider\", \"all\", \"\", \"\"), \"model\", \"circuits\", \"\", \"\")",
-          "legendFormat": "{{provider}} / {{model}}",
-          "range": true
+          "range": true,
+          "expr": "lumen_circuit_state{provider=~\"$provider\",model=~\"$model\"} or label_replace(label_replace(vector(0), \"provider\", \"all\", \"\", \"\"), \"model\", \"circuits\", \"\", \"\")",
+          "legendFormat": "{{provider}} / {{model}}"
         }
       ],
       "fieldConfig": {
@@ -1019,7 +1697,7 @@
         "h": 8,
         "w": 6,
         "x": 12,
-        "y": 30
+        "y": 59
       },
       "datasource": {
         "type": "prometheus",
@@ -1028,9 +1706,8 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "lumen_provider_up",
-          "legendFormat": "{{provider}}",
-          "instant": true
+          "expr": "lumen_provider_up{provider=~\"$provider\"}",
+          "legendFormat": "{{provider}}"
         }
       ],
       "fieldConfig": {
@@ -1069,13 +1746,12 @@
     },
     {
       "type": "timeseries",
-      "title": "Gateway internals (drops / rejections / reloads)",
-      "description": "All should stay at zero: dropped usage-log entries (full channel), rejected x-lumen-metadata headers, and config hot-reload failures.",
+      "title": "Drops / rejections / reloads",
       "gridPos": {
         "h": 8,
         "w": 6,
         "x": 18,
-        "y": 30
+        "y": 59
       },
       "datasource": {
         "type": "prometheus",
@@ -1084,27 +1760,27 @@
       "targets": [
         {
           "refId": "A",
+          "range": true,
           "expr": "increase(lumen_usage_log_dropped_total[$__rate_interval])",
-          "legendFormat": "usage log dropped",
-          "range": true
+          "legendFormat": "usage log dropped"
         },
         {
           "refId": "B",
+          "range": true,
           "expr": "increase(lumen_metadata_rejected_total[$__rate_interval])",
-          "legendFormat": "metadata rejected",
-          "range": true
+          "legendFormat": "metadata rejected"
         },
         {
           "refId": "C",
+          "range": true,
           "expr": "increase(lumen_config_reload_failures_total[$__rate_interval])",
-          "legendFormat": "config reload failures",
-          "range": true
+          "legendFormat": "config reload failures"
         },
         {
           "refId": "D",
+          "range": true,
           "expr": "increase(lumen_config_reloads_total[$__rate_interval])",
-          "legendFormat": "config reloads",
-          "range": true
+          "legendFormat": "config reloads"
         }
       ],
       "fieldConfig": {
@@ -1128,154 +1804,8 @@
           "mode": "multi",
           "sort": "desc"
         }
-      }
-    },
-    {
-      "type": "timeseries",
-      "title": "Token rate by org",
-      "description": "Multi-tenant attribution via x-lumen-metadata org_id (ADR 002 allowlisted label).",
-      "gridPos": {
-        "h": 8,
-        "w": 8,
-        "x": 0,
-        "y": 38
       },
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "expr": "sum by (org_id) (rate(lumen_tokens_total{org_id!=\"\"}[$__rate_interval]))",
-          "legendFormat": "{{org_id}}",
-          "range": true
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short",
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 2,
-            "fillOpacity": 25,
-            "showPoints": "never",
-            "stacking": {
-              "mode": "normal"
-            }
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "right",
-          "calcs": [
-            "sum"
-          ]
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      }
-    },
-    {
-      "type": "timeseries",
-      "title": "Token rate by team",
-      "description": "org_id / team_id split from x-lumen-metadata.",
-      "gridPos": {
-        "h": 8,
-        "w": 8,
-        "x": 8,
-        "y": 38
-      },
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "expr": "sum by (org_id, team_id) (rate(lumen_tokens_total{team_id!=\"\"}[$__rate_interval]))",
-          "legendFormat": "{{org_id}} / {{team_id}}",
-          "range": true
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short",
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 2,
-            "fillOpacity": 25,
-            "showPoints": "never",
-            "stacking": {
-              "mode": "normal"
-            }
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "right",
-          "calcs": [
-            "sum"
-          ]
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      }
-    },
-    {
-      "type": "bargauge",
-      "title": "Top projects by tokens (range)",
-      "description": "Per-project consumption over the dashboard range - the billing view of x-lumen-metadata project_id.",
-      "gridPos": {
-        "h": 8,
-        "w": 8,
-        "x": 16,
-        "y": 38
-      },
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "expr": "topk(10, sum by (org_id, team_id, project_id) (increase(lumen_tokens_total{project_id!=\"\"}[$__range])))",
-          "legendFormat": "{{org_id}} / {{team_id}} / {{project_id}}",
-          "instant": true
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short",
-          "decimals": 0,
-          "color": {
-            "mode": "fixed",
-            "fixedColor": "#0072B2"
-          },
-          "noValue": "no tenant traffic yet"
-        },
-        "overrides": []
-      },
-      "options": {
-        "displayMode": "gradient",
-        "orientation": "horizontal",
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ]
-        },
-        "showUnfilled": true
-      }
+      "description": "All should stay at zero: dropped usage-log entries (full channel), rejected x-lumen-metadata headers, config hot-reload failures."
     }
   ]
 }
