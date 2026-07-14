@@ -131,6 +131,9 @@ health_check_interval_ms = 30000  # probe cadence (must not be 0 when enabled)
 #   id            the id clients send (owned entirely by you)
 #   upstream_id   what LUMEN sends upstream (defaults to `id`)
 #   capabilities  any of: "chat", "embed", "rerank"
+#   modalities    input modalities; defaults to ["text"]. Add "image" to accept
+#                 image content parts on /v1/embeddings (M9). Image input to a
+#                 model without "image" is rejected with LM-2003.
 # Model ids must be unique across ALL providers (a collision aborts startup and
 # names both offending providers). Several ids MAY map to the same upstream_id.
 # ---------------------------------------------------------------------------
@@ -217,6 +220,10 @@ fallbacks = ["jina-rerank", "voyage-rerank"]
 id = "embed-multilingual"
 upstream_id = "embed-v4.0"
 capabilities = ["embed", "rerank"]
+# embed-v4 is multimodal: declare "image" so /v1/embeddings accepts image
+# content parts. With [image_fetch] enabled, remote image URLs are fetched and
+# inlined; otherwise clients must pass a data: URI.
+modalities = ["text", "image"]
 
 # Jina: embeddings + reranking (hosted).
 [[providers]]
@@ -252,3 +259,26 @@ base_url = "http://localhost:8081"
 id = "bge-reranker"
 upstream_id = "BAAI/bge-reranker-large"
 capabilities = ["rerank"]
+
+# ---------------------------------------------------------------------------
+# Multimodal image fetching (M9) — OFF by default.
+#
+# When enabled, a remote http(s) image URL in a /v1/embeddings content-parts
+# request is fetched server-side, base64-encoded, and inlined as a data: URI
+# before being sent to the provider. Disabled → such a URL is rejected with
+# LM-2005 (clients must pass a data: URI themselves).
+#
+# Guards (always on when enabled): the private/loopback/link-local IP block is
+# non-configurable; the connection is pinned to the vetted resolved address
+# (DNS-rebinding safe); downloads are capped and time-bounded; only image/*
+# content types are accepted. Restrict `allowed_hosts` / `allowed_url_prefixes`
+# to your own asset origins in production — leaving both empty with fetching on
+# logs a startup warning.
+# ---------------------------------------------------------------------------
+[image_fetch]
+enabled = false
+max_bytes = 10485760          # 10 MiB per image
+timeout_ms = 5000             # per-fetch timeout
+allowed_schemes = ["https"]   # add "http" to allow plaintext
+allowed_hosts = []            # e.g. ["cdn.example.com", ".mycompany.com"]; empty = any public host
+allowed_url_prefixes = []     # e.g. ["https://cdn.example.com/images/"]; empty = no prefix restriction

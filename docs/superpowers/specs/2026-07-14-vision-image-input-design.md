@@ -41,6 +41,15 @@ capability, same streaming path. No new top-level `Capability` variant.
 - Anthropic/Gemini "file"/GCS URI image sources (only inline base64 + —for
   providers that accept them— passthrough of remote URLs).
 
+> **Update (M9 landed first):** the shared `ContentPart` / `ImageUrl` types now
+> live in `crates/core/src/content.rs` (introduced by the multimodal-embeddings
+> milestone) and should be **reused** here rather than redefined in `chat.rs`.
+> `ContentPart.kind` (`"type"`) already defaults to `"text"`, and image-vs-text
+> is dispatched by field presence, not `kind` — see that module. The M8
+> `MessageContent` enum and `ChatMessage.content` widening below are unchanged;
+> only the part types are shared. M8's "never fetch" stance for chat is
+> unaffected by M9's opt-in embeddings fetch.
+
 ## 3. Core type change
 
 `crates/core/src/chat.rs`. Widen `ChatMessage.content`:

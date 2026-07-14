@@ -79,3 +79,13 @@ never a blocking BPE pass. Counting must **never fail or slow a request**.
   than the thing that defines them.
 - New error/counter surface: a `tokens_estimated_total` counter lets operators
   see how much of their accounting is measured vs estimated.
+
+## Addendum (M9) — multimodal embeddings
+
+Image content parts in `/v1/embeddings` do not change this ADR's contract:
+upstream `usage` is trusted when reported (Cohere, Voyage, and Jina all fold
+image cost into their reported token/usage counts). When the upstream reports
+nothing, the local fallback estimates **text parts only** — image parts
+contribute 0 tokens — and the response is still flagged `estimated: true`. This
+undercounts image-heavy requests on a no-usage upstream; a per-image token
+heuristic is a backlog item (see ROADMAP M9 note). No new counter surface.

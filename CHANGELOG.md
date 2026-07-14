@@ -6,6 +6,34 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added — Multimodal embeddings + guarded image fetch (M9)
+
+- `POST /v1/embeddings` now accepts image inputs via OpenAI-style content parts:
+  `input` may be an array whose items are strings or arrays of typed parts
+  (`{"type":"text",...}` / `{"type":"image_url",...}`), mixable per item. The
+  part `type` defaults to `"text"`, and text-vs-image is decided by which field
+  is present, not by `type`. Text-only `input` (string or string array) is
+  unchanged. Shared `ContentPart`/`ImageUrl` types live in
+  `crates/core/src/content.rs` (M8 chat vision will reuse them).
+- Per-model `modalities` config (default `["text"]`), surfaced in
+  `GET /v1/models`. Image input to a model without `"image"` fails fast with
+  `LM-2003` (400) before any upstream call.
+- Multimodal translation for Cohere (embed-v4 `inputs`/`content`), Voyage
+  (`/multimodalembeddings`), and Jina (object `input` array). Non-image-capable
+  providers are gated by the `modalities` check.
+- **Opt-in, guarded server-side image fetch** (`[image_fetch]`, default off):
+  a remote `http(s)` image URL is fetched, base64-encoded, and inlined as a
+  `data:` URI before provider translation. Guards: scheme/host/prefix
+  allowlists, a non-configurable private/loopback/link-local IP block with the
+  connection pinned to the vetted resolved address (DNS-rebinding safe), a
+  streamed size cap, a per-fetch timeout, an `image/*` MIME allowlist, and
+  redirect re-validation. Cancellation-aware. New error codes `LM-2005`
+  (fetch disabled), `LM-2006` (rejected by a guard), `LM-2007` (fetch failed).
+  A remote URL never leaks internal network detail in the client error.
+- Token accounting (ADR 003) for multimodal: upstream `usage` is trusted; the
+  local fallback estimates text parts only (images contribute 0, flagged
+  `estimated`).
+
 ### Added — OpenAI-compatible provider kinds
 
 - Eleven new `kind`s served by the OpenAI provider with a per-kind base URL:

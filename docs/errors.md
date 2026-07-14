@@ -30,6 +30,10 @@ code prefix groups by cause: `1xxx` request, `2xxx` routing, `3xxx` upstream,
 |-----------|------|----------------------------------------------------------------|
 | `LM-2001` | 404  | The requested model id was not found.                          |
 | `LM-2002` | 400  | The model exists but does not serve the requested capability.  |
+| `LM-2003` | 400  | Image input was sent to a model whose `modalities` do not include `"image"` (M9). |
+| `LM-2005` | 400  | A remote image URL was supplied but server-side image fetching is disabled (`[image_fetch] enabled = false`). Inline the image as a `data:` URI or enable fetching (M9). |
+| `LM-2006` | 400  | A remote image URL was rejected by a fetch guard (scheme, host/prefix allowlist, private-IP block, size cap, or non-image content type). The specific reason is logged server-side, never returned (M9). |
+| `LM-2007` | 502  | A permitted image fetch failed at the remote host (network error, timeout, or error status). `type: upstream_error` (M9). |
 | `LM-2010` | 400  | A rerank request supplied no `documents` to score.             |
 
 ## Upstream errors — `LM-3xxx` · `type: upstream_error`

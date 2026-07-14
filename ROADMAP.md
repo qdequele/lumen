@@ -77,5 +77,27 @@ Note : overhead hors réseau mesuré (~3 µs médian, image 10,6 Mo, RSS idle
 (binaires non installés dans l'environnement de dev). Image amd64 via buildx CI ;
 arm64 vérifiée localement (`docker run`).
 
+## M9 — Embeddings multimodales + fetch d'images gardé ✅
+- [x] `EmbedInput` élargi aux content-parts (texte + image, mixables), types
+      partagés `ContentPart`/`ImageUrl` dans `crates/core/src/content.rs`
+- [x] `modalities` par modèle (défaut `["text"]`), exposé dans `GET /v1/models`,
+      enforcement `LM-2003` (image → modèle non multimodal) avant l'amont
+- [x] Fetch serveur opt-in et gardé (`[image_fetch]`, off par défaut) : blocage
+      IP privées non configurable + pinning (anti DNS-rebinding), allowlists
+      scheme/host/prefix, cap de taille streamé, timeout, MIME `image/*`,
+      re-validation des redirections, annulation. `LM-2005/2006/2007`
+- [x] Traduction multimodale Cohere (embed-v4 `inputs`), Voyage
+      (`/multimodalembeddings`), Jina (`input` objets)
+- [x] Comptage tokens : usage amont fiable ; estimation locale = texte seul
+      (images = 0, marqué `estimated`) — ADR 003
+Spec : `docs/superpowers/specs/2026-07-14-multimodal-embeddings-design.md`
+
+Note : exception consciente et bornée à la règle « ne jamais déréférencer une
+URL » — opt-in, hors hot-path streaming, timeout. La vision chat (M8) conserve
+le « never fetch ».
+
 ## Backlog v2 (ne pas implémenter)
-UI admin, cache sémantique, multimodal (images/audio), guardrails, rate limiting distribué (Redis), OTLP tracing, plugin WASM.
+UI admin, cache sémantique, audio (STT/TTS), génération/sortie d'images,
+guardrails, rate limiting distribué (Redis), OTLP tracing, plugin WASM.
+Multimodal *chat* (vision) : voir le plan M8.
+Heuristique de tokens par image pour l'estimation de secours (M9).
