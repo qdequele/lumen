@@ -385,6 +385,13 @@ itself (OpenAI, Anthropic); Gemini's `inline_data` field takes only inline
 bytes, so a remote URL routed to Gemini is rejected with `LM-2004` (400)
 instead of the gateway silently fetching it on the caller's behalf.
 
+The `LM-2004` pre-flight check inspects the **primary** provider of the model's
+fallback chain. In the uncommon case where the primary accepts remote URLs
+(e.g. OpenAI) but a Gemini model is configured as a *fallback*, a request with a
+remote image URL passes pre-flight and, only if the primary then fails over to
+Gemini, surfaces as an upstream `LM-3002` (502) — the gateway still never
+fetches the URL. Configure inline `data:` URIs when a Gemini fallback is in play.
+
 **Accounting.** Upstream-reported `usage` already folds in image tokens; when
 an upstream reports no usage, the local estimation fallback counts text only
 (images contribute `0`) and the response is still flagged `"estimated": true` —
