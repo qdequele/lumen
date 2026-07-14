@@ -44,12 +44,17 @@ pub async fn spawn_with_guards(
 
 /// Spawn the app from a fully-built state (auth/pricing/usage attached by the
 /// caller); returns its base URL.
+///
+/// `body_limit` is applied onto `state` here (the single place it's threaded
+/// through to `build_app`), so `AppState.body_limit` — surfaced in the
+/// `LM-1002` message — can never drift from the limit `build_app` actually
+/// enforces.
 pub async fn spawn_state(state: AppState, body_limit: usize) -> String {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind ephemeral port");
     let addr = listener.local_addr().expect("read local addr");
-    let app = build_app(state, body_limit);
+    let app = build_app(state.with_body_limit(body_limit));
 
     // `pending()` shutdown = never shut down for the lifetime of the test.
     tokio::spawn(async move {

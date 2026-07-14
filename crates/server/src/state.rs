@@ -62,6 +62,8 @@ pub struct AppState {
     pub resilience: Arc<ResilienceRuntime>,
     /// Background provider-health registry (M6 §6.5), for `/health/providers`.
     pub health: Arc<ProviderHealth>,
+    /// Configured max request body size in bytes (for the `LM-1002` message).
+    pub body_limit: usize,
 }
 
 impl AppState {
@@ -80,6 +82,9 @@ impl AppState {
             pricing: Arc::new(ArcSwap::from_pointee(CostTable::default())),
             resilience: Arc::new(ResilienceRuntime::defaults()),
             health: Arc::new(ProviderHealth::default()),
+            // Matches `config::default_body_limit()`; overridden via
+            // `with_body_limit` once the real config is known (main.rs boot).
+            body_limit: 10 * 1024 * 1024,
         }
     }
 
@@ -94,6 +99,13 @@ impl AppState {
     #[must_use]
     pub fn with_health(mut self, health: Arc<ProviderHealth>) -> Self {
         self.health = health;
+        self
+    }
+
+    /// Set the request body-size limit surfaced in `LM-1002`.
+    #[must_use]
+    pub fn with_body_limit(mut self, body_limit: usize) -> Self {
+        self.body_limit = body_limit;
         self
     }
 

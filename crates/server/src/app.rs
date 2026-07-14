@@ -1,14 +1,15 @@
 //! Assembly of the axum application and its middleware stack.
 
 use crate::{admin, auth, chat, embeddings, health, models, rerank, routes, state::AppState};
-use axum::extract::Request;
-use axum::http::{header, HeaderValue};
-use axum::response::Response;
+use axum::extract::{Request, State};
+use axum::http::{header, HeaderValue, StatusCode};
+use axum::response::{IntoResponse, Response};
 use axum::{
     middleware::{self, Next},
     routing::{get, patch, post, put},
     Router,
 };
+use lumen_core::GatewayError;
 use tower::ServiceBuilder;
 use tower_http::{
     limit::RequestBodyLimitLayer,
@@ -17,6 +18,8 @@ use tower_http::{
 };
 use tracing::info_span;
 
+use crate::error::ApiError;
+
 /// Build the full application router with its middleware stack.
 ///
 /// Middleware, outermost first:
@@ -24,7 +27,9 @@ use tracing::info_span;
 /// 2. open a tracing span per request — carrying method, path and request id,
 ///    but never the body or query string (user data is never logged);
 /// 3. propagate the request id onto the response;
-/// 4. reject bodies larger than `body_limit` bytes.
+/// 4. rewrite a bare `413` from the body-limit layer below into the `LM-1002`
+///    envelope;
+/// 5. reject bodies larger than `body_limit` bytes.
 ///
 /// Route groups:
 /// * `/health`, `/health/providers`, `/metrics` — operational, never
@@ -32,13 +37,28 @@ use tracing::info_span;
 /// * `/v1/*` — the API surface; virtual-key auth when enabled (M5);
 /// * `/admin/*` — key management; mounted only when auth is enabled,
 ///   protected by the master key.
-pub fn build_app(state: AppState, body_limit: usize) -> Router {
+///
+/// The body-size limit is read from `state.body_limit` — the single source of
+/// truth also surfaced in the `LM-1002` message — rather than a second
+/// parameter, so the enforced limit and the advertised one can never diverge.
+pub fn build_app(state: AppState) -> Router {
+    let body_limit = state.body_limit;
     let middleware_stack = ServiceBuilder::new()
         .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
         .layer(TraceLayer::new_for_http().make_span_with(make_request_span))
         .layer(PropagateRequestIdLayer::x_request_id())
         // Conservative default security headers on every response (M7 §7.4).
         .layer(middleware::from_fn(security_headers))
+        // `RequestBodyLimitLayer` short-circuits an over-limit body with a bare
+        // `413 Payload Too Large` plain-text response *before* axum routing or
+        // any handler runs (verified empirically: it fires on `Content-Length`
+        // alone, so the chat handler's `JsonRejection` branch never sees it).
+        // This middleware sits just outside that layer to rewrite the bare 413
+        // into our `LM-1002` JSON envelope.
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            map_body_limit_response,
+        ))
         .layer(RequestBodyLimitLayer::new(body_limit));
 
     let api = Router::new()
@@ -72,6 +92,35 @@ pub fn build_app(state: AppState, body_limit: usize) -> Router {
     }
 
     app.with_state(state).layer(middleware_stack)
+}
+
+/// Rewrite a bare `413` from [`RequestBodyLimitLayer`] into the `LM-1002`
+/// envelope.
+///
+/// `RequestBodyLimitLayer` returns its own plain-text `413` directly — it
+/// never constructs a [`GatewayError`], so the response otherwise carries no
+/// stable error code. This middleware wraps that layer and swaps any `413` it
+/// produces for [`GatewayError::PayloadTooLarge`], keeping the `body_limit`
+/// this gateway was configured with in the message.
+///
+/// This rewrites *every* `413`, trusting that only `RequestBodyLimitLayer`
+/// (immediately inside this middleware in the stack below) ever produces one.
+/// No handler in this crate returns 413 for any other reason today; if one
+/// ever needs to, route it around this layer or it will be relabelled as a
+/// body-size rejection.
+async fn map_body_limit_response(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let response = next.run(request).await;
+    if response.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        return ApiError::from(GatewayError::PayloadTooLarge {
+            limit: state.body_limit,
+        })
+        .into_response();
+    }
+    response
 }
 
 /// Conservative default security headers for every response (M7 §7.4).

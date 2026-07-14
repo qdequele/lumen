@@ -11,13 +11,37 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
+use figment::{
+    providers::{Format, Toml},
+    Figment,
+};
 use lumen_core::Capability;
 use lumen_providers::{http, ModelSpec, ProviderKind, ProviderSpec, Registry};
+use lumen_server::config::Config;
 use serde_json::{json, Value};
 use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const LIMIT: usize = 10 * 1024 * 1024;
+
+/// Parse a TOML snippet into a full [`Config`] (defaults fill the rest).
+fn config_from(toml: &str) -> Config {
+    Figment::new()
+        .merge(Toml::string(toml))
+        .extract::<Config>()
+        .expect("valid test config")
+}
+
+/// Spawn the full app from a config. `spawn_state` applies
+/// `config.server.body_limit` onto the state (for the `LM-1002` message) and
+/// into the body-size-limit layer from the same value.
+async fn spawn(config: &Config) -> String {
+    let registry = Arc::new(
+        Registry::build(config.provider_specs(), http::build_client()).expect("registry builds"),
+    );
+    let state = common::base_state(registry);
+    common::spawn_state(state, config.server.body_limit).await
+}
 
 /// One OpenAI-kind provider (chat + an embed-only model) pointed at `upstream`.
 fn openai_registry(upstream: &str) -> Arc<Registry> {
@@ -876,4 +900,58 @@ async fn first_token_timeout_streaming_before_headers_is_504_fg3011() {
     assert_eq!(resp.status(), 504);
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["error"]["code"], "LM-3011");
+}
+
+#[tokio::test]
+async fn oversized_body_returns_lm_1002_envelope() {
+    let upstream = wiremock::MockServer::start().await;
+    let cfg = format!(
+        r#"
+        [server]
+        body_limit = 256
+
+        [[providers]]
+        name = "openai"
+        kind = "openai"
+        base_url = "{}"
+        [[providers.models]]
+        id = "gpt"
+        capabilities = ["chat"]
+        "#,
+        upstream.uri()
+    );
+    let base = spawn(&config_from(&cfg)).await;
+
+    let big = "x".repeat(4096);
+    let body = serde_json::json!({ "model": "gpt", "messages": [{"role":"user","content": big}] });
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 413);
+    let json: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(json["error"]["code"], "LM-1002");
+}
+
+/// A syntactically-invalid but under-limit body must still map to `LM-1001`
+/// (400) — the `LM-1002` middleware only rewrites bare `413`s, so this must
+/// not regress.
+#[tokio::test]
+async fn malformed_json_body_is_still_lm_1001() {
+    let upstream = MockServer::start().await;
+    let base = common::spawn_with(openai_registry(&upstream.uri()), LIMIT).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .header("content-type", "application/json")
+        .body("{ not valid json")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 400);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "LM-1001");
 }

@@ -76,4 +76,16 @@ async fn oversized_body_is_rejected_with_413() {
         .unwrap();
 
     assert_eq!(resp.status(), 413, "expected Payload Too Large");
+    // The `LM-1002` envelope must advertise the *actual* configured limit
+    // (32), not some other value `AppState.body_limit` happened to default to
+    // — this is the single-source-of-truth invariant `spawn_state` enforces.
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "LM-1002");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("32"),
+        "expected the message to cite the configured 32-byte limit, got {body:?}"
+    );
 }

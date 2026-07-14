@@ -57,6 +57,13 @@ pub async fn chat(
     payload: Result<Json<ChatRequest>, JsonRejection>,
 ) -> Result<Response, ApiError> {
     // Malformed body → LM-1001 in our envelope (not axum's plain-text default).
+    //
+    // An over-limit body never reaches here: `RequestBodyLimitLayer` (see
+    // `app.rs`) short-circuits at the tower layer with a bare 413 before axum's
+    // routing/extraction runs, so `JsonRejection` never surfaces
+    // `PAYLOAD_TOO_LARGE` — verified empirically (a debug probe in this
+    // `map_err` never fired for an over-limit request). `app::map_body_limit_response`
+    // rewrites that bare 413 into the `LM-1002` envelope instead.
     let Json(req) = payload.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
 
     if req.messages.is_empty() {
