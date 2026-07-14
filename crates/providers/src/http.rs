@@ -23,7 +23,7 @@ pub fn build_client() -> reqwest::Client {
 }
 
 /// Build the process-wide HTTP client with an explicit connect timeout
-/// (LM-3012, client-wide — M6 §6.4) and an overall backstop.
+/// (LM-3012, client-wide - M6 §6.4) and an overall backstop.
 ///
 /// The `overall` cap is a safety net so a wedged upstream cannot pin a
 /// connection forever; the executor's total timeout (and cancellation on client
@@ -95,7 +95,7 @@ where
 /// success status return the response body as a `Bytes` stream, mapping
 /// transport errors to [`ProviderError`]. The initial send honours `cancel`; the
 /// returned stream is aborted by being dropped (the server holds the cancel drop
-/// guard inside the response body — see ADR 004). A non-success status is
+/// guard inside the response body - see ADR 004). A non-success status is
 /// classified and returned as `Err` before any streaming begins.
 pub async fn open_stream<B>(
     client: &reqwest::Client,
@@ -220,7 +220,7 @@ pub(crate) fn map_transport(provider: &str, err: &reqwest::Error) -> ProviderErr
 /// Run an upstream call, aborting it if `cancel` fires first.
 ///
 /// When the downstream client disconnects the token fires, `fut` is dropped,
-/// and the underlying reqwest future is cancelled — closing the connection so
+/// and the underlying reqwest future is cancelled - closing the connection so
 /// the upstream stops working. `biased` makes cancellation win a tie.
 pub async fn with_cancel<F, T>(cancel: &CancellationToken, fut: F) -> Result<T, ProviderError>
 where

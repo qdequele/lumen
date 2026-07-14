@@ -1,7 +1,7 @@
 //! Retry with exponential backoff and jitter (M6 §6.1).
 //!
 //! Only *retryable* [`ProviderError`]s are retried (5xx, timeouts, unreachable,
-//! 429 — never a 4xx client fault; see [`ProviderError::is_retryable`]). Backoff
+//! 429 - never a 4xx client fault; see [`ProviderError::is_retryable`]). Backoff
 //! is exponential (`base·2ⁿ`, capped at `max`) with **equal jitter**, and an
 //! upstream `Retry-After` acts as a floor. The delay maths live in a pure,
 //! unit-tested [`backoff_delay`]; production feeds it a lock-free pseudo-random
@@ -90,7 +90,7 @@ pub fn backoff_delay(
 }
 
 /// A lock-free pseudo-random fraction in `[0, 1)` (splitmix64). Good enough for
-/// jitter; needs no dependency, never blocks, and reads no clock — so it is
+/// jitter; needs no dependency, never blocks, and reads no clock - so it is
 /// safe on the request hot path. Not for cryptographic use.
 fn jitter01() -> f64 {
     const GAMMA: u64 = 0x9E37_79B9_7F4A_7C15;

@@ -24,7 +24,7 @@ use crate::error::ApiError;
 ///
 /// Middleware, outermost first:
 /// 1. assign an `x-request-id` (uuid) if the client didn't send one;
-/// 2. open a tracing span per request — carrying method, path and request id,
+/// 2. open a tracing span per request - carrying method, path and request id,
 ///    but never the body or query string (user data is never logged);
 /// 3. propagate the request id onto the response;
 /// 4. rewrite a bare `413` from the body-limit layer below into the `LM-1002`
@@ -32,14 +32,14 @@ use crate::error::ApiError;
 /// 5. reject bodies larger than `body_limit` bytes.
 ///
 /// Route groups:
-/// * `/health`, `/health/providers`, `/metrics` — operational, never
+/// * `/health`, `/health/providers`, `/metrics` - operational, never
 ///   authenticated, no I/O (`/health` never depends on provider state);
-/// * `/v1/*` — the API surface; virtual-key auth when enabled (M5);
-/// * `/admin/*` — key management; mounted only when auth is enabled,
+/// * `/v1/*` - the API surface; virtual-key auth when enabled (M5);
+/// * `/admin/*` - key management; mounted only when auth is enabled,
 ///   protected by the master key.
 ///
-/// The body-size limit is read from `state.body_limit` — the single source of
-/// truth also surfaced in the `LM-1002` message — rather than a second
+/// The body-size limit is read from `state.body_limit` - the single source of
+/// truth also surfaced in the `LM-1002` message - rather than a second
 /// parameter, so the enforced limit and the advertised one can never diverge.
 pub fn build_app(state: AppState) -> Router {
     let body_limit = state.body_limit;
@@ -97,7 +97,7 @@ pub fn build_app(state: AppState) -> Router {
 /// Rewrite a bare `413` from [`RequestBodyLimitLayer`] into the `LM-1002`
 /// envelope.
 ///
-/// `RequestBodyLimitLayer` returns its own plain-text `413` directly — it
+/// `RequestBodyLimitLayer` returns its own plain-text `413` directly - it
 /// never constructs a [`GatewayError`], so the response otherwise carries no
 /// stable error code. This middleware wraps that layer and swaps any `413` it
 /// produces for [`GatewayError::PayloadTooLarge`], keeping the `body_limit`
@@ -127,7 +127,7 @@ async fn map_body_limit_response(
 ///
 /// LUMEN is a JSON/SSE API, never a browser-rendered app, so the strictest
 /// values are safe: deny framing and sniffing, send no referrer, and lock the
-/// CSP to `default-src 'none'`. HSTS is deliberately *not* set — it depends on
+/// CSP to `default-src 'none'`. HSTS is deliberately *not* set - it depends on
 /// the deployment terminating TLS, so it is left to the operator's proxy.
 async fn security_headers(request: Request, next: Next) -> Response {
     let mut response = next.run(request).await;
@@ -146,7 +146,7 @@ async fn security_headers(request: Request, next: Next) -> Response {
     response
 }
 
-/// Build the per-request tracing span. Only metadata — never the body or query.
+/// Build the per-request tracing span. Only metadata - never the body or query.
 fn make_request_span<B>(request: &axum::http::Request<B>) -> tracing::Span {
     let request_id = request
         .headers()

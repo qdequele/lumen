@@ -4,7 +4,7 @@
 //! variables (nested keys use `__`, e.g. `LUMEN_SERVER__PORT=9090`).
 //!
 //! # Secrets
-//! API keys are NEVER stored in this config — only the *name* of the
+//! API keys are NEVER stored in this config - only the *name* of the
 //! environment variable that holds each key (`api_key_env = "OPENAI_API_KEY"`).
 //! The actual secret is read from the environment at provider-construction
 //! time, so deriving `Debug` on these structs cannot leak a key.
@@ -46,7 +46,7 @@ pub struct Config {
 
 /// Retries, circuit breaker, timeouts and background health checks (M6).
 ///
-/// `first_token` is not here — it stays [`ServerConfig::first_token_timeout_ms`]
+/// `first_token` is not here - it stays [`ServerConfig::first_token_timeout_ms`]
 /// (its M4 home) and can be overridden per provider. `connect` is a client-wide
 /// setting (one pooled HTTP client), so it has no per-provider override.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -197,7 +197,7 @@ pub struct TelemetryConfig {
     pub metadata_labels: Vec<String>,
 }
 
-/// Base label names already used by the token counters — an allowlisted
+/// Base label names already used by the token counters - an allowlisted
 /// metadata key may not shadow them.
 const RESERVED_LABELS: [&str; 5] = ["capability", "model", "provider", "direction", "estimated"];
 

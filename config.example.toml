@@ -23,7 +23,7 @@ body_limit = 10485760     # max request body in bytes (10 MiB)
 
 # How long to wait for the upstream's first sign of life before failing with
 # LM-3011 (504). Streaming: time to the first SSE frame. Non-streaming: the
-# whole upstream call (per-phase timeouts land later) — raise this if you run
+# whole upstream call (per-phase timeouts land later) - raise this if you run
 # long non-streaming generations.
 first_token_timeout_ms = 30000
 
@@ -33,7 +33,7 @@ sse_heartbeat_ms = 15000
 
 # ---------------------------------------------------------------------------
 # Auth: virtual keys, hard budgets, quotas, usage log. Disabled by
-# default — the gateway is then an open proxy with no database at all.
+# default - the gateway is then an open proxy with no database at all.
 #
 # When enabled, the LUMEN_MASTER_KEY env var is REQUIRED (64 hex chars =
 # 32 bytes). It is both the bearer token of the /admin API and the AES-256-GCM
@@ -42,7 +42,7 @@ sse_heartbeat_ms = 15000
 # Enforcement is in memory on the request path (the DB is never consulted per
 # request): budget checks are an atomic reservation of the pre-call estimate,
 # settled to the real usage after the call. Refusals: 402 LM-4001 (budget),
-# 429 LM-4002 (RPM), 429 LM-4003 (TPM) — always BEFORE the upstream call.
+# 429 LM-4002 (RPM), 429 LM-4003 (TPM) - always BEFORE the upstream call.
 # ---------------------------------------------------------------------------
 [auth]
 enabled = false
@@ -61,7 +61,7 @@ retention_days = 30               # purge usage_log rows older than this
 # Clients may send an `x-lumen-metadata` header (alias: `cf-aig-metadata`)
 # with a FLAT JSON object (≤ 16 keys, key ≤ 64 B, value ≤ 256 B, header ≤ 4 KiB)
 # of string/number/bool values. The full object is attached to structured logs
-# and the usage_log `metadata` column. It is opaque — never inspected — but it
+# and the usage_log `metadata` column. It is opaque - never inspected - but it
 # IS logged: do not put secrets or prompt content in it.
 #
 # ONLY the keys listed here become Prometheus labels on the token counters;
@@ -74,14 +74,14 @@ metadata_labels = []              # e.g. ["team", "env"]
 # ---------------------------------------------------------------------------
 # Resilience: retries, fallbacks, circuit breaker, timeouts, health checks.
 #
-# Every value below is the built-in default — the whole section is optional.
+# Every value below is the built-in default - the whole section is optional.
 # Retries and the circuit breaker are always active with these defaults; only
 # per-model `fallbacks` (see the model blocks below) and background health
 # checks are opt-in. None of this ever touches the DB on the request path, and
 # an upstream 429 storm can never destabilise the gateway itself.
 # ---------------------------------------------------------------------------
 [resilience]
-# Retries — applied ONLY to retryable upstream failures (5xx, connect/read
+# Retries - applied ONLY to retryable upstream failures (5xx, connect/read
 # timeout, 429). A client 4xx is NEVER retried (a fallback would reject it too).
 # Backoff is exponential with equal jitter, and honours an upstream
 # `Retry-After` as a floor. While streaming, a retry happens only if no chunk
@@ -91,7 +91,7 @@ retry_max_attempts = 3            # total attempts per provider incl. the first
 retry_base_ms = 200               # base backoff wait after the first failure
 retry_max_ms = 5000               # ceiling on the exponential backoff term
 
-# Circuit breaker — per (provider, model). After N consecutive provider-fault
+# Circuit breaker - per (provider, model). After N consecutive provider-fault
 # failures the circuit opens; while open the model is skipped straight to its
 # next fallback, or answered with 503 LM-3020 (+ Retry-After) when none remains.
 # After the cooldown, a single half-open probe decides whether to close again.
@@ -105,7 +105,7 @@ circuit_cooldown_ms = 30000       # time spent open before a half-open probe
 # (server.first_token_timeout_ms); the total timeout is here. BOTH the
 # first-token and total timeouts can be overridden per provider (see the
 # ollama-local block below). Each timeout maps to a distinct 504 for debugging:
-# LM-3012 connect, LM-3011 first-token, LM-3013 total (the whole request —
+# LM-3012 connect, LM-3011 first-token, LM-3013 total (the whole request -
 # all retries and fallbacks together).
 connect_timeout_ms = 5000         # TCP + TLS connection establishment
 total_timeout_ms = 600000         # absolute per-request deadline (10 minutes)
@@ -114,7 +114,7 @@ total_timeout_ms = 600000         # absolute per-request deadline (10 minutes)
 # probes every provider that has a configured `base_url` (self-hosted TEI /
 # Ollama, or any explicit override) and publishes the result at
 # GET /health/providers and on lumen_provider_up{provider}. Providers on a
-# built-in vendor URL report `unknown` (never probed — the gateway hardcodes no
+# built-in vendor URL report `unknown` (never probed - the gateway hardcodes no
 # vendor endpoints). The gateway's own /health stays independent of provider
 # health and does no I/O.
 health_check_enabled = false
@@ -151,7 +151,7 @@ capabilities = ["chat"]
 # An image part sent to a model without it is rejected with LM-2003 (400)
 # before any upstream call. See docs/providers.md#vision-image-input.
 # modalities = ["text", "image"]
-# Optional prices (USD) — the source of cost counting and hard budgets.
+# Optional prices (USD) - the source of cost counting and hard budgets.
 # A model without prices costs 0: budgets then never bite on it.
 cost_per_1m_input = 2.5
 cost_per_1m_output = 10.0
@@ -167,7 +167,7 @@ id = "text-embedding-3-small"
 capabilities = ["embed"]
 
 # Anthropic: chat (bidirectional OpenAI <-> Anthropic translation). Configured
-# here as gpt-4o's fallback — the same capability from a different vendor, so a
+# here as gpt-4o's fallback - the same capability from a different vendor, so a
 # single-vendor outage doesn't take chat down.
 [[providers]]
 name = "anthropic"

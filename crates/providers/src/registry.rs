@@ -6,7 +6,7 @@
 //! The inner table lives behind an [`ArcSwap`] so a future hot reload (M7) can
 //! atomically swap the whole routing table without locking the request path.
 //! API keys are resolved from the environment by the caller (the server) and
-//! passed in already — the registry never reads env vars or holds config.
+//! passed in already - the registry never reads env vars or holds config.
 
 use arc_swap::ArcSwap;
 use lumen_core::{Capability, ChatProvider, EmbeddingProvider, RerankProvider};
@@ -38,7 +38,7 @@ pub struct ModelSpec {
 }
 
 /// A provider instance to build. `api_key` is already resolved from the
-/// environment (or, since M5, decrypted from the store) by the caller —
+/// environment (or, since M5, decrypted from the store) by the caller -
 /// `None` for keyless providers.
 #[derive(Clone)]
 pub struct ProviderSpec {
@@ -221,7 +221,7 @@ impl Registry {
         })
     }
 
-    /// Atomically replace the routing table (hot reload — M7).
+    /// Atomically replace the routing table (hot reload - M7).
     #[allow(clippy::needless_pass_by_value)]
     pub fn reload(&self, specs: Vec<ProviderSpec>) -> Result<(), RegistryError> {
         let inner = build_inner(&specs, &self.client)?;
@@ -392,7 +392,7 @@ fn build_providers(
         // Cloudflare Workers AI, self-hosted vLLM/llama.cpp/LM Studio) share the
         // OpenAI provider; only the base URL differs. The base is the explicit
         // override, else the kind's built-in default. Kinds with neither (vLLM,
-        // Cloudflare — its URL carries the account id) must not silently fall
+        // Cloudflare - its URL carries the account id) must not silently fall
         // through to api.openai.com, so a missing URL is a build error.
         ProviderKind::Openai
         | ProviderKind::Groq

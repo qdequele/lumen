@@ -1,7 +1,7 @@
 //! Operational routes: `/health` and `/metrics`.
 //!
 //! Neither route touches the database or any provider. `/health` in particular
-//! performs NO I/O — it answers 200 as long as the process is alive, so that a
+//! performs NO I/O - it answers 200 as long as the process is alive, so that a
 //! readiness probe never fails under load and triggers a restart cascade
 //! (lesson: LiteLLM #15526).
 

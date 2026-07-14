@@ -1,4 +1,4 @@
-//! Jina AI provider — embeddings and reranking.
+//! Jina AI provider - embeddings and reranking.
 //!
 //! Jina's embeddings endpoint is OpenAI-compatible, so the embed path is a
 //! near-passthrough (like [`crate::openai`]). Reranking (`POST /rerank`) is

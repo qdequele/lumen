@@ -1,4 +1,4 @@
-//! OpenAI provider — the canonical reference implementation.
+//! OpenAI provider - the canonical reference implementation.
 //!
 //! For embeddings the OpenAI wire schema is identical to our internal
 //! [`EmbedRequest`]/[`EmbedResponse`], so translation is a near-passthrough.

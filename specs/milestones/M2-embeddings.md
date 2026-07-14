@@ -1,7 +1,7 @@
-# M2 — Embeddings: first complete request path
+# M2 - Embeddings: first complete request path
 
 ## Objective
-`POST /v1/embeddings` works end-to-end with OpenAI and Ollama, automatic batching, propagated cancellation. This is the milestone that establishes ALL the patterns (provider, router, tests) — the most important one in the project.
+`POST /v1/embeddings` works end-to-end with OpenAI and Ollama, automatic batching, propagated cancellation. This is the milestone that establishes ALL the patterns (provider, router, tests) - the most important one in the project.
 
 ## Tasks
 
@@ -18,7 +18,7 @@
 
 ### 2.3 Ollama provider (embeddings)
 - [x] `providers/src/ollama/`: `/api/embed` API, Ollama ↔ internal schema translation
-- [x] No API key required (local base_url) — the code must accept providers without auth
+- [x] No API key required (local base_url) - the code must accept providers without auth
 
 ### 2.4 Batching
 - [x] If `inputs.len() > provider.max_batch_size()`: split, run the sub-batches in parallel (bounded concurrency, default 4), reassemble IN ORDER, sum the usages
@@ -34,7 +34,7 @@
 3. Test: unknown model → 404 LM-2001; chat-only model requested for embedding → 400 LM-2002.
 4. Test: upstream responds 429 with Retry-After → 429 response to the client with the header propagated and code LM-3001.
 5. Test: upstream responds with malformed JSON → 502 LM-3002 (never 500, never a panic).
-6. Ollama and OpenAI pass the SAME generic test suite (macro or generic conformance-suite function) — this harness will serve all subsequent providers.
+6. Ollama and OpenAI pass the SAME generic test suite (macro or generic conformance-suite function) - this harness will serve all subsequent providers.
 
 ## Pattern to establish (reused everywhere afterwards)
 Generic conformance suite: `fn conformance_suite<P: EmbeddingProvider>(provider: P, mock: MockServer)` run for each provider. Every new provider MUST pass it.

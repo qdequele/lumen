@@ -1,4 +1,4 @@
-# LUMEN — Universal LLM Gateway in Rust
+# LUMEN - Universal LLM Gateway in Rust
 
 ## Mission
 A self-hostable, lightweight and fast gateway for **all types of models**: chat/LLM, embeddings, reranking. An alternative to LiteLLM (too heavy, Python, 1.7-4x overhead) and OpenRouter (SaaS, not self-hostable, telemetry).
@@ -8,7 +8,7 @@ A self-hostable, lightweight and fast gateway for **all types of models**: chat/
 2. **Sovereignty**: zero telemetry, prompts NEVER logged by default, single self-host binary.
 3. **Robustness**: propagated cancellation, backpressure, DB off the request path.
 4. **Multi-capability**: chat + embeddings + rerank are first-class citizens.
-5. **Token observability**: EVERY request of EVERY capability produces a token count (never zero by default) — upstream usage if available, otherwise a local estimate marked `estimated`. Exposed in the response, in Prometheus, and in `usage_log`. A central reason for being. See ADR 003.
+5. **Token observability**: EVERY request of EVERY capability produces a token count (never zero by default) - upstream usage if available, otherwise a local estimate marked `estimated`. Exposed in the response, in Prometheus, and in `usage_log`. A central reason for being. See ADR 003.
 
 ## Architecture (Cargo workspace)
 ```
@@ -47,12 +47,12 @@ pub trait RerankProvider: Send + Sync {
 A provider implements 1 to N traits. The router routes by (capability, model).
 
 ### Public API
-- `POST /v1/chat/completions` — OpenAI format, SSE streaming
-- `POST /v1/embeddings` — OpenAI format
-- `POST /v1/rerank` — Cohere format (`query`, `documents`, `top_n`)
-- `GET /v1/models` — exposes `"capabilities": ["chat"|"embed"|"rerank"]` per model
-- `GET /health` — isolated path, touches NEITHER the DB NOR the providers
-- `GET /metrics` — Prometheus
+- `POST /v1/chat/completions` - OpenAI format, SSE streaming
+- `POST /v1/embeddings` - OpenAI format
+- `POST /v1/rerank` - Cohere format (`query`, `documents`, `top_n`)
+- `GET /v1/models` - exposes `"capabilities": ["chat"|"embed"|"rerank"]` per model
+- `GET /health` - isolated path, touches NEITHER the DB NOR the providers
+- `GET /metrics` - Prometheus
 
 ## Mandated stack
 - **Runtime**: tokio (multi-thread), axum, tower, hyper
@@ -73,12 +73,13 @@ A provider implements 1 to N traits. The router routes by (capability, model).
 6. Clippy pedantic enabled: `cargo clippy --workspace --all-targets -- -D warnings` must pass.
 7. Every public module has a doc comment. Every error has a stable code (`LM-1001` etc.) documented in `docs/errors.md`.
 8. Errors ALWAYS distinguish: client error (4xx) / upstream provider error (502/503 + provider name) / internal gateway error (500). Never a misleading 401 during an internal outage (lesson from OpenRouter).
+9. **FORBIDDEN**: em-dashes (the U+2014 character) anywhere in the repo, in source, docs, config or commit messages. Use hyphens, commas, colons, parentheses, or restructure the sentence. CI rejects em-dashes (`no-em-dashes` job).
 
 ## Work loop (to follow every session)
 0. **Dependency freshness (ALWAYS, at the start of a session)**: `rustup update`
    for the latest stable, then `cargo outdated --workspace --root-deps-only`.
    Bump the versions in `Cargo.toml` when it is safe, then re-run the
-   validation (step 4) — clippy pedantic may introduce new lints with
+   validation (step 4) - clippy pedantic may introduce new lints with
    each Rust version. Note any notable bump in `CHANGELOG.md`.
 1. Read `ROADMAP.md` → identify the current milestone (first unchecked).
 2. Read the corresponding `specs/milestones/M<N>-*.md`.

@@ -9,7 +9,7 @@ HTTP status, and a coarse `type`. The response body is always:
 
 The `type` is one of `invalid_request`, `upstream_error`, or `internal`. The
 gateway always distinguishes three situations and never disguises one as
-another — in particular, an internal malfunction is never reported as a
+another - in particular, an internal malfunction is never reported as a
 misleading `401` (a lesson from OpenRouter outages), and a malformed *upstream*
 response is a `502`, never a gateway `500`.
 
@@ -17,14 +17,14 @@ Codes are stable: once assigned, a code keeps its meaning across releases. The
 code prefix groups by cause: `1xxx` request, `2xxx` routing, `3xxx` upstream,
 `4xxx` auth/budget, `5xxx` internal.
 
-## Request errors — `LM-1xxx` · `type: invalid_request`
+## Request errors - `LM-1xxx` · `type: invalid_request`
 
 | Code      | HTTP | Meaning                                                        |
 |-----------|------|----------------------------------------------------------------|
 | `LM-1001` | 400  | Malformed or invalid request body / parameters.                |
 | `LM-1002` | 413  | Request body exceeded the configured size limit.               |
 
-## Routing & capability-request errors — `LM-2xxx` · `type: invalid_request`
+## Routing & capability-request errors - `LM-2xxx` · `type: invalid_request`
 
 | Code      | HTTP | Meaning                                                        |
 |-----------|------|----------------------------------------------------------------|
@@ -34,7 +34,7 @@ code prefix groups by cause: `1xxx` request, `2xxx` routing, `3xxx` upstream,
 | `LM-2004` | 400  | A remote image URL was sent to a provider that only accepts inline base64 image data. |
 | `LM-2010` | 400  | A rerank request supplied no `documents` to score.             |
 
-## Upstream errors — `LM-3xxx` · `type: upstream_error`
+## Upstream errors - `LM-3xxx` · `type: upstream_error`
 
 These always name the provider that failed. Retriable ones may be transparently
 retried on a fallback before surfacing.
@@ -54,7 +54,7 @@ retried on a fallback before surfacing.
 
 For `LM-3001`, `LM-3020` (and `LM-4002`/`LM-4003`), a `Retry-After` value may be
 advertised. The three timeouts (`LM-3011` first-token, `LM-3012` connect,
-`LM-3013` total) are distinct codes purely for debugging — see §6.4 and
+`LM-3013` total) are distinct codes purely for debugging - see §6.4 and
 `docs/adr/005-resilience-execution.md`.
 
 ### How resilience shapes these codes
@@ -65,26 +65,26 @@ has given up. Before surfacing, a retryable failure (`LM-3001` 429,
 backoff, then the request fails over to the model's configured `fallbacks`.
 The mapping between a failure and the code that eventually surfaces:
 
-- **`LM-3020` (503)** — the primary's circuit is open and no fallback remained.
+- **`LM-3020` (503)** - the primary's circuit is open and no fallback remained.
   Skipping an open circuit is instant (no upstream call), and the response
   carries a `Retry-After` equal to the cooldown remainder.
-- **`LM-3004` (503)** — every link in the fallback chain was tried and failed
+- **`LM-3004` (503)** - every link in the fallback chain was tried and failed
   (retries exhausted or circuits open all the way down).
-- **`LM-3013` (504)** — the total per-request deadline elapsed while retrying or
+- **`LM-3013` (504)** - the total per-request deadline elapsed while retrying or
   failing over; it bounds *all* attempts together, so a slow chain fails here
   rather than hanging.
-- **`LM-3011` / `LM-3012` (504)** — first-token and connect timeouts; each is a
+- **`LM-3011` / `LM-3012` (504)** - first-token and connect timeouts; each is a
   retryable failure on its own before it surfaces.
 
 A hard upstream client error (a 4xx bad request) is **never** retried or failed
-over — a different provider would reject it too — and surfaces immediately.
+over - a different provider would reject it too - and surfaces immediately.
 Whichever model ultimately served a successful request is reported in the
 `x-lumen-model-used` response header.
 
-## Auth / budget errors — `LM-4xxx` · `type: invalid_request`
+## Auth / budget errors - `LM-4xxx` · `type: invalid_request`
 
 Codes pinned by the spec. Enforcement happens in memory, **before** any
-upstream call — a rejected request never leaks spend to a provider.
+upstream call - a rejected request never leaks spend to a provider.
 
 | Code      | HTTP | Meaning                                                        |
 |-----------|------|----------------------------------------------------------------|
@@ -93,7 +93,7 @@ upstream call — a rejected request never leaks spend to a provider.
 | `LM-4003` | 429  | The key's tokens-per-minute quota was exceeded.                |
 | `LM-4004` | 401  | Missing or invalid virtual key. Deliberately does not say *why* (unknown, disabled and expired are indistinguishable) so callers cannot probe key state. |
 
-## Internal errors — `LM-5xxx` · `type: internal`
+## Internal errors - `LM-5xxx` · `type: internal`
 
 | Code      | HTTP | Meaning                                                        |
 |-----------|------|----------------------------------------------------------------|

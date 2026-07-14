@@ -5,13 +5,13 @@
 //! * [`SseTranslator`] + [`translate_sse_stream`] are the shared plumbing for
 //!   providers whose streaming wire format is NOT OpenAI (Anthropic, Google):
 //!   upstream bytes → incremental SSE parse → provider-specific event
-//!   translation → OpenAI chunks. Translation state is bounded — the full
+//!   translation → OpenAI chunks. Translation state is bounded - the full
 //!   response text is never accumulated.
 //! * [`items_to_sse_bytes`] / [`items_to_chunks`] adapt the translated item
 //!   stream to the two `ChatProvider` streaming signatures. The terminal
 //!   `data: [DONE]` is emitted only when the translator saw a genuine upstream
 //!   terminal event, so a mid-stream upstream death is detectable downstream
-//!   (LM-3010 — the server appends the error frame).
+//!   (LM-3010 - the server appends the error frame).
 
 use bytes::Bytes;
 use futures::stream::{self, BoxStream, StreamExt};
@@ -75,7 +75,7 @@ pub fn translate_sse_stream<T: SseTranslator>(
 
 /// Adapt a translated item stream to the `chat_stream_bytes` signature:
 /// each chunk becomes a `data: {json}\n\n` frame; the upstream's terminal event
-/// becomes `data: [DONE]\n\n`. No `[DONE]` is fabricated — if the upstream dies
+/// becomes `data: [DONE]\n\n`. No `[DONE]` is fabricated - if the upstream dies
 /// mid-stream the byte stream simply ends, which the server turns into LM-3010.
 pub fn items_to_sse_bytes(
     items: BoxStream<'static, Result<StreamItem, ProviderError>>,

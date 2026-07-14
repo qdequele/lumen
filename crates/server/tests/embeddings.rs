@@ -195,7 +195,7 @@ async fn client_disconnect_during_slow_upstream_does_not_hang_server() {
 
     let base = common::spawn_with(registry_for(&upstream.uri()), LIMIT).await;
 
-    // Client gives up after 200ms — well before the 3s upstream delay. This
+    // Client gives up after 200ms - well before the 3s upstream delay. This
     // drops the connection, which drops the handler future and cancels the
     // upstream call.
     let result = reqwest::Client::new()

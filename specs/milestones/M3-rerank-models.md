@@ -1,4 +1,4 @@
-# M3 — Reranking + model discovery
+# M3 - Reranking + model discovery
 
 ## Objective
 Rerank (Cohere format) and `/v1/models` with capabilities. LUMEN becomes the only gateway where chat/embed/rerank are equals.
@@ -13,16 +13,16 @@ Rerank (Cohere format) and `/v1/models` with capabilities. LUMEN becomes the onl
 ### 3.2 Providers
 - [x] Cohere: `EmbeddingProvider` + `RerankProvider` (API v2)
 - [x] Jina: `EmbeddingProvider` + `RerankProvider`
-- [x] TEI (Text Embeddings Inference, self-hosted): `EmbeddingProvider` + `RerankProvider` — `/embed` and `/rerank` API, no auth by default
+- [x] TEI (Text Embeddings Inference, self-hosted): `EmbeddingProvider` + `RerankProvider` - `/embed` and `/rerank` API, no auth by default
 - [x] Voyage: `EmbeddingProvider` + `RerankProvider`
 - [x] Each one passes the M2 conformance suite (extended to rerank: `rerank_conformance_suite`)
 
 ### 3.3 /v1/models
-- [x] `GET /v1/models`: extended OpenAI format — `{ id, object: "model", owned_by: <provider>, capabilities: ["chat"|"embed"|"rerank"] }`
+- [x] `GET /v1/models`: extended OpenAI format - `{ id, object: "model", owned_by: <provider>, capabilities: ["chat"|"embed"|"rerank"] }`
 - [x] Reflects ONLY the user's config (no upstream introspection)
 
 ### 3.4 Versioned aliasing
-- [x] Config: `[[providers.models]] id = "my-embedder" upstream_id = "text-embedding-3-large"` — the public ID belongs to the user
+- [x] Config: `[[providers.models]] id = "my-embedder" upstream_id = "text-embedding-3-large"` - the public ID belongs to the user
 - [x] Multiple aliases can point to the same upstream_id
 - [x] ID collision between providers → boot-time error with the two conflicting locations
 

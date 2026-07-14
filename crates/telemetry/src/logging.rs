@@ -3,7 +3,7 @@
 //! Prompts and request bodies are NEVER logged: the gateway treats user data
 //! as radioactive. Only metadata (request id, model, status, latency) is
 //! emitted, and that is the responsibility of the request span, not this
-//! module — which only wires up the subscriber.
+//! module - which only wires up the subscriber.
 
 use tracing_subscriber::EnvFilter;
 

@@ -3,8 +3,8 @@
 //! Anthropic streams typed SSE events (`message_start`, `content_block_start`,
 //! `content_block_delta`, `message_delta`, `message_stop`, ...) rather than
 //! OpenAI chunks; this module translates them event by event. Translation
-//! state is bounded — ids, usage counters and a content-block→tool-call index
-//! map — never the accumulated text (the M4 spec's hard rule).
+//! state is bounded - ids, usage counters and a content-block→tool-call index
+//! map - never the accumulated text (the M4 spec's hard rule).
 //!
 //! Mapping:
 //!
@@ -13,13 +13,13 @@
 //! * `content_block_start` (`tool_use`) → a `tool_calls` delta with the id,
 //!   name and empty arguments (OpenAI tool-call indices are allocated in
 //!   order of appearance, independent of Anthropic block indices);
-//! * `content_block_delta` — `text_delta` → a content delta,
+//! * `content_block_delta` - `text_delta` → a content delta,
 //!   `input_json_delta` → a `tool_calls` arguments delta;
 //! * `message_delta` → the final chunk with the mapped `finish_reason` and
 //!   full usage (`input_tokens` from `message_start` + `output_tokens` here);
 //! * `message_stop` → the terminal marker (`data: [DONE]` on the byte path);
 //! * `ping` and unknown events are ignored; `error` events surface as a
-//!   [`ProviderError`] (only the upstream error *type* is propagated — never
+//!   [`ProviderError`] (only the upstream error *type* is propagated - never
 //!   message bodies, which could echo prompt content).
 
 use std::collections::HashMap;

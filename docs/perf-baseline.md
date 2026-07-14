@@ -10,14 +10,14 @@ stated honestly rather than papered over.
 
 Two layers, because "added latency" has two very different scales:
 
-1. **In-process overhead (`cargo bench`)** — the CPU work the gateway adds *per
+1. **In-process overhead (`cargo bench`)** - the CPU work the gateway adds *per
    request, with no sockets involved*: the resilience executor wrapping a
    provider call (circuit-breaker admit → retry loop → per-attempt timeout) plus
    the JSON (de)serialization the OpenAI surface does. This is the honest
    measure of "added latency off-network": it excludes the upstream and the
    network entirely. Criterion, warmed, reports median with a 95 % CI.
 
-2. **End-to-end head-to-head (`bench/`, docker-compose + k6)** — LUMEN and
+2. **End-to-end head-to-head (`bench/`, docker-compose + k6)** - LUMEN and
    LiteLLM both proxying the *same* zero-latency mock upstream, driven by k6.
    Added latency = gateway percentile − direct-to-mock percentile. This is the
    number a user feels; it includes one extra localhost hop. Provided as a
@@ -33,7 +33,7 @@ Two layers, because "added latency" has two very different scales:
 
 Numbers are hardware-specific; re-run the commands on your target to get yours.
 
-## Results — in-process overhead (measured here)
+## Results - in-process overhead (measured here)
 
 | Bench | Median | 95 % CI |
 |---|---|---|
@@ -63,8 +63,8 @@ in CI via buildx (`release.yml`).
 
 | # | Target | Status |
 |---|---|---|
-| 1 | < 1 ms added **p99** off-network | **Met (median), with margin.** The gateway's per-request CPU work is ~3.2 µs median; even a 100× tail would sit at ~0.3 ms, well under 1 ms. The p99 *under concurrent load* is produced by the k6 harness below — not run in the recording environment (no LiteLLM image pulled), so the sub-µs→µs in-process figure is what is asserted here. |
-| 2 | < 25 MB RAM under load | **Met at idle (8.8 MB).** Under load, memory is bounded by design — no unbounded queues (backpressure + bounded channels), the usage log drops rather than grows (proven by criterion 5, the 500-concurrent test). The exact under-load RSS is captured by `docker stats` during the k6 run. |
+| 1 | < 1 ms added **p99** off-network | **Met (median), with margin.** The gateway's per-request CPU work is ~3.2 µs median; even a 100× tail would sit at ~0.3 ms, well under 1 ms. The p99 *under concurrent load* is produced by the k6 harness below - not run in the recording environment (no LiteLLM image pulled), so the sub-µs→µs in-process figure is what is asserted here. |
+| 2 | < 25 MB RAM under load | **Met at idle (8.8 MB).** Under load, memory is bounded by design - no unbounded queues (backpressure + bounded channels), the usage log drops rather than grows (proven by criterion 5, the 500-concurrent test). The exact under-load RSS is captured by `docker stats` during the k6 run. |
 | 3 | throughput ≥ 95 % of direct | **Not measured in this environment** (requires the LiteLLM/k6 head-to-head). The harness is provided and reproducible; with a ~3 µs in-process overhead against network latencies of ≥ 1 ms, the theoretical ceiling is ≫ 95 %, but the empirical number must come from the harness on real hardware. |
 
 Honest summary: the **off-network overhead is measured and is microseconds**,

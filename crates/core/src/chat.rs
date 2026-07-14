@@ -1,7 +1,7 @@
 //! Chat completion types, mirroring the OpenAI `chat/completions` schema.
 //!
 //! Unknown fields are preserved through [`serde(flatten)`] `extra` maps so that
-//! provider-specific parameters pass through untouched — OpenAI compatibility
+//! provider-specific parameters pass through untouched - OpenAI compatibility
 //! takes precedence over internal tidiness.
 
 use std::borrow::Cow;
@@ -74,7 +74,7 @@ pub struct ImageUrl {
 pub struct DataUri {
     /// e.g. `image/png`.
     pub media_type: String,
-    /// The base64 payload (still encoded — never decoded on the hot path).
+    /// The base64 payload (still encoded - never decoded on the hot path).
     pub base64_data: String,
 }
 

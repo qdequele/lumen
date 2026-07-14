@@ -45,7 +45,7 @@ pub struct Timeouts {
 }
 
 /// The hot-swappable part of the resilience config: everything derived from the
-/// config file. The circuit breakers are deliberately *not* here — their live
+/// config file. The circuit breakers are deliberately *not* here - their live
 /// state must survive a reload (a reload must not reset an open circuit).
 #[derive(Debug, Clone)]
 struct ResiliencePolicy {
@@ -109,7 +109,7 @@ impl ResiliencePolicy {
 /// touching breaker state (DEBT-1 / M7 §7.3).
 #[derive(Debug)]
 pub struct ResilienceRuntime {
-    /// Per-(provider, model) circuit breakers — never rebuilt on reload.
+    /// Per-(provider, model) circuit breakers - never rebuilt on reload.
     pub breakers: CircuitBreakers,
     policy: arc_swap::ArcSwap<ResiliencePolicy>,
 }
@@ -130,7 +130,7 @@ impl ResilienceRuntime {
         }
     }
 
-    /// A runtime with library defaults, no fallbacks and no gauge — used by
+    /// A runtime with library defaults, no fallbacks and no gauge - used by
     /// tests and as the open-gateway baseline.
     #[must_use]
     pub fn defaults() -> Self {
@@ -141,7 +141,7 @@ impl ResilienceRuntime {
     }
 
     /// Atomically replace the derived policy (retry, timeouts, fallbacks) from a
-    /// new config — the hot-reload entry point. Circuit-breaker state is left
+    /// new config - the hot-reload entry point. Circuit-breaker state is left
     /// untouched, so an open circuit stays open across a reload.
     pub fn reload_policy(&self, config: &Config) {
         self.policy
@@ -163,7 +163,7 @@ impl ResilienceRuntime {
         self.map_policy(|p| p.default_timeouts.first_token = first_token)
     }
 
-    /// Override the retry policy (builder style) — e.g. tests that assert on a
+    /// Override the retry policy (builder style) - e.g. tests that assert on a
     /// single attempt.
     #[must_use]
     pub fn with_retry(self, retry: RetryPolicy) -> Self {

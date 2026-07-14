@@ -47,7 +47,7 @@ pub struct AppState {
     pub registry: Arc<Registry>,
     /// Chat streaming guard timings.
     pub guards: StreamGuards,
-    /// Token-accounting counters (ADR 003) — always on.
+    /// Token-accounting counters (ADR 003) - always on.
     pub tokens: TokenMetrics,
     /// Virtual-key auth runtime; `None` = auth disabled (open gateway).
     pub auth: Option<Arc<AuthRuntime>>,
@@ -137,7 +137,7 @@ impl AppState {
         self
     }
 
-    /// Attach a shared price-table cell (builder style) — used when the hot
+    /// Attach a shared price-table cell (builder style) - used when the hot
     /// reloader must swap the same cell the handlers read (DEBT-1).
     #[must_use]
     pub fn with_pricing_cell(mut self, pricing: Arc<ArcSwap<CostTable>>) -> Self {

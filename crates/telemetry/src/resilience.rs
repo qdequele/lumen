@@ -1,7 +1,7 @@
 //! Resilience gauges (M6): circuit-breaker state and background provider health.
 //!
 //! Both are low-cardinality: `circuit_state` is bounded by the configured
-//! (provider × model) pairs and `provider_up` by the provider count — all
+//! (provider × model) pairs and `provider_up` by the provider count - all
 //! operator-defined. The numeric encodings are deliberately decoupled from the
 //! router's own enums (the router maps its state to the numbers) so this crate
 //! never has to depend on `router`.
@@ -11,9 +11,9 @@ use prometheus::{IntGaugeVec, Opts};
 
 /// Circuit-breaker state, as exported on `lumen_circuit_state`.
 pub const CIRCUIT_CLOSED: i64 = 0;
-/// The breaker is open — calls are short-circuited.
+/// The breaker is open - calls are short-circuited.
 pub const CIRCUIT_OPEN: i64 = 1;
-/// The breaker is half-open — a single probe is allowed through.
+/// The breaker is half-open - a single probe is allowed through.
 pub const CIRCUIT_HALF_OPEN: i64 = 2;
 
 /// M6 gauges, registered against one [`Metrics`] registry. Cheap to clone

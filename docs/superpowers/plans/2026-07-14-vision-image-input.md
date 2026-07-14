@@ -1,10 +1,10 @@
-# M8 — Vision (image input to chat) Implementation Plan
+# M8 - Vision (image input to chat) Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Accept image inputs in `POST /v1/chat/completions` (OpenAI content-parts format) across OpenAI-family (pass-through), Anthropic, and Google/Gemini (translation).
 
-**Architecture:** Widen `ChatMessage.content` from `Option<String>` to `Option<MessageContent>` (a string *or* an array of typed parts). Vision routes as the existing `Chat` capability — no new endpoint or routing capability. Per-model `modalities` are advertised in `GET /v1/models` and enforced (image → non-vision model = `LM-2003`, 400, before any upstream call). The gateway never fetches a user-supplied image URL: OpenAI/Anthropic accept remote URLs and fetch them; Gemini takes only inline base64, so a remote URL bound for Gemini is `LM-2004` (400).
+**Architecture:** Widen `ChatMessage.content` from `Option<String>` to `Option<MessageContent>` (a string *or* an array of typed parts). Vision routes as the existing `Chat` capability - no new endpoint or routing capability. Per-model `modalities` are advertised in `GET /v1/models` and enforced (image → non-vision model = `LM-2003`, 400, before any upstream call). The gateway never fetches a user-supplied image URL: OpenAI/Anthropic accept remote URLs and fetch them; Gemini takes only inline base64, so a remote URL bound for Gemini is `LM-2004` (400).
 
 **Tech Stack:** Rust, serde/serde_json, axum, wiremock + tokio::test.
 
@@ -116,7 +116,7 @@ mod tests {
 - [ ] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p core --lib chat::tests`
-Expected: FAIL — `MessageContent` / `ImageUrl` / `as_data_uri` do not exist (compile error).
+Expected: FAIL - `MessageContent` / `ImageUrl` / `as_data_uri` do not exist (compile error).
 
 - [ ] **Step 3: Implement the types and helpers**
 
@@ -181,7 +181,7 @@ pub struct ImageUrl {
 pub struct DataUri {
     /// e.g. `image/png`.
     pub media_type: String,
-    /// The base64 payload (still encoded — never decoded on the hot path).
+    /// The base64 payload (still encoded - never decoded on the hot path).
     pub base64_data: String,
 }
 
@@ -267,7 +267,7 @@ to:
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test -p core --lib`
-Expected: PASS — chat + tokens tests green.
+Expected: PASS - chat + tokens tests green.
 
 - [ ] **Step 5: Fix any other in-crate `content` consumers, then gate**
 
@@ -322,7 +322,7 @@ Add to `crates/core/src/error.rs` `error_codes_are_stable` test (after the `LM-2
         );
 ```
 
-Add an enforcement integration test to `crates/server/tests/chat.rs` (follow the existing helpers in that file — `config_from`, `spawn`, `post_chat`; mirror the nearest existing test's setup). The model is declared with default modalities (text only), so an image part is rejected pre-flight:
+Add an enforcement integration test to `crates/server/tests/chat.rs` (follow the existing helpers in that file - `config_from`, `spawn`, `post_chat`; mirror the nearest existing test's setup). The model is declared with default modalities (text only), so an image part is rejected pre-flight:
 
 ```rust
 #[tokio::test]
@@ -367,7 +367,7 @@ async fn image_to_a_non_vision_model_is_rejected_with_lm_2003() {
 - [ ] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p core --lib error::tests::error_codes_are_stable`
-Expected: FAIL — the two variants don't exist.
+Expected: FAIL - the two variants don't exist.
 
 - [ ] **Step 3: Add the error variants**
 
@@ -440,7 +440,7 @@ fn default_modalities() -> Vec<String> {
       }
   ```
 
-`crates/server/src/config.rs` — thread modalities into `ModelSpec` at ~line 698:
+`crates/server/src/config.rs` - thread modalities into `ModelSpec` at ~line 698:
 ```rust
                     .map(|m| ModelSpec {
                         id: m.id.clone(),
@@ -450,7 +450,7 @@ fn default_modalities() -> Vec<String> {
                     })
 ```
 
-`crates/server/src/models.rs` — add to `ModelEntry` (after `capabilities`):
+`crates/server/src/models.rs` - add to `ModelEntry` (after `capabilities`):
 ```rust
     /// Input modalities this model accepts (`text`, `image`).
     pub modalities: Vec<String>,
@@ -554,7 +554,7 @@ git commit -m "feat(server): per-model modalities, /v1/models exposure, vision e
 
 **Files:**
 - Modify: `crates/providers/src/anthropic/mod.rs` (`translate_request` default-role arm + image-block helper)
-- Test: `crates/providers/src/anthropic/mod.rs` (`#[cfg(test)]`) or the crate's existing anthropic test file — assert the exact translated JSON.
+- Test: `crates/providers/src/anthropic/mod.rs` (`#[cfg(test)]`) or the crate's existing anthropic test file - assert the exact translated JSON.
 
 **Interfaces:**
 - Consumes: `MessageContent`, `ContentPart`, `ImageUrl::as_data_uri`, `ImageUrl::is_remote` (Task 1).
@@ -639,7 +639,7 @@ fn text_only_message_stays_a_plain_string() {
 - [ ] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p providers anthropic 2>&1 | tail -20`
-Expected: FAIL — compile error (`translate_request` still assumes `Option<String>`).
+Expected: FAIL - compile error (`translate_request` still assumes `Option<String>`).
 
 - [ ] **Step 3: Implement the translation**
 
@@ -782,7 +782,7 @@ fn remote_url_image_is_a_translation_error() {
 - [ ] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p providers google 2>&1 | tail -20`
-Expected: FAIL — compile error (`GeminiPart` is text-only; `translate_request` is infallible).
+Expected: FAIL - compile error (`GeminiPart` is text-only; `translate_request` is infallible).
 
 - [ ] **Step 3: Implement the translation**
 
@@ -897,7 +897,7 @@ git commit -m "feat(providers): Gemini inline_data image translation; reject rem
 
 **Files:**
 - Modify: `crates/server/src/state.rs` (`AppState.body_limit` + `with_body_limit` builder)
-- Modify: wherever `AppState` is assembled at boot (`crates/server/src/lifecycle.rs` or `main.rs` — grep for `build_app(` and the `AppState::new` call) to set `body_limit`
+- Modify: wherever `AppState` is assembled at boot (`crates/server/src/lifecycle.rs` or `main.rs` - grep for `build_app(` and the `AppState::new` call) to set `body_limit`
 - Modify: `crates/server/src/chat.rs` (map a 413 `JsonRejection` to `PayloadTooLarge`)
 - Test: `crates/server/tests/chat.rs`
 
@@ -944,16 +944,16 @@ async fn oversized_body_returns_lm_1002_envelope() {
 }
 ```
 
-(If `config_from`/`spawn` don't thread `[server] body_limit` yet, ensure the test harness builds the app with `cfg.server.body_limit` — see Step 3.)
+(If `config_from`/`spawn` don't thread `[server] body_limit` yet, ensure the test harness builds the app with `cfg.server.body_limit` - see Step 3.)
 
 - [ ] **Step 2: Run the test to verify it fails**
 
 Run: `cargo test -p server --test chat oversized_body_returns_lm_1002_envelope`
-Expected: FAIL — currently an oversized body maps to `LM-1001` (400), not `LM-1002` (413).
+Expected: FAIL - currently an oversized body maps to `LM-1001` (400), not `LM-1002` (413).
 
 - [ ] **Step 3: Implement**
 
-`crates/server/src/state.rs` — add the field (near the other pub fields, ~line 64) and a builder (near the other `with_*`):
+`crates/server/src/state.rs` - add the field (near the other pub fields, ~line 64) and a builder (near the other `with_*`):
 ```rust
     /// Configured max request body size in bytes (for the `LM-1002` message).
     pub body_limit: usize,
@@ -971,7 +971,7 @@ Set `body_limit: default_body_limit()` (import from config) or `10 * 1024 * 1024
 
 At the boot assembly site (grep `build_app(`): set `let state = state.with_body_limit(config.server.body_limit);` before `build_app(state, config.server.body_limit)`. Make the test harness do the same.
 
-`crates/server/src/chat.rs` — replace the body map_err at lines 59-60:
+`crates/server/src/chat.rs` - replace the body map_err at lines 59-60:
 ```rust
     // Malformed body → LM-1001; over-limit body → LM-1002 (both in our envelope).
     let Json(req) = payload.map_err(|e| {
@@ -1069,12 +1069,12 @@ Expected: PASS. If the image part is altered, fix the OpenAI provider serializat
 - [ ] **Step 3: Update docs**
 
 - `docs/errors.md`: add `LM-2003` (400) and `LM-2004` (400) rows to the `LM-2xxx` table with the meanings from the spec.
-- `docs/providers.md`: add a "Vision (image input)" section — the OpenAI content-parts request shape, which kinds support it (OpenAI-family pass-through, Anthropic, Gemini), the `modalities = ["text","image"]` per-model config, and the never-fetch / Gemini-needs-base64 (`LM-2004`) rule.
+- `docs/providers.md`: add a "Vision (image input)" section - the OpenAI content-parts request shape, which kinds support it (OpenAI-family pass-through, Anthropic, Gemini), the `modalities = ["text","image"]` per-model config, and the never-fetch / Gemini-needs-base64 (`LM-2004`) rule.
 - `README.md`: note vision support in the capability/matrix section.
 - `config.example.toml`: add a commented `modalities = ["text", "image"]` line to a chat model example.
-- `docs/adr/003-*.md`: append an addendum — image tokens are trusted from upstream usage; the local estimation fallback counts text only (images contribute 0, response still flagged `estimated`); a per-image heuristic is deferred.
+- `docs/adr/003-*.md`: append an addendum - image tokens are trusted from upstream usage; the local estimation fallback counts text only (images contribute 0, response still flagged `estimated`); a per-image heuristic is deferred.
 - `docs/backlog.md`: add "per-image token heuristic for the estimation fallback (OpenAI tile formula)" and "Anthropic/Gemini file/GCS image URIs".
-- `CHANGELOG.md`: add an `Added — Vision (image input to chat)` entry under `[Unreleased]`.
+- `CHANGELOG.md`: add an `Added - Vision (image input to chat)` entry under `[Unreleased]`.
 - `ROADMAP.md`: check off M8 / record the vision slice.
 
 - [ ] **Step 4: Full gate**
@@ -1105,6 +1105,6 @@ git commit -m "feat: vision image input to chat (docs, conformance, accounting n
 
 **Placeholder scan:** No TBD/TODO; every code step shows real code; every command has expected output. ✓
 
-**Type consistency:** `MessageContent`, `ContentPart` (`kind`/`text`/`image_url`/`extra`), `ImageUrl` (`url`/`detail`), `DataUri` (`media_type`/`base64_data`), `MessageContent::text()/has_image()`, `ImageUrl::as_data_uri()/is_remote()`, `Registry::modalities()`, `ChatProvider::accepts_remote_image_url()`, `GatewayError::ImageInputNotSupported/ImageUrlNotSupported`, `AppState::with_body_limit` — names used consistently across tasks. ✓
+**Type consistency:** `MessageContent`, `ContentPart` (`kind`/`text`/`image_url`/`extra`), `ImageUrl` (`url`/`detail`), `DataUri` (`media_type`/`base64_data`), `MessageContent::text()/has_image()`, `ImageUrl::as_data_uri()/is_remote()`, `Registry::modalities()`, `ChatProvider::accepts_remote_image_url()`, `GatewayError::ImageInputNotSupported/ImageUrlNotSupported`, `AppState::with_body_limit` - names used consistently across tasks. ✓
 
-**Known cross-task break (called out in-task):** adding required fields to `ModelSpec`/`LoadedModelSummary` breaks existing struct literals in tests — Task 2 Step 6 sweeps them. `translate_request` becoming fallible (Gemini) updates its in-file callers — Task 4 Step 3.
+**Known cross-task break (called out in-task):** adding required fields to `ModelSpec`/`LoadedModelSummary` breaks existing struct literals in tests - Task 2 Step 6 sweeps them. `translate_request` becoming fallible (Gemini) updates its in-file callers - Task 4 Step 3.

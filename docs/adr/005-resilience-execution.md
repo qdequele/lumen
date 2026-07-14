@@ -1,4 +1,4 @@
-# ADR 005 — Resilience execution model (retries, fallback, circuit breaker, timeouts)
+# ADR 005 - Resilience execution model (retries, fallback, circuit breaker, timeouts)
 
 - Status: accepted
 - Date: 2026-07-13
@@ -8,8 +8,8 @@
 The resilience layer adds retries, multi-provider fallback chains, a
 per-provider circuit breaker and per-phase timeouts. The overriding constraint
 is pillar 1 (< 1 ms added p99) and pillar 3 (robustness): none of this may add a
-database or lock to the request path, and — the explicit lesson (LiteLLM
-#15526) — a storm of 429s from an upstream must never destabilise the gateway
+database or lock to the request path, and - the explicit lesson (LiteLLM
+#15526) - a storm of 429s from an upstream must never destabilise the gateway
 itself. The router crate was previously a pure resolution helper; this change
 turns it into an **execution** layer that wraps a provider call with the
 resilience machinery.
@@ -31,8 +31,8 @@ Three design tensions had to be resolved:
 ### One generic executor, capability-specific chain resolution
 
 The executor is **generic over a closure** `FnMut(link_index) -> Future<Result<T,
-ProviderError>>`. It owns the resilience control flow — breaker gate, retry
-loop, fallback across links, total-timeout deadline — and knows nothing about
+ProviderError>>`. It owns the resilience control flow - breaker gate, retry
+loop, fallback across links, total-timeout deadline - and knows nothing about
 chat/embed/rerank. Each handler resolves a **chain** (`resolve_*_chain`: the
 requested model followed by its configured fallbacks, each re-resolved for the
 *same* capability) and supplies a closure that performs the actual typed call
@@ -47,12 +47,12 @@ rather than a panic.
 
 ### Retry classification lives on `ProviderError`
 
-`ProviderError::is_retryable()` (5xx, connect/read timeout, 429, unreachable —
+`ProviderError::is_retryable()` (5xx, connect/read timeout, 429, unreachable -
 never a 4xx client fault) and `is_provider_fault()` (does this failure indicate
 the *provider* is unhealthy, i.e. should it count against the breaker) are the
 single source of truth, shared by the retry loop and the breaker. A hard
-upstream 4xx (bad request) is neither retried nor failed over — a fallback
-provider would reject it too — and is returned immediately.
+upstream 4xx (bad request) is neither retried nor failed over - a fallback
+provider would reject it too - and is returned immediately.
 
 ### Backoff: pure function + injected randomness
 
@@ -74,11 +74,11 @@ provider-fault failures) → Half-Open (after the cooldown) → one probe →
 Closed/Open. Concurrent requests that find the breaker Half-Open are refused the
 probe (treated as Open) so exactly one request probes. State is pushed to a
 Prometheus gauge `lumen_circuit_state{provider,model}` (0 closed / 1 open /
-2 half-open) on every transition — the telemetry crate exposes a numeric setter
+2 half-open) on every transition - the telemetry crate exposes a numeric setter
 so `router` depends on `telemetry` with no cycle. The breaker map is a
 `DashMap`, entries created on first use; bounded by the (provider × model) count,
 which is operator-configured and finite. **Never touched off the request path by
-a blocking call** — health checks read a snapshot.
+a blocking call** - health checks read a snapshot.
 
 A logical request records **one** breaker outcome per link (success, or one
 failure after that link's retries are exhausted), so "5 consecutive failures"
@@ -92,8 +92,8 @@ returned 2xx and we commit to forwarding), the existing `to_event_stream` guards
 (ADR 004: LM-3010 missing terminator, LM-3011 first-token, heartbeat) own the
 rest and never retry. This satisfies "retry only if no chunk emitted": an open
 failure means nothing was forwarded, a post-open failure becomes a clean SSE
-error frame. (A 2xx-then-immediate-error is deliberately treated as committed —
-not retried — since the upstream accepted the request.)
+error frame. (A 2xx-then-immediate-error is deliberately treated as committed -
+not retried - since the upstream accepted the request.)
 
 One consequence, recorded explicitly: the circuit breaker for a streaming call
 only ever sees the **open** phase. `on_success` fires as soon as the byte stream
@@ -116,15 +116,15 @@ self-healing.
 
 Three timeouts, global defaults with per-model overrides:
 
-- **connect** (default 5 s) — a `reqwest::Client` setting, so it is **global
+- **connect** (default 5 s) - a `reqwest::Client` setting, so it is **global
   only** (per-provider connect would require one client per provider and lose
   connection pooling; deferred, noted in docs). A connect timeout is now
   distinguished from a read timeout: `ProviderError::ConnectTimeout` →
   `LM-3012` (504).
-- **first_token** (default 30 s, per-model override) — reuses the streaming path;
+- **first_token** (default 30 s, per-model override) - reuses the streaming path;
   `LM-3011` (504). For non-streaming it bounds the whole call; for streaming,
   the time to the first frame.
-- **total** (default 600 s, per-model override) — an absolute deadline threaded
+- **total** (default 600 s, per-model override) - an absolute deadline threaded
   through the executor bounding *all* retries and fallbacks together; exceeding
   it yields `LM-3013` (504).
 
@@ -137,7 +137,7 @@ kept for "all fallbacks exhausted".
 A background task (default **off**) probes each provider that has a configured
 `base_url` (self-hosted TEI/Ollama, or any explicit override) with a short GET,
 storing Up/Down + latency in memory and a `lumen_provider_up{provider}`
-gauge. Providers relying on a built-in vendor URL report `unknown` — the gateway
+gauge. Providers relying on a built-in vendor URL report `unknown` - the gateway
 never hardcodes vendor endpoints. Results are exposed at **`/health/providers`**
 for observability; the gateway's own **`/health`** stays completely independent
 of provider health (criterion 5) and does no I/O.

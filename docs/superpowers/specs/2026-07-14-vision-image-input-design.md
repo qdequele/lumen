@@ -1,4 +1,4 @@
-# M8 — Vision (image input to chat)
+# M8 - Vision (image input to chat)
 
 **Status:** approved design, pre-implementation
 **Date:** 2026-07-14
@@ -38,8 +38,8 @@ capability, same streaming path. No new top-level `Capability` variant.
 - Server-side image fetching, resizing, re-encoding, or validation of image
   bytes. The gateway never dereferences a user-supplied image URL.
 - A per-image token *heuristic* for the estimation fallback (backlog item).
-- Anthropic/Gemini "file"/GCS URI image sources (only inline base64 + —for
-  providers that accept them— passthrough of remote URLs).
+- Anthropic/Gemini "file"/GCS URI image sources (only inline base64 + -for
+  providers that accept them- passthrough of remote URLs).
 
 ## 3. Core type change
 
@@ -60,7 +60,7 @@ pub struct ChatMessage {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum MessageContent {
-    /// `"content": "hello"` — tried first (serde untagged order matters).
+    /// `"content": "hello"` - tried first (serde untagged order matters).
     Text(String),
     /// `"content": [ {"type":"text",...}, {"type":"image_url",...} ]`
     Parts(Vec<ContentPart>),
@@ -94,19 +94,19 @@ pub struct ImageUrl {
 ```
 
 Helpers on `MessageContent`:
-- `fn text(&self) -> Cow<'_, str>` — concatenated `text` of all parts whose
+- `fn text(&self) -> Cow<'_, str>` - concatenated `text` of all parts whose
   `kind == "text"` (borrowed directly for the `Text` variant; empty for an
   image-only message). Used by the token estimator and any text-only
   log/inspection path.
-- `fn has_image(&self) -> bool` — true if any part has `image_url.is_some()`
+- `fn has_image(&self) -> bool` - true if any part has `image_url.is_some()`
   (equivalently `kind == "image_url"`). Used by the enforcement check.
 
 **Rationale (approaches considered).** (A, chosen) `MessageContent` as a typed
 untagged enum (`Text` string vs `Parts` array), with each part a typed struct +
 `flatten`ed `extra`. Type-safe access to `text`/`image_url`, forward-compatible
 via `extra`/`kind`, and identical to the codebase's existing struct idiom.
-(B) parts as raw `Vec<serde_json::Value>` — robust but pushes ad-hoc JSON poking
-into every consumer. (C) a separate `content_parts` field — not
+(B) parts as raw `Vec<serde_json::Value>` - robust but pushes ad-hoc JSON poking
+into every consumer. (C) a separate `content_parts` field - not
 OpenAI-compatible, so it would not parse real vision requests. The originally
 sketched internally-tagged enum with an `#[serde(untagged)]` `Other` variant was
 rejected: serde does not support that combination.
@@ -150,7 +150,7 @@ remote `http(s)` URL.
 |---|---|---|
 | OpenAI-family / vLLM | forward verbatim | forward verbatim |
 | Anthropic | `{type:"image",source:{type:"base64",media_type,data}}` | `{type:"image",source:{type:"url",url}}` (Anthropic fetches) |
-| Gemini | `{inline_data:{mime_type,data}}` | **`LM-2004` (400)** — Gemini takes only inline bytes; gateway must not fetch |
+| Gemini | `{inline_data:{mime_type,data}}` | **`LM-2004` (400)** - Gemini takes only inline bytes; gateway must not fetch |
 
 **Data-URI parsing.** `data:<media_type>;base64,<payload>` → `(media_type,
 payload)`. A malformed data URI (no `;base64,`, empty payload) → `LM-1001`
@@ -176,8 +176,8 @@ Two new `LM-2xxx` codes (`type: invalid_request`), siblings of `LM-2002`
 | `LM-2004` | 400 | Resolved provider requires inline base64 image data; remote image URLs are unsupported for it (Gemini). |
 
 Reused:
-- `LM-1001` (400) — malformed content parts / malformed data URI.
-- `LM-1002` (413) — request body exceeded the configured size limit (§7).
+- `LM-1001` (400) - malformed content parts / malformed data URI.
+- `LM-1002` (413) - request body exceeded the configured size limit (§7).
 
 No secret or image bytes ever appear in an error message.
 
@@ -226,15 +226,15 @@ Base64 images are large (a 5 MiB image ≈ 6.7 MiB base64 inside JSON).
 
 ## 10. Milestone breakdown (tests-first, one atomic commit each)
 
-1. **Core types** — `MessageContent` / `ContentPart` / `ImageUrl` + `text()` /
+1. **Core types** - `MessageContent` / `ContentPart` / `ImageUrl` + `text()` /
    `has_image()`; serde round-trip + regression tests. Update the token
    estimator to `content.text()`.
-2. **Config + routing** — `modalities` config field, `/v1/models` exposure,
+2. **Config + routing** - `modalities` config field, `/v1/models` exposure,
    enforcement (`LM-2003`) + tests.
-3. **Anthropic translation** — image blocks (base64 + url) + tests.
-4. **Gemini translation** — `inline_data` + remote-URL `LM-2004` + tests.
-5. **Body limit** — `server.max_body_bytes` + `LM-1002` envelope mapping + test.
-6. **Finish** — accounting addendum, conformance suite, gate
+3. **Anthropic translation** - image blocks (base64 + url) + tests.
+4. **Gemini translation** - `inline_data` + remote-URL `LM-2004` + tests.
+5. **Body limit** - `server.max_body_bytes` + `LM-1002` envelope mapping + test.
+6. **Finish** - accounting addendum, conformance suite, gate
    (`cargo test --workspace && cargo clippy --workspace --all-targets -- -D
    warnings && cargo fmt --check`), code-reviewer, docs-writer (README matrix,
    `docs/providers.md`, `docs/errors.md`, `config.example.toml`), CHANGELOG,

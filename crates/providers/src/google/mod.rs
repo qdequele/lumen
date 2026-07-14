@@ -1,4 +1,4 @@
-//! Google Gemini provider — chat completions with bidirectional translation.
+//! Google Gemini provider - chat completions with bidirectional translation.
 //!
 //! Gemini's `generateContent` API differs from OpenAI in several ways this
 //! module bridges:
@@ -11,7 +11,7 @@
 //! * generation params live under `generationConfig`;
 //! * responses are `candidates` with a `finishReason` and `usageMetadata`;
 //! * streaming events are partial responses, translated fragment by fragment
-//!   in [`stream`] (bounded state — the text is never accumulated).
+//!   in [`stream`] (bounded state - the text is never accumulated).
 
 mod stream;
 
@@ -197,7 +197,7 @@ fn map_finish_reason(reason: Option<&str>) -> Option<String> {
 ///
 /// # Errors
 /// Returns [`ProviderError::Translation`] if a message carries a remote
-/// (`http`/`https`) image URL — Gemini accepts only inline base64 image
+/// (`http`/`https`) image URL - Gemini accepts only inline base64 image
 /// bytes, and the gateway never fetches a URL on the caller's behalf.
 fn translate_request(req: &ChatRequest) -> Result<GeminiRequest, ProviderError> {
     let mut system_parts: Vec<GeminiPart> = Vec::new();
@@ -382,7 +382,7 @@ impl ChatProvider for GoogleProvider {
         Ok(items_to_sse_bytes(items))
     }
 
-    /// Gemini accepts only inline base64 image bytes, never a fetchable URL —
+    /// Gemini accepts only inline base64 image bytes, never a fetchable URL -
     /// the gateway must not fetch on the caller's behalf (LM-2004 pre-flight
     /// in the handler; [`translate_request`] is the defensive fallback path).
     fn accepts_remote_image_url(&self) -> bool {

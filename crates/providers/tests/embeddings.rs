@@ -187,7 +187,7 @@ impl EmbedFixture for OllamaFixture {
 }
 
 // --------------------------------------------------------------------------
-// Cohere fixture — request `texts`, response `{ embeddings: { float } }`
+// Cohere fixture - request `texts`, response `{ embeddings: { float } }`
 // --------------------------------------------------------------------------
 
 struct CohereEmbedFixture;
@@ -244,7 +244,7 @@ impl EmbedFixture for CohereEmbedFixture {
 }
 
 // --------------------------------------------------------------------------
-// TEI fixture — request `inputs`, response is a bare `[[f32]]` array
+// TEI fixture - request `inputs`, response is a bare `[[f32]]` array
 // --------------------------------------------------------------------------
 
 struct TeiEmbedFixture;
@@ -297,7 +297,7 @@ impl EmbedFixture for TeiEmbedFixture {
 }
 
 // --------------------------------------------------------------------------
-// Jina & Voyage fixtures — OpenAI-compatible embeddings (reuse `OpenAiEcho`)
+// Jina & Voyage fixtures - OpenAI-compatible embeddings (reuse `OpenAiEcho`)
 // --------------------------------------------------------------------------
 
 struct JinaEmbedFixture;
@@ -557,7 +557,7 @@ async fn run_conformance(fx: &dyn EmbedFixture) {
 }
 
 // --------------------------------------------------------------------------
-// Per-provider entry points — both run the identical suite
+// Per-provider entry points - both run the identical suite
 // --------------------------------------------------------------------------
 
 #[tokio::test]

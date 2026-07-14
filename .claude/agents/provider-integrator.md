@@ -18,11 +18,11 @@ You work ONLY in `crates/providers/src/<provider>/` and its tests. You never mod
 6. Validate: `cargo test -p providers && cargo clippy -p providers -- -D warnings`.
 
 ## Specific rules
-- Every trait impl accepts a `CancellationToken` and uses it with `tokio::select!` — dropping on the client side MUST cancel the upstream HTTP request.
-- Schema translation is exhaustive: fields not supported by the provider are either dropped silently with a `debug` log, or rejected with a clear error — never ignored without a trace. The policy (drop vs reject) is configurable via `strict_mode`.
+- Every trait impl accepts a `CancellationToken` and uses it with `tokio::select!` - dropping on the client side MUST cancel the upstream HTTP request.
+- Schema translation is exhaustive: fields not supported by the provider are either dropped silently with a `debug` log, or rejected with a clear error - never ignored without a trace. The policy (drop vs reject) is configurable via `strict_mode`.
 - Upstream errors are mapped to `ProviderError` with the original status code, the provider name, and a retry-hint (`Retryable`/`Fatal`).
 - `max_batch_size()` for embeddings reflects the provider's real documented limit.
-- No hard-coded API key, even in tests — wiremock + dummy keys `sk-test-xxx`.
+- No hard-coded API key, even in tests - wiremock + dummy keys `sk-test-xxx`.
 
 ## Final report format
 - Files created/modified

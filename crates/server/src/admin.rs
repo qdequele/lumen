@@ -1,11 +1,11 @@
 //! Minimal admin API (M5 §5.5): key management under `/admin`, protected by
 //! the master key (see `auth::require_master_key`).
 //!
-//! * `POST /admin/keys` — create a key. The response is the ONLY place the
+//! * `POST /admin/keys` - create a key. The response is the ONLY place the
 //!   plaintext key ever appears; it is never stored and never logged.
-//! * `GET /admin/keys` — list keys (records only, no hashes, no plaintext).
-//! * `PATCH /admin/keys/{id}` — adjust budgets/limits, enable/disable.
-//! * `PUT /admin/provider-keys/{name}` — store a provider API key encrypted
+//! * `GET /admin/keys` - list keys (records only, no hashes, no plaintext).
+//! * `PATCH /admin/keys/{id}` - adjust budgets/limits, enable/disable.
+//! * `PUT /admin/provider-keys/{name}` - store a provider API key encrypted
 //!   at rest (AES-256-GCM under the master key); read back at boot for
 //!   providers whose `api_key_env` is unset or empty.
 //!
@@ -26,14 +26,14 @@ use serde::{Deserialize, Serialize};
 /// `POST /admin/keys` response: the record plus the one-time plaintext key.
 #[derive(Debug, Serialize)]
 pub struct CreatedKey {
-    /// The clear virtual key. Shown exactly once — store it now.
+    /// The clear virtual key. Shown exactly once - store it now.
     pub key: String,
     /// The created record.
     #[serde(flatten)]
     pub record: VirtualKeyRecord,
 }
 
-/// Map an auth-layer failure to an opaque 500 — never a misleading 401.
+/// Map an auth-layer failure to an opaque 500 - never a misleading 401.
 fn internal(error: &lumen_auth::AuthError) -> ApiError {
     GatewayError::Internal(error.to_string()).into()
 }
@@ -81,7 +81,7 @@ pub async fn list_keys(
 }
 
 /// Patch a key: adjust budgets/limits, enable/disable. An unknown id is a
-/// 400 `LM-1001` naming the id — the public taxonomy reserves 404 for
+/// 400 `LM-1001` naming the id - the public taxonomy reserves 404 for
 /// unknown *models* (`LM-2001`) and has no admin-resource code.
 pub async fn patch_key(
     State(state): State<AppState>,

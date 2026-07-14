@@ -1,4 +1,4 @@
-# ADR 001 — Bare package names, `lumen_*` library names
+# ADR 001 - Bare package names, `lumen_*` library names
 
 - Status: accepted
 - Date: 2026-07-12
@@ -14,7 +14,7 @@ Naming a package `core`, however, is hazardous: a library crate literally named
 `core` lands in the extern prelude of any downstream crate and shadows the
 standard library's `::core`. This surfaces in the doctest harness, where
 `::core::fmt`, `::core::future`, etc. (referenced by expanded std/`async_trait`
-macros) fail to resolve — observed concretely as `E0433: cannot find 'fmt' in
+macros) fail to resolve - observed concretely as `E0433: cannot find 'fmt' in
 'core'` while normal builds still passed.
 
 ## Decision

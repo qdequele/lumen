@@ -1,9 +1,9 @@
 //! The resilience execution layer (M6, ADR 005).
 //!
 //! [`execute`] runs one capability call across a resolved fallback **chain**
-//! (the requested model followed by its configured fallbacks), applying — per
-//! link — the circuit-breaker gate, a first-token timeout on each attempt, and
-//! the retry loop; and — across links — fallback when a link is exhausted or
+//! (the requested model followed by its configured fallbacks), applying - per
+//! link - the circuit-breaker gate, a first-token timeout on each attempt, and
+//! the retry loop; and - across links - fallback when a link is exhausted or
 //! its breaker is open. The whole call is bounded by the total timeout. It is
 //! generic over a closure that performs the actual typed call for a given link
 //! index, so one implementation serves chat (streaming *open* and non-streaming),

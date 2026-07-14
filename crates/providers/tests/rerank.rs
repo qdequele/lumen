@@ -43,7 +43,7 @@ trait RerankFixture: Send + Sync {
 const SCORES: [(u32, f32); 3] = [(0, 0.10), (1, 0.99), (2, 0.50)];
 
 // --------------------------------------------------------------------------
-// Cohere fixture — { results: [{index, relevance_score}], meta }
+// Cohere fixture - { results: [{index, relevance_score}], meta }
 // --------------------------------------------------------------------------
 
 struct CohereFixture;
@@ -89,7 +89,7 @@ impl RerankFixture for CohereFixture {
 }
 
 // --------------------------------------------------------------------------
-// Jina fixture — { results: [{index, relevance_score}] }
+// Jina fixture - { results: [{index, relevance_score}] }
 // --------------------------------------------------------------------------
 
 struct JinaFixture;
@@ -129,7 +129,7 @@ impl RerankFixture for JinaFixture {
 }
 
 // --------------------------------------------------------------------------
-// TEI fixture — bare array [{index, score}]
+// TEI fixture - bare array [{index, score}]
 // --------------------------------------------------------------------------
 
 struct TeiFixture;
@@ -169,7 +169,7 @@ impl RerankFixture for TeiFixture {
 }
 
 // --------------------------------------------------------------------------
-// Voyage fixture — { data: [{index, relevance_score}] }
+// Voyage fixture - { data: [{index, relevance_score}] }
 // --------------------------------------------------------------------------
 
 struct VoyageFixture;
@@ -357,7 +357,7 @@ async fn run_conformance(fx: &dyn RerankFixture) {
 }
 
 // --------------------------------------------------------------------------
-// Per-provider entry points — all run the identical suite
+// Per-provider entry points - all run the identical suite
 // --------------------------------------------------------------------------
 
 #[tokio::test]

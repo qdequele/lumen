@@ -17,7 +17,7 @@ before any public disclosure. Please give us a reasonable window to remediate.
 LUMEN is pre-1.0. Security fixes land on `main` and in the latest tagged
 release. There is no long-term-support branch yet.
 
-## Security model — what LUMEN guarantees
+## Security model - what LUMEN guarantees
 
 LUMEN is a self-hosted gateway; you run it inside your own trust boundary.
 The design makes a few guarantees relevant to security:
@@ -28,7 +28,7 @@ The design makes a few guarantees relevant to security:
   Keys are never logged, never placed in an error returned to a client, and the
   redacting `Debug` impls keep them out of debug output (enforced by tests).
 - **Prompts and responses are never logged by default.** The usage log records
-  token counts, cost and metadata labels — never message content.
+  token counts, cost and metadata labels - never message content.
 - **Virtual keys** are stored only as BLAKE3 hashes; the plaintext is shown once
   at creation and never again. Unknown, disabled and expired keys are
   indistinguishable to the caller (`LM-4004`) so key state cannot be probed.
@@ -47,7 +47,7 @@ The design makes a few guarantees relevant to security:
 - **Terminate TLS** in front of LUMEN (a reverse proxy / load balancer). The
   gateway speaks plain HTTP; do not expose it directly to the internet without
   TLS.
-- **Protect `LUMEN_MASTER_KEY`** and the SQLite database file — together they
+- **Protect `LUMEN_MASTER_KEY`** and the SQLite database file - together they
   decrypt any stored provider keys.
 - **Restrict `/admin/*` and `/metrics`** at the network layer as appropriate;
   `/admin/*` requires the master key, but metrics are unauthenticated by design.

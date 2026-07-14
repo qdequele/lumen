@@ -1,7 +1,7 @@
 //! Asynchronous, batched usage logging (M5 §5.3).
 //!
 //! The request path calls [`UsageLogger::log`], which is a non-blocking
-//! `try_send` into a **bounded** channel — the request path can NEVER block
+//! `try_send` into a **bounded** channel - the request path can NEVER block
 //! or slow down because the database is busy (lesson: LiteLLM #12067). A
 //! dedicated writer task drains the channel and batches `INSERT`s (default:
 //! every 2 s or 500 entries, whichever comes first). A full channel drops the
@@ -40,7 +40,7 @@ pub struct UsageLogger {
 
 impl UsageLogger {
     /// Enqueue one record without ever waiting. Returns `false` when the
-    /// channel is full (or the writer is gone) and the record was dropped —
+    /// channel is full (or the writer is gone) and the record was dropped -
     /// the caller increments `usage_log_dropped_total`.
     pub fn log(&self, record: UsageRecord) -> bool {
         self.tx.try_send(record).is_ok()
@@ -67,7 +67,7 @@ pub fn spawn_usage_writer(
             tokio::select! {
                 received = rx.recv_many(&mut buffer, batch_max) => {
                     if received == 0 {
-                        break; // all senders dropped — final drain below
+                        break; // all senders dropped - final drain below
                     }
                     if buffer.len() >= batch_max {
                         flush(&store, &mut buffer).await;

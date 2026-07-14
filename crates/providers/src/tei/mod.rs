@@ -1,4 +1,4 @@
-//! TEI (Hugging Face Text Embeddings Inference) provider — self-hosted.
+//! TEI (Hugging Face Text Embeddings Inference) provider - self-hosted.
 //!
 //! TEI serves one model per process and has no OpenAI-compatible envelope:
 //!

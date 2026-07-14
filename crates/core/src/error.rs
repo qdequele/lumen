@@ -2,8 +2,8 @@
 //!
 //! Two layers:
 //!
-//! * [`ProviderError`] — what a provider returns. Never contains secrets.
-//! * [`GatewayError`] — what the gateway returns to the client. Carries a
+//! * [`ProviderError`] - what a provider returns. Never contains secrets.
+//! * [`GatewayError`] - what the gateway returns to the client. Carries a
 //!   stable `LM-XXXX` code (documented in `docs/errors.md`), an HTTP status,
 //!   and a coarse [`ErrorType`].
 //!
@@ -37,7 +37,7 @@ pub enum ProviderError {
     Timeout { provider: String },
 
     /// The gateway could not establish a connection to the upstream within the
-    /// connect timeout — the TCP/TLS handshake never completed. Distinct from a
+    /// connect timeout - the TCP/TLS handshake never completed. Distinct from a
     /// read timeout so operators can tell a dead host from a slow one (LM-3012).
     #[error("provider '{provider}' connection timed out")]
     ConnectTimeout { provider: String },
@@ -50,7 +50,7 @@ pub enum ProviderError {
     FirstTokenTimeout { provider: String },
 
     /// The upstream could not be reached at all (DNS failure, connection
-    /// refused, TLS error) — distinct from an HTTP error status.
+    /// refused, TLS error) - distinct from an HTTP error status.
     #[error("provider '{provider}' is unreachable")]
     Unavailable { provider: String },
 
@@ -75,7 +75,7 @@ impl ProviderError {
     /// Whether retrying this call (on the same provider, or a fallback) may
     /// succeed. Retryable: 5xx upstream, connect/read timeouts, unreachable
     /// host, 429. Never retryable: a client-fault 4xx, a schema/translation
-    /// error (deterministic), or a cancellation (M6 §6.1 — never retry 4xx).
+    /// error (deterministic), or a cancellation (M6 §6.1 - never retry 4xx).
     #[must_use]
     pub const fn is_retryable(&self) -> bool {
         match self {
@@ -116,7 +116,7 @@ impl ProviderError {
 }
 
 /// Which gateway-side per-key quota tripped (distinct stable codes: RPM is
-/// `LM-4002`, TPM is `LM-4003` — pinned by the M5 spec).
+/// `LM-4002`, TPM is `LM-4003` - pinned by the M5 spec).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuotaKind {
     /// Requests per minute.
@@ -193,7 +193,7 @@ pub enum GatewayError {
     },
 
     /// An upstream provider returned a response the gateway could not parse
-    /// (malformed / schema mismatch). The upstream's fault, so 502 — never 500.
+    /// (malformed / schema mismatch). The upstream's fault, so 502 - never 500.
     #[error("upstream provider '{provider}' returned an unparseable response")]
     UpstreamInvalidResponse { provider: String },
 
@@ -251,7 +251,7 @@ pub enum GatewayError {
     },
 
     /// Missing or invalid virtual key. Deliberately does not say *why* the
-    /// key is invalid (unknown / disabled / expired) — that would let a
+    /// key is invalid (unknown / disabled / expired) - that would let a
     /// caller probe key state.
     #[error("authentication required")]
     Unauthorized,

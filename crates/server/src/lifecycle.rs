@@ -56,7 +56,7 @@ where
 /// Resolve when the process receives SIGINT (Ctrl-C) or SIGTERM.
 ///
 /// If a signal handler cannot be installed, that branch simply never fires
-/// (we never panic here) — the other signal still works.
+/// (we never panic here) - the other signal still works.
 pub async fn shutdown_signal() {
     let ctrl_c = async {
         let _ = tokio::signal::ctrl_c().await;

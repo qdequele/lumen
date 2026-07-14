@@ -1,6 +1,6 @@
 //! Enforcement tests for the in-memory key state (M5 §5.2).
 //!
-//! Everything here is memory-only — no database in sight — because that is
+//! Everything here is memory-only - no database in sight - because that is
 //! the whole point: admission control never touches SQLite.
 
 use lumen_auth::key::hash_key;
@@ -32,7 +32,7 @@ fn state_with(plaintext: &str, rec: VirtualKeyRecord) -> AuthState {
 #[test]
 fn race_50_concurrent_requests_on_budget_for_10_exactly_10_pass() {
     // Acceptance criterion 1: a hard budget can never be overrun by
-    // concurrency — the reservation is an atomic CAS.
+    // concurrency - the reservation is an atomic CAS.
     let state = state_with(
         "fg-race",
         VirtualKeyRecord {
@@ -69,7 +69,7 @@ fn race_50_concurrent_requests_on_budget_for_10_exactly_10_pass() {
         .count();
     assert_eq!(admitted, 10, "exactly the budget-covered requests pass");
 
-    // The final spent counter equals the budget — zero overrun.
+    // The final spent counter equals the budget - zero overrun.
     assert_eq!(entry.spent_micro(), usd_to_micro(10.0));
 
     // And the 51st request is refused with the budget error.
@@ -110,7 +110,7 @@ fn dropping_an_unsettled_reservation_refunds_it() {
     let entry = state.authenticate("fg-refund", NOW).expect("key valid");
 
     let reservation = entry.admit(NOW, 10, usd_to_micro(1.0)).expect("admitted");
-    drop(reservation); // upstream call failed / was cancelled — no cost
+    drop(reservation); // upstream call failed / was cancelled - no cost
     assert_eq!(entry.spent_micro(), 0);
     assert!(entry.admit(NOW, 10, usd_to_micro(1.0)).is_ok());
 }

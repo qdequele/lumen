@@ -1,6 +1,6 @@
 [book]
 title = "LUMEN"
-description = "Universal, self-hostable LLM gateway in Rust — chat, embeddings, reranking."
+description = "Universal, self-hostable LLM gateway in Rust - chat, embeddings, reranking."
 authors = ["LUMEN contributors"]
 language = "en"
 src = "docs"

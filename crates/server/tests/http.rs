@@ -4,7 +4,7 @@ mod common;
 
 #[tokio::test]
 async fn health_returns_ok_json_even_without_any_api_keys() {
-    // This test sets NO provider key env vars — /health must still answer 200
+    // This test sets NO provider key env vars - /health must still answer 200
     // (acceptance criterion 2: readiness never depends on secrets or I/O).
     let base = common::spawn().await;
 
@@ -77,8 +77,9 @@ async fn oversized_body_is_rejected_with_413() {
 
     assert_eq!(resp.status(), 413, "expected Payload Too Large");
     // The `LM-1002` envelope must advertise the *actual* configured limit
-    // (32), not some other value `AppState.body_limit` happened to default to
-    // — this is the single-source-of-truth invariant `spawn_state` enforces.
+    // (32), not some other value `AppState.body_limit` happened to default
+    // to - this is the single-source-of-truth invariant `spawn_state`
+    // enforces.
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["error"]["code"], "LM-1002");
     assert!(

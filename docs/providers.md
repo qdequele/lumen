@@ -1,6 +1,6 @@
 # Providers
 
-LUMEN ships twenty built-in provider kinds — nine native integrations (their own
+LUMEN ships twenty built-in provider kinds - nine native integrations (their own
 request/response translation) plus eleven **OpenAI-compatible** hosts that reuse
 the OpenAI path with a per-kind base URL. Each `[[providers]]` block in your
 config selects one with a `kind` string and gives it a unique `name` (your own
@@ -24,7 +24,7 @@ Rules that apply to every provider:
 - **API keys are never in the config.** `api_key_env` names an environment
   variable; LUMEN reads it only when a request actually routes to that
   provider. A hosted provider whose env var is unset fails only at use, not at
-  boot — a partial set of keys is fine.
+  boot - a partial set of keys is fine.
 - **Model ids are globally unique** across all providers. A collision aborts
   startup and names both offending providers. Several ids may map to one
   `upstream_id` (versioned aliasing).
@@ -40,8 +40,8 @@ Rules that apply to every provider:
 |-------------|:----:|:-----:|:------:|:-------------:|:--------------:|:-----------------:|
 | `openai`    |  ✅  |  ✅   |        | required      | optional       | 2048              |
 | `mistral`   |  ✅  |  ✅   |        | required      | optional       | 512               |
-| `anthropic` |  ✅  |       |        | required      | optional       | —                 |
-| `google`    |  ✅  |       |        | required      | optional       | —                 |
+| `anthropic` |  ✅  |       |        | required      | optional       | -                 |
+| `google`    |  ✅  |       |        | required      | optional       | -                 |
 | `cohere`    |      |  ✅   |   ✅   | required      | optional       | 96                |
 | `jina`      |      |  ✅   |   ✅   | required      | optional       | 2048              |
 | `voyage`    |      |  ✅   |   ✅   | required      | optional       | 128               |
@@ -62,8 +62,8 @@ serves chat simply has no embed models configured):
 | `xai`         |  ✅  |  ✅   | required      | optional     | `https://api.x.ai/v1`                     |
 | `deepinfra`   |  ✅  |  ✅   | required      | optional     | `https://api.deepinfra.com/v1/openai`     |
 | `huggingface` |  ✅  |  ✅   | required      | optional     | `https://router.huggingface.co/v1`        |
-| `cloudflare`  |  ✅  |  ✅   | required      | **required** | — (URL embeds your account id)            |
-| `vllm`        |  ✅  |  ✅   | keyless       | **required** | — (your self-hosted server)               |
+| `cloudflare`  |  ✅  |  ✅   | required      | **required** | - (URL embeds your account id)            |
+| `vllm`        |  ✅  |  ✅   | keyless       | **required** | - (your self-hosted server)               |
 
 All OpenAI-compatible kinds use a 2048-input embed batch limit. Anything that
 speaks the OpenAI wire format but isn't listed can still be used via
@@ -221,7 +221,7 @@ capabilities = ["rerank"]
 
 - **kind**: `tei` · **capabilities**: embed, rerank.
 - **Auth**: keyless.
-- **base_url**: **required** — points at your Text Embeddings Inference server.
+- **base_url**: **required** - points at your Text Embeddings Inference server.
   TEI serves one model per process, so `upstream_id` is ignored by the upstream
   but kept for your own clarity.
 - **Embed batch limit**: 32.
@@ -242,9 +242,9 @@ capabilities = ["rerank"]
 
 - **kind**: `ollama` · **capabilities**: embed.
 - **Auth**: keyless.
-- **base_url**: **required** — points at your Ollama server.
+- **base_url**: **required** - points at your Ollama server.
 - **Embed batch limit**: 512.
-- **Tip**: a local model may take a while to load into VRAM on its first call —
+- **Tip**: a local model may take a while to load into VRAM on its first call -
   relax `first_token_timeout_ms` / `total_timeout_ms` on the provider block (see
   `config.example.toml`).
 
@@ -304,7 +304,7 @@ capabilities = ["chat"]
 Cloudflare **Workers AI** via its OpenAI-compatible endpoint. `base_url` is
 **required** because it embeds your account id; `api_key_env` holds a Cloudflare
 API token. (Workers AI reranking uses a Cloudflare-specific endpoint and is not
-covered by this OpenAI-compatible kind yet — see `docs/backlog.md`.)
+covered by this OpenAI-compatible kind yet - see `docs/backlog.md`.)
 
 ```toml
 [[providers]]
@@ -375,10 +375,10 @@ rejected with `LM-2003` (400, see `docs/errors.md`) before any upstream call.
 |---|---|---|
 | OpenAI-family (`openai` + the OpenAI-compatible kinds) and `vllm` | forwarded verbatim | forwarded verbatim |
 | `anthropic` | translated to a `base64` image source block | translated to a `url` image source block (Anthropic fetches it) |
-| `google` (Gemini) | translated to `inline_data` | rejected — `LM-2004` |
+| `google` (Gemini) | translated to `inline_data` | rejected - `LM-2004` |
 
 **Never-fetch rule.** LUMEN never dereferences a user-supplied image URL
-itself — doing so would be an SSRF vector (the gateway could be aimed at
+itself - doing so would be an SSRF vector (the gateway could be aimed at
 internal addresses) and would violate the streaming/latency pillar. A remote
 `http(s)` `image_url` is only ever forwarded to a provider that fetches it
 itself (OpenAI, Anthropic); Gemini's `inline_data` field takes only inline
@@ -389,17 +389,17 @@ The `LM-2004` pre-flight check inspects the **primary** provider of the model's
 fallback chain. In the uncommon case where the primary accepts remote URLs
 (e.g. OpenAI) but a Gemini model is configured as a *fallback*, a request with a
 remote image URL passes pre-flight and, only if the primary then fails over to
-Gemini, surfaces as an upstream `LM-3002` (502) — the gateway still never
+Gemini, surfaces as an upstream `LM-3002` (502) - the gateway still never
 fetches the URL. Configure inline `data:` URIs when a Gemini fallback is in play.
 
 **Accounting.** Upstream-reported `usage` already folds in image tokens; when
 an upstream reports no usage, the local estimation fallback counts text only
-(images contribute `0`) and the response is still flagged `"estimated": true` —
+(images contribute `0`) and the response is still flagged `"estimated": true` -
 see the [ADR 003 addendum](adr/003-token-accounting.md#addendum-m8--vision--image-input).
 
 ## Fallbacks across providers
 
-Any model can name an ordered list of `fallbacks` — models that back it when its
+Any model can name an ordered list of `fallbacks` - models that back it when its
 provider exhausts retries or its circuit is open. Each fallback must exist and
 serve every capability of the model it backs (validated at boot), which lets you
 survive a single-vendor outage by spanning providers:
