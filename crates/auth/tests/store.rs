@@ -30,6 +30,8 @@ fn usage(key_id: &str, ts: i64) -> UsageRecord {
         tokens_in: 12,
         tokens_out: 34,
         search_units: None,
+        media_count: 0,
+        media_bytes: 0,
         estimated: false,
         cost: 0.001,
         latency_ms: 42,

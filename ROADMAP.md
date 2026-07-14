@@ -90,9 +90,33 @@ Note: a per-image token heuristic (OpenAI tile formula) and file/GCS URIs
 (Anthropic/Gemini) are deferred - see `docs/backlog.md`.
 Spec: `docs/superpowers/specs/2026-07-14-vision-image-input-design.md`.
 
+## M9 - Multimodal embeddings + guarded image fetch ✅
+- [x] `EmbedInput` widened to content-parts (text + image, mixable), reusing the
+      shared `ContentPart`/`ImageUrl` from `crates/core/src/chat.rs` (M8)
+- [x] Per-model `modalities` reused for embeddings; image to a non-image model →
+      `LM-2003` before the upstream call, checked across the whole fallback chain
+- [x] Opt-in guarded server fetch (`[image_fetch]`, off by default): non-configurable
+      private-IP block + connection pinning (DNS-rebinding safe), scheme/host/prefix
+      allowlists, streamed size cap, timeout, `image/*` MIME, redirect re-validation,
+      per-request count cap, cancellation. `LM-2005/2006/2007`
+- [x] Multimodal translation: Cohere (embed-v4 `inputs`), Voyage
+      (`/multimodalembeddings`), Jina (object `input`)
+- [x] Token counting (ADR 003): upstream usage trusted; local estimate is text-only
+      (images = 0, flagged `estimated`)
+- [x] Media accounting (billing dimension): media count + DECODED bytes per type in
+      Prometheus (`lumen_media_total`, `lumen_media_bytes_total`), the `lumen::usage`
+      log, and `usage_log` (`media_count`/`media_bytes` columns, migration 0003)
+Spec: `docs/superpowers/specs/2026-07-14-multimodal-embeddings-design.md`
+
+Note: a conscious, bounded exception to the "never dereference a URL" rule -
+opt-in, off the streaming hot path, time-bounded. Chat vision (M8) keeps
+"never fetch".
+
 ## Backlog v2 (do not implement)
 Admin UI, semantic cache, audio (STT/TTS), image generation/output, guardrails, distributed rate limiting (Redis), OTLP tracing, WASM plugin.
 
 Note: M8 shipped the first, narrowest slice of the "multimodal (images/audio)"
-non-goal - image input to chat only (see above). Image output and audio (input
-and output) remain out of scope.
+non-goal - image input to chat only (see above). M9 added image input to
+embeddings with an opt-in guarded fetch. Image output and audio (input and
+output) remain out of scope. A per-image token heuristic for the estimation
+fallback (M9) is also deferred.

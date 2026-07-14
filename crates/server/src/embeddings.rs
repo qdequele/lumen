@@ -44,6 +44,22 @@ pub async fn embeddings(
     let links = lumen_router::embedding_links(&chain);
     let exec = state.resilience.exec_config(&client_model);
 
+    // M9 enforcement (fail fast): image input requires EVERY model in the
+    // resolved chain (primary + fallbacks) to declare the "image" modality,
+    // otherwise a fallback hop could route image content to a text-only model.
+    // Rejected before any upstream call with a clear LM-2003 naming the
+    // offending model. Shares `ImageInputNotSupported` with chat vision (M8).
+    if req.input.has_image() {
+        if let Some(bad) = chain_ids.iter().find(|id| {
+            !state
+                .registry
+                .modalities(id)
+                .is_some_and(|mods| mods.iter().any(|m| m == "image"))
+        }) {
+            return Err(GatewayError::ImageInputNotSupported { model: bad.clone() }.into());
+        }
+    }
+
     // Admission BEFORE the upstream call: the pre-call estimate is reserved
     // atomically against the key's budget and quotas (M5 §5.2). The provider
     // label is corrected to the one that actually serves (M6) after execution.
@@ -71,6 +87,15 @@ pub async fn embeddings(
     // call so the provider stops work.
     let cancel = CancellationToken::new();
     let _guard = cancel.clone().drop_guard();
+
+    // M9: resolve any remote image URLs to inline `data:` URIs under the
+    // guarded-fetch policy, BEFORE batching/translation, so providers only ever
+    // see inline bytes. A no-op for text and for `data:` URIs; honors
+    // cancellation. Runs after admission so a rejected key never triggers a
+    // fetch.
+    let mut req = req;
+    lumen_providers::image_fetch::resolve_image_parts(&mut req.input, &state.image_fetch, &cancel)
+        .await?;
 
     // Execute across the chain with retries, fallback, circuit breaking and the
     // per-model timeouts. A fresh request clone (per attempt/link) carries that
@@ -114,11 +139,15 @@ pub async fn embeddings(
         response.usage.estimated = Some(true);
     }
     let cost = pricing.token_cost(&executed.model_used, tokens_in, 0);
+    // M9: media accounting. `req.input`'s image parts are now `data:` URIs
+    // (resolved before execution), so this measures decoded bytes with no I/O.
+    let media = lumen_core::measure_media(&req.input);
     accounting.finish(&Outcome {
         tokens_in,
         tokens_out: 0,
         estimated,
         search_units: None,
+        media,
         cost,
         status: 200,
     });

@@ -112,6 +112,23 @@ fn parse_args() -> Result<Option<PathBuf>, String> {
 }
 
 /// Build the app and serve until shutdown. Uses its own multi-thread runtime.
+/// Build the guarded image-fetch policy from config, logging its posture once
+/// at boot (a warning when enabled with no host/prefix allowlist).
+fn build_image_fetch_policy(
+    config: &Config,
+) -> std::sync::Arc<lumen_providers::image_fetch::ImageFetchPolicy> {
+    if config.image_fetch.enabled {
+        if config.image_fetch.is_unrestricted() {
+            tracing::warn!(
+                "image fetch enabled with no host/prefix allowlist; only scheme and private-IP guards apply"
+            );
+        } else {
+            tracing::info!("image fetch enabled (host/prefix allowlist active)");
+        }
+    }
+    std::sync::Arc::new(config.image_fetch.to_policy())
+}
+
 fn run(config: Config, config_path: PathBuf) -> anyhow::Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -188,12 +205,15 @@ fn run(config: Config, config_path: PathBuf) -> anyhow::Result<()> {
 
         let health = boot_health(&config, &client, &resilience_metrics);
 
+        let image_fetch = build_image_fetch_policy(&config);
+
         let mut state = AppState::new(metrics, registry, tokens)
             .with_guards(guards)
             .with_pricing_cell(pricing)
             .with_resilience(resilience)
             .with_health(health)
-            .with_body_limit(config.server.body_limit);
+            .with_body_limit(config.server.body_limit)
+            .with_image_fetch(image_fetch);
         if let Some(runtime) = auth_runtime.clone() {
             state = state.with_auth(runtime);
         }

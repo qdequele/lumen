@@ -34,6 +34,12 @@ fn registry_for(upstream: &str) -> Arc<Registry> {
                 capabilities: vec![Capability::Chat],
                 modalities: vec!["text".to_owned()],
             },
+            ModelSpec {
+                id: "embed-image".to_owned(),
+                upstream_id: "multimodal-embed".to_owned(),
+                capabilities: vec![Capability::Embed],
+                modalities: vec!["text".to_owned(), "image".to_owned()],
+            },
         ],
     }];
     Arc::new(Registry::build(specs, http::build_client()).expect("registry builds"))
@@ -108,6 +114,112 @@ async fn chat_only_model_requested_for_embedding_is_400_fg2002() {
     assert_eq!(resp.status(), 400);
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["error"]["code"], "LM-2002");
+}
+
+#[tokio::test]
+async fn image_input_to_text_only_model_is_400_fg2003_without_upstream_call() {
+    let upstream = MockServer::start().await;
+    // No mock mounted: if the handler calls upstream, the request 404s there and
+    // this test's assertions on `received_requests` catch the leak.
+    let base = common::spawn_with(registry_for(&upstream.uri()), LIMIT).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/embeddings"))
+        .json(&json!({
+            "model": "embed-small",
+            "input": [[
+                {"type": "text", "text": "a caption"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
+            ]]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 400);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "LM-2003");
+    assert_eq!(body["error"]["type"], "invalid_request");
+
+    // Fail-fast: the upstream must never have been contacted.
+    let requests = upstream.received_requests().await.unwrap();
+    assert!(
+        requests.is_empty(),
+        "no upstream call for a rejected image request"
+    );
+}
+
+#[tokio::test]
+async fn data_uri_image_is_counted_in_media_metrics() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/embeddings"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "object": "list",
+            "data": [{ "object": "embedding", "index": 0, "embedding": [0.1] }],
+            "model": "multimodal-embed",
+            "usage": { "prompt_tokens": 3, "total_tokens": 3 }
+        })))
+        .mount(&upstream)
+        .await;
+
+    let base = common::spawn_with(registry_for(&upstream.uri()), LIMIT).await;
+
+    // A 3-byte image inline as a data: URI (no fetch needed).
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/embeddings"))
+        .json(&json!({
+            "model": "embed-image",
+            "input": [[
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
+            ]]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // The media counters must now show one image of 3 decoded bytes.
+    let metrics = reqwest::get(format!("{base}/metrics"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        metrics.contains("lumen_media_total"),
+        "media count metric present"
+    );
+    assert!(
+        metrics.contains("lumen_media_bytes_total"),
+        "media bytes metric present"
+    );
+    assert!(metrics.contains(r#"media_type="image""#));
+}
+
+#[tokio::test]
+async fn remote_image_url_with_fetch_disabled_is_400_fg2005() {
+    let upstream = MockServer::start().await;
+    // Default test state has image fetching disabled, so a remote image URL to
+    // an image-capable model is rejected with LM-2005 before any upstream call.
+    let base = common::spawn_with(registry_for(&upstream.uri()), LIMIT).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/embeddings"))
+        .json(&json!({
+            "model": "embed-image",
+            "input": [[
+                {"type": "image_url", "image_url": {"url": "https://example.com/cat.png"}}
+            ]]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 400);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "LM-2005");
+    assert!(upstream.received_requests().await.unwrap().is_empty());
 }
 
 #[tokio::test]

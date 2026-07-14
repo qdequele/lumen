@@ -2,45 +2,97 @@
 
 use serde::{Deserialize, Deserializer, Serialize};
 
-/// Input to an embedding request: either a single string or a batch.
+use crate::chat::ContentPart;
+
+/// Input to an embedding request: a single string, a text batch, or a
+/// multimodal batch of content-parts items.
 ///
 /// (Token-array inputs are intentionally not modelled in v1.)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum EmbedInput {
-    /// A single piece of text.
+    /// A single piece of text (`"input": "hi"`).
     Single(String),
-    /// A batch of texts, embedded and returned in the same order.
+    /// A batch of texts (`"input": ["a","b"]`), embedded and returned in order.
     Batch(Vec<String>),
+    /// A multimodal batch (`"input": ["a", [{parts}], ...]`): each item is a
+    /// string or an array of content parts. Only entered when at least one item
+    /// is a parts array (untagged order tries `Single`/`Batch` first).
+    Multi(Vec<EmbedItem>),
+}
+
+/// One item of a multimodal embedding batch: a bare string or an array of
+/// typed content parts (text and/or image), order preserved.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum EmbedItem {
+    /// A bare string item (tried first - untagged order matters).
+    Text(String),
+    /// An array of typed content parts.
+    Parts(Vec<ContentPart>),
 }
 
 impl EmbedInput {
-    /// Number of individual texts in this input.
+    /// Number of individual items in this input.
     #[must_use]
     pub fn len(&self) -> usize {
         match self {
             EmbedInput::Single(_) => 1,
             EmbedInput::Batch(v) => v.len(),
+            EmbedInput::Multi(v) => v.len(),
         }
     }
 
-    /// Whether the input contains no texts.
+    /// Whether the input contains no items.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         match self {
             EmbedInput::Single(_) => false,
             EmbedInput::Batch(v) => v.is_empty(),
+            EmbedInput::Multi(v) => v.is_empty(),
         }
     }
 
-    /// Borrow the inputs as a slice-like iterator, regardless of shape.
+    /// Whether any item carries an image part (dispatch by field presence).
+    #[must_use]
+    pub fn has_image(&self) -> bool {
+        match self {
+            EmbedInput::Single(_) | EmbedInput::Batch(_) => false,
+            EmbedInput::Multi(items) => items.iter().any(|item| match item {
+                EmbedItem::Text(_) => false,
+                EmbedItem::Parts(parts) => parts.iter().any(|p| p.image().is_some()),
+            }),
+        }
+    }
+
+    /// Borrow the text inputs, regardless of shape. For text-only inputs this is
+    /// one `&str` per item; for multimodal items it yields each text fragment
+    /// (image parts contribute nothing). Used by the text-only provider paths
+    /// and by token estimation.
     pub fn iter(&self) -> impl Iterator<Item = &str> {
-        // `Either`-free: collect into a small enum iterator.
-        let slice: &[String] = match self {
-            EmbedInput::Single(s) => std::slice::from_ref(s),
-            EmbedInput::Batch(v) => v.as_slice(),
+        self.text_iter()
+    }
+
+    /// Every text fragment across all items (image parts contribute nothing).
+    pub fn text_iter(&self) -> impl Iterator<Item = &str> {
+        // Materialise into a `Vec` iterator to keep one concrete return type
+        // across the three shapes without a bespoke iterator enum.
+        let fragments: Vec<&str> = match self {
+            EmbedInput::Single(s) => vec![s.as_str()],
+            EmbedInput::Batch(v) => v.iter().map(String::as_str).collect(),
+            EmbedInput::Multi(items) => items
+                .iter()
+                .flat_map(|item| -> Vec<&str> {
+                    match item {
+                        EmbedItem::Text(s) => vec![s.as_str()],
+                        EmbedItem::Parts(parts) => {
+                            parts.iter().filter_map(ContentPart::text_str).collect()
+                        }
+                    }
+                })
+                .collect(),
         };
-        slice.iter().map(String::as_str)
+        fragments.into_iter()
     }
 }
 

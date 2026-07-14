@@ -8,8 +8,9 @@
 
 use async_trait::async_trait;
 use lumen_core::{
-    EmbedRequest, EmbedResponse, EmbeddingProvider, ProviderError, RerankProvider, RerankRequest,
-    RerankResponse, RerankResult, RerankUsage,
+    ContentPart, EmbedData, EmbedInput, EmbedItem, EmbedRequest, EmbedResponse, EmbedUsage,
+    EmbeddingProvider, ProviderError, RerankProvider, RerankRequest, RerankResponse, RerankResult,
+    RerankUsage,
 };
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -52,6 +53,116 @@ impl VoyageProvider {
             api_key,
         }
     }
+
+    /// Embed a multimodal (content-parts) batch via Voyage's
+    /// `/multimodalembeddings` endpoint. Each item becomes one `inputs` entry
+    /// with an ordered `content` array of text / inline-base64-image parts.
+    async fn embed_multimodal(
+        &self,
+        model: &str,
+        items: &[EmbedItem],
+        cancel: &CancellationToken,
+    ) -> Result<EmbedResponse, ProviderError> {
+        let inputs: Vec<VoyageInput> = items
+            .iter()
+            .map(|item| {
+                let content = match item {
+                    EmbedItem::Text(s) => vec![VoyageContent::Text { text: s }],
+                    EmbedItem::Parts(parts) => parts.iter().map(part_to_content).collect(),
+                };
+                VoyageInput { content }
+            })
+            .collect();
+        let body = VoyageMultiRequest { model, inputs };
+
+        let url = format!("{}/multimodalembeddings", self.base_url);
+        let bytes = post_json(
+            &self.client,
+            &url,
+            &body,
+            self.api_key.as_deref(),
+            &self.provider_name,
+            cancel,
+        )
+        .await?;
+
+        let parsed: VoyageMultiResponse = serde_json::from_slice(&bytes)
+            .map_err(|e| ProviderError::Translation(format!("voyage multimodal response: {e}")))?;
+        let data = parsed
+            .data
+            .into_iter()
+            .enumerate()
+            .map(|(index, d)| EmbedData {
+                object: "embedding".to_owned(),
+                index: u32::try_from(index).unwrap_or(u32::MAX),
+                embedding: d.embedding,
+            })
+            .collect();
+        Ok(EmbedResponse {
+            object: "list".to_owned(),
+            data,
+            model: model.to_owned(),
+            usage: EmbedUsage {
+                prompt_tokens: parsed.usage.total_tokens,
+                total_tokens: parsed.usage.total_tokens,
+                estimated: None,
+            },
+        })
+    }
+}
+
+/// Voyage `/multimodalembeddings` request body.
+#[derive(Serialize)]
+struct VoyageMultiRequest<'a> {
+    model: &'a str,
+    inputs: Vec<VoyageInput<'a>>,
+}
+
+#[derive(Serialize)]
+struct VoyageInput<'a> {
+    content: Vec<VoyageContent<'a>>,
+}
+
+/// One multimodal content part: `{"type":"text","text":...}` or
+/// `{"type":"image_base64","image_base64":"data:..."}`.
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum VoyageContent<'a> {
+    Text { text: &'a str },
+    ImageBase64 { image_base64: &'a str },
+}
+
+#[derive(Deserialize)]
+struct VoyageMultiResponse {
+    #[serde(default)]
+    data: Vec<VoyageMultiData>,
+    #[serde(default)]
+    usage: VoyageMultiUsage,
+}
+
+#[derive(Deserialize)]
+struct VoyageMultiData {
+    #[serde(default)]
+    embedding: Vec<f32>,
+}
+
+#[derive(Default, Deserialize)]
+struct VoyageMultiUsage {
+    #[serde(default)]
+    total_tokens: u32,
+}
+
+/// Translate one content part to Voyage's shape (dispatch by field presence).
+fn part_to_content(part: &ContentPart) -> VoyageContent<'_> {
+    if let Some(image) = part.image() {
+        VoyageContent::ImageBase64 {
+            image_base64: &image.url,
+        }
+    } else {
+        VoyageContent::Text {
+            text: part.text_str().unwrap_or(""),
+        }
+    }
 }
 
 /// Redacted so the API key can never reach a log line via `{:?}`.
@@ -72,7 +183,12 @@ impl EmbeddingProvider for VoyageProvider {
         req: EmbedRequest,
         cancel: CancellationToken,
     ) -> Result<EmbedResponse, ProviderError> {
-        // OpenAI-compatible schema: near-passthrough in both directions.
+        // Multimodal (content-parts) requests go to Voyage's dedicated
+        // `/multimodalembeddings` endpoint; text-only requests stay on the
+        // OpenAI-compatible near-passthrough path.
+        if let EmbedInput::Multi(items) = &req.input {
+            return self.embed_multimodal(&req.model, items, &cancel).await;
+        }
         let url = format!("{}/embeddings", self.base_url);
         let bytes = post_json(
             &self.client,

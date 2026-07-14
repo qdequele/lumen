@@ -6,6 +6,7 @@ use crate::pricing::CostTable;
 use crate::resilience::ResilienceRuntime;
 use arc_swap::ArcSwap;
 use lumen_auth::usage::UsageLogger;
+use lumen_providers::image_fetch::ImageFetchPolicy;
 use lumen_providers::Registry;
 use lumen_telemetry::{Metrics, TokenMetrics};
 use std::sync::Arc;
@@ -64,6 +65,9 @@ pub struct AppState {
     pub health: Arc<ProviderHealth>,
     /// Configured max request body size in bytes (for the `LM-1002` message).
     pub body_limit: usize,
+    /// Guarded image-fetch policy for multimodal embeddings (M9). Default:
+    /// disabled (a remote image URL yields `LM-2005`).
+    pub image_fetch: Arc<ImageFetchPolicy>,
 }
 
 impl AppState {
@@ -85,7 +89,15 @@ impl AppState {
             // Matches `config::default_body_limit()`; overridden via
             // `with_body_limit` once the real config is known (main.rs boot).
             body_limit: 10 * 1024 * 1024,
+            image_fetch: Arc::new(ImageFetchPolicy::default()),
         }
+    }
+
+    /// Attach the guarded image-fetch policy (builder style).
+    #[must_use]
+    pub fn with_image_fetch(mut self, policy: Arc<ImageFetchPolicy>) -> Self {
+        self.image_fetch = policy;
+        self
     }
 
     /// Attach the resilience runtime (builder style).

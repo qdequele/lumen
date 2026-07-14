@@ -29,7 +29,7 @@ pub async fn embed_batched(
         return provider.embed(req, cancel.clone()).await;
     }
 
-    // Consume the request, MOVING the input strings into sub-batches rather
+    // Consume the request, MOVING the input items into sub-batches rather
     // than cloning them (the payload can be large - pillar 1: no avoidable
     // copies on the request path). Request-level options are small and cloned.
     let EmbedRequest {
@@ -39,27 +39,29 @@ pub async fn embed_batched(
         dimensions,
         user,
     } = req;
-    let all_inputs: Vec<String> = match input {
-        EmbedInput::Single(s) => vec![s],
-        EmbedInput::Batch(v) => v,
-    };
-    let total_inputs = all_inputs.len();
+    let total_inputs = input.len();
 
-    let mut sub_requests: Vec<EmbedRequest> = Vec::new();
-    let mut iter = all_inputs.into_iter();
-    loop {
-        let chunk: Vec<String> = iter.by_ref().take(max_batch).collect();
-        if chunk.is_empty() {
-            break;
-        }
-        sub_requests.push(EmbedRequest {
+    // Split the input into `max_batch`-sized chunks, preserving the variant so
+    // each sub-request keeps its shape (text batch stays a text batch, a
+    // multimodal batch stays multimodal).
+    let sub_inputs: Vec<EmbedInput> = match input {
+        // A single item never reaches here (len == 1 <= max_batch fast path),
+        // but keep the arm total and correct.
+        EmbedInput::Single(s) => vec![EmbedInput::Single(s)],
+        EmbedInput::Batch(v) => chunk_vec(v, max_batch).map(EmbedInput::Batch).collect(),
+        EmbedInput::Multi(v) => chunk_vec(v, max_batch).map(EmbedInput::Multi).collect(),
+    };
+
+    let sub_requests: Vec<EmbedRequest> = sub_inputs
+        .into_iter()
+        .map(|input| EmbedRequest {
             model: model.clone(),
-            input: EmbedInput::Batch(chunk),
+            input,
             encoding_format: encoding_format.clone(),
             dimensions,
             user: user.clone(),
-        });
-    }
+        })
+        .collect();
 
     let concurrency = concurrency.max(1).min(sub_requests.len());
 
@@ -72,6 +74,16 @@ pub async fn embed_batched(
         .await?;
 
     Ok(reassemble(responses, total_inputs, &model))
+}
+
+/// Split a vector into consecutive chunks of at most `size` items, moving the
+/// elements (no clone). `size` is assumed non-zero (callers pass `max(1)`).
+fn chunk_vec<T>(items: Vec<T>, size: usize) -> impl Iterator<Item = Vec<T>> {
+    let mut iter = items.into_iter();
+    std::iter::from_fn(move || {
+        let chunk: Vec<T> = iter.by_ref().take(size).collect();
+        (!chunk.is_empty()).then_some(chunk)
+    })
 }
 
 /// Concatenate sub-responses in order, re-index globally, and sum usage.

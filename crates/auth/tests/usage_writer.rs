@@ -13,6 +13,8 @@ fn record(model: &str) -> UsageRecord {
         tokens_in: 1,
         tokens_out: 2,
         search_units: None,
+        media_count: 0,
+        media_bytes: 0,
         estimated: false,
         cost: 0.0,
         latency_ms: 5,

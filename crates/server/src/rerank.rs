@@ -108,6 +108,7 @@ pub async fn rerank_handler(
         tokens_out: 0,
         estimated: true,
         search_units: Some(search_units),
+        media: lumen_core::MediaUsage::default(),
         cost,
         status: 200,
     });

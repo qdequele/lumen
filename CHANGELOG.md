@@ -6,6 +6,42 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added - Multimodal embeddings + guarded image fetch (M9)
+
+- `POST /v1/embeddings` now accepts image inputs via OpenAI-style content parts:
+  `input` may be an array whose items are strings or arrays of typed parts
+  (`{"type":"text",...}` / `{"type":"image_url",...}`), mixable per item. The
+  part `type` defaults to `"text"`, and text-vs-image is decided by which field
+  is present, not by `type`. Text-only `input` (string or string array) is
+  unchanged. Reuses the shared `ContentPart`/`ImageUrl` types from
+  `crates/core/src/chat.rs` (introduced by M8 chat vision).
+- Per-model `modalities` config (default `["text"]`), surfaced in
+  `GET /v1/models`. Image input to a model without `"image"` fails fast with
+  `LM-2003` (400) before any upstream call.
+- Multimodal translation for Cohere (embed-v4 `inputs`/`content`), Voyage
+  (`/multimodalembeddings`), and Jina (object `input` array). Non-image-capable
+  providers are gated by the `modalities` check.
+- **Opt-in, guarded server-side image fetch** (`[image_fetch]`, default off):
+  a remote `http(s)` image URL is fetched, base64-encoded, and inlined as a
+  `data:` URI before provider translation. Guards: scheme/host/prefix
+  allowlists, a non-configurable private/loopback/link-local IP block with the
+  connection pinned to the vetted resolved address (DNS-rebinding safe), a
+  streamed size cap, a per-fetch timeout, an `image/*` MIME allowlist, and
+  redirect re-validation. Cancellation-aware. New error codes `LM-2005`
+  (fetch disabled), `LM-2006` (rejected by a guard), `LM-2007` (fetch failed).
+  A remote URL never leaks internal network detail in the client error.
+- Token accounting (ADR 003) for multimodal: upstream `usage` is trusted; the
+  local fallback estimates text parts only (images contribute 0, flagged
+  `estimated`).
+- **Media accounting** as a billing dimension alongside tokens: each request's
+  media item count and total **decoded** bytes are measured (per top-level type)
+  and exported as Prometheus counters `lumen_media_total` and
+  `lumen_media_bytes_total` (labels `capability`/`model`/`provider`/`media_type`
+  + the metadata allowlist), added to the `lumen::usage` structured log, and
+  persisted to new `usage_log` columns `media_count` / `media_bytes` (migration
+  `0003`). Measured uniformly whether the image was a client `data:` URI or
+  gateway-fetched.
+
 ### Added - Vision (image input to chat)
 
 - `POST /v1/chat/completions` accepts OpenAI's content-parts message shape

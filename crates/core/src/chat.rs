@@ -45,7 +45,10 @@ pub enum MessageContent {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContentPart {
     /// The part discriminator: `"text"`, `"image_url"`, or a future type.
-    #[serde(rename = "type")]
+    /// Defaults to `"text"` when omitted, so `{"text":"hi"}` and
+    /// `{"image_url":{...}}` parse without an explicit `type`; real
+    /// OpenAI-shaped parts (which always send `type`) still parse.
+    #[serde(rename = "type", default = "default_kind")]
     pub kind: String,
     /// Present when `kind == "text"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -56,6 +59,37 @@ pub struct ContentPart {
     /// Any other fields (and the payload of unknown part types), preserved verbatim.
     #[serde(flatten)]
     pub extra: Map<String, Value>,
+}
+
+/// The default content-part `type` when none is given.
+fn default_kind() -> String {
+    "text".to_owned()
+}
+
+impl ContentPart {
+    /// The image reference, if this part carries one. Dispatch is by field
+    /// presence, not `kind` (since `kind` defaults to `"text"`).
+    #[must_use]
+    pub fn image(&self) -> Option<&ImageUrl> {
+        self.image_url.as_ref()
+    }
+
+    /// Mutable access to the image reference, if any. Used by the embeddings
+    /// image-fetch stage to rewrite a remote URL to an inline `data:` URI.
+    pub fn image_mut(&mut self) -> Option<&mut ImageUrl> {
+        self.image_url.as_mut()
+    }
+
+    /// The text of this part, if it is a text part. A part carrying an
+    /// `image_url` is never treated as text even if it also has `text`.
+    #[must_use]
+    pub fn text_str(&self) -> Option<&str> {
+        if self.image_url.is_some() {
+            None
+        } else {
+            self.text.as_deref()
+        }
+    }
 }
 
 /// An `image_url` part's value: a URL (remote `http(s)` or a `data:` URI) plus

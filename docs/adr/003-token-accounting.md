@@ -102,3 +102,16 @@ order above; they sharpen what "estimation" means when tier 2 fires.
   dimensions, without a decode step this gateway does not perform) and is out
   of scope for this slice; the hot-path rule above (never decode/inspect image
   bytes on the request path) still holds.
+
+## Addendum (M9 - multimodal embeddings)
+
+The same priority order applies to image content parts in `/v1/embeddings`:
+upstream `usage` is trusted when reported (Cohere, Voyage and Jina all fold
+image cost into their reported token/usage counts). When the upstream reports
+nothing, the local fallback estimates text parts only (image parts contribute
+0 tokens) and the response is still flagged `estimated: true`. This undercounts
+image-heavy requests on a no-usage upstream; a per-image token heuristic is a
+backlog item (see the ROADMAP M9 note). Media volume itself is accounted
+separately (count + decoded bytes) via `lumen_media_total` /
+`lumen_media_bytes_total` and the `usage_log` `media_count`/`media_bytes`
+columns, not through the token counters.

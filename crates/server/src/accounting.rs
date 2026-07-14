@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 /// The measured result of one finished request.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct Outcome {
     /// Input/prompt tokens.
     pub tokens_in: u64,
@@ -33,6 +33,9 @@ pub struct Outcome {
     pub estimated: bool,
     /// Rerank search units, when applicable.
     pub search_units: Option<u64>,
+    /// Media accounting (count + decoded bytes, by type) - M9. Empty for
+    /// text-only requests.
+    pub media: lumen_core::MediaUsage,
     /// Cost in USD (from the config price table).
     pub cost: f64,
     /// HTTP status returned to the client.
@@ -166,6 +169,8 @@ impl Accounting {
             key_id = self.key_id.as_deref().unwrap_or("-"),
             tokens_in = outcome.tokens_in,
             tokens_out = outcome.tokens_out,
+            media_count = outcome.media.count,
+            media_bytes = outcome.media.bytes,
             estimated = outcome.estimated,
             cost = outcome.cost,
             status = outcome.status,
@@ -207,6 +212,21 @@ impl Accounting {
             self.tokens
                 .add_search_units(&self.model_used, &self.provider, &values, units);
         }
+        // M9: media count + decoded bytes, one Prometheus sample per top-level
+        // media type, attributed to the served model/provider.
+        for ty in &outcome.media.by_type {
+            self.tokens.add_media(
+                &lumen_telemetry::tokens::MediaSample {
+                    capability: self.capability,
+                    model: &self.model_used,
+                    provider: &self.provider,
+                    media_type: &ty.media_type,
+                },
+                &values,
+                ty.count,
+                ty.bytes,
+            );
+        }
 
         if let Some(logger) = &self.usage {
             let record = UsageRecord {
@@ -219,6 +239,8 @@ impl Accounting {
                 search_units: outcome
                     .search_units
                     .map(|u| i64::try_from(u).unwrap_or(i64::MAX)),
+                media_count: i64::try_from(outcome.media.count).unwrap_or(i64::MAX),
+                media_bytes: i64::try_from(outcome.media.bytes).unwrap_or(i64::MAX),
                 estimated: outcome.estimated,
                 cost: outcome.cost,
                 latency_ms: i64::try_from(self.started.elapsed().as_millis()).unwrap_or(i64::MAX),
@@ -286,6 +308,7 @@ impl StreamAccounting {
             tokens_out,
             estimated,
             search_units: None,
+            media: lumen_core::MediaUsage::default(),
             cost,
             status,
         });

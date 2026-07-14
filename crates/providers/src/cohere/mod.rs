@@ -13,8 +13,9 @@
 
 use async_trait::async_trait;
 use lumen_core::{
-    EmbedData, EmbedRequest, EmbedResponse, EmbedUsage, EmbeddingProvider, ProviderError,
-    RerankProvider, RerankRequest, RerankResponse, RerankResult, RerankUsage,
+    ContentPart, EmbedData, EmbedInput, EmbedItem, EmbedRequest, EmbedResponse, EmbedUsage,
+    EmbeddingProvider, ProviderError, RerankProvider, RerankRequest, RerankResponse, RerankResult,
+    RerankUsage,
 };
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -72,6 +73,15 @@ impl fmt::Debug for CohereProvider {
 
 // ---- Embeddings ----------------------------------------------------------
 
+/// Either the text-only `texts` shape or the multimodal `inputs` content-array
+/// shape (embed-v4). Untagged so each variant serializes as its bare fields.
+#[derive(Serialize)]
+#[serde(untagged)]
+enum CohereEmbedBody<'a> {
+    Text(CohereEmbedRequest<'a>),
+    Multi(CohereEmbedMultiRequest<'a>),
+}
+
 #[derive(Serialize)]
 struct CohereEmbedRequest<'a> {
     model: &'a str,
@@ -80,6 +90,85 @@ struct CohereEmbedRequest<'a> {
     /// defaults to `search_document` (the indexing case).
     input_type: &'static str,
     embedding_types: [&'static str; 1],
+}
+
+/// Multimodal request body (embed-v4): each batch item becomes one `inputs`
+/// entry with an ordered `content` array of text/image parts.
+#[derive(Serialize)]
+struct CohereEmbedMultiRequest<'a> {
+    model: &'a str,
+    inputs: Vec<CohereInput<'a>>,
+    input_type: &'static str,
+    embedding_types: [&'static str; 1],
+}
+
+#[derive(Serialize)]
+struct CohereInput<'a> {
+    content: Vec<CohereContent<'a>>,
+}
+
+/// One content part in Cohere's embed-v4 shape:
+/// `{"type":"text","text":...}` or `{"type":"image_url","image_url":{"url":...}}`.
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum CohereContent<'a> {
+    Text { text: &'a str },
+    ImageUrl { image_url: CohereImageUrl<'a> },
+}
+
+#[derive(Serialize)]
+struct CohereImageUrl<'a> {
+    url: &'a str,
+}
+
+/// Cohere's `input_type` for the indexing case (the gateway does not know
+/// query-vs-document intent).
+const INPUT_TYPE: &str = "search_document";
+
+/// Build the request body, choosing the text `texts` shape or the multimodal
+/// `inputs` content-array shape (used whenever the input is a content-parts
+/// batch, so per-item grouping and images are preserved).
+fn build_cohere_body(req: &EmbedRequest) -> CohereEmbedBody<'_> {
+    match &req.input {
+        EmbedInput::Multi(items) => {
+            let inputs = items
+                .iter()
+                .map(|item| {
+                    let content = match item {
+                        EmbedItem::Text(s) => vec![CohereContent::Text { text: s }],
+                        EmbedItem::Parts(parts) => parts.iter().map(part_to_content).collect(),
+                    };
+                    CohereInput { content }
+                })
+                .collect();
+            CohereEmbedBody::Multi(CohereEmbedMultiRequest {
+                model: &req.model,
+                inputs,
+                input_type: INPUT_TYPE,
+                embedding_types: ["float"],
+            })
+        }
+        EmbedInput::Single(_) | EmbedInput::Batch(_) => CohereEmbedBody::Text(CohereEmbedRequest {
+            model: &req.model,
+            texts: req.input.iter().collect(),
+            input_type: INPUT_TYPE,
+            embedding_types: ["float"],
+        }),
+    }
+}
+
+/// Translate one content part to Cohere's content shape (dispatch by field
+/// presence: an `image_url` is an image regardless of its declared `type`).
+fn part_to_content(part: &ContentPart) -> CohereContent<'_> {
+    if let Some(image) = part.image() {
+        CohereContent::ImageUrl {
+            image_url: CohereImageUrl { url: &image.url },
+        }
+    } else {
+        CohereContent::Text {
+            text: part.text_str().unwrap_or(""),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -117,12 +206,7 @@ impl EmbeddingProvider for CohereProvider {
         cancel: CancellationToken,
     ) -> Result<EmbedResponse, ProviderError> {
         let url = format!("{}/v2/embed", self.base_url);
-        let body = CohereEmbedRequest {
-            model: &req.model,
-            texts: req.input.iter().collect(),
-            input_type: "search_document",
-            embedding_types: ["float"],
-        };
+        let body = build_cohere_body(&req);
 
         let bytes = post_json(
             &self.client,

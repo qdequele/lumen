@@ -35,6 +35,16 @@ Rules that apply to every provider:
 - **Batching**: an embed request with more inputs than the provider's batch
   limit is split into sub-batches, run with bounded concurrency, and reassembled
   in the original order. The limits below are built in.
+- **Multimodal embeddings (M9)**: declare `modalities = ["text", "image"]` on a
+  model to accept image content parts on `/v1/embeddings`. `input` items may be
+  strings or arrays of parts (`{"type":"text",...}` / `{"type":"image_url",...}`).
+  Images are passed as `data:` URIs, or - with `[image_fetch]` enabled - as
+  remote `http(s)` URLs the gateway fetches under SSRF/resource guards and
+  inlines. Image input to a model without `"image"` is rejected with `LM-2003`;
+  a remote URL with fetching disabled is `LM-2005`. Cohere (embed-v4) and Voyage
+  embed a combined text+image vector per item; **Jina** embeds one modality per
+  item (a mixed item is sent as its image, its caption text is not combined).
+  See the multimodal-embeddings design spec for the full guard list.
 
 | `kind`      | Chat | Embed | Rerank | `api_key_env` | `base_url`     | Embed batch limit |
 |-------------|:----:|:-----:|:------:|:-------------:|:--------------:|:-----------------:|

@@ -42,6 +42,9 @@ pub struct Config {
     /// Resilience knobs: retries, circuit breaker, timeouts, health checks (M6).
     #[serde(default)]
     pub resilience: ResilienceConfig,
+    /// Guarded server-side image fetching for multimodal embeddings (M9).
+    #[serde(default)]
+    pub image_fetch: ImageFetchConfig,
 }
 
 /// Retries, circuit breaker, timeouts and background health checks (M6).
@@ -261,6 +264,72 @@ pub struct ServerConfig {
     pub sse_heartbeat_ms: u64,
 }
 
+/// Guarded server-side image fetching for multimodal embeddings (M9).
+///
+/// Off by default. When enabled, remote `http(s)` image URLs in an embeddings
+/// request are fetched under SSRF/resource guards and inlined as `data:` URIs.
+/// The private-IP block is always on and has no config knob.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImageFetchConfig {
+    /// Master switch. `false` → a remote image URL is rejected with `LM-2005`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Maximum bytes downloaded per image.
+    #[serde(default = "default_image_max_bytes")]
+    pub max_bytes: u64,
+    /// Per-fetch timeout in milliseconds.
+    #[serde(default = "default_image_timeout_ms")]
+    pub timeout_ms: u64,
+    /// Permitted URL schemes. Defaults to `["https"]`.
+    #[serde(default = "default_image_schemes")]
+    pub allowed_schemes: Vec<String>,
+    /// Permitted hosts (exact, or `.suffix` for a domain + subdomains). Empty =
+    /// any public host.
+    #[serde(default)]
+    pub allowed_hosts: Vec<String>,
+    /// Permitted URL prefixes. Empty = no prefix restriction.
+    #[serde(default)]
+    pub allowed_url_prefixes: Vec<String>,
+}
+
+impl Default for ImageFetchConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_bytes: default_image_max_bytes(),
+            timeout_ms: default_image_timeout_ms(),
+            allowed_schemes: default_image_schemes(),
+            allowed_hosts: Vec::new(),
+            allowed_url_prefixes: Vec::new(),
+        }
+    }
+}
+
+impl ImageFetchConfig {
+    /// Build the runtime policy. `allow_private_ips` is hard-wired to `false`:
+    /// the private-IP SSRF block is never configurable.
+    #[must_use]
+    pub fn to_policy(&self) -> lumen_providers::image_fetch::ImageFetchPolicy {
+        lumen_providers::image_fetch::ImageFetchPolicy {
+            enabled: self.enabled,
+            max_bytes: self.max_bytes,
+            timeout: std::time::Duration::from_millis(self.timeout_ms),
+            allowed_schemes: self.allowed_schemes.clone(),
+            allowed_hosts: self.allowed_hosts.clone(),
+            allowed_url_prefixes: self.allowed_url_prefixes.clone(),
+            allow_private_ips: false,
+        }
+    }
+
+    /// Whether fetching is enabled with no host/prefix allowlist - worth a
+    /// startup warning (only the scheme and private-IP guards then apply).
+    #[must_use]
+    pub fn is_unrestricted(&self) -> bool {
+        self.enabled && self.allowed_hosts.is_empty() && self.allowed_url_prefixes.is_empty()
+    }
+}
+
 /// A single upstream provider and the models it serves.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -301,8 +370,8 @@ pub struct ModelConfig {
     /// Capabilities this model serves.
     pub capabilities: Vec<Capability>,
     /// Modalities this model accepts as input. Defaults to `["text"]`; add
-    /// `"image"` to allow image content parts (vision). Unknown modalities
-    /// parse but are ignored in this release.
+    /// `"image"` to allow image content parts on chat (vision) and embeddings.
+    /// Unknown modalities parse but are ignored in this release.
     #[serde(default = "default_modalities")]
     pub modalities: Vec<String>,
     /// Price per **million input tokens**, USD (M5 cost counting).
@@ -370,6 +439,15 @@ const fn default_body_limit() -> usize {
 }
 fn default_modalities() -> Vec<String> {
     vec!["text".to_owned()]
+}
+const fn default_image_max_bytes() -> u64 {
+    10 * 1024 * 1024
+}
+const fn default_image_timeout_ms() -> u64 {
+    5000
+}
+fn default_image_schemes() -> Vec<String> {
+    vec!["https".to_owned()]
 }
 const fn default_first_token_timeout_ms() -> u64 {
     30_000
