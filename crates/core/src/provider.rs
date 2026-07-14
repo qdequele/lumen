@@ -62,6 +62,14 @@ pub trait ChatProvider: Send + Sync {
         let done = stream::once(async { Ok(Bytes::from_static(b"data: [DONE]\n\n")) });
         Ok(framed.chain(done).boxed())
     }
+
+    /// Whether this provider can accept a remote (`http(s)`) image URL in a
+    /// content part. Providers that only accept inline base64 image bytes
+    /// (Gemini) return `false`, so the gateway rejects a remote URL with
+    /// `LM-2004` rather than forwarding one the upstream cannot fetch.
+    fn accepts_remote_image_url(&self) -> bool {
+        true
+    }
 }
 
 /// A provider that can produce text embeddings.

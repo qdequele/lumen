@@ -47,11 +47,13 @@ fn full_registry(upstream: &str) -> Arc<Registry> {
                     id: "gpt".to_owned(),
                     upstream_id: "gpt-4o-2024-08-06".to_owned(),
                     capabilities: vec![Capability::Chat],
+                    modalities: vec!["text".to_owned()],
                 },
                 ModelSpec {
                     id: "embed-small".to_owned(),
                     upstream_id: "text-embedding-3-small".to_owned(),
                     capabilities: vec![Capability::Embed],
+                    modalities: vec!["text".to_owned()],
                 },
             ],
         },
@@ -64,6 +66,7 @@ fn full_registry(upstream: &str) -> Arc<Registry> {
                 id: "rerank-fast".to_owned(),
                 upstream_id: "rerank-v3.5".to_owned(),
                 capabilities: vec![Capability::Rerank],
+                modalities: vec!["text".to_owned()],
             }],
         },
         ProviderSpec {
@@ -75,6 +78,7 @@ fn full_registry(upstream: &str) -> Arc<Registry> {
                 id: "tei-embed".to_owned(),
                 upstream_id: "tei-model".to_owned(),
                 capabilities: vec![Capability::Embed],
+                modalities: vec!["text".to_owned()],
             }],
         },
     ];

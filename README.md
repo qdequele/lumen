@@ -44,6 +44,12 @@ the honest numbers and the method are in
 A single model id is owned entirely by you and may serve one to three
 capabilities. The router resolves each request by `(capability, model)`.
 
+**Vision (image input):** `POST /v1/chat/completions` also accepts OpenAI's
+content-parts message shape (text + `image_url` parts) for any model whose
+config opts in with `modalities = ["text", "image"]` (default `["text"]`).
+OpenAI-family kinds and `vllm` forward image parts verbatim; `anthropic` and
+`google` translate them. See [`docs/providers.md`](docs/providers.md#vision-image-input).
+
 ## 5-minute quickstart
 
 Zero to a successful **chat + embed + rerank** request.

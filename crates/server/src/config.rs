@@ -300,6 +300,11 @@ pub struct ModelConfig {
     pub upstream_id: Option<String>,
     /// Capabilities this model serves.
     pub capabilities: Vec<Capability>,
+    /// Modalities this model accepts as input. Defaults to `["text"]`; add
+    /// `"image"` to allow image content parts (vision). Unknown modalities
+    /// parse but are ignored in this release.
+    #[serde(default = "default_modalities")]
+    pub modalities: Vec<String>,
     /// Price per **million input tokens**, USD (M5 cost counting).
     #[serde(default)]
     pub cost_per_1m_input: Option<f64>,
@@ -362,6 +367,9 @@ const fn default_port() -> u16 {
 }
 const fn default_body_limit() -> usize {
     10 * 1024 * 1024
+}
+fn default_modalities() -> Vec<String> {
+    vec!["text".to_owned()]
 }
 const fn default_first_token_timeout_ms() -> u64 {
     30_000
@@ -699,6 +707,7 @@ impl Config {
                         id: m.id.clone(),
                         upstream_id: m.resolved_upstream_id().to_owned(),
                         capabilities: m.capabilities.clone(),
+                        modalities: m.modalities.clone(),
                     })
                     .collect(),
             })

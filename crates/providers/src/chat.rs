@@ -141,7 +141,10 @@ pub fn single_shot_stream(
                 index: c.index,
                 delta: ChatDelta {
                     role: Some(c.message.role),
-                    content: c.message.content,
+                    // `ChatDelta.content` stays a plain string (OpenAI streaming
+                    // deltas are never multipart); collapse any image parts to
+                    // their text, matching the non-streaming `.text()` idiom.
+                    content: c.message.content.map(|c| c.text().into_owned()),
                     extra: c.message.extra,
                 },
                 finish_reason: c.finish_reason,
@@ -155,7 +158,7 @@ pub fn single_shot_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lumen_core::{ChatChoice, ChatMessage, Usage};
+    use lumen_core::{ChatChoice, ChatMessage, MessageContent, Usage};
 
     fn response() -> ChatResponse {
         ChatResponse {
@@ -167,7 +170,7 @@ mod tests {
                 index: 0,
                 message: ChatMessage {
                     role: "assistant".to_owned(),
-                    content: Some("hello".to_owned()),
+                    content: Some(MessageContent::Text("hello".to_owned())),
                     name: None,
                     extra: serde_json::Map::new(),
                 },

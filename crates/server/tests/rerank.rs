@@ -26,11 +26,13 @@ fn registry_for(upstream: &str) -> Arc<Registry> {
                 id: "rerank-fast".to_owned(),
                 upstream_id: "rerank-v3.5".to_owned(),
                 capabilities: vec![Capability::Rerank],
+                modalities: vec!["text".to_owned()],
             },
             ModelSpec {
                 id: "embed-only".to_owned(),
                 upstream_id: "embed-v4.0".to_owned(),
                 capabilities: vec![Capability::Embed],
+                modalities: vec!["text".to_owned()],
             },
         ],
     }];

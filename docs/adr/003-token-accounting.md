@@ -78,3 +78,27 @@ never a blocking BPE pass. Counting must **never fail or slow a request**.
   token counts rather than the thing that defines them.
 - New error/counter surface: a `tokens_estimated_total` counter lets operators
   see how much of their accounting is measured vs estimated.
+
+## Addendum (M8 — vision / image input)
+
+Image content parts (`{"type":"image_url",...}`) do not change the priority
+order above; they sharpen what "estimation" means when tier 2 fires.
+
+- **Upstream usage stays authoritative and untouched.** OpenAI, Anthropic and
+  Gemini all fold image tokens into their reported `prompt_tokens`, so a vision
+  request with upstream-reported usage is exactly as accurate as a text-only
+  one — no special-casing needed.
+- **The local estimation fallback counts text only.** When the upstream omits
+  usage, the heuristic estimator (`estimate_chat_prompt`, `crates/core/src/tokens.rs`)
+  sums `MessageContent::text()` per message — the concatenation of `text` parts.
+  An image part contributes **0** to that sum; only the message's fixed
+  per-message overhead is counted for an image-only message. The response is
+  still flagged `"estimated": true`, so the client is never told a number is
+  measured when it is not, but a vision-heavy request on a no-usage upstream is
+  undercounted.
+- **A per-image token heuristic (e.g. OpenAI's tile-based formula) is
+  deferred** — see `docs/backlog.md`. It would need to know image dimensions
+  (not always available: a `data:` URI encodes bytes, not decoded pixel
+  dimensions, without a decode step this gateway does not perform) and is out
+  of scope for this slice; the hot-path rule above (never decode/inspect image
+  bytes on the request path) still holds.

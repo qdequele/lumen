@@ -27,7 +27,7 @@ pub mod tokens;
 pub use capability::Capability;
 pub use chat::{
     ChatChoice, ChatChunk, ChatChunkChoice, ChatDelta, ChatMessage, ChatRequest, ChatResponse,
-    Usage,
+    ContentPart, DataUri, ImageUrl, MessageContent, Usage,
 };
 pub use embed::{EmbedData, EmbedInput, EmbedRequest, EmbedResponse, EmbedUsage};
 pub use error::{ErrorBody, ErrorEnvelope, ErrorType, GatewayError, ProviderError, QuotaKind};

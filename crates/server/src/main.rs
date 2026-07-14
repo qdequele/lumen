@@ -192,14 +192,15 @@ fn run(config: Config, config_path: PathBuf) -> anyhow::Result<()> {
             .with_guards(guards)
             .with_pricing_cell(pricing)
             .with_resilience(resilience)
-            .with_health(health);
+            .with_health(health)
+            .with_body_limit(config.server.body_limit);
         if let Some(runtime) = auth_runtime.clone() {
             state = state.with_auth(runtime);
         }
         if let Some(logger) = usage_logger {
             state = state.with_usage(logger);
         }
-        let app = build_app(state, config.server.body_limit);
+        let app = build_app(state);
 
         lifecycle::serve(listener, app, DRAIN_TIMEOUT, lifecycle::shutdown_signal())
             .await

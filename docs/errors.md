@@ -30,6 +30,8 @@ code prefix groups by cause: `1xxx` request, `2xxx` routing, `3xxx` upstream,
 |-----------|------|----------------------------------------------------------------|
 | `LM-2001` | 404  | The requested model id was not found.                          |
 | `LM-2002` | 400  | The model exists but does not serve the requested capability.  |
+| `LM-2003` | 400  | An image content part was sent to a model without the `image` modality. |
+| `LM-2004` | 400  | A remote image URL was sent to a provider that only accepts inline base64 image data. |
 | `LM-2010` | 400  | A rerank request supplied no `documents` to score.             |
 
 ## Upstream errors — `LM-3xxx` · `type: upstream_error`

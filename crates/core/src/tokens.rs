@@ -36,7 +36,7 @@ pub fn estimate_text(text: &str) -> u64 {
 pub fn estimate_chat_prompt(req: &ChatRequest) -> u64 {
     req.messages
         .iter()
-        .map(|m| PER_MESSAGE_OVERHEAD + m.content.as_deref().map_or(0, estimate_text))
+        .map(|m| PER_MESSAGE_OVERHEAD + m.content.as_ref().map_or(0, |c| estimate_text(&c.text())))
         .sum()
 }
 
@@ -65,7 +65,7 @@ mod tests {
     fn msg(content: &str) -> ChatMessage {
         ChatMessage {
             role: "user".to_owned(),
-            content: Some(content.to_owned()),
+            content: Some(crate::chat::MessageContent::Text(content.to_owned())),
             name: None,
             extra: serde_json::Map::new(),
         }

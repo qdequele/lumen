@@ -6,6 +6,36 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added — Vision (image input to chat)
+
+- `POST /v1/chat/completions` accepts OpenAI's content-parts message shape
+  (`content` as a string *or* an array of `{"type":"text"|"image_url",...}`
+  parts); unknown future part types (e.g. `input_audio`) survive round-trip
+  verbatim rather than erroring. `MessageContent`/`ContentPart`/`ImageUrl` land
+  in `crates/core/src/chat.rs`.
+- Per-model opt-in: `modalities = ["text", "image"]` in `[[providers.models]]`
+  (default `["text"]`), surfaced in `GET /v1/models`. An image part sent to a
+  model that hasn't opted in is rejected with the new `LM-2003` (400) before
+  any upstream call.
+- **Provider translation:** OpenAI-family kinds (+ `vllm`) forward image parts
+  verbatim; **Anthropic** translates `image_url` to `image` source blocks
+  (base64 or `url`, both directions); **Gemini** translates to `inline_data`
+  (base64 only) — a remote image URL routed to Gemini is rejected with the new
+  `LM-2004` (400) rather than the gateway fetching it itself. LUMEN never
+  dereferences a user-supplied image URL (SSRF-safety + the latency pillar);
+  only providers that fetch remote URLs themselves (OpenAI, Anthropic) may
+  receive one.
+- **Accounting** (ADR 003 addendum): upstream-reported `usage` already folds in
+  image tokens and is trusted as-is; the local estimation fallback counts text
+  only (`MessageContent::text()`), so an image part contributes `0` to an
+  estimate — the response is still honestly flagged `"estimated": true`, never
+  a silent zero. A per-image token heuristic is deferred (`docs/backlog.md`).
+- `LM-1002` request-body-size envelope (previously a raw 413) now wraps every
+  route, including chat — base64-inlined images can be large.
+- Docs: `docs/errors.md` (`LM-2003`/`LM-2004`), a new "Vision (image input)"
+  section in `docs/providers.md`, README capability note, and a commented
+  `modalities` example in `config.example.toml`.
+
 ### Added — OpenAI-compatible provider kinds
 
 - Eleven new `kind`s served by the OpenAI provider with a per-kind base URL:

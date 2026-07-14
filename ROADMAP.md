@@ -77,5 +77,22 @@ Note: off-network overhead measured (~3 µs median, 10.6 MB image, idle RSS
 (binaries not installed in the dev environment). amd64 image via buildx CI;
 arm64 verified locally (`docker run`).
 
+## M8 — Vision (image input to chat) ✅
+- [x] Core types: `MessageContent`/`ContentPart`/`ImageUrl` (`content` is a string OR an array of parts), `text()`/`has_image()`
+- [x] Per-model `modalities` config (default `["text"]`), exposed in `GET /v1/models`
+- [x] Pre-flight enforcement: an image to a non-vision model → `LM-2003` (400), before any upstream call
+- [x] Anthropic translation (`image` base64/url blocks) and Gemini (`inline_data`); a remote URL to Gemini → `LM-2004` (400), the gateway never fetches upstream
+- [x] OpenAI-family (+ `vllm`): verbatim passthrough of parts, conformance-tested
+- [x] Configurable request body-size limit → `LM-1002` (413) envelope on all routes
+- [x] Token counting (ADR 003): upstream usage is authoritative; text-only estimation fallback (image = 0), always `estimated`
+
+Note: a per-image token heuristic (OpenAI tile formula) and file/GCS URIs
+(Anthropic/Gemini) are deferred — see `docs/backlog.md`.
+Spec: `docs/superpowers/specs/2026-07-14-vision-image-input-design.md`.
+
 ## Backlog v2 (do not implement)
-Admin UI, semantic cache, multimodal (images/audio), guardrails, distributed rate limiting (Redis), OTLP tracing, WASM plugin.
+Admin UI, semantic cache, audio (STT/TTS), image generation/output, guardrails, distributed rate limiting (Redis), OTLP tracing, WASM plugin.
+
+Note: M8 shipped the first, narrowest slice of the "multimodal (images/audio)"
+non-goal — image input to chat only (see above). Image output and audio (input
+and output) remain out of scope.

@@ -334,6 +334,69 @@ upstream_id = "meta-llama/Llama-3.1-8B-Instruct"
 capabilities = ["chat", "embed"]
 ```
 
+## Vision (image input)
+
+`POST /v1/chat/completions` accepts OpenAI's content-parts message shape, so a
+user message can carry text and image parts in one array:
+
+```json
+{
+  "model": "gpt-4o",
+  "messages": [{
+    "role": "user",
+    "content": [
+      { "type": "text", "text": "What is this?" },
+      { "type": "image_url", "image_url": { "url": "data:image/png;base64,iVBORw0KG..." } }
+    ]
+  }]
+}
+```
+
+`image_url.url` is either a `data:<media-type>;base64,<payload>` URI (inline
+bytes) or a remote `http(s)` URL.
+
+**Per-model opt-in.** A model only accepts image parts once its config
+declares the `image` modality (default is `["text"]`):
+
+```toml
+[[providers.models]]
+id = "gpt-4o"
+capabilities = ["chat"]
+modalities = ["text", "image"]   # opts this model into vision
+```
+
+`GET /v1/models` reflects this back as `"modalities": ["text","image"]` per
+model. Sending an image part to a model whose `modalities` lack `"image"` is
+rejected with `LM-2003` (400, see `docs/errors.md`) before any upstream call.
+
+**Which kinds support it:**
+
+| Provider family | `data:` (inline base64) | `http(s)` URL |
+|---|---|---|
+| OpenAI-family (`openai` + the OpenAI-compatible kinds) and `vllm` | forwarded verbatim | forwarded verbatim |
+| `anthropic` | translated to a `base64` image source block | translated to a `url` image source block (Anthropic fetches it) |
+| `google` (Gemini) | translated to `inline_data` | rejected — `LM-2004` |
+
+**Never-fetch rule.** LUMEN never dereferences a user-supplied image URL
+itself — doing so would be an SSRF vector (the gateway could be aimed at
+internal addresses) and would violate the streaming/latency pillar. A remote
+`http(s)` `image_url` is only ever forwarded to a provider that fetches it
+itself (OpenAI, Anthropic); Gemini's `inline_data` field takes only inline
+bytes, so a remote URL routed to Gemini is rejected with `LM-2004` (400)
+instead of the gateway silently fetching it on the caller's behalf.
+
+The `LM-2004` pre-flight check inspects the **primary** provider of the model's
+fallback chain. In the uncommon case where the primary accepts remote URLs
+(e.g. OpenAI) but a Gemini model is configured as a *fallback*, a request with a
+remote image URL passes pre-flight and, only if the primary then fails over to
+Gemini, surfaces as an upstream `LM-3002` (502) — the gateway still never
+fetches the URL. Configure inline `data:` URIs when a Gemini fallback is in play.
+
+**Accounting.** Upstream-reported `usage` already folds in image tokens; when
+an upstream reports no usage, the local estimation fallback counts text only
+(images contribute `0`) and the response is still flagged `"estimated": true` —
+see the [ADR 003 addendum](adr/003-token-accounting.md#addendum-m8--vision--image-input).
+
 ## Fallbacks across providers
 
 Any model can name an ordered list of `fallbacks` — models that back it when its

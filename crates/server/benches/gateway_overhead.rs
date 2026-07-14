@@ -18,7 +18,8 @@ use async_trait::async_trait;
 use criterion::{criterion_group, criterion_main, Criterion};
 use futures::stream::BoxStream;
 use lumen_core::{
-    ChatChoice, ChatMessage, ChatProvider, ChatRequest, ChatResponse, ProviderError, Usage,
+    ChatChoice, ChatMessage, ChatProvider, ChatRequest, ChatResponse, MessageContent,
+    ProviderError, Usage,
 };
 use lumen_router::circuit::{BreakerConfig, CircuitBreakers};
 use lumen_router::executor::{execute, ExecConfig, Link};
@@ -71,11 +72,11 @@ fn sample_response() -> ChatResponse {
             index: 0,
             message: ChatMessage {
                 role: "assistant".to_owned(),
-                content: Some(
+                content: Some(MessageContent::Text(
                     "Consistency, availability and partition tolerance cannot all be \
                      guaranteed at once. Under a partition you must trade one for another."
                         .to_owned(),
-                ),
+                )),
                 name: None,
                 extra: serde_json::Map::new(),
             },
