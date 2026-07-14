@@ -7,10 +7,11 @@
 
 use async_trait::async_trait;
 use lumen_core::{
-    EmbedRequest, EmbedResponse, EmbeddingProvider, ProviderError, RerankProvider, RerankRequest,
-    RerankResponse, RerankResult, RerankUsage,
+    EmbedInput, EmbedItem, EmbedRequest, EmbedResponse, EmbeddingProvider, ProviderError,
+    RerankProvider, RerankRequest, RerankResponse, RerankResult, RerankUsage,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use std::fmt;
 use tokio_util::sync::CancellationToken;
 
@@ -71,17 +72,33 @@ impl EmbeddingProvider for JinaProvider {
         req: EmbedRequest,
         cancel: CancellationToken,
     ) -> Result<EmbedResponse, ProviderError> {
-        // OpenAI-compatible schema: near-passthrough in both directions.
+        // OpenAI-compatible schema: near-passthrough for text. A multimodal
+        // (content-parts) request translates to Jina's object-`input` array
+        // (`{"text":...}` / `{"image":...}`), one element per item; the response
+        // is OpenAI-shaped either way.
         let url = format!("{}/embeddings", self.base_url);
-        let bytes = post_json(
-            &self.client,
-            &url,
-            &req,
-            self.api_key.as_deref(),
-            &self.provider_name,
-            &cancel,
-        )
-        .await?;
+        let bytes = if let EmbedInput::Multi(items) = &req.input {
+            let body = json!({ "model": req.model, "input": jina_multimodal_input(items) });
+            post_json(
+                &self.client,
+                &url,
+                &body,
+                self.api_key.as_deref(),
+                &self.provider_name,
+                &cancel,
+            )
+            .await?
+        } else {
+            post_json(
+                &self.client,
+                &url,
+                &req,
+                self.api_key.as_deref(),
+                &self.provider_name,
+                &cancel,
+            )
+            .await?
+        };
         serde_json::from_slice::<EmbedResponse>(&bytes)
             .map_err(|e| ProviderError::Translation(format!("jina embeddings response: {e}")))
     }
@@ -89,6 +106,29 @@ impl EmbeddingProvider for JinaProvider {
     fn max_batch_size(&self) -> usize {
         MAX_BATCH_SIZE
     }
+}
+
+/// Build Jina's object-`input` array, one element per batch item. Jina's CLIP
+/// models embed each element as a single text *or* image vector (no combined
+/// text+image vector), so an item that carries an image is sent as
+/// `{"image":...}` and any accompanying caption text is not sent; a text-only
+/// item is sent as `{"text":...}`. This preserves the one-item→one-embedding
+/// contract.
+fn jina_multimodal_input(items: &[EmbedItem]) -> Vec<Value> {
+    items
+        .iter()
+        .map(|item| match item {
+            EmbedItem::Text(s) => json!({ "text": s }),
+            EmbedItem::Parts(parts) => {
+                if let Some(image) = parts.iter().find_map(lumen_core::ContentPart::image) {
+                    json!({ "image": image.url })
+                } else {
+                    let text: String = parts.iter().filter_map(|p| p.text_str()).collect();
+                    json!({ "text": text })
+                }
+            }
+        })
+        .collect()
 }
 
 // ---- Reranking -----------------------------------------------------------

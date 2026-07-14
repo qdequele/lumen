@@ -5,10 +5,10 @@
 use std::sync::Arc;
 
 use lumen_core::{ContentPart, EmbedInput, EmbedItem, EmbedRequest, EmbeddingProvider, ImageUrl};
-use lumen_providers::{http, CohereProvider};
+use lumen_providers::{http, CohereProvider, JinaProvider, VoyageProvider};
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
-use wiremock::matchers::method;
+use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const DATA_URI: &str = "data:image/png;base64,QUJD";
@@ -113,4 +113,126 @@ async fn cohere_text_only_still_uses_texts() {
     let body = sent_body(&upstream).await;
     assert_eq!(body["texts"][0], "hello");
     assert!(body.get("inputs").is_none());
+}
+
+#[tokio::test]
+async fn voyage_multimodal_uses_multimodal_endpoint_and_content() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/multimodalembeddings"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [{ "embedding": [0.3, 0.4] }],
+            "usage": { "total_tokens": 7 }
+        })))
+        .mount(&upstream)
+        .await;
+
+    let provider: Arc<dyn EmbeddingProvider> = Arc::new(VoyageProvider::new(
+        http::build_client(),
+        "voyage-test",
+        Some(upstream.uri()),
+        Some("sk-x".to_owned()),
+    ));
+
+    let resp = provider
+        .embed(
+            multimodal_request("voyage-multimodal-3"),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("embed ok");
+    assert_eq!(resp.data.len(), 1);
+    assert_eq!(resp.data[0].embedding, vec![0.3, 0.4]);
+    assert_eq!(resp.usage.prompt_tokens, 7);
+
+    let body = sent_body(&upstream).await;
+    let content = &body["inputs"][0]["content"];
+    assert_eq!(content[0]["type"], "text");
+    assert_eq!(content[0]["text"], "a caption");
+    assert_eq!(content[1]["type"], "image_base64");
+    assert_eq!(content[1]["image_base64"], DATA_URI);
+}
+
+#[tokio::test]
+async fn voyage_text_only_uses_openai_embeddings_endpoint() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/embeddings"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "object": "list",
+            "data": [{ "object": "embedding", "index": 0, "embedding": [0.1] }],
+            "model": "voyage-3",
+            "usage": { "prompt_tokens": 2, "total_tokens": 2 }
+        })))
+        .mount(&upstream)
+        .await;
+
+    let provider: Arc<dyn EmbeddingProvider> = Arc::new(VoyageProvider::new(
+        http::build_client(),
+        "voyage-test",
+        Some(upstream.uri()),
+        Some("sk-x".to_owned()),
+    ));
+
+    let req = EmbedRequest {
+        model: "voyage-3".to_owned(),
+        input: EmbedInput::Batch(vec!["hello".to_owned()]),
+        encoding_format: None,
+        dimensions: None,
+        user: None,
+    };
+    provider.embed(req, CancellationToken::new()).await.unwrap();
+
+    let body = sent_body(&upstream).await;
+    assert_eq!(body["input"][0], "hello");
+}
+
+#[tokio::test]
+async fn jina_multimodal_uses_input_object_array() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/embeddings"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "object": "list",
+            "data": [
+                { "object": "embedding", "index": 0, "embedding": [0.1] },
+                { "object": "embedding", "index": 1, "embedding": [0.2] }
+            ],
+            "model": "jina-clip-v2",
+            "usage": { "prompt_tokens": 4, "total_tokens": 4 }
+        })))
+        .mount(&upstream)
+        .await;
+
+    let provider: Arc<dyn EmbeddingProvider> = Arc::new(JinaProvider::new(
+        http::build_client(),
+        "jina-test",
+        Some(upstream.uri()),
+        Some("sk-x".to_owned()),
+    ));
+
+    // Two single-modality items: one text, one image.
+    let req = EmbedRequest {
+        model: "jina-clip-v2".to_owned(),
+        input: EmbedInput::Multi(vec![
+            EmbedItem::Text("a caption".to_owned()),
+            EmbedItem::Parts(vec![ContentPart {
+                kind: "image_url".to_owned(),
+                text: None,
+                image_url: Some(ImageUrl {
+                    url: DATA_URI.to_owned(),
+                    detail: None,
+                }),
+                extra: serde_json::Map::new(),
+            }]),
+        ]),
+        encoding_format: None,
+        dimensions: None,
+        user: None,
+    };
+    provider.embed(req, CancellationToken::new()).await.unwrap();
+
+    let body = sent_body(&upstream).await;
+    assert_eq!(body["input"][0]["text"], "a caption");
+    assert_eq!(body["input"][1]["image"], DATA_URI);
 }
