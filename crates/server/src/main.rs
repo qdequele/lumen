@@ -188,11 +188,23 @@ fn run(config: Config, config_path: PathBuf) -> anyhow::Result<()> {
 
         let health = boot_health(&config, &client, &resilience_metrics);
 
+        if config.image_fetch.enabled {
+            if config.image_fetch.is_unrestricted() {
+                tracing::warn!(
+                    "image fetch enabled with no host/prefix allowlist; only scheme and private-IP guards apply"
+                );
+            } else {
+                tracing::info!("image fetch enabled (host/prefix allowlist active)");
+            }
+        }
+        let image_fetch = std::sync::Arc::new(config.image_fetch.to_policy());
+
         let mut state = AppState::new(metrics, registry, tokens)
             .with_guards(guards)
             .with_pricing_cell(pricing)
             .with_resilience(resilience)
-            .with_health(health);
+            .with_health(health)
+            .with_image_fetch(image_fetch);
         if let Some(runtime) = auth_runtime.clone() {
             state = state.with_auth(runtime);
         }

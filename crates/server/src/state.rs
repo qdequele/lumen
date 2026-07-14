@@ -6,6 +6,7 @@ use crate::pricing::CostTable;
 use crate::resilience::ResilienceRuntime;
 use arc_swap::ArcSwap;
 use lumen_auth::usage::UsageLogger;
+use lumen_providers::image_fetch::ImageFetchPolicy;
 use lumen_providers::Registry;
 use lumen_telemetry::{Metrics, TokenMetrics};
 use std::sync::Arc;
@@ -62,6 +63,9 @@ pub struct AppState {
     pub resilience: Arc<ResilienceRuntime>,
     /// Background provider-health registry (M6 §6.5), for `/health/providers`.
     pub health: Arc<ProviderHealth>,
+    /// Guarded image-fetch policy for multimodal embeddings (M9). Default:
+    /// disabled (a remote image URL yields `LM-2005`).
+    pub image_fetch: Arc<ImageFetchPolicy>,
 }
 
 impl AppState {
@@ -80,7 +84,15 @@ impl AppState {
             pricing: Arc::new(ArcSwap::from_pointee(CostTable::default())),
             resilience: Arc::new(ResilienceRuntime::defaults()),
             health: Arc::new(ProviderHealth::default()),
+            image_fetch: Arc::new(ImageFetchPolicy::default()),
         }
+    }
+
+    /// Attach the guarded image-fetch policy (builder style).
+    #[must_use]
+    pub fn with_image_fetch(mut self, policy: Arc<ImageFetchPolicy>) -> Self {
+        self.image_fetch = policy;
+        self
     }
 
     /// Attach the resilience runtime (builder style).

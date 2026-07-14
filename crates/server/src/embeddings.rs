@@ -82,6 +82,15 @@ pub async fn embeddings(
     let cancel = CancellationToken::new();
     let _guard = cancel.clone().drop_guard();
 
+    // M9: resolve any remote image URLs to inline `data:` URIs under the
+    // guarded-fetch policy, BEFORE batching/translation, so providers only ever
+    // see inline bytes. A no-op for text and for `data:` URIs; honors
+    // cancellation. Runs after admission so a rejected key never triggers a
+    // fetch.
+    let mut req = req;
+    lumen_providers::image_fetch::resolve_image_parts(&mut req.input, &state.image_fetch, &cancel)
+        .await?;
+
     // Execute across the chain with retries, fallback, circuit breaking and the
     // per-model timeouts. A fresh request clone (per attempt/link) carries that
     // link's upstream id.

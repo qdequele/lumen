@@ -16,6 +16,7 @@ pub mod chat;
 pub mod cohere;
 pub mod google;
 pub mod http;
+pub mod image_fetch;
 pub mod jina;
 pub mod kind;
 pub mod mapping;

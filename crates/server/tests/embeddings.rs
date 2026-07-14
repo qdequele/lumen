@@ -34,6 +34,12 @@ fn registry_for(upstream: &str) -> Arc<Registry> {
                 capabilities: vec![Capability::Chat],
                 modalities: Vec::new(),
             },
+            ModelSpec {
+                id: "embed-image".to_owned(),
+                upstream_id: "multimodal-embed".to_owned(),
+                capabilities: vec![Capability::Embed],
+                modalities: vec!["text".to_owned(), "image".to_owned()],
+            },
         ],
     }];
     Arc::new(Registry::build(specs, http::build_client()).expect("registry builds"))
@@ -141,6 +147,31 @@ async fn image_input_to_text_only_model_is_400_fg2003_without_upstream_call() {
         requests.is_empty(),
         "no upstream call for a rejected image request"
     );
+}
+
+#[tokio::test]
+async fn remote_image_url_with_fetch_disabled_is_400_fg2005() {
+    let upstream = MockServer::start().await;
+    // Default test state has image fetching disabled, so a remote image URL to
+    // an image-capable model is rejected with LM-2005 before any upstream call.
+    let base = common::spawn_with(registry_for(&upstream.uri()), LIMIT).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/embeddings"))
+        .json(&json!({
+            "model": "embed-image",
+            "input": [[
+                {"type": "image_url", "image_url": {"url": "https://example.com/cat.png"}}
+            ]]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 400);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "LM-2005");
+    assert!(upstream.received_requests().await.unwrap().is_empty());
 }
 
 #[tokio::test]
