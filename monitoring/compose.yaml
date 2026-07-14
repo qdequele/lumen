@@ -1,0 +1,69 @@
+# LUMEN real-life test rig: the gateway + Prometheus + Grafana with the
+# dashboard pre-provisioned.
+#
+#   cd monitoring
+#   cp .env.example .env         # then paste your API keys into .env
+#   docker compose up -d --build
+#
+#   Gateway     http://localhost:8080   (OrbStack: http://lumen.lumen-monitoring.orb.local)
+#   Prometheus  http://localhost:9090
+#   Grafana     http://localhost:3000   (admin / lumen; anonymous read access on)
+#
+# After editing .env, re-create the gateway so it sees the new keys:
+#   docker compose up -d lumen
+
+name: lumen-monitoring
+
+services:
+  lumen:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    # All provider API keys come from .env; the file is optional so the stack
+    # boots (and the dashboard works) before any key is configured.
+    env_file:
+      - path: ./.env
+        required: false
+    volumes:
+      - ./lumen.toml:/config.toml:ro
+
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=7d
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    depends_on:
+      - lumen
+
+  grafana:
+    image: grafana/grafana:12.2.0
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: lumen
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/lumen-gateway.json
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3000/api/health | grep -q ok"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  prometheus_data:
+  grafana_data:

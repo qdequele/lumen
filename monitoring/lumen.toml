@@ -1,0 +1,194 @@
+# LUMEN monitoring test-rig configuration.
+#
+# Eight hosted providers, all capabilities exercised. API keys are NEVER put
+# in this file: each provider names the env var that holds its key, and the
+# gateway reads it only when a request actually routes there. Providers whose
+# key is absent simply fail at use, not at boot, so a partial set of keys is
+# fine - the smoke suite skips them.
+#
+# Keys live in monitoring/.env (see .env.example). ONE manual edit is needed
+# below: the Cloudflare base_url embeds your account id.
+
+log_format = "json"
+
+[server]
+host = "0.0.0.0"              # container bind; the compose file maps 8080
+port = 8080
+first_token_timeout_ms = 60000
+
+[telemetry]
+# The smoke/traffic scripts tag requests with x-lumen-metadata, e.g.
+# {"scenario":"traffic","org_id":"acme","team_id":"search","project_id":"website-search"}
+# and the Grafana dashboard splits token series on these keys (multi-tenant
+# accounting). ONLY allowlisted keys become Prometheus labels (ADR 002) - keep
+# this list small and its values bounded, every combination is a time series.
+metadata_labels = ["scenario", "org_id", "team_id", "project_id"]
+
+[resilience]
+# Probe providers that have an explicit base_url (here: Cloudflare) and
+# publish lumen_provider_up / GET /health/providers for the dashboard.
+health_check_enabled = true
+health_check_interval_ms = 15000
+
+# ---------------------------------------------------------------------------
+# OpenAI: chat (vision-capable) + embeddings.
+# ---------------------------------------------------------------------------
+[[providers]]
+name = "openai"
+kind = "openai"
+api_key_env = "OPENAI_API_KEY"
+
+[[providers.models]]
+id = "gpt-4o-mini"
+capabilities = ["chat"]
+modalities = ["text", "image"]
+cost_per_1m_input = 0.15
+cost_per_1m_output = 0.6
+# Cross-vendor chat fallback chain: OpenAI -> Anthropic -> Mistral.
+fallbacks = ["claude-haiku-4-5", "mistral-small"]
+
+[[providers.models]]
+id = "text-embedding-3-small"
+capabilities = ["embed"]
+cost_per_1m_input = 0.02
+
+# ---------------------------------------------------------------------------
+# Anthropic: chat.
+# ---------------------------------------------------------------------------
+[[providers]]
+name = "anthropic"
+kind = "anthropic"
+api_key_env = "ANTHROPIC_API_KEY"
+
+[[providers.models]]
+id = "claude-haiku-4-5"
+upstream_id = "claude-haiku-4-5-20251001"
+capabilities = ["chat"]
+modalities = ["text", "image"]
+cost_per_1m_input = 1.0
+cost_per_1m_output = 5.0
+
+# ---------------------------------------------------------------------------
+# Mistral: chat + embeddings.
+# ---------------------------------------------------------------------------
+[[providers]]
+name = "mistral"
+kind = "mistral"
+api_key_env = "MISTRAL_API_KEY"
+
+[[providers.models]]
+id = "mistral-small"
+upstream_id = "mistral-small-latest"
+capabilities = ["chat"]
+cost_per_1m_input = 0.1
+cost_per_1m_output = 0.3
+
+[[providers.models]]
+id = "mistral-embed"
+capabilities = ["embed"]
+cost_per_1m_input = 0.1
+
+# ---------------------------------------------------------------------------
+# Google Gemini: chat.
+# ---------------------------------------------------------------------------
+[[providers]]
+name = "google"
+kind = "google"
+api_key_env = "GEMINI_API_KEY"
+
+# "gemini-flash-latest" is Google's rolling alias for the newest Flash model;
+# pin a dated id in production. Vision: Gemini takes inline data: URIs only -
+# a remote http(s) image URL routed here is rejected with LM-2004 (the gateway
+# never fetches user-supplied URLs itself; see docs/providers.md).
+[[providers.models]]
+id = "gemini-flash"
+upstream_id = "gemini-flash-latest"
+capabilities = ["chat"]
+modalities = ["text", "image"]
+cost_per_1m_input = 0.3
+cost_per_1m_output = 2.5
+
+# ---------------------------------------------------------------------------
+# Cohere: embeddings + reranking.
+# ---------------------------------------------------------------------------
+[[providers]]
+name = "cohere"
+kind = "cohere"
+api_key_env = "COHERE_API_KEY"
+
+[[providers.models]]
+id = "cohere-embed"
+upstream_id = "embed-v4.0"
+capabilities = ["embed"]
+# embed-v4 is multimodal: accept image content parts (data: URIs) on
+# /v1/embeddings so the dashboard's media accounting panels light up (M9).
+modalities = ["text", "image"]
+cost_per_1m_input = 0.12
+
+[[providers.models]]
+id = "cohere-rerank"
+upstream_id = "rerank-v3.5"
+capabilities = ["rerank"]
+cost_per_1k_searches = 2.0
+# Three-vendor rerank fallback chain.
+fallbacks = ["jina-rerank", "voyage-rerank"]
+
+# ---------------------------------------------------------------------------
+# Jina: embeddings + reranking.
+# ---------------------------------------------------------------------------
+[[providers]]
+name = "jina"
+kind = "jina"
+api_key_env = "JINA_API_KEY"
+
+[[providers.models]]
+id = "jina-embed"
+upstream_id = "jina-embeddings-v3"
+capabilities = ["embed"]
+cost_per_1m_input = 0.02
+
+[[providers.models]]
+id = "jina-rerank"
+upstream_id = "jina-reranker-v2-base-multilingual"
+capabilities = ["rerank"]
+cost_per_1k_searches = 0.02
+
+# ---------------------------------------------------------------------------
+# Voyage: embeddings + reranking.
+# ---------------------------------------------------------------------------
+[[providers]]
+name = "voyage"
+kind = "voyage"
+api_key_env = "VOYAGE_API_KEY"
+
+[[providers.models]]
+id = "voyage-embed"
+upstream_id = "voyage-3-lite"
+capabilities = ["embed"]
+cost_per_1m_input = 0.02
+
+[[providers.models]]
+id = "voyage-rerank"
+upstream_id = "rerank-2"
+capabilities = ["rerank"]
+cost_per_1k_searches = 0.05
+
+# ---------------------------------------------------------------------------
+# Cloudflare Workers AI (OpenAI-compatible): chat + embeddings.
+#
+# ---------------------------------------------------------------------------
+[[providers]]
+name = "cloudflare"
+kind = "cloudflare"
+api_key_env = "CLOUDFLARE_API_TOKEN"
+base_url = "https://api.cloudflare.com/client/v4/accounts/e73266567c2c759b9f57c5ff839ccf9e/ai/v1"
+
+[[providers.models]]
+id = "cf-llama"
+upstream_id = "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
+capabilities = ["chat"]
+
+[[providers.models]]
+id = "cf-embed"
+upstream_id = "@cf/baai/bge-m3"
+capabilities = ["embed"]

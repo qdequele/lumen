@@ -1,0 +1,14 @@
+# Prometheus scrape config for the LUMEN test rig. A 5s interval keeps the
+# demo dashboard lively; use 15-60s in production.
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: lumen
+    static_configs:
+      - targets: ["lumen:8080"]
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
