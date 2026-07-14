@@ -15,6 +15,7 @@
 # Env files
 .env
 .env.*
+!.env.example
 
 # mdBook output
 /book
