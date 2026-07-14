@@ -18,6 +18,7 @@
 
 pub mod capability;
 pub mod chat;
+pub mod content;
 pub mod embed;
 pub mod error;
 pub mod provider;
@@ -29,7 +30,8 @@ pub use chat::{
     ChatChoice, ChatChunk, ChatChunkChoice, ChatDelta, ChatMessage, ChatRequest, ChatResponse,
     Usage,
 };
-pub use embed::{EmbedData, EmbedInput, EmbedRequest, EmbedResponse, EmbedUsage};
+pub use content::{ContentPart, ImageUrl};
+pub use embed::{EmbedData, EmbedInput, EmbedItem, EmbedRequest, EmbedResponse, EmbedUsage};
 pub use error::{ErrorBody, ErrorEnvelope, ErrorType, GatewayError, ProviderError, QuotaKind};
 pub use provider::{ChatProvider, EmbeddingProvider, RerankProvider};
 pub use rerank::{
@@ -91,6 +93,82 @@ mod tests {
         assert_eq!(batch.input.len(), 3);
         let texts: Vec<&str> = batch.input.iter().collect();
         assert_eq!(texts, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn embed_input_accepts_multimodal_parts() {
+        let raw = r#"{
+            "model": "m",
+            "input": [
+                "plain text item",
+                [
+                    {"type": "text", "text": "a caption"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
+                ]
+            ]
+        }"#;
+        let req: EmbedRequest = serde_json::from_str(raw).unwrap();
+        assert_eq!(req.input.len(), 2);
+        assert!(req.input.has_image());
+        // Round-trips back to an equivalent JSON structure.
+        let back = serde_json::to_value(&req).unwrap();
+        assert_eq!(back["input"][0], "plain text item");
+        assert_eq!(
+            back["input"][1][1]["image_url"]["url"],
+            "data:image/png;base64,AAAA"
+        );
+    }
+
+    #[test]
+    fn content_part_type_defaults_to_text() {
+        // No `"type"` → defaults to text.
+        let raw = r#"{"model":"m","input":[[{"text":"hi"}]]}"#;
+        let req: EmbedRequest = serde_json::from_str(raw).unwrap();
+        assert!(!req.input.has_image());
+        let texts: Vec<&str> = req.input.text_iter().collect();
+        assert_eq!(texts, vec!["hi"]);
+    }
+
+    #[test]
+    fn untyped_image_url_part_is_detected_as_image() {
+        // No `"type"` but an `image_url` field → dispatch by field presence.
+        let raw = r#"{"model":"m","input":[[{"image_url":{"url":"data:image/png;base64,AA"}}]]}"#;
+        let req: EmbedRequest = serde_json::from_str(raw).unwrap();
+        assert!(req.input.has_image());
+    }
+
+    #[test]
+    fn unknown_part_type_survives_round_trip() {
+        let raw = r#"{"model":"m","input":[[{"type":"input_audio","input_audio":{"data":"x"}}]]}"#;
+        let req: EmbedRequest = serde_json::from_str(raw).unwrap();
+        assert!(!req.input.has_image());
+        let back = serde_json::to_value(&req).unwrap();
+        assert_eq!(back["input"][0][0]["type"], "input_audio");
+        assert_eq!(back["input"][0][0]["input_audio"]["data"], "x");
+    }
+
+    #[test]
+    fn text_only_array_parses_as_batch_not_multi() {
+        // Untagged order: an all-strings array is `Batch`, never `Multi`.
+        let req: EmbedInput = serde_json::from_str(r#"["a","b"]"#).unwrap();
+        assert!(matches!(req, EmbedInput::Batch(_)));
+        // A bare string is `Single`.
+        let single: EmbedInput = serde_json::from_str(r#""x""#).unwrap();
+        assert!(matches!(single, EmbedInput::Single(_)));
+    }
+
+    #[test]
+    fn text_iter_gathers_all_text_fragments() {
+        let raw = r#"{
+            "model":"m",
+            "input":[
+                "one",
+                [{"type":"text","text":"two"},{"type":"image_url","image_url":{"url":"data:image/png;base64,AA"}},{"type":"text","text":"three"}]
+            ]
+        }"#;
+        let req: EmbedRequest = serde_json::from_str(raw).unwrap();
+        let texts: Vec<&str> = req.input.text_iter().collect();
+        assert_eq!(texts, vec!["one", "two", "three"]);
     }
 
     #[test]
