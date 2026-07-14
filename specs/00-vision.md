@@ -1,22 +1,22 @@
-# Vision — pourquoi LUMEN existe
+# Vision — why LUMEN exists
 
-## Le problème
-Les gateways LLM existantes ont des défauts structurels documentés :
+## The problem
+Existing LLM gateways have documented structural flaws:
 
-**LiteLLM** (Python) : overhead 1.7-4x de throughput mesuré par des utilisateurs en production ; DB dans le chemin de requête (1M de logs → API ralentie) ; 4 Gi RAM/worker recommandés + recyclage de workers pour contenir les fuites ; pas de propagation de cancellation (le GPU continue de générer après déconnexion client) ; readiness probes qui échouent sous charge → cascades de restarts k8s.
+**LiteLLM** (Python): 1.7-4x throughput overhead measured by users in production; DB in the request path (1M logs → slowed-down API); 4 Gi RAM/worker recommended + worker recycling to contain leaks; no cancellation propagation (the GPU keeps generating after the client disconnects); readiness probes that fail under load → cascades of k8s restarts.
 
-**OpenRouter** (SaaS) : pas self-hostable ; pannes de leur propre infra avec des 401 trompeurs ; 5,5 % de frais ; échantillonnage de prompts par défaut ; IDs de modèles qui changent et cassent les intégrations ; pas de hard budget en request path (les agents vident les crédits).
+**OpenRouter** (SaaS): not self-hostable; outages of their own infrastructure with misleading 401s; 5.5% fees; prompt sampling by default; model IDs that change and break integrations; no hard budget in the request path (agents drain the credits).
 
-**Tous** : le reranking et les embeddings sont des seconds citoyens, alors que toute stack RAG en a besoin.
+**All of them**: reranking and embeddings are second-class citizens, even though every RAG stack needs them.
 
-## La réponse
-Une gateway en Rust : binaire unique, chat + embeddings + rerank égaux, < 1 ms d'overhead, zéro télémétrie, budgets durs atomiques, cancellation de bout en bout, DB hors du chemin critique.
+## The answer
+A gateway written in Rust: single binary, chat + embeddings + rerank as equals, < 1 ms overhead, zero telemetry, atomic hard budgets, end-to-end cancellation, DB off the critical path.
 
-## Utilisateur cible
-Le dev/l'équipe qui self-host, mixe APIs cloud (OpenAI, Anthropic, Cohere...) et modèles locaux (Ollama, vLLM, TEI), construit du RAG ou des agents, et veut de la prod fiable sans opérer Postgres+Redis+tuning Gunicorn.
+## Target user
+The dev/team who self-hosts, mixes cloud APIs (OpenAI, Anthropic, Cohere...) and local models (Ollama, vLLM, TEI), builds RAG or agents, and wants reliable production without operating Postgres+Redis+Gunicorn tuning.
 
-## Principes de décision (quand la spec ne dit rien)
-1. En cas de doute : la solution la plus simple qui préserve les 4 piliers (perf, souveraineté, robustesse, multi-capacités).
-2. Une feature qui ajoute de la latence au chemin de requête doit être opt-in.
-3. La compatibilité OpenAI prime sur l'élégance interne — les clients existants doivent marcher sans modification.
-4. Toute donnée utilisateur (prompts, documents) est radioactive : ne jamais la stocker, la logger ou la transmettre ailleurs que vers le provider choisi.
+## Decision principles (when the spec is silent)
+1. When in doubt: the simplest solution that preserves the 4 pillars (performance, sovereignty, robustness, multi-capability).
+2. A feature that adds latency to the request path must be opt-in.
+3. OpenAI compatibility takes precedence over internal elegance — existing clients must work without modification.
+4. Any user data (prompts, documents) is radioactive: never store it, log it, or transmit it anywhere other than to the chosen provider.

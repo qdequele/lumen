@@ -1,4 +1,4 @@
-# Performance baseline (M7 §7.1)
+# Performance baseline
 
 LUMEN's first pillar is **performance**: < 1 ms added p99 off-network,
 ~15 MB idle RAM, streaming that doesn't re-serialize. This document records how
@@ -11,10 +11,10 @@ stated honestly rather than papered over.
 Two layers, because "added latency" has two very different scales:
 
 1. **In-process overhead (`cargo bench`)** — the CPU work the gateway adds *per
-   request, with no sockets involved*: the M6 resilience executor wrapping a
+   request, with no sockets involved*: the resilience executor wrapping a
    provider call (circuit-breaker admit → retry loop → per-attempt timeout) plus
    the JSON (de)serialization the OpenAI surface does. This is the honest
-   measure of "latence ajoutée hors réseau": it excludes the upstream and the
+   measure of "added latency off-network": it excludes the upstream and the
    network entirely. Criterion, warmed, reports median with a 95 % CI.
 
 2. **End-to-end head-to-head (`bench/`, docker-compose + k6)** — LUMEN and
@@ -37,7 +37,7 @@ Numbers are hardware-specific; re-run the commands on your target to get yours.
 
 | Bench | Median | 95 % CI |
 |---|---|---|
-| `executor_overhead_chat` (M6 executor around an instant provider) | **1.21 µs** | 1.04 – 1.40 µs |
+| `executor_overhead_chat` (executor around an instant provider) | **1.21 µs** | 1.04 – 1.40 µs |
 | `json_request_deserialize` (parse a chat request) | **1.34 µs** | 1.15 – 1.55 µs |
 | `json_response_serialize` (serialize a chat response) | **0.60 µs** | 0.55 – 0.66 µs |
 
@@ -64,7 +64,7 @@ in CI via buildx (`release.yml`).
 | # | Target | Status |
 |---|---|---|
 | 1 | < 1 ms added **p99** off-network | **Met (median), with margin.** The gateway's per-request CPU work is ~3.2 µs median; even a 100× tail would sit at ~0.3 ms, well under 1 ms. The p99 *under concurrent load* is produced by the k6 harness below — not run in the recording environment (no LiteLLM image pulled), so the sub-µs→µs in-process figure is what is asserted here. |
-| 2 | < 25 MB RAM under load | **Met at idle (8.8 MB).** Under load, memory is bounded by design — no unbounded queues (backpressure + bounded channels), the usage log drops rather than grows (proven by M6 criterion 5, the 500-concurrent test). The exact under-load RSS is captured by `docker stats` during the k6 run. |
+| 2 | < 25 MB RAM under load | **Met at idle (8.8 MB).** Under load, memory is bounded by design — no unbounded queues (backpressure + bounded channels), the usage log drops rather than grows (proven by criterion 5, the 500-concurrent test). The exact under-load RSS is captured by `docker stats` during the k6 run. |
 | 3 | throughput ≥ 95 % of direct | **Not measured in this environment** (requires the LiteLLM/k6 head-to-head). The harness is provided and reproducible; with a ~3 µs in-process overhead against network latencies of ≥ 1 ms, the theoretical ceiling is ≫ 95 %, but the empirical number must come from the harness on real hardware. |
 
 Honest summary: the **off-network overhead is measured and is microseconds**,

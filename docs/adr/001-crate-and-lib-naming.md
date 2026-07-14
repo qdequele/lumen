@@ -2,7 +2,6 @@
 
 - Status: accepted
 - Date: 2026-07-12
-- Milestone: M1
 
 ## Context
 

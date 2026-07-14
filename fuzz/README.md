@@ -1,4 +1,4 @@
-# Fuzzing (M7 §7.4)
+# Fuzzing
 
 Light fuzzing of the untrusted-input parsers, run weekly in CI (10 min/target)
 and on demand locally.

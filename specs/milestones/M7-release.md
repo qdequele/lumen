@@ -1,57 +1,57 @@
 # M7 — Release
 
-## Objectif
-Prouver les promesses (benchmarks publics), packager, documenter. Sortie = v0.1.0 taguée.
+## Objective
+Prove the promises (public benchmarks), package, document. Output = tagged v0.1.0.
 
-## Tâches
+## Tasks
 
 ### 7.1 Benchmarks
-- [x] Criterion : latence ajoutée par la gateway (proxy vs direct, mock amont local), overhead streaming par chunk, throughput embeddings batchés
-- [x] Harnais de comparaison reproductible vs LiteLLM (docker-compose : mock amont + lumen + litellm + k6/oha) — mesurer latence ajoutée p50/p99, RAM, req/s
-- [x] Résultats dans `docs/perf-baseline.md` avec la méthodo exacte (versions, hardware, commandes) — reproductible par n'importe qui
-- [x] Cibles à valider : < 1 ms ajoutée p99 hors réseau, < 25 Mo RAM sous charge, throughput ≥ 95 % du direct
+- [x] Criterion: latency added by the gateway (proxy vs direct, local mock upstream), streaming overhead per chunk, batched embeddings throughput
+- [x] Reproducible comparison harness vs LiteLLM (docker-compose: mock upstream + lumen + litellm + k6/oha) — measure added p50/p99 latency, RAM, req/s
+- [x] Results in `docs/perf-baseline.md` with the exact methodology (versions, hardware, commands) — reproducible by anyone
+- [x] Targets to validate: < 1 ms added p99 excluding network, < 25 MB RAM under load, throughput ≥ 95% of direct
 
-Note : overhead hors réseau mesuré (~3 µs médian) et RSS idle 8,8 Mo → cibles 1
-et 2 atteintes avec marge ; le comparatif chargé vs LiteLLM (throughput,
-p50/p99, RAM sous charge) est fourni comme harnais reproductible `bench/` mais
-non exécuté dans l'environnement de dev (écart documenté honnêtement).
+Note: overhead excluding network measured (~3 µs median) and idle RSS 8.8 MB → targets 1
+and 2 met with margin; the loaded comparison vs LiteLLM (throughput,
+p50/p99, RAM under load) is provided as a reproducible harness `bench/` but
+not run in the dev environment (gap documented honestly).
 
 ### 7.2 Packaging
-- [x] Binaire statique `x86_64-unknown-linux-musl` + `aarch64` ; vérifier la taille (< 25 Mo strippé)
-- [x] Dockerfile multi-stage → distroless/static, multi-arch (buildx), image < 30 Mo
-- [x] `docker run -v ./config.toml:/config.toml -e OPENAI_API_KEY ghcr.io/.../lumen` fonctionne tel quel
-- [x] Release GitHub Actions : binaires + image sur tag `v*`
+- [x] Static binary `x86_64-unknown-linux-musl` + `aarch64`; check the size (< 25 MB stripped)
+- [x] Multi-stage Dockerfile → distroless/static, multi-arch (buildx), image < 30 MB
+- [x] `docker run -v ./config.toml:/config.toml -e OPENAI_API_KEY ghcr.io/.../lumen` works as-is
+- [x] GitHub Actions release: binaries + image on `v*` tag
 
-Note : image distroless/musl **10,6 Mo**, `docker run` vérifié localement sur
-arm64 (`/health` 200, `/v1/models`). amd64 construit via buildx en CI
-(`release.yml`) — non exécuté hors CI.
+Note: distroless/musl image **10.6 MB**, `docker run` verified locally on
+arm64 (`/health` 200, `/v1/models`). amd64 built via buildx in CI
+(`release.yml`) — not run outside CI.
 
 ### 7.3 Hot reload
-- [x] SIGHUP ou watch du fichier config → nouvelle config validée puis swap atomique (ArcSwap du registry) — connexions en cours non affectées
-- [x] Config invalide au reload → log erreur, ancienne config conservée, métrique `config_reload_failures_total`
+- [x] SIGHUP or config file watch → new config validated then atomic swap (ArcSwap of the registry) — in-flight connections unaffected
+- [x] Invalid config on reload → log error, old config kept, metric `config_reload_failures_total`
 
-Note : métrique nommée `lumen_config_reload_failures_total` (+
-`lumen_config_reloads_total`). Le reload préserve les clés provider
-stockées en base (snapshot boot) — durci après revue.
+Note: metric named `lumen_config_reload_failures_total` (+
+`lumen_config_reloads_total`). The reload preserves the provider keys
+stored in the database (boot snapshot) — hardened after review.
 
-### 7.4 Sécurité & qualité
-- [x] `cargo audit` + `cargo deny` (licences + advisories) dans la CI
-- [x] Fuzzing léger du parser SSE et de la traduction Anthropic (cargo-fuzz, corpus des fixtures) — 10 min en CI hebdo
-- [x] `SECURITY.md`, en-têtes de sécurité HTTP par défaut
+### 7.4 Security & quality
+- [x] `cargo audit` + `cargo deny` (licenses + advisories) in the CI
+- [x] Light fuzzing of the SSE parser and the Anthropic translation (cargo-fuzz, fixtures corpus) — 10 min in weekly CI
+- [x] `SECURITY.md`, default HTTP security headers
 
-Note : `deny.toml` + job CI `supply-chain` (audit + deny). Fuzz : crate `fuzz/`
-(cibles `sse_parser`, `chat_request`) + workflow hebdo ; la traduction Anthropic
-est atteinte via le parser SSE partagé — fuzz direct des `translate_*` reporté
-au backlog (fns privées). Binaires audit/deny/fuzz non installés en dev, câblés
-en CI.
+Note: `deny.toml` + CI job `supply-chain` (audit + deny). Fuzz: crate `fuzz/`
+(targets `sse_parser`, `chat_request`) + weekly workflow; the Anthropic translation
+is reached via the shared SSE parser — direct fuzzing of the `translate_*` fns deferred
+to the backlog (private fns). audit/deny/fuzz binaries not installed in dev, wired
+in CI.
 
-### 7.5 Documentation (déléguer à docs-writer)
-- [x] README avec quickstart 5 minutes, tableau providers×capacités, benchmarks
-- [x] Guides par provider, docs/errors.md complet, CHANGELOG v0.1.0
+### 7.5 Documentation (delegate to docs-writer)
+- [x] README with 5-minute quickstart, providers×capabilities table, benchmarks
+- [x] Per-provider guides, complete docs/errors.md, CHANGELOG v0.1.0
 
-## Critères d'acceptation
-1. [x] `docs/perf-baseline.md` publié — cibles 1 & 2 atteintes (mesurées), cible 3 (throughput chargé) documentée honnêtement avec harnais reproductible.
-2. [x] Image Docker : `docker run` du README fonctionne — vérifié sur arm64 localement ; amd64 via buildx CI.
-3. [x] Reload avec config cassée → service intact, `lumen_config_reload_failures_total` incrémentée (testé).
-4. [x] cargo audit/deny câblés en CI (verts attendus ; binaires non installés dans l'environnement de dev).
-5. [x] Un nouvel utilisateur peut passer de zéro à chat + embed + rerank via le seul README (quickstart 5 min + 3 curls avec des ids de `config.example.toml`).
+## Acceptance criteria
+1. [x] `docs/perf-baseline.md` published — targets 1 & 2 met (measured), target 3 (loaded throughput) documented honestly with a reproducible harness.
+2. [x] Docker image: the README's `docker run` works — verified on arm64 locally; amd64 via buildx CI.
+3. [x] Reload with a broken config → service intact, `lumen_config_reload_failures_total` incremented (tested).
+4. [x] cargo audit/deny wired in CI (green expected; binaries not installed in the dev environment).
+5. [x] A new user can go from zero to chat + embed + rerank via the README alone (5-min quickstart + 3 curls with ids from `config.example.toml`).

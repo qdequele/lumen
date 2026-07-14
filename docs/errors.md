@@ -35,7 +35,7 @@ code prefix groups by cause: `1xxx` request, `2xxx` routing, `3xxx` upstream,
 ## Upstream errors — `LM-3xxx` · `type: upstream_error`
 
 These always name the provider that failed. Retriable ones may be transparently
-retried on a fallback (M6) before surfacing.
+retried on a fallback before surfacing.
 
 | Code      | HTTP | Meaning                                                        |
 |-----------|------|----------------------------------------------------------------|
@@ -52,10 +52,10 @@ retried on a fallback (M6) before surfacing.
 
 For `LM-3001`, `LM-3020` (and `LM-4002`/`LM-4003`), a `Retry-After` value may be
 advertised. The three timeouts (`LM-3011` first-token, `LM-3012` connect,
-`LM-3013` total) are distinct codes purely for debugging — see M6 §6.4 and
+`LM-3013` total) are distinct codes purely for debugging — see §6.4 and
 `docs/adr/005-resilience-execution.md`.
 
-### How resilience shapes these codes (M6)
+### How resilience shapes these codes
 
 The `3xxx` codes are what a client sees only *after* the resilience machinery
 has given up. Before surfacing, a retryable failure (`LM-3001` 429,
@@ -81,7 +81,7 @@ Whichever model ultimately served a successful request is reported in the
 
 ## Auth / budget errors — `LM-4xxx` · `type: invalid_request`
 
-Codes pinned by the M5 spec. Enforcement happens in memory, **before** any
+Codes pinned by the spec. Enforcement happens in memory, **before** any
 upstream call — a rejected request never leaks spend to a provider.
 
 | Code      | HTTP | Meaning                                                        |

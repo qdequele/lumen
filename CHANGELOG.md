@@ -25,10 +25,10 @@ First tagged release. LUMEN is a universal, self-hostable LLM gateway in
 Rust — chat, embeddings and reranking as first-class capabilities behind one
 OpenAI/Cohere-compatible surface, with a measured **~3 µs** added CPU per
 request off-network, **~8.8 MB** idle RAM, hard budgets, end-to-end
-cancellation, and zero telemetry. See the milestone entries below (M1–M7) for
-the full feature history.
+cancellation, and zero telemetry. See the entries below for the full feature
+history.
 
-### Added — M7: release (hot reload, packaging, security, benchmarks)
+### Added — Release (hot reload, packaging, security, benchmarks)
 
 - **Config hot reload** (§7.3): `SIGHUP` or a config-file change re-validates and
   atomically swaps the provider routing table via the registry's ArcSwap;
@@ -53,9 +53,9 @@ the full feature history.
 - **New metrics**: `lumen_config_reloads_total`,
   `lumen_config_reload_failures_total`.
 
-### Added — M6: résilience (retries, fallback, circuit breaker, timeouts, health)
+### Added — Resilience (retries, fallback, circuit breaker, timeouts, health)
 
-**M6 is complete.** The gateway now survives flaky upstreams without becoming
+The gateway now survives flaky upstreams without becoming
 flaky itself: retries, multi-provider fallback, a per-provider circuit breaker,
 per-phase timeouts and optional background health checks — none of it on a
 database path, and `/health` stays independent of provider health (the LiteLLM
@@ -80,12 +80,12 @@ database path, and `/health` stays independent of provider health (the LiteLLM
   `lumen_circuit_state{provider,model}` (0/1/2). Open with no fallback left
   → 503 `LM-3020` with `Retry-After`.
 - **Timeouts** (§6.4): `connect_timeout_ms` (5000, client-wide → `LM-3012`),
-  `first_token` (the M4 `server.first_token_timeout_ms`, 30 000 → `LM-3011`) and
+  `first_token` (the `server.first_token_timeout_ms`, 30 000 → `LM-3011`) and
   `total_timeout_ms` (600 000 → `LM-3013`), each a distinct code. `first_token`
   and `total` are overridable per provider; `connect` is client-wide (one
   pooled HTTP client). All bounded by the executor's absolute total deadline.
 - **Streaming stays committed once it starts**: retry/fallback happen only while
-  *opening* the upstream byte stream; after the first frame the M4 guards
+  *opening* the upstream byte stream; after the first frame the stream guards
   (LM-3010/3011, heartbeat) own the stream and never retry.
 - **Background health checks** (§6.5, `health_check_enabled` off by default):
   a periodic probe of every provider with a configured `base_url` fills
@@ -98,9 +98,9 @@ database path, and `/health` stays independent of provider health (the LiteLLM
   capability-specific resolution, breaker placement, streaming boundary, the
   connect-per-provider and first-frame-peek simplifications deferred).
 
-### Added — M5: auth, virtual keys, hard budgets & token accounting
+### Added — Auth, virtual keys, hard budgets & token accounting
 
-**M5 is complete.** The gateway can now be shared safely: keys, budgets that
+The gateway can now be shared safely: keys, budgets that
 can NEVER be overrun, and a token count for every single request.
 
 - **Virtual keys** (`[auth]`, off by default): `fg-` + 32 random bytes,
@@ -108,7 +108,7 @@ can NEVER be overrun, and a token count for every single request.
   would just burn hot-path CPU). Auth on all of `/v1/*`; unknown, disabled
   and expired keys are one indistinguishable `LM-4004` (401). `/health` and
   `/metrics` stay open.
-- **Hard budgets, enforced in memory** (M5 §5.2): the pre-call cost estimate
+- **Hard budgets, enforced in memory** (§5.2): the pre-call cost estimate
   is *reserved* with an atomic CAS before the upstream call and settled to
   the real usage after it — 50 concurrent requests against a budget for 10
   admit exactly 10 (tested at both the atomic and the HTTP level). Refusals
@@ -151,15 +151,15 @@ can NEVER be overrun, and a token count for every single request.
 
 ### Changed
 
-- **LM-4xxx codes realigned to the M5 spec** (they were placeholders, never
+- **LM-4xxx codes realigned to the spec** (they were placeholders, never
   emitted): `LM-4001` = budget exhausted (402), `LM-4002` = RPM (429),
   `LM-4003` = TPM (429), `LM-4004` = missing/invalid key (401).
 - `Usage`, `EmbedUsage` and `RerankUsage` gained an optional `estimated`
   field, omitted unless the gateway estimated the counts (ADR 003).
 
-### Added — M4 (final slice): streaming translation, tools, and stream guards
+### Added — Streaming translation, tools, and stream guards
 
-**M4 is complete.** This slice closes every remaining criterion:
+This closes every remaining streaming criterion:
 
 - **Incremental SSE parser** (`providers::sse`): reassembles upstream events
   fragmented across TCP packets (LF and CRLF, multi-line `data:`, comments
@@ -182,7 +182,7 @@ can NEVER be overrun, and a token count for every single request.
   - *first-token timeout* (`first_token_timeout_ms`, default 30 s) → LM-3011:
     a plain 504 when the upstream never answered, an SSE error frame when the
     stream had started; non-streaming applies the window to the whole upstream
-    call (per-phase timeouts land in M6);
+    call (per-phase timeouts come later);
   - *missing terminator* → LM-3010 error frame when the upstream dies without
     `data: [DONE]` (criterion 5) — detection survives a `[DONE]` split across
     frame boundaries; the gateway never fabricates the terminator itself;
@@ -190,10 +190,10 @@ can NEVER be overrun, and a token count for every single request.
     streams so proxies don't reap slow upstreams.
 - **Streaming usage (ADR 003), upstream half**: passthrough requests
   `stream_options.include_usage`; translated providers emit full usage in the
-  final chunk. The local-estimation fallback (`estimated=true`) moves to M5
+  final chunk. The local-estimation fallback (`estimated=true`) lands later
   with the Prometheus counters and `usage_log`.
 
-### Added — M4 (slice 3, partial): Google Gemini + Mistral embeddings
+### Added — Google Gemini + Mistral embeddings
 
 - **Google Gemini** chat provider (non-streaming) with bidirectional
   translation: OpenAI messages → `contents` (assistant→`model`, system hoisted
@@ -204,12 +204,12 @@ can NEVER be overrun, and a token count for every single request.
   Mistral now serves both chat and embeddings; added to the embeddings
   conformance suite.
 
-  *Still remaining to complete M4:* Anthropic + Gemini streaming-event
+  *Still remaining:* Anthropic + Gemini streaming-event
   translation (criterion 4), first-token timeout LM-3011 (criterion 6),
   upstream-closes-without-`[DONE]` → LM-3010 (criterion 5), SSE heartbeat, and
   streaming token estimation (ADR 003).
 
-### Added — M4 (slice 2): zero-copy SSE streaming
+### Added — Zero-copy SSE streaming
 
 - Real incremental streaming for `stream=true`: the gateway forwards the
   upstream SSE bytes **verbatim** — no per-chunk `serde` round trip (ADR 004).
@@ -221,11 +221,11 @@ can NEVER be overrun, and a token count for every single request.
   Proven byte-identical over 100 chunks; `stream_options.include_usage` is
   requested automatically without overriding a client's choice.
 
-  *Still deferred to slice 3:* Anthropic streaming-event translation, Google
+  *Still deferred:* Anthropic streaming-event translation, Google
   Gemini, Mistral embeddings, first-token timeout (LM-3011), SSE heartbeat, and
   streaming token sniffing/estimation (ADR 003).
 
-### Added — M4 (slice 1): chat completions (non-streaming)
+### Added — Chat completions (non-streaming)
 
 - `POST /v1/chat/completions`: non-streaming JSON end to end (validate → route →
   provider → OpenAI-shaped response), and a functional streaming SSE path
@@ -242,7 +242,7 @@ can NEVER be overrun, and a token count for every single request.
 - Reserved streaming error codes `LM-3010` (upstream stream interrupted, 502)
   and `LM-3011` (first-token timeout, 504) in the taxonomy and `docs/errors.md`.
 
-  *Deferred to the M4 streaming slice:* zero-copy incremental SSE passthrough,
+  *Deferred to the streaming work:* zero-copy incremental SSE passthrough,
   Anthropic streaming-event translation, Google Gemini, Mistral embeddings, the
   first-token timeout, and streaming token estimation (ADR 003).
 
@@ -251,7 +251,7 @@ can NEVER be overrun, and a token count for every single request.
 - `http::post_json` gained a header-based sibling `post_json_with_headers` (for
   Anthropic's non-bearer auth); the two share one send/classify core.
 
-### Added — M3: reranking & model discovery
+### Added — Reranking & model discovery
 
 - `POST /v1/rerank` (Cohere wire format): `documents` accept bare strings or
   `{ "text": ... }` objects; the gateway guarantees the client-facing invariants
@@ -280,13 +280,13 @@ can NEVER be overrun, and a token count for every single request.
   **1.97.0** (from 1.95.0) — clippy pedantic and the full suite stay green.
 - Planned a Cloudflare-style per-request metadata header
   (`x-lumen-metadata`) for logs, `usage_log` and cardinality-bounded
-  Prometheus labels — design in ADR 002, tasks folded into the M5 spec.
+  Prometheus labels — design in ADR 002, tasks folded into a later change.
 - Elevated **token accounting** to a first-class, always-on promise: every
   request of every capability yields a token count (upstream usage when present,
   else a labelled local estimate — never a silent zero, e.g. TEI), surfaced in
   the response, Prometheus counters and `usage_log`. Design in ADR 003; tasks
-  threaded through M4 (streaming extraction) and M5 (counters, estimation,
-  storage), and added to the mission pillars and ROADMAP.
+  threaded through the streaming work (extraction) and the auth/budgets work
+  (counters, estimation, storage), and added to the mission pillars and ROADMAP.
 
 ### Changed
 
@@ -296,7 +296,7 @@ can NEVER be overrun, and a token count for every single request.
 - Added `LM-2010` (empty rerank `documents`, 400) to the taxonomy and
   `docs/errors.md`, and a `Voyage` variant to `ProviderKind`.
 
-### Added — M2: embeddings (first complete request path)
+### Added — Embeddings (first complete request path)
 
 - `POST /v1/embeddings` end to end (OpenAI wire format): validate → route →
   provider → response, with the client model id resolved to its upstream alias.
@@ -305,7 +305,7 @@ can NEVER be overrun, and a token count for every single request.
 - A generic embeddings **conformance suite** that both providers pass
   identically (nominal, batching-in-order, 429/`Retry-After`, 5xx, malformed
   response, cancellation) — the reusable harness every future provider must pass.
-- Provider **registry** behind `ArcSwap` (ready for M7 hot reload) that builds
+- Provider **registry** behind `ArcSwap` (ready for hot reload) that builds
   instances from config-derived specs and resolves `(capability, model)`; the
   **router** turns misses into `LM-2001` (unknown model, 404) or `LM-2002`
   (capability mismatch, 400).
@@ -317,7 +317,7 @@ can NEVER be overrun, and a token count for every single request.
 
 ### Changed
 
-- Error taxonomy realigned to the codes pinned by the M2 spec: `1xxx` request,
+- Error taxonomy realigned to the codes pinned by the spec: `1xxx` request,
   `2xxx` routing (`LM-2001`/`LM-2002`), `3xxx` upstream (`LM-3001` rate-limited,
   `LM-3002` malformed-response → 502, plus generic/unavailable/timeout), `4xxx`
   auth/budget, `5xxx` internal. Added a `ProviderError::Unavailable` variant for
@@ -325,7 +325,7 @@ can NEVER be overrun, and a token count for every single request.
 - `ProviderKind` moved from the server config into the `providers` crate (it is
   the registry's construction discriminant); crate package names stay bare.
 
-### Added — M1: skeleton & foundations
+### Added — Skeleton & foundations
 
 - Cargo workspace with six crates (`core`, `providers`, `router`, `auth`,
   `telemetry`, `server`), release profile tuned for a small, fast binary

@@ -1,27 +1,27 @@
-# LUMEN — LLM Gateway universelle en Rust
+# LUMEN — Universal LLM Gateway in Rust
 
 ## Mission
-Gateway self-hostable, légère et rapide pour **tous les types de modèles** : chat/LLM, embeddings, reranking. Alternative à LiteLLM (trop lourd, Python, 1.7-4x d'overhead) et OpenRouter (SaaS, pas self-hostable, télémétrie).
+A self-hostable, lightweight and fast gateway for **all types of models**: chat/LLM, embeddings, reranking. An alternative to LiteLLM (too heavy, Python, 1.7-4x overhead) and OpenRouter (SaaS, not self-hostable, telemetry).
 
-## Piliers non négociables (dans l'ordre)
-1. **Performance** : < 1 ms de latence ajoutée p99, streaming zero-copy, ~15 Mo RAM idle.
-2. **Souveraineté** : zéro télémétrie, prompts JAMAIS loggés par défaut, binaire unique self-host.
-3. **Robustesse** : cancellation propagée, backpressure, DB hors du chemin de requête.
-4. **Multi-capacités** : chat + embeddings + rerank sont des citoyens de première classe.
-5. **Observabilité des tokens** : CHAQUE requête de CHAQUE capacité produit un compte de tokens (jamais zéro par défaut) — usage amont si dispo, sinon estimation locale marquée `estimated`. Exposé en réponse, en Prometheus et dans `usage_log`. Raison d'être centrale. Voir ADR 003.
+## Non-negotiable pillars (in order)
+1. **Performance**: < 1 ms added latency p99, zero-copy streaming, ~15 MB RAM idle.
+2. **Sovereignty**: zero telemetry, prompts NEVER logged by default, single self-host binary.
+3. **Robustness**: propagated cancellation, backpressure, DB off the request path.
+4. **Multi-capability**: chat + embeddings + rerank are first-class citizens.
+5. **Token observability**: EVERY request of EVERY capability produces a token count (never zero by default) — upstream usage if available, otherwise a local estimate marked `estimated`. Exposed in the response, in Prometheus, and in `usage_log`. A central reason for being. See ADR 003.
 
-## Architecture (workspace Cargo)
+## Architecture (Cargo workspace)
 ```
 crates/
-├── core        # types partagés, traits Provider, erreurs (thiserror)
-├── providers   # 1 module par provider (openai, anthropic, cohere, ollama, tei...)
-├── router      # résolution modèle→provider, fallback, load balancing
-├── auth        # clés virtuelles, quotas, budgets durs
-├── telemetry   # métriques Prometheus, logs structurés (tracing), comptage TOKENS (ADR 003) + coûts
-└── server      # binaire axum, SSE, config, hot reload
+├── core        # shared types, Provider traits, errors (thiserror)
+├── providers   # 1 module per provider (openai, anthropic, cohere, ollama, tei...)
+├── router      # model→provider resolution, fallback, load balancing
+├── auth        # virtual keys, quotas, hard budgets
+├── telemetry   # Prometheus metrics, structured logs (tracing), TOKEN counting (ADR 003) + costs
+└── server      # axum binary, SSE, config, hot reload
 ```
 
-### Traits de capacités (crates/core)
+### Capability traits (crates/core)
 ```rust
 #[async_trait]
 pub trait ChatProvider: Send + Sync {
@@ -44,58 +44,58 @@ pub trait RerankProvider: Send + Sync {
         -> Result<RerankResponse, ProviderError>;
 }
 ```
-Un provider implémente 1 à N traits. Le router route par (capacité, modèle).
+A provider implements 1 to N traits. The router routes by (capability, model).
 
-### API publique
-- `POST /v1/chat/completions` — format OpenAI, streaming SSE
-- `POST /v1/embeddings` — format OpenAI
-- `POST /v1/rerank` — format Cohere (`query`, `documents`, `top_n`)
-- `GET /v1/models` — expose `"capabilities": ["chat"|"embed"|"rerank"]` par modèle
-- `GET /health` — chemin isolé, ne touche NI la DB NI les providers
+### Public API
+- `POST /v1/chat/completions` — OpenAI format, SSE streaming
+- `POST /v1/embeddings` — OpenAI format
+- `POST /v1/rerank` — Cohere format (`query`, `documents`, `top_n`)
+- `GET /v1/models` — exposes `"capabilities": ["chat"|"embed"|"rerank"]` per model
+- `GET /health` — isolated path, touches NEITHER the DB NOR the providers
 - `GET /metrics` — Prometheus
 
-## Stack imposée
-- **Runtime** : tokio (multi-thread), axum, tower, hyper
-- **HTTP client** : reqwest (rustls, PAS openssl)
-- **Sérialisation** : serde + serde_json
-- **DB** : sqlx + SQLite par défaut ; Postgres derrière feature flag `postgres`
-- **Erreurs** : thiserror dans les libs, anyhow SEULEMENT dans main.rs
-- **Logs** : tracing + tracing-subscriber (JSON en prod)
-- **Config** : figment (TOML + env vars), hot reload via notify
-- **Tests** : wiremock pour mocker les providers, tokio::test
+## Mandated stack
+- **Runtime**: tokio (multi-thread), axum, tower, hyper
+- **HTTP client**: reqwest (rustls, NOT openssl)
+- **Serialization**: serde + serde_json
+- **DB**: sqlx + SQLite by default; Postgres behind the `postgres` feature flag
+- **Errors**: thiserror in libs, anyhow ONLY in main.rs
+- **Logs**: tracing + tracing-subscriber (JSON in prod)
+- **Config**: figment (TOML + env vars), hot reload via notify
+- **Tests**: wiremock to mock providers, tokio::test
 
-## Règles de code STRICTES
-1. **INTERDIT** : `unwrap()`, `expect()`, `panic!()` hors tests et main.rs (justifier avec un commentaire si exception).
-2. **INTERDIT** : bloquer le runtime tokio (pas de `std::thread::sleep`, pas d'I/O sync).
-3. **OBLIGATOIRE** : tout appel provider prend un `CancellationToken` ; drop du client HTTP = abort de la requête amont (leçon LiteLLM issue #22805).
-4. **OBLIGATOIRE** : le logging des requêtes passe par un channel mpsc borné → writer batché async. JAMAIS d'écriture DB synchrone dans le chemin de requête (leçon LiteLLM issue #12067).
-5. **OBLIGATOIRE** : les secrets providers ne sont JAMAIS loggés, jamais dans les erreurs retournées au client, jamais en Debug (`#[derive]` custom ou `secrecy` crate).
-6. Clippy pedantic activé : `cargo clippy --workspace --all-targets -- -D warnings` doit passer.
-7. Chaque module public a un doc comment. Chaque erreur a un code stable (`LM-1001` etc.) documenté dans `docs/errors.md`.
-8. Les erreurs distinguent TOUJOURS : erreur client (4xx) / erreur provider amont (502/503 + nom du provider) / erreur gateway interne (500). Jamais de 401 trompeur pendant une panne interne (leçon OpenRouter).
+## STRICT code rules
+1. **FORBIDDEN**: `unwrap()`, `expect()`, `panic!()` outside tests and main.rs (justify with a comment if an exception).
+2. **FORBIDDEN**: blocking the tokio runtime (no `std::thread::sleep`, no sync I/O).
+3. **MANDATORY**: every provider call takes a `CancellationToken`; dropping the HTTP client = abort of the upstream request (lesson from LiteLLM issue #22805).
+4. **MANDATORY**: request logging goes through a bounded mpsc channel → async batched writer. NEVER a synchronous DB write in the request path (lesson from LiteLLM issue #12067).
+5. **MANDATORY**: provider secrets are NEVER logged, never in errors returned to the client, never in Debug (custom `#[derive]` or the `secrecy` crate).
+6. Clippy pedantic enabled: `cargo clippy --workspace --all-targets -- -D warnings` must pass.
+7. Every public module has a doc comment. Every error has a stable code (`LM-1001` etc.) documented in `docs/errors.md`.
+8. Errors ALWAYS distinguish: client error (4xx) / upstream provider error (502/503 + provider name) / internal gateway error (500). Never a misleading 401 during an internal outage (lesson from OpenRouter).
 
-## Boucle de travail (à suivre à chaque session)
-0. **Fraîcheur des dépendances (TOUJOURS, en début de session)** : `rustup update`
-   pour la dernière stable, puis `cargo outdated --workspace --root-deps-only`.
-   Monter les versions dans `Cargo.toml` quand c'est sûr, puis relancer la
-   validation (étape 4) — clippy pedantic peut introduire de nouveaux lints à
-   chaque version de Rust. Noter tout bump notable dans `CHANGELOG.md`.
-1. Lire `ROADMAP.md` → identifier le milestone courant (premier non coché).
-2. Lire `specs/milestones/M<N>-*.md` correspondant.
-3. Pour chaque tâche du milestone : écrire les tests D'ABORD, puis l'implémentation.
-4. Valider : `cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings && cargo fmt --check`.
-5. Cocher les cases dans ROADMAP.md et le fichier de milestone. Ajouter une entrée dans `CHANGELOG.md`.
-6. Commit atomique par tâche : `feat(router): fallback chain with circuit breaker`.
-7. Si un choix d'architecture n'est pas couvert par les specs : écrire une ADR courte dans `docs/adr/NNN-titre.md` AVANT d'implémenter.
+## Work loop (to follow every session)
+0. **Dependency freshness (ALWAYS, at the start of a session)**: `rustup update`
+   for the latest stable, then `cargo outdated --workspace --root-deps-only`.
+   Bump the versions in `Cargo.toml` when it is safe, then re-run the
+   validation (step 4) — clippy pedantic may introduce new lints with
+   each Rust version. Note any notable bump in `CHANGELOG.md`.
+1. Read `ROADMAP.md` → identify the current milestone (first unchecked).
+2. Read the corresponding `specs/milestones/M<N>-*.md`.
+3. For each task of the milestone: write the tests FIRST, then the implementation.
+4. Validate: `cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings && cargo fmt --check`.
+5. Check the boxes in ROADMAP.md and the milestone file. Add an entry in `CHANGELOG.md`.
+6. Atomic commit per task: `feat(router): fallback chain with circuit breaker`.
+7. If an architecture choice is not covered by the specs: write a short ADR in `docs/adr/NNN-titre.md` BEFORE implementing.
 
-## Definition of Done (par tâche)
-- [ ] Tests unitaires + au moins 1 test d'intégration (wiremock)
-- [ ] Aucun warning clippy
-- [ ] Cancellation testée si la tâche touche le chemin de requête
-- [ ] Pas de secret dans les logs (vérifier avec un test)
-- [ ] Doc comments sur l'API publique
+## Definition of Done (per task)
+- [ ] Unit tests + at least 1 integration test (wiremock)
+- [ ] No clippy warning
+- [ ] Cancellation tested if the task touches the request path
+- [ ] No secret in the logs (verify with a test)
+- [ ] Doc comments on the public API
 
-## Commandes
+## Commands
 ```bash
 cargo test --workspace                # tests
 cargo clippy --workspace --all-targets -- -D warnings
@@ -104,12 +104,12 @@ cargo run -p server -- --config config.example.toml
 cargo bench                           # benchmarks criterion (M7)
 ```
 
-## Subagents disponibles (.claude/agents/)
-- `provider-integrator` : ajoute un nouveau provider (pattern répétable)
-- `test-writer` : écrit les tests avant l'implémentation
-- `code-reviewer` : review read-only après chaque milestone
-- `perf-auditor` : traque allocations, copies, blocages du runtime
-- `docs-writer` : docs utilisateur, README, exemples de config
+## Available subagents (.claude/agents/)
+- `provider-integrator`: adds a new provider (repeatable pattern)
+- `test-writer`: writes the tests before the implementation
+- `code-reviewer`: read-only review after each milestone
+- `perf-auditor`: tracks allocations, copies, runtime blocking
+- `docs-writer`: user docs, README, config examples
 
-## Ce qu'on ne fait PAS (v1)
-UI web, billing, cache sémantique, guardrails/moderation, support des images/audio, plugin system. Noter les idées dans `docs/backlog.md` et passer.
+## What we do NOT do (v1)
+Web UI, billing, semantic cache, guardrails/moderation, image/audio support, plugin system. Note the ideas in `docs/backlog.md` and move on.

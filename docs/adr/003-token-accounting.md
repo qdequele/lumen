@@ -1,8 +1,7 @@
 # ADR 003 — Token accounting for every request, every capability
 
-- Status: accepted (core promise; wired across M4–M5)
+- Status: accepted (core promise)
 - Date: 2026-07-12
-- Milestones: M4 (streaming extraction), M5 (counters, storage, estimation)
 
 ## Context
 
@@ -48,7 +47,7 @@ and rerank call, produced by a two-tier strategy and surfaced in three places.
 ### Hot-path rule
 The request path never runs a heavy tokenizer. Upstream usage is passed through
 as-is; when it is missing, accurate estimation happens **off the hot path** in
-the async usage-writer task (M5). The response `usage` field carries the
+the async usage-writer task. The response `usage` field carries the
 upstream value when present, else the cheap heuristic (flagged `estimated`),
 never a blocking BPE pass. Counting must **never fail or slow a request**.
 
@@ -64,7 +63,7 @@ never a blocking BPE pass. Counting must **never fail or slow a request**.
    `lumen_tokens_total{capability, model, provider, direction, estimated}`
    and `lumen_rerank_search_units_total{model, provider}`. Optional
    metadata-allowlist labels come from ADR 002 (never client-unbounded).
-3. **`usage_log`** (M5) — per-request `tokens_in`, `tokens_out`,
+3. **`usage_log`** — per-request `tokens_in`, `tokens_out`,
    `search_units`, `estimated`, alongside cost and metadata for later slicing.
 
 ## Consequences
@@ -73,9 +72,9 @@ never a blocking BPE pass. Counting must **never fail or slow a request**.
   gap is closed by estimation, and the count is labelled honestly.
 - The latency pillar holds: passthrough is free; BPE estimation is off-hot-path
   and on the blocking pool.
-- M2/M3 already surface upstream-reported `usage`; this ADR adds the estimation
-  fallback and the Prometheus/usage_log counters (M5) plus streaming extraction
-  (M4). Cost counting (M5 §5.4) becomes a consumer of these token counts rather
-  than the thing that defines them.
+- The embeddings and rerank paths already surface upstream-reported `usage`;
+  this ADR adds the estimation fallback and the Prometheus/usage_log counters
+  plus streaming extraction. Cost counting (§5.4) becomes a consumer of these
+  token counts rather than the thing that defines them.
 - New error/counter surface: a `tokens_estimated_total` counter lets operators
   see how much of their accounting is measured vs estimated.
