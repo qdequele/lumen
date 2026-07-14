@@ -22,6 +22,9 @@ pub struct ModelEntry {
     pub owned_by: String,
     /// Capabilities this model serves (`chat` / `embed` / `rerank`).
     pub capabilities: Vec<&'static str>,
+    /// Input modalities this model accepts (`text`, `image`). Defaults to
+    /// `["text"]` (M9).
+    pub modalities: Vec<String>,
 }
 
 /// The `GET /v1/models` envelope.
@@ -45,6 +48,7 @@ pub async fn models(State(state): State<AppState>) -> Json<ModelList> {
             object: "model",
             owned_by: m.owned_by,
             capabilities: m.capabilities.iter().map(|c| c.as_str()).collect(),
+            modalities: m.modalities,
         })
         .collect();
 

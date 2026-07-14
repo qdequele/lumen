@@ -174,6 +174,29 @@ pub enum GatewayError {
     #[error("`documents` must not be empty")]
     EmptyDocuments,
 
+    /// Image input was sent to a model whose declared `modalities` do not
+    /// include `"image"` (M9). Fail-fast before any upstream call.
+    #[error("model '{model}' does not accept image input")]
+    ImageModelUnsupported { model: String },
+
+    /// A remote image URL was supplied but server-side image fetching is
+    /// disabled (M9). The operator must enable `[image_fetch]` or the client
+    /// must inline the image as a `data:` URI.
+    #[error("remote image fetching is disabled; inline the image as a data: URI")]
+    ImageFetchDisabled,
+
+    /// A remote image URL was rejected by a fetch guard (scheme, host/prefix
+    /// allowlist, private-IP block, size cap, or non-image content type). The
+    /// specific reason is logged server-side but never returned — it must not
+    /// leak internal network topology.
+    #[error("image URL rejected by fetch policy")]
+    ImageUrlRejected,
+
+    /// A permitted image fetch failed at the remote host (network error,
+    /// timeout, or error status). The remote host's fault → 502.
+    #[error("failed to fetch a remote image")]
+    ImageFetchFailed,
+
     // ---- Upstream errors (LM-3xxx) ------------------------------------------
     /// An upstream provider rate limited the request (HTTP 429).
     #[error("upstream provider '{provider}' rate limited the request")]
@@ -261,6 +284,10 @@ impl GatewayError {
             GatewayError::PayloadTooLarge { .. } => "LM-1002",
             GatewayError::ModelNotFound(_) => "LM-2001",
             GatewayError::UnsupportedCapability { .. } => "LM-2002",
+            GatewayError::ImageModelUnsupported { .. } => "LM-2003",
+            GatewayError::ImageFetchDisabled => "LM-2005",
+            GatewayError::ImageUrlRejected => "LM-2006",
+            GatewayError::ImageFetchFailed => "LM-2007",
             GatewayError::EmptyDocuments => "LM-2010",
             GatewayError::UpstreamRateLimited { .. } => "LM-3001",
             GatewayError::UpstreamInvalidResponse { .. } => "LM-3002",
@@ -292,6 +319,9 @@ impl GatewayError {
         match self {
             GatewayError::InvalidRequest(_)
             | GatewayError::UnsupportedCapability { .. }
+            | GatewayError::ImageModelUnsupported { .. }
+            | GatewayError::ImageFetchDisabled
+            | GatewayError::ImageUrlRejected
             | GatewayError::EmptyDocuments => 400,
             GatewayError::Unauthorized => 401,
             GatewayError::BudgetExceeded => 402,
@@ -301,7 +331,8 @@ impl GatewayError {
             GatewayError::Internal(_) => 500,
             GatewayError::Upstream { .. }
             | GatewayError::UpstreamInvalidResponse { .. }
-            | GatewayError::UpstreamStreamInterrupted { .. } => 502,
+            | GatewayError::UpstreamStreamInterrupted { .. }
+            | GatewayError::ImageFetchFailed => 502,
             GatewayError::UpstreamUnavailable { .. } | GatewayError::CircuitOpen { .. } => 503,
             GatewayError::UpstreamTimeout { .. }
             | GatewayError::UpstreamFirstTokenTimeout { .. }
@@ -317,12 +348,16 @@ impl GatewayError {
             GatewayError::InvalidRequest(_)
             | GatewayError::ModelNotFound(_)
             | GatewayError::UnsupportedCapability { .. }
+            | GatewayError::ImageModelUnsupported { .. }
+            | GatewayError::ImageFetchDisabled
+            | GatewayError::ImageUrlRejected
             | GatewayError::EmptyDocuments
             | GatewayError::PayloadTooLarge { .. }
             | GatewayError::Unauthorized
             | GatewayError::BudgetExceeded
             | GatewayError::QuotaExceeded { .. } => ErrorType::InvalidRequest,
             GatewayError::Upstream { .. }
+            | GatewayError::ImageFetchFailed
             | GatewayError::UpstreamInvalidResponse { .. }
             | GatewayError::UpstreamUnavailable { .. }
             | GatewayError::UpstreamTimeout { .. }
@@ -494,6 +529,14 @@ mod tests {
         );
         // Empty rerank documents (pinned by the M3 spec).
         assert_eq!(GatewayError::EmptyDocuments.code(), "LM-2010");
+        // Vision / image-fetch codes (M9).
+        assert_eq!(
+            GatewayError::ImageModelUnsupported { model: "m".into() }.code(),
+            "LM-2003"
+        );
+        let unsupported = GatewayError::ImageModelUnsupported { model: "m".into() };
+        assert_eq!(unsupported.http_status(), 400);
+        assert_eq!(unsupported.error_type(), ErrorType::InvalidRequest);
         // Streaming upstream faults (M4).
         assert_eq!(
             GatewayError::UpstreamStreamInterrupted {

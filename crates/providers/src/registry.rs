@@ -25,7 +25,7 @@ use crate::tei::TeiProvider;
 use crate::voyage::VoyageProvider;
 
 /// A model exposed by a provider, with its upstream id and capabilities.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ModelSpec {
     /// Client-facing model id.
     pub id: String,
@@ -33,6 +33,17 @@ pub struct ModelSpec {
     pub upstream_id: String,
     /// Declared capabilities.
     pub capabilities: Vec<Capability>,
+    /// Declared input modalities (`"text"`, `"image"`, …). An empty list means
+    /// text-only. Only `"image"` is currently acted on (M9 enforcement).
+    pub modalities: Vec<String>,
+}
+
+impl ModelSpec {
+    /// Whether this model declares image input support.
+    #[must_use]
+    pub fn supports_image(&self) -> bool {
+        self.modalities.iter().any(|m| m == "image")
+    }
 }
 
 /// A provider instance to build. `api_key` is already resolved from the
@@ -168,6 +179,9 @@ pub struct LoadedModelSummary {
     pub owned_by: String,
     /// Capabilities it exposes.
     pub capabilities: Vec<Capability>,
+    /// Declared input modalities (`"text"` by default). Surfaced in
+    /// `GET /v1/models`.
+    pub modalities: Vec<String>,
 }
 
 #[derive(Default)]
@@ -182,6 +196,8 @@ struct Inner {
     /// ones like chat). Lets the router tell "unknown model" apart from
     /// "known model, wrong capability".
     model_capabilities: HashMap<String, Vec<Capability>>,
+    /// model id -> declared input modalities (M9). Absent = text-only.
+    model_modalities: HashMap<String, Vec<String>>,
     /// Every exposed model, in configuration order, for `GET /v1/models`.
     models: Vec<LoadedModelSummary>,
 }
@@ -253,6 +269,17 @@ impl Registry {
         self.inner.load().model_capabilities.get(model_id).cloned()
     }
 
+    /// Whether the model declares image input support (M9). Unknown models and
+    /// text-only models return `false`.
+    #[must_use]
+    pub fn model_supports_image(&self, model_id: &str) -> bool {
+        self.inner
+            .load()
+            .model_modalities
+            .get(model_id)
+            .is_some_and(|mods| mods.iter().any(|m| m == "image"))
+    }
+
     /// Every exposed model, in configuration order (for `GET /v1/models`).
     #[must_use]
     pub fn list_models(&self) -> Vec<LoadedModelSummary> {
@@ -284,10 +311,22 @@ fn build_inner(specs: &[ProviderSpec], client: &reqwest::Client) -> Result<Inner
                 .or_default()
                 .extend(model.capabilities.iter().copied());
 
+            // Normalize an unset modality list to text-only, so the map and the
+            // `/v1/models` listing always report at least `["text"]`.
+            let modalities = if model.modalities.is_empty() {
+                vec!["text".to_owned()]
+            } else {
+                model.modalities.clone()
+            };
+            inner
+                .model_modalities
+                .insert(model.id.clone(), modalities.clone());
+
             inner.models.push(LoadedModelSummary {
                 id: model.id.clone(),
                 owned_by: spec.name.clone(),
                 capabilities: model.capabilities.clone(),
+                modalities,
             });
 
             if model.capabilities.contains(&Capability::Chat) {
@@ -566,6 +605,7 @@ mod tests {
             id: id.to_owned(),
             upstream_id: id.to_owned(),
             capabilities: caps.to_vec(),
+            modalities: Vec::new(),
         }
     }
 
@@ -694,6 +734,7 @@ mod tests {
                     id: "friendly".to_owned(),
                     upstream_id: "text-embedding-3-small".to_owned(),
                     capabilities: vec![Capability::Embed],
+                    modalities: Vec::new(),
                 }],
             )],
             reqwest::Client::new(),

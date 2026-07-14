@@ -26,11 +26,13 @@ fn registry_for(upstream: &str) -> Arc<Registry> {
                 id: "embed-small".to_owned(),
                 upstream_id: "text-embedding-3-small".to_owned(),
                 capabilities: vec![Capability::Embed],
+                modalities: Vec::new(),
             },
             ModelSpec {
                 id: "chat-only".to_owned(),
                 upstream_id: "gpt-4o".to_owned(),
                 capabilities: vec![Capability::Chat],
+                modalities: Vec::new(),
             },
         ],
     }];
@@ -106,6 +108,39 @@ async fn chat_only_model_requested_for_embedding_is_400_fg2002() {
     assert_eq!(resp.status(), 400);
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["error"]["code"], "LM-2002");
+}
+
+#[tokio::test]
+async fn image_input_to_text_only_model_is_400_fg2003_without_upstream_call() {
+    let upstream = MockServer::start().await;
+    // No mock mounted: if the handler calls upstream, the request 404s there and
+    // this test's assertions on `received_requests` catch the leak.
+    let base = common::spawn_with(registry_for(&upstream.uri()), LIMIT).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/embeddings"))
+        .json(&json!({
+            "model": "embed-small",
+            "input": [[
+                {"type": "text", "text": "a caption"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
+            ]]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 400);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "LM-2003");
+    assert_eq!(body["error"]["type"], "invalid_request");
+
+    // Fail-fast: the upstream must never have been contacted.
+    let requests = upstream.received_requests().await.unwrap();
+    assert!(
+        requests.is_empty(),
+        "no upstream call for a rejected image request"
+    );
 }
 
 #[tokio::test]

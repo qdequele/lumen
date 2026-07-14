@@ -31,11 +31,13 @@ fn openai_registry(upstream: &str) -> Arc<Registry> {
                 id: "gpt".to_owned(),
                 upstream_id: "gpt-4o-2024-08-06".to_owned(),
                 capabilities: vec![Capability::Chat],
+                modalities: Vec::new(),
             },
             ModelSpec {
                 id: "embed-only".to_owned(),
                 upstream_id: "text-embedding-3-small".to_owned(),
                 capabilities: vec![Capability::Embed],
+                modalities: Vec::new(),
             },
         ],
     }];
@@ -52,6 +54,7 @@ fn anthropic_registry(upstream: &str) -> Arc<Registry> {
             id: "claude".to_owned(),
             upstream_id: "claude-3-5-sonnet".to_owned(),
             capabilities: vec![Capability::Chat],
+            modalities: Vec::new(),
         }],
     }];
     Arc::new(Registry::build(specs, http::build_client()).expect("registry builds"))
@@ -67,6 +70,7 @@ fn google_registry(upstream: &str) -> Arc<Registry> {
             id: "gemini".to_owned(),
             upstream_id: "gemini-2.0-flash".to_owned(),
             capabilities: vec![Capability::Chat],
+            modalities: Vec::new(),
         }],
     }];
     Arc::new(Registry::build(specs, http::build_client()).expect("registry builds"))
@@ -107,6 +111,7 @@ async fn openai_compatible_kind_routes_through_the_openai_path() {
             id: "fast".to_owned(),
             upstream_id: "llama-3.3-70b".to_owned(),
             capabilities: vec![Capability::Chat],
+            modalities: Vec::new(),
         }],
     }];
     let registry = Arc::new(Registry::build(specs, http::build_client()).expect("registry builds"));

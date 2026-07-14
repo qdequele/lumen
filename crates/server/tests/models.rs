@@ -22,6 +22,8 @@ fn registry() -> Arc<Registry> {
                 upstream_id: "embed-v4.0".to_owned(),
                 // A single Cohere model configured for BOTH embed and rerank.
                 capabilities: vec![Capability::Embed, Capability::Rerank],
+                // ...and declared multimodal (M9).
+                modalities: vec!["text".to_owned(), "image".to_owned()],
             }],
         },
         ProviderSpec {
@@ -33,6 +35,7 @@ fn registry() -> Arc<Registry> {
                 id: "gpt".to_owned(),
                 upstream_id: "gpt-4o".to_owned(),
                 capabilities: vec![Capability::Chat],
+                modalities: Vec::new(),
             }],
         },
     ];
@@ -65,10 +68,22 @@ async fn lists_configured_models_with_capabilities() {
     // A Cohere embed+rerank model appears with both (acceptance criterion 3).
     assert!(caps.contains(&"embed"));
     assert!(caps.contains(&"rerank"));
+    // Declared modalities are surfaced (M9).
+    let mods: Vec<&str> = multi["modalities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m.as_str().unwrap())
+        .collect();
+    assert!(mods.contains(&"text"));
+    assert!(mods.contains(&"image"));
 
     let gpt = data.iter().find(|m| m["id"] == "gpt").unwrap();
     assert_eq!(gpt["owned_by"], "openai");
     assert_eq!(gpt["capabilities"][0], "chat");
+    // A model with no declared modalities defaults to text-only.
+    assert_eq!(gpt["modalities"][0], "text");
+    assert_eq!(gpt["modalities"].as_array().unwrap().len(), 1);
 }
 
 #[tokio::test]
