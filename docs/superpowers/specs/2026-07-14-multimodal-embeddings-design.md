@@ -203,8 +203,12 @@ Additional properties:
 - **Timeout** — `timeout_ms` (default 5000) bounds the whole fetch.
 - **Cancellation** — the fetch honors the request `CancellationToken`; a client
   disconnect aborts in-flight fetches (consistent with the M4 guarantee).
-- **Bounded concurrency** — images within one request are fetched concurrently
-  with a small bound (reuse `batch::DEFAULT_CONCURRENCY` = 4).
+- **Bounded concurrency + count cap** — images within one request are fetched
+  concurrently with a small bound (`FETCH_CONCURRENCY` = 4), and the number of
+  remote images per request is capped (`MAX_IMAGES_PER_REQUEST` = 32); an
+  over-limit request is rejected (`LM-2006`) *before* any fetch, so this stage
+  cannot become an unbounded fan-out after budget admission. Wall-clock is thus
+  bounded to roughly `ceil(N / 4) * timeout`.
 - **No redirects to internal targets** — redirects are followed only if the
   redirect target re-passes guards 1–4; otherwise the fetch fails `LM-2006`.
   (Implemented by disabling automatic redirects and validating each hop, or an

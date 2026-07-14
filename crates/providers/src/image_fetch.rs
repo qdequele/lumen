@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use base64::Engine;
 use futures::StreamExt;
-use lumen_core::{ContentPart, EmbedInput, EmbedItem, GatewayError};
+use lumen_core::{EmbedInput, EmbedItem, GatewayError};
 use tokio_util::sync::CancellationToken;
 
 /// Runtime policy for the guarded fetch stage, built from the operator's
@@ -63,15 +63,34 @@ impl Default for ImageFetchPolicy {
 /// against every guard.
 const MAX_REDIRECTS: usize = 3;
 
+/// Maximum remote images fetched for one request. Bounds the work a single
+/// request can trigger *after* budget admission (a body can otherwise name
+/// thousands of URLs); an over-limit request is rejected before any fetch.
+const MAX_IMAGES_PER_REQUEST: usize = 32;
+
+/// How many image fetches run concurrently. Bounds wall-clock to
+/// roughly `ceil(N / CONCURRENCY) * timeout`.
+const FETCH_CONCURRENCY: usize = 4;
+
+/// Whether a URL is an inline `data:` URI (never fetched).
+fn is_data_uri(url: &str) -> bool {
+    url.trim_start().to_ascii_lowercase().starts_with("data:")
+}
+
 /// Resolve every remote image URL in `input` to an inline `data:` URI, in
 /// place, applying the policy's guards. `data:` URIs are left untouched;
 /// non-multimodal inputs are a no-op. Returns the first guard/fetch error.
+///
+/// Remote images are fetched with bounded concurrency and capped in number
+/// ([`MAX_IMAGES_PER_REQUEST`]); an over-limit request is rejected before any
+/// fetch, so this stage cannot be turned into an unbounded fan-out.
 ///
 /// # Errors
 /// - [`GatewayError::ImageFetchDisabled`] (`LM-2005`) — a remote URL while
 ///   `policy.enabled` is `false`.
 /// - [`GatewayError::ImageUrlRejected`] (`LM-2006`) — a guard rejected the URL
-///   (scheme, host/prefix allowlist, private IP, size cap, or non-image type).
+///   (scheme, host/prefix allowlist, private IP, size cap, non-image type) or
+///   the request exceeded [`MAX_IMAGES_PER_REQUEST`].
 /// - [`GatewayError::ImageFetchFailed`] (`LM-2007`) — the remote host failed,
 ///   timed out, or the DNS lookup failed.
 pub async fn resolve_image_parts(
@@ -82,41 +101,76 @@ pub async fn resolve_image_parts(
     let EmbedInput::Multi(items) = input else {
         return Ok(());
     };
+
+    // Phase 1 — gather remote image URLs in traversal order (immutable walk).
+    // A remote URL while fetching is disabled fails fast here.
+    let mut remote: Vec<String> = Vec::new();
+    for item in items.iter() {
+        if let EmbedItem::Parts(parts) = item {
+            for part in parts {
+                if let Some(image) = part.image() {
+                    if is_data_uri(&image.url) {
+                        continue;
+                    }
+                    if !policy.enabled {
+                        return Err(GatewayError::ImageFetchDisabled);
+                    }
+                    remote.push(image.url.clone());
+                }
+            }
+        }
+    }
+    if remote.is_empty() {
+        return Ok(());
+    }
+    if remote.len() > MAX_IMAGES_PER_REQUEST {
+        return Err(GatewayError::ImageUrlRejected);
+    }
+
+    // Phase 2 — fetch concurrently, preserving order, short-circuiting on the
+    // first error (which cancels the remaining in-flight fetches).
+    let fetched = fetch_all(&remote, policy, cancel).await?;
+
+    // Phase 3 — write the results back in the same traversal order.
+    let mut results = fetched.into_iter();
     for item in items.iter_mut() {
-        let EmbedItem::Parts(parts) = item else {
-            continue;
-        };
-        for part in parts.iter_mut() {
-            resolve_part(part, policy, cancel).await?;
+        if let EmbedItem::Parts(parts) = item {
+            for part in parts.iter_mut() {
+                if let Some(image) = part.image_mut() {
+                    if is_data_uri(&image.url) {
+                        continue;
+                    }
+                    if let Some(data_uri) = results.next() {
+                        image.url = data_uri;
+                    }
+                }
+            }
         }
     }
     Ok(())
 }
 
-/// Resolve one content part's image URL in place, if it has one.
-async fn resolve_part(
-    part: &mut ContentPart,
+/// Fetch every URL with bounded concurrency, returning the resulting `data:`
+/// URIs in the same order. The first error short-circuits and drops the
+/// remaining in-flight fetches.
+async fn fetch_all(
+    urls: &[String],
     policy: &ImageFetchPolicy,
     cancel: &CancellationToken,
-) -> Result<(), GatewayError> {
-    let Some(image) = part.image_mut() else {
-        return Ok(());
-    };
-    // A `data:` URI is already inline — never fetched.
-    if image
-        .url
-        .trim_start()
-        .to_ascii_lowercase()
-        .starts_with("data:")
-    {
-        return Ok(());
-    }
-    if !policy.enabled {
-        return Err(GatewayError::ImageFetchDisabled);
-    }
-    let data_uri = fetch_to_data_uri(&image.url, policy, cancel).await?;
-    image.url = data_uri;
-    Ok(())
+) -> Result<Vec<String>, GatewayError> {
+    use futures::stream::{self, TryStreamExt};
+    // `buffered` preserves order and polls up to `FETCH_CONCURRENCY` at once;
+    // `try_collect` short-circuits (and drops the rest) on the first error.
+    // Each future owns its URL (`async move`) to keep the stream's item type
+    // free of a per-element borrow.
+    stream::iter(
+        urls.iter()
+            .cloned()
+            .map(|url| async move { fetch_to_data_uri(&url, policy, cancel).await }),
+    )
+    .buffered(FETCH_CONCURRENCY)
+    .try_collect()
+    .await
 }
 
 /// Whether the URL string starts with one of the allowed prefixes (empty =
@@ -151,6 +205,8 @@ async fn fetch_to_data_uri(
         if !host_allowed(host, &policy.allowed_hosts)
             || !prefix_allowed(&current, &policy.allowed_url_prefixes)
         {
+            // Server-side diagnostic only; the host is not returned to the client.
+            tracing::debug!(host, "image fetch rejected: host/prefix not allowed");
             return Err(GatewayError::ImageUrlRejected);
         }
         // Guard 4: resolve DNS and block non-public addresses; pin the
@@ -158,7 +214,7 @@ async fn fetch_to_data_uri(
         let port = parsed
             .port_or_known_default()
             .ok_or(GatewayError::ImageUrlRejected)?;
-        let addr = resolve_vetted_addr(host, port, policy).await?;
+        let addr = resolve_vetted_addr(host, port, policy, cancel).await?;
 
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
@@ -232,24 +288,37 @@ async fn resolve_vetted_addr(
     host: &str,
     port: u16,
     policy: &ImageFetchPolicy,
+    cancel: &CancellationToken,
 ) -> Result<std::net::SocketAddr, GatewayError> {
     let allow_private = policy.allow_private_ips;
     let host_owned = host.to_owned();
-    // std DNS resolution is blocking — keep it off the runtime.
-    let addrs: Vec<SocketAddr> = tokio::task::spawn_blocking(move || {
+    // std DNS resolution is blocking — keep it off the runtime. Bound it by the
+    // per-fetch timeout and honor cancellation so a slow resolver cannot exceed
+    // the budget or ignore a client disconnect.
+    let lookup = tokio::task::spawn_blocking(move || {
         (host_owned.as_str(), port)
             .to_socket_addrs()
-            .map(Iterator::collect)
-    })
-    .await
-    .map_err(|_| GatewayError::ImageFetchFailed)?
-    .map_err(|_| GatewayError::ImageFetchFailed)?;
+            .map(Iterator::collect::<Vec<SocketAddr>>)
+    });
+    let addrs: Vec<SocketAddr> = tokio::select! {
+        biased;
+        () = cancel.cancelled() => return Err(GatewayError::ImageFetchFailed),
+        joined = tokio::time::timeout(policy.timeout, lookup) => joined
+            .map_err(|_| GatewayError::ImageFetchFailed)?      // timed out
+            .map_err(|_| GatewayError::ImageFetchFailed)?      // join error
+            .map_err(|_| GatewayError::ImageFetchFailed)?,     // resolve error
+    };
 
     let first = addrs
         .first()
         .copied()
         .ok_or(GatewayError::ImageFetchFailed)?;
     if !allow_private && addrs.iter().any(|a| !is_public_ip(&a.ip())) {
+        // Server-side diagnostic only; the address is not returned to the client.
+        tracing::debug!(
+            host,
+            "image fetch rejected: resolves to a non-public address"
+        );
         return Err(GatewayError::ImageUrlRejected);
     }
     Ok(first)
@@ -319,7 +388,18 @@ pub(crate) fn is_public_ip(ip: &IpAddr) -> bool {
                 // fe80::/10 link-local unicast.
                 || (seg[0] & 0xffc0) == 0xfe80
                 // ff00::/8 multicast.
-                || (seg[0] & 0xff00) == 0xff00)
+                || (seg[0] & 0xff00) == 0xff00
+                // Transition ranges that embed an IPv4 address an attacker
+                // could aim at an internal host — rejected outright (they are
+                // deprecated/rare as public unicast, so the block is safe):
+                //   ::/96      IPv4-compatible (first 96 bits zero)
+                //   2002::/16  6to4
+                //   2001:0::/32 Teredo
+                //   64:ff9b::/96 NAT64 well-known prefix
+                || seg[..6].iter().all(|s| *s == 0)
+                || seg[0] == 0x2002
+                || (seg[0] == 0x2001 && seg[1] == 0x0000)
+                || (seg[0] == 0x0064 && seg[1] == 0xff9b))
         }
     }
 }
@@ -366,6 +446,12 @@ mod tests {
         assert!(!is_public_ip(&"fe80::1".parse().unwrap())); // link-local
                                                              // IPv4-mapped loopback must be caught, not treated as public.
         assert!(!is_public_ip(&"::ffff:127.0.0.1".parse().unwrap()));
+        // IPv6 transition ranges that embed IPv4 must not slip through
+        // (attacker-controlled DNS could aim them at an internal v4 host).
+        assert!(!is_public_ip(&"64:ff9b::7f00:1".parse().unwrap())); // NAT64 → 127.0.0.1
+        assert!(!is_public_ip(&"2002:7f00:1::".parse().unwrap())); // 6to4
+        assert!(!is_public_ip(&"2001:0:abcd::".parse().unwrap())); // Teredo
+        assert!(!is_public_ip(&"::7f00:1".parse().unwrap())); // IPv4-compatible
     }
 
     #[test]

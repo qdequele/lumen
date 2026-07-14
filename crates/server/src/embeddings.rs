@@ -44,14 +44,18 @@ pub async fn embeddings(
     let links = lumen_router::embedding_links(&chain);
     let exec = state.resilience.exec_config(&client_model);
 
-    // M9 enforcement (fail fast): image input to a model whose declared
-    // modalities lack "image" is rejected before any upstream call, so a
-    // doomed round-trip never happens and the client gets a clear LM-2003.
-    if req.input.has_image() && !state.registry.model_supports_image(&client_model) {
-        return Err(GatewayError::ImageModelUnsupported {
-            model: client_model,
+    // M9 enforcement (fail fast): image input requires EVERY model in the
+    // resolved chain (primary + fallbacks) to declare the "image" modality —
+    // otherwise a fallback hop could route image content to a text-only model.
+    // Rejected before any upstream call with a clear LM-2003 naming the
+    // offending model.
+    if req.input.has_image() {
+        if let Some(bad) = chain_ids
+            .iter()
+            .find(|id| !state.registry.model_supports_image(id))
+        {
+            return Err(GatewayError::ImageModelUnsupported { model: bad.clone() }.into());
         }
-        .into());
     }
 
     // Admission BEFORE the upstream call: the pre-call estimate is reserved

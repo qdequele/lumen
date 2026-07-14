@@ -198,3 +198,37 @@ async fn host_not_in_allowlist_is_rejected() {
         .unwrap_err();
     assert!(matches!(err, GatewayError::ImageUrlRejected));
 }
+
+#[tokio::test]
+async fn too_many_remote_images_is_rejected_before_fetching() {
+    let host = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "image/png")
+                .set_body_bytes(vec![1u8, 2, 3]),
+        )
+        .mount(&host)
+        .await;
+
+    // 33 remote image parts — over the per-request cap (32).
+    let parts: Vec<ContentPart> = (0..33)
+        .map(|i| ContentPart {
+            kind: "image_url".to_owned(),
+            text: None,
+            image_url: Some(ImageUrl {
+                url: format!("{}/img{i}.png", host.uri()),
+                detail: None,
+            }),
+            extra: serde_json::Map::new(),
+        })
+        .collect();
+    let mut input = EmbedInput::Multi(vec![EmbedItem::Parts(parts)]);
+
+    let err = resolve_image_parts(&mut input, &enabled_policy(), &CancellationToken::new())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, GatewayError::ImageUrlRejected));
+    // Rejected before any fetch.
+    assert!(host.received_requests().await.unwrap().is_empty());
+}

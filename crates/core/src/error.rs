@@ -186,9 +186,10 @@ pub enum GatewayError {
     ImageFetchDisabled,
 
     /// A remote image URL was rejected by a fetch guard (scheme, host/prefix
-    /// allowlist, private-IP block, size cap, or non-image content type). The
-    /// specific reason is logged server-side but never returned — it must not
-    /// leak internal network topology.
+    /// allowlist, private-IP block, size cap, non-image content type, or the
+    /// per-request image count cap). The reason may be logged server-side at
+    /// `debug`, but is never returned — it must not leak internal network
+    /// topology.
     #[error("image URL rejected by fetch policy")]
     ImageUrlRejected,
 
