@@ -97,14 +97,19 @@ milestone.
 
 ## Noted while building M4 (slice 2 — zero-copy streaming)
 
-- **Acceptance criterion 5 (LM-3010) not yet implemented.** In passthrough, if
-  the upstream closes cleanly WITHOUT a `[DONE]` terminator and without a
-  transport error, `bytes_stream()` just ends: the gateway stops gracefully (no
-  hang, no panic) but emits no `data: {"error": {"code": "LM-3010"...}}` frame.
-  Detecting a missing `[DONE]` requires sniffing the tail bytes, which fights
-  pure zero-copy — design it in slice 3 (e.g. a lightweight tail-watcher that
-  only inspects frame boundaries, not JSON). No mid-stream error-frame test yet
-  either. Tracked as slice-3 work.
+- ~~**Acceptance criterion 5 (LM-3010) not yet implemented.**~~ **Resolved**
+  (commit `076b909`, slice 3). When the upstream closes without a `[DONE]`
+  terminator and without a transport error, the gateway now appends a terminal
+  `data: {"error": {"code": "LM-3010"...}}` frame then closes cleanly. The
+  lightweight tail-watcher (`EventStreamState::scan_frame` in
+  `crates/server/src/chat.rs`) inspects only frame boundaries — it matches a
+  line-anchored `\ndata: [DONE]` marker and keeps at most `DONE_MARKER.len() - 1`
+  trailing bytes, so a terminator split across two frames is still detected and
+  model content that merely contains the text can never spoof it. Covered by the
+  unit guard tests in that module and the end-to-end wiremock test
+  `upstream_stream_without_done_yields_fg3010_error_frame` (passthrough), plus
+  the mid-stream error-frame tests (`mid_stream_provider_error_becomes_terminal_error_frame`
+  and `resilience.rs`).
 
 - **Tools on Gemini**: `translate_request` (google) silently ignores
   `tools`/`tool_choice`, and the streaming translator reads only `parts[].text`
