@@ -1,74 +1,74 @@
-# M5 — Auth, clés virtuelles & budgets durs
+# M5 — Auth, virtual keys & hard budgets
 
-## Objectif
-Clés virtuelles avec budgets DURS enforced dans le chemin de requête — le gap que ni LiteLLM ni OpenRouter ne comblent bien (workloads agentiques qui vident les crédits sans stop). Et la DB reste HORS du chemin critique.
+## Objective
+Virtual keys with HARD budgets enforced in the request path — the gap that neither LiteLLM nor OpenRouter fills well (agentic workloads that drain credits without stopping). And the DB stays OFF the critical path.
 
-## Tâches
+## Tasks
 
-### 5.1 Stockage
-- [x] sqlx + SQLite, migrations embarquées (`sqlx::migrate!`)
-- [x] Tables : `virtual_keys(id, key_hash, name, budget_max, budget_spent, rpm_limit, tpm_limit, expires_at, disabled)`, `usage_log(id, key_id, model, capability, tokens_in, tokens_out, search_units, cost, latency_ms, status, ts)` — PAS de colonne prompt/response
-- [x] Clés virtuelles : `fg-` + 32 bytes random ; stockage argon2/blake3 du hash, jamais le clair
-- [x] Clés providers optionnellement en DB, chiffrées AES-256-GCM (master key via env `LUMEN_MASTER_KEY`) ; le mode par défaut reste les env vars
+### 5.1 Storage
+- [x] sqlx + SQLite, embedded migrations (`sqlx::migrate!`)
+- [x] Tables: `virtual_keys(id, key_hash, name, budget_max, budget_spent, rpm_limit, tpm_limit, expires_at, disabled)`, `usage_log(id, key_id, model, capability, tokens_in, tokens_out, search_units, cost, latency_ms, status, ts)` — NO prompt/response column
+- [x] Virtual keys: `fg-` + 32 random bytes; store an argon2/blake3 hash, never the cleartext
+- [x] Provider keys optionally in the DB, encrypted with AES-256-GCM (master key via env `LUMEN_MASTER_KEY`); the default mode remains env vars
 
-### 5.2 Enforcement dans le request path — SANS toucher la DB
-- [x] État des clés (budget restant, compteurs RPM/TPM) chargé en mémoire au boot dans un `DashMap`/`ArcSwap`
-- [x] Vérification budget/quota = lecture mémoire + CAS atomique. Requête refusée AVANT l'appel amont : 402 LM-4001 (budget épuisé), 429 LM-4002 (RPM), 429 LM-4003 (TPM)
-- [x] Débit du budget : estimation pré-appel (max_tokens) réservée atomiquement, ajustée post-appel avec l'usage réel — pas de course possible entre requêtes concurrentes
-- [x] Persistance : flush périodique (défaut 10 s) des compteurs mémoire → DB. Crash = perte de max 10 s de comptage, jamais de dépassement de budget non détecté à la requête suivante
+### 5.2 Enforcement in the request path — WITHOUT touching the DB
+- [x] Key state (remaining budget, RPM/TPM counters) loaded into memory at boot in a `DashMap`/`ArcSwap`
+- [x] Budget/quota check = memory read + atomic CAS. Request refused BEFORE the upstream call: 402 LM-4001 (budget exhausted), 429 LM-4002 (RPM), 429 LM-4003 (TPM)
+- [x] Budget debit: pre-call estimation (max_tokens) reserved atomically, adjusted post-call with the real usage — no possible race between concurrent requests
+- [x] Persistence: periodic flush (default 10 s) of the in-memory counters → DB. Crash = loss of at most 10 s of counting, never an undetected budget overrun on the next request
 
-### 5.3 Logging d'usage asynchrone
-- [x] Channel mpsc BORNÉ (défaut 10 000) → tâche writer qui batch les INSERT (défaut : toutes les 2 s ou 500 entrées)
-- [x] Channel plein → drop du log + compteur Prometheus `usage_log_dropped_total` incrémenté. Le request path ne bloque JAMAIS sur le logging (leçon LiteLLM #12067)
-- [x] Rétention configurable : purge des usage_log > N jours (tâche de fond, défaut 30 j)
+### 5.3 Asynchronous usage logging
+- [x] BOUNDED mpsc channel (default 10,000) → writer task that batches the INSERTs (default: every 2 s or 500 entries)
+- [x] Channel full → drop the log + increment the Prometheus counter `usage_log_dropped_total`. The request path NEVER blocks on logging (LiteLLM lesson #12067)
+- [x] Configurable retention: purge usage_log > N days (background task, default 30 d)
 
-### 5.4 Comptage des tokens (promesse centrale — voir ADR 003)
-- [x] **Un compte de tokens pour CHAQUE requête, toute capacité**, jamais `0` par défaut : chat (in + out), embeddings (in), rerank (search_units si dispo + tokens query+documents)
-- [x] Source prioritaire : usage rapporté par l'amont (`estimated = false`) ; sinon fallback estimation (`estimated = true`)
-- [x] Fallback : heuristique légère (byte/char) par défaut, tokenizer précis optionnel par modèle (config) exécuté via `spawn_blocking` — JAMAIS de tokenizer lourd sur le chemin de requête (pilier 1) *(heuristique implémentée ; le tokenizer précis opt-in part en backlog — dépendance lourde, voir `docs/backlog.md` § M5 — l'invariant « jamais de tokenizer lourd inline » tient par construction)*
-- [x] TEI (aucun usage amont) → tokens estimés, jamais zéro silencieux
-- [x] Compteurs Prometheus à cardinalité fixe : `lumen_tokens_total{capability,model,provider,direction,estimated}`, `lumen_rerank_search_units_total{model,provider}`, `tokens_estimated_total`
-- [x] Le comptage ne bloque ni ne fait échouer JAMAIS une requête ; l'estimation précise se fait hors du hot path (dans le writer async)
+### 5.4 Token counting (central promise — see ADR 003)
+- [x] **A token count for EVERY request, every capability**, never `0` by default: chat (in + out), embeddings (in), rerank (search_units if available + query+documents tokens)
+- [x] Priority source: usage reported by the upstream (`estimated = false`); otherwise fall back to estimation (`estimated = true`)
+- [x] Fallback: lightweight heuristic (byte/char) by default, precise per-model tokenizer optional (config) run via `spawn_blocking` — NEVER a heavy tokenizer on the request path (pillar 1) *(heuristic implemented; the opt-in precise tokenizer goes to the backlog — heavy dependency, see `docs/backlog.md` § M5 — the "never a heavy tokenizer inline" invariant holds by construction)*
+- [x] TEI (no upstream usage) → estimated tokens, never a silent zero
+- [x] Fixed-cardinality Prometheus counters: `lumen_tokens_total{capability,model,provider,direction,estimated}`, `lumen_rerank_search_units_total{model,provider}`, `tokens_estimated_total`
+- [x] Counting NEVER blocks or fails a request; precise estimation happens off the hot path (in the async writer)
 
-### 5.4b Comptage des coûts (consommateur des tokens ci-dessus)
-- [x] Table de prix par modèle dans la config (`cost_per_1m_input`, `cost_per_1m_output`, `cost_per_1k_searches`)
-- [x] Coût dérivé des tokens comptés en 5.4 ; embeddings : tokens in seulement ; rerank : search units
-- [x] Usage extrait du dernier chunk en streaming ; si absent, estimation et flag `estimated: true` dans le log et la réponse
+### 5.4b Cost counting (consumer of the tokens above)
+- [x] Per-model price table in the config (`cost_per_1m_input`, `cost_per_1m_output`, `cost_per_1k_searches`)
+- [x] Cost derived from the tokens counted in 5.4; embeddings: input tokens only; rerank: search units
+- [x] Usage extracted from the last chunk in streaming; if absent, estimation and `estimated: true` flag in the log and the response
 
-### 5.5 API d'admin minimale
-- [x] `POST/GET/PATCH /admin/keys` protégé par la master key — créer/lister/désactiver des clés, ajuster les budgets
-- [x] La réponse de création est la SEULE fois où la clé claire est visible
+### 5.5 Minimal admin API
+- [x] `POST/GET/PATCH /admin/keys` protected by the master key — create/list/disable keys, adjust budgets
+- [x] The creation response is the ONLY time the cleartext key is visible
 
-### 5.6 Métadonnées de requête (style Cloudflare AI Gateway) — voir ADR 002
-- [x] Header `x-lumen-metadata` (+ alias `cf-aig-metadata`) : objet JSON PLAT `clé → (string|number|bool)`, parsé une fois au bord dans les extensions de requête (zéro alloc si absent)
-- [x] Bornes : ≤ 16 clés, clé ≤ 64 o, valeur ≤ 256 o, header ≤ 4 Kio
-- [x] Sink logs : la métadonnée complète est attachée aux champs du log structuré ET stockée dans une colonne `metadata` de `usage_log` (filtrage à la Cloudflare)
-- [x] Sink Prometheus : SEULES les clés de l'allowlist config (`telemetry.metadata_labels`, défaut vide) deviennent des labels ; les autres restent logs-only (cardinalité bornée par l'opérateur, jamais par le client)
-- [x] Robustesse : métadonnée absente/malformée/hors-bornes → droppée avec `warn!` + compteur `metadata_rejected_total`, la requête N'ÉCHOUE JAMAIS
-- [x] Sécurité : métadonnée opaque, jamais inspectée ; documenter qu'elle est loggée et ne doit pas contenir de secret ni de contenu de prompt
+### 5.6 Request metadata (Cloudflare AI Gateway style) — see ADR 002
+- [x] `x-lumen-metadata` header (+ alias `cf-aig-metadata`): FLAT JSON object `key → (string|number|bool)`, parsed once at the edge into the request extensions (zero alloc if absent)
+- [x] Bounds: ≤ 16 keys, key ≤ 64 B, value ≤ 256 B, header ≤ 4 KiB
+- [x] Log sink: the full metadata is attached to the structured-log fields AND stored in a `metadata` column of `usage_log` (Cloudflare-style filtering)
+- [x] Prometheus sink: ONLY the config allowlist keys (`telemetry.metadata_labels`, default empty) become labels; the others stay logs-only (cardinality bounded by the operator, never by the client)
+- [x] Robustness: absent/malformed/out-of-bounds metadata → dropped with `warn!` + counter `metadata_rejected_total`, the request NEVER fails
+- [x] Security: metadata is opaque, never inspected; document that it is logged and must not contain secrets or prompt content
 
-## Critères d'acceptation
+## Acceptance criteria
 
-> Statut : critères 1–11 couverts par des tests automatisés (`crates/server/tests/auth.rs`
-> au niveau HTTP + `crates/auth/tests/*` au niveau unitaire). Notes :
-> * Critère 3 : le chemin de requête ne touche JAMAIS la DB par construction ;
->   testé avec un writer mort (stand-in d'une DB verrouillée) — 70 requêtes
->   passent à pleine vitesse, chaque entrée droppée est comptée.
-> * Critère 5 : moitié DB testée par dump complet (`debug_dump`) ; côté logs,
->   le plaintext n'est jamais passé à `tracing` et `PlaintextKey`/`MasterKey`
->   ont un `Debug` caviardé (testé unitairement).
-> * Critère 12 : sans objet en l'état — seul l'heuristique O(octets) inline
->   existe ; le tokenizer précis (le seul risque de latence) est en backlog et
->   devra embarquer ce test de latence quand il arrivera.
-1. Test de course : 50 requêtes concurrentes sur une clé avec budget pour 10 → exactement les requêtes couvertes par le budget passent, zéro dépassement (assert sur le compteur atomique final).
-2. Test : budget épuisé → 402 AVANT tout appel amont (wiremock : zéro requête reçue).
-3. Test : DB verrouillée/lente (simulée) → les requêtes API continuent de passer, seul le flush est retardé ; latence p99 du chemin de requête inchangée.
-4. Test : channel de logs saturé → requêtes non bloquées, compteur dropped incrémenté.
-5. Test : la clé virtuelle claire n'apparaît ni en DB ni dans les logs (grep sur logs capturés + dump DB).
-6. Test : redémarrage → budgets rechargés depuis la DB, une clé épuisée reste épuisée.
-7. Test : `x-lumen-metadata` valide → apparaît dans le log d'usage ; seules les clés de l'allowlist deviennent des labels Prometheus ; une clé hors allowlist n'ajoute AUCune série temporelle.
-8. Test : métadonnée malformée ou > bornes → requête réussit quand même, `metadata_rejected_total` incrémenté, rien dans les labels.
-9. Test : embeddings via TEI (amont sans usage) → le log ET `lumen_tokens_total` rapportent un compte > 0 avec `estimated="true"` ; jamais zéro.
-10. Test : embeddings via OpenAI (amont avec usage) → compte = valeur amont, `estimated="false"`.
-11. Test : chaque capacité (chat/embed/rerank) incrémente `lumen_tokens_total` avec le bon `capability`/`direction` ; rerank incrémente aussi `lumen_rerank_search_units_total`.
-12. Test : latence p99 du chemin de requête inchangée quand l'estimation par tokenizer est activée (l'estimation reste hors hot path).
+> Status: criteria 1–11 covered by automated tests (`crates/server/tests/auth.rs`
+> at the HTTP level + `crates/auth/tests/*` at the unit level). Notes:
+> * Criterion 3: the request path NEVER touches the DB by construction;
+>   tested with a dead writer (stand-in for a locked DB) — 70 requests
+>   pass at full speed, each dropped entry is counted.
+> * Criterion 5: the DB half tested by a full dump (`debug_dump`); on the logs side,
+>   the plaintext is never passed to `tracing` and `PlaintextKey`/`MasterKey`
+>   have a redacted `Debug` (unit tested).
+> * Criterion 12: moot as things stand — only the inline O(bytes) heuristic
+>   exists; the precise tokenizer (the only latency risk) is in the backlog and
+>   will need to carry this latency test when it arrives.
+1. Race test: 50 concurrent requests on a key with budget for 10 → exactly the requests covered by the budget pass, zero overrun (assert on the final atomic counter).
+2. Test: budget exhausted → 402 BEFORE any upstream call (wiremock: zero requests received).
+3. Test: locked/slow DB (simulated) → the API requests keep passing, only the flush is delayed; request-path p99 latency unchanged.
+4. Test: saturated log channel → requests not blocked, dropped counter incremented.
+5. Test: the cleartext virtual key appears neither in the DB nor in the logs (grep over captured logs + DB dump).
+6. Test: restart → budgets reloaded from the DB, an exhausted key stays exhausted.
+7. Test: valid `x-lumen-metadata` → appears in the usage log; only the allowlist keys become Prometheus labels; a key outside the allowlist adds NO time series.
+8. Test: malformed or > bounds metadata → request still succeeds, `metadata_rejected_total` incremented, nothing in the labels.
+9. Test: embeddings via TEI (upstream without usage) → the log AND `lumen_tokens_total` report a count > 0 with `estimated="true"`; never zero.
+10. Test: embeddings via OpenAI (upstream with usage) → count = upstream value, `estimated="false"`.
+11. Test: each capability (chat/embed/rerank) increments `lumen_tokens_total` with the right `capability`/`direction`; rerank also increments `lumen_rerank_search_units_total`.
+12. Test: request-path p99 latency unchanged when tokenizer-based estimation is enabled (estimation stays off the hot path).

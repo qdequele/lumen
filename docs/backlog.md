@@ -1,7 +1,7 @@
 # Backlog
 
 Ideas surfaced during development that are intentionally out of scope for v1
-(see `CLAUDE.md` → "Ce qu'on ne fait PAS (v1)" and `ROADMAP.md` → "Backlog v2").
+(see `CLAUDE.md` → "What we do NOT do (v1)" and `ROADMAP.md` → "Backlog v2").
 Recorded here so they are not lost, and so we don't gold-plate the current
 milestone.
 
@@ -77,7 +77,7 @@ milestone.
 - **Streaming disconnect test is a no-hang assertion, not an abort assertion.**
   `streaming_client_disconnect_does_not_hang_server` proves the server stays
   responsive but not that the upstream connection was actually closed (M4
-  acceptance criterion 2: "amont fermé en < 100 ms"). And because the interim
+  acceptance criterion 2: "upstream closed in < 100 ms"). And because the interim
   single-shot `chat_stream` awaits the full `chat()` before the guard is moved
   into the SSE body, the moved-guard path is not exercised. Strengthen in the
   streaming slice: assert via wiremock that the upstream request was aborted,
@@ -106,11 +106,11 @@ milestone.
   only inspects frame boundaries, not JSON). No mid-stream error-frame test yet
   either. Tracked as slice-3 work.
 
-- **Tools sur Gemini** : `translate_request` (google) ignore silencieusement
-  `tools`/`tool_choice`, et le traducteur streaming ne lit que `parts[].text`
-  (un `functionCall` serait avalé). Décider : mapper vers `functionDeclarations`
-  Gemini, ou rejeter explicitement (LM-2002) quand `tools` est présent sur un
-  modèle routé Google. Relevé en review M4.
+- **Tools on Gemini**: `translate_request` (google) silently ignores
+  `tools`/`tool_choice`, and the streaming translator reads only `parts[].text`
+  (a `functionCall` would be swallowed). Decide: map to Gemini
+  `functionDeclarations`, or reject explicitly (LM-2002) when `tools` is present
+  on a Google-routed model. Noted in the M4 review.
 
 ## Noted while building M5
 
@@ -144,7 +144,7 @@ milestone.
   not zeroized on drop; the `zeroize` crate would close the residual-memory
   window. Low risk (single long-lived process), noted from the M5 review.
 
-## M6 (résilience) — deferred
+## M6 (resilience) — deferred
 
 - **Per-provider connect timeout.** `connect` is a `reqwest::Client` setting and
   the gateway shares one pooled client across providers, so the connect timeout

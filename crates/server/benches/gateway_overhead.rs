@@ -5,7 +5,7 @@
 //! retry loop, per-attempt timeout) and the JSON (de)serialization the OpenAI
 //! surface performs. No sockets are involved — the "provider" resolves
 //! instantly — so the numbers isolate gateway overhead from upstream/network
-//! latency, matching the "< 1 ms added p99 hors réseau" target.
+//! latency, matching the "< 1 ms added p99 off-network" target.
 //!
 //! Run with `cargo bench -p server`. The full head-to-head vs LiteLLM under
 //! load lives in `bench/` (docker-compose + k6) and is documented in

@@ -37,7 +37,7 @@ The design makes a few guarantees relevant to security:
 - **Errors never mislead.** A client error, an upstream provider error, and an
   internal malfunction are always distinguished (4xx / 502-504 / 500); an
   internal failure is never reported as a 401.
-- **Default response security headers** (M7): `X-Content-Type-Options: nosniff`,
+- **Default response security headers**: `X-Content-Type-Options: nosniff`,
   `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, and a locked-down
   `Content-Security-Policy: default-src 'none'`. HSTS is intentionally left to
   the TLS-terminating proxy.

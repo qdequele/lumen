@@ -1,8 +1,7 @@
 # ADR 002 — Per-request metadata header for logging & metrics
 
-- Status: accepted (planned for M5)
+- Status: accepted (planned)
 - Date: 2026-07-12
-- Milestone: M5
 
 ## Context
 
@@ -14,7 +13,7 @@ then attached to each request's log for filtering and search.
 
 LUMEN needs the same capability, feeding both:
 
-- **structured logs** (`tracing`) and the M5 `usage_log` records, and
+- **structured logs** (`tracing`) and the `usage_log` records, and
 - **Prometheus** metrics.
 
 The tension is Prometheus **cardinality**. Prometheus label values multiply the
@@ -46,7 +45,7 @@ typed value carried in request extensions.
 3. **Two sinks, different rules.**
    - **Logs / `usage_log`:** the full (bounded) object is attached to the
      request's structured log fields and stored in a `metadata` column on
-     `usage_log` (M5) for later filtering — the Cloudflare-style use case.
+     `usage_log` for later filtering — the Cloudflare-style use case.
    - **Prometheus:** ONLY keys named in a config **allowlist**
      (`telemetry.metadata_labels = ["env", "team"]`, default empty) become
      metric labels; every other key is logs-only. An allowlisted key absent
@@ -69,7 +68,7 @@ typed value carried in request extensions.
   Cloudflare's log-search model.
 - The request path gains only a bounded header parse (no allocation when the
   header is absent), preserving the latency pillar.
-- Implementation lands in M5 alongside usage logging (`usage_log.metadata`
+- Implementation lands alongside usage logging (`usage_log.metadata`
   column, the batched writer, and the Prometheus label wiring in `telemetry`).
   A thin extractor in `server` reads the header into request extensions so chat,
   embeddings and rerank handlers all share it.

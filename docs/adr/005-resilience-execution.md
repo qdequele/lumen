@@ -1,18 +1,18 @@
 # ADR 005 — Resilience execution model (retries, fallback, circuit breaker, timeouts)
 
-- Status: accepted (M6)
+- Status: accepted
 - Date: 2026-07-13
-- Milestone: M6
 
 ## Context
 
-M6 adds retries, multi-provider fallback chains, a per-provider circuit breaker
-and per-phase timeouts. The overriding constraint is pillar 1 (< 1 ms added p99)
-and pillar 3 (robustness): none of this may add a database or lock to the
-request path, and — the explicit M6 lesson (LiteLLM #15526) — a storm of 429s
-from an upstream must never destabilise the gateway itself. The router crate
-until M6 was a pure resolution helper; M6 turns it into an **execution** layer
-that wraps a provider call with the resilience machinery.
+The resilience layer adds retries, multi-provider fallback chains, a
+per-provider circuit breaker and per-phase timeouts. The overriding constraint
+is pillar 1 (< 1 ms added p99) and pillar 3 (robustness): none of this may add a
+database or lock to the request path, and — the explicit lesson (LiteLLM
+#15526) — a storm of 429s from an upstream must never destabilise the gateway
+itself. The router crate was previously a pure resolution helper; this change
+turns it into an **execution** layer that wraps a provider call with the
+resilience machinery.
 
 Three design tensions had to be resolved:
 
@@ -121,7 +121,7 @@ Three timeouts, global defaults with per-model overrides:
   connection pooling; deferred, noted in docs). A connect timeout is now
   distinguished from a read timeout: `ProviderError::ConnectTimeout` →
   `LM-3012` (504).
-- **first_token** (default 30 s, per-model override) — reuses the M4 path;
+- **first_token** (default 30 s, per-model override) — reuses the streaming path;
   `LM-3011` (504). For non-streaming it bounds the whole call; for streaming,
   the time to the first frame.
 - **total** (default 600 s, per-model override) — an absolute deadline threaded
@@ -154,4 +154,4 @@ of provider health (criterion 5) and does no I/O.
 - `usage_log` gains a `model_used` column (migration 0002) so a fallback is
   observable after the fact, mirroring the `x-lumen-model-used` header.
 - Per-provider connect timeouts and true first-frame-peek streaming retries are
-  explicitly out of scope for M6 and recorded in `docs/backlog.md`.
+  explicitly out of scope here and recorded in `docs/backlog.md`.

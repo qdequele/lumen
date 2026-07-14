@@ -10,7 +10,7 @@ default**.
 
 LUMEN is an alternative to LiteLLM (Python, heavier) and OpenRouter (SaaS,
 not self-hostable). The gateway's own overhead is **microseconds, off-network**:
-the per-request CPU work it adds is **~3.2 µs median** (M6 resilience executor +
+the per-request CPU work it adds is **~3.2 µs median** (resilience executor +
 OpenAI-surface (de)serialization), measured with `cargo bench` on Apple Silicon.
 Streaming forwards upstream bytes verbatim with no per-chunk re-serialization
 (see [ADR 004](docs/adr/004-streaming-passthrough.md)). A full, reproducible
@@ -184,7 +184,7 @@ Per-provider setup (env var, `base_url`, defaults, batch limits) is in
 
 Each area is summarized here; the linked docs and ADRs carry the detail.
 
-### Auth, keys & hard budgets (M5)
+### Auth, keys & hard budgets
 
 Off by default — with `[auth].enabled = false` the gateway is an open proxy with
 no database at all. When enabled (requires `LUMEN_MASTER_KEY`, 64 hex
@@ -195,7 +195,7 @@ spends. The DB is never on the request path. Refusals are `402 LM-4001`
 `401 LM-4004`. Keys and budgets are managed via the `/admin/*` API, gated by the
 master key. See [`SECURITY.md`](SECURITY.md).
 
-### Resilience (M6)
+### Resilience
 
 Survives flaky upstreams without becoming flaky itself: **retries** with
 exponential backoff + jitter (retryable failures only, never a client 4xx),
@@ -206,7 +206,7 @@ three distinct **per-phase timeouts** (`LM-3012` connect, `LM-3011` first-token,
 the `x-lumen-model-used` response header. All configured under
 `[resilience]`; design in [ADR 005](docs/adr/005-resilience-execution.md).
 
-### Observability & token accounting (M5, ADR 003)
+### Observability & token accounting (ADR 003)
 
 **Every** request of every capability produces a token count — upstream usage
 when reported, otherwise a local byte-heuristic estimate flagged
@@ -222,14 +222,14 @@ message content**. See [ADR 003](docs/adr/003-token-accounting.md) and
 [ADR 002](docs/adr/002-request-metadata-header.md) for the `x-lumen-metadata`
 header.
 
-### Config hot reload (M7)
+### Config hot reload
 
 `SIGHUP` or a file-watch triggers a reload: the new config is validated, then the
 provider registry is atomically swapped. In-flight requests are unaffected. An
 invalid config is **rejected** — the old config keeps serving and
 `lumen_config_reload_failures_total` increments.
 
-### Security headers (M7)
+### Security headers
 
 Every response carries `X-Content-Type-Options: nosniff`,
 `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, and
@@ -260,7 +260,7 @@ profile, `rustc 1.97.0`):
 
 | Measure                                             | Value             |
 |-----------------------------------------------------|-------------------|
-| M6 executor around an instant provider (`executor_overhead_chat`) | ~1.21 µs median |
+| Executor around an instant provider (`executor_overhead_chat`) | ~1.21 µs median |
 | Parse a chat request (`json_request_deserialize`)   | ~1.34 µs median   |
 | Serialize a chat response (`json_response_serialize`)| ~0.60 µs median  |
 | **Total added CPU per non-streaming chat request**  | **~3.2 µs median**|

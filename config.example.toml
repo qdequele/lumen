@@ -32,7 +32,7 @@ first_token_timeout_ms = 30000
 sse_heartbeat_ms = 15000
 
 # ---------------------------------------------------------------------------
-# Auth: virtual keys, hard budgets, quotas, usage log (M5). Disabled by
+# Auth: virtual keys, hard budgets, quotas, usage log. Disabled by
 # default — the gateway is then an open proxy with no database at all.
 #
 # When enabled, the LUMEN_MASTER_KEY env var is REQUIRED (64 hex chars =
@@ -72,7 +72,7 @@ retention_days = 30               # purge usage_log rows older than this
 metadata_labels = []              # e.g. ["team", "env"]
 
 # ---------------------------------------------------------------------------
-# Resilience: retries, fallbacks, circuit breaker, timeouts, health checks (M6).
+# Resilience: retries, fallbacks, circuit breaker, timeouts, health checks.
 #
 # Every value below is the built-in default — the whole section is optional.
 # Retries and the circuit breaker are always active with these defaults; only
@@ -146,7 +146,7 @@ api_key_env = "OPENAI_API_KEY"
 id = "gpt-4o"
 upstream_id = "gpt-4o-2024-08-06"
 capabilities = ["chat"]
-# Optional prices (USD) — the source of cost counting and hard budgets (M5).
+# Optional prices (USD) — the source of cost counting and hard budgets.
 # A model without prices costs 0: budgets then never bite on it.
 cost_per_1m_input = 2.5
 cost_per_1m_output = 10.0
