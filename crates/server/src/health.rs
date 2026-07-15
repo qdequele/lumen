@@ -134,9 +134,21 @@ impl ProbeTarget {
     /// reachability until it earns a real probe.
     fn probe_url(&self) -> String {
         match self.kind {
-            lumen_providers::ProviderKind::Tei | lumen_providers::ProviderKind::Vllm => {
+            lumen_providers::ProviderKind::Tei => {
                 format!("{}/health", self.url.trim_end_matches('/'))
             }
+            // vLLM serves /health at the SERVER ROOT, but the documented
+            // base_url convention for OpenAI-compatible kinds carries a /v1
+            // suffix (the chat/embeddings paths are built as {base}/chat/...).
+            // Strip that suffix so a healthy server is not probed at the
+            // nonexistent /v1/health and wrongly marked down.
+            lumen_providers::ProviderKind::Vllm => {
+                let base = self.url.trim_end_matches('/');
+                let root = base.strip_suffix("/v1").unwrap_or(base);
+                format!("{root}/health")
+            }
+            // Ollama's documented base_url is the server root (no /v1), and
+            // /api/version hangs directly off it.
             lumen_providers::ProviderKind::Ollama => {
                 format!("{}/api/version", self.url.trim_end_matches('/'))
             }
@@ -269,14 +281,32 @@ mod tests {
         assert_eq!(tei.probe_url(), "http://tei:8080/health");
         assert!(tei.is_liveness_endpoint());
 
+        // vLLM's documented base_url shape carries the OpenAI-compatible /v1
+        // prefix (docs/providers.md), but the server exposes /health at the
+        // SERVER ROOT - the probe must strip the /v1 segment, or a healthy
+        // vLLM would 404 and be marked down.
         let vllm = ProbeTarget {
             name: "vllm".to_owned(),
+            url: "http://vllm:8000/v1".to_owned(),
+            kind: ProviderKind::Vllm,
+        };
+        assert_eq!(vllm.probe_url(), "http://vllm:8000/health");
+        assert!(vllm.is_liveness_endpoint());
+
+        // A base_url without the /v1 suffix (or with a trailing slash) still
+        // lands on root /health.
+        let vllm_root = ProbeTarget {
+            name: "vllm-root".to_owned(),
             url: "http://vllm:8000/".to_owned(),
             kind: ProviderKind::Vllm,
         };
-        // vLLM's OpenAI-compatible server exposes an unauthenticated /health.
-        assert_eq!(vllm.probe_url(), "http://vllm:8000/health");
-        assert!(vllm.is_liveness_endpoint());
+        assert_eq!(vllm_root.probe_url(), "http://vllm:8000/health");
+        let vllm_v1_slash = ProbeTarget {
+            name: "vllm-v1-slash".to_owned(),
+            url: "http://vllm:8000/v1/".to_owned(),
+            kind: ProviderKind::Vllm,
+        };
+        assert_eq!(vllm_v1_slash.probe_url(), "http://vllm:8000/health");
 
         let ollama = ProbeTarget {
             name: "ollama".to_owned(),
@@ -323,6 +353,9 @@ mod tests {
         use lumen_providers::ProviderKind;
 
         let upstream = MockServer::start().await;
+        // vLLM serves /health at the server ROOT; the documented base_url
+        // carries /v1. Mount only root /health so a probe that wrongly hits
+        // /v1/health would get wiremock's default 404 instead.
         Mock::given(method("GET"))
             .and(path("/health"))
             .respond_with(ResponseTemplate::new(503))
@@ -331,7 +364,7 @@ mod tests {
 
         let targets = vec![ProbeTarget {
             name: "vllm".to_owned(),
-            url: upstream.uri(),
+            url: format!("{}/v1", upstream.uri()),
             kind: ProviderKind::Vllm,
         }];
         let health = ProviderHealth::with_providers(&["vllm".to_owned()]);
@@ -350,6 +383,42 @@ mod tests {
             snap["vllm"].detail.as_deref(),
             Some("liveness returned HTTP 503")
         );
+    }
+
+    #[tokio::test]
+    async fn healthy_vllm_with_v1_base_url_is_marked_up() {
+        use lumen_providers::ProviderKind;
+
+        // Regression guard: with the documented `base_url = ".../v1"` shape,
+        // a probe that naively appends /health would hit /v1/health, 404, and
+        // mark a HEALTHY vLLM down. Only root /health answers 200 here; any
+        // other path gets wiremock's default 404 (a liveness non-2xx = down),
+        // so this test fails unless the probe strips the /v1 segment.
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/health"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&upstream)
+            .await;
+
+        let targets = vec![ProbeTarget {
+            name: "vllm".to_owned(),
+            url: format!("{}/v1", upstream.uri()),
+            kind: ProviderKind::Vllm,
+        }];
+        let health = ProviderHealth::with_providers(&["vllm".to_owned()]);
+        probe_once(
+            &reqwest::Client::new(),
+            &targets,
+            &health,
+            None,
+            Duration::from_secs(5),
+        )
+        .await;
+
+        let snap = health.snapshot();
+        assert_eq!(snap["vllm"].status, HealthState::Up);
+        assert_eq!(snap["vllm"].detail.as_deref(), Some("liveness ok"));
     }
 
     #[tokio::test]

@@ -10,7 +10,9 @@ All notable changes to LUMEN are documented here. The format is based on
 
 - The background health-check task (`resilience.health_check_enabled`) now
   uses a real liveness endpoint for every self-hosted, keyless provider kind,
-  not just TEI: **vLLM** (`GET {base_url}/health`) and **Ollama**
+  not just TEI: **vLLM** (server-root `GET /health`; a trailing `/v1` in the
+  configured `base_url` is stripped, since the documented convention is
+  `base_url = "http://host:8000/v1"`) and **Ollama**
   (`GET {base_url}/api/version`), both built for this exact use. A non-2xx
   response on these now correctly marks the provider `down`, same as TEI.
 - Keyed vendor kinds (OpenAI, Anthropic, the OpenAI-compatible hosts, ...)

@@ -112,11 +112,13 @@ total_timeout_ms = 600000         # absolute per-request deadline (10 minutes)
 
 # Background health checks (OFF by default). When enabled, a periodic task
 # probes every provider that has a configured `base_url` (self-hosted TEI /
-# Ollama, or any explicit override) and publishes the result at
-# GET /health/providers and on lumen_provider_up{provider}. Providers on a
-# built-in vendor URL report `unknown` (never probed - the gateway hardcodes no
-# vendor endpoints). The gateway's own /health stays independent of provider
-# health and does no I/O.
+# Ollama / vLLM, or any explicit override) and publishes the result at
+# GET /health/providers and on lumen_provider_up{provider}. Self-hosted kinds
+# get a real liveness endpoint (TEI and vLLM: server-root /health; Ollama:
+# /api/version) where a non-2xx means down; other kinds get a bare
+# reachability GET on base_url. Providers on a built-in vendor URL report
+# `unknown` (never probed - the gateway hardcodes no vendor endpoints). The
+# gateway's own /health stays independent of provider health and does no I/O.
 health_check_enabled = false
 health_check_interval_ms = 30000  # probe cadence (must not be 0 when enabled)
 
