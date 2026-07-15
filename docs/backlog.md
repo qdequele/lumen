@@ -182,11 +182,10 @@ milestone.
 
 ## M6 (resilience) - deferred
 
-- **Per-provider connect timeout.** `connect` is a `reqwest::Client` setting and
-  the gateway shares one pooled client across providers, so the connect timeout
-  is process-wide. Per-provider connect would need one client per provider
-  (losing cross-provider pooling); `first_token` and `total` are already
-  per-provider. See ADR 005.
+- ~~**Per-provider connect timeout.**~~ **Done (issue #24, 2026-07-15.)** A
+  provider may set `connect_timeout_ms`; it then gets its own (unpooled)
+  `reqwest::Client` built at registry construction, while every non-overriding
+  provider keeps sharing the one pooled client. See the ADR 005 amendment.
 - **First-frame-peek streaming retry.** Streaming retry/fallback happens only at
   the *open* phase (send + status). A stream that opens 200 then errors on its
   very first frame is treated as committed (clean SSE error frame, no retry).

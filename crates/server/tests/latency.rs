@@ -24,6 +24,7 @@ fn openai_registry(upstream: &str) -> Arc<Registry> {
         api_key: Some("sk-test-xxx".to_owned()),
         base_url: Some(upstream.to_owned()),
         strict: false,
+        connect_timeout_ms: None,
         models: vec![ModelSpec {
             id: "gpt".to_owned(),
             upstream_id: "gpt-4o-2024-08-06".to_owned(),
@@ -31,7 +32,14 @@ fn openai_registry(upstream: &str) -> Arc<Registry> {
             modalities: vec!["text".to_owned()],
         }],
     }];
-    Arc::new(Registry::build(specs, http::build_client()).expect("registry builds"))
+    Arc::new(
+        Registry::build(
+            specs,
+            http::build_client(),
+            std::time::Duration::from_secs(300),
+        )
+        .expect("registry builds"),
+    )
 }
 
 async fn scrape_metrics(base: &str) -> String {

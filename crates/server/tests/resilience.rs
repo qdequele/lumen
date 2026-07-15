@@ -36,7 +36,12 @@ fn config_from(toml: &str) -> Config {
 /// providers so routing and resilience agree. Returns the base URL.
 async fn spawn(config: &Config) -> String {
     let registry = Arc::new(
-        Registry::build(config.provider_specs(), http::build_client()).expect("registry builds"),
+        Registry::build(
+            config.provider_specs(),
+            http::build_client(),
+            std::time::Duration::from_secs(300),
+        )
+        .expect("registry builds"),
     );
     let state = common::base_state(registry)
         .with_pricing(CostTable::from_config(config))

@@ -22,6 +22,7 @@ fn registry_for(upstream: &str) -> Arc<Registry> {
         api_key: Some("sk-test-xxx".to_owned()),
         base_url: Some(upstream.to_owned()),
         strict: false,
+        connect_timeout_ms: None,
         models: vec![
             ModelSpec {
                 id: "rerank-fast".to_owned(),
@@ -37,7 +38,14 @@ fn registry_for(upstream: &str) -> Arc<Registry> {
             },
         ],
     }];
-    Arc::new(Registry::build(specs, http::build_client()).expect("registry builds"))
+    Arc::new(
+        Registry::build(
+            specs,
+            http::build_client(),
+            std::time::Duration::from_secs(300),
+        )
+        .expect("registry builds"),
+    )
 }
 
 const LIMIT: usize = 10 * 1024 * 1024;
@@ -269,6 +277,7 @@ fn registry_for_jina(upstream: &str) -> Arc<Registry> {
         api_key: Some("sk-test-xxx".to_owned()),
         base_url: Some(upstream.to_owned()),
         strict: false,
+        connect_timeout_ms: None,
         models: vec![ModelSpec {
             id: "jina-rerank".to_owned(),
             upstream_id: "jina-reranker-v2".to_owned(),
@@ -276,7 +285,14 @@ fn registry_for_jina(upstream: &str) -> Arc<Registry> {
             modalities: vec!["text".to_owned()],
         }],
     }];
-    Arc::new(Registry::build(specs, http::build_client()).expect("registry builds"))
+    Arc::new(
+        Registry::build(
+            specs,
+            http::build_client(),
+            std::time::Duration::from_secs(300),
+        )
+        .expect("registry builds"),
+    )
 }
 
 /// Registry with one Voyage-kind provider pointed at `upstream`, exposing a
@@ -288,6 +304,7 @@ fn registry_for_voyage(upstream: &str) -> Arc<Registry> {
         api_key: Some("sk-test-xxx".to_owned()),
         base_url: Some(upstream.to_owned()),
         strict: false,
+        connect_timeout_ms: None,
         models: vec![ModelSpec {
             id: "voyage-rerank".to_owned(),
             upstream_id: "rerank-2".to_owned(),
@@ -295,7 +312,14 @@ fn registry_for_voyage(upstream: &str) -> Arc<Registry> {
             modalities: vec!["text".to_owned()],
         }],
     }];
-    Arc::new(Registry::build(specs, http::build_client()).expect("registry builds"))
+    Arc::new(
+        Registry::build(
+            specs,
+            http::build_client(),
+            std::time::Duration::from_secs(300),
+        )
+        .expect("registry builds"),
+    )
 }
 
 #[tokio::test]

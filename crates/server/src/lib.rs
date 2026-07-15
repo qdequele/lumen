@@ -40,7 +40,13 @@ use std::sync::Arc;
 /// spec is invalid (e.g. a keyless provider missing its required `base_url`).
 pub fn build_registry(config: &Config) -> Result<Arc<Registry>, lumen_providers::RegistryError> {
     let client = lumen_providers::http::build_client();
-    let registry = Registry::build(config.provider_specs(), client)?;
+    // `build_client` uses the 300 s default overall cap; a per-provider connect
+    // override reuses that same backstop (ADR 005, 2026-07-15 amendment).
+    let registry = Registry::build(
+        config.provider_specs(),
+        client,
+        std::time::Duration::from_secs(300),
+    )?;
     Ok(Arc::new(registry))
 }
 

@@ -22,6 +22,7 @@ fn registry_for(upstream: &str) -> Arc<Registry> {
         api_key: Some("sk-test-xxx".to_owned()),
         base_url: Some(upstream.to_owned()),
         strict: false,
+        connect_timeout_ms: None,
         models: vec![
             ModelSpec {
                 id: "embed-small".to_owned(),
@@ -43,7 +44,14 @@ fn registry_for(upstream: &str) -> Arc<Registry> {
             },
         ],
     }];
-    Arc::new(Registry::build(specs, http::build_client()).expect("registry builds"))
+    Arc::new(
+        Registry::build(
+            specs,
+            http::build_client(),
+            std::time::Duration::from_secs(300),
+        )
+        .expect("registry builds"),
+    )
 }
 
 /// Registry with one Cohere-kind provider pointed at `upstream`, exposing a
@@ -55,6 +63,7 @@ fn registry_for_cohere(upstream: &str) -> Arc<Registry> {
         api_key: Some("sk-test-xxx".to_owned()),
         base_url: Some(upstream.to_owned()),
         strict: false,
+        connect_timeout_ms: None,
         models: vec![ModelSpec {
             id: "embed-multilingual".to_owned(),
             upstream_id: "embed-v4.0".to_owned(),
@@ -62,7 +71,14 @@ fn registry_for_cohere(upstream: &str) -> Arc<Registry> {
             modalities: vec!["text".to_owned()],
         }],
     }];
-    Arc::new(Registry::build(specs, http::build_client()).expect("registry builds"))
+    Arc::new(
+        Registry::build(
+            specs,
+            http::build_client(),
+            std::time::Duration::from_secs(300),
+        )
+        .expect("registry builds"),
+    )
 }
 
 const LIMIT: usize = 10 * 1024 * 1024;
@@ -153,6 +169,7 @@ async fn token_input_to_text_only_provider_is_400_fg1001_without_upstream_call()
         api_key: None,
         base_url: Some(upstream.uri()),
         strict: false,
+        connect_timeout_ms: None,
         models: vec![ModelSpec {
             id: "tei-embed".to_owned(),
             upstream_id: "tei-embed".to_owned(),
@@ -160,7 +177,14 @@ async fn token_input_to_text_only_provider_is_400_fg1001_without_upstream_call()
             modalities: vec!["text".to_owned()],
         }],
     }];
-    let registry = Arc::new(Registry::build(specs, http::build_client()).expect("registry builds"));
+    let registry = Arc::new(
+        Registry::build(
+            specs,
+            http::build_client(),
+            std::time::Duration::from_secs(300),
+        )
+        .expect("registry builds"),
+    );
     let base = common::spawn_with(registry, LIMIT).await;
 
     let resp = reqwest::Client::new()

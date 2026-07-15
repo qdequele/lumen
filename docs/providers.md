@@ -484,7 +484,10 @@ capabilities = ["rerank"]
 - **Embed batch limit**: 512.
 - **Tip**: a local model may take a while to load into VRAM on its first call -
   relax `first_token_timeout_ms` / `total_timeout_ms` on the provider block (see
-  `config.example.toml`).
+  `config.example.toml`). A self-hosted box on a slow link can also override
+  `connect_timeout_ms`; note that doing so gives this provider its own (unpooled)
+  HTTP client (ADR 005, 2026-07-15 amendment), whereas the first-token and total
+  overrides do not. All three fall back to their global defaults when unset.
 
 ```toml
 [[providers]]
@@ -493,6 +496,7 @@ kind = "ollama"
 base_url = "http://localhost:11434"
 first_token_timeout_ms = 60000
 total_timeout_ms = 120000
+connect_timeout_ms = 10000  # optional: own client, relaxed connect deadline
 
 [[providers.models]]
 id = "nomic-embed"

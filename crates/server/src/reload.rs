@@ -422,7 +422,14 @@ mod tests {
 
     fn registry_from(path: &Path) -> Arc<Registry> {
         let config = Config::load(path).expect("initial config valid");
-        Arc::new(Registry::build(config.provider_specs(), http::build_client()).expect("registry"))
+        Arc::new(
+            Registry::build(
+                config.provider_specs(),
+                http::build_client(),
+                std::time::Duration::from_secs(300),
+            )
+            .expect("registry"),
+        )
     }
 
     /// Reload targets sharing `registry`/`metrics`, with default pricing and
@@ -706,6 +713,7 @@ mod tests {
                 api_key: Some("env-key".to_owned()), // already resolved from env
                 base_url: None,
                 strict: false,
+                connect_timeout_ms: None,
                 models: Vec::new(),
             },
             ProviderSpec {
@@ -714,6 +722,7 @@ mod tests {
                 api_key: None, // env var unset → would go out unauthenticated
                 base_url: None,
                 strict: false,
+                connect_timeout_ms: None,
                 models: Vec::new(),
             },
         ];
