@@ -15,6 +15,12 @@
 - [Vision (image input)](chat/vision.md)
 - [Tool calling](chat/tool-calling.md)
 
+# Embeddings
+
+- [Embeddings](embeddings/embeddings.md)
+- [Batching](embeddings/batching.md)
+- [Multimodal embeddings](embeddings/multimodal.md)
+
 # Reference
 
 - [Providers](providers.md)
