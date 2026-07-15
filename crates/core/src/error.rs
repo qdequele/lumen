@@ -62,6 +62,19 @@ pub enum ProviderError {
     #[error("translation error: {0}")]
     Translation(String),
 
+    /// The provider handling this attempt only accepts inline base64 image
+    /// data, but the request carried a remote (`http`/`https`) image URL.
+    ///
+    /// Distinct from [`Translation`](ProviderError::Translation): this is a
+    /// client-input problem (LM-2004), not a malformed/unparseable upstream
+    /// response. It surfaces when the LM-2004 pre-flight in the handler only
+    /// inspected the primary route (`chain[0]`) and a fallback link that
+    /// cannot take a remote URL (e.g. Gemini) ends up being attempted - the
+    /// gateway never fetches the URL on the caller's behalf, so the honest
+    /// answer is a 4xx naming the incapable provider, not a 502 (GH #13).
+    #[error("provider '{provider}' requires inline base64 image data; remote image URLs are not supported")]
+    ImageUrlNotSupported { provider: String },
+
     /// The upstream signalled rate limiting (HTTP 429).
     #[error("provider '{provider}' rate limited the request")]
     RateLimited {
@@ -75,7 +88,9 @@ impl ProviderError {
     /// Whether retrying this call (on the same provider, or a fallback) may
     /// succeed. Retryable: 5xx upstream, connect/read timeouts, unreachable
     /// host, 429. Never retryable: a client-fault 4xx, a schema/translation
-    /// error (deterministic), or a cancellation (M6 §6.1 - never retry 4xx).
+    /// error (deterministic), an image-incapable provider (deterministic -
+    /// no fallback further down the chain is any more likely to fetch the
+    /// URL), or a cancellation (M6 §6.1 - never retry 4xx).
     #[must_use]
     pub const fn is_retryable(&self) -> bool {
         match self {
@@ -85,13 +100,16 @@ impl ProviderError {
             | ProviderError::FirstTokenTimeout { .. }
             | ProviderError::Unavailable { .. }
             | ProviderError::RateLimited { .. } => true,
-            ProviderError::Cancelled | ProviderError::Translation(_) => false,
+            ProviderError::Cancelled
+            | ProviderError::Translation(_)
+            | ProviderError::ImageUrlNotSupported { .. } => false,
         }
     }
 
     /// Whether this failure indicates the *provider* is unhealthy and should
     /// count against its circuit breaker. A deterministic client/translation
-    /// error or a cancellation says nothing about provider health.
+    /// error, an image-incapable provider, or a cancellation says nothing
+    /// about provider health.
     #[must_use]
     pub const fn is_provider_fault(&self) -> bool {
         match self {
@@ -101,7 +119,9 @@ impl ProviderError {
             | ProviderError::FirstTokenTimeout { .. }
             | ProviderError::Unavailable { .. }
             | ProviderError::RateLimited { .. } => true,
-            ProviderError::Cancelled | ProviderError::Translation(_) => false,
+            ProviderError::Cancelled
+            | ProviderError::Translation(_)
+            | ProviderError::ImageUrlNotSupported { .. } => false,
         }
     }
 
@@ -455,6 +475,15 @@ impl GatewayError {
             ProviderError::Translation(_) => GatewayError::UpstreamInvalidResponse {
                 provider: provider.to_owned(),
             },
+            // The resolved link cannot take a remote image URL (LM-2004): a
+            // client-input problem, never the provider's fault, even when it
+            // surfaces from a fallback link rather than the pre-flight check
+            // (GH #13). Never a 502.
+            ProviderError::ImageUrlNotSupported { provider: p } => {
+                GatewayError::ImageUrlNotSupported {
+                    provider: p_or(provider, p),
+                }
+            }
             // Cancellation is normally handled before a body is produced; if it
             // does surface, treat it as an internal condition rather than a
             // misleading client/upstream error.
@@ -699,6 +728,9 @@ mod tests {
                 retryable: false,
             },
             ProviderError::Translation("bad json".into()),
+            ProviderError::ImageUrlNotSupported {
+                provider: "p".into(),
+            },
             ProviderError::Cancelled,
         ] {
             assert!(!err.is_retryable(), "{err:?} must not be retried");
@@ -816,6 +848,31 @@ mod tests {
         assert_eq!(ge.http_status(), 502);
         assert_ne!(ge.http_status(), 500);
         assert_eq!(ge.error_type(), ErrorType::UpstreamError);
+    }
+
+    #[test]
+    fn provider_image_url_not_supported_becomes_lm_2004_not_502() {
+        // GH #13: when this failure surfaces from a fallback link deep in the
+        // chain (not the LM-2004 pre-flight, which only inspects the primary),
+        // it must still be the honest 4xx - never the generic 502 that a plain
+        // `ProviderError::Translation` would produce.
+        let ge = GatewayError::from_provider(
+            "primary-router-name",
+            ProviderError::ImageUrlNotSupported {
+                provider: "gemini-fallback".into(),
+            },
+        );
+        assert_eq!(ge.code(), "LM-2004");
+        assert_eq!(ge.http_status(), 400);
+        assert_eq!(ge.error_type(), ErrorType::InvalidRequest);
+        match ge {
+            GatewayError::ImageUrlNotSupported { provider } => {
+                // The provider embedded in the error (the fallback that was
+                // actually attempted) wins over the router-supplied name.
+                assert_eq!(provider, "gemini-fallback");
+            }
+            other => panic!("expected ImageUrlNotSupported, got {other:?}"),
+        }
     }
 
     #[test]

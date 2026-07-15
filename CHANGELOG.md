@@ -47,6 +47,17 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ### Fixed
 
+- **LM-2004 pre-flight now covers the whole fallback chain, not just the
+  primary route.** The remote-image-URL check in the chat handler only
+  inspected `chain[0]`; if the primary provider accepted remote URLs (e.g.
+  OpenAI) but a fail-over reached an image-incapable model (e.g. Gemini), the
+  fallback's translation failure surfaced as a generic `LM-3002` (502) instead
+  of the honest `LM-2004` (400) client error. Added a dedicated
+  `ProviderError::ImageUrlNotSupported` variant (deterministic, never
+  retried, never faults the circuit breaker - matching `Translation`'s
+  fallback-stopping semantics) so this specific failure is classified
+  correctly no matter which link in the chain hits it, without eagerly
+  rejecting requests a fallback would never actually need to serve (GH #13).
 - Anthropic chat responses (both `POST /v1/chat/completions` and its SSE
   stream) now stamp `created` with a real unix timestamp instead of a
   hardcoded `0`. New shared `providers::mapping::unix_timestamp` helper

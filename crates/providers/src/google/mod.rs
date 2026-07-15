@@ -268,10 +268,16 @@ fn map_finish_reason(reason: Option<&str>) -> Option<String> {
 /// Build the Gemini request body from an OpenAI-shaped [`ChatRequest`].
 ///
 /// # Errors
-/// Returns [`ProviderError::Translation`] if a message carries a remote
-/// (`http`/`https`) image URL - Gemini accepts only inline base64 image
-/// bytes, and the gateway never fetches a URL on the caller's behalf.
-fn translate_request(req: &ChatRequest) -> Result<GeminiRequest, ProviderError> {
+/// Returns [`ProviderError::ImageUrlNotSupported`] if a message carries a
+/// remote (`http`/`https`) image URL - Gemini accepts only inline base64
+/// image bytes, and the gateway never fetches a URL on the caller's behalf.
+/// `provider_name` names the attempted link (which may be a fallback, not the
+/// route the LM-2004 pre-flight checked - GH #13) so the error is attributed
+/// correctly.
+fn translate_request(
+    req: &ChatRequest,
+    provider_name: &str,
+) -> Result<GeminiRequest, ProviderError> {
     // Tool traffic maps to parts: assistant `tool_calls` -> `functionCall`
     // (role `model`), role `tool` -> `functionResponse` (role `user`,
     // consecutive results merge into one content, matching Gemini's
@@ -309,7 +315,7 @@ fn translate_request(req: &ChatRequest) -> Result<GeminiRequest, ProviderError> 
                 } else {
                     "user".to_owned()
                 },
-                parts: gemini_parts(m.content.as_ref(), &text)?,
+                parts: gemini_parts(m.content.as_ref(), &text, provider_name)?,
             }),
         }
     }
@@ -486,23 +492,24 @@ fn translate_tool_choice(choice: &serde_json::Value) -> Option<serde_json::Value
 }
 
 /// Build Gemini `parts` from a message: data-URI images become `inline_data`;
-/// a remote image URL is a translation error (Gemini takes only inline bytes,
-/// and the gateway never fetches the URL). Text-only content is one text part.
+/// a remote image URL is a client-input error (LM-2004 - Gemini takes only
+/// inline bytes, and the gateway never fetches the URL). Text-only content is
+/// one text part.
 fn gemini_parts(
     content: Option<&MessageContent>,
     text: &str,
+    provider_name: &str,
 ) -> Result<Vec<GeminiPart>, ProviderError> {
     match content {
         Some(MessageContent::Parts(parts)) if parts.iter().any(|p| p.image_url.is_some()) => {
             let mut out = Vec::with_capacity(parts.len());
             for p in parts {
                 if let Some(img) = &p.image_url {
-                    let data = img.as_data_uri().ok_or_else(|| {
-                        ProviderError::Translation(
-                            "Gemini requires inline base64 image data; remote image URLs are not supported"
-                                .to_owned(),
-                        )
-                    })?;
+                    let data =
+                        img.as_data_uri()
+                            .ok_or_else(|| ProviderError::ImageUrlNotSupported {
+                                provider: provider_name.to_owned(),
+                            })?;
                     out.push(GeminiPart::image(data.media_type, data.base64_data));
                 } else if p.kind == "text" {
                     if let Some(t) = &p.text {
@@ -614,7 +621,7 @@ impl ChatProvider for GoogleProvider {
             "{}/v1beta/models/{}:generateContent",
             self.base_url, req.model
         );
-        let body = translate_request(&req)?;
+        let body = translate_request(&req, &self.provider_name)?;
         let headers = [("x-goog-api-key", self.api_key.as_deref().unwrap_or(""))];
 
         let bytes = post_json_with_headers(
@@ -674,7 +681,7 @@ impl GoogleProvider {
             "{}/v1beta/models/{}:streamGenerateContent?alt=sse",
             self.base_url, req.model
         );
-        let body = translate_request(&req)?;
+        let body = translate_request(&req, &self.provider_name)?;
         let headers = [("x-goog-api-key", self.api_key.as_deref().unwrap_or(""))];
 
         let bytes = open_stream_with_headers(
@@ -723,12 +730,15 @@ mod tests {
 
     #[test]
     fn request_maps_roles_and_hoists_system() {
-        let out = translate_request(&request(vec![
-            msg("system", "be brief"),
-            msg("user", "hi"),
-            msg("assistant", "hello"),
-            msg("user", "more"),
-        ]))
+        let out = translate_request(
+            &request(vec![
+                msg("system", "be brief"),
+                msg("user", "hi"),
+                msg("assistant", "hello"),
+                msg("user", "more"),
+            ]),
+            "google",
+        )
         .unwrap();
         assert_eq!(
             out.system_instruction.as_ref().unwrap().parts[0]
@@ -829,7 +839,7 @@ mod tests {
             stream: false,
             extra: serde_json::Map::new(),
         };
-        let body = serde_json::to_value(translate_request(&req).unwrap()).unwrap();
+        let body = serde_json::to_value(translate_request(&req, "google").unwrap()).unwrap();
         let parts = &body["contents"][0]["parts"];
         assert_eq!(parts[0]["text"], "what?");
         assert_eq!(parts[1]["inline_data"]["mime_type"], "image/jpeg");
@@ -898,7 +908,7 @@ mod tests {
             extra,
         };
 
-        let out = serde_json::to_value(translate_request(&req).unwrap()).unwrap();
+        let out = serde_json::to_value(translate_request(&req, "google").unwrap()).unwrap();
         assert_eq!(
             out,
             json!({
@@ -995,7 +1005,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_url_image_is_a_translation_error() {
+    fn remote_url_image_is_image_url_not_supported_naming_the_attempted_link() {
         use lumen_core::{ChatMessage, ChatRequest, ContentPart, ImageUrl, MessageContent};
         let req = ChatRequest {
             model: "gemini".to_owned(),
@@ -1021,9 +1031,15 @@ mod tests {
             stream: false,
             extra: serde_json::Map::new(),
         };
-        assert!(matches!(
-            translate_request(&req),
-            Err(lumen_core::ProviderError::Translation(_))
-        ));
+        // The provider name passed in is the link actually attempted (which
+        // may be a fallback, not the route the LM-2004 pre-flight checked -
+        // GH #13), so it must come through in the error unchanged.
+        match translate_request(&req, "gemini-fallback") {
+            Ok(_) => panic!("expected the remote URL to be rejected"),
+            Err(lumen_core::ProviderError::ImageUrlNotSupported { provider }) => {
+                assert_eq!(provider, "gemini-fallback");
+            }
+            Err(other) => panic!("expected ImageUrlNotSupported, got {other:?}"),
+        }
     }
 }
