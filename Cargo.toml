@@ -78,6 +78,7 @@ zeroize = "1"
 wiremock = "0.6"
 criterion = { version = "0.5", features = ["async_tokio"] }
 tempfile = "3"
+libc = "0.2"
 
 [workspace.lints.clippy]
 # Pedantic is on across the workspace (CLAUDE.md rule 6).

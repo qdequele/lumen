@@ -59,6 +59,9 @@ criterion = { workspace = true }
 async-trait = { workspace = true }
 tempfile = { workspace = true }
 
+[target.'cfg(unix)'.dev-dependencies]
+libc = { workspace = true }
+
 [[bench]]
 name = "gateway_overhead"
 harness = false

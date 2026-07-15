@@ -6,6 +6,22 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed - Deterministic 429-storm resilience test
+
+- `health_stays_fast_under_upstream_429_storm` no longer flakes on macOS. The
+  kernel clamps every listen backlog to `kern.ipc.somaxconn` (128 by default)
+  and answers accept-queue overflow with RST, so the test's 500 simultaneous
+  loopback connects were reset by the OS before the gateway ever saw them
+  (surfacing as connect `ECONNRESET` or first-write `EPIPE` panics). The storm
+  now retries kernel-level connection failures with a bounded budget (matching
+  Linux SYN-retransmit semantics), shares one pooled client with a timeout so a
+  wedged gateway fails loudly instead of hanging, pre-warms the health probe's
+  keep-alive connection so the latency bound measures the handler path rather
+  than the kernel's accept queue, and raises the process soft fd limit (the
+  storm holds ~2000 sockets across four hops in one process, above launchd's
+  256 default). What the test asserts is unchanged: /health stays under the
+  same bound during the storm and all 500 requests complete with 429/503.
+
 ### Added - Google Vertex AI provider
 
 - New provider `kind = "vertex_ai"`: Gemini models on Google Cloud Vertex AI

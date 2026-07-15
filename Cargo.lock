@@ -2339,6 +2339,7 @@ dependencies = [
  "figment",
  "futures",
  "hyper",
+ "libc",
  "notify",
  "providers",
  "reqwest",
