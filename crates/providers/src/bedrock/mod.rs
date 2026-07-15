@@ -19,9 +19,22 @@
 //! * streaming is AWS event-stream binary framing (see [`eventstream`]),
 //!   translated frame by frame in [`stream`] (bounded state).
 //!
-//! Region drives the endpoint host `bedrock-runtime.{region}.amazonaws.com`;
-//! credentials (access key id + secret, plus an optional session token) are
-//! held in a [`Credentials`] value whose `Debug` never reveals the secrets.
+//! Region drives the endpoint host `bedrock-runtime.{region}.amazonaws.com`
+//! and the SigV4 signing scope. It is resolved from the configured `base_url`
+//! host (standard and VPC-endpoint shapes), else from `AWS_REGION` /
+//! `AWS_DEFAULT_REGION`; when neither yields a region the registry fails the
+//! build with a clear error instead of silently signing for a wrong region.
+//!
+//! Credentials (access key id + secret, plus an optional session token) live in
+//! a [`Credentials`] value whose `Debug` never reveals the secrets. When built
+//! from the registry the provider re-reads the standard AWS environment
+//! variables on EVERY request-signing call (cheap: three env lookups), so
+//! credentials updated in the process environment - or a config hot reload
+//! rebuilding the provider - take effect without a restart. A full AWS
+//! credential-provider chain (IMDS, SSO, profiles, `credential_process`) is
+//! intentionally out of scope for v1: only static keys and pre-issued STS
+//! session tokens are supported, and an expired session token keeps failing
+//! (403) until the environment provides a fresh one.
 
 mod eventstream;
 mod sigv4;
@@ -47,8 +60,38 @@ use crate::chat::{items_to_chunks, items_to_sse_bytes};
 use crate::http::{map_transport, with_cancel};
 use crate::mapping::{classify_status, parse_retry_after};
 
-/// Default AWS region when none can be derived from the configured endpoint.
-pub const DEFAULT_REGION: &str = "us-east-1";
+/// Where a provider's signing credentials come from. Kept private: the public
+/// constructors ([`BedrockProvider::new`] and
+/// [`BedrockProvider::new_with_env_credentials`]) select the variant.
+enum CredentialSource {
+    /// Fixed credentials captured at construction (tests, embedders). Never
+    /// refreshed.
+    Static(Credentials),
+    /// Re-read the standard AWS environment variables on every signing call,
+    /// with an optional secret-access-key override from `api_key_env`.
+    Env { secret_override: Option<String> },
+    /// No credentials were provided; every request fails with a clear error.
+    Missing,
+}
+
+// Manual Debug: `Env.secret_override` is a secret and must never leak through
+// a stray `{:?}` (CLAUDE.md rule 5). `Static` defers to `Credentials`' own
+// redacting Debug.
+impl fmt::Debug for CredentialSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CredentialSource::Static(creds) => f.debug_tuple("Static").field(creds).finish(),
+            CredentialSource::Env { secret_override } => f
+                .debug_struct("Env")
+                .field(
+                    "secret_override",
+                    &secret_override.as_ref().map(|_| "<redacted>"),
+                )
+                .finish(),
+            CredentialSource::Missing => write!(f, "Missing"),
+        }
+    }
+}
 
 /// Resolved AWS credentials. The secret access key and session token are
 /// secrets: this type's `Debug` reveals only the (public) access key id, so a
@@ -107,10 +150,13 @@ impl fmt::Debug for Credentials {
     }
 }
 
-/// Derive the AWS region from a configured `base_url`, if it is a standard
-/// `bedrock-runtime.{region}.amazonaws.com` host. Returns `None` for a custom
-/// endpoint (e.g. a VPC endpoint or a test mock), where the caller must supply
-/// the region another way (defaulting to [`DEFAULT_REGION`]).
+/// Derive the AWS region from a configured `base_url` host. Handles the
+/// standard runtime endpoint (`bedrock-runtime.{region}.amazonaws.com`) and
+/// VPC/PrivateLink endpoint shapes (`bedrock-runtime.{region}.vpce.amazonaws.com`,
+/// `vpce-xxx.bedrock-runtime.{region}.vpce.amazonaws.com`): the label following a
+/// `bedrock-runtime` label is taken when it looks like a region. Returns `None`
+/// for any other host (e.g. a test mock), where the region must come from the
+/// environment instead - see [`resolve_region`].
 #[must_use]
 pub fn region_from_base_url(base_url: Option<&str>) -> Option<String> {
     let url = base_url?;
@@ -119,12 +165,44 @@ pub fn region_from_base_url(base_url: Option<&str>) -> Option<String> {
         .map_or(url, |(_, rest)| rest)
         .split('/')
         .next()?;
-    let rest = host.strip_prefix("bedrock-runtime.")?;
-    let region = rest.strip_suffix(".amazonaws.com")?;
-    if region.is_empty() || region.contains('.') {
-        return None;
+    let labels: Vec<&str> = host.split('.').collect();
+    let runtime_index = labels.iter().position(|l| *l == "bedrock-runtime")?;
+    let candidate = labels.get(runtime_index + 1)?;
+    if looks_like_region(candidate) {
+        Some((*candidate).to_owned())
+    } else {
+        None
     }
-    Some(region.to_owned())
+}
+
+/// Whether a host label plausibly names an AWS region (`us-east-1`,
+/// `ap-southeast-2`, `us-gov-west-1`, ...): lowercase alphanumerics and
+/// hyphens, at least one hyphen, starting with a letter and ending with a
+/// digit. Deliberately shape-based, not a hard-coded region list.
+fn looks_like_region(label: &str) -> bool {
+    label.contains('-')
+        && label.starts_with(|c: char| c.is_ascii_lowercase())
+        && label.ends_with(|c: char| c.is_ascii_digit())
+        && label
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+/// Resolve the signing region: from the `base_url` host if it carries one
+/// (standard or VPC endpoint shapes), else from the `AWS_REGION` /
+/// `AWS_DEFAULT_REGION` environment variables. `None` means the region cannot
+/// be determined; the registry turns that into a build error rather than
+/// silently signing with a default region (which would 403 against any other
+/// region's endpoint).
+#[must_use]
+pub fn resolve_region(base_url: Option<&str>) -> Option<String> {
+    region_from_base_url(base_url)
+        .or_else(|| std::env::var("AWS_REGION").ok().filter(|r| !r.is_empty()))
+        .or_else(|| {
+            std::env::var("AWS_DEFAULT_REGION")
+                .ok()
+                .filter(|r| !r.is_empty())
+        })
 }
 
 /// An AWS Bedrock chat provider (Converse API).
@@ -136,15 +214,18 @@ pub struct BedrockProvider {
     /// Endpoint base URL (no trailing slash), e.g.
     /// `https://bedrock-runtime.us-east-1.amazonaws.com`.
     endpoint: String,
-    /// Signing credentials. `None` when none could be resolved: every request
-    /// then fails with a clear error rather than sending unsigned.
-    credentials: Option<Credentials>,
+    /// Where signing credentials come from (static, env-per-request, or
+    /// missing - the latter fails every request with a clear error).
+    credentials: CredentialSource,
 }
 
 impl BedrockProvider {
-    /// Construct a provider. `region` names the signing region; `base_url`
-    /// overrides the endpoint (else the region's public runtime host is used);
-    /// `credentials` are the SigV4 signing credentials (`None` fails requests).
+    /// Construct a provider with FIXED credentials. `region` names the signing
+    /// region; `base_url` overrides the endpoint (else the region's public
+    /// runtime host is used); `credentials` are the SigV4 signing credentials
+    /// (`None` fails every request cleanly). Static credentials are never
+    /// refreshed - the registry path uses
+    /// [`new_with_env_credentials`](Self::new_with_env_credentials) instead.
     #[must_use]
     pub fn new(
         client: reqwest::Client,
@@ -152,6 +233,38 @@ impl BedrockProvider {
         region: impl Into<String>,
         base_url: Option<String>,
         credentials: Option<Credentials>,
+    ) -> Self {
+        let source = credentials.map_or(CredentialSource::Missing, CredentialSource::Static);
+        Self::build(client, provider_name, region, base_url, source)
+    }
+
+    /// Construct a provider whose credentials are re-read from the standard AWS
+    /// environment variables on every request-signing call, so rotated values
+    /// take effect without a restart. `secret_override` (from `api_key_env`)
+    /// replaces only the secret access key when set.
+    #[must_use]
+    pub fn new_with_env_credentials(
+        client: reqwest::Client,
+        provider_name: impl Into<String>,
+        region: impl Into<String>,
+        base_url: Option<String>,
+        secret_override: Option<String>,
+    ) -> Self {
+        Self::build(
+            client,
+            provider_name,
+            region,
+            base_url,
+            CredentialSource::Env { secret_override },
+        )
+    }
+
+    fn build(
+        client: reqwest::Client,
+        provider_name: impl Into<String>,
+        region: impl Into<String>,
+        base_url: Option<String>,
+        credentials: CredentialSource,
     ) -> Self {
         let region = region.into();
         let endpoint = base_url
@@ -167,6 +280,27 @@ impl BedrockProvider {
         }
     }
 
+    /// Resolve the credentials to sign THIS request with. The env source
+    /// re-reads the environment on every call (three cheap lookups) so updated
+    /// values are picked up per request.
+    fn request_credentials(&self) -> Result<Credentials, ProviderError> {
+        let missing = || {
+            // No secret leaks: this only reports that config is incomplete.
+            ProviderError::Translation(format!(
+                "bedrock provider '{}' has no AWS credentials configured \
+                 (set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY)",
+                self.provider_name
+            ))
+        };
+        match &self.credentials {
+            CredentialSource::Static(creds) => Ok(creds.clone()),
+            CredentialSource::Env { secret_override } => {
+                Credentials::from_env(secret_override.clone()).ok_or_else(missing)
+            }
+            CredentialSource::Missing => Err(missing()),
+        }
+    }
+
     /// The bare `Host` header value (endpoint with the scheme stripped).
     fn host(&self) -> &str {
         self.endpoint
@@ -174,26 +308,22 @@ impl BedrockProvider {
             .map_or(self.endpoint.as_str(), |(_, rest)| rest)
     }
 
-    /// The request path for a Converse action, with the model id percent-encoded
-    /// so the signed canonical path matches the URL on the wire.
+    /// The wire request path for a Converse action, with the model id
+    /// percent-encoded ONCE (the signer double-encodes it again for the
+    /// canonical request, per the non-S3 SigV4 rule - see [`sigv4`]).
     fn path(model: &str, action: &str) -> String {
         format!("/model/{}/{action}", uri_encode_segment(model))
     }
 
-    /// Build a signed request builder for `path` carrying `body_bytes`. The
-    /// signature covers exactly `body_bytes`, which are also what gets sent.
+    /// Build a signed request builder for the wire `path` carrying
+    /// `body_bytes`. The signature covers exactly `body_bytes`, which are also
+    /// what gets sent.
     fn signed_request(
         &self,
         path: &str,
         body_bytes: Vec<u8>,
     ) -> Result<reqwest::RequestBuilder, ProviderError> {
-        let creds = self.credentials.as_ref().ok_or_else(|| {
-            // No secret leaks: this only reports that config is incomplete.
-            ProviderError::Translation(format!(
-                "bedrock provider '{}' has no AWS credentials configured",
-                self.provider_name
-            ))
-        })?;
+        let creds = self.request_credentials()?;
 
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -807,6 +937,40 @@ mod tests {
     }
 
     #[test]
+    fn region_parsed_from_vpc_endpoint_shapes() {
+        // Plain VPC endpoint host.
+        assert_eq!(
+            region_from_base_url(Some(
+                "https://bedrock-runtime.us-gov-west-1.vpce.amazonaws.com"
+            )),
+            Some("us-gov-west-1".to_owned())
+        );
+        // PrivateLink DNS with a vpce-id prefix label.
+        assert_eq!(
+            region_from_base_url(Some(
+                "https://vpce-0abc123-xyz.bedrock-runtime.ap-southeast-2.vpce.amazonaws.com"
+            )),
+            Some("ap-southeast-2".to_owned())
+        );
+        // A label after bedrock-runtime that is not region-shaped is rejected.
+        assert_eq!(
+            region_from_base_url(Some("https://bedrock-runtime.internal.example.com")),
+            None
+        );
+    }
+
+    #[test]
+    fn region_shape_check_accepts_regions_and_rejects_noise() {
+        assert!(looks_like_region("us-east-1"));
+        assert!(looks_like_region("ap-southeast-2"));
+        assert!(looks_like_region("us-gov-west-1"));
+        assert!(!looks_like_region("amazonaws")); // no hyphen
+        assert!(!looks_like_region("vpce-0abc")); // does not end with a digit
+        assert!(!looks_like_region("Us-East-1")); // uppercase
+        assert!(!looks_like_region("internal")); // no hyphen, no digit
+    }
+
+    #[test]
     fn default_endpoint_is_derived_from_region() {
         let p = BedrockProvider::new(
             reqwest::Client::new(),
@@ -1083,5 +1247,49 @@ mod tests {
             .await
             .expect_err("no creds should fail before sending");
         assert!(matches!(err, ProviderError::Translation(_)));
+    }
+
+    /// The env credential source must never leak its secret override through
+    /// `Debug` on the provider.
+    #[test]
+    fn env_credential_source_debug_never_reveals_the_override() {
+        let p = BedrockProvider::new_with_env_credentials(
+            reqwest::Client::new(),
+            "bedrock",
+            "us-east-1",
+            None,
+            Some("override-secret-value".to_owned()),
+        );
+        let dbg = format!("{p:?}");
+        assert!(
+            !dbg.contains("override-secret-value"),
+            "leaked override: {dbg}"
+        );
+        assert!(dbg.contains("redacted"), "expected redaction marker: {dbg}");
+    }
+
+    /// Env-sourced credentials are resolved PER REQUEST, so a value written to
+    /// the process environment after construction is picked up (the credential
+    /// staleness mitigation). Uses dedicated env var reads via
+    /// `Credentials::from_env`; only Bedrock code touches these variables.
+    #[test]
+    fn credentials_from_env_reads_vars_and_honours_secret_override() {
+        std::env::set_var("AWS_ACCESS_KEY_ID", "AKIAENVTEST");
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", "env-secret");
+        std::env::remove_var("AWS_SESSION_TOKEN");
+
+        let creds = Credentials::from_env(None).expect("env creds resolve");
+        assert_eq!(creds.access_key_id, "AKIAENVTEST");
+        assert_eq!(creds.secret_access_key, "env-secret");
+        assert!(creds.session_token.is_none());
+
+        // The api_key override replaces only the secret half.
+        let creds = Credentials::from_env(Some("override-secret".to_owned()))
+            .expect("override creds resolve");
+        assert_eq!(creds.access_key_id, "AKIAENVTEST");
+        assert_eq!(creds.secret_access_key, "override-secret");
+
+        std::env::remove_var("AWS_ACCESS_KEY_ID");
+        std::env::remove_var("AWS_SECRET_ACCESS_KEY");
     }
 }

@@ -8,6 +8,14 @@
 //!
 //! Reference: <https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_sigv4-create-signed-request.html>
 //!
+//! Canonical-path encoding: for every service EXCEPT S3, SigV4 requires each
+//! path segment of the canonical request to be URI-encoded TWICE. The wire URL
+//! carries the single-encoded path (`...v2%3A0`); the canonical request signs
+//! the double-encoded form (`...v2%253A0`), because AWS re-encodes the received
+//! wire path once more before recomputing the signature. Signing the
+//! single-encoded path yields `403 SignatureDoesNotMatch` for any model id
+//! containing a reserved character (every versioned id with a `:`).
+//!
 //! Secrets (the secret access key, the session token) are never logged and
 //! never placed in any error; only the derived, opaque `Authorization` value is
 //! returned to the caller.
@@ -58,8 +66,10 @@ pub(super) struct SignedHeaders {
 ///
 /// * `host` is the bare `Host` header value (no scheme), e.g.
 ///   `bedrock-runtime.us-east-1.amazonaws.com`.
-/// * `canonical_path` is the already-percent-encoded request path (the caller
-///   encodes the model id, so the signed path matches the bytes on the wire).
+/// * `wire_path` is the request path exactly as sent on the wire, with each
+///   segment percent-encoded ONCE (the caller encodes the model id). The
+///   canonical request internally signs the DOUBLE-encoded form of this path,
+///   per the non-S3 SigV4 rule (see the module docs).
 /// * `body` is the exact request body that will be sent.
 /// * `timestamp` is the request instant as Unix seconds (injected so the signer
 ///   is deterministic and unit-testable against AWS's published vectors).
@@ -69,7 +79,7 @@ pub(super) struct SignedHeaders {
 pub(super) fn sign_request(
     params: &SigningParams<'_>,
     host: &str,
-    canonical_path: &str,
+    wire_path: &str,
     body: &[u8],
     timestamp: u64,
 ) -> SignedHeaders {
@@ -90,39 +100,22 @@ pub(super) fn sign_request(
     }
     headers.sort_by(|a, b| a.0.cmp(b.0));
 
-    let canonical_headers = headers.iter().fold(String::new(), |mut acc, header| {
-        acc.push_str(header.0);
-        acc.push(':');
-        acc.push_str(header.1.trim());
-        acc.push('\n');
-        acc
-    });
-    let signed_headers: String = headers
-        .iter()
-        .map(|(name, _)| *name)
-        .collect::<Vec<_>>()
-        .join(";");
+    // The canonical request signs the DOUBLE-encoded path (non-S3 SigV4 rule);
+    // the wire URL keeps the single-encoded form.
+    let canonical_path = canonical_uri(wire_path);
+    let (canonical, signed_headers) =
+        canonical_request("POST", &canonical_path, "", &headers, &content_sha256);
 
-    // 1. Canonical request. Empty canonical query string (no params).
-    let canonical_request = format!(
-        "POST\n{canonical_path}\n\n{canonical_headers}\n{signed_headers}\n{content_sha256}"
-    );
-
-    // 2. String to sign.
     let scope = format!("{date_stamp}/{}/{SERVICE}/aws4_request", params.region);
-    let hashed_canonical = hex::encode(Sha256::digest(canonical_request.as_bytes()));
-    let string_to_sign = format!("{ALGORITHM}\n{amz_date}\n{scope}\n{hashed_canonical}");
-
-    // 3. Signing key and signature.
-    let signing_key = derive_signing_key(
+    let sts = string_to_sign(&amz_date, &scope, &canonical);
+    let signature = compute_signature(
         params.secret_access_key,
         &date_stamp,
         params.region,
         SERVICE,
+        &sts,
     );
-    let signature = hex::encode(hmac(&signing_key, string_to_sign.as_bytes()));
 
-    // 4. Authorization header.
     let authorization = format!(
         "{ALGORITHM} Credential={}/{scope}, SignedHeaders={signed_headers}, Signature={signature}",
         params.access_key_id
@@ -136,10 +129,70 @@ pub(super) fn sign_request(
     }
 }
 
+/// Build the canonical request and the `SignedHeaders` list from its parts.
+/// `headers` must already be sorted by lowercase name. Generic over method /
+/// path / query so the known-answer tests can drive it with the AWS
+/// `aws-sig-v4-test-suite` inputs verbatim.
+fn canonical_request(
+    method: &str,
+    canonical_path: &str,
+    canonical_query: &str,
+    headers: &[(&str, String)],
+    payload_hash: &str,
+) -> (String, String) {
+    let canonical_headers = headers.iter().fold(String::new(), |mut acc, header| {
+        acc.push_str(header.0);
+        acc.push(':');
+        acc.push_str(header.1.trim());
+        acc.push('\n');
+        acc
+    });
+    let signed_headers: String = headers
+        .iter()
+        .map(|(name, _)| *name)
+        .collect::<Vec<_>>()
+        .join(";");
+    let canonical = format!(
+        "{method}\n{canonical_path}\n{canonical_query}\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
+    );
+    (canonical, signed_headers)
+}
+
+/// Build the SigV4 string-to-sign from the timestamp, credential scope and the
+/// canonical request.
+fn string_to_sign(amz_date: &str, scope: &str, canonical_request: &str) -> String {
+    let hashed = hex::encode(Sha256::digest(canonical_request.as_bytes()));
+    format!("{ALGORITHM}\n{amz_date}\n{scope}\n{hashed}")
+}
+
+/// Derive the signing key and produce the final lowercase-hex signature.
+fn compute_signature(
+    secret_access_key: &str,
+    date_stamp: &str,
+    region: &str,
+    service: &str,
+    string_to_sign: &str,
+) -> String {
+    let key = derive_signing_key(secret_access_key, date_stamp, region, service);
+    hex::encode(hmac(&key, string_to_sign.as_bytes()))
+}
+
+/// Double-encode a single-encoded wire path for the canonical request (the
+/// non-S3 SigV4 rule): every segment is percent-encoded once more, so `%3A`
+/// becomes `%253A` while slashes and unreserved characters are untouched.
+fn canonical_uri(wire_path: &str) -> String {
+    wire_path
+        .split('/')
+        .map(uri_encode_segment)
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 /// Percent-encode one path segment per RFC 3986: every byte except the
-/// unreserved set (`A-Z a-z 0-9 - _ . ~`) becomes `%XX`. Used to encode the
-/// Bedrock model id (which contains `:` in versioned ids like
-/// `...-v2:0`) so the signed canonical path matches the URL sent on the wire.
+/// unreserved set (`A-Z a-z 0-9 - _ . ~`) becomes `%XX`. Applied once by the
+/// caller to build the wire path (the model id contains `:` in versioned ids
+/// like `...-v2:0`), and once more by [`canonical_uri`] for the canonical
+/// request.
 pub(super) fn uri_encode_segment(segment: &str) -> String {
     let mut out = String::with_capacity(segment.len());
     for &byte in segment.as_bytes() {
@@ -232,6 +285,9 @@ fn civil_from_days(days_since_epoch: u64) -> (i64, u32, u32) {
 mod tests {
     use super::*;
 
+    /// AWS's public example credentials from the SigV4 test suite (not real).
+    const TEST_SECRET: &str = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY";
+
     #[test]
     fn amz_time_matches_known_instant() {
         // 2015-08-30T12:36:00Z = 1440938160 (AWS SigV4 documentation vector).
@@ -263,23 +319,113 @@ mod tests {
         assert_eq!(uri_encode_segment("a b/c"), "a%20b%2Fc");
     }
 
-    /// Known-answer test against the AWS SigV4 test suite's canonical example
-    /// (`get-vanilla` adapted): verifies the derived signing key and the final
-    /// signature are stable for a fixed input. Uses AWS's documented example
-    /// credentials, which are public and not real.
+    /// The canonical path is the wire path encoded ONCE MORE (non-S3 rule):
+    /// `%3A` (wire) must become `%253A` (canonical), slashes untouched.
+    #[test]
+    fn canonical_uri_double_encodes_the_wire_path() {
+        assert_eq!(
+            canonical_uri("/model/anthropic.claude-3-5-sonnet-20241022-v2%3A0/converse"),
+            "/model/anthropic.claude-3-5-sonnet-20241022-v2%253A0/converse"
+        );
+        // A colon-free path is unchanged by the second pass.
+        assert_eq!(
+            canonical_uri("/model/test/converse"),
+            "/model/test/converse"
+        );
+    }
+
     #[test]
     fn signing_key_derivation_matches_aws_published_vector() {
         // AWS's documented worked example ("Deriving the signing key",
         // service = iam). The credentials are AWS's public example, not real.
-        let key = derive_signing_key(
-            "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
-            "20150830",
-            "us-east-1",
-            "iam",
-        );
+        let key = derive_signing_key(TEST_SECRET, "20150830", "us-east-1", "iam");
         assert_eq!(
             hex::encode(&key),
             "c4afb1cc5771d871763a393e44b703571b55cc28424d1a5e86da6ed3c154a4b9"
+        );
+    }
+
+    /// Known-answer test: the `get-vanilla` case of AWS's published
+    /// `aws-sig-v4-test-suite`, asserting the EXACT final signature.
+    ///
+    /// Inputs (from the suite): `GET /` against `example.amazonaws.com` at
+    /// `20150830T123600Z`, service `service`, region `us-east-1`, empty body,
+    /// only `host` and `x-amz-date` signed. Published signature:
+    /// `5fa00fa31553b73ebf1942676e86291e8372ff2a2260956d9b8aae1d763fbf31`.
+    #[test]
+    fn get_vanilla_matches_aws_test_suite_signature() {
+        let empty_hash = hex::encode(Sha256::digest(b""));
+        let headers: Vec<(&str, String)> = vec![
+            ("host", "example.amazonaws.com".to_owned()),
+            ("x-amz-date", "20150830T123600Z".to_owned()),
+        ];
+        let (canonical, signed_headers) = canonical_request("GET", "/", "", &headers, &empty_hash);
+        assert_eq!(signed_headers, "host;x-amz-date");
+        let sts = string_to_sign(
+            "20150830T123600Z",
+            "20150830/us-east-1/service/aws4_request",
+            &canonical,
+        );
+        let signature = compute_signature(TEST_SECRET, "20150830", "us-east-1", "service", &sts);
+        assert_eq!(
+            signature,
+            "5fa00fa31553b73ebf1942676e86291e8372ff2a2260956d9b8aae1d763fbf31"
+        );
+    }
+
+    /// Known-answer test: the `post-vanilla` case of the same suite. Published
+    /// signature: `5da7c1a2acd57cee7505fc6676e4e544621c30862966e37dddb68e92efbe5d6b`.
+    #[test]
+    fn post_vanilla_matches_aws_test_suite_signature() {
+        let empty_hash = hex::encode(Sha256::digest(b""));
+        let headers: Vec<(&str, String)> = vec![
+            ("host", "example.amazonaws.com".to_owned()),
+            ("x-amz-date", "20150830T123600Z".to_owned()),
+        ];
+        let (canonical, _) = canonical_request("POST", "/", "", &headers, &empty_hash);
+        let sts = string_to_sign(
+            "20150830T123600Z",
+            "20150830/us-east-1/service/aws4_request",
+            &canonical,
+        );
+        let signature = compute_signature(TEST_SECRET, "20150830", "us-east-1", "service", &sts);
+        assert_eq!(
+            signature,
+            "5da7c1a2acd57cee7505fc6676e4e544621c30862966e37dddb68e92efbe5d6b"
+        );
+    }
+
+    /// Known-answer test for the DOUBLE-encoded canonical path: signing a wire
+    /// path containing `%3A` must produce the signature computed over the
+    /// `%253A` canonical form. Expected value computed independently (Python
+    /// hashlib/hmac following the documented SigV4 steps) over the canonical
+    /// request with path `/model/anthropic.claude-3-5-sonnet-20241022-v2%253A0/converse`.
+    /// Signing the single-encoded path instead yields
+    /// `a0cf8808e8d8092566bf4a44fd054a5f90fc49525072e5eddd3f76be3ab22db4`
+    /// (the SignatureDoesNotMatch bug this test guards against).
+    #[test]
+    fn sign_request_signs_the_double_encoded_canonical_path() {
+        let params = SigningParams {
+            access_key_id: "AKIDEXAMPLE",
+            secret_access_key: TEST_SECRET,
+            session_token: None,
+            region: "us-east-1",
+        };
+        let signed = sign_request(
+            &params,
+            "bedrock-runtime.us-east-1.amazonaws.com",
+            "/model/anthropic.claude-3-5-sonnet-20241022-v2%3A0/converse",
+            b"{}",
+            1_440_938_160,
+        );
+        let signature = signed
+            .authorization
+            .rsplit("Signature=")
+            .next()
+            .expect("signature present");
+        assert_eq!(
+            signature, "f90d1ffff57230eb5fe7b2cda7a813d66a075984a0a6a666ce8e5d6031e53b54",
+            "canonical path must be double-encoded (%253A), not single-encoded (%3A)"
         );
     }
 
@@ -287,7 +433,7 @@ mod tests {
     fn sign_request_produces_well_formed_authorization() {
         let params = SigningParams {
             access_key_id: "AKIDEXAMPLE",
-            secret_access_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+            secret_access_key: TEST_SECRET,
             session_token: None,
             region: "us-east-1",
         };
@@ -344,10 +490,9 @@ mod tests {
     /// The secret access key must never appear in any signer output.
     #[test]
     fn signer_output_never_contains_the_secret() {
-        let secret = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY";
         let params = SigningParams {
             access_key_id: "AKIDEXAMPLE",
-            secret_access_key: secret,
+            secret_access_key: TEST_SECRET,
             session_token: Some("SECRET-SESSION-TOKEN"),
             region: "us-east-1",
         };
@@ -358,8 +503,8 @@ mod tests {
             b"payload",
             1_440_938_160,
         );
-        assert!(!signed.authorization.contains(secret));
-        assert!(!signed.content_sha256.contains(secret));
+        assert!(!signed.authorization.contains(TEST_SECRET));
+        assert!(!signed.content_sha256.contains(TEST_SECRET));
         // The session token IS the security-token header value by definition,
         // but must not leak into the Authorization line beyond its header name.
         assert!(!signed.authorization.contains("SECRET-SESSION-TOKEN"));

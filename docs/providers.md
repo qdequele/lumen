@@ -225,8 +225,14 @@ capabilities = ["chat"]
 - **Auth**: AWS Signature Version 4 (SigV4), not a bearer key. Credentials are
   read from the standard AWS environment variables (`AWS_ACCESS_KEY_ID`,
   `AWS_SECRET_ACCESS_KEY`, and optionally `AWS_SESSION_TOKEN` for temporary
-  credentials). `api_key_env` is optional and, if set, overrides only the secret
-  access key. The secret and session token are never logged or shown in `Debug`.
+  credentials) **on every request**, so values updated in the process
+  environment (or a config hot reload) take effect without a restart.
+  `api_key_env` is optional and, if set, overrides only the secret access key.
+  The secret and session token are never logged or shown in `Debug`.
+- **Credential scope (v1)**: only static keys and pre-issued STS session tokens.
+  There is no AWS credential-provider chain (no IMDS/instance roles, SSO,
+  profiles or `credential_process`); an expired session token keeps failing
+  with 403 until the environment supplies a fresh one.
 - **API**: the Bedrock **Converse** API (`POST /model/{modelId}/converse` and
   `/converse-stream`), which gives one uniform schema across the Anthropic,
   Meta Llama, Amazon Titan/Nova, Mistral and Cohere model families. The legacy
@@ -234,8 +240,11 @@ capabilities = ["chat"]
   covers the same models).
 - **Region / base_url**: set `base_url` to the runtime endpoint for your region,
   `https://bedrock-runtime.{region}.amazonaws.com`; the region is parsed back out
-  of it for the SigV4 signing scope (defaulting to `us-east-1` for a custom
-  endpoint). Any custom or VPC endpoint is accepted.
+  of it for the SigV4 signing scope. VPC/PrivateLink endpoint hosts
+  (`bedrock-runtime.{region}.vpce.amazonaws.com`, including a `vpce-…`-prefixed
+  DNS name) are recognised too. For any other custom endpoint the region comes
+  from `AWS_REGION` / `AWS_DEFAULT_REGION`; if no source yields a region, startup
+  fails with a clear error rather than silently signing for a wrong region.
 - **Translation**: OpenAI ⇄ Converse is bidirectional, including system prompts,
   `inferenceConfig` (max tokens, temperature, top-p, stop sequences), tools, and
   streaming. Streaming arrives as AWS event-stream binary frames, decoded and

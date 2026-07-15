@@ -34,6 +34,9 @@ const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 /// total_len(4) + headers_len(4) + prelude_crc(4) + message_crc(4).
 const OVERHEAD_BYTES: usize = 16;
 
+/// The event-stream byte-array header value type (length-prefixed, skipped).
+const HEADER_TYPE_BYTES: u8 = 6;
+
 /// The event-stream string header value type.
 const HEADER_TYPE_STRING: u8 = 7;
 
@@ -166,8 +169,10 @@ fn parse_headers(mut bytes: &[u8]) -> Result<Vec<(String, String)>, ProviderErro
         let value_type = bytes[0];
         bytes = &bytes[1..];
 
-        if value_type == HEADER_TYPE_STRING || value_type == 6 {
-            // string / byte-array: value_len(2) | value
+        if value_type == HEADER_TYPE_STRING || value_type == HEADER_TYPE_BYTES {
+            // string / byte-array: value_len(2) | value. Only STRING values are
+            // collected (the `:event-type` family); a byte-array value is
+            // binary, not text, so it is skipped rather than lossily decoded.
             if bytes.len() < 2 {
                 return Err(truncated());
             }
@@ -176,9 +181,19 @@ fn parse_headers(mut bytes: &[u8]) -> Result<Vec<(String, String)>, ProviderErro
             if bytes.len() < value_len {
                 return Err(truncated());
             }
-            let value = String::from_utf8_lossy(&bytes[..value_len]).into_owned();
+            if value_type == HEADER_TYPE_STRING {
+                // The spec requires string header values to be valid UTF-8;
+                // anything else is a broken frame, not data to repair.
+                let value = std::str::from_utf8(&bytes[..value_len])
+                    .map_err(|_| {
+                        ProviderError::Translation(
+                            "bedrock event-stream string header is not valid UTF-8".to_owned(),
+                        )
+                    })?
+                    .to_owned();
+                headers.push((name, value));
+            }
             bytes = &bytes[value_len..];
-            headers.push((name, value));
         } else {
             // Non-string header: skip by its fixed width. Converse never sends
             // these on the events we translate, but the sizes keep the parser
@@ -310,6 +325,44 @@ mod tests {
         let msgs = decoder.push(&bytes).expect("decodes");
         assert_eq!(msgs[0].message_type(), Some("exception"));
         assert_eq!(msgs[0].exception_type(), Some("throttlingException"));
+    }
+
+    /// A byte-array (type 6) header is binary, not text: it must be skipped
+    /// without desynchronising the parser, and never surfaced as a lossily
+    /// decoded string.
+    #[test]
+    #[allow(clippy::cast_possible_truncation)] // tiny fixture lengths
+    fn byte_array_header_is_skipped_and_string_headers_still_parse() {
+        let mut header_bytes = Vec::new();
+        // `:sig` (type 6, three binary bytes including invalid UTF-8).
+        header_bytes.push(4u8);
+        header_bytes.extend_from_slice(b":sig");
+        header_bytes.push(6u8);
+        header_bytes.extend_from_slice(&3u16.to_be_bytes());
+        header_bytes.extend_from_slice(&[0xff, 0x00, 0xfe]);
+        // `:event-type` (type 7 string) after it must still parse.
+        header_bytes.push(11u8);
+        header_bytes.extend_from_slice(b":event-type");
+        header_bytes.push(7u8);
+        header_bytes.extend_from_slice(&4u16.to_be_bytes());
+        header_bytes.extend_from_slice(b"ping");
+
+        let total = OVERHEAD_BYTES + header_bytes.len();
+        let mut raw = Vec::with_capacity(total);
+        raw.extend_from_slice(&(total as u32).to_be_bytes());
+        raw.extend_from_slice(&(header_bytes.len() as u32).to_be_bytes());
+        raw.extend_from_slice(&0u32.to_be_bytes());
+        raw.extend_from_slice(&header_bytes);
+        raw.extend_from_slice(&0u32.to_be_bytes());
+
+        let mut decoder = EventStreamDecoder::new();
+        let msgs = decoder.push(&raw).expect("decodes");
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].event_type(), Some("ping"));
+        assert!(
+            msgs[0].headers.iter().all(|(name, _)| name != ":sig"),
+            "binary header must not be collected as a string"
+        );
     }
 
     #[test]

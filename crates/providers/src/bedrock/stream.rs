@@ -107,8 +107,10 @@ impl BedrockStreamTranslator {
         }
 
         // Exception frames are surfaced by TYPE only - never the payload body,
-        // which may echo prompt content.
+        // which may echo prompt content. The stream is latched finished so any
+        // trailing frames after the exception are ignored.
         if message.message_type() == Some("exception") {
+            self.finished = true;
             let kind = message.exception_type().unwrap_or("unknown");
             return Err(ProviderError::Translation(format!(
                 "bedrock stream exception: {kind}"
@@ -454,6 +456,29 @@ mod tests {
         let text = err.to_string();
         assert!(text.contains("modelStreamErrorException"));
         assert!(!text.contains("SECRET UPSTREAM DETAIL"));
+    }
+
+    #[test]
+    fn events_after_an_exception_are_ignored() {
+        let mut t = translator();
+        let exception = super::super::eventstream::test_support::frame(
+            &[
+                (":exception-type", "throttlingException"),
+                (":message-type", "exception"),
+            ],
+            br#"{"message":"slow down"}"#,
+        );
+        let _ = t
+            .translate(&decode_one(&exception))
+            .expect_err("exception fails the stream");
+        // The stream is latched: trailing frames produce nothing.
+        let late = t
+            .translate(&decode_one(&event_frame(
+                "contentBlockDelta",
+                r#"{"delta":{"text":"late"},"contentBlockIndex":0}"#,
+            )))
+            .expect("ignored after exception");
+        assert!(late.is_empty());
     }
 
     #[test]
