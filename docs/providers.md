@@ -54,7 +54,7 @@ Rules that apply to every provider:
 | `anthropic` |  ✅  |       |        | required      | optional       | -                 |
 | `google`    |  ✅  |       |        | required      | optional       | -                 |
 | `vertex_ai` |  ✅  |       |        | required (SA JSON) | **required** (GCP region) | - |
-| `cohere`    |      |  ✅   |   ✅   | required      | optional       | 96                |
+| `cohere`    |  ✅  |  ✅   |   ✅   | required      | optional       | 96                |
 | `jina`      |      |  ✅   |   ✅   | required      | optional       | 2048              |
 | `voyage`    |      |  ✅   |   ✅   | required      | optional       | 128               |
 | `tei`       |      |  ✅   |   ✅   | keyless       | **required**   | 32                |
@@ -214,9 +214,18 @@ capabilities = ["chat"]
 
 ## cohere
 
-- **kind**: `cohere` · **capabilities**: embed, rerank. A single model can serve
-  both.
+- **kind**: `cohere` · **capabilities**: chat, embed, rerank. A single model can
+  serve any combination.
 - **Auth**: `api_key_env` (e.g. `COHERE_API_KEY`), bearer token.
+- **Chat**: Command R / R+ via `POST /v2/chat`, including streaming. The wire
+  shape is OpenAI-adjacent (roles live directly in `messages`, no top-level
+  `system` hoist like Anthropic; `tool_calls` are already OpenAI-shaped), so
+  translation is closer to identity than Anthropic's. `tool_choice` collapses
+  to Cohere's `REQUIRED`/`NONE` (forcing one specific named tool has no v2
+  equivalent and falls back to `auto`). Usage prefers `usage.tokens` (actual
+  counts) over `usage.billed_units` (what's charged); a response reporting
+  neither leaves the gateway's local estimator to fill in an honestly-flagged
+  count (ADR 003).
 - **Embed batch limit**: 96.
 - **Cost**: rerank is billed in search units (`cost_per_1k_searches`).
 - **`input_type` override**: Cohere's embed v2 API requires an `input_type`
@@ -236,6 +245,11 @@ capabilities = ["chat"]
 name = "cohere"
 kind = "cohere"
 api_key_env = "COHERE_API_KEY"
+
+[[providers.models]]
+id = "command-r-plus"
+upstream_id = "command-r-plus-08-2024"
+capabilities = ["chat"]
 
 [[providers.models]]
 id = "rerank-english"
