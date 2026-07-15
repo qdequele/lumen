@@ -235,6 +235,18 @@ provider registry is atomically swapped. In-flight requests are unaffected. An
 invalid config is **rejected** - the old config keeps serving and
 `lumen_config_reload_failures_total` increments.
 
+### `--check-config`
+
+`lumen --check-config [--config <PATH>]` validates a config file the same way
+the server does at boot (parsing, semantic validation and provider registry
+construction) and exits: `0` if valid, non-zero otherwise. It binds no
+listener, opens no database, and contacts no provider, so it is safe to run
+in a CI or deploy pipeline ahead of a real boot:
+
+```bash
+lumen --check-config --config config.toml
+```
+
 ### Security headers
 
 Every response carries `X-Content-Type-Options: nosniff`,
