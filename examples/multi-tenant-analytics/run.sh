@@ -15,6 +15,7 @@ echo
 # "key" field (see docs/operations/keys-budgets.md) - extract it without a
 # jq dependency.
 virtual_key=$(printf '%s' "$created" | grep -o '"key":"[^"]*"' | head -1 | cut -d'"' -f4)
+: "${virtual_key:?failed to parse created key from admin response}"
 
 echo "== chat #1 as tenant 'acme', tagged via x-lumen-metadata =="
 curl -sf "$BASE_URL/v1/chat/completions" \

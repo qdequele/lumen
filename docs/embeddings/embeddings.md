@@ -45,7 +45,7 @@ providers with no native `encoding_format`, such as Ollama and TEI.
 | Array of strings | `"input": ["a", "b"]` | A batch, embedded and returned in order. |
 | Pre-tokenized token-id array | `"input": [1, 2, 3]` | One item, counted as one embedding (OpenAI semantics). |
 | Batch of token-id arrays | `"input": [[1, 2], [3, 4]]` | Each inner array is one item. |
-| Content-part array(s) | `"input": [{"type": "text", ...}, ...]` | Multimodal: text and/or image parts. See [Multimodal embeddings](multimodal.md). |
+| Content-part array(s) | `"input": [[{"type": "text", ...}, {"type": "image_url", ...}], "plain text"]` | Multimodal: each item is a string or an array of text/image parts. See [Multimodal embeddings](multimodal.md). |
 
 Pre-tokenized shapes are rejected on providers that cannot consume them (see
 below). Content-part shapes require a model that opts into the `image`

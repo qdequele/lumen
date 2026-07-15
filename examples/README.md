@@ -17,9 +17,6 @@ up).
 - **multi-tenant-analytics**: per-tenant cost attribution, virtual keys
   with a hard budget plus `x-lumen-metadata` turned into Prometheus labels.
 
-More scenarios live alongside these; see each directory's own `README.md`
-for what it adds.
-
 ## Running a scenario
 
 Every scenario follows the same two-terminal recipe:
