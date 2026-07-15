@@ -338,10 +338,94 @@ async fn streaming_failure_after_first_chunk_is_not_retried() {
     assert_eq!(primary.received_requests().await.unwrap().len(), 1);
 }
 
+/// Raise this process's soft fd limit towards its hard limit.
+///
+/// The 429 storm below holds on the order of 2000 sockets at peak, all in this
+/// one test process (storm client + gateway inbound + gateway outbound +
+/// wiremock inbound). macOS's launchd default soft limit is 256, which turns
+/// the storm into EMFILE noise unrelated to what the test asserts.
+#[cfg(unix)]
+fn raise_fd_limit() {
+    // SAFETY: getrlimit/setrlimit only read/write the plain rlimit struct
+    // passed by pointer; no ownership or aliasing concerns.
+    unsafe {
+        let mut lim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut lim) == 0 {
+            let want = lim.rlim_max.min(8192);
+            if lim.rlim_cur < want {
+                lim.rlim_cur = want;
+                // Best effort: if the kernel refuses, the connect retry in the
+                // storm still absorbs transient socket-exhaustion failures.
+                let _ = libc::setrlimit(libc::RLIMIT_NOFILE, &raw const lim);
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn raise_fd_limit() {}
+
+/// True when a request error is the kernel refusing the connection itself:
+/// a connect-phase failure, or a reset/broken-pipe surfaced right after the
+/// handshake. Under listen-queue overflow macOS completes the handshake and
+/// THEN sends RST, so the failure lands either at connect (`ECONNRESET`) or
+/// on the first write (`EPIPE`), depending on timing.
+fn kernel_conn_failure(e: &reqwest::Error) -> bool {
+    if e.is_connect() {
+        return true;
+    }
+    let mut source = std::error::Error::source(e);
+    while let Some(inner) = source {
+        if let Some(io) = inner.downcast_ref::<std::io::Error>() {
+            return matches!(
+                io.kind(),
+                std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::BrokenPipe
+            );
+        }
+        source = inner.source();
+    }
+    false
+}
+
+/// POST one storm request, retrying kernel-level connection failures.
+///
+/// macOS clamps every listen backlog to `kern.ipc.somaxconn` (128 by default)
+/// and answers accept-queue overflow with RST, so a 500-way simultaneous
+/// connect burst on loopback gets some handshakes reset before the gateway
+/// ever sees them (Linux silently drops the SYN and the client's TCP stack
+/// retransmits; this bounded retry gives macOS the same semantics). Only
+/// kernel-level connection failures are retried: an HTTP-level error or a
+/// hang still fails the test, so this cannot mask a wedged gateway - and a
+/// gateway that resets every connection exhausts the bounded budget anyway.
+async fn storm_chat(client: &reqwest::Client, base: &str) -> reqwest::StatusCode {
+    let mut attempts: u32 = 0;
+    loop {
+        let sent = client
+            .post(format!("{base}/v1/chat/completions"))
+            .json(&json!({ "model": "gpt", "messages": [{ "role": "user", "content": "hi" }] }))
+            .send()
+            .await;
+        match sent {
+            Ok(resp) => return resp.status(),
+            Err(e) if kernel_conn_failure(&e) && attempts < 100 => {
+                attempts += 1;
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Err(e) => panic!("storm request failed after {attempts} connect retries: {e:?}"),
+        }
+    }
+}
+
 // Criterion 5: under a storm of upstream 429s, /health stays fast and every
 // request completes (no unbounded queue, no hang).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn health_stays_fast_under_upstream_429_storm() {
+    raise_fd_limit();
     let upstream = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
@@ -368,17 +452,37 @@ async fn health_stays_fast_under_upstream_429_storm() {
     );
     let base = spawn(&config_from(&cfg)).await;
 
-    // Fire 500 concurrent requests.
+    // Establish the health probe's keep-alive connection BEFORE the storm, as
+    // a monitoring agent would. The latency loop below then measures the
+    // gateway's handler path, not the kernel's (somaxconn-clamped) accept
+    // queue that the storm is about to slam.
+    let client = reqwest::Client::new();
+    let warmup = client
+        .get(format!("{base}/health"))
+        .send()
+        .await
+        .expect("health warm-up");
+    assert_eq!(warmup.status(), 200);
+
+    // Fire 500 concurrent requests through one pooled client. A single client
+    // (rather than one per task) lets finished connections be reused by
+    // still-queued requests instead of piling more handshakes onto the
+    // backlog, and the timeout turns a wedged gateway into a loud failure
+    // instead of a hung test.
+    let storm_client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .expect("storm client");
     let mut tasks = Vec::new();
     for _ in 0..500 {
         let base = base.clone();
+        let storm_client = storm_client.clone();
         tasks.push(tokio::spawn(async move {
-            post_chat(&base, "gpt").await.status()
+            storm_chat(&storm_client, &base).await
         }));
     }
 
     // While the storm is in flight, /health must stay snappy.
-    let client = reqwest::Client::new();
     let mut worst = Duration::ZERO;
     for _ in 0..20 {
         let t = Instant::now();
