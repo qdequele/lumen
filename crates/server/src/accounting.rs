@@ -277,8 +277,9 @@ impl Accounting {
 
 /// Streaming accounting: sniffs the forwarded SSE bytes for the final usage
 /// chunk and closes the [`Accounting`] when the stream ends - including on
-/// client disconnect (via `Drop`), where whatever was observed so far is
-/// settled instead of refunding tokens the upstream already produced.
+/// client disconnect (via `Drop`, settled as 499 / client-cancelled), where
+/// whatever was observed so far is settled instead of refunding tokens the
+/// upstream already produced.
 pub struct StreamAccounting {
     accounting: Option<Accounting>,
     sniffer: UsageSniffer,
@@ -301,16 +302,11 @@ impl StreamAccounting {
         self.sniffer.scan(frame);
     }
 
-    /// Close the record with a 200 outcome (clean end or client disconnect -
-    /// the HTTP status the client saw). Idempotent; also runs from `Drop`.
-    pub fn finalize(&mut self) {
-        self.finalize_with_status(200);
-    }
-
     /// Close the record with the terminal outcome of the stream: 200 for a
     /// clean end, the gateway error's status (502/504/…) when the stream was
-    /// cut short by an in-band error frame - so `usage_log.status` reflects
-    /// what actually happened, not the initial response headers.
+    /// cut short by an in-band error frame, 499 when the client disconnected
+    /// mid-stream (via `Drop`) - so `usage_log.status` reflects what actually
+    /// happened, not the initial response headers. Idempotent.
     pub fn finalize_with_status(&mut self, status: u16) {
         let Some(accounting) = self.accounting.take() else {
             return;
@@ -335,8 +331,14 @@ impl StreamAccounting {
 }
 
 impl Drop for StreamAccounting {
+    /// The safety net for streams dropped before their terminal event. Every
+    /// clean end and in-band error settles explicitly first (idempotent), so
+    /// reaching here with an open record means the body was dropped
+    /// mid-stream - a client disconnect (or, rarely, server shutdown).
+    /// Settled as 499 / client-cancelled (issue #11): never a fake 200
+    /// success, never an internal 500.
     fn drop(&mut self) {
-        self.finalize();
+        self.finalize_with_status(GatewayError::ClientCancelled.http_status());
     }
 }
 
@@ -443,6 +445,64 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lumen_telemetry::Metrics;
+
+    /// A minimal open accounting record wired to a fresh registry, so tests
+    /// can observe exactly what closing it records.
+    fn open_accounting(metrics: &Metrics) -> Accounting {
+        let tokens = TokenMetrics::register(metrics, &[]).expect("register token metrics");
+        let latency = LatencyMetrics::register(metrics).expect("register latency metrics");
+        Accounting {
+            capability: "chat",
+            model: "gpt".to_owned(),
+            model_used: "gpt".to_owned(),
+            provider: "openai".to_owned(),
+            key_id: None,
+            reservation: None,
+            metadata: None,
+            tokens,
+            latency,
+            usage: None,
+            pricing: Arc::new(CostTable::default()),
+            started: Instant::now(),
+        }
+    }
+
+    // Issue #11: the Drop safety net fires exactly when the body stream was
+    // dropped BEFORE its terminal event (clean ends and in-band errors all
+    // settle explicitly first) - i.e. a mid-stream client disconnect. That
+    // must be recorded as 499 / client-cancelled, never as a fake 200
+    // success and never as an internal 500.
+    #[test]
+    fn dropping_an_unfinished_stream_settles_as_a_499_client_cancel() {
+        let metrics = Metrics::new();
+        let mut stream = StreamAccounting::new(open_accounting(&metrics), 7);
+        stream.scan(b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n");
+        drop(stream);
+
+        let out = metrics.encode_text();
+        let line = out
+            .lines()
+            .find(|l| l.starts_with("lumen_request_duration_seconds_count"))
+            .unwrap_or_else(|| panic!("no request duration sample:\n{out}"));
+        assert!(line.contains(r#"status="499""#), "{line}");
+        assert!(!out.contains(r#"status="200""#), "{out}");
+        assert!(!out.contains(r#"status="500""#), "{out}");
+    }
+
+    // An explicitly settled stream (clean end or in-band error) must be
+    // untouched by the Drop safety net: finalize_with_status is idempotent.
+    #[test]
+    fn explicit_settlement_wins_over_the_drop_safety_net() {
+        let metrics = Metrics::new();
+        let mut stream = StreamAccounting::new(open_accounting(&metrics), 7);
+        stream.finalize_with_status(200);
+        drop(stream);
+
+        let out = metrics.encode_text();
+        assert!(out.contains(r#"status="200""#), "{out}");
+        assert!(!out.contains(r#"status="499""#), "{out}");
+    }
 
     #[test]
     fn sniffer_reads_usage_from_the_final_chunk() {

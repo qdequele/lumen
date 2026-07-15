@@ -67,13 +67,50 @@ folded into an existing one: an operator dashboarding cancellation volume
 distinctly from ordinary `4xx` client errors, not just confirm it isn't a
 `5xx`.
 
+### The stream-accounting safety net settles disconnects as 499
+
+`StreamAccounting` (crates/server/src/accounting.rs) closes the per-request
+accounting record when a chat stream ends. Clean ends and in-band error
+frames settle explicitly with their real status; the `Drop` impl is the
+safety net for a body dropped before any terminal event - which is precisely
+a mid-stream client disconnect (or, rarely, server shutdown). That net used
+to hardcode 200, silently recording the most common real-world cancel as a
+success. It now settles at 499, and the stream wrapper settles at 200 as
+soon as the `[DONE]` terminator is observed so a client that disconnects
+after a clean end is still recorded as a 200.
+
 ## Consequences
 
-- `lumen_http_request_duration_seconds{status="499"}` and
-  `lumen_request_duration_seconds{status="499"}` now separate client cancels
-  from both `5xx` internal failures and generic `4xx` client errors. Existing
-  alert rules built on `status=~"5.."` automatically stop firing on client
-  cancels - no rule changes required, which was the point of the issue.
+Precisely which cancellation paths this covers:
+
+- **Mid-stream client disconnect (the common case)**: the SSE body is
+  dropped before its terminal event; `StreamAccounting`'s drop net now
+  settles `usage_log.status` and the `lumen_request_duration_seconds`
+  sample at `499` instead of a fake `200`. These were never inflating 5xx
+  alerts before - worse, they were invisible, recorded as successes. The
+  win here is honest classification and a countable cancellation signal.
+- **Cooperative in-band cancellation while the stream is polled**: the
+  provider byte stream's `select!` on the `CancellationToken`
+  (crates/providers/src/http.rs) yields `ProviderError::Cancelled`, which the
+  stream wrapper maps through `GatewayError::from_provider` into a terminal
+  SSE error frame. That frame now carries `LM-6001` / `client_cancelled` and
+  settles the sample at `499` - previously `LM-5001` / `internal` / `500`.
+  This was the one path that genuinely inflated `status="500"` samples, and
+  alert rules built on `status=~"5.."` stop firing on it with no rule change.
+- **Not covered - non-streaming client disconnect**: dropping the connection
+  drops the whole handler and middleware future, so no status sample is
+  recorded at all, before or after this change (the latency middleware's own
+  documentation notes it only observes completed requests). There is nothing
+  to relabel on this path: it never polluted any metric, and it still
+  produces no sample. Making it observable would need a disconnect-aware
+  middleware, out of scope here.
+- **Server shutdown dropping in-flight streams** is indistinguishable from a
+  client disconnect at this layer and is also recorded as 499. Acceptable:
+  it is rare, and "the stream was cut before its end through no fault of the
+  gateway's request handling" is the semantic 499 carries here.
+
+Other consequences:
+
 - The public error envelope's `type` field gains a fourth possible value,
   `client_cancelled`. This is additive; `docs/errors.md` is updated as the
   source of truth.

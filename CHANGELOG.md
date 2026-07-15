@@ -17,6 +17,12 @@ All notable changes to LUMEN are documented here. The format is based on
   `lumen_http_request_duration_seconds`/`lumen_request_duration_seconds` and any
   alert built on `status=~"5.."` no longer count a client hanging up as an
   internal gateway malfunction.
+- A mid-stream client disconnect now settles the request's accounting record
+  (`usage_log.status` and the `lumen_request_duration_seconds` sample) at 499
+  instead of a hardcoded 200: previously the most common real-world cancel
+  was silently recorded as a success. A stream whose `data: [DONE]`
+  terminator was already delivered still settles as 200 even if the client
+  disconnects immediately after.
 
 ### Added - Endpoint latency observability
 

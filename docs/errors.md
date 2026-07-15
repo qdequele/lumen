@@ -120,3 +120,11 @@ deliberately kept out of both `type: internal` and the `5xx` status class: a
 client hanging up is not a gateway malfunction, and must never inflate the
 `internal`-error metrics or alerts a real one would (issue #11, see
 `docs/adr/006-client-cancellation-error-code.md`).
+
+Two paths produce it. A cancellation surfacing mid-stream is emitted as a
+terminal SSE error frame carrying this envelope. A client that simply
+disconnects mid-stream never sees a frame at all, but the request's
+accounting record (`usage_log.status` and the
+`lumen_request_duration_seconds{status="499"}` sample) is settled at 499
+instead of being miscounted as a 200 success. A non-streaming disconnect
+drops the request before any outcome is recorded and produces no sample.
