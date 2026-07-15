@@ -4,7 +4,8 @@
 //! spec: a request carries a `query` and `documents` (each a bare string or a
 //! `{ "text": ... }` object); the response carries `results` ordered by
 //! descending `relevance_score`, each result's `index` pointing back to the
-//! original document position, plus a `usage.search_units` count.
+//! original document position, plus a `usage.search_units` count and (ADR
+//! 003) a `usage.total_tokens` count for token-billing providers.
 //!
 //! Providers translate their own wire schema to/from these types; the gateway
 //! (see `lumen_providers::rerank`) guarantees ordering, `top_n` clamping and
@@ -147,6 +148,15 @@ pub struct RerankResult {
 }
 
 /// Billing/accounting for a rerank call.
+///
+/// Rerank is billed in **search units** by Cohere and in **tokens** by
+/// Jina/Voyage (ADR 003). Both counts are carried independently rather than
+/// overloading one field: `search_units` is Cohere's billing unit,
+/// `total_tokens` is the token count of `query + documents` that Jina/Voyage
+/// report (and that the gateway derives for every other provider, for
+/// uniform observability). Each count has its own `*_estimated` flag since a
+/// response can carry a real `search_units` alongside a derived
+/// `total_tokens`, or vice versa.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct RerankUsage {
     /// Number of search units billed (Cohere's unit; one per rerank call over a
@@ -157,6 +167,16 @@ pub struct RerankUsage {
     /// upstream reported none (ADR 003); omitted for upstream-reported usage.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub estimated: Option<bool>,
+    /// Token count of `query + documents`, for providers that bill rerank in
+    /// tokens (Jina, Voyage) - and, per ADR 003, for every provider so
+    /// observability stays uniform. Upstream-reported when available
+    /// (Jina/Voyage's `usage.total_tokens`), otherwise gateway-derived.
+    #[serde(default)]
+    pub total_tokens: u32,
+    /// `Some(true)` when the gateway derived `total_tokens` itself because the
+    /// upstream reported none (ADR 003); omitted for upstream-reported usage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens_estimated: Option<bool>,
 }
 
 /// A rerank response, ordered by descending `relevance_score`.

@@ -68,9 +68,9 @@ milestone.
   per-model default (config-side) is still open if per-request opt-in proves
   insufficient in practice.
 - `usage.search_units` is only meaningful for Cohere; Jina and Voyage bill
-  rerank in tokens, so they report `0`. If token-based rerank usage matters for
-  M5 cost counting, widen `RerankUsage` (e.g. add `total_tokens`) rather than
-  overloading `search_units`.
+  rerank in tokens. Resolved (issue #10): `RerankUsage` now carries a separate
+  `total_tokens`/`tokens_estimated` pair, upstream-reported for Jina/Voyage and
+  gateway-derived (from `query + documents`) for every other provider.
 - ~~Rerank `documents` accept string or `{text}` only. Cohere also allows
   arbitrary objects with a `rank_fields` selector - out of scope.~~ **Resolved
   (issue #25).** `RerankDocument::Object` now keeps all fields; the request

@@ -100,13 +100,26 @@ pub async fn rerank_handler(
         response.usage.search_units = u32::try_from(search_units).unwrap_or(u32::MAX);
         response.usage.estimated = Some(true);
     }
+
+    // ADR 003 / issue #10: upstream-reported token usage (Jina, Voyage) wins
+    // when present; otherwise the gateway falls back to the query+documents
+    // heuristic estimate - never a silent zero, and honestly flagged either
+    // way.
+    let (tokens_in, tokens_in_estimated) = if response.usage.total_tokens > 0 {
+        (u64::from(response.usage.total_tokens), false)
+    } else {
+        (estimated_tokens, true)
+    };
+    if tokens_in_estimated {
+        response.usage.total_tokens = u32::try_from(tokens_in).unwrap_or(u32::MAX);
+        response.usage.tokens_estimated = Some(true);
+    }
+
     let cost = pricing.search_cost(&executed.model_used, search_units);
     accounting.finish(&Outcome {
-        // Rerank tokens are always gateway-estimated (uniform observability
-        // per ADR 003); the billing unit is `search_units`.
-        tokens_in: estimated_tokens,
+        tokens_in,
         tokens_out: 0,
-        estimated: true,
+        estimated: tokens_in_estimated,
         search_units: Some(search_units),
         media: lumen_core::MediaUsage::default(),
         cost,

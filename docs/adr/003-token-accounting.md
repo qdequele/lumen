@@ -107,6 +107,20 @@ order above; they sharpen what "estimation" means when tier 2 fires.
   documented approximation, not an attempt at per-image precision; it trades
   some accuracy for closing the "silently counts as 0" gap entirely.
 
+## Addendum (issue #10 - rerank token usage shape)
+
+`RerankUsage` (§ "What is counted, per capability") carries `search_units`
+and `total_tokens` as two independent counts, each with its own
+`*_estimated` flag (`estimated` for `search_units`, `tokens_estimated` for
+`total_tokens`) rather than one shared flag - a response can have a real
+`search_units` (Cohere) alongside a derived `total_tokens`, or the reverse
+(Jina/Voyage). The priority order from the "Source" section above applies
+per count: Jina and Voyage report `usage.total_tokens` in their rerank
+response, which the gateway passes through unflagged; when a provider omits
+it (Cohere, TEI, or Jina/Voyage without `usage`), the gateway derives
+`total_tokens` from `query + documents` via the existing byte-heuristic
+estimator, flagged `"tokens_estimated": true`.
+
 ## Addendum (M9 - multimodal embeddings)
 
 The same priority order applies to image content parts in `/v1/embeddings`:

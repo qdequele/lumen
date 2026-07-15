@@ -360,6 +360,10 @@ impl RerankProvider for CohereProvider {
             usage: RerankUsage {
                 search_units: parsed.meta.billed_units.search_units,
                 estimated: None,
+                // Cohere does not report a token count; the gateway derives
+                // one for uniform observability (ADR 003), see
+                // `lumen_server::rerank`.
+                ..Default::default()
             },
         })
     }
