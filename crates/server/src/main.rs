@@ -21,7 +21,7 @@ use lumen_server::{
     health::{spawn_health_checks, ProbeTarget, ProviderHealth},
     lifecycle, log_startup,
     pricing::CostTable,
-    reload::{spawn_config_reloader, ReloadTargets},
+    reload::{spawn_config_reloader, AuthKnobs, ProviderKeySource, ReloadTargets},
     resilience::ResilienceRuntime,
     state::AppState,
 };
@@ -223,13 +223,27 @@ fn run(config: Config, config_path: PathBuf) -> anyhow::Result<()> {
         // periodic budget flush and retention purge. All optional - the
         // gateway stays a stateless open proxy when auth is disabled.
         let mut provider_specs = config.provider_specs();
-        let (auth_runtime, usage_logger, usage_writer, key_backfill) = if config.auth.enabled {
-            let (runtime, logger, writer, backfill) =
-                boot_auth_stack(&config, &mut provider_specs).await?;
-            (Some(runtime), Some(logger), Some(writer), backfill)
-        } else {
-            (None, None, None, std::collections::HashMap::new())
-        };
+        let (auth_runtime, usage_logger, usage_writer, boot_backfill, key_source, auth_knobs) =
+            if config.auth.enabled {
+                let boot = boot_auth_stack(&config, &mut provider_specs).await?;
+                (
+                    Some(boot.runtime),
+                    Some(boot.usage_logger),
+                    Some(boot.usage_writer),
+                    boot.key_backfill,
+                    Some(boot.key_source),
+                    Some(boot.auth_knobs),
+                )
+            } else {
+                (
+                    None,
+                    None,
+                    None,
+                    std::collections::HashMap::new(),
+                    None,
+                    None,
+                )
+            };
 
         // Connect timeout is client-wide (one pooled client); the overall cap
         // is a backstop above the executor's total timeout (M6 §6.4).
@@ -242,25 +256,23 @@ fn run(config: Config, config_path: PathBuf) -> anyhow::Result<()> {
                 .context("failed to build provider registry")?,
         );
 
-        // The price table lives in a shared cell so the hot reloader swaps the
-        // very cell the handlers read (DEBT-1).
+        // Shared cell so the hot reloader swaps the very cell handlers read.
         let pricing = Arc::new(ArcSwap::from_pointee(CostTable::from_config(&config)));
 
-        // Config hot reload (M7 §7.3): SIGHUP or a config-file change re-validates
-        // and atomically swaps the routing table, price table and resilience
-        // policy (circuit-breaker state preserved). A watcher-setup failure only
-        // disables reload - the server still runs - so it is logged, not fatal.
+        // Config hot reload (M7 §7.3): SIGHUP / file change / admin trigger swaps
+        // routing, pricing, resilience and auth knobs and re-reads DB provider
+        // keys (rotation without restart). See `reload` module docs.
+        let reload_trigger = Arc::new(tokio::sync::Notify::new());
         let reload_targets = ReloadTargets {
             registry: Arc::clone(&registry),
             pricing: Arc::clone(&pricing),
             resilience: Arc::clone(&resilience),
             metrics: reload_metrics,
-            key_backfill,
+            key_backfill: Arc::new(ArcSwap::from_pointee(boot_backfill)),
+            key_source,
+            auth_knobs,
         };
-        match spawn_config_reloader(config_path, reload_targets) {
-            Ok(_handle) => tracing::info!("config hot reload armed (SIGHUP + file watch)"),
-            Err(error) => tracing::warn!(%error, "config hot reload unavailable"),
-        }
+        let reload_armed = arm_config_reload(config_path, reload_targets, &reload_trigger);
 
         let health = boot_health(&config, &client, &resilience_metrics);
 
@@ -273,6 +285,10 @@ fn run(config: Config, config_path: PathBuf) -> anyhow::Result<()> {
             .with_health(health)
             .with_body_limit(config.server.body_limit)
             .with_image_fetch(image_fetch);
+        // Expose the reload trigger only when the reloader is actually armed.
+        if reload_armed {
+            state = state.with_reload_trigger(Arc::clone(&reload_trigger));
+        }
         if let Some(runtime) = auth_runtime.clone() {
             state = state.with_auth(runtime);
         }
@@ -285,32 +301,58 @@ fn run(config: Config, config_path: PathBuf) -> anyhow::Result<()> {
             .await
             .context("server error")?;
 
-        // Final budget flush so a clean shutdown loses zero accounting.
-        if let Some(runtime) = auth_runtime {
-            let dirty = runtime.keys.drain_dirty();
-            if !dirty.is_empty() {
-                if let Err(error) = runtime.store.persist_budgets(&dirty).await {
-                    tracing::warn!(%error, "final budget flush failed");
-                }
-            }
-        }
-
-        // Drain the usage writer: `serve` returning dropped the app (and with
-        // it every UsageLogger clone), which closes the channel; the writer
-        // then flushes what is buffered and exits. Bounded wait - shutdown
-        // must never hang on a sick database.
-        if let Some(writer) = usage_writer {
-            if tokio::time::timeout(Duration::from_secs(5), writer)
-                .await
-                .is_err()
-            {
-                tracing::warn!("usage writer did not drain within 5s; giving up");
-            }
-        }
+        drain_on_shutdown(auth_runtime, usage_writer).await;
 
         tracing::info!("shutdown complete");
         Ok(())
     })
+}
+
+/// Clean-shutdown drain: a final budget flush (so a clean shutdown loses zero
+/// accounting) then a bounded wait for the usage writer to flush and exit.
+/// `serve` returning dropped the app (and every `UsageLogger` clone), closing
+/// the channel; the wait is bounded so shutdown never hangs on a sick database.
+async fn drain_on_shutdown(
+    auth_runtime: Option<Arc<AuthRuntime>>,
+    usage_writer: Option<tokio::task::JoinHandle<()>>,
+) {
+    if let Some(runtime) = auth_runtime {
+        let dirty = runtime.keys.drain_dirty();
+        if !dirty.is_empty() {
+            if let Err(error) = runtime.store.persist_budgets(&dirty).await {
+                tracing::warn!(%error, "final budget flush failed");
+            }
+        }
+    }
+    if let Some(writer) = usage_writer {
+        if tokio::time::timeout(Duration::from_secs(5), writer)
+            .await
+            .is_err()
+        {
+            tracing::warn!("usage writer did not drain within 5s; giving up");
+        }
+    }
+}
+
+/// Arm the config hot reloader (SIGHUP + file watch + admin trigger). A
+/// watcher-setup failure only disables reload - the server still runs - so it
+/// is logged, not fatal. Returns whether the reloader is armed, so the caller
+/// only exposes the admin reload trigger when a reload can actually happen.
+fn arm_config_reload(
+    config_path: PathBuf,
+    targets: ReloadTargets,
+    trigger: &Arc<tokio::sync::Notify>,
+) -> bool {
+    match spawn_config_reloader(config_path, targets, Arc::clone(trigger)) {
+        Ok(_handle) => {
+            tracing::info!("config hot reload armed (SIGHUP + file watch + admin trigger)");
+            true
+        }
+        Err(error) => {
+            tracing::warn!(%error, "config hot reload unavailable");
+            false
+        }
+    }
 }
 
 /// Seed the provider-health registry (every provider `unknown`) and, when
@@ -355,24 +397,38 @@ fn boot_health(
     health
 }
 
+/// Everything [`boot_auth_stack`] hands back to [`run`].
+struct AuthBoot {
+    /// The virtual-key auth runtime (in-memory table, store, admin token).
+    runtime: Arc<AuthRuntime>,
+    /// The usage-log channel handle exposed to the request path.
+    usage_logger: lumen_auth::usage::UsageLogger,
+    /// The usage writer task (drained on shutdown).
+    usage_writer: tokio::task::JoinHandle<()>,
+    /// Boot-time DB provider-key snapshot (seeds the hot-reload backfill cell).
+    key_backfill: std::collections::HashMap<String, String>,
+    /// DB key source the reloader re-reads on every reload (rotation support).
+    key_source: Arc<ProviderKeySource>,
+    /// Live auth knobs the flush/purge tasks read and a reload retunes.
+    auth_knobs: Arc<AuthKnobs>,
+}
+
 /// Boot the M5 auth stack: master key, SQLite store, provider-key back-fill,
 /// in-memory key table, usage writer, periodic budget flush and retention
-/// purge. Returns the runtime and the usage-log handle.
+/// purge. The flush and purge tasks read their cadence/window from the shared
+/// [`AuthKnobs`] so a hot reload retunes them with no restart.
 async fn boot_auth_stack(
     config: &Config,
     provider_specs: &mut [lumen_providers::ProviderSpec],
-) -> anyhow::Result<(
-    Arc<AuthRuntime>,
-    lumen_auth::usage::UsageLogger,
-    tokio::task::JoinHandle<()>,
-    std::collections::HashMap<String, String>,
-)> {
+) -> anyhow::Result<AuthBoot> {
     use zeroize::Zeroize;
     let mut master_value = std::env::var(MASTER_KEY_ENV).with_context(|| {
         format!("auth.enabled requires the {MASTER_KEY_ENV} env var (64 hex chars)")
     })?;
     let master = MasterKey::from_env_value(&master_value)
         .with_context(|| format!("invalid {MASTER_KEY_ENV}"))?;
+    // A live knob cell shared with the flush/purge tasks and swapped on reload.
+    let auth_knobs = Arc::new(AuthKnobs::from_config(config));
 
     let store = KeyStore::connect(&config.auth.db_url())
         .await
@@ -412,6 +468,18 @@ async fn boot_auth_stack(
         },
     );
 
+    // The reloader re-reads DB provider keys on each reload (rotation without a
+    // restart). It needs its own master handle (the runtime's is moved in
+    // below), built here before the clear master string is wiped.
+    let provider_names: Vec<String> = config.providers.iter().map(|p| p.name.clone()).collect();
+    let source_master = MasterKey::from_env_value(&master_value)
+        .with_context(|| format!("invalid {MASTER_KEY_ENV}"))?;
+    let key_source = Arc::new(ProviderKeySource::new(
+        store.clone(),
+        source_master,
+        provider_names,
+    ));
+
     let runtime = Arc::new(AuthRuntime {
         keys,
         store: store.clone(),
@@ -424,14 +492,17 @@ async fn boot_auth_stack(
 
     // Periodic budget flush: memory → DB. A crash loses at most one interval
     // of *accounting*; enforcement lives in memory and is reloaded from the
-    // last flush at boot.
+    // last flush at boot. The cadence is read live from `auth_knobs` so a hot
+    // reload retunes it without a restart (a sleep loop, since a live period
+    // change can't be pushed into a fixed `tokio::time::Interval`).
     let flush_runtime = Arc::clone(&runtime);
-    let flush_interval = Duration::from_millis(config.auth.flush_interval_ms);
+    let flush_knobs = Arc::clone(&auth_knobs);
     tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(flush_interval);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            ticker.tick().await;
+            // `.max(1)` guards a reload that disabled auth (knob validated to be
+            // non-zero while auth is enabled, but a disabling reload sets 0).
+            let interval = Duration::from_millis(flush_knobs.flush_interval_ms().max(1));
+            tokio::time::sleep(interval).await;
             let dirty = flush_runtime.keys.drain_dirty();
             if dirty.is_empty() {
                 continue;
@@ -442,13 +513,15 @@ async fn boot_auth_stack(
         }
     });
 
-    // Retention purge: drop usage_log rows older than the window.
-    let retention = i64::from(config.auth.retention_days) * 86_400;
+    // Retention purge: drop usage_log rows older than the window. The window is
+    // read live from `auth_knobs` each tick so a reload retunes it in place.
+    let purge_knobs = Arc::clone(&auth_knobs);
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(Duration::from_secs(3_600));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
+            let retention = i64::from(purge_knobs.retention_days()) * 86_400;
             match store.purge_usage_older_than(now_unix() - retention).await {
                 Ok(0) => {}
                 Ok(purged) => tracing::info!(purged, "usage-log retention purge"),
@@ -457,7 +530,14 @@ async fn boot_auth_stack(
         }
     });
 
-    Ok((runtime, logger, writer, key_backfill))
+    Ok(AuthBoot {
+        runtime,
+        usage_logger: logger,
+        usage_writer: writer,
+        key_backfill,
+        key_source,
+        auth_knobs,
+    })
 }
 
 #[cfg(test)]

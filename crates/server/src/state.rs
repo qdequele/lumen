@@ -70,6 +70,11 @@ pub struct AppState {
     /// Guarded image-fetch policy for multimodal embeddings (M9). Default:
     /// disabled (a remote image URL yields `LM-2005`).
     pub image_fetch: Arc<ImageFetchPolicy>,
+    /// Hot-reload trigger; `Some` when the config reloader is armed. The admin
+    /// API pings it after storing a provider key so the rotation is applied
+    /// without a restart (the reloader re-reads the key from the DB). `None` =
+    /// no reloader (e.g. tests, or a watcher-setup failure at boot).
+    pub reload_trigger: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl AppState {
@@ -99,6 +104,7 @@ impl AppState {
             // `with_body_limit` once the real config is known (main.rs boot).
             body_limit: 10 * 1024 * 1024,
             image_fetch: Arc::new(ImageFetchPolicy::default()),
+            reload_trigger: None,
         }
     }
 
@@ -106,6 +112,14 @@ impl AppState {
     #[must_use]
     pub fn with_image_fetch(mut self, policy: Arc<ImageFetchPolicy>) -> Self {
         self.image_fetch = policy;
+        self
+    }
+
+    /// Attach the hot-reload trigger (builder style) so the admin API can
+    /// request a reload after a provider-key rotation.
+    #[must_use]
+    pub fn with_reload_trigger(mut self, trigger: Arc<tokio::sync::Notify>) -> Self {
+        self.reload_trigger = Some(trigger);
         self
     }
 

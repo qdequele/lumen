@@ -160,8 +160,11 @@ milestone.
   the budget after both) now rolls back the bumps it already made, so it
   consumes no quota. (A request refused at its own step never bumped that
   window.)
-- **DB-stored provider keys are boot-time only.** `PUT /admin/provider-keys`
-  takes effect at the next restart; wire it into the M7 hot-reload path.
+- **DB-stored provider keys are boot-time only.** ~~`PUT /admin/provider-keys`
+  takes effect at the next restart; wire it into the M7 hot-reload path.~~
+  *Done (post-v0.1.0):* the admin route pings the hot-reload trigger and every
+  reload re-reads provider keys from the encrypted store, so a rotation applies
+  without a restart. Env-sourced keys keep precedence.
 - **Metadata values are stringified** in `usage_log.metadata`. ~~JSON object of
   strings.~~ RESOLVED (issue #26, ADR 007): the column now stores typed JSON
   (`{"batch":42,"canary":true}`), so numeric/boolean filtering via SQLite
@@ -204,15 +207,20 @@ milestone.
 
 ## M7 (release) - deferred
 
-- **Hot reload swaps the routing table only.** SIGHUP / file-watch re-validate
-  the config and atomically swap the provider registry (ArcSwap). Server bind
-  address, `[auth]`, `[resilience]` and pricing are read once at boot; changing
-  them still needs a restart. Extending the swap to those is a follow-up.
-- **Hot reload re-resolves env keys fresh; DB keys are a boot snapshot.** A
-  reload re-reads provider keys from the environment and re-applies the DB-key
-  snapshot captured at boot (so a reload never strips a stored key). *Rotating*
-  a DB-stored key (`PUT /admin/provider-keys`) after boot still needs a restart
-  to take effect - the snapshot is boot-time.
+- **Hot reload swaps routing, pricing, resilience and the safe auth knobs.**
+  SIGHUP / file-watch / admin-trigger re-validate the config and atomically swap
+  the provider registry (ArcSwap), the price table, the resilience policy and the
+  runtime-safe `[auth]` knobs (`flush_interval_ms`, `retention_days`). Still
+  restart-only, by design: the **server bind address** (rebinding a live listener
+  is high-risk), `auth.enabled`, `auth.db_path`, and the bounded usage-log
+  channel knobs (`usage_channel_capacity`, `usage_batch_max`, `usage_flush_ms`)
+  whose capacity is fixed when the channel is created.
+- **Hot reload re-resolves env keys fresh; DB keys are re-read each reload.** A
+  reload re-reads provider keys from the environment and, for env-keyless
+  providers, from the encrypted DB store, so *rotating* a DB-stored key
+  (`PUT /admin/provider-keys`) after boot takes effect on the next reload (the
+  admin route triggers one) with no restart. A DB read error keeps the previous
+  snapshot so a reload never strips a stored key.
 - **Anthropic/Gemini translation fuzzing** goes only as deep as the shared SSE
   parser today. Fuzzing the `translate_request`/`translate_response`/stream
   translators directly needs a small public (or `#[cfg(fuzzing)]`) shim over the
@@ -226,7 +234,12 @@ milestone.
 
 - **Full-config hot reload (DEBT-1)** - done. Reload now swaps pricing and the
   resilience policy (retry/timeouts/fallbacks) as well as the routing table,
-  preserving circuit-breaker state. (Auth knobs + server bind still boot-time.)
+  preserving circuit-breaker state.
+- **Auth-knob hot reload + DB provider-key rotation** - done. Reload also swaps
+  the safe `[auth]` knobs (`flush_interval_ms`, `retention_days`) and re-reads
+  DB-stored provider keys, and `PUT /admin/provider-keys` triggers a reload so a
+  rotation applies without a restart. Server bind address stays boot-time (see
+  the M7 note above for the exact restart-only surface).
 - **Key-material zeroization (DEBT-2)** - done. `MasterKey` wipes on drop and
   the raw `LUMEN_MASTER_KEY` string is zeroized after use.
 - **Richer health probe (DEBT-3, issue #23)** - done for the self-hosted,
