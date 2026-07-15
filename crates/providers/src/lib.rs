@@ -36,6 +36,7 @@ pub use azure::AzureProvider;
 pub use batch::embed_batched;
 pub use cloudflare::CloudflareRerankProvider;
 pub use cohere::CohereProvider;
+pub use google::vertex::VertexProvider;
 pub use google::GoogleProvider;
 pub use jina::JinaProvider;
 pub use kind::ProviderKind;

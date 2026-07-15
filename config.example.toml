@@ -125,7 +125,8 @@ health_check_interval_ms = 30000  # probe cadence (must not be 0 when enabled)
 #
 # Each `[[providers]]` block declares one upstream. `kind` selects the built-in
 # implementation: openai | anthropic | cohere | ollama | tei | jina | voyage |
-# mistral | google | azure. `name` is your own label and must be unique.
+# mistral | google | azure | vertex_ai. `name` is your own label and must be
+# unique.
 #
 # Each `[[providers.models]]` block exposes a model to clients:
 #   id            the id clients send (owned entirely by you)
@@ -183,6 +184,25 @@ upstream_id = "claude-3-5-sonnet-20241022"
 capabilities = ["chat"]
 cost_per_1m_input = 3.0
 cost_per_1m_output = 15.0
+
+# Google Vertex AI: chat (Gemini models on GCP). Distinct from kind = "google"
+# (the public Gemini Developer API): Vertex uses regional endpoints and GCP
+# service-account OAuth. `api_key_env` names a var holding the FULL
+# service-account key JSON (the key file contents, not a path):
+#   export VERTEX_SA_JSON="$(cat service-account.json)"
+# `base_url` carries the GCP region; the project id comes from the JSON. LUMEN
+# exchanges an RS256-signed JWT for a short-lived access token and caches it in
+# memory (refreshed 60 s before expiry) - the key is never logged.
+# [[providers]]
+# name = "vertex"
+# kind = "vertex_ai"
+# api_key_env = "VERTEX_SA_JSON"
+# base_url = "us-central1"
+#
+# [[providers.models]]
+# id = "gemini-flash-vertex"
+# upstream_id = "gemini-2.0-flash"
+# capabilities = ["chat"]
 
 # Ollama: local, keyless. Requires a base_url.
 [[providers]]

@@ -53,6 +53,7 @@ Rules that apply to every provider:
 | `mistral`   |  ✅  |  ✅   |        | required      | optional       | 512               |
 | `anthropic` |  ✅  |       |        | required      | optional       | -                 |
 | `google`    |  ✅  |       |        | required      | optional       | -                 |
+| `vertex_ai` |  ✅  |       |        | required (SA JSON) | **required** (GCP region) | - |
 | `cohere`    |      |  ✅   |   ✅   | required      | optional       | 96                |
 | `jina`      |      |  ✅   |   ✅   | required      | optional       | 2048              |
 | `voyage`    |      |  ✅   |   ✅   | required      | optional       | 128               |
@@ -169,6 +170,44 @@ api_key_env = "GEMINI_API_KEY"
 
 [[providers.models]]
 id = "gemini-2.0-flash"
+upstream_id = "gemini-2.0-flash"
+capabilities = ["chat"]
+```
+
+## vertex_ai
+
+- **kind**: `vertex_ai` · **capabilities**: chat only (Gemini models on Google
+  Cloud Vertex AI). Distinct from `google`, which is the public Gemini
+  Developer API: Vertex uses regional endpoints and GCP OAuth instead of a
+  static API key.
+- **Auth**: `api_key_env` names an env var holding the **full service-account
+  key JSON** (the contents of the key file downloaded from GCP, not a path and
+  not an API key). LUMEN signs an RS256 JWT assertion with the account's
+  private key, exchanges it at the account's `token_uri` for a short-lived
+  OAuth2 access token (scope `cloud-platform`), and sends it as a `Bearer`
+  header. Tokens are cached in memory and refreshed 60 s before expiry, so the
+  exchange stays off the per-request hot path. The private key is redacted from
+  all `Debug` output and never appears in logs or errors.
+- **base_url**: **required** - it carries the **GCP region** (e.g.
+  `us-central1`), not a URL. The endpoint is derived from it:
+  `https://{region}-aiplatform.googleapis.com/v1/projects/{project}/locations/{region}/publishers/google/models/{model}:generateContent`
+  (and `:streamGenerateContent?alt=sse` when streaming).
+- **Project id**: taken from the service-account JSON's `project_id`.
+- **Translation**: identical to `google` (same `GenerateContent` wire schema),
+  including streaming. Like Gemini, only inline base64 image data is accepted;
+  remote image URLs are rejected with `LM-2004`.
+
+```toml
+[[providers]]
+name = "vertex"
+kind = "vertex_ai"
+# The env var holds the service-account key file's JSON contents:
+#   export VERTEX_SA_JSON="$(cat service-account.json)"
+api_key_env = "VERTEX_SA_JSON"
+base_url = "us-central1"   # GCP region
+
+[[providers.models]]
+id = "gemini-flash-vertex"
 upstream_id = "gemini-2.0-flash"
 capabilities = ["chat"]
 ```
