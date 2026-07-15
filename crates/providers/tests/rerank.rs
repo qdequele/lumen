@@ -17,7 +17,8 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use lumen_core::{ProviderError, RerankDocument, RerankProvider, RerankRequest};
 use lumen_providers::{
-    rerank, CloudflareRerankProvider, CohereProvider, JinaProvider, TeiProvider, VoyageProvider,
+    rerank, CloudflareRerankProvider, CohereProvider, JinaProvider, MixedbreadProvider,
+    NvidiaProvider, PineconeProvider, TeiProvider, TogetherRerankProvider, VoyageProvider,
 };
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
@@ -254,6 +255,170 @@ impl RerankFixture for CloudflareFixture {
                         "errors": [],
                         "messages": []
                     }))
+                    .set_delay(delay),
+            )
+            .mount(mock)
+            .await;
+    }
+}
+
+// --------------------------------------------------------------------------
+// Mixedbread fixture - { data: [{index, score}] } (top_k / input request)
+// --------------------------------------------------------------------------
+
+struct MixedbreadFixture;
+
+#[async_trait]
+impl RerankFixture for MixedbreadFixture {
+    fn build(&self, base_url: String) -> Arc<dyn RerankProvider> {
+        Arc::new(MixedbreadProvider::new(
+            reqwest::Client::new(),
+            "mxbai-test",
+            Some(base_url),
+            Some("sk-test-xxx".to_owned()),
+        ))
+    }
+
+    async fn mount_scored(&self, mock: &MockServer) {
+        let data: Vec<_> = SCORES
+            .iter()
+            .map(|(i, s)| json!({ "index": i, "score": s }))
+            .collect();
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "data": data })))
+            .mount(mock)
+            .await;
+    }
+
+    async fn mount_delayed(&self, mock: &MockServer, delay: Duration) {
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "data": [{ "index": 0, "score": 1.0 }] }))
+                    .set_delay(delay),
+            )
+            .mount(mock)
+            .await;
+    }
+}
+
+// --------------------------------------------------------------------------
+// Pinecone fixture - { data: [{index, score}], usage: {rerank_units} }
+// --------------------------------------------------------------------------
+
+struct PineconeFixture;
+
+#[async_trait]
+impl RerankFixture for PineconeFixture {
+    fn build(&self, base_url: String) -> Arc<dyn RerankProvider> {
+        Arc::new(PineconeProvider::new(
+            reqwest::Client::new(),
+            "pinecone-test",
+            Some(base_url),
+            Some("pcsk-test-xxx".to_owned()),
+        ))
+    }
+
+    async fn mount_scored(&self, mock: &MockServer) {
+        let data: Vec<_> = SCORES
+            .iter()
+            .map(|(i, s)| json!({ "index": i, "score": s }))
+            .collect();
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "data": data, "usage": { "rerank_units": 1 } })),
+            )
+            .mount(mock)
+            .await;
+    }
+
+    async fn mount_delayed(&self, mock: &MockServer, delay: Duration) {
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "data": [{ "index": 0, "score": 1.0 }] }))
+                    .set_delay(delay),
+            )
+            .mount(mock)
+            .await;
+    }
+}
+
+// --------------------------------------------------------------------------
+// NVIDIA NIM fixture - { rankings: [{index, logit}] } (query/passages request)
+// --------------------------------------------------------------------------
+
+struct NvidiaFixture;
+
+#[async_trait]
+impl RerankFixture for NvidiaFixture {
+    fn build(&self, base_url: String) -> Arc<dyn RerankProvider> {
+        Arc::new(NvidiaProvider::new(
+            reqwest::Client::new(),
+            "nvidia-test",
+            base_url,
+            Some("nvapi-test-xxx".to_owned()),
+        ))
+    }
+
+    async fn mount_scored(&self, mock: &MockServer) {
+        // NIM returns logits; the three fixed scores are used as-is.
+        let rankings: Vec<_> = SCORES
+            .iter()
+            .map(|(i, s)| json!({ "index": i, "logit": s }))
+            .collect();
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "rankings": rankings })))
+            .mount(mock)
+            .await;
+    }
+
+    async fn mount_delayed(&self, mock: &MockServer, delay: Duration) {
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "rankings": [{ "index": 0, "logit": 1.0 }] }))
+                    .set_delay(delay),
+            )
+            .mount(mock)
+            .await;
+    }
+}
+
+// --------------------------------------------------------------------------
+// Together fixture - { results: [{index, relevance_score}] } (Cohere-shaped)
+// --------------------------------------------------------------------------
+
+struct TogetherFixture;
+
+#[async_trait]
+impl RerankFixture for TogetherFixture {
+    fn build(&self, base_url: String) -> Arc<dyn RerankProvider> {
+        Arc::new(TogetherRerankProvider::new(
+            reqwest::Client::new(),
+            "together-test",
+            Some(base_url),
+            Some("sk-test-xxx".to_owned()),
+        ))
+    }
+
+    async fn mount_scored(&self, mock: &MockServer) {
+        let results: Vec<_> = SCORES
+            .iter()
+            .map(|(i, s)| json!({ "index": i, "relevance_score": s }))
+            .collect();
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "results": results })))
+            .mount(mock)
+            .await;
+    }
+
+    async fn mount_delayed(&self, mock: &MockServer, delay: Duration) {
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "results": [{ "index": 0, "relevance_score": 1.0 }] }))
                     .set_delay(delay),
             )
             .mount(mock)
@@ -536,4 +701,24 @@ async fn voyage_without_usage_reports_zero_tokens_for_gateway_fallback() {
 
     assert_eq!(resp.usage.total_tokens, 0);
     assert_eq!(resp.usage.tokens_estimated, None);
+}
+
+#[tokio::test]
+async fn mixedbread_passes_rerank_conformance_suite() {
+    run_conformance(&MixedbreadFixture).await;
+}
+
+#[tokio::test]
+async fn pinecone_passes_rerank_conformance_suite() {
+    run_conformance(&PineconeFixture).await;
+}
+
+#[tokio::test]
+async fn nvidia_passes_rerank_conformance_suite() {
+    run_conformance(&NvidiaFixture).await;
+}
+
+#[tokio::test]
+async fn together_passes_rerank_conformance_suite() {
+    run_conformance(&TogetherFixture).await;
 }

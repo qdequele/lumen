@@ -23,12 +23,16 @@ pub mod jina;
 pub mod kind;
 pub mod mapping;
 pub mod mistral;
+pub mod mixedbread;
+pub mod nvidia;
 pub mod ollama;
 pub mod openai;
+pub mod pinecone;
 pub mod registry;
 pub mod rerank;
 pub mod sse;
 pub mod tei;
+pub mod together;
 pub mod voyage;
 
 pub use anthropic::AnthropicProvider;
@@ -41,11 +45,15 @@ pub use google::GoogleProvider;
 pub use jina::JinaProvider;
 pub use kind::ProviderKind;
 pub use mistral::MistralProvider;
+pub use mixedbread::MixedbreadProvider;
+pub use nvidia::NvidiaProvider;
 pub use ollama::OllamaProvider;
 pub use openai::OpenAiProvider;
+pub use pinecone::PineconeProvider;
 pub use registry::{
     ChatRoute, EmbeddingRoute, LoadedModelSummary, ModelSpec, ProviderSpec, Registry,
     RegistryError, RerankRoute,
 };
 pub use tei::TeiProvider;
+pub use together::TogetherRerankProvider;
 pub use voyage::VoyageProvider;

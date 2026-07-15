@@ -26,6 +26,12 @@ pub enum ProviderKind {
     /// Google Vertex AI (regional endpoints, GCP service-account OAuth). Distinct
     /// from `Google`, which is the public Gemini Developer API.
     VertexAi,
+    /// Mixedbread reranking (`mxbai-rerank-*`); bearer auth.
+    Mixedbread,
+    /// Pinecone hosted reranking; `Api-Key` header auth.
+    Pinecone,
+    /// NVIDIA NIM reranking (`/v1/ranking`); `base_url` required, key optional.
+    Nvidia,
     // --- OpenAI-compatible hosts (served by the OpenAI provider with a
     //     per-kind base URL; chat + embeddings). ------------------------------
     Groq,
@@ -62,6 +68,9 @@ impl ProviderKind {
             ProviderKind::Google => "google",
             ProviderKind::Azure => "azure",
             ProviderKind::VertexAi => "vertex_ai",
+            ProviderKind::Mixedbread => "mixedbread",
+            ProviderKind::Pinecone => "pinecone",
+            ProviderKind::Nvidia => "nvidia",
             ProviderKind::Groq => "groq",
             ProviderKind::Together => "together",
             ProviderKind::Fireworks => "fireworks",
@@ -118,12 +127,14 @@ impl ProviderKind {
 
     /// Whether this provider requires an API key to be configured.
     ///
-    /// Local, self-hosted providers (Ollama, TEI, vLLM) are keyless.
+    /// Local, self-hosted providers (Ollama, TEI, vLLM) are keyless. NVIDIA NIM
+    /// is treated as keyless-optional: self-hosted NIMs run without a key, while
+    /// the hosted API still works when one is supplied.
     #[must_use]
     pub const fn requires_api_key(self) -> bool {
         !matches!(
             self,
-            ProviderKind::Ollama | ProviderKind::Tei | ProviderKind::Vllm
+            ProviderKind::Ollama | ProviderKind::Tei | ProviderKind::Vllm | ProviderKind::Nvidia
         )
     }
 }
