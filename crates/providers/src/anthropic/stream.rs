@@ -70,7 +70,7 @@ impl AnthropicTranslator {
         ChatChunk {
             id: self.id.clone(),
             object: "chat.completion.chunk".to_owned(),
-            created: 0, // Anthropic does not stream a creation timestamp.
+            created: crate::mapping::unix_timestamp(), // Anthropic streams no creation time.
             model: self.model.clone(),
             choices: vec![ChatChunkChoice {
                 index: 0,
@@ -301,6 +301,33 @@ mod tests {
             .iter()
             .flat_map(|e| translator.translate(e).expect("translates"))
             .collect()
+    }
+
+    /// Anthropic streams carry no creation time; each translated chunk must
+    /// be stamped with a real unix timestamp instead of the historical
+    /// hardcoded `0`.
+    #[test]
+    fn chunk_created_is_a_real_unix_timestamp_not_zero() {
+        let mut t = AnthropicTranslator::new("claude-req");
+        let items = feed(
+            &mut t,
+            &[event(
+                "message_start",
+                serde_json::json!({
+                    "type": "message_start",
+                    "message": {
+                        "id": "msg_abc", "model": "claude-3-5-sonnet",
+                        "usage": { "input_tokens": 25 }
+                    }
+                }),
+            )],
+        );
+        let StreamItem::Chunk(role) = &items[0] else {
+            panic!("expected chunk")
+        };
+        // Sanity-bound against a fixed past instant (2024-01-01 UTC) rather
+        // than pinning an exact wall-clock value.
+        assert!(role.created > 1_704_067_200);
     }
 
     /// The criterion-4 fixture: a text + tool_use stream translates to the
