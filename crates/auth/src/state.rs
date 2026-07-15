@@ -9,7 +9,10 @@
 //!   concurrent requests can never overrun the budget between check and debit;
 //! * **RPM/TPM quotas** - per-minute windows packed into single atomics
 //!   (window minute in the high 32 bits, count in the low 32), bumped with a
-//!   CAS loop.
+//!   CAS loop. The TPM window debits the pre-call estimate and is then settled
+//!   to the real token count afterwards (mirroring the budget); a bump made by
+//!   a request that a later admission step refuses is rolled back, so a
+//!   rejected request consumes no quota.
 //!
 //! Money is tracked in integer **micro-USD** so the atomics stay exact; the
 //! DB speaks USD floats at the edges ([`usd_to_micro`] / [`micro_to_usd`]).
@@ -120,13 +123,15 @@ impl KeyEntry {
     }
 
     /// Admit one request: bump the RPM and TPM windows, then atomically
-    /// reserve the estimated cost against the hard budget. Refused requests
-    /// still count toward the quotas (they did hit the gateway); a refused
-    /// request never reserves budget.
+    /// reserve the estimated cost against the hard budget. When a later
+    /// admission step refuses (TPM after RPM, or the budget after both), the
+    /// earlier bumps are rolled back so a rejected request consumes no quota
+    /// and never reserves budget.
     ///
-    /// The TPM window is debited with the pre-call **estimate** and never
-    /// adjusted afterwards (unlike the budget): conservative by design -
-    /// a quota can throttle early but can never be overrun.
+    /// The TPM window is debited with the pre-call **estimate**;
+    /// [`Reservation::settle`] later adjusts it to the real token count, and
+    /// dropping the reservation unsettled refunds the estimate (the call never
+    /// happened).
     ///
     /// # Errors
     ///
@@ -143,7 +148,8 @@ impl KeyEntry {
         let retry_after = || Some(Duration::from_secs(window_remaining_secs(now)));
 
         let rpm = self.rpm_limit.load(Ordering::SeqCst);
-        if rpm != UNLIMITED && !bump_window(&self.rpm_window, minute, rpm, 1) {
+        let rpm_tracked = rpm != UNLIMITED;
+        if rpm_tracked && !bump_window(&self.rpm_window, minute, rpm, 1) {
             return Err(GatewayError::QuotaExceeded {
                 quota: QuotaKind::Rpm,
                 retry_after: retry_after(),
@@ -151,8 +157,14 @@ impl KeyEntry {
         }
 
         let tpm = self.tpm_limit.load(Ordering::SeqCst);
-        if tpm != UNLIMITED && !bump_window(&self.tpm_window, minute, tpm, estimated_tokens.max(0))
-        {
+        let tpm_tracked = tpm != UNLIMITED;
+        let tpm_debit = estimated_tokens.max(0);
+        if tpm_tracked && !bump_window(&self.tpm_window, minute, tpm, tpm_debit) {
+            // A rejected request must not burn a request slot: roll back the
+            // RPM bump we just made.
+            if rpm_tracked {
+                adjust_window(&self.rpm_window, minute, -1);
+            }
             return Err(GatewayError::QuotaExceeded {
                 quota: QuotaKind::Tpm,
                 retry_after: retry_after(),
@@ -169,6 +181,14 @@ impl KeyEntry {
             let mut current = self.spent_micro.load(Ordering::SeqCst);
             loop {
                 if current.saturating_add(reserve) > max {
+                    // Refused after the quota bumps: unwind them so the budget
+                    // rejection does not also consume the caller's quota.
+                    if rpm_tracked {
+                        adjust_window(&self.rpm_window, minute, -1);
+                    }
+                    if tpm_tracked {
+                        adjust_window(&self.tpm_window, minute, -tpm_debit);
+                    }
                     return Err(GatewayError::BudgetExceeded);
                 }
                 match self.spent_micro.compare_exchange_weak(
@@ -187,30 +207,49 @@ impl KeyEntry {
         Ok(Reservation {
             entry: Arc::clone(self),
             reserved_micro: reserve,
+            tpm_debit: tpm_tracked.then_some(tpm_debit),
+            minute,
             settled: false,
         })
     }
 }
 
-/// A budget reservation held for the duration of one upstream call.
+/// A budget (and TPM) reservation held for the duration of one upstream call.
 ///
-/// [`settle`](Self::settle) replaces the reserved estimate with the real
-/// cost; dropping without settling refunds the whole reservation (the call
-/// failed or was cancelled - no spend happened).
+/// [`settle`](Self::settle) replaces the reserved estimate with the real cost
+/// and real token count. Dropping without settling refunds the **budget**
+/// reservation (the call failed or was cancelled - no money was spent) but
+/// deliberately keeps the **TPM** debit: the tokens-per-minute window is a
+/// rate limiter, and a request that hit the gateway counts even when the
+/// upstream call then failed. Only a successful [`settle`](Self::settle),
+/// which knows the real token count, adjusts the TPM window.
 #[derive(Debug)]
 pub struct Reservation {
     entry: Arc<KeyEntry>,
     reserved_micro: i64,
+    /// Tokens debited to the TPM window at admit, to settle/refund against the
+    /// real usage; `None` when TPM is untracked (no debit was made).
+    tpm_debit: Option<i64>,
+    /// The minute the debits were made in: a settle/refund only touches the
+    /// TPM window while it still belongs to this minute, otherwise the slot
+    /// has already rolled over and there is nothing to adjust.
+    minute: i64,
     settled: bool,
 }
 
 impl Reservation {
-    /// Commit the real cost of the call, releasing any over-reservation (or
-    /// charging the shortfall - the real cost wins even past the budget; the
-    /// *next* request will be refused).
-    pub fn settle(mut self, actual_cost_micro: i64) {
+    /// Commit the real cost and token count of the call. The budget releases
+    /// any over-reservation (or charges the shortfall), and the TPM window is
+    /// adjusted from the pre-call estimate to the real token count. In both
+    /// dimensions the real figure wins even past the limit - the *next*
+    /// request is the one that gets refused.
+    pub fn settle(mut self, actual_cost_micro: i64, actual_tokens: i64) {
         let delta = actual_cost_micro.max(0) - self.reserved_micro;
         self.entry.spent_micro.fetch_add(delta, Ordering::SeqCst);
+        if let Some(debited) = self.tpm_debit {
+            let token_delta = actual_tokens.max(0) - debited;
+            adjust_window(&self.entry.tpm_window, self.minute, token_delta);
+        }
         self.entry.dirty.store(true, Ordering::SeqCst);
         self.settled = true;
     }
@@ -219,6 +258,9 @@ impl Reservation {
 impl Drop for Reservation {
     fn drop(&mut self) {
         if !self.settled {
+            // Refund the budget only: no money was spent. The TPM debit is
+            // kept on purpose (see the struct doc) - a request that hit the
+            // gateway counts against the rate limit even when it failed.
             self.entry
                 .spent_micro
                 .fetch_sub(self.reserved_micro, Ordering::SeqCst);
@@ -335,6 +377,34 @@ fn bump_window(window: &AtomicU64, minute: i64, limit: i64, add: i64) -> bool {
         let next = (minute_tag << 32) | new_count;
         match window.compare_exchange_weak(current, next, Ordering::SeqCst, Ordering::SeqCst) {
             Ok(_) => return true,
+            Err(actual) => current = actual,
+        }
+    }
+}
+
+/// Adjust a packed `minute << 32 | count` window's count by `delta` (which may
+/// be negative), saturating into `[0, u32::MAX]`. A no-op once the window has
+/// rolled past `minute` - that slot's tokens have already expired, so there is
+/// nothing left to unwind or settle. Used to roll back a bump when a later
+/// admission step rejects, to refund an unsettled reservation, and to settle
+/// the TPM estimate to the real token count.
+fn adjust_window(window: &AtomicU64, minute: i64, delta: i64) {
+    if delta == 0 {
+        return;
+    }
+    let minute_tag = u64::try_from(minute).unwrap_or(0) & 0xFFFF_FFFF;
+    let mut current = window.load(Ordering::SeqCst);
+    loop {
+        if current >> 32 != minute_tag {
+            // The window belongs to another minute now: the debit we would
+            // adjust is already gone.
+            return;
+        }
+        let count = i64::from(u32::try_from(current & 0xFFFF_FFFF).unwrap_or(u32::MAX));
+        let new_count = count.saturating_add(delta).clamp(0, i64::from(u32::MAX));
+        let next = (minute_tag << 32) | u64::try_from(new_count).unwrap_or(0);
+        match window.compare_exchange_weak(current, next, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return,
             Err(actual) => current = actual,
         }
     }

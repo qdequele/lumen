@@ -6,6 +6,31 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed - Rate-limit and usage-log accounting refinements (issue #26, ADR 007)
+
+- **TPM is now settled to real usage, like the budget.** A successful request
+  debits the pre-call token estimate to the per-minute window and then adjusts
+  it to the real token count when accounting closes. A large `max_tokens`
+  reservation no longer starves a key for a full minute after a short reply.
+  A dropped (failed/cancelled) reservation deliberately keeps the TPM debit -
+  a request that hit the gateway still counts against the rate limit - while
+  the budget reservation is refunded (no money was spent).
+- **A request refused inside admission no longer burns quota.** When TPM
+  refuses after RPM was counted, or the budget refuses after RPM and TPM were
+  counted, the earlier bumps are rolled back, so a rejected request consumes no
+  RPM/TPM.
+- **Rejected requests now produce a usage-log row.** An admission refusal
+  (402/429) writes a status-only `usage_log` entry (zero tokens, zero cost, the
+  `status` column carrying the rejection) via the same bounded, non-blocking
+  channel as successful requests - never a synchronous DB write on the request
+  path. Enables per-key rejection analytics. (401 stays unlogged: it is refused
+  in the auth middleware before accounting opens.)
+- **`usage_log.metadata` keeps JSON value types.** Metadata values are stored
+  as typed JSON (`{"batch":42,"canary":true}`) instead of stringified
+  (`{"batch":"42"}`), so numeric/boolean filtering via SQLite `json_extract`
+  works. Prometheus labels still stringify (labels are always strings). The
+  column stays TEXT - no migration.
+
 ### Added - Richer per-kind health probes (#23)
 
 - The background health-check task (`resilience.health_check_enabled`) now

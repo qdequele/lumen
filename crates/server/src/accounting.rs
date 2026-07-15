@@ -104,14 +104,28 @@ impl Accounting {
         };
 
         let (key_id, reservation) = match key {
-            Some(AuthedKey(entry)) => {
-                let reservation = entry.admit(
-                    now_unix(),
-                    i64::try_from(estimated_tokens).unwrap_or(i64::MAX),
-                    usd_to_micro(estimated_cost),
-                )?;
-                (Some(entry.id().to_owned()), Some(reservation))
-            }
+            Some(AuthedKey(entry)) => match entry.admit(
+                now_unix(),
+                i64::try_from(estimated_tokens).unwrap_or(i64::MAX),
+                usd_to_micro(estimated_cost),
+            ) {
+                Ok(reservation) => (Some(entry.id().to_owned()), Some(reservation)),
+                Err(error) => {
+                    // The request is refused (402/429) before any upstream
+                    // call. Still record a status-only usage-log row so
+                    // per-key rejection analytics work, via the same
+                    // non-blocking channel as successful requests (never a
+                    // synchronous DB write on the request path).
+                    Self::log_rejection(
+                        state,
+                        target,
+                        entry.id(),
+                        metadata.as_ref(),
+                        error.http_status(),
+                    );
+                    return Err(error);
+                }
+            },
             None => (None, None),
         };
 
@@ -129,6 +143,42 @@ impl Accounting {
             pricing,
             started: Instant::now(),
         })
+    }
+
+    /// Enqueue a status-only usage-log row for a request refused at admission
+    /// (budget/quota). Zero tokens and zero cost - nothing was consumed - the
+    /// `status` column (402/429) carries the rejection. Non-blocking: a full
+    /// channel drops the row and counts it, exactly like the success path.
+    fn log_rejection(
+        state: &AppState,
+        target: Target<'_>,
+        key_id: &str,
+        metadata: Option<&RequestMetadata>,
+        status: u16,
+    ) {
+        let Some(logger) = &state.usage else {
+            return;
+        };
+        let record = UsageRecord {
+            key_id: Some(key_id.to_owned()),
+            model: target.model.to_owned(),
+            model_used: target.model.to_owned(),
+            capability: target.capability.to_owned(),
+            tokens_in: 0,
+            tokens_out: 0,
+            search_units: None,
+            media_count: 0,
+            media_bytes: 0,
+            estimated: false,
+            cost: 0.0,
+            latency_ms: 0,
+            status,
+            metadata: metadata.map(RequestMetadata::to_json),
+            ts: now_unix(),
+        };
+        if !logger.log(record) {
+            state.tokens.inc_usage_dropped();
+        }
     }
 
     /// The shared price table (for computing the outcome's cost).
@@ -156,7 +206,11 @@ impl Accounting {
     /// fails and never blocks (ADR 003 hot-path rule).
     pub fn finish(mut self, outcome: &Outcome) {
         if let Some(reservation) = self.reservation.take() {
-            reservation.settle(usd_to_micro(outcome.cost));
+            // Settle both dimensions to the real usage: the budget to the real
+            // cost and the TPM window to the real token count (in - out).
+            let actual_tokens = i64::try_from(outcome.tokens_in.saturating_add(outcome.tokens_out))
+                .unwrap_or(i64::MAX);
+            reservation.settle(usd_to_micro(outcome.cost), actual_tokens);
         }
 
         // One clock read closes the record: the log event, the histogram and
@@ -198,10 +252,14 @@ impl Accounting {
         );
 
         let allowlist = self.tokens.metadata_labels();
-        let values: Vec<&str> = match &self.metadata {
+        let owned_values = match &self.metadata {
             Some(meta) => meta.label_values(allowlist),
             None => crate::metadata::empty_label_values(allowlist),
         };
+        let values: Vec<&str> = owned_values
+            .iter()
+            .map(std::convert::AsRef::as_ref)
+            .collect();
 
         // Metrics attribute tokens to the model/provider that actually served
         // the request (== requested unless a fallback fired).
@@ -247,30 +305,41 @@ impl Accounting {
             );
         }
 
-        if let Some(logger) = &self.usage {
-            let record = UsageRecord {
-                key_id: self.key_id.clone(),
-                model: self.model.clone(),
-                model_used: self.model_used.clone(),
-                capability: self.capability.to_owned(),
-                tokens_in: i64::try_from(outcome.tokens_in).unwrap_or(i64::MAX),
-                tokens_out: i64::try_from(outcome.tokens_out).unwrap_or(i64::MAX),
-                search_units: outcome
-                    .search_units
-                    .map(|u| i64::try_from(u).unwrap_or(i64::MAX)),
-                media_count: i64::try_from(outcome.media.count).unwrap_or(i64::MAX),
-                media_bytes: i64::try_from(outcome.media.bytes).unwrap_or(i64::MAX),
-                estimated: outcome.estimated,
-                cost: outcome.cost,
-                latency_ms: i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX),
-                status: outcome.status,
-                metadata: metadata_json,
-                ts: now_unix(),
-            };
-            if !logger.log(record) {
-                // Channel full: drop the entry, count it, move on (§5.3).
-                self.tokens.inc_usage_dropped();
-            }
+        self.enqueue_usage(outcome, elapsed, metadata_json);
+    }
+
+    /// Build and enqueue the usage-log row for a finished request. Non-blocking
+    /// `try_send`; a full channel drops the row and counts it (§5.3).
+    fn enqueue_usage(
+        &self,
+        outcome: &Outcome,
+        elapsed: std::time::Duration,
+        metadata_json: Option<String>,
+    ) {
+        let Some(logger) = &self.usage else {
+            return;
+        };
+        let record = UsageRecord {
+            key_id: self.key_id.clone(),
+            model: self.model.clone(),
+            model_used: self.model_used.clone(),
+            capability: self.capability.to_owned(),
+            tokens_in: i64::try_from(outcome.tokens_in).unwrap_or(i64::MAX),
+            tokens_out: i64::try_from(outcome.tokens_out).unwrap_or(i64::MAX),
+            search_units: outcome
+                .search_units
+                .map(|u| i64::try_from(u).unwrap_or(i64::MAX)),
+            media_count: i64::try_from(outcome.media.count).unwrap_or(i64::MAX),
+            media_bytes: i64::try_from(outcome.media.bytes).unwrap_or(i64::MAX),
+            estimated: outcome.estimated,
+            cost: outcome.cost,
+            latency_ms: i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX),
+            status: outcome.status,
+            metadata: metadata_json,
+            ts: now_unix(),
+        };
+        if !logger.log(record) {
+            self.tokens.inc_usage_dropped();
         }
     }
 }

@@ -147,22 +147,32 @@ milestone.
   usage (rare: `include_usage` is auto-requested and translators always emit
   usage), the output-token estimate is the number of `data:` frames (~1 token
   per delta for OpenAI-style streams). Crude but honest (`estimated=true`).
-- **usage_log records successful requests only.** Refusals (401/402/429) and
-  upstream failures are visible in logs/metrics but produce no usage row (no
-  spend happened). If per-key rejection analytics matter, add a `status`-only
-  row path - the column already exists.
-- **Rejected requests still count toward RPM/TPM.** Quota bumps are not
-  unwound when a later admission step (budget) refuses the request. Standard
-  rate-limiter behaviour; documented here for the principle of least surprise.
+- **usage_log records successful requests only.** ~~Refusals (401/402/429) and
+  upstream failures are visible in logs/metrics but produce no usage row.~~
+  RESOLVED (issue #26, ADR 007): admission refusals (402/429) now enqueue a
+  status-only usage row (zero tokens, `status` carries the rejection) through
+  the same non-blocking channel. 401 stays unlogged (refused in the auth
+  middleware, before accounting opens - no key to attribute); upstream failures
+  are already logged by the normal finish path.
+- **Rejected requests still count toward RPM/TPM.** ~~Quota bumps are not
+  unwound when a later admission step (budget) refuses the request.~~ RESOLVED
+  (issue #26, ADR 007): a request refused *inside* admission (TPM after RPM, or
+  the budget after both) now rolls back the bumps it already made, so it
+  consumes no quota. (A request refused at its own step never bumped that
+  window.)
 - **DB-stored provider keys are boot-time only.** `PUT /admin/provider-keys`
   takes effect at the next restart; wire it into the M7 hot-reload path.
-- **Metadata values are stringified** in `usage_log.metadata` (JSON object of
-  strings). If typed filtering (numeric ranges) matters, store the original
-  JSON value instead.
-- **TPM debits the pre-call estimate, never adjusted.** Unlike the budget
+- **Metadata values are stringified** in `usage_log.metadata`. ~~JSON object of
+  strings.~~ RESOLVED (issue #26, ADR 007): the column now stores typed JSON
+  (`{"batch":42,"canary":true}`), so numeric/boolean filtering via SQLite
+  `json_extract` works. Prometheus labels still stringify (labels are strings).
+- **TPM debits the pre-call estimate, never adjusted.** ~~Unlike the budget
   (reserved then settled to real usage), the tokens-per-minute window keeps the
-  estimate (`max_tokens` or the 2048 default when absent). Conservative - can
-  throttle early, can never overrun. Adjust post-call if it starves real users.
+  estimate.~~ RESOLVED (issue #26, ADR 007): a successful request now settles
+  the TPM window to the real token count, mirroring the budget - large
+  `max_tokens` reservations no longer starve a key. A dropped (failed/cancelled)
+  reservation deliberately keeps the TPM debit: a request that hit the gateway
+  still counts against the rate limit.
 - **No zeroization of key material.** `MasterKey` and the raw env string are
   not zeroized on drop; the `zeroize` crate would close the residual-memory
   window. Low risk (single long-lived process), noted from the M5 review.

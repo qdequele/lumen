@@ -15,6 +15,7 @@
 
 use axum::http::HeaderMap;
 use serde_json::Value;
+use std::borrow::Cow;
 
 /// Canonical header name.
 pub const METADATA_HEADER: &str = "x-lumen-metadata";
@@ -31,10 +32,15 @@ const MAX_KEY_BYTES: usize = 64;
 const MAX_VALUE_BYTES: usize = 256;
 
 /// The parsed, validated metadata of one request.
+///
+/// Values keep their original JSON type (string, number or bool) so the
+/// `usage_log.metadata` column stores typed JSON (`{"batch":42}`, not
+/// `{"batch":"42"}`) and SQLite `json_extract` can filter numerically.
+/// Prometheus labels, which are always strings, stringify on the way out.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RequestMetadata {
-    /// Key → value, values stringified (`true`, `42`, `"…"` without quotes).
-    pairs: Vec<(String, String)>,
+    /// Key → typed value; only `String`, `Number` and `Bool` ever appear.
+    pairs: Vec<(String, Value)>,
 }
 
 /// Outcome of looking for metadata on a request.
@@ -76,21 +82,20 @@ impl RequestMetadata {
             if key.len() > MAX_KEY_BYTES {
                 return MetadataOutcome::Rejected("key exceeds 64 bytes");
             }
-            let rendered = match value {
+            match &value {
                 Value::String(s) => {
                     if s.len() > MAX_VALUE_BYTES {
                         return MetadataOutcome::Rejected("value exceeds 256 bytes");
                     }
-                    s
                 }
-                Value::Number(n) => n.to_string(),
-                Value::Bool(b) => b.to_string(),
+                Value::Number(_) | Value::Bool(_) => {}
                 // Flat objects only: nesting is rejected, not flattened.
                 Value::Null | Value::Array(_) | Value::Object(_) => {
                     return MetadataOutcome::Rejected("values must be string/number/bool");
                 }
-            };
-            pairs.push((key, rendered));
+            }
+            // The original typed value is retained (see the struct doc).
+            pairs.push((key, value));
         }
         MetadataOutcome::Valid(RequestMetadata { pairs })
     }
@@ -101,36 +106,50 @@ impl RequestMetadata {
         self.pairs.is_empty()
     }
 
-    /// Compact JSON for the `usage_log.metadata` column and structured logs.
+    /// Compact JSON for the `usage_log.metadata` column and structured logs,
+    /// with values kept in their original JSON type.
     #[must_use]
     pub fn to_json(&self) -> String {
         let mut map = serde_json::Map::with_capacity(self.pairs.len());
         for (key, value) in &self.pairs {
-            map.insert(key.clone(), Value::String(value.clone()));
+            map.insert(key.clone(), value.clone());
         }
         Value::Object(map).to_string()
     }
 
     /// Label values aligned with the allowlist order; absent keys become `""`
     /// (ADR 002 sink 2 - only allowlisted keys ever reach Prometheus).
+    /// Numbers and bools stringify here since Prometheus labels are strings.
     #[must_use]
-    pub fn label_values<'a>(&'a self, allowlist: &[String]) -> Vec<&'a str> {
+    pub fn label_values<'a>(&'a self, allowlist: &[String]) -> Vec<Cow<'a, str>> {
         allowlist
             .iter()
             .map(|wanted| {
                 self.pairs
                     .iter()
                     .find(|(key, _)| key == wanted)
-                    .map_or("", |(_, value)| value.as_str())
+                    .map_or(Cow::Borrowed(""), |(_, value)| render_label(value))
             })
             .collect()
     }
 }
 
+/// Render a metadata value as a Prometheus label string, borrowing the string
+/// case and only allocating for numbers/bools.
+fn render_label(value: &Value) -> Cow<'_, str> {
+    match value {
+        Value::String(s) => Cow::Borrowed(s.as_str()),
+        Value::Number(n) => Cow::Owned(n.to_string()),
+        Value::Bool(b) => Cow::Owned(b.to_string()),
+        // Never constructed (extract rejects other variants); render as empty.
+        _ => Cow::Borrowed(""),
+    }
+}
+
 /// All-empty label values for requests without metadata.
 #[must_use]
-pub fn empty_label_values(allowlist: &[String]) -> Vec<&'static str> {
-    vec![""; allowlist.len()]
+pub fn empty_label_values(allowlist: &[String]) -> Vec<Cow<'static, str>> {
+    vec![Cow::Borrowed(""); allowlist.len()]
 }
 
 #[cfg(test)]
@@ -156,7 +175,7 @@ mod tests {
     }
 
     #[test]
-    fn valid_flat_object_parses_with_typed_values_stringified() {
+    fn valid_flat_object_keeps_json_value_types() {
         let headers = headers_with(
             METADATA_HEADER,
             r#"{"team":"search","batch":42,"canary":true}"#,
@@ -164,10 +183,22 @@ mod tests {
         let MetadataOutcome::Valid(meta) = RequestMetadata::extract(&headers) else {
             panic!("expected valid metadata");
         };
+        // The usage-log JSON keeps the original types: string stays quoted,
+        // number and bool stay unquoted (so numeric filtering works).
         let json = meta.to_json();
         assert!(json.contains(r#""team":"search""#));
-        assert!(json.contains(r#""batch":"42""#));
-        assert!(json.contains(r#""canary":"true""#));
+        assert!(json.contains(r#""batch":42"#), "number stays typed: {json}");
+        assert!(
+            json.contains(r#""canary":true"#),
+            "bool stays typed: {json}"
+        );
+        assert!(!json.contains(r#""batch":"42""#), "not stringified: {json}");
+
+        // Prometheus labels, however, stringify (labels are always strings).
+        let allowlist = vec!["batch".to_owned(), "canary".to_owned()];
+        let labels = meta.label_values(&allowlist);
+        let labels: Vec<&str> = labels.iter().map(std::convert::AsRef::as_ref).collect();
+        assert_eq!(labels, vec!["42", "true"]);
     }
 
     #[test]
@@ -265,7 +296,11 @@ mod tests {
         };
         let allowlist = vec!["env".to_owned(), "team".to_owned()];
         // Non-allowlisted keys ("secretish") never surface here.
-        assert_eq!(meta.label_values(&allowlist), vec!["", "search"]);
-        assert_eq!(empty_label_values(&allowlist), vec!["", ""]);
+        let labels = meta.label_values(&allowlist);
+        let labels: Vec<&str> = labels.iter().map(std::convert::AsRef::as_ref).collect();
+        assert_eq!(labels, vec!["", "search"]);
+        let empty = empty_label_values(&allowlist);
+        let empty: Vec<&str> = empty.iter().map(std::convert::AsRef::as_ref).collect();
+        assert_eq!(empty, vec!["", ""]);
     }
 }

@@ -575,6 +575,122 @@ async fn successful_requests_land_in_the_usage_log_with_cost() {
     assert!(dump.contains("3.0"), "cost at $1/token:\n{dump}");
 }
 
+#[tokio::test]
+async fn rejected_requests_land_in_the_usage_log_with_the_rejection_status() {
+    // M5 point 3: a request refused at admission (here 402, budget) still
+    // produces a status-only usage row - zero tokens, zero cost - so per-key
+    // rejection analytics work. No upstream call happens.
+    let upstream = MockServer::start().await;
+    let h = spawn_auth(full_registry(&upstream.uri()), &[]).await;
+    // Budget covers nothing: the $1 estimate cannot be reserved → 402.
+    let key = h.create_key(Some(0.5), None, None).await;
+
+    let resp = h
+        .client
+        .post(format!("{}/v1/embeddings", h.base))
+        .bearer_auth(&key)
+        .json(&embed_body())
+        .send()
+        .await
+        .expect("send");
+    assert_eq!(resp.status(), 402);
+
+    h.wait_usage_rows(1).await;
+    let dump = h.store.debug_dump().await.expect("dump");
+    // The refused capability/model, status 402, and zero tokens are recorded.
+    assert!(dump.contains("'embed-small'"), "dump:\n{dump}");
+    assert!(dump.contains("'embed'"), "dump:\n{dump}");
+    assert!(dump.contains("|402|"), "status 402 recorded:\n{dump}");
+    assert!(
+        dump.contains("|0|0|"),
+        "zero tokens on a rejection:\n{dump}"
+    );
+
+    // Still no upstream traffic (the refusal is before any provider call).
+    assert!(upstream.received_requests().await.expect("reqs").is_empty());
+}
+
+#[tokio::test]
+async fn a_quota_rejection_is_also_logged() {
+    // M5 point 3, the 429 variant: after the RPM cap is hit, the refused
+    // request produces its own status-only row (status 429) alongside the
+    // successful one.
+    let upstream = MockServer::start().await;
+    mount_openai_embeddings(&upstream, 1).await;
+    let h = spawn_auth(full_registry(&upstream.uri()), &[]).await;
+    let key = h.create_key(None, Some(1), None).await;
+
+    let url = format!("{}/v1/embeddings", h.base);
+    let first = h
+        .client
+        .post(&url)
+        .bearer_auth(&key)
+        .json(&embed_body())
+        .send()
+        .await
+        .expect("send");
+    assert_eq!(first.status(), 200);
+    let second = h
+        .client
+        .post(&url)
+        .bearer_auth(&key)
+        .json(&embed_body())
+        .send()
+        .await
+        .expect("send");
+    assert_eq!(second.status(), 429);
+
+    // Two rows: the success (200) and the rejection (429).
+    h.wait_usage_rows(2).await;
+    let dump = h.store.debug_dump().await.expect("dump");
+    assert!(dump.contains("|429|"), "429 rejection recorded:\n{dump}");
+    assert!(dump.contains("|200|"), "200 success recorded:\n{dump}");
+}
+
+#[tokio::test]
+async fn metadata_numeric_and_bool_values_are_stored_typed() {
+    // M5 point 4: the usage-log metadata JSON keeps original value types, so
+    // numeric/boolean filtering (SQLite json_extract) is possible - numbers
+    // and bools are NOT stringified.
+    let upstream = MockServer::start().await;
+    mount_openai_embeddings(&upstream, 1).await;
+    let h = spawn_auth(full_registry(&upstream.uri()), &[]).await;
+    let key = h.create_key(None, None, None).await;
+
+    let resp = h
+        .client
+        .post(format!("{}/v1/embeddings", h.base))
+        .bearer_auth(&key)
+        .header(
+            "x-lumen-metadata",
+            r#"{"batch":42,"canary":true,"team":"search"}"#,
+        )
+        .json(&embed_body())
+        .send()
+        .await
+        .expect("send");
+    assert_eq!(resp.status(), 200);
+
+    h.wait_usage_rows(1).await;
+    let dump = h.store.debug_dump().await.expect("dump");
+    assert!(
+        dump.contains(r#""batch":42"#),
+        "number stays typed:\n{dump}"
+    );
+    assert!(
+        dump.contains(r#""canary":true"#),
+        "bool stays typed:\n{dump}"
+    );
+    assert!(
+        dump.contains(r#""team":"search""#),
+        "string stays quoted:\n{dump}"
+    );
+    assert!(
+        !dump.contains(r#""batch":"42""#),
+        "number must not be stringified:\n{dump}"
+    );
+}
+
 // ---- Token accounting (criteria 9, 10, 11) ----------------------------------
 
 #[tokio::test]
