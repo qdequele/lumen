@@ -22,6 +22,29 @@ All notable changes to LUMEN are documented here. The format is based on
   256 default). What the test asserts is unchanged: /health stays under the
   same bound during the storm and all 500 requests complete with 429/503.
 
+### Added - Google Vertex AI provider
+
+- New provider `kind = "vertex_ai"`: Gemini models on Google Cloud Vertex AI
+  (chat, streaming and non-streaming). Distinct from `kind = "google"` (the
+  public Gemini Developer API): requests go to the regional endpoint
+  `https://{region}-aiplatform.googleapis.com/v1/projects/{project}/locations/{region}/publishers/google/models/{model}:generateContent`
+  (`:streamGenerateContent?alt=sse` when streaming), reusing the existing
+  Gemini wire translation.
+- GCP service-account OAuth: LUMEN signs an RS256 JWT assertion with the
+  account's private key and exchanges it for a short-lived `Bearer` access
+  token (scope `cloud-platform`). Tokens are cached in memory and refreshed
+  60 s before expiry, keeping the exchange off the per-request hot path;
+  concurrent refreshes coalesce onto one fetch. A token-exchange failure is a
+  provider-named upstream error (LM-3003 family), never a misleading client
+  401. The private key is redacted from all `Debug` output, logs and errors.
+- Config: `api_key_env` names an env var holding the full service-account key
+  JSON; `base_url` carries the GCP region (e.g. `us-central1`); the project id
+  comes from the credentials. An unset credentials env var still boots (parity
+  with other providers) and fails per request; garbage credentials JSON is a
+  startup error naming the provider.
+- New workspace dependency `jsonwebtoken` (RS256 signing; `ring`-backed, no
+  OpenSSL, consistent with the rustls-only policy).
+
 ### Added - Azure OpenAI provider (deployment routing + api-version)
 
 - New `azure` provider kind (chat + embeddings): reuses the OpenAI JSON

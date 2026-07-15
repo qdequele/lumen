@@ -50,6 +50,10 @@ base64 = "0.22"
 thiserror = "2"
 anyhow = "1"
 
+# GCP service-account OAuth (Vertex AI): RS256-signed JWT assertion. Pure-Rust
+# crypto backend (ring), never OpenSSL - compatible with the rustls-only policy.
+jsonwebtoken = { version = "9", default-features = false, features = ["use_pem"] }
+
 # Logging / metrics
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }

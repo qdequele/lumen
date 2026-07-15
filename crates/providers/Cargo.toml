@@ -26,6 +26,7 @@ tokio-util = { workspace = true }
 arc-swap = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+jsonwebtoken = { workspace = true }
 
 [dev-dependencies]
 wiremock = { workspace = true }

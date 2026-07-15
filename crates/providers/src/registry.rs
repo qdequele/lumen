@@ -17,6 +17,7 @@ use crate::anthropic::AnthropicProvider;
 use crate::azure::AzureProvider;
 use crate::cloudflare::CloudflareRerankProvider;
 use crate::cohere::CohereProvider;
+use crate::google::vertex::VertexProvider;
 use crate::google::GoogleProvider;
 use crate::jina::JinaProvider;
 use crate::kind::ProviderKind;
@@ -102,6 +103,17 @@ pub enum RegistryError {
         first_provider: String,
         /// The provider that redeclared it.
         second_provider: String,
+    },
+
+    /// A provider's own configuration was rejected by its implementation (e.g.
+    /// Vertex AI service-account credentials that were missing or unparseable).
+    /// The message is secret-free.
+    #[error("provider '{name}' configuration error: {message}")]
+    ProviderConfig {
+        /// The offending provider's name.
+        name: String,
+        /// A secret-free description of what was wrong.
+        message: String,
     },
 }
 
@@ -608,6 +620,30 @@ fn build_providers(
                 rerank: None,
             })
         }
+        // Vertex AI carries its config in the existing spec fields: `base_url`
+        // holds the GCP region, `api_key` holds the inline service-account JSON
+        // (the provider secret). The project id comes from the credentials.
+        ProviderKind::VertexAi => {
+            let location = require_base_url()?;
+            let provider = VertexProvider::new(
+                client.clone(),
+                spec.name.clone(),
+                spec.api_key.as_deref(),
+                None,
+                Some(location),
+                None,
+            )
+            .map_err(|e| RegistryError::ProviderConfig {
+                name: spec.name.clone(),
+                message: e.to_string(),
+            })?;
+            let chat: Arc<dyn ChatProvider> = Arc::new(provider);
+            Ok(BuiltProviders {
+                chat: Some(chat),
+                embed: None,
+                rerank: None,
+            })
+        }
     }
 }
 
@@ -815,6 +851,79 @@ mod tests {
             reg.embedding_route("friendly").unwrap().upstream_id,
             "text-embedding-3-small"
         );
+    }
+
+    #[test]
+    fn vertex_ai_resolves_chat_and_validates_config() {
+        let creds = serde_json::json!({
+            "type": "service_account",
+            "project_id": "proj",
+            "client_email": "svc@proj.iam.gserviceaccount.com",
+            "private_key": include_str!("google/vertex/testdata/test_private_key.pem"),
+            "token_uri": "https://oauth2.googleapis.com/token",
+        })
+        .to_string();
+
+        // With region (in base_url) + credentials: the chat route resolves.
+        let reg = Registry::build(
+            vec![ProviderSpec {
+                name: "vertex".to_owned(),
+                kind: ProviderKind::VertexAi,
+                api_key: Some(creds.clone()),
+                base_url: Some("us-central1".to_owned()),
+                strict: false,
+                models: vec![model("gemini-flash", &[Capability::Chat])],
+            }],
+            reqwest::Client::new(),
+        )
+        .expect("vertex_ai builds");
+        assert!(reg.chat_route("gemini-flash").is_some());
+
+        // Without a region there is nothing to route to: a clear build error.
+        let no_region = Registry::build(
+            vec![ProviderSpec {
+                name: "vertex".to_owned(),
+                kind: ProviderKind::VertexAi,
+                api_key: Some(creds),
+                base_url: None,
+                strict: false,
+                models: vec![model("m", &[Capability::Chat])],
+            }],
+            reqwest::Client::new(),
+        );
+        assert!(matches!(
+            no_region,
+            Err(RegistryError::MissingBaseUrl { .. })
+        ));
+
+        // A missing credentials env var must NOT fail the boot (parity with
+        // every other provider whose key env is unset).
+        let keyless = Registry::build(
+            vec![ProviderSpec {
+                name: "vertex".to_owned(),
+                kind: ProviderKind::VertexAi,
+                api_key: None,
+                base_url: Some("us-central1".to_owned()),
+                strict: false,
+                models: vec![model("m", &[Capability::Chat])],
+            }],
+            reqwest::Client::new(),
+        );
+        assert!(keyless.is_ok(), "unset creds env must still boot");
+
+        // Garbage credentials JSON is deterministic misconfiguration: build error.
+        let garbage = Registry::build(
+            vec![ProviderSpec {
+                name: "vertex".to_owned(),
+                kind: ProviderKind::VertexAi,
+                api_key: Some("sk-test-xxx".to_owned()),
+                base_url: Some("us-central1".to_owned()),
+                strict: false,
+                models: vec![model("m", &[Capability::Chat])],
+            }],
+            reqwest::Client::new(),
+        );
+        assert!(matches!(garbage, Err(RegistryError::ProviderConfig { .. })));
     }
 
     #[test]
