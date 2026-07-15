@@ -1,0 +1,2 @@
+CONTAINER ID   NAME      CPU %     MEM USAGE / LIMIT     MEM %     NET I/O          BLOCK I/O        PIDS
+c7e2daac328a   litellm   101.86%   1.028GiB / 7.818GiB   13.15%    667kB / 1.42MB   179MB / 56.7MB   17
