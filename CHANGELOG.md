@@ -22,6 +22,19 @@ All notable changes to LUMEN are documented here. The format is based on
   256 default). What the test asserts is unchanged: /health stays under the
   same bound during the storm and all 500 requests complete with 429/503.
 
+### Added - Gemini tool calling
+
+- **The Google (Gemini) provider now supports tool calling** instead of
+  silently dropping it (issue #4). Request translation maps OpenAI `tools` to
+  Gemini `tools[].functionDeclarations` and `tool_choice` to
+  `toolConfig.functionCallingConfig` (`auto`/`required`/`none`/specific
+  function). Assistant `tool_calls` become `functionCall` parts (role `model`)
+  and role `tool` messages become `functionResponse` parts (role `user`,
+  consecutive results merged). Both the non-streaming and streaming response
+  translators surface Gemini `functionCall` parts as OpenAI `tool_calls` and
+  map the trailing `STOP` to `finish_reason: "tool_calls"`. A synthetic call
+  id (`call_<n>`) is minted since Gemini does not return one.
+
 ### Added - `--check-config` validation mode
 
 - New `lumen --check-config [--config <PATH>]` mode for CI / deploy pipelines
