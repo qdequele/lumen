@@ -245,6 +245,44 @@ impl EmbedFixture for CohereEmbedFixture {
 }
 
 // --------------------------------------------------------------------------
+// Cohere `input_type` override (issue #22): a caller passes `input_type` as
+// an OpenAI-embeddings-request extra field; Cohere honors it verbatim,
+// defaulting to `search_document` (the indexing case) when absent.
+// --------------------------------------------------------------------------
+
+#[tokio::test]
+async fn cohere_embed_defaults_input_type_to_search_document() {
+    let mock = MockServer::start().await;
+    CohereEmbedFixture.mount_echo(&mock).await;
+    let provider = CohereEmbedFixture.build(mock.uri());
+
+    // `CohereEcho` echoes each input parsed as an `f32`; a numeric string
+    // input keeps the mock response valid (see `scenario_nominal`).
+    let req = batch_request(vec!["0".into()]);
+    provider.embed(req, CancellationToken::new()).await.unwrap();
+
+    let requests = mock.received_requests().await.unwrap();
+    let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(body["input_type"], "search_document");
+}
+
+#[tokio::test]
+async fn cohere_embed_honors_input_type_override() {
+    let mock = MockServer::start().await;
+    CohereEmbedFixture.mount_echo(&mock).await;
+    let provider = CohereEmbedFixture.build(mock.uri());
+
+    let mut req = batch_request(vec!["0".into()]);
+    req.extra
+        .insert("input_type".to_owned(), json!("search_query"));
+    provider.embed(req, CancellationToken::new()).await.unwrap();
+
+    let requests = mock.received_requests().await.unwrap();
+    let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(body["input_type"], "search_query");
+}
+
+// --------------------------------------------------------------------------
 // TEI fixture - request `inputs`, response is a bare `[[f32]]` array
 // --------------------------------------------------------------------------
 
@@ -405,6 +443,7 @@ fn batch_request(texts: Vec<String>) -> EmbedRequest {
         encoding_format: None,
         dimensions: None,
         user: None,
+        extra: serde_json::Map::new(),
     }
 }
 

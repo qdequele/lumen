@@ -36,6 +36,24 @@ pub async fn embeddings(
         return Err(GatewayError::InvalidRequest("`input` must not be empty".to_owned()).into());
     }
 
+    // Cohere `input_type` override (issue #22): validated here, regardless of
+    // which provider ultimately serves the request, so an unknown value fails
+    // fast with LM-1001 rather than surfacing as an opaque upstream 400 (or,
+    // for a non-Cohere provider, being silently ignored while the caller
+    // believes it took effect).
+    if let Some(value) = req.extra.get("input_type") {
+        let is_allowed = value
+            .as_str()
+            .is_some_and(|s| lumen_providers::cohere::ALLOWED_INPUT_TYPES.contains(&s));
+        if !is_allowed {
+            return Err(GatewayError::InvalidRequest(format!(
+                "invalid `input_type` {value}: expected one of {:?}",
+                lumen_providers::cohere::ALLOWED_INPUT_TYPES
+            ))
+            .into());
+        }
+    }
+
     // Resolve the requested model to a fallback chain (primary + configured
     // fallbacks), each re-resolved for the embed capability (M6 §6.2).
     let client_model = req.model.clone();

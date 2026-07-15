@@ -99,6 +99,19 @@ All notable changes to LUMEN are documented here. The format is based on
   field with a debug log). Backed by a new `ProviderError::UnsupportedField`
   that maps to a client 400 and is never retried or failed over.
 
+### Added - Cohere embed `input_type` override (#22)
+
+- `POST /v1/embeddings` now accepts an `input_type` extra field so a caller
+  can override Cohere's query-vs-document intent (`search_query`,
+  `search_document`, `classification`, `clustering`) instead of always
+  getting the `search_document` default - materially affects retrieval
+  quality for query-time embeddings. `EmbedRequest` gained an `extra` map
+  (the same `serde(flatten)` idiom `ChatRequest` already uses) to carry it
+  and any other provider-specific field, verbatim, through automatic
+  batching. An unrecognized value is rejected with `LM-1001` before any
+  upstream call; every other provider ignores the field harmlessly. See
+  `docs/providers.md` § cohere.
+
 ### Fixed
 
 - **Dedicated client-cancel error code (issue #11).** A client-initiated

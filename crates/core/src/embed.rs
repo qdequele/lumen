@@ -1,6 +1,12 @@
 //! Embedding types, mirroring the OpenAI `embeddings` schema.
+//!
+//! Unknown fields are preserved through a [`serde(flatten)`] `extra` map (the
+//! same idiom as [`crate::chat::ChatRequest`]), so provider-specific
+//! parameters - e.g. Cohere's `input_type` (search_query vs search_document,
+//! see `docs/providers.md` § cohere) - pass through untouched.
 
 use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::{Map, Value};
 
 use crate::chat::ContentPart;
 
@@ -136,6 +142,10 @@ pub struct EmbedRequest {
     pub dimensions: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
+    /// Any additional fields (e.g. Cohere's `input_type` override) preserved
+    /// verbatim and available to provider translation code.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 /// Token accounting for embeddings.

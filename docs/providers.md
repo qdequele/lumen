@@ -172,6 +172,14 @@ capabilities = ["chat"]
 - **Auth**: `api_key_env` (e.g. `COHERE_API_KEY`), bearer token.
 - **Embed batch limit**: 96.
 - **Cost**: rerank is billed in search units (`cost_per_1k_searches`).
+- **`input_type` override**: Cohere's embed v2 API requires an `input_type`
+  and the gateway cannot know query-vs-document intent, so it defaults to
+  `search_document` (the indexing case). Set `input_type` as an extra field on
+  the `/v1/embeddings` request body to override it per request, e.g.
+  `{"model": "embed-multilingual", "input": "...", "input_type": "search_query"}`.
+  Allowed values: `search_document`, `search_query`, `classification`,
+  `clustering`. An unrecognized value is rejected with `LM-1001` before any
+  upstream call. Ignored (harmlessly) by every other provider.
 
 ```toml
 [[providers]]

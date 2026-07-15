@@ -175,6 +175,21 @@ mod tests {
     }
 
     #[test]
+    fn embed_request_preserves_input_type_via_extra() {
+        // A caller-supplied `input_type` (Cohere's search_query vs
+        // search_document override, issue #22) survives round-trip via `extra`,
+        // the same idiom `ChatRequest` uses for provider-specific fields.
+        let raw = r#"{"model":"m","input":"hello","input_type":"search_query"}"#;
+        let req: EmbedRequest = serde_json::from_str(raw).unwrap();
+        assert_eq!(
+            req.extra.get("input_type").and_then(|v| v.as_str()),
+            Some("search_query")
+        );
+        let back = serde_json::to_value(&req).unwrap();
+        assert_eq!(back["input_type"], "search_query");
+    }
+
+    #[test]
     fn rerank_request_parses_cohere_shape() {
         let req: RerankRequest = serde_json::from_str(
             r#"{"model":"rerank-v3","query":"q","documents":["d1","d2"],"top_n":1}"#,
