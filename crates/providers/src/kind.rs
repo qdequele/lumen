@@ -23,6 +23,9 @@ pub enum ProviderKind {
     /// Not OpenAI-compatible (own URL scheme), so it is NOT part of
     /// [`is_openai_compatible`](ProviderKind::is_openai_compatible).
     Azure,
+    /// Google Vertex AI (regional endpoints, GCP service-account OAuth). Distinct
+    /// from `Google`, which is the public Gemini Developer API.
+    VertexAi,
     // --- OpenAI-compatible hosts (served by the OpenAI provider with a
     //     per-kind base URL; chat + embeddings). ------------------------------
     Groq,
@@ -58,6 +61,7 @@ impl ProviderKind {
             ProviderKind::Mistral => "mistral",
             ProviderKind::Google => "google",
             ProviderKind::Azure => "azure",
+            ProviderKind::VertexAi => "vertex_ai",
             ProviderKind::Groq => "groq",
             ProviderKind::Together => "together",
             ProviderKind::Fireworks => "fireworks",

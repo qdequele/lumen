@@ -30,6 +30,7 @@
 //! `docs/providers.md`.
 
 mod stream;
+pub mod vertex;
 
 use async_trait::async_trait;
 use bytes::Bytes;
