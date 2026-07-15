@@ -21,8 +21,6 @@ milestone.
   not modelled - only string and string-batch. Add if a provider needs it.
 - Rerank `documents` accepts only strings; Cohere also allows objects. Reduce
   object documents to text at the edge when a provider requires it.
-- Config: consider a `--check-config` subcommand that validates and exits, for
-  CI / deploy pipelines, once the CLI surface grows.
 - `error_type()` collapses 401/402/429 into `invalid_request` because the public
   taxonomy only has three `type`s. Fine per `CLAUDE.md`, but note it's coarse.
 - Acceptance criterion "boot < 100 ms" is verified manually (M1); fold a real
@@ -107,11 +105,14 @@ milestone.
   the mid-stream error-frame tests (`mid_stream_provider_error_becomes_terminal_error_frame`
   and `resilience.rs`).
 
-- **Tools on Gemini**: `translate_request` (google) silently ignores
-  `tools`/`tool_choice`, and the streaming translator reads only `parts[].text`
-  (a `functionCall` would be swallowed). Decide: map to Gemini
-  `functionDeclarations`, or reject explicitly (LM-2002) when `tools` is present
-  on a Google-routed model. Noted in the M4 review.
+- **Tools on Gemini**: RESOLVED (issue #4). `translate_request` (google) now
+  maps OpenAI `tools` to Gemini `tools[].functionDeclarations` and `tool_choice`
+  to `toolConfig.functionCallingConfig`; assistant `tool_calls` become
+  `functionCall` parts, role `tool` messages become `functionResponse` parts,
+  and both the non-streaming and streaming translators surface Gemini
+  `functionCall` parts as OpenAI `tool_calls`. Chose the full mapping over the
+  LM-2002 rejection. Covered by unit tests and wiremock round-trips in
+  `crates/server/tests/chat.rs`.
 
 ## Noted while building M5
 
@@ -199,11 +200,14 @@ milestone.
 
 ## Noted while building M8 (vision - image input to chat)
 
-- **Per-image token heuristic for the estimation fallback** (OpenAI tile
-  formula). The estimation fallback (upstream reports no `usage`) counts text
-  only; an image part contributes `0`. A per-image estimate needs decoded
+- **Per-image token heuristic for the estimation fallback - done** (issue #9).
+  The estimation fallback (upstream reports no `usage`) now adds a flat
+  per-image constant (`85` tokens for `"detail": "low"`, `765` for
+  `"high"`/`"auto"`/unset) instead of counting an image part as `0`. A true
+  per-dimension tile count (OpenAI's `85 + 170 * tiles`) still needs decoded
   pixel dimensions, which the gateway does not extract from a `data:` URI
-  today (out of scope - no image-byte inspection on the request path). See the
+  today and remains out of scope (no image-byte inspection on the request
+  path). See the
   [ADR 003 addendum](adr/003-token-accounting.md#addendum-m8--vision--image-input).
 - **Anthropic/Gemini file/GCS image URIs.** Only inline base64 (`data:` URIs)
   and, where the provider fetches it itself (Anthropic), remote `http(s)` URLs
@@ -236,9 +240,9 @@ milestone.
   loop) but a soft break of the 4xx/5xx separation (rule 8). Options if it ever
   bites: scan the whole chain in the pre-flight (rejects some primary-servable
   requests), or add a dedicated client-input `ProviderError` mapped to a 4xx.
-- **Per-image token heuristic for the estimation fallback.** When an upstream
-  reports no usage, image parts currently count `0` (text-only estimate). Add a
-  tile-based heuristic (OpenAI's ~85 base + 170/tile by resolution) so vision
-  requests aren't under-counted on no-usage upstreams.
+- **Per-image token heuristic for the estimation fallback - done** (issue #9,
+  see the note above under "M8 (vision - image input to chat)"). The remaining
+  gap is a true dimension-based tile count, which needs image decoding this
+  gateway deliberately does not do on the request path.
 - **Provider-native image URI forms.** Anthropic/Gemini file & GCS URI image
   sources (beyond inline base64 + remote URL) are not modelled.

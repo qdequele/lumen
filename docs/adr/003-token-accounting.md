@@ -88,20 +88,24 @@ order above; they sharpen what "estimation" means when tier 2 fires.
   Gemini all fold image tokens into their reported `prompt_tokens`, so a vision
   request with upstream-reported usage is exactly as accurate as a text-only
   one - no special-casing needed.
-- **The local estimation fallback counts text only.** When the upstream omits
-  usage, the heuristic estimator (`estimate_chat_prompt`, `crates/core/src/tokens.rs`)
-  sums `MessageContent::text()` per message - the concatenation of `text` parts.
-  An image part contributes **0** to that sum; only the message's fixed
-  per-message overhead is counted for an image-only message. The response is
-  still flagged `"estimated": true`, so the client is never told a number is
-  measured when it is not, but a vision-heavy request on a no-usage upstream is
-  undercounted.
-- **A per-image token heuristic (e.g. OpenAI's tile-based formula) is
-  deferred** - see `docs/backlog.md`. It would need to know image dimensions
-  (not always available: a `data:` URI encodes bytes, not decoded pixel
-  dimensions, without a decode step this gateway does not perform) and is out
-  of scope for this slice; the hot-path rule above (never decode/inspect image
-  bytes on the request path) still holds.
+- **The local estimation fallback counts text plus a flat per-image estimate.**
+  When the upstream omits usage, the heuristic estimator (`estimate_chat_prompt`,
+  `crates/core/src/tokens.rs`) sums `MessageContent::text()` per message (the
+  concatenation of `text` parts) plus, for every `image_url` part, a flat
+  per-image token constant chosen from the part's `detail` hint:
+  `"low"` -> `85` tokens (OpenAI's exact, resolution-independent low-detail
+  cost - no dimensions needed to reproduce it); `"high"`/`"auto"`/unset ->
+  `765` tokens, an approximation of OpenAI's `85 + 170 * tiles` tile formula
+  for a typical ~1024x1024 image. The response is still flagged
+  `"estimated": true`, so the client is never told a number is measured when
+  it is not.
+- **A true per-dimension tile count is still deferred** - see
+  `docs/backlog.md`. OpenAI's real high-detail formula depends on decoded
+  pixel dimensions, which a `data:` URI does not carry and this gateway does
+  not extract (the hot-path rule above - never decode/inspect image bytes on
+  the request path - still holds). The flat `765`-token constant is a
+  documented approximation, not an attempt at per-image precision; it trades
+  some accuracy for closing the "silently counts as 0" gap entirely.
 
 ## Addendum (M9 - multimodal embeddings)
 

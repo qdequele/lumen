@@ -256,8 +256,9 @@ async fn image_to_a_non_vision_model_is_rejected_with_lm_2003() {
 /// upstream byte-for-byte (no re-shaping), and - since this mock upstream
 /// reports no `usage` at all - the response still carries a non-zero,
 /// honestly-labelled `estimated` token count rather than a silent zero
-/// (ADR 003 §8: the text-only estimation fallback still fires for a vision
-/// request; only the image part contributes 0).
+/// (ADR 003 addendum: the estimation fallback fires for a vision request;
+/// the image part now contributes the flat per-image heuristic from
+/// `lumen_core::tokens`, not 0 - see issue #9).
 #[tokio::test]
 async fn openai_family_forwards_image_parts_verbatim() {
     let upstream = MockServer::start().await;
@@ -316,14 +317,14 @@ async fn openai_family_forwards_image_parts_verbatim() {
     assert_eq!(sent["messages"][0]["content"][0]["text"], "what is this?");
 
     // No upstream usage → the local estimator ran, flagged honestly, never a
-    // silent zero. The image part contributes 0 to the estimate (ADR 003
-    // addendum): "what is this?" (13 bytes) => 4 text tokens + the 4-token
-    // per-message overhead = 8, exactly what a text-only message would
-    // yield - pinning this value proves the image part is NOT silently
-    // double- or mis-counted, not merely that the count is positive.
+    // silent zero. "what is this?" (13 bytes) => 4 text tokens + the 4-token
+    // per-message overhead + the flat per-image heuristic (no `detail`, so
+    // the default 765-token estimate, issue #9) = 773 - pinning this value
+    // proves the image part is counted exactly once, at the documented
+    // amount, not silently dropped back to 0.
     let got: Value = resp.json().await.unwrap();
     assert_eq!(got["usage"]["estimated"], true);
-    assert_eq!(got["usage"]["prompt_tokens"], 8);
+    assert_eq!(got["usage"]["prompt_tokens"], 773);
 }
 
 #[tokio::test]
@@ -862,6 +863,137 @@ async fn gemini_streaming_translates_fragments_to_openai_chunks() {
     assert_eq!(chunks[2]["choices"][0]["delta"]["content"], "jour");
     assert_eq!(chunks[3]["choices"][0]["finish_reason"], "stop");
     assert_eq!(chunks[3]["usage"]["total_tokens"], 8);
+}
+
+#[tokio::test]
+async fn gemini_tool_calling_non_streaming_round_trip() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1beta/models/gemini-2.0-flash:generateContent"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "candidates": [{
+                "content": {
+                    "role": "model",
+                    "parts": [{
+                        "functionCall": { "name": "get_weather", "args": { "city": "Paris" } }
+                    }]
+                },
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 9, "candidatesTokenCount": 5, "totalTokenCount": 14
+            }
+        })))
+        .mount(&upstream)
+        .await;
+
+    let base = common::spawn_with(google_registry(&upstream.uri()), LIMIT).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&json!({
+            "model": "gemini",
+            "messages": [{ "role": "user", "content": "weather in Paris?" }],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Weather lookup",
+                    "parameters": {
+                        "type": "object",
+                        "properties": { "city": { "type": "string" } },
+                        "required": ["city"]
+                    }
+                }
+            }],
+            "tool_choice": "auto"
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    // Downstream: an OpenAI tool-call message with null content.
+    assert!(body["choices"][0]["message"]["content"].is_null());
+    let call = &body["choices"][0]["message"]["tool_calls"][0];
+    assert_eq!(call["type"], "function");
+    assert_eq!(call["function"]["name"], "get_weather");
+    assert_eq!(call["function"]["arguments"], "{\"city\":\"Paris\"}");
+    assert_eq!(body["choices"][0]["finish_reason"], "tool_calls");
+
+    // Upstream: OpenAI tools mapped to Gemini functionDeclarations + toolConfig.
+    let requests = upstream.received_requests().await.unwrap();
+    let sent: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    let decl = &sent["tools"][0]["functionDeclarations"][0];
+    assert_eq!(decl["name"], "get_weather");
+    assert_eq!(decl["parameters"]["properties"]["city"]["type"], "string");
+    assert_eq!(sent["toolConfig"]["functionCallingConfig"]["mode"], "AUTO");
+}
+
+#[tokio::test]
+async fn gemini_streaming_function_call_translates_to_tool_calls() {
+    let upstream = MockServer::start().await;
+    let body = [json!({
+        "candidates": [{
+            "content": {
+                "role": "model",
+                "parts": [{
+                    "functionCall": { "name": "get_weather", "args": { "city": "Paris" } }
+                }]
+            },
+            "finishReason": "STOP"
+        }],
+        "usageMetadata": {
+            "promptTokenCount": 9, "candidatesTokenCount": 5, "totalTokenCount": 14
+        }
+    })]
+    .iter()
+    .map(|data| format!("data: {data}\n\n"))
+    .collect::<String>();
+
+    Mock::given(method("POST"))
+        .and(path(
+            "/v1beta/models/gemini-2.0-flash:streamGenerateContent",
+        ))
+        .and(query_param("alt", "sse"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(body),
+        )
+        .mount(&upstream)
+        .await;
+
+    let base = common::spawn_with(google_registry(&upstream.uri()), LIMIT).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&json!({
+            "model": "gemini",
+            "messages": [{ "role": "user", "content": "weather in Paris?" }],
+            "tools": [{
+                "type": "function",
+                "function": { "name": "get_weather" }
+            }],
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let text = resp.text().await.unwrap();
+
+    assert!(text.ends_with("data: [DONE]\n\n"), "got: {text}");
+    let chunks = sse_data_frames(&text);
+    // role, tool-call delta, finish.
+    assert_eq!(chunks.len(), 3, "got: {text}");
+    assert_eq!(chunks[0]["choices"][0]["delta"]["role"], "assistant");
+    let call = &chunks[1]["choices"][0]["delta"]["tool_calls"][0];
+    assert_eq!(call["index"], 0);
+    assert_eq!(call["function"]["name"], "get_weather");
+    assert_eq!(call["function"]["arguments"], "{\"city\":\"Paris\"}");
+    assert_eq!(chunks[2]["choices"][0]["finish_reason"], "tool_calls");
 }
 
 #[tokio::test]
