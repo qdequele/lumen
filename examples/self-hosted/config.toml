@@ -1,0 +1,33 @@
+# Fully self-hosted, no API keys: Ollama (chat via its OpenAI-compatible
+# endpoint, embeddings natively) + TEI (rerank). Works offline.
+[[providers]]
+name = "ollama-openai"
+kind = "vllm"                       # any OpenAI-compatible server
+base_url = "http://localhost:11434/v1"
+first_token_timeout_ms = 60000      # first call may load the model into VRAM
+total_timeout_ms = 120000
+
+[[providers.models]]
+id = "llama"
+upstream_id = "llama3.2"
+capabilities = ["chat"]
+
+[[providers]]
+name = "ollama-native"
+kind = "ollama"
+base_url = "http://localhost:11434"
+
+[[providers.models]]
+id = "nomic-embed"
+upstream_id = "nomic-embed-text"
+capabilities = ["embed"]
+
+[[providers]]
+name = "tei"
+kind = "tei"
+base_url = "http://localhost:8081"
+
+[[providers.models]]
+id = "bge-reranker"
+upstream_id = "BAAI/bge-reranker-large"
+capabilities = ["rerank"]

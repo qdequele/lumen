@@ -1,0 +1,10 @@
+# Minimal chat: one provider, one model. Needs OPENAI_API_KEY.
+[[providers]]
+name = "openai"
+kind = "openai"
+api_key_env = "OPENAI_API_KEY"
+
+[[providers.models]]
+id = "gpt-4o"
+upstream_id = "gpt-4o-2024-08-06"
+capabilities = ["chat"]

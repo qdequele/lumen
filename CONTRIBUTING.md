@@ -38,6 +38,19 @@ cargo build --workspace
 cargo run -p server -- --config config.example.toml   # run locally
 ```
 
+### Documentation site
+
+The docs in `docs/` build into an mdBook published at
+<https://qdequele.github.io/lumen/> (see `.github/workflows/docs.yml`).
+To work on them locally:
+
+```bash
+cargo install mdbook
+mdbook serve --open     # live-reloading preview from the repo root
+```
+
+`docs/SUMMARY.md` is the navigation; a page not listed there does not appear.
+
 ## Validation - must pass before you open a PR
 
 ```bash

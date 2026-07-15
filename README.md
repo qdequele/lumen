@@ -18,6 +18,10 @@ head-to-head against LiteLLM under load ships in [`bench/`](bench/README.md);
 the honest numbers and the method are in
 [`docs/perf-baseline.md`](docs/perf-baseline.md).
 
+**Full documentation: <https://qdequele.github.io/lumen/>** - guides per
+capability, operations (analytics, budgets, resilience), examples, and
+reference.
+
 ## Contents
 
 - [Capabilities & API](#capabilities--api)
@@ -52,7 +56,9 @@ OpenAI-family kinds and `vllm` forward image parts verbatim; `anthropic` and
 
 ## 5-minute quickstart
 
-Zero to a successful **chat + embed + rerank** request.
+Zero to a successful **chat + embed + rerank** request. For ready-made
+scenario configs (RAG, multi-tenant, fallback chains, …), see
+[`examples/`](examples/).
 
 ### 1. Write a minimal `config.toml`
 
@@ -203,53 +209,33 @@ Off by default - with `[auth].enabled = false` the gateway is an open proxy with
 no database at all. When enabled (requires `LUMEN_MASTER_KEY`, 64 hex
 chars), it adds **virtual keys**, **hard budgets** and **RPM/TPM quotas**, all
 enforced **in memory before any upstream call**, so a rejected request never
-spends. The DB is never on the request path. Refusals are `402 LM-4001`
-(budget), `429 LM-4002` (RPM), `429 LM-4003` (TPM); a missing/invalid key is
-`401 LM-4004`. Keys and budgets are managed via the `/admin/*` API, gated by the
-master key. See [`SECURITY.md`](SECURITY.md).
+spends. See [Keys, quotas & budgets](https://qdequele.github.io/lumen/operations/keys-budgets.html).
 
 ### Resilience
 
 Survives flaky upstreams without becoming flaky itself: **retries** with
 exponential backoff + jitter (retryable failures only, never a client 4xx),
 per-model **fallback chains**, a per-`(provider, model)` **circuit breaker**, and
-three distinct **per-phase timeouts** (`LM-3012` connect, `LM-3011` first-token,
-`LM-3013` total). Optional **background health checks** publish
-`GET /health/providers`. The model that actually served a request is reported in
-the `x-lumen-model-used` response header. All configured under
-`[resilience]`; design in [ADR 005](docs/adr/005-resilience-execution.md).
+per-phase timeouts. Optional **background health checks** publish
+`GET /health/providers`. See [Resilience tuning](https://qdequele.github.io/lumen/operations/resilience.html).
 
 ### Observability & token accounting (ADR 003)
 
 **Every** request of every capability produces a token count - upstream usage
 when reported, otherwise a local byte-heuristic estimate flagged
 `"estimated": true`. Never a silent zero. Surfaced three ways: in the response
-body, on `/metrics`, and (when auth is on) in the `usage_log` table. Key
-metrics: `lumen_tokens_total{capability,model,provider,direction,estimated}`,
-`lumen_rerank_search_units_total`, `lumen_circuit_state{provider,model}`,
-`lumen_provider_up{provider}`, `lumen_usage_log_dropped_total`,
-`lumen_config_reloads_total` / `lumen_config_reload_failures_total`. The
-usage log is written on a bounded async channel that **drops rather than blocks**
-the request path, and stores token counts, cost and metadata labels - **never
-message content**. See [ADR 003](docs/adr/003-token-accounting.md) and
-[ADR 002](docs/adr/002-request-metadata-header.md) for the `x-lumen-metadata`
-header.
+body, on `/metrics`, and (when auth is on) in the `usage_log` table. See
+[Token accounting & cost](https://qdequele.github.io/lumen/operations/token-accounting.html)
+and [Metrics & dashboards](https://qdequele.github.io/lumen/operations/metrics.html).
 
 ### Config hot reload
 
 `SIGHUP`, a file-watch, or an admin provider-key rotation triggers a reload: the
 new config is validated, then the provider registry, price table, resilience
-policy and the runtime-safe `[auth]` knobs (`flush_interval_ms`,
-`retention_days`) are atomically swapped, and DB-stored provider keys are
-re-read. In-flight requests are unaffected. An invalid config is **rejected** -
-the old config keeps serving and `lumen_config_reload_failures_total` increments.
-
-Rotating a DB-stored provider key with `PUT /admin/provider-keys/{name}` applies
-without a restart (the handler requests a reload that re-reads the key from the
-encrypted store). Environment-sourced keys keep precedence. Restart-only, by
-design: the server bind address, `auth.enabled`, `auth.db_path`, and the bounded
-usage-log channel knobs (`usage_channel_capacity`, `usage_batch_max`,
-`usage_flush_ms`).
+policy and the runtime-safe `[auth]` knobs are atomically swapped; in-flight
+requests are unaffected. An invalid config is **rejected** - the old config
+keeps serving. See
+[Deployment](https://qdequele.github.io/lumen/operations/deployment.html).
 
 ### `--check-config`
 
@@ -257,32 +243,22 @@ usage-log channel knobs (`usage_channel_capacity`, `usage_batch_max`,
 the server does at boot (parsing, semantic validation and provider registry
 construction) and exits: `0` if valid, non-zero otherwise. It binds no
 listener, opens no database, and contacts no provider, so it is safe to run
-in a CI or deploy pipeline ahead of a real boot:
-
-```bash
-lumen --check-config --config config.toml
-```
+in a CI or deploy pipeline ahead of a real boot. See
+[Installation](https://qdequele.github.io/lumen/getting-started/installation.html).
 
 ### Security headers
 
-Every response carries `X-Content-Type-Options: nosniff`,
-`X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, and
-`Content-Security-Policy: default-src 'none'`. TLS is intentionally left to a
-terminating reverse proxy - see [`SECURITY.md`](SECURITY.md).
+Every response carries a standard set of security headers. TLS is
+intentionally left to a terminating reverse proxy. See
+[Deployment](https://qdequele.github.io/lumen/operations/deployment.html).
 
 ## Configuration
 
 Everything is one TOML file (plus `LUMEN_*` env overrides, using `__` for
-nesting, e.g. `LUMEN_SERVER__PORT=9090`). The exhaustively commented
-reference is [`config.example.toml`](config.example.toml), with sections:
-
-- `log_format` - `"pretty"` (default) or `"json"`.
-- `[server]` - bind host/port, body limit, first-token timeout, SSE heartbeat.
-- `[auth]` - virtual keys, budgets, quotas, usage log (off by default).
-- `[telemetry]` - which `x-lumen-metadata` keys become Prometheus labels.
-- `[resilience]` - retries, circuit breaker, timeouts, health checks.
-- `[[providers]]` / `[[providers.models]]` - upstreams, model ids, capabilities,
-  prices, and per-model `fallbacks`.
+nesting, e.g. `LUMEN_SERVER__PORT=9090`). The exhaustively commented reference
+is [`config.example.toml`](config.example.toml); the full walkthrough lives in
+the book's
+[Configuration basics](https://qdequele.github.io/lumen/getting-started/configuration.html).
 
 API keys are **never** written in the config - a provider references the *name*
 of the env var that holds its key.
@@ -327,6 +303,8 @@ Vulnerability reporting and the full security model are in
 - Performance: [`docs/perf-baseline.md`](docs/perf-baseline.md)
 - Architecture decisions: [`docs/adr/`](docs/adr/)
 - Changelog: [`CHANGELOG.md`](CHANGELOG.md)
+- Examples: [examples/](examples/)
+- Documentation site: <https://qdequele.github.io/lumen/>
 
 ## License
 

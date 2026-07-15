@@ -84,3 +84,27 @@ jobs:
         uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check advisories licenses sources
+
+  examples:
+    name: example configs
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      # --check-config needs no env vars: provider keys are only read when a
+      # request routes to a provider, and the master key only at real boot.
+      - name: Validate every example config
+        run: |
+          cargo build -q -p server --bin lumen
+          for cfg in examples/*/config.toml; do
+            echo "== $cfg"
+            ./target/debug/lumen --check-config --config "$cfg"
+          done

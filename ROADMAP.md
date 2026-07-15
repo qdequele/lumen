@@ -90,7 +90,7 @@ image via buildx CI; arm64 verified locally (`docker run`).
 
 Note: a per-image token heuristic (OpenAI tile formula) and file/GCS URIs
 (Anthropic/Gemini) are deferred - see `docs/backlog.md`.
-Spec: `docs/superpowers/specs/2026-07-14-vision-image-input-design.md`.
+Spec: `specs/design/2026-07-14-vision-image-input-design.md`.
 
 ## M9 - Multimodal embeddings + guarded image fetch ✅
 - [x] `EmbedInput` widened to content-parts (text + image, mixable), reusing the
@@ -108,7 +108,7 @@ Spec: `docs/superpowers/specs/2026-07-14-vision-image-input-design.md`.
 - [x] Media accounting (billing dimension): media count + DECODED bytes per type in
       Prometheus (`lumen_media_total`, `lumen_media_bytes_total`), the `lumen::usage`
       log, and `usage_log` (`media_count`/`media_bytes` columns, migration 0003)
-Spec: `docs/superpowers/specs/2026-07-14-multimodal-embeddings-design.md`
+Spec: `specs/design/2026-07-14-multimodal-embeddings-design.md`
 
 Note: a conscious, bounded exception to the "never dereference a URL" rule -
 opt-in, off the streaming hot path, time-bounded. Chat vision (M8) keeps

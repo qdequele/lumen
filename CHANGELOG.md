@@ -334,6 +334,13 @@ All notable changes to LUMEN are documented here. The format is based on
 - `base_url` is required for `azure` (every Azure resource endpoint is
   operator-specific; there is no shared public default).
 - `config.example.toml` and `docs/providers.md` updated with a worked example.
+### Changed
+
+- Documentation restructured around capabilities: the mdBook at
+  https://qdequele.github.io/lumen/ is now the canonical documentation home
+  (getting started, chat / embeddings / reranking guides, operations incl.
+  analytics and budgets, examples); the README slimmed down accordingly.
+  Added runnable `examples/` scenarios validated in CI by `--check-config`.
 
 ### Added - Provider-native file/GCS image URI sources (issue #12)
 

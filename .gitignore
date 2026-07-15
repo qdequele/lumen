@@ -11,6 +11,7 @@
 *.db-shm
 *.db-wal
 *.sqlite
+examples-multi-tenant.db
 
 # Env files
 .env

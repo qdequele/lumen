@@ -1,6 +1,6 @@
 # Providers
 
-LUMEN ships twenty-two built-in provider kinds - eleven native integrations
+LUMEN ships twenty-six built-in provider kinds - fifteen native integrations
 (their own request/response translation, including deployment-routed `azure`
 and SigV4-signed `bedrock`) plus eleven **OpenAI-compatible** hosts that reuse
 the OpenAI path with a per-kind base URL. Each `[[providers]]` block in your
@@ -667,8 +667,11 @@ rejected with `LM-2003` (400, see `docs/errors.md`) before any upstream call.
 | Provider family | `data:` (inline base64) | `http(s)` URL |
 |---|---|---|
 | OpenAI-family (`openai` + the OpenAI-compatible kinds) and `vllm` | forwarded verbatim | forwarded verbatim |
+| `azure` | forwarded verbatim (OpenAI wire schema) | forwarded verbatim |
 | `anthropic` | translated to a `base64` image source block | translated to a `url` image source block (Anthropic fetches it) |
 | `google` (Gemini) | translated to `inline_data` | rejected - `LM-2004` |
+| `vertex_ai` | translated to `inline_data` (same as `google`) | rejected - `LM-2004` |
+| `bedrock` | translated to a Converse image block (`png`/`jpeg`/`gif`/`webp`) | rejected - `LM-2004` |
 
 **Never-fetch rule.** LUMEN never dereferences a user-supplied image URL
 itself - doing so would be an SSRF vector (the gateway could be aimed at
@@ -720,10 +723,12 @@ confidently inferred from the URI's file extension (`.png`, `.jpg`, ...);
 otherwise it is omitted rather than guessed. Files API URIs carry no
 extension, and Gemini already knows the mime type recorded at upload time.
 
-**Accounting.** Upstream-reported `usage` already folds in image tokens; when
-an upstream reports no usage, the local estimation fallback counts text only
-(images contribute `0`) and the response is still flagged `"estimated": true` -
-see the [ADR 003 addendum](adr/003-token-accounting.md#addendum-m8--vision--image-input).
+**Accounting.** Upstream-reported `usage` is authoritative and already folds in
+image tokens. When an upstream reports no usage at all, the local estimation
+fallback counts each image content part with a flat per-image heuristic (85
+tokens at `"detail": "low"`, 765 tokens otherwise) rather than counting it as
+zero, and the response is still flagged `"estimated": true` - see the
+[ADR 003 addendum](adr/003-token-accounting.md#addendum-m8--vision--image-input).
 
 ## Fallbacks across providers
 
