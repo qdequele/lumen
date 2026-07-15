@@ -39,6 +39,7 @@ use lumen_core::{
     ProviderError, Usage,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::fmt;
 use tokio_util::sync::CancellationToken;
 
@@ -101,6 +102,34 @@ struct GeminiRequest {
     system_instruction: Option<GeminiSystem>,
     #[serde(rename = "generationConfig", skip_serializing_if = "Option::is_none")]
     generation_config: Option<GeminiGenerationConfig>,
+    /// OpenAI `tools` become one `tools[]` entry holding all
+    /// `functionDeclarations`; omitted when the request carries no tools.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tools: Vec<GeminiTool>,
+    /// OpenAI `tool_choice` becomes `toolConfig.functionCallingConfig`;
+    /// omitted (upstream default `AUTO` applies) when absent or unrecognised.
+    #[serde(rename = "toolConfig", skip_serializing_if = "Option::is_none")]
+    tool_config: Option<serde_json::Value>,
+}
+
+/// A Gemini `tools[]` entry. Gemini nests every function under one entry's
+/// `functionDeclarations` array (unlike OpenAI's flat `tools` list).
+#[derive(Serialize)]
+struct GeminiTool {
+    #[serde(rename = "functionDeclarations")]
+    function_declarations: Vec<GeminiFunctionDeclaration>,
+}
+
+/// One Gemini function declaration: `{name, description?, parameters?}`, where
+/// `parameters` is an OpenAPI-subset JSON schema (OpenAI's `parameters` maps
+/// across directly).
+#[derive(Serialize)]
+struct GeminiFunctionDeclaration {
+    name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parameters: Option<serde_json::Value>,
 }
 
 #[derive(Serialize)]
@@ -122,6 +151,13 @@ struct GeminiPart {
     inline_data: Option<GeminiInlineData>,
     #[serde(rename = "file_data", skip_serializing_if = "Option::is_none")]
     file_data: Option<GeminiFileData>,
+    /// An assistant tool call: `{ "name": ..., "args": {...} }`. Mutually
+    /// exclusive with the other fields.
+    #[serde(rename = "functionCall", skip_serializing_if = "Option::is_none")]
+    function_call: Option<serde_json::Value>,
+    /// A tool result fed back to the model: `{ "name": ..., "response": {...} }`.
+    #[serde(rename = "functionResponse", skip_serializing_if = "Option::is_none")]
+    function_response: Option<serde_json::Value>,
 }
 
 #[derive(Serialize)]
@@ -153,6 +189,8 @@ impl GeminiPart {
             text: Some(s),
             inline_data: None,
             file_data: None,
+            function_call: None,
+            function_response: None,
         }
     }
 
@@ -162,6 +200,30 @@ impl GeminiPart {
             text: None,
             inline_data: Some(GeminiInlineData { mime_type, data }),
             file_data: None,
+            function_call: None,
+            function_response: None,
+        }
+    }
+
+    /// An assistant tool-call part (`functionCall`).
+    fn function_call(name: &str, args: &serde_json::Value) -> Self {
+        Self {
+            text: None,
+            inline_data: None,
+            file_data: None,
+            function_call: Some(json!({ "name": name, "args": args })),
+            function_response: None,
+        }
+    }
+
+    /// A tool-result part (`functionResponse`). `response` must be a JSON object.
+    fn function_response(name: &str, response: &serde_json::Value) -> Self {
+        Self {
+            text: None,
+            inline_data: None,
+            file_data: None,
+            function_call: None,
+            function_response: Some(json!({ "name": name, "response": response })),
         }
     }
 
@@ -174,6 +236,8 @@ impl GeminiPart {
                 mime_type,
                 file_uri,
             }),
+            function_call: None,
+            function_response: None,
         }
     }
 }
@@ -235,6 +299,18 @@ struct GeminiResponseContent {
 struct GeminiResponsePart {
     #[serde(default)]
     text: String,
+    #[serde(rename = "functionCall", default)]
+    function_call: Option<GeminiFunctionCall>,
+}
+
+/// A model-emitted tool call: Gemini returns the arguments as a JSON object
+/// (OpenAI carries them as a JSON string, so [`translate_response`] re-encodes).
+#[derive(Deserialize)]
+struct GeminiFunctionCall {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    args: serde_json::Value,
 }
 
 #[derive(Default, Deserialize)]
@@ -263,10 +339,24 @@ fn map_finish_reason(reason: Option<&str>) -> Option<String> {
 /// Build the Gemini request body from an OpenAI-shaped [`ChatRequest`].
 ///
 /// # Errors
-/// Returns [`ProviderError::Translation`] if a message carries a remote
-/// (`http`/`https`) image URL - Gemini accepts only inline base64 image
-/// bytes, and the gateway never fetches a URL on the caller's behalf.
-fn translate_request(req: &ChatRequest) -> Result<GeminiRequest, ProviderError> {
+/// Returns [`ProviderError::ImageUrlNotSupported`] if a message carries a
+/// remote (`http`/`https`) image URL - Gemini accepts only inline base64
+/// image bytes, and the gateway never fetches a URL on the caller's behalf.
+/// `provider_name` names the attempted link (which may be a fallback, not the
+/// route the LM-2004 pre-flight checked - GH #13) so the error is attributed
+/// correctly.
+fn translate_request(
+    req: &ChatRequest,
+    provider_name: &str,
+) -> Result<GeminiRequest, ProviderError> {
+    // Tool traffic maps to parts: assistant `tool_calls` -> `functionCall`
+    // (role `model`), role `tool` -> `functionResponse` (role `user`,
+    // consecutive results merge into one content, matching Gemini's
+    // user/model alternation). A `tool_call_id` -> function-name map lets a
+    // `functionResponse` recover the name Gemini requires (OpenAI carries it
+    // only on the originating `tool_call`).
+    let mut tool_names: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     let mut system_parts: Vec<GeminiPart> = Vec::new();
     let mut contents: Vec<GeminiContent> = Vec::new();
     for m in &req.messages {
@@ -281,6 +371,14 @@ fn translate_request(req: &ChatRequest) -> Result<GeminiRequest, ProviderError> 
                     system_parts.push(GeminiPart::text(text));
                 }
             }
+            "tool" => push_tool_result(&mut contents, &tool_names, m, &text),
+            "assistant"
+                if m.extra
+                    .get("tool_calls")
+                    .is_some_and(serde_json::Value::is_array) =>
+            {
+                push_assistant_tool_calls(&mut contents, &mut tool_names, m, &text);
+            }
             // OpenAI's `assistant` is Gemini's `model`; everything else → user.
             role => contents.push(GeminiContent {
                 role: if role == "assistant" {
@@ -288,7 +386,7 @@ fn translate_request(req: &ChatRequest) -> Result<GeminiRequest, ProviderError> 
                 } else {
                     "user".to_owned()
                 },
-                parts: gemini_parts(m.content.as_ref(), &text)?,
+                parts: gemini_parts(m.content.as_ref(), &text, provider_name)?,
             }),
         }
     }
@@ -315,15 +413,163 @@ fn translate_request(req: &ChatRequest) -> Result<GeminiRequest, ProviderError> 
             })
         },
         generation_config: Some(generation_config),
+        tools: translate_tools(req),
+        tool_config: req.extra.get("tool_choice").and_then(translate_tool_choice),
     })
 }
 
+/// Append a role-`tool` message as a Gemini `functionResponse` part, merging
+/// into the previous user content when it already holds tool results (Gemini
+/// expects strict user/model alternation).
+fn push_tool_result(
+    contents: &mut Vec<GeminiContent>,
+    tool_names: &std::collections::HashMap<String, String>,
+    m: &ChatMessage,
+    text: &str,
+) {
+    let call_id = m
+        .extra
+        .get("tool_call_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    // Prefer the name recorded from the assistant call, then an explicit
+    // `name`, then the id itself as a last resort.
+    let name = tool_names
+        .get(call_id)
+        .cloned()
+        .or_else(|| m.name.clone())
+        .unwrap_or_else(|| call_id.to_owned());
+    let part = GeminiPart::function_response(&name, &tool_response_value(text));
+    match contents.last_mut() {
+        Some(prev)
+            if prev.role == "user" && prev.parts.iter().any(|p| p.function_response.is_some()) =>
+        {
+            prev.parts.push(part);
+        }
+        _ => contents.push(GeminiContent {
+            role: "user".to_owned(),
+            parts: vec![part],
+        }),
+    }
+}
+
+/// Append an assistant message carrying `tool_calls` as a Gemini `model`
+/// content with `functionCall` parts (preceded by a text part when present),
+/// recording each call id -> name so a later `functionResponse` can name it.
+fn push_assistant_tool_calls(
+    contents: &mut Vec<GeminiContent>,
+    tool_names: &mut std::collections::HashMap<String, String>,
+    m: &ChatMessage,
+    text: &str,
+) {
+    let mut parts = Vec::new();
+    if !text.is_empty() {
+        parts.push(GeminiPart::text(text.to_owned()));
+    }
+    if let Some(calls) = m.extra.get("tool_calls").and_then(|v| v.as_array()) {
+        for call in calls {
+            let name = call
+                .pointer("/function/name")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            if let Some(id) = call.get("id").and_then(|v| v.as_str()) {
+                tool_names.insert(id.to_owned(), name.to_owned());
+            }
+            parts.push(GeminiPart::function_call(
+                name,
+                &parse_tool_arguments(call.pointer("/function/arguments")),
+            ));
+        }
+    }
+    contents.push(GeminiContent {
+        role: "model".to_owned(),
+        parts,
+    });
+}
+
+/// OpenAI tool-call `arguments` is a JSON *string*; Gemini `args` is the object
+/// itself. Unparseable or absent arguments degrade to an empty object.
+fn parse_tool_arguments(arguments: Option<&serde_json::Value>) -> serde_json::Value {
+    arguments
+        .and_then(|v| v.as_str())
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_else(|| json!({}))
+}
+
+/// A tool result is an opaque string to OpenAI, but Gemini's `functionResponse`
+/// `response` must be a JSON *object*. A result that already is a JSON object
+/// passes through; anything else is wrapped as `{ "result": <text> }`.
+fn tool_response_value(text: &str) -> serde_json::Value {
+    match serde_json::from_str::<serde_json::Value>(text) {
+        Ok(v @ serde_json::Value::Object(_)) => v,
+        _ => json!({ "result": text }),
+    }
+}
+
+/// OpenAI `tools` (`{type: "function", function: {name, description,
+/// parameters}}`) → one Gemini `tools[]` entry whose `functionDeclarations`
+/// hold every function. Non-function entries are skipped.
+fn translate_tools(req: &ChatRequest) -> Vec<GeminiTool> {
+    let Some(tools) = req.extra.get("tools").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    let declarations: Vec<GeminiFunctionDeclaration> = tools
+        .iter()
+        .filter_map(|tool| {
+            let function = tool.get("function")?;
+            Some(GeminiFunctionDeclaration {
+                name: function.get("name")?.as_str()?.to_owned(),
+                description: function
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned),
+                parameters: function.get("parameters").cloned(),
+            })
+        })
+        .collect();
+    if declarations.is_empty() {
+        Vec::new()
+    } else {
+        vec![GeminiTool {
+            function_declarations: declarations,
+        }]
+    }
+}
+
+/// OpenAI `tool_choice` → Gemini `toolConfig.functionCallingConfig`. Unknown
+/// shapes are dropped (the upstream default, `AUTO`, applies) rather than
+/// guessed.
+fn translate_tool_choice(choice: &serde_json::Value) -> Option<serde_json::Value> {
+    match choice {
+        serde_json::Value::String(s) => match s.as_str() {
+            "auto" => Some(json!({ "functionCallingConfig": { "mode": "AUTO" } })),
+            "required" => Some(json!({ "functionCallingConfig": { "mode": "ANY" } })),
+            "none" => Some(json!({ "functionCallingConfig": { "mode": "NONE" } })),
+            _ => None,
+        },
+        serde_json::Value::Object(_) => choice
+            .pointer("/function/name")
+            .and_then(|v| v.as_str())
+            .map(|name| {
+                json!({
+                    "functionCallingConfig": {
+                        "mode": "ANY",
+                        "allowedFunctionNames": [name],
+                    }
+                })
+            }),
+        _ => None,
+    }
+}
+
 /// Build Gemini `parts` from a message: data-URI images become `inline_data`;
-/// a remote image URL is a translation error (Gemini takes only inline bytes,
-/// and the gateway never fetches the URL). Text-only content is one text part.
+/// a remote image URL is a client-input error (LM-2004 - Gemini takes only
+/// inline bytes, and the gateway never fetches the URL). Text-only content is
+/// one text part.
 fn gemini_parts(
     content: Option<&MessageContent>,
     text: &str,
+    provider_name: &str,
 ) -> Result<Vec<GeminiPart>, ProviderError> {
     match content {
         Some(MessageContent::Parts(parts)) if parts.iter().any(|p| p.image_url.is_some()) => {
@@ -336,12 +582,11 @@ fn gemini_parts(
                         out.push(GeminiPart::file(uri.to_owned(), mime_type));
                         continue;
                     }
-                    let data = img.as_data_uri().ok_or_else(|| {
-                        ProviderError::Translation(
-                            "Gemini requires inline base64 image data or a gemini-native file/GCS URI; remote image URLs are not supported"
-                                .to_owned(),
-                        )
-                    })?;
+                    let data =
+                        img.as_data_uri()
+                            .ok_or_else(|| ProviderError::ImageUrlNotSupported {
+                                provider: provider_name.to_owned(),
+                            })?;
                     out.push(GeminiPart::image(data.media_type, data.base64_data));
                 } else if p.kind == "text" {
                     if let Some(t) = &p.text {
@@ -369,13 +614,50 @@ fn collect_stop_sequences(stop: &serde_json::Value) -> Vec<String> {
 
 /// Build an OpenAI-shaped [`ChatResponse`] from a Gemini response.
 fn translate_response(resp: GeminiResponse, requested_model: &str) -> ChatResponse {
-    let candidate = resp.candidates.into_iter().next();
-    let (content, finish_reason) = candidate
-        .map(|c| {
-            let text: String = c.content.parts.into_iter().map(|p| p.text).collect();
-            (text, map_finish_reason(c.finish_reason.as_deref()))
-        })
-        .unwrap_or_default();
+    let mut text = String::new();
+    let mut tool_calls: Vec<serde_json::Value> = Vec::new();
+    let mut finish_reason = None;
+    if let Some(candidate) = resp.candidates.into_iter().next() {
+        finish_reason = map_finish_reason(candidate.finish_reason.as_deref());
+        for part in candidate.content.parts {
+            if let Some(call) = part.function_call {
+                // Gemini omits a call id; synthesize a stable, per-response one.
+                let index = tool_calls.len();
+                let args = if call.args.is_null() {
+                    json!({})
+                } else {
+                    call.args
+                };
+                tool_calls.push(json!({
+                    "id": format!("call_{index}"),
+                    "type": "function",
+                    "function": {
+                        "name": call.name,
+                        // OpenAI carries arguments as a JSON string.
+                        "arguments": args.to_string(),
+                    },
+                }));
+            } else {
+                text.push_str(&part.text);
+            }
+        }
+    }
+
+    let mut extra = serde_json::Map::new();
+    if !tool_calls.is_empty() {
+        // Gemini reports `STOP` even for tool calls; OpenAI expects `tool_calls`.
+        finish_reason = Some("tool_calls".to_owned());
+        extra.insert(
+            "tool_calls".to_owned(),
+            serde_json::Value::Array(tool_calls),
+        );
+    }
+    // OpenAI uses `content: null` for pure tool-call messages.
+    let content = if text.is_empty() && !extra.is_empty() {
+        None
+    } else {
+        Some(MessageContent::Text(text))
+    };
 
     let usage = Usage {
         prompt_tokens: resp.usage_metadata.prompt,
@@ -393,9 +675,9 @@ fn translate_response(resp: GeminiResponse, requested_model: &str) -> ChatRespon
             index: 0,
             message: ChatMessage {
                 role: "assistant".to_owned(),
-                content: Some(MessageContent::Text(content)),
+                content,
                 name: None,
-                extra: serde_json::Map::new(),
+                extra,
             },
             finish_reason,
         }],
@@ -416,7 +698,7 @@ impl ChatProvider for GoogleProvider {
             "{}/v1beta/models/{}:generateContent",
             self.base_url, req.model
         );
-        let body = translate_request(&req)?;
+        let body = translate_request(&req, &self.provider_name)?;
         let headers = [("x-goog-api-key", self.api_key.as_deref().unwrap_or(""))];
 
         let bytes = post_json_with_headers(
@@ -483,7 +765,7 @@ impl GoogleProvider {
             "{}/v1beta/models/{}:streamGenerateContent?alt=sse",
             self.base_url, req.model
         );
-        let body = translate_request(&req)?;
+        let body = translate_request(&req, &self.provider_name)?;
         let headers = [("x-goog-api-key", self.api_key.as_deref().unwrap_or(""))];
 
         let bytes = open_stream_with_headers(
@@ -532,12 +814,15 @@ mod tests {
 
     #[test]
     fn request_maps_roles_and_hoists_system() {
-        let out = translate_request(&request(vec![
-            msg("system", "be brief"),
-            msg("user", "hi"),
-            msg("assistant", "hello"),
-            msg("user", "more"),
-        ]))
+        let out = translate_request(
+            &request(vec![
+                msg("system", "be brief"),
+                msg("user", "hi"),
+                msg("assistant", "hello"),
+                msg("user", "more"),
+            ]),
+            "google",
+        )
         .unwrap();
         assert_eq!(
             out.system_instruction.as_ref().unwrap().parts[0]
@@ -563,9 +848,11 @@ mod tests {
                     parts: vec![
                         GeminiResponsePart {
                             text: "Hello ".to_owned(),
+                            function_call: None,
                         },
                         GeminiResponsePart {
                             text: "there".to_owned(),
+                            function_call: None,
                         },
                     ],
                 },
@@ -636,15 +923,173 @@ mod tests {
             stream: false,
             extra: serde_json::Map::new(),
         };
-        let body = serde_json::to_value(translate_request(&req).unwrap()).unwrap();
+        let body = serde_json::to_value(translate_request(&req, "google").unwrap()).unwrap();
         let parts = &body["contents"][0]["parts"];
         assert_eq!(parts[0]["text"], "what?");
         assert_eq!(parts[1]["inline_data"]["mime_type"], "image/jpeg");
         assert_eq!(parts[1]["inline_data"]["data"], "/9j/");
     }
 
+    /// An OpenAI request WITH tools translates to the exact expected Gemini
+    /// JSON: `tools[].functionDeclarations`, `toolConfig`, an assistant
+    /// `functionCall` part, and a `functionResponse` part (request side).
     #[test]
-    fn remote_url_image_is_a_translation_error() {
+    fn request_with_tools_matches_expected_gemini_json_exactly() {
+        let mut assistant_extra = serde_json::Map::new();
+        assistant_extra.insert(
+            "tool_calls".to_owned(),
+            json!([{
+                "id": "call_1",
+                "type": "function",
+                "function": { "name": "get_weather", "arguments": "{\"city\":\"Paris\"}" }
+            }]),
+        );
+        let mut tool_extra = serde_json::Map::new();
+        tool_extra.insert("tool_call_id".to_owned(), json!("call_1"));
+
+        let mut extra = serde_json::Map::new();
+        extra.insert(
+            "tools".to_owned(),
+            json!([{
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Weather lookup",
+                    "parameters": {
+                        "type": "object",
+                        "properties": { "city": { "type": "string" } },
+                        "required": ["city"]
+                    }
+                }
+            }]),
+        );
+        extra.insert("tool_choice".to_owned(), json!("auto"));
+
+        let req = ChatRequest {
+            model: "gemini-2.0".to_owned(),
+            messages: vec![
+                msg("system", "be brief"),
+                msg("user", "weather in Paris?"),
+                ChatMessage {
+                    role: "assistant".to_owned(),
+                    content: None,
+                    name: None,
+                    extra: assistant_extra,
+                },
+                ChatMessage {
+                    role: "tool".to_owned(),
+                    content: Some(MessageContent::Text("18C, sunny".to_owned())),
+                    name: None,
+                    extra: tool_extra,
+                },
+            ],
+            temperature: None,
+            top_p: None,
+            max_tokens: Some(1024),
+            n: None,
+            stop: None,
+            stream: false,
+            extra,
+        };
+
+        let out = serde_json::to_value(translate_request(&req, "google").unwrap()).unwrap();
+        assert_eq!(
+            out,
+            json!({
+                "contents": [
+                    { "role": "user", "parts": [{ "text": "weather in Paris?" }] },
+                    { "role": "model", "parts": [{
+                        "functionCall": { "name": "get_weather", "args": { "city": "Paris" } }
+                    }] },
+                    { "role": "user", "parts": [{
+                        "functionResponse": {
+                            "name": "get_weather",
+                            "response": { "result": "18C, sunny" }
+                        }
+                    }] }
+                ],
+                "systemInstruction": { "parts": [{ "text": "be brief" }] },
+                "generationConfig": { "maxOutputTokens": 1024 },
+                "tools": [{
+                    "functionDeclarations": [{
+                        "name": "get_weather",
+                        "description": "Weather lookup",
+                        "parameters": {
+                            "type": "object",
+                            "properties": { "city": { "type": "string" } },
+                            "required": ["city"]
+                        }
+                    }]
+                }],
+                "toolConfig": { "functionCallingConfig": { "mode": "AUTO" } }
+            })
+        );
+    }
+
+    #[test]
+    fn tool_choice_variants_map_to_function_calling_config() {
+        assert_eq!(
+            translate_tool_choice(&json!("auto")),
+            Some(json!({ "functionCallingConfig": { "mode": "AUTO" } }))
+        );
+        assert_eq!(
+            translate_tool_choice(&json!("required")),
+            Some(json!({ "functionCallingConfig": { "mode": "ANY" } }))
+        );
+        assert_eq!(
+            translate_tool_choice(&json!("none")),
+            Some(json!({ "functionCallingConfig": { "mode": "NONE" } }))
+        );
+        assert_eq!(
+            translate_tool_choice(&json!({
+                "type": "function", "function": { "name": "f" }
+            })),
+            Some(json!({
+                "functionCallingConfig": { "mode": "ANY", "allowedFunctionNames": ["f"] }
+            }))
+        );
+        // Unknown shapes are dropped, not guessed.
+        assert_eq!(translate_tool_choice(&json!(42)), None);
+    }
+
+    #[test]
+    fn response_function_call_becomes_openai_tool_calls() {
+        let resp = GeminiResponse {
+            candidates: vec![GeminiCandidate {
+                content: GeminiResponseContent {
+                    parts: vec![GeminiResponsePart {
+                        text: String::new(),
+                        function_call: Some(GeminiFunctionCall {
+                            name: "get_weather".to_owned(),
+                            args: json!({ "city": "Paris" }),
+                        }),
+                    }],
+                },
+                finish_reason: Some("STOP".to_owned()),
+            }],
+            usage_metadata: GeminiUsage {
+                prompt: 4,
+                candidates: 2,
+                total: 6,
+            },
+        };
+        let out = translate_response(resp, "gemini-2.0");
+        let message = &out.choices[0].message;
+        // Pure tool-call message: content is null, tool_calls carry the call.
+        assert_eq!(message.content, None);
+        let calls = message.extra["tool_calls"].as_array().unwrap();
+        assert_eq!(calls[0]["type"], "function");
+        assert_eq!(calls[0]["function"]["name"], "get_weather");
+        assert_eq!(
+            calls[0]["function"]["arguments"],
+            json!({ "city": "Paris" }).to_string()
+        );
+        // A Gemini `STOP` alongside a function call maps to OpenAI `tool_calls`.
+        assert_eq!(out.choices[0].finish_reason.as_deref(), Some("tool_calls"));
+    }
+
+    #[test]
+    fn remote_url_image_is_image_url_not_supported_naming_the_attempted_link() {
         use lumen_core::{ChatMessage, ChatRequest, ContentPart, ImageUrl, MessageContent};
         let req = ChatRequest {
             model: "gemini".to_owned(),
@@ -670,10 +1115,16 @@ mod tests {
             stream: false,
             extra: serde_json::Map::new(),
         };
-        assert!(matches!(
-            translate_request(&req),
-            Err(lumen_core::ProviderError::Translation(_))
-        ));
+        // The provider name passed in is the link actually attempted (which
+        // may be a fallback, not the route the LM-2004 pre-flight checked -
+        // GH #13), so it must come through in the error unchanged.
+        match translate_request(&req, "gemini-fallback") {
+            Ok(_) => panic!("expected the remote URL to be rejected"),
+            Err(lumen_core::ProviderError::ImageUrlNotSupported { provider }) => {
+                assert_eq!(provider, "gemini-fallback");
+            }
+            Err(other) => panic!("expected ImageUrlNotSupported, got {other:?}"),
+        }
     }
 
     /// Issue #12: a `gs://` GCS URI becomes a `file_data` part carrying the
@@ -713,7 +1164,7 @@ mod tests {
             stream: false,
             extra: serde_json::Map::new(),
         };
-        let body = serde_json::to_value(translate_request(&req).unwrap()).unwrap();
+        let body = serde_json::to_value(translate_request(&req, "google").unwrap()).unwrap();
         let parts = &body["contents"][0]["parts"];
         assert_eq!(parts[0]["text"], "what?");
         assert_eq!(parts[1]["file_data"]["file_uri"], "gs://my-bucket/cat.png");
@@ -752,7 +1203,7 @@ mod tests {
             stream: false,
             extra: serde_json::Map::new(),
         };
-        let body = serde_json::to_value(translate_request(&req).unwrap()).unwrap();
+        let body = serde_json::to_value(translate_request(&req, "google").unwrap()).unwrap();
         let part = &body["contents"][0]["parts"][0];
         assert_eq!(
             part["file_data"]["file_uri"],
