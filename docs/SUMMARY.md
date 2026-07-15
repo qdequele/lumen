@@ -2,6 +2,12 @@
 
 [Introduction](introduction.md)
 
+# Getting started
+
+- [Installation](getting-started/installation.md)
+- [Quickstart](getting-started/quickstart.md)
+- [Configuration basics](getting-started/configuration.md)
+
 # Reference
 
 - [Providers](providers.md)
