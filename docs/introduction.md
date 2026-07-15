@@ -8,17 +8,28 @@ endpoint in front of many providers - for **chat**, **embeddings** and
 static binary, **zero telemetry**, and prompts that are **never logged by
 default**.
 
-This site is the reference documentation. For a quickstart, the provider
-matrix and configuration walkthrough, see the
-[README on GitHub](https://github.com/qdequele/lumen#readme).
-
 ## What's here
 
-- **[Providers](providers.md)** - the provider × capability matrix and per-provider notes.
-- **[Error codes](errors.md)** - the stable `LM-*` error taxonomy returned by the gateway.
-- **[Performance baseline](perf-baseline.md)** - measured overhead and the method behind the numbers.
+- **Getting started** - [installation](getting-started/installation.md),
+  [quickstart](getting-started/quickstart.md) and
+  [configuration basics](getting-started/configuration.md).
+- **Chat** - [completions](chat/completions.md), [streaming](chat/streaming.md),
+  [vision](chat/vision.md) and [tool calling](chat/tool-calling.md).
+- **Embeddings** - [embeddings](embeddings/embeddings.md),
+  [batching](embeddings/batching.md) and
+  [multimodal embeddings](embeddings/multimodal.md).
+- **Reranking** - [reranking](reranking/reranking.md).
+- **Operations** - [token accounting & cost](operations/token-accounting.md),
+  [metrics & dashboards](operations/metrics.md),
+  [usage log & multi-tenant metadata](operations/usage-log.md),
+  [keys, quotas & budgets](operations/keys-budgets.md),
+  [resilience tuning](operations/resilience.md) and
+  [deployment](operations/deployment.md).
+- **[Examples](examples.md)** - ready-made scenario configs.
+- **Reference** - [providers](providers.md), [error codes](errors.md) and the
+  [performance baseline](perf-baseline.md).
 - **[Architecture decisions](adr/001-crate-and-lib-naming.md)** - the ADRs that pin the design.
-- **[Backlog](backlog.md)** - ideas and deferred work not in scope for v1.
+- **Project** - [backlog](backlog.md) and [contributing](contributing.md).
 
 ## The four pillars
 
