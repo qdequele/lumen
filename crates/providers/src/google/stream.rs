@@ -11,6 +11,7 @@
 
 use lumen_core::{ChatChunk, ChatChunkChoice, ChatDelta, ProviderError, Usage};
 use serde::Deserialize;
+use serde_json::json;
 
 use super::map_finish_reason;
 use crate::chat::{SseTranslator, StreamItem};
@@ -24,6 +25,11 @@ pub(super) struct GoogleTranslator {
     started: bool,
     /// Set once a `finishReason` was seen; later events are ignored.
     finished: bool,
+    /// Next OpenAI tool-call index to allocate (Gemini has no block indices).
+    next_tool_index: u64,
+    /// Set once any `functionCall` part was forwarded; a trailing Gemini
+    /// `STOP` then maps to OpenAI's `tool_calls` rather than `stop`.
+    saw_tool_call: bool,
 }
 
 impl GoogleTranslator {
@@ -32,6 +38,8 @@ impl GoogleTranslator {
             model: requested_model.to_owned(),
             started: false,
             finished: false,
+            next_tool_index: 0,
+            saw_tool_call: false,
         }
     }
 
@@ -52,6 +60,20 @@ impl GoogleTranslator {
                 finish_reason,
             }],
             usage,
+        }
+    }
+
+    /// A delta carrying only a `tool_calls` array.
+    fn tool_calls_delta(entry: serde_json::Value) -> ChatDelta {
+        let mut extra = serde_json::Map::new();
+        extra.insert(
+            "tool_calls".to_owned(),
+            serde_json::Value::Array(vec![entry]),
+        );
+        ChatDelta {
+            role: None,
+            content: None,
+            extra,
         }
     }
 }
@@ -83,13 +105,38 @@ impl SseTranslator for GoogleTranslator {
             return Ok(items);
         };
 
-        let text: String = candidate
-            .content
-            .parts
-            .into_iter()
-            .map(|p| p.text)
-            .collect();
-        let finish = map_finish_reason(candidate.finish_reason.as_deref());
+        // Separate text from tool calls: Gemini interleaves them as parts, but
+        // OpenAI models text as a `content` delta and tool calls as a
+        // `tool_calls` delta. Gemini streams each `functionCall` complete (args
+        // and all), so one delta per call suffices (no incremental arg deltas).
+        let mut text = String::new();
+        let mut tool_deltas: Vec<serde_json::Value> = Vec::new();
+        for part in candidate.content.parts {
+            if let Some(call) = part.function_call {
+                self.saw_tool_call = true;
+                let index = self.next_tool_index;
+                self.next_tool_index += 1;
+                let args = if call.args.is_null() {
+                    json!({})
+                } else {
+                    call.args
+                };
+                tool_deltas.push(json!({
+                    "index": index,
+                    "id": format!("call_{index}"),
+                    "type": "function",
+                    "function": { "name": call.name, "arguments": args.to_string() },
+                }));
+            } else {
+                text.push_str(&part.text);
+            }
+        }
+
+        let mut finish = map_finish_reason(candidate.finish_reason.as_deref());
+        // Gemini reports `STOP` even for tool calls; OpenAI expects `tool_calls`.
+        if self.saw_tool_call && finish.as_deref() == Some("stop") {
+            finish = Some("tool_calls".to_owned());
+        }
 
         if !text.is_empty() {
             items.push(StreamItem::Chunk(self.chunk(
@@ -98,6 +145,14 @@ impl SseTranslator for GoogleTranslator {
                     content: Some(text),
                     extra: serde_json::Map::new(),
                 },
+                None,
+                None,
+            )));
+        }
+
+        for entry in tool_deltas {
+            items.push(StreamItem::Chunk(self.chunk(
+                Self::tool_calls_delta(entry),
                 None,
                 None,
             )));
@@ -151,6 +206,18 @@ struct GeminiStreamContent {
 struct GeminiStreamPart {
     #[serde(default)]
     text: String,
+    #[serde(rename = "functionCall", default)]
+    function_call: Option<GeminiStreamFunctionCall>,
+}
+
+/// A streamed tool call. Gemini sends the whole call (name and complete args)
+/// in one part rather than incremental argument deltas.
+#[derive(Deserialize)]
+struct GeminiStreamFunctionCall {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    args: serde_json::Value,
 }
 
 #[derive(Deserialize)]
@@ -224,6 +291,57 @@ mod tests {
         assert_eq!(usage.completion_tokens, 2);
         assert_eq!(usage.total_tokens, 8);
         assert_eq!(last[2], StreamItem::Done);
+    }
+
+    #[test]
+    fn stream_function_call_becomes_tool_calls_delta_and_tool_calls_finish() {
+        let mut t = GoogleTranslator::new("gemini-2.0");
+        let items = t
+            .translate(&event(serde_json::json!({
+                "candidates": [{
+                    "content": {
+                        "role": "model",
+                        "parts": [{
+                            "functionCall": { "name": "get_weather", "args": { "city": "Paris" } }
+                        }]
+                    },
+                    "finishReason": "STOP"
+                }],
+                "usageMetadata": {
+                    "promptTokenCount": 5, "candidatesTokenCount": 3, "totalTokenCount": 8
+                }
+            })))
+            .expect("translates");
+
+        // role chunk, tool-call delta, finish chunk, Done.
+        assert_eq!(items.len(), 4);
+        let StreamItem::Chunk(role) = &items[0] else {
+            panic!("expected chunk")
+        };
+        assert_eq!(role.choices[0].delta.role.as_deref(), Some("assistant"));
+
+        let StreamItem::Chunk(tool) = &items[1] else {
+            panic!("expected chunk")
+        };
+        let calls = &tool.choices[0].delta.extra["tool_calls"];
+        assert_eq!(calls[0]["index"], 0);
+        assert_eq!(calls[0]["type"], "function");
+        assert_eq!(calls[0]["function"]["name"], "get_weather");
+        assert_eq!(
+            calls[0]["function"]["arguments"],
+            serde_json::json!({ "city": "Paris" }).to_string()
+        );
+
+        let StreamItem::Chunk(finish) = &items[2] else {
+            panic!("expected chunk")
+        };
+        // A trailing Gemini `STOP` with a function call maps to `tool_calls`.
+        assert_eq!(
+            finish.choices[0].finish_reason.as_deref(),
+            Some("tool_calls")
+        );
+        assert_eq!(finish.usage.expect("usage").total_tokens, 8);
+        assert_eq!(items[3], StreamItem::Done);
     }
 
     #[test]
