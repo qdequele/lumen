@@ -24,6 +24,7 @@
 //!   don't reap a slow upstream.
 
 use std::convert::Infallible;
+use std::sync::Arc;
 
 use axum::body::Body;
 use axum::extract::rejection::JsonRejection;
@@ -289,70 +290,144 @@ async fn chat_non_streaming(
     accounting.served_by(&executed.model_used, &executed.provider_used);
     let mut response = executed.value;
     let served_model = executed.model_used.clone();
-    settle_non_streaming(
-        accounting,
-        &ctx.state.token_counter,
-        ctx.req,
-        &served_model,
-        &mut response,
-    )
-    .await;
+    settle_non_streaming(ctx, accounting, &served_model, &mut response);
     Ok((model_used_headers(&served_model), Json(response)).into_response())
 }
 
 /// Close the books on a non-streaming completion (ADR 003): upstream usage
-/// when reported, else local estimates - never a silent zero. The estimate is
-/// surfaced (flagged) in the response body too. When the operator opted into
-/// the accurate tokenizer, the fallback is an exact per-model BPE count run off
-/// the tokio runtime (`spawn_blocking`); otherwise it is the byte heuristic.
-async fn settle_non_streaming(
+/// when reported, else local estimates - never a silent zero.
+///
+/// The response envelope ALWAYS carries the cheap heuristic estimate (flagged
+/// `estimated`) - never a BPE pass, never a wait (ADR 003 hot-path rule). When
+/// the opt-in accurate tokenizer refines this model, the open accounting
+/// record is handed to a spawned background task that recounts with exact BPE
+/// on the blocking pool and then closes the record - so `usage_log` and
+/// Prometheus carry the accurate number while the client response is returned
+/// immediately with the heuristic. Latency surfaces are frozen at response
+/// time (`mark_completed`), so the deferral never inflates them.
+fn settle_non_streaming(
+    ctx: &ChatExec<'_>,
     accounting: Accounting,
-    counter: &crate::tokenizer::TokenCounter,
-    req: &ChatRequest,
     client_model: &str,
     response: &mut lumen_core::ChatResponse,
 ) {
     let reported = response
         .usage
         .filter(|u| u.prompt_tokens > 0 || u.completion_tokens > 0);
-    let (tokens_in, tokens_out, estimated) = if let Some(usage) = reported {
-        (
+    if let Some(usage) = reported {
+        let (tokens_in, tokens_out) = (
             u64::from(usage.prompt_tokens),
             u64::from(usage.completion_tokens),
-            false,
-        )
-    } else {
-        // Upstream reported nothing: estimate locally (accurate or heuristic),
-        // off the hot path. Concatenate the completion text so a single BPE
-        // pass counts the whole output.
-        let tokens_in = counter.count_chat_prompt(req).await;
-        let output_text: String = response
-            .choices
-            .iter()
-            .filter_map(|c| c.message.content.as_ref().map(|c| c.text()))
-            .collect();
-        let tokens_out = counter.count_text(client_model, &output_text).await;
-        (tokens_in, tokens_out, true)
-    };
-    if estimated {
-        response.usage = Some(Usage {
-            prompt_tokens: u32::try_from(tokens_in).unwrap_or(u32::MAX),
-            completion_tokens: u32::try_from(tokens_out).unwrap_or(u32::MAX),
-            total_tokens: u32::try_from(tokens_in + tokens_out).unwrap_or(u32::MAX),
-            estimated: Some(true),
+        );
+        let cost = accounting
+            .pricing()
+            .token_cost(client_model, tokens_in, tokens_out);
+        accounting.finish(&Outcome {
+            tokens_in,
+            tokens_out,
+            estimated: false,
+            search_units: None,
+            media: lumen_core::MediaUsage::default(),
+            cost,
+            status: 200,
         });
+        return;
     }
+
+    // Upstream reported nothing: the envelope gets the inline heuristic.
+    let tokens_in = ctx.estimated_input;
+    let tokens_out: u64 = response
+        .choices
+        .iter()
+        .map(|c| {
+            c.message
+                .content
+                .as_ref()
+                .map_or(0, |c| tokens::estimate_text(&c.text()))
+        })
+        .sum();
+    response.usage = Some(Usage {
+        prompt_tokens: u32::try_from(tokens_in).unwrap_or(u32::MAX),
+        completion_tokens: u32::try_from(tokens_out).unwrap_or(u32::MAX),
+        total_tokens: u32::try_from(tokens_in + tokens_out).unwrap_or(u32::MAX),
+        estimated: Some(true),
+    });
+
+    if ctx.state.token_counter.refines(client_model) {
+        defer_chat_refinement(
+            ctx,
+            accounting,
+            client_model,
+            (tokens_in, tokens_out),
+            response,
+        );
+        return;
+    }
+
     let cost = accounting
         .pricing()
         .token_cost(client_model, tokens_in, tokens_out);
     accounting.finish(&Outcome {
         tokens_in,
         tokens_out,
-        estimated,
+        estimated: true,
         search_units: None,
         media: lumen_core::MediaUsage::default(),
         cost,
         status: 200,
+    });
+}
+
+/// Defer the accounting close to a background refinement task (opt-in accurate
+/// tokenizer, ADR 003): freeze the latency now, extract the owned text, and
+/// let the task recount with exact BPE (spawn_blocking inside `refine_chat`)
+/// before finishing. On any refinement failure the heuristic numbers settle
+/// the record. The caller has already put the heuristic in the envelope.
+fn defer_chat_refinement(
+    ctx: &ChatExec<'_>,
+    mut accounting: Accounting,
+    client_model: &str,
+    heuristic: (u64, u64),
+    response: &lumen_core::ChatResponse,
+) {
+    accounting.mark_completed();
+    let counter = Arc::clone(&ctx.state.token_counter);
+    let model = client_model.to_owned();
+    let message_texts: Vec<String> = ctx
+        .req
+        .messages
+        .iter()
+        .map(|m| {
+            m.content
+                .as_ref()
+                .map(|c| c.text().into_owned())
+                .unwrap_or_default()
+        })
+        .collect();
+    // The refined output counts the concatenated completion text in one BPE
+    // pass (choices beyond the first are rare).
+    let output_text: String = response
+        .choices
+        .iter()
+        .filter_map(|c| c.message.content.as_ref().map(|c| c.text()))
+        .collect();
+    tokio::spawn(async move {
+        let (refined_in, refined_out) = counter
+            .refine_chat(&model, message_texts, output_text)
+            .await
+            .unwrap_or(heuristic);
+        let cost = accounting
+            .pricing()
+            .token_cost(&model, refined_in, refined_out);
+        accounting.finish(&Outcome {
+            tokens_in: refined_in,
+            tokens_out: refined_out,
+            estimated: true,
+            search_units: None,
+            media: lumen_core::MediaUsage::default(),
+            cost,
+            status: 200,
+        });
     });
 }
 

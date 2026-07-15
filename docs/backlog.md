@@ -140,11 +140,14 @@ milestone.
 - **Accurate per-model tokenizer - DONE** (issue #8). ADR 003's opt-in
   "accurate tokenizer via `spawn_blocking`" now ships behind
   `[tokenizer] mode = "accurate"`: exact `tiktoken-rs` BPE (cl100k_base /
-  o200k_base by model prefix) for the local fallback, run on the blocking pool,
-  heuristic fallback for non-OpenAI models and any failure. The default stays
-  the byte heuristic (zero cost). See the ADR 003 "opt-in accurate tokenizer"
-  addendum. Remaining follow-up: streaming input counts stay heuristic (no
-  buffered prompt to BPE under the ADR 004 passthrough rule).
+  o200k_base by model prefix) refines the local fallback AFTER the response
+  is handed off (deferred accounting close, BPE on the blocking pool), landing
+  in Prometheus and usage_log; the response envelope stays heuristic and the
+  request is never delayed. Heuristic fallback for non-OpenAI models and any
+  failure. The default stays the byte heuristic (zero cost). See the ADR 003
+  "opt-in accurate tokenizer" addendum. Remaining follow-up: streaming input
+  counts stay heuristic (no buffered prompt to BPE under the ADR 004
+  passthrough rule).
 - **Streaming output estimation = data-frame count.** When a stream carries no
   usage (rare: `include_usage` is auto-requested and translators always emit
   usage), the output-token estimate is the number of `data:` frames (~1 token

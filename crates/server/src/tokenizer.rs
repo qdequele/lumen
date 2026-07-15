@@ -4,15 +4,27 @@
 //! dependencies on the request path, allocation-light, hot-path-safe, and used
 //! only as the local estimation fallback when an upstream reports no usage.
 //!
-//! When an operator sets `[tokenizer] mode = "accurate"`, this module counts
-//! OpenAI-family prompts with the exact BPE tokenizer (`tiktoken-rs`,
-//! `cl100k_base` / `o200k_base` selected by the model id's prefix). The BPE
-//! pass runs on the blocking pool via [`tokio::task::spawn_blocking`], so a
-//! large prompt never occupies a tokio worker (repo rule 2). Any failure - a
-//! model that maps to no known encoder, a panicking encode - falls back to the
-//! heuristic, so counting can never fail or reject a request.
+//! When an operator sets `[tokenizer] mode = "accurate"`, this module refines
+//! that fallback for OpenAI-family models with the exact BPE tokenizer
+//! (`tiktoken-rs`, `cl100k_base` / `o200k_base` selected by the model id's
+//! prefix). Per ADR 003's hot-path rule the refinement NEVER runs on the
+//! request path and never delays the client's response:
 //!
-//! Accurate counts are still flagged `estimated = true`: a locally computed
+//! - The response envelope always carries the cheap heuristic estimate
+//!   (flagged `estimated`), computed inline as before.
+//! - The handler then hands the open [`Accounting`](crate::accounting::Accounting)
+//!   record plus the already-extracted text to a spawned background task,
+//!   which calls a `refine_*` method here and closes the record with the
+//!   refined count - so `usage_log` and Prometheus carry the accurate number.
+//! - Inside `refine_*`, the CPU-bound BPE pass runs on the blocking pool via
+//!   [`tokio::task::spawn_blocking`], never on a tokio worker (repo rule 2).
+//!
+//! Every `refine_*` returns `Option`: `None` means "no refinement applies"
+//! (heuristic mode, a model tiktoken does not describe, or a blocking-pool
+//! failure) and the caller keeps the heuristic numbers it already computed -
+//! counting can never fail or slow a request.
+//!
+//! Refined counts are still flagged `estimated = true`: a locally computed
 //! count is an estimate against the upstream's authoritative usage, which
 //! always wins when present (ADR 003). The encoders are built once at config
 //! load (see [`TokenCounter::from_config`]) and shared behind an `Arc`, so no
@@ -20,7 +32,6 @@
 
 use std::sync::Arc;
 
-use lumen_core::{tokens, ChatRequest, EmbedRequest, RerankRequest};
 use tiktoken_rs::CoreBPE;
 
 use crate::config::{TokenizerConfig, TokenizerMode};
@@ -33,14 +44,15 @@ const PER_MESSAGE_OVERHEAD: u64 = 4;
 /// A pre-initialized token counter, built once at config load and shared by
 /// every handler (a cheap `Arc` clone in [`AppState`](crate::state::AppState)).
 ///
-/// [`Heuristic`](Self::Heuristic) is a zero-cost marker that delegates straight
-/// to [`lumen_core::tokens`]; [`Accurate`](Self::Accurate) owns the BPE
-/// encoders so none is ever built on the request path.
+/// [`Heuristic`](Self::Heuristic) is a zero-cost marker: every `refine_*`
+/// returns `None` immediately and nothing is ever spawned.
+/// [`Accurate`](Self::Accurate) owns the BPE encoders so none is ever built on
+/// the request path.
 pub enum TokenCounter {
-    /// The default byte heuristic. Synchronous, never touches the blocking pool.
+    /// The default byte heuristic. Refinement is a no-op.
     Heuristic,
-    /// Accurate BPE counting for OpenAI-family models, heuristic fallback for
-    /// everything else.
+    /// Accurate BPE refinement for OpenAI-family models; everything else keeps
+    /// the heuristic.
     Accurate(AccurateEncoders),
 }
 
@@ -61,8 +73,10 @@ enum Family {
 
 /// Map an OpenAI(-compatible) model id to its BPE vocabulary by prefix, or
 /// `None` for a model tiktoken does not describe (the caller then keeps the
-/// heuristic). The GPT-4o family is checked before GPT-4 so `gpt-4o*` never
-/// falls into the `cl100k` branch.
+/// heuristic). Matching runs on the gateway-facing model id (the operator's
+/// alias), so an alias that does not carry the upstream family prefix keeps
+/// the heuristic. The GPT-4o family is checked before GPT-4 so `gpt-4o*`
+/// never falls into the `cl100k` branch.
 fn family_for_model(model: &str) -> Option<Family> {
     let m = model.to_ascii_lowercase();
     // o200k_base: GPT-4o, o1/o3/o4 reasoning, GPT-4.1 and GPT-5 families.
@@ -143,136 +157,101 @@ impl TokenCounter {
         matches!(self, Self::Accurate(_))
     }
 
-    /// Count the prompt tokens of a chat request. Accurate mode BPE-encodes each
-    /// message's text off the tokio runtime and adds the same per-message
-    /// overhead as the heuristic; any failure falls back to the heuristic.
-    pub async fn count_chat_prompt(&self, req: &ChatRequest) -> u64 {
-        let Self::Accurate(encoders) = self else {
-            return tokens::estimate_chat_prompt(req);
-        };
-        let Some(bpe) = encoders.encoder_for(&req.model) else {
-            return tokens::estimate_chat_prompt(req);
-        };
-        let texts: Vec<String> = req
-            .messages
-            .iter()
-            .map(|m| {
-                m.content
-                    .as_ref()
-                    .map(|c| c.text().into_owned())
-                    .unwrap_or_default()
-            })
-            .collect();
-        let overhead = to_u64(req.messages.len()).saturating_mul(PER_MESSAGE_OVERHEAD);
-        match tokio::task::spawn_blocking(move || {
-            texts.iter().map(|t| bpe.encode_ordinary(t).len()).sum()
+    /// Whether this counter can refine `model`'s heuristic count with an exact
+    /// BPE pass (accurate mode AND a known OpenAI-family prefix). Handlers use
+    /// this to decide whether deferring accounting to a background refinement
+    /// task is worth anything; when `false`, they settle inline with the
+    /// heuristic exactly as in heuristic mode - zero added work.
+    #[must_use]
+    pub fn refines(&self, model: &str) -> bool {
+        match self {
+            Self::Heuristic => false,
+            Self::Accurate(_) => family_for_model(model).is_some(),
+        }
+    }
+
+    /// The encoder for `model` when refinement applies.
+    fn encoder_for(&self, model: &str) -> Option<Arc<CoreBPE>> {
+        match self {
+            Self::Heuristic => None,
+            Self::Accurate(encoders) => encoders.encoder_for(model),
+        }
+    }
+
+    /// Refine a chat estimate: exact `(input, output)` token counts for the
+    /// already-extracted message texts (plus the same per-message overhead as
+    /// the heuristic) and the concatenated completion text. `None` = keep the
+    /// heuristic. Runs the BPE pass on the blocking pool.
+    pub async fn refine_chat(
+        &self,
+        model: &str,
+        message_texts: Vec<String>,
+        output_text: String,
+    ) -> Option<(u64, u64)> {
+        let bpe = self.encoder_for(model)?;
+        let overhead = to_u64(message_texts.len()).saturating_mul(PER_MESSAGE_OVERHEAD);
+        let counts = tokio::task::spawn_blocking(move || {
+            let input: usize = message_texts
+                .iter()
+                .map(|t| bpe.encode_ordinary(t).len())
+                .sum();
+            let output = bpe.encode_ordinary(&output_text).len();
+            (input, output)
         })
         .await
-        {
-            Ok(sum) => to_u64(sum).saturating_add(overhead),
-            Err(_) => tokens::estimate_chat_prompt(req),
-        }
+        .ok()?;
+        Some((to_u64(counts.0).saturating_add(overhead), to_u64(counts.1)))
     }
 
-    /// Count the tokens of a single piece of text under `model` (chat
-    /// completion output). Heuristic fallback on any failure.
-    pub async fn count_text(&self, model: &str, text: &str) -> u64 {
-        let Self::Accurate(encoders) = self else {
-            return tokens::estimate_text(text);
-        };
-        let Some(bpe) = encoders.encoder_for(model) else {
-            return tokens::estimate_text(text);
-        };
-        let owned = text.to_owned();
-        match tokio::task::spawn_blocking(move || bpe.encode_ordinary(&owned).len()).await {
-            Ok(n) => to_u64(n),
-            Err(_) => tokens::estimate_text(text),
-        }
-    }
-
-    /// Count the input tokens of an embeddings request (sum over the batch,
-    /// image parts contribute nothing). Heuristic fallback on any failure.
-    pub async fn count_embed_input(&self, req: &EmbedRequest) -> u64 {
-        let Self::Accurate(encoders) = self else {
-            return tokens::estimate_embed_input(req);
-        };
-        let Some(bpe) = encoders.encoder_for(&req.model) else {
-            return tokens::estimate_embed_input(req);
-        };
-        let texts: Vec<String> = req.input.iter().map(str::to_owned).collect();
-        match tokio::task::spawn_blocking(move || {
+    /// Refine an embeddings estimate: exact input token count summed over the
+    /// batch. `None` = keep the heuristic. Runs on the blocking pool.
+    pub async fn refine_embed(&self, model: &str, texts: Vec<String>) -> Option<u64> {
+        let bpe = self.encoder_for(model)?;
+        let sum = tokio::task::spawn_blocking(move || {
             texts
                 .iter()
                 .map(|t| bpe.encode_ordinary(t).len())
                 .sum::<usize>()
         })
         .await
-        {
-            Ok(sum) => to_u64(sum),
-            Err(_) => tokens::estimate_embed_input(req),
-        }
+        .ok()?;
+        Some(to_u64(sum))
     }
 
-    /// Count the tokens processed by a rerank request: the query is compared
-    /// against every document, so it counts once per document (matching the
-    /// heuristic's semantics). Heuristic fallback on any failure.
-    pub async fn count_rerank(&self, req: &RerankRequest) -> u64 {
-        let Self::Accurate(encoders) = self else {
-            return tokens::estimate_rerank(req);
-        };
-        let Some(bpe) = encoders.encoder_for(&req.model) else {
-            return tokens::estimate_rerank(req);
-        };
-        let query = req.query.clone();
-        let docs: Vec<String> = req.documents.iter().map(|d| d.text().to_owned()).collect();
-        let doc_count = to_u64(docs.len());
-        match tokio::task::spawn_blocking(move || {
+    /// Refine a rerank estimate: the query is compared against every document,
+    /// so it counts once per document (matching the heuristic's semantics).
+    /// `None` = keep the heuristic. Runs on the blocking pool.
+    pub async fn refine_rerank(
+        &self,
+        model: &str,
+        query: String,
+        documents: Vec<String>,
+    ) -> Option<u64> {
+        let bpe = self.encoder_for(model)?;
+        let doc_count = to_u64(documents.len());
+        let (query_tokens, doc_tokens) = tokio::task::spawn_blocking(move || {
             let query_tokens = bpe.encode_ordinary(&query).len();
-            let doc_tokens: usize = docs.iter().map(|d| bpe.encode_ordinary(d).len()).sum();
+            let doc_tokens: usize = documents.iter().map(|d| bpe.encode_ordinary(d).len()).sum();
             (query_tokens, doc_tokens)
         })
         .await
-        {
-            Ok((query_tokens, doc_tokens)) => doc_count
+        .ok()?;
+        Some(
+            doc_count
                 .saturating_mul(to_u64(query_tokens))
                 .saturating_add(to_u64(doc_tokens)),
-            Err(_) => tokens::estimate_rerank(req),
-        }
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lumen_core::chat::{ChatMessage, MessageContent};
 
     fn accurate() -> TokenCounter {
         TokenCounter::from_config(&TokenizerConfig {
             mode: TokenizerMode::Accurate,
         })
-    }
-
-    fn user_msg(text: &str) -> ChatMessage {
-        ChatMessage {
-            role: "user".to_owned(),
-            content: Some(MessageContent::Text(text.to_owned())),
-            name: None,
-            extra: serde_json::Map::new(),
-        }
-    }
-
-    fn chat_req(model: &str, messages: Vec<ChatMessage>) -> ChatRequest {
-        ChatRequest {
-            model: model.to_owned(),
-            messages,
-            temperature: None,
-            top_p: None,
-            max_tokens: None,
-            n: None,
-            stop: None,
-            stream: false,
-            extra: serde_json::Map::new(),
-        }
     }
 
     #[test]
@@ -294,89 +273,124 @@ mod tests {
         assert_eq!(family_for_model("mistral-large"), None);
     }
 
-    #[tokio::test]
-    async fn accurate_mode_counts_a_known_string_exactly_for_cl100k() {
-        // "hello world" is [15339, 1917] in cl100k_base: exactly 2 tokens.
+    #[test]
+    fn refines_is_true_only_for_accurate_mode_and_known_families() {
         let counter = accurate();
         assert!(counter.is_accurate());
-        assert_eq!(counter.count_text("gpt-4", "hello world").await, 2);
+        assert!(counter.refines("gpt-4"));
+        assert!(counter.refines("gpt-4o-mini"));
+        assert!(!counter.refines("claude-3-5-sonnet"));
+        assert!(!counter.refines("rerank-v3.5"));
+
+        let heuristic = TokenCounter::from_config(&TokenizerConfig::default());
+        assert!(!heuristic.is_accurate());
+        // Heuristic mode never refines, even for OpenAI-family models.
+        assert!(!heuristic.refines("gpt-4"));
     }
 
     #[tokio::test]
-    async fn accurate_mode_counts_a_known_string_exactly_for_o200k() {
+    async fn refine_counts_a_known_string_exactly_for_cl100k() {
+        // "hello world" is [15339, 1917] in cl100k_base: exactly 2 tokens,
+        // plus the 4-token per-message overhead for the one message.
+        let counter = accurate();
+        let refined = counter
+            .refine_chat("gpt-4", vec!["hello world".to_owned()], String::new())
+            .await;
+        assert_eq!(refined, Some((2 + PER_MESSAGE_OVERHEAD, 0)));
+    }
+
+    #[tokio::test]
+    async fn refine_counts_a_known_string_exactly_for_o200k() {
         // The o200k_base vocabulary also encodes "hello world" as 2 tokens.
         let counter = accurate();
-        assert_eq!(counter.count_text("gpt-4o", "hello world").await, 2);
+        let refined = counter
+            .refine_chat(
+                "gpt-4o",
+                vec!["hello world".to_owned()],
+                "hello world".to_owned(),
+            )
+            .await;
+        assert_eq!(refined, Some((2 + PER_MESSAGE_OVERHEAD, 2)));
     }
 
     #[tokio::test]
-    async fn accurate_chat_prompt_is_bpe_plus_message_overhead() {
-        let counter = accurate();
-        let req = chat_req("gpt-4", vec![user_msg("hello world")]);
-        // 2 BPE tokens + 4 per-message overhead.
-        assert_eq!(
-            counter.count_chat_prompt(&req).await,
-            2 + PER_MESSAGE_OVERHEAD
-        );
-    }
-
-    #[tokio::test]
-    async fn heuristic_mode_is_unchanged_and_matches_core() {
+    async fn heuristic_mode_never_refines_the_fallback_path() {
+        // In heuristic mode every refine_* is None: the caller keeps the
+        // heuristic numbers and nothing touches the blocking pool.
         let counter = TokenCounter::from_config(&TokenizerConfig::default());
-        assert!(!counter.is_accurate());
-        let req = chat_req("gpt-4", vec![user_msg("hello world")]);
-        // Byte heuristic: 11 bytes -> 3 tokens + 4 overhead == core's estimate.
         assert_eq!(
-            counter.count_chat_prompt(&req).await,
-            tokens::estimate_chat_prompt(&req)
+            counter
+                .refine_chat("gpt-4", vec!["hello world".to_owned()], String::new())
+                .await,
+            None
         );
         assert_eq!(
-            counter.count_text("gpt-4", "hello world").await,
-            tokens::estimate_text("hello world")
+            counter
+                .refine_embed("text-embedding-3-small", vec!["hello world".to_owned()])
+                .await,
+            None
         );
-    }
-
-    #[tokio::test]
-    async fn accurate_mode_falls_back_to_heuristic_for_unknown_models() {
-        // A non-OpenAI model has no tiktoken vocabulary: the accurate counter
-        // must return exactly the heuristic value, never fail.
-        let counter = accurate();
-        let text = "some prompt for a llama model";
         assert_eq!(
-            counter.count_text("llama-3-70b", text).await,
-            tokens::estimate_text(text)
-        );
-        let req = chat_req("mistral-large", vec![user_msg("hello world")]);
-        assert_eq!(
-            counter.count_chat_prompt(&req).await,
-            tokens::estimate_chat_prompt(&req)
+            counter
+                .refine_rerank("gpt-4o", "q".to_owned(), vec!["d".to_owned()])
+                .await,
+            None
         );
     }
 
     #[tokio::test]
-    async fn accurate_embed_and_rerank_use_bpe_for_openai_models() {
+    async fn unknown_models_never_refine_in_accurate_mode() {
+        // A non-OpenAI model has no tiktoken vocabulary: refinement declines
+        // (None) and the caller keeps the heuristic - never an error.
         let counter = accurate();
-        let embed: EmbedRequest = serde_json::from_str(
-            r#"{"model":"text-embedding-3-small","input":["hello world","hello world"]}"#,
-        )
-        .expect("valid request");
-        // 2 + 2 BPE tokens.
-        assert_eq!(counter.count_embed_input(&embed).await, 4);
+        assert_eq!(
+            counter
+                .refine_chat("llama-3-70b", vec!["some prompt".to_owned()], String::new())
+                .await,
+            None
+        );
+        assert_eq!(
+            counter
+                .refine_embed("mistral-embed", vec!["text".to_owned()])
+                .await,
+            None
+        );
+    }
 
-        let rerank: RerankRequest = serde_json::from_str(
-            r#"{"model":"gpt-4o","query":"hello world","documents":["hello world"]}"#,
-        )
-        .expect("valid request");
-        // query (2) once per document (1) + document tokens (2) == 4.
-        assert_eq!(counter.count_rerank(&rerank).await, 4);
+    #[tokio::test]
+    async fn refine_embed_and_rerank_count_exactly() {
+        let counter = accurate();
+        assert_eq!(
+            counter
+                .refine_embed(
+                    "text-embedding-3-small",
+                    vec!["hello world".to_owned(), "hello world".to_owned()],
+                )
+                .await,
+            Some(4)
+        );
+        // query (2 tokens) once per document (1) + document tokens (2) == 4.
+        assert_eq!(
+            counter
+                .refine_rerank(
+                    "gpt-4o",
+                    "hello world".to_owned(),
+                    vec!["hello world".to_owned()],
+                )
+                .await,
+            Some(4)
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn accurate_counting_runs_off_the_runtime_worker() {
+    async fn refinement_runs_off_the_runtime_worker() {
         // On a single-threaded runtime, a blocking BPE pass inline would starve
         // the only worker. That this resolves proves the work is dispatched to
         // the blocking pool via spawn_blocking, not run on the worker thread.
         let counter = accurate();
-        assert_eq!(counter.count_text("gpt-4", "hello world").await, 2);
+        let refined = counter
+            .refine_chat("gpt-4", vec!["hello world".to_owned()], String::new())
+            .await;
+        assert_eq!(refined, Some((2 + PER_MESSAGE_OVERHEAD, 0)));
     }
 }

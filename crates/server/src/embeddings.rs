@@ -148,13 +148,12 @@ pub async fn embeddings(
     accounting.served_by(&executed.model_used, &executed.provider_used);
 
     // ADR 003: upstream usage when reported, else the local estimate - never
-    // a silent zero (e.g. TEI reports nothing). The fallback is the accurate
-    // per-model BPE count when opted in (off the hot path via spawn_blocking),
-    // otherwise the byte heuristic.
+    // a silent zero (e.g. TEI reports nothing). The response envelope always
+    // carries the inline heuristic (never a BPE pass, never a wait).
     let (tokens_in, estimated) = if response.usage.prompt_tokens > 0 {
         (u64::from(response.usage.prompt_tokens), false)
     } else {
-        (state.token_counter.count_embed_input(&req).await, true)
+        (estimated_input, true)
     };
     if estimated {
         // Surface the estimate in the response too (flagged, per ADR 003).
@@ -162,19 +161,15 @@ pub async fn embeddings(
         response.usage.total_tokens = response.usage.prompt_tokens;
         response.usage.estimated = Some(true);
     }
-    let cost = pricing.token_cost(&executed.model_used, tokens_in, 0);
-    // M9: media accounting. `req.input`'s image parts are now `data:` URIs
-    // (resolved before execution), so this measures decoded bytes with no I/O.
-    let media = lumen_core::measure_media(&req.input);
-    accounting.finish(&Outcome {
+    finish_embed(
+        &state,
+        accounting,
+        &pricing,
+        &executed.model_used,
+        &req,
         tokens_in,
-        tokens_out: 0,
         estimated,
-        search_units: None,
-        media,
-        cost,
-        status: 200,
-    });
+    );
 
     // Honor the client's requested output encoding (OpenAI `encoding_format`).
     // Providers always decode to `Vec<f32>` internally; re-encode to base64 on
@@ -188,4 +183,59 @@ pub async fn embeddings(
     }
 
     Ok((model_used_headers(&executed.model_used), Json(response)).into_response())
+}
+
+/// Close the embed accounting record: inline for upstream-reported or
+/// heuristic counts; deferred to a background refinement task when the opt-in
+/// accurate tokenizer refines this model (ADR 003). The deferred task recounts
+/// the batch with exact BPE on the blocking pool, so usage_log and Prometheus
+/// get the accurate number while the response (heuristic, flagged) has already
+/// been returned. Latency is frozen first so the deferral never inflates it.
+fn finish_embed(
+    state: &AppState,
+    mut accounting: Accounting,
+    pricing: &std::sync::Arc<crate::pricing::CostTable>,
+    model_used: &str,
+    req: &lumen_core::EmbedRequest,
+    tokens_in: u64,
+    estimated: bool,
+) {
+    // M9: media accounting. `req.input`'s image parts are now `data:` URIs
+    // (resolved before execution), so this measures decoded bytes with no I/O.
+    let media = lumen_core::measure_media(&req.input);
+
+    if estimated && state.token_counter.refines(model_used) {
+        accounting.mark_completed();
+        let counter = std::sync::Arc::clone(&state.token_counter);
+        let model = model_used.to_owned();
+        let texts: Vec<String> = req.input.iter().map(str::to_owned).collect();
+        let pricing_task = pricing.clone();
+        tokio::spawn(async move {
+            let refined = counter
+                .refine_embed(&model, texts)
+                .await
+                .unwrap_or(tokens_in);
+            let cost = pricing_task.token_cost(&model, refined, 0);
+            accounting.finish(&Outcome {
+                tokens_in: refined,
+                tokens_out: 0,
+                estimated: true,
+                search_units: None,
+                media,
+                cost,
+                status: 200,
+            });
+        });
+    } else {
+        let cost = pricing.token_cost(model_used, tokens_in, 0);
+        accounting.finish(&Outcome {
+            tokens_in,
+            tokens_out: 0,
+            estimated,
+            search_units: None,
+            media,
+            cost,
+            status: 200,
+        });
+    }
 }

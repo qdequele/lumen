@@ -149,22 +149,36 @@ a config knob, without disturbing the default heuristic path.
   `gpt-4.1` / `gpt-5`. A model that matches no OpenAI-family prefix (Claude,
   Mistral, Llama, TEI models, ...) keeps the byte heuristic - tiktoken does not
   describe those vocabularies, so a BPE count would be a false precision.
-- **Hot-path rule, refined.** The heuristic is unchanged: free, inline, used
-  for the pre-call budget admission estimate on every request. The accurate BPE
-  count is computed *only when tier 2 fires* (an upstream reported no usage),
-  *after* the upstream call, and *on the blocking pool* via `spawn_blocking` -
-  never on a tokio worker (repo rule 2). This is the concrete realization of
-  "accurate estimation happens off the hot path": the pre-upstream request path
-  never runs BPE, and the encoders are built once at config load, never lazily
-  on a request. The added work in accurate mode is a post-response, blocking-pool
-  encode of a prompt already in memory - the documented cost an operator opts
-  into for billing-grade estimates.
-- **Scope.** Applied to the paths with a synchronous post-response settlement:
-  chat (non-streaming), embeddings, and rerank. Streaming input counts stay on
-  the heuristic - the stream is forwarded, never buffered (ADR 004), so there is
-  no assembled prompt/response to BPE without violating the passthrough rule.
+- **Hot-path rule, upheld.** The heuristic is unchanged: free, inline, used
+  for the pre-call budget admission estimate on every request AND for the
+  response envelope. The response `usage` field always carries the cheap
+  heuristic (flagged `estimated`) - never a BPE pass, never a wait - exactly as
+  this ADR's hot-path rule states. The accurate BPE count is computed *only
+  when tier 2 fires* (an upstream reported no usage) and *after the response is
+  handed off*: the handler settles the envelope with the heuristic, then
+  defers the accounting close to a spawned background task that recounts with
+  exact BPE *on the blocking pool* via `spawn_blocking` (never on a tokio
+  worker, repo rule 2) and finishes the record. The accurate number therefore
+  surfaces in **Prometheus and `usage_log`** (the operator-facing accounting
+  surfaces), not in the response envelope, and the client response is never
+  delayed by refinement. The end-to-end latency histogram and
+  `usage_log.latency_ms` are frozen at response time before the deferral, so
+  they measure the request, not the refinement. Encoders are built once at
+  config load, never lazily on a request.
+- **Scope.** Applied to the paths with a post-response settlement: chat
+  (non-streaming), embeddings, and rerank. Rerank tokens remain always
+  gateway-estimated (uniform observability, above) whether or not the upstream
+  billed search units; its refinement follows the same deferred path and is
+  usually a no-op, since real rerank model ids rarely carry an OpenAI tiktoken
+  family prefix. Streaming input counts stay on the heuristic - the stream is
+  forwarded, never buffered (ADR 004), so there is no assembled
+  prompt/response to BPE without violating the passthrough rule.
 - **Honesty preserved.** Accurate local counts are still flagged
   `estimated = true`. A local count, however exact the tokenizer, is an estimate
   of what the upstream would bill; upstream-reported usage always wins
-  (`estimated = false`). On any tokenizer failure the count falls back to the
-  heuristic, so counting can never fail or reject a request.
+  (`estimated = false`). On any tokenizer failure the deferred close settles
+  with the heuristic numbers, so counting can never fail or reject a request.
+  Consequence to be aware of: when refinement fires, the response envelope
+  (heuristic) and the accounting surfaces (accurate) intentionally differ -
+  the envelope is the hot-path-safe estimate, the accounting surfaces are the
+  billing-grade one.
