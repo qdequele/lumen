@@ -224,9 +224,11 @@ mod tests {
                 api_key: Some("sk-test-xxx".to_owned()),
                 base_url: None,
                 strict: false,
+                connect_timeout_ms: None,
                 models,
             }],
             reqwest::Client::new(),
+            std::time::Duration::from_secs(300),
         )
         .expect("registry builds")
     }
@@ -239,9 +241,11 @@ mod tests {
                 api_key: Some("sk-test-xxx".to_owned()),
                 base_url: None,
                 strict: false,
+                connect_timeout_ms: None,
                 models,
             }],
             reqwest::Client::new(),
+            std::time::Duration::from_secs(300),
         )
         .expect("registry builds")
     }

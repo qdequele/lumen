@@ -74,7 +74,14 @@ pub async fn spawn_state(state: AppState, body_limit: usize) -> String {
 /// An empty registry (no providers) - for tests that don't hit `/v1/*`.
 #[must_use]
 pub fn empty_registry() -> Arc<Registry> {
-    Arc::new(Registry::build(Vec::new(), http::build_client()).expect("empty registry builds"))
+    Arc::new(
+        Registry::build(
+            Vec::new(),
+            http::build_client(),
+            std::time::Duration::from_secs(300),
+        )
+        .expect("empty registry builds"),
+    )
 }
 
 /// Spawn with the given body limit and an empty registry.

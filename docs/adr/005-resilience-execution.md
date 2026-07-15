@@ -1,6 +1,6 @@
 # ADR 005 - Resilience execution model (retries, fallback, circuit breaker, timeouts)
 
-- Status: accepted
+- Status: accepted (amended 2026-07-15: per-provider connect timeout, see below)
 - Date: 2026-07-13
 
 ## Context
@@ -116,11 +116,12 @@ self-healing.
 
 Three timeouts, global defaults with per-model overrides:
 
-- **connect** (default 5 s) - a `reqwest::Client` setting, so it is **global
+- **connect** (default 5 s) - a `reqwest::Client` setting. Originally **global
   only** (per-provider connect would require one client per provider and lose
-  connection pooling; deferred, noted in docs). A connect timeout is now
-  distinguished from a read timeout: `ProviderError::ConnectTimeout` →
-  `LM-3012` (504).
+  connection pooling; deferred). **Superseded by the 2026-07-15 amendment
+  below**: a provider may now override it with `connect_timeout_ms`, at the cost
+  of its own (unpooled) client. A connect timeout is distinguished from a read
+  timeout: `ProviderError::ConnectTimeout` → `LM-3012` (504).
 - **first_token** (default 30 s, per-model override) - reuses the streaming path;
   `LM-3011` (504). For non-streaming it bounds the whole call; for streaming,
   the time to the first frame.
@@ -154,4 +155,37 @@ of provider health (criterion 5) and does no I/O.
 - `usage_log` gains a `model_used` column (migration 0002) so a fallback is
   observable after the fact, mirroring the `x-lumen-model-used` header.
 - Per-provider connect timeouts and true first-frame-peek streaming retries are
-  explicitly out of scope here and recorded in `docs/backlog.md`.
+  explicitly out of scope here and recorded in `docs/backlog.md`. (Per-provider
+  connect timeouts were subsequently implemented; see the amendment below.)
+
+## Amendment (2026-07-15): per-provider connect timeout
+
+The original decision left `connect` global-only because a per-provider connect
+timeout is a `reqwest::Client` setting and one pooled client is shared across
+all providers, so overriding it per provider would mean one client per provider
+and the loss of cross-provider connection pooling. Issue #24 asked for it anyway
+(an upstream that is reliably reachable can afford a much tighter connect
+deadline than a flaky one; a distant self-hosted box may need a looser one), so
+the deferral is **superseded**.
+
+**Chosen design.** The shared, pooled client remains the default and carries the
+global `resilience.connect_timeout_ms`. A provider that sets the new optional
+`connect_timeout_ms` (alongside the existing per-provider `first_token_timeout_ms`
+and `total_timeout_ms`) is given its **own** `reqwest::Client`, built once at
+registry construction, with that connect timeout and the *same* overall backstop
+as the shared client. Every provider that does not override keeps sharing the
+one pooled client, so pooling is preserved for the common case and only an
+explicitly-overriding provider pays for it.
+
+**Trade-off (documented, accepted).** An overriding provider no longer shares
+the process-wide connection pool: its connections are pooled only within its own
+dedicated client. This is a per-provider, opt-in cost. Nothing else about the
+provider changes (same overall cap, same executor timeouts, same error codes).
+
+**Where it lives.** `ProviderSpec` gains `connect_timeout_ms: Option<u64>`;
+`Registry::build`/`reload` take the overall backstop and build the dedicated
+clients in `build_inner`. Because the registry rebuilds all clients from the new
+specs on every hot reload, changing (adding, editing or removing) a provider's
+`connect_timeout_ms` takes effect on `SIGHUP`/file-change reload with no restart,
+exactly like the other two per-provider timeout overrides. Config validation
+rejects a `connect_timeout_ms` of `0`, matching the other overrides.

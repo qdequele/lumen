@@ -50,8 +50,10 @@ pub struct Config {
 /// Retries, circuit breaker, timeouts and background health checks (M6).
 ///
 /// `first_token` is not here - it stays [`ServerConfig::first_token_timeout_ms`]
-/// (its M4 home) and can be overridden per provider. `connect` is a client-wide
-/// setting (one pooled HTTP client), so it has no per-provider override.
+/// (its M4 home) and can be overridden per provider. `connect` here is the
+/// default connect timeout for the shared, pooled HTTP client; a provider may
+/// override it with `connect_timeout_ms`, which gives that provider its own
+/// client (ADR 005, 2026-07-15 amendment).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResilienceConfig {
@@ -359,6 +361,14 @@ pub struct ProviderConfig {
     /// drops it with a debug log.
     #[serde(default)]
     pub strict: bool,
+    /// Per-provider connection-establishment timeout override in ms (else the
+    /// global [`ResilienceConfig::connect_timeout_ms`]). Setting it gives this
+    /// provider its OWN HTTP client, so it no longer shares the process-wide
+    /// connection pool (ADR 005, 2026-07-15 amendment): a deliberate trade-off
+    /// for an upstream that needs a tighter or looser connect deadline than the
+    /// rest.
+    #[serde(default)]
+    pub connect_timeout_ms: Option<u64>,
     /// Models this provider exposes.
     #[serde(default)]
     pub models: Vec<ModelConfig>,
@@ -626,6 +636,7 @@ impl Config {
             for (field, value) in [
                 ("first_token_timeout_ms", provider.first_token_timeout_ms),
                 ("total_timeout_ms", provider.total_timeout_ms),
+                ("connect_timeout_ms", provider.connect_timeout_ms),
             ] {
                 if value == Some(0) {
                     return Err(err(format!(
@@ -785,6 +796,7 @@ impl Config {
                     .and_then(|var| std::env::var(var).ok()),
                 base_url: p.base_url.clone(),
                 strict: p.strict,
+                connect_timeout_ms: p.connect_timeout_ms,
                 models: p
                     .models
                     .iter()
@@ -1175,6 +1187,46 @@ mod tests {
         let cfg = load_str(toml).unwrap();
         let overrides = cfg.model_timeout_overrides();
         assert_eq!(overrides.get("gpt"), Some(&(Some(60_000), Some(120_000))));
+    }
+
+    #[test]
+    fn per_provider_connect_timeout_parses_and_reaches_the_spec() {
+        let toml = r#"
+            [[providers]]
+            name = "flakyvendor"
+            kind = "openai"
+            connect_timeout_ms = 250
+            [[providers.models]]
+            id = "gpt"
+            capabilities = ["chat"]
+        "#;
+        let cfg = load_str(toml).unwrap();
+        assert_eq!(cfg.providers[0].connect_timeout_ms, Some(250));
+        let specs = cfg.provider_specs();
+        assert_eq!(specs[0].connect_timeout_ms, Some(250));
+    }
+
+    #[test]
+    fn per_provider_connect_timeout_of_zero_is_rejected() {
+        let toml = r#"
+            [[providers]]
+            name = "vendor"
+            kind = "openai"
+            connect_timeout_ms = 0
+            [[providers.models]]
+            id = "gpt"
+            capabilities = ["chat"]
+        "#;
+        let err = load_str(toml).unwrap_err();
+        assert!(err.to_string().contains("connect_timeout_ms"));
+    }
+
+    #[test]
+    fn provider_without_connect_override_leaves_the_spec_none() {
+        let cfg = load_str(VALID).unwrap();
+        for spec in cfg.provider_specs() {
+            assert_eq!(spec.connect_timeout_ms, None);
+        }
     }
 
     #[test]

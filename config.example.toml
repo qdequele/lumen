@@ -100,13 +100,15 @@ retry_max_ms = 5000               # ceiling on the exponential backoff term
 circuit_failure_threshold = 5     # consecutive failures that trip it open
 circuit_cooldown_ms = 30000       # time spent open before a half-open probe
 
-# Timeouts. `connect` is client-wide (one pooled HTTP client, so there is no
-# per-provider connect override). The first-token timeout lives in [server]
-# (server.first_token_timeout_ms); the total timeout is here. BOTH the
-# first-token and total timeouts can be overridden per provider (see the
-# ollama-local block below). Each timeout maps to a distinct 504 for debugging:
-# LM-3012 connect, LM-3011 first-token, LM-3013 total (the whole request -
-# all retries and fallbacks together).
+# Timeouts. `connect` here is the default for the shared, pooled HTTP client.
+# The first-token timeout lives in [server] (server.first_token_timeout_ms); the
+# total timeout is here. ALL THREE (connect, first-token, total) can be
+# overridden per provider (see the ollama-local block below). Overriding a
+# provider's connect timeout gives it its OWN HTTP client, so it no longer
+# shares the pool (ADR 005, 2026-07-15 amendment); the other two overrides do
+# not. Each timeout maps to a distinct 504 for debugging: LM-3012 connect,
+# LM-3011 first-token, LM-3013 total (the whole request - all retries and
+# fallbacks together).
 connect_timeout_ms = 5000         # TCP + TLS connection establishment
 total_timeout_ms = 600000         # absolute per-request deadline (10 minutes)
 
@@ -236,8 +238,12 @@ base_url = "http://localhost:11434"
 # Per-provider timeout overrides (optional). A local model can take a while to
 # load into VRAM on its first call, so relax the first-token and total windows
 # for THIS provider only; they fall back to [server].first_token_timeout_ms and
-# [resilience].total_timeout_ms when unset. `connect` is client-wide and cannot
-# be overridden per provider. Applies to every model this provider serves.
+# [resilience].total_timeout_ms when unset. `connect_timeout_ms` may also be
+# overridden here: a self-hosted box on a slow link can be given a looser connect
+# deadline than the global default. NOTE: setting connect_timeout_ms gives this
+# provider its OWN (unpooled) HTTP client (ADR 005, 2026-07-15 amendment); leave
+# it unset to keep sharing the pooled client. All apply to every model this
+# provider serves.
 first_token_timeout_ms = 60000
 total_timeout_ms = 120000
 # strict = false   # optional (default false). When true, reject a request that
@@ -245,6 +251,7 @@ total_timeout_ms = 120000
                    # cannot honor (Ollama: `dimensions`) with a 400 (LM-1001),
                    # instead of silently dropping it. `encoding_format` is always
                    # handled at the response edge and is never affected.
+connect_timeout_ms = 10000        # own client: relaxed connect for a slow local link
 
 [[providers.models]]
 id = "nomic-embed"

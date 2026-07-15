@@ -18,6 +18,7 @@ fn registry() -> Arc<Registry> {
             api_key: Some("sk-test-xxx".to_owned()),
             base_url: None,
             strict: false,
+            connect_timeout_ms: None,
             models: vec![ModelSpec {
                 id: "multi".to_owned(),
                 upstream_id: "embed-v4.0".to_owned(),
@@ -32,6 +33,7 @@ fn registry() -> Arc<Registry> {
             api_key: Some("sk-test-xxx".to_owned()),
             base_url: None,
             strict: false,
+            connect_timeout_ms: None,
             models: vec![ModelSpec {
                 id: "gpt".to_owned(),
                 upstream_id: "gpt-4o".to_owned(),
@@ -40,7 +42,14 @@ fn registry() -> Arc<Registry> {
             }],
         },
     ];
-    Arc::new(Registry::build(specs, http::build_client()).expect("registry builds"))
+    Arc::new(
+        Registry::build(
+            specs,
+            http::build_client(),
+            std::time::Duration::from_secs(300),
+        )
+        .expect("registry builds"),
+    )
 }
 
 const LIMIT: usize = 10 * 1024 * 1024;

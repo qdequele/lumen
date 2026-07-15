@@ -22,13 +22,15 @@ pub fn build_client() -> reqwest::Client {
     build_client_with(Duration::from_secs(10), Duration::from_secs(300))
 }
 
-/// Build the process-wide HTTP client with an explicit connect timeout
-/// (LM-3012, client-wide - M6 §6.4) and an overall backstop.
+/// Build an HTTP client with an explicit connect timeout (LM-3012 - M6 §6.4)
+/// and an overall backstop.
 ///
 /// The `overall` cap is a safety net so a wedged upstream cannot pin a
 /// connection forever; the executor's total timeout (and cancellation on client
-/// disconnect) normally fire first. One pooled client is shared across all
-/// providers, so the connect timeout is necessarily process-wide.
+/// disconnect) normally fire first. Normally one pooled client is shared across
+/// all providers, so `connect` is the process-wide default; a provider that
+/// sets `connect_timeout_ms` is given a dedicated client built here with its own
+/// connect timeout (ADR 005, 2026-07-15 amendment).
 #[must_use]
 pub fn build_client_with(connect: Duration, overall: Duration) -> reqwest::Client {
     reqwest::Client::builder()

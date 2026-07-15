@@ -12,6 +12,7 @@ use arc_swap::ArcSwap;
 use lumen_core::{Capability, ChatProvider, EmbeddingProvider, RerankProvider};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::anthropic::AnthropicProvider;
 use crate::azure::AzureProvider;
@@ -62,6 +63,13 @@ pub struct ProviderSpec {
     /// silently dropping it). Currently honored by Ollama for `dimensions`
     /// (issue #25). Defaults to `false` (lenient).
     pub strict: bool,
+    /// Per-provider connection-establishment timeout, in ms. When set, this
+    /// provider is given its OWN [`reqwest::Client`] (built at registry
+    /// construction) with this connect timeout; the trade-off is that such a
+    /// provider no longer shares the process-wide connection pool (ADR 005,
+    /// 2026-07-15 amendment). `None` (the common case) keeps the provider on
+    /// the shared, pooled client.
+    pub connect_timeout_ms: Option<u64>,
     /// Models this provider serves.
     pub models: Vec<ModelSpec>,
 }
@@ -76,6 +84,7 @@ impl std::fmt::Debug for ProviderSpec {
             .field("api_key", &self.api_key.as_ref().map(|_| "REDACTED"))
             .field("base_url", &self.base_url)
             .field("strict", &self.strict)
+            .field("connect_timeout_ms", &self.connect_timeout_ms)
             .field("models", &self.models)
             .finish()
     }
@@ -242,25 +251,40 @@ pub struct Registry {
     inner: ArcSwap<Inner>,
     /// Shared HTTP client, retained for hot-reload rebuilds (M7).
     client: reqwest::Client,
+    /// Overall-timeout backstop applied to any dedicated per-provider client
+    /// (built when a spec overrides its connect timeout). Kept identical to the
+    /// shared client's backstop so an overriding provider only changes its
+    /// connect timeout, nothing else. Retained for hot-reload rebuilds.
+    overall_backstop: Duration,
 }
 
 impl Registry {
     /// Build the registry from provider specs, sharing `client` across all
-    /// provider instances. Takes ownership of the spec set (a full description
-    /// of the routing table), even though today it only borrows to construct.
+    /// provider instances that do not override their connect timeout. A spec
+    /// with `connect_timeout_ms` set is given its own client (built here, once)
+    /// with that connect timeout and `overall_backstop` as the overall cap - so
+    /// pooling is preserved for every provider that does not override. Takes
+    /// ownership of the spec set (a full description of the routing table).
     #[allow(clippy::needless_pass_by_value)]
-    pub fn build(specs: Vec<ProviderSpec>, client: reqwest::Client) -> Result<Self, RegistryError> {
-        let inner = build_inner(&specs, &client)?;
+    pub fn build(
+        specs: Vec<ProviderSpec>,
+        client: reqwest::Client,
+        overall_backstop: Duration,
+    ) -> Result<Self, RegistryError> {
+        let inner = build_inner(&specs, &client, overall_backstop)?;
         Ok(Self {
             inner: ArcSwap::from_pointee(inner),
             client,
+            overall_backstop,
         })
     }
 
-    /// Atomically replace the routing table (hot reload - M7).
+    /// Atomically replace the routing table (hot reload - M7). Dedicated
+    /// per-provider clients are rebuilt from the new specs, so a changed (or
+    /// newly added/removed) `connect_timeout_ms` override takes effect on reload.
     #[allow(clippy::needless_pass_by_value)]
     pub fn reload(&self, specs: Vec<ProviderSpec>) -> Result<(), RegistryError> {
-        let inner = build_inner(&specs, &self.client)?;
+        let inner = build_inner(&specs, &self.client, self.overall_backstop)?;
         self.inner.store(Arc::new(inner));
         Ok(())
     }
@@ -308,14 +332,27 @@ impl Registry {
     }
 }
 
-fn build_inner(specs: &[ProviderSpec], client: &reqwest::Client) -> Result<Inner, RegistryError> {
+fn build_inner(
+    specs: &[ProviderSpec],
+    client: &reqwest::Client,
+    overall_backstop: Duration,
+) -> Result<Inner, RegistryError> {
     let mut inner = Inner::default();
     // model id -> the provider that first declared it, so a collision names both.
     let mut owner: HashMap<&str, &str> = HashMap::new();
 
     for spec in specs {
+        // A provider that overrides its connect timeout gets a dedicated client
+        // (built once, here) with that timeout; every other provider stays on
+        // the shared, pooled client. Owned locally so its lifetime spans the
+        // `build_providers` call below.
+        let dedicated = spec
+            .connect_timeout_ms
+            .map(|ms| crate::http::build_client_with(Duration::from_millis(ms), overall_backstop));
+        let provider_client = dedicated.as_ref().unwrap_or(client);
+
         // One instance per provider, shared across all of its models via `Arc`.
-        let built = build_providers(spec, client)?;
+        let built = build_providers(spec, provider_client)?;
 
         for model in &spec.models {
             if let Some(first) = owner.insert(model.id.as_str(), spec.name.as_str()) {
@@ -790,8 +827,70 @@ mod tests {
             api_key: Some("sk-test-xxx".to_owned()),
             base_url: base_url.map(str::to_owned),
             strict: false,
+            connect_timeout_ms: None,
             models,
         }
+    }
+
+    /// A provider whose connect timeout is overridden gets a dedicated client
+    /// with that timeout, so a connect to an unroutable host fails fast well
+    /// before the shared client's default (10 s) connect timeout would. The
+    /// non-routable 10.255.255.1 address swallows the SYN, so the only thing
+    /// that can end the call is the connect timeout: a fast return proves the
+    /// per-provider override took effect. Kept deterministic (no wiremock) by
+    /// asserting a generous upper bound far below the default.
+    #[tokio::test]
+    async fn overriding_provider_uses_its_own_fast_connect_timeout() {
+        use lumen_core::{ChatRequest, ProviderError};
+        use std::time::{Duration, Instant};
+        use tokio_util::sync::CancellationToken;
+
+        let mut overriding = spec(
+            ProviderKind::Openai,
+            "slow-host",
+            Some("http://10.255.255.1:81/v1"),
+            vec![model("m", &[Capability::Chat])],
+        );
+        overriding.connect_timeout_ms = Some(150);
+
+        let reg = Registry::build(
+            vec![overriding],
+            reqwest::Client::new(),
+            Duration::from_secs(300),
+        )
+        .expect("registry builds");
+
+        let route = reg.chat_route("m").expect("chat route present");
+        let started = Instant::now();
+        let result = route
+            .provider
+            .chat(
+                ChatRequest {
+                    model: "m".to_owned(),
+                    messages: Vec::new(),
+                    temperature: None,
+                    top_p: None,
+                    max_tokens: None,
+                    n: None,
+                    stop: None,
+                    stream: false,
+                    extra: serde_json::Map::new(),
+                },
+                CancellationToken::new(),
+            )
+            .await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(result, Err(ProviderError::ConnectTimeout { .. })),
+            "expected a connect timeout, got {result:?}"
+        );
+        // Default connect timeout is 10 s; a return under 5 s can only mean the
+        // 150 ms per-provider override was applied to a dedicated client.
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "connect should have failed fast under the override, took {elapsed:?}"
+        );
     }
 
     fn model(id: &str, caps: &[Capability]) -> ModelSpec {
@@ -816,6 +915,7 @@ mod tests {
                 ],
             )],
             reqwest::Client::new(),
+            Duration::from_secs(300),
         )
         .unwrap();
 
@@ -836,6 +936,7 @@ mod tests {
                 vec![model("e", &[Capability::Embed])],
             )],
             reqwest::Client::new(),
+            Duration::from_secs(300),
         );
         assert!(matches!(result, Err(RegistryError::MissingBaseUrl { .. })));
     }
@@ -867,6 +968,7 @@ mod tests {
                     vec![model("m", &[Capability::Chat, Capability::Embed])],
                 )],
                 reqwest::Client::new(),
+                Duration::from_secs(300),
             )
             .unwrap_or_else(|e| panic!("{kind:?} should build: {e}"));
             assert!(reg.chat_route("m").is_some(), "{kind:?} chat");
@@ -883,6 +985,7 @@ mod tests {
             let result = Registry::build(
                 vec![spec(kind, "p", None, vec![model("m", &[Capability::Chat])])],
                 reqwest::Client::new(),
+                Duration::from_secs(300),
             );
             assert!(
                 matches!(result, Err(RegistryError::MissingBaseUrl { .. })),
@@ -898,6 +1001,7 @@ mod tests {
                 vec![model("m", &[Capability::Chat])],
             )],
             reqwest::Client::new(),
+            Duration::from_secs(300),
         )
         .expect("vllm with base_url builds");
         assert!(reg.chat_route("m").is_some());
@@ -915,6 +1019,7 @@ mod tests {
                 vec![model("m", &[Capability::Chat])],
             )],
             reqwest::Client::new(),
+            Duration::from_secs(300),
         );
         assert!(matches!(result, Err(RegistryError::MissingBaseUrl { .. })));
     }
@@ -929,6 +1034,7 @@ mod tests {
                 vec![model("m", &[Capability::Chat, Capability::Embed])],
             )],
             reqwest::Client::new(),
+            Duration::from_secs(300),
         )
         .unwrap();
         assert!(reg.chat_route("m").is_some());
@@ -945,6 +1051,7 @@ mod tests {
                 vec![model("claude", &[Capability::Chat])],
             )],
             reqwest::Client::new(),
+            Duration::from_secs(300),
         )
         .unwrap();
         assert!(reg.chat_route("claude").is_some());
@@ -964,6 +1071,7 @@ mod tests {
                 vec![model("m", &[Capability::Chat])],
             )],
             reqwest::Client::new(),
+            Duration::from_secs(300),
         );
         assert!(
             matches!(result, Err(RegistryError::MissingRegion { .. })),
@@ -981,6 +1089,7 @@ mod tests {
                 vec![model("e", &[Capability::Embed])],
             )],
             reqwest::Client::new(),
+            Duration::from_secs(300),
         );
         assert!(matches!(result, Err(RegistryError::MissingBaseUrl { .. })));
     }
@@ -1000,6 +1109,7 @@ mod tests {
                 }],
             )],
             reqwest::Client::new(),
+            Duration::from_secs(300),
         )
         .unwrap();
         assert_eq!(
@@ -1027,9 +1137,11 @@ mod tests {
                 api_key: Some(creds.clone()),
                 base_url: Some("us-central1".to_owned()),
                 strict: false,
+                connect_timeout_ms: None,
                 models: vec![model("gemini-flash", &[Capability::Chat])],
             }],
             reqwest::Client::new(),
+            Duration::from_secs(300),
         )
         .expect("vertex_ai builds");
         assert!(reg.chat_route("gemini-flash").is_some());
@@ -1042,9 +1154,11 @@ mod tests {
                 api_key: Some(creds),
                 base_url: None,
                 strict: false,
+                connect_timeout_ms: None,
                 models: vec![model("m", &[Capability::Chat])],
             }],
             reqwest::Client::new(),
+            Duration::from_secs(300),
         );
         assert!(matches!(
             no_region,
@@ -1060,9 +1174,11 @@ mod tests {
                 api_key: None,
                 base_url: Some("us-central1".to_owned()),
                 strict: false,
+                connect_timeout_ms: None,
                 models: vec![model("m", &[Capability::Chat])],
             }],
             reqwest::Client::new(),
+            Duration::from_secs(300),
         );
         assert!(keyless.is_ok(), "unset creds env must still boot");
 
@@ -1074,9 +1190,11 @@ mod tests {
                 api_key: Some("sk-test-xxx".to_owned()),
                 base_url: Some("us-central1".to_owned()),
                 strict: false,
+                connect_timeout_ms: None,
                 models: vec![model("m", &[Capability::Chat])],
             }],
             reqwest::Client::new(),
+            Duration::from_secs(300),
         );
         assert!(matches!(garbage, Err(RegistryError::ProviderConfig { .. })));
     }
@@ -1091,6 +1209,7 @@ mod tests {
                 vec![model("multi", &[Capability::Embed, Capability::Rerank])],
             )],
             reqwest::Client::new(),
+            Duration::from_secs(300),
         )
         .unwrap();
         assert!(reg.embedding_route("multi").is_some());
@@ -1113,6 +1232,7 @@ mod tests {
                 )],
             )],
             reqwest::Client::new(),
+            Duration::from_secs(300),
         )
         .unwrap();
         assert!(reg.chat_route("cf-multi").is_some());
@@ -1133,6 +1253,7 @@ mod tests {
                 )],
             )],
             reqwest::Client::new(),
+            Duration::from_secs(300),
         )
         .unwrap();
         assert!(reg.chat_route("command-r-plus").is_some());
@@ -1151,6 +1272,7 @@ mod tests {
                     vec![model("rr", &[Capability::Rerank])],
                 )],
                 reqwest::Client::new(),
+                Duration::from_secs(300),
             )
             .unwrap_or_else(|e| panic!("{kind:?} should build: {e}"));
             assert!(reg.rerank_route("rr").is_some(), "{kind:?} rerank");
@@ -1172,6 +1294,7 @@ mod tests {
                 )],
             )],
             reqwest::Client::new(),
+            Duration::from_secs(300),
         )
         .unwrap();
         assert!(reg.chat_route("multi").is_some());
@@ -1189,6 +1312,7 @@ mod tests {
                 vec![model("rr", &[Capability::Rerank])],
             )],
             reqwest::Client::new(),
+            Duration::from_secs(300),
         );
         assert!(matches!(result, Err(RegistryError::MissingBaseUrl { .. })));
     }
@@ -1203,6 +1327,7 @@ mod tests {
                 vec![model("rr", &[Capability::Rerank])],
             )],
             reqwest::Client::new(),
+            Duration::from_secs(300),
         )
         .expect("nvidia with base_url builds");
         assert!(reg.rerank_route("rr").is_some());
@@ -1226,6 +1351,7 @@ mod tests {
                 ),
             ],
             reqwest::Client::new(),
+            Duration::from_secs(300),
         );
         match result {
             Err(RegistryError::DuplicateModelId {
@@ -1259,6 +1385,7 @@ mod tests {
                 ),
             ],
             reqwest::Client::new(),
+            Duration::from_secs(300),
         )
         .unwrap();
 

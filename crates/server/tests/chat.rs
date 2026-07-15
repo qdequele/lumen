@@ -37,7 +37,12 @@ fn config_from(toml: &str) -> Config {
 /// into the body-size-limit layer from the same value.
 async fn spawn(config: &Config) -> String {
     let registry = Arc::new(
-        Registry::build(config.provider_specs(), http::build_client()).expect("registry builds"),
+        Registry::build(
+            config.provider_specs(),
+            http::build_client(),
+            std::time::Duration::from_secs(300),
+        )
+        .expect("registry builds"),
     );
     let state = common::base_state(registry);
     common::spawn_state(state, config.server.body_limit).await
@@ -51,6 +56,7 @@ fn openai_registry(upstream: &str) -> Arc<Registry> {
         api_key: Some("sk-test-xxx".to_owned()),
         base_url: Some(upstream.to_owned()),
         strict: false,
+        connect_timeout_ms: None,
         models: vec![
             ModelSpec {
                 id: "gpt".to_owned(),
@@ -66,7 +72,14 @@ fn openai_registry(upstream: &str) -> Arc<Registry> {
             },
         ],
     }];
-    Arc::new(Registry::build(specs, http::build_client()).expect("registry builds"))
+    Arc::new(
+        Registry::build(
+            specs,
+            http::build_client(),
+            std::time::Duration::from_secs(300),
+        )
+        .expect("registry builds"),
+    )
 }
 
 fn anthropic_registry(upstream: &str) -> Arc<Registry> {
@@ -76,6 +89,7 @@ fn anthropic_registry(upstream: &str) -> Arc<Registry> {
         api_key: Some("sk-ant-test".to_owned()),
         base_url: Some(upstream.to_owned()),
         strict: false,
+        connect_timeout_ms: None,
         models: vec![ModelSpec {
             id: "claude".to_owned(),
             upstream_id: "claude-3-5-sonnet".to_owned(),
@@ -83,7 +97,14 @@ fn anthropic_registry(upstream: &str) -> Arc<Registry> {
             modalities: vec!["text".to_owned()],
         }],
     }];
-    Arc::new(Registry::build(specs, http::build_client()).expect("registry builds"))
+    Arc::new(
+        Registry::build(
+            specs,
+            http::build_client(),
+            std::time::Duration::from_secs(300),
+        )
+        .expect("registry builds"),
+    )
 }
 
 fn google_registry(upstream: &str) -> Arc<Registry> {
@@ -93,6 +114,7 @@ fn google_registry(upstream: &str) -> Arc<Registry> {
         api_key: Some("goog-test".to_owned()),
         base_url: Some(upstream.to_owned()),
         strict: false,
+        connect_timeout_ms: None,
         models: vec![ModelSpec {
             id: "gemini".to_owned(),
             upstream_id: "gemini-2.0-flash".to_owned(),
@@ -100,7 +122,14 @@ fn google_registry(upstream: &str) -> Arc<Registry> {
             modalities: vec!["text".to_owned()],
         }],
     }];
-    Arc::new(Registry::build(specs, http::build_client()).expect("registry builds"))
+    Arc::new(
+        Registry::build(
+            specs,
+            http::build_client(),
+            std::time::Duration::from_secs(300),
+        )
+        .expect("registry builds"),
+    )
 }
 
 /// Vision-capable variant of [`anthropic_registry`] (issue #12 tests).
@@ -111,6 +140,7 @@ fn anthropic_vision_registry(upstream: &str) -> Arc<Registry> {
         api_key: Some("sk-ant-test".to_owned()),
         base_url: Some(upstream.to_owned()),
         strict: false,
+        connect_timeout_ms: None,
         models: vec![ModelSpec {
             id: "claude".to_owned(),
             upstream_id: "claude-3-5-sonnet".to_owned(),
@@ -118,7 +148,14 @@ fn anthropic_vision_registry(upstream: &str) -> Arc<Registry> {
             modalities: vec!["text".to_owned(), "image".to_owned()],
         }],
     }];
-    Arc::new(Registry::build(specs, http::build_client()).expect("registry builds"))
+    Arc::new(
+        Registry::build(
+            specs,
+            http::build_client(),
+            std::time::Duration::from_secs(300),
+        )
+        .expect("registry builds"),
+    )
 }
 
 /// Vision-capable variant of [`google_registry`] (issue #12 tests).
@@ -129,6 +166,7 @@ fn google_vision_registry(upstream: &str) -> Arc<Registry> {
         api_key: Some("goog-test".to_owned()),
         base_url: Some(upstream.to_owned()),
         strict: false,
+        connect_timeout_ms: None,
         models: vec![ModelSpec {
             id: "gemini".to_owned(),
             upstream_id: "gemini-2.0-flash".to_owned(),
@@ -136,7 +174,14 @@ fn google_vision_registry(upstream: &str) -> Arc<Registry> {
             modalities: vec!["text".to_owned(), "image".to_owned()],
         }],
     }];
-    Arc::new(Registry::build(specs, http::build_client()).expect("registry builds"))
+    Arc::new(
+        Registry::build(
+            specs,
+            http::build_client(),
+            std::time::Duration::from_secs(300),
+        )
+        .expect("registry builds"),
+    )
 }
 
 fn openai_chat_body(model: &str) -> Value {
@@ -171,6 +216,7 @@ async fn openai_compatible_kind_routes_through_the_openai_path() {
         api_key: Some("gsk-test".to_owned()),
         base_url: Some(upstream.uri()), // override the built-in api.groq.com default
         strict: false,
+        connect_timeout_ms: None,
         models: vec![ModelSpec {
             id: "fast".to_owned(),
             upstream_id: "llama-3.3-70b".to_owned(),
@@ -178,7 +224,14 @@ async fn openai_compatible_kind_routes_through_the_openai_path() {
             modalities: vec!["text".to_owned()],
         }],
     }];
-    let registry = Arc::new(Registry::build(specs, http::build_client()).expect("registry builds"));
+    let registry = Arc::new(
+        Registry::build(
+            specs,
+            http::build_client(),
+            std::time::Duration::from_secs(300),
+        )
+        .expect("registry builds"),
+    );
     let base = common::spawn_with(registry, LIMIT).await;
 
     let resp = reqwest::Client::new()

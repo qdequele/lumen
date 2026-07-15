@@ -6,6 +6,21 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added - Per-provider connect timeout (issue #24)
+
+- A provider block may now set `connect_timeout_ms`, joining the existing
+  per-provider `first_token_timeout_ms` and `total_timeout_ms` overrides. When
+  set, that provider is given its own `reqwest::Client` (built once at registry
+  construction) with the override as its connect timeout and the same overall
+  backstop as the shared client. Providers that do not override keep sharing the
+  one pooled client, so cross-provider connection pooling is preserved for the
+  common case. Trade-off: an overriding provider no longer shares the pool (its
+  connections pool only within its own client). Config validation rejects a
+  `connect_timeout_ms` of `0`. The override is picked up on hot reload like the
+  other two, because the registry rebuilds its clients from the new specs.
+  Supersedes the ADR 005 deferral of per-provider connect timeouts (amended
+  2026-07-15).
+
 ### Added - Hot reload extended to auth knobs + DB provider-key rotation
 
 - **Hot reload now retunes the safe `[auth]` knobs without a restart.** A

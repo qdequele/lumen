@@ -245,14 +245,19 @@ fn run(config: Config, config_path: PathBuf) -> anyhow::Result<()> {
                 )
             };
 
-        // Connect timeout is client-wide (one pooled client); the overall cap
-        // is a backstop above the executor's total timeout (M6 §6.4).
+        // The shared client sets the default (process-wide) connect timeout and
+        // an overall cap that backstops the executor's total timeout (M6 §6.4).
+        // A provider that sets `connect_timeout_ms` gets its own client with the
+        // same overall backstop (ADR 005, 2026-07-15 amendment); every other
+        // provider keeps sharing this pooled client.
+        let overall_backstop =
+            Duration::from_millis(config.resilience.total_timeout_ms.saturating_add(30_000));
         let client = lumen_providers::http::build_client_with(
             Duration::from_millis(config.resilience.connect_timeout_ms),
-            Duration::from_millis(config.resilience.total_timeout_ms.saturating_add(30_000)),
+            overall_backstop,
         );
         let registry = Arc::new(
-            lumen_providers::Registry::build(provider_specs, client.clone())
+            lumen_providers::Registry::build(provider_specs, client.clone(), overall_backstop)
                 .context("failed to build provider registry")?,
         );
 

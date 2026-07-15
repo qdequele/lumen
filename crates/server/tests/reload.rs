@@ -71,7 +71,14 @@ fn registry_with_key(path: &Path, key: &str) -> Arc<Registry> {
             spec.api_key = Some(key.to_owned());
         }
     }
-    Arc::new(Registry::build(specs, http::build_client()).expect("registry builds"))
+    Arc::new(
+        Registry::build(
+            specs,
+            http::build_client(),
+            std::time::Duration::from_secs(300),
+        )
+        .expect("registry builds"),
+    )
 }
 
 async fn mount_rerank(upstream: &MockServer) {

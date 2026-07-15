@@ -43,6 +43,7 @@ fn full_registry(upstream: &str) -> Arc<Registry> {
             api_key: Some("sk-test-xxx".to_owned()),
             base_url: Some(upstream.to_owned()),
             strict: false,
+            connect_timeout_ms: None,
             models: vec![
                 ModelSpec {
                     id: "gpt".to_owned(),
@@ -64,6 +65,7 @@ fn full_registry(upstream: &str) -> Arc<Registry> {
             api_key: Some("sk-co-test".to_owned()),
             base_url: Some(upstream.to_owned()),
             strict: false,
+            connect_timeout_ms: None,
             models: vec![ModelSpec {
                 id: "rerank-fast".to_owned(),
                 upstream_id: "rerank-v3.5".to_owned(),
@@ -77,6 +79,7 @@ fn full_registry(upstream: &str) -> Arc<Registry> {
             api_key: None,
             base_url: Some(upstream.to_owned()),
             strict: false,
+            connect_timeout_ms: None,
             models: vec![ModelSpec {
                 id: "tei-embed".to_owned(),
                 upstream_id: "tei-model".to_owned(),
@@ -85,7 +88,14 @@ fn full_registry(upstream: &str) -> Arc<Registry> {
             }],
         },
     ];
-    Arc::new(Registry::build(specs, http::build_client()).expect("registry builds"))
+    Arc::new(
+        Registry::build(
+            specs,
+            http::build_client(),
+            std::time::Duration::from_secs(300),
+        )
+        .expect("registry builds"),
+    )
 }
 
 /// $1 per token / per search: budget arithmetic in the tests is 1:1.
