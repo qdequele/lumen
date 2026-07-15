@@ -9,8 +9,8 @@ covers the advanced features:
   * vision: image content parts in /v1/chat/completions (OpenAI forwarded
     verbatim, Anthropic translated to base64 blocks, Gemini to inline_data)
   * function calling: tools request -> tool_calls response -> tool-result
-    roundtrip, plus streamed tool calls (OpenAI, Anthropic, Mistral; the
-    Gemini translation does not cover tools)
+    roundtrip (OpenAI, Anthropic, Mistral, Gemini), plus streamed tool calls
+    (OpenAI)
   * multimodal embeddings: mixed text + image batches (Cohere embed-v4),
     with media accounting asserted on /metrics (M9)
   * gateway guards: LM-2003 (image to a text-only model), LM-2004 (remote
@@ -464,10 +464,12 @@ def main() -> int:
         check_embed("mistral", "mistral-embed")
 
     if provider("GEMINI_API_KEY", "google (gemini)",
-                ["gemini chat", "gemini chat-stream", "gemini chat-vision"]):
+                ["gemini chat", "gemini chat-stream", "gemini chat-vision",
+                 "gemini chat-tools"]):
         check_chat("gemini", "gemini-flash")
         check_chat_stream("gemini", "gemini-flash")
         check_chat_vision("gemini", "gemini-flash")
+        check_chat_tools("gemini", "gemini-flash")
 
     if provider("COHERE_API_KEY", "cohere",
                 ["cohere embed", "cohere embed-image", "cohere rerank"]):

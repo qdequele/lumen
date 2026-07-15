@@ -6,6 +6,23 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **`LUMEN_MASTER_KEY` was folded into the config and broke `--check-config`
+  and every real auth-enabled boot.** `Config::load` merged all `LUMEN_*`
+  environment variables into the config via `figment::providers::Env`, so
+  setting `LUMEN_MASTER_KEY` (the secret `boot_auth_stack` reads directly
+  from the process environment, never a config value) produced a top-level
+  `master_key` key that `Config`'s `#[serde(deny_unknown_fields)]` rejected
+  with "unknown field: found `master_key`". This was discovered while
+  documenting examples: `--check-config` failed whenever the var was set,
+  and since `main()` calls `Config::load` before `boot_auth_stack` on every
+  boot, any real deployment with `[auth] enabled = true` (which requires
+  `LUMEN_MASTER_KEY`) hit the exact same failure and could not start.
+  `Config::load` now excludes `master_key` from the `LUMEN_*` env merge
+  (`Env::prefixed("LUMEN_").ignore(&["master_key"])`); the secret is still
+  read normally by `boot_auth_stack` via `std::env::var`.
+
 ### Added - Test & benchmark debt (issue #27)
 
 - **Direct fuzzing of the Anthropic/Google translation paths.** Each provider
@@ -32,6 +49,11 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ### Fixed - Test determinism
 
+- `monitoring/smoke.py` now exercises the Gemini tool-calling roundtrip
+  (`check_chat_tools` added to the `google (gemini)` provider block, skipped
+  like the others when `GEMINI_API_KEY` is absent) and its module docstring
+  and `monitoring/README.md` no longer claim Gemini tool calls are
+  unexercised, now that Gemini tool calling has shipped (issue #4).
 - `resilience.rs::health_stays_fast_under_upstream_429_storm` no longer panics
   on a client-side TCP connect reset/broken-pipe under its 500-concurrent-request
   storm (a saturated OS accept backlog on some hosts, not gateway behaviour):
