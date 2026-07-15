@@ -2,11 +2,16 @@
 
 `/v1/chat/completions` accepts OpenAI's `tools` request field and returns
 `tool_calls` on the response message, for every chat provider: passed
-through untouched for the OpenAI-family kinds and `vllm` (via the same
-unknown-field passthrough that carries `tools` and `tool_choice`, see
+through untouched for the OpenAI-family kinds, `vllm` and `azure` (via the
+same unknown-field passthrough that carries `tools` and `tool_choice`, see
 [Chat completions](completions.md)), translated to and from the provider's
-own schema for `anthropic` (`tool_use` content blocks) and `google`
-(`tools[].functionDeclarations`, `toolConfig.functionCallingConfig`).
+own schema for `anthropic` (`tool_use` content blocks), `google`/`vertex_ai`
+(`tools[].functionDeclarations`, `toolConfig.functionCallingConfig`),
+`bedrock` (`toolConfig`/`toolUse`/`toolResult` on the Converse API) and
+`cohere` (mostly a field rename - OpenAI-shaped `tool_calls` pass through
+largely unchanged - with `tool_choice` collapsing to Cohere's
+`REQUIRED`/`NONE` strings; forcing one named tool has no v2 equivalent and
+falls back to `auto`).
 
 ## Two-leg flow
 
@@ -71,7 +76,8 @@ streaming tool-call shape. See [Streaming](streaming.md).
 
 ## Coverage
 
-Translation is implemented for `anthropic` and `google` (Gemini); the
-OpenAI-family kinds and `vllm` pass `tools`/`tool_choice` through untouched
-since they already speak the OpenAI shape. Provider setup and the full
+Translation is implemented for `anthropic`, `google`, `vertex_ai`, `bedrock`
+and `cohere`; the OpenAI-family kinds, `vllm` and `azure` pass
+`tools`/`tool_choice` through untouched since they already speak (or
+near-passthrough, for `azure`) the OpenAI shape. Provider setup and the full
 capability matrix are in [Providers](../providers.md).

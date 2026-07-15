@@ -9,8 +9,9 @@ against the original input regardless of how it was split upstream.
 ## Where limits come from
 
 Every provider kind has a built-in embed batch limit. The native kinds
-(`openai`, `mistral`, `cohere`, `jina`, `voyage`, `tei`, `ollama`) each have
-their own limit; the OpenAI-compatible hosts all share a 2048-input limit.
+(`openai`, `mistral`, `cohere`, `jina`, `voyage`, `tei`, `ollama`, `azure`)
+each have their own limit; the OpenAI-compatible hosts all share a
+2048-input limit.
 The exact numbers are in the [Providers](../providers.md) matrix, in the
 native-kinds table and in the
 [OpenAI-compatible hosts](../providers.md#openai-compatible-hosts) section.

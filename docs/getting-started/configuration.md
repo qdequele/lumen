@@ -47,9 +47,11 @@ of the environment variable that holds its key, via `api_key_env`.
 
 ## Hot reload
 
-A `SIGHUP` or a file watch triggers a reload: the new config is validated,
-then the provider registry is atomically swapped. Details in
-[Deployment](../operations/deployment.md).
+A `SIGHUP`, a file watch, or an admin provider-key rotation triggers a
+reload: the new config is validated, then the provider registry, price
+table, resilience policy and the runtime-safe `[auth]` knobs are atomically
+swapped (the bind address and a few other knobs still need a restart).
+Details in [Deployment](../operations/deployment.md#hot-reload).
 
 ## Validate before you boot
 

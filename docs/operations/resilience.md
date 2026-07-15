@@ -15,9 +15,17 @@ Applied **only** to retryable upstream failures: 5xx, connect/read timeouts,
 and 429. A client 4xx is **never** retried - a fallback provider would reject
 it too. Backoff is exponential with **equal jitter**, and honors an upstream
 `Retry-After` header as a floor (a `Retry-After: 3` guarantees at least a
-3-second wait). While streaming, a retry only happens if the upstream byte
-stream hasn't opened yet - once a chunk has reached the client, the request
-is committed and errors surface as a clean SSE error frame instead.
+3-second wait). While streaming, commitment happens at the **first content
+frame**, not at the open: after the upstream opens (2xx + headers), the
+gateway peeks the first frame before committing. An upstream that opens
+`200` then errors or closes before delivering any content still retries and
+falls over, charging the circuit breaker like an open failure, instead of
+surfacing a terminal SSE error frame - so an immediately-dead stream is
+still retried even though it opened. Once the first content frame reaches
+the client the request is committed and a later mid-stream error becomes a
+clean SSE error frame instead of a retry. See [ADR 005 (first-frame-peek
+amendment)](../adr/005-resilience-execution.md) and
+[Streaming](../chat/streaming.md).
 
 ```toml
 [resilience]
@@ -58,9 +66,13 @@ closed, `1` open, `2` half-open).
 
 | Timeout | Code | Where configured |
 |---|---|---|
-| Connect | `LM-3012` (504) | Client-wide - one pooled `reqwest::Client`, so there is no per-provider connect override. |
-| First-token | `LM-3011` (504) | `[server].first_token_timeout_ms`; per-provider overridable. Streaming: time to the first SSE frame. Non-streaming: the whole call. |
+| Connect | `LM-3012` (504) | `[resilience].connect_timeout_ms`, shared by one pooled `reqwest::Client`. A provider may override it with its own `connect_timeout_ms`, at the cost of its own unpooled client (cross-provider connection pooling is lost for that provider only). A `connect_timeout_ms` of `0` is rejected at config validation. |
+| First-token | `LM-3011` (504) | `[server].first_token_timeout_ms`; per-provider overridable. Streaming: time to the first content frame (bounds the open-then-peek). Non-streaming: the whole call. |
 | Total | `LM-3013` (504) | `[resilience].total_timeout_ms`; per-provider overridable. Bounds the entire request - all retries and fallbacks together. |
+
+A provider's own `connect_timeout_ms` override is picked up on hot reload
+like the other resilience knobs, since the registry rebuilds its clients
+from the new config.
 
 ```toml
 [resilience]

@@ -39,12 +39,29 @@ If the stream goes idle for longer than `sse_heartbeat_ms`
 (`[server]` in `config.example.toml`), the gateway injects a `: ping` SSE
 comment to keep intermediate proxies from reaping the connection as silent.
 
-## Guards
+## Commitment: the first content frame, not the open
 
-- No first SSE frame within `first_token_timeout_ms` (`[server]`) -> the
-  request fails with `LM-3011` (504).
-- The upstream connection dies mid-stream without a `[DONE]` terminator ->
-  the client receives a terminal SSE error frame carrying `LM-3010` (502).
+Retries and fallback stay live past the upstream opening the stream (2xx +
+headers): after opening, the gateway peeks the first frame before committing
+to the client. An upstream that opens `200` then errors, or closes, before
+delivering any content frame is a *pre-commit* failure - the gateway retries
+and falls over per the resilience policy (and penalises that provider's
+circuit breaker) exactly like an open failure, instead of surfacing a
+terminal SSE error frame. A silent open (no bytes at all) still fails over
+via the `first_token_timeout_ms` bound on the peek. Only once the first
+content frame is forwarded does the request commit; from that point the
+guards below own the rest and nothing retries. See [ADR 005 (first-frame-peek
+amendment)](../adr/005-resilience-execution.md).
+
+## Guards (post-commit)
+
+- No first content frame within `first_token_timeout_ms` (`[server]`),
+  across every retry/fallback attempt -> the request fails with `LM-3011`
+  (504).
+- The upstream connection dies mid-stream (after commit) without a `[DONE]`
+  terminator, or every link in the fallback chain fails to deliver a content
+  frame at all -> the client receives a terminal SSE error frame carrying
+  `LM-3010` (502).
 
 Both are documented in [Error codes](../errors.md).
 

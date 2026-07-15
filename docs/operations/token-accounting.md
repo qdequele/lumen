@@ -11,19 +11,24 @@ afterthought - see [ADR 003](../adr/003-token-accounting.md).
 Upstream usage reporting is inconsistent across providers: TEI's `/embed`
 returns a bare vector array with no usage at all; streaming chat only
 carries usage when the client asks for it (and some providers omit it even
-then); rerank is billed in search units by Cohere but in tokens by
-Jina/Voyage, and TEI reports neither. A gateway that only passes through
-whatever the upstream says would show `0` tokens for a large slice of
-traffic. LUMEN closes that gap: a count is guaranteed for every call, and
+then); rerank is billed in search units by Cohere and Pinecone but in
+tokens by Jina/Voyage, and TEI reports neither. A gateway that only passes
+through whatever the upstream says would show `0` tokens for a large slice
+of traffic. LUMEN closes that gap: a count is guaranteed for every call, and
 the count is always honest about whether it was measured or estimated.
 
 ## Where it surfaces
 
 1. **Response body** - the OpenAI-compatible `usage` object on chat and
-   embeddings responses, and `usage.search_units` on rerank responses.
-2. **Prometheus** - `lumen_tokens_total` and
-   `lumen_rerank_search_units_total`, both carrying an `estimated` (or
-   upstream-reported) signal. See [Metrics & dashboards](metrics.md).
+   embeddings responses, and `usage.search_units` plus `usage.total_tokens`
+   on rerank responses (rerank carries both a search-unit and a token count,
+   each independently flagged - `estimated` for `search_units`,
+   `tokens_estimated` for `total_tokens` - see
+   [Reranking - Billing](../reranking/reranking.md#billing-search-units-and-tokens)).
+2. **Prometheus** - `lumen_tokens_total` (every capability, including
+   rerank's token count) and `lumen_rerank_search_units_total` (rerank's
+   search-unit count), both carrying an `estimated` (or upstream-reported)
+   signal. See [Metrics & dashboards](metrics.md).
 3. **`usage_log`** (when `[auth]` is enabled) - per-request token counts,
    cost and the `estimated` flag, alongside status and metadata for later
    slicing. See [Usage log & multi-tenant metadata](usage-log.md).

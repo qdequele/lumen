@@ -33,13 +33,14 @@ the whole fallback chain, not just the primary, so a fallback missing the
 
 ## Per-provider handling
 
-OpenAI-family kinds and `vllm` forward image parts verbatim - both `data:`
-URIs and remote URLs. `anthropic` and `google` translate them into their own
-schema. A remote `http(s)` URL routed to Gemini is rejected pre-flight with
-`LM-2004` (400): Gemini's `inline_data` field only takes inline bytes, and
-the gateway never fetches a chat image URL on the caller's behalf (an SSRF
-vector it deliberately avoids). Full per-kind table in
-[Providers - Vision](../providers.md#vision-image-input).
+OpenAI-family kinds, `vllm` and `azure` forward image parts verbatim - both
+`data:` URIs and remote URLs. `anthropic` translates both forms into its own
+schema. `google`, `vertex_ai` and `bedrock` translate only inline `data:`
+URIs into their own schema; a remote `http(s)` URL routed to any of the
+three is rejected pre-flight with `LM-2004` (400), since none of them
+fetches a URL itself and the gateway never fetches a chat image URL on the
+caller's behalf (an SSRF vector it deliberately avoids). Full per-kind table
+in [Providers - Vision](../providers.md#vision-image-input).
 
 ## Provider-native sources
 

@@ -106,9 +106,12 @@ curl -s -X PUT http://localhost:8080/admin/provider-keys/openai \
 `{name}` is the provider's configured `name` (as in `[[providers]]`). The
 body is `{"key": "<provider api key>"}`; a successful call returns `204 No
 Content`. The key is sealed with AES-256-GCM under `LUMEN_MASTER_KEY` before
-it touches disk, and is read back only at boot, for providers whose
-`api_key_env` is unset or empty - a stored key takes effect at the next
-restart.
+it touches disk, for providers whose `api_key_env` is unset or empty. The
+call pings the hot-reload trigger after sealing the key, so the reloader
+re-reads provider keys from the encrypted store (off the request path) and
+rebuilds the provider registry - a rotated key takes effect without a
+restart. Environment-sourced keys keep precedence over a stored key. See
+[Deployment - Hot reload](deployment.md#hot-reload).
 
 ## Operator notes
 

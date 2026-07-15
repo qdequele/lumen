@@ -55,12 +55,24 @@ Every response does carry a conservative set of default security headers:
 
 ## Hot reload
 
-A `SIGHUP` or a file-watch event triggers a config reload: the new file is
-validated first, and only then is the provider registry atomically swapped
-in. In-flight requests are unaffected. If the new config is invalid, it is
+A `SIGHUP`, a file-watch event, or an admin provider-key rotation
+(`PUT /admin/provider-keys/{name}`) triggers a config reload: the new config
+is validated first, and only then are the provider registry, price table,
+resilience policy and the runtime-safe `[auth]` knobs
+(`flush_interval_ms`, `retention_days`) atomically swapped in. Every reload
+also re-reads DB-stored provider keys, so a key rotated via the admin API
+takes effect without a restart even without an explicit trigger call; a DB
+read error keeps the previous snapshot rather than stripping a working key.
+In-flight requests are unaffected. If the new config is invalid, it is
 **rejected** - the old config keeps serving, and
 `lumen_config_reload_failures_total` increments so the failed reload is
 visible in your dashboards.
+
+Some settings stay boot-time only and need a real restart: the bind
+address, `auth.enabled`, `auth.db_path`, and the bounded usage-log channel
+knobs (`usage_channel_capacity`, `usage_batch_max`, `usage_flush_ms`) -
+rebinding a live listener or resizing a running channel is out of scope for
+a live swap.
 
 ## Validate configs in the pipeline
 

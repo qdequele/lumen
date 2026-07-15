@@ -25,7 +25,7 @@ curl -s http://localhost:8080/v1/rerank \
     { "index": 0, "relevance_score": 0.98 },
     { "index": 1, "relevance_score": 0.02 }
   ],
-  "usage": { "search_units": 1 }
+  "usage": { "search_units": 1, "total_tokens": 42, "tokens_estimated": true }
 }
 ```
 
@@ -38,11 +38,12 @@ Results come back sorted by descending `relevance_score`. Each result's
 `documents` must be non-empty. An empty list is rejected before any upstream
 call with `LM-2010` (400). See [Error codes](../errors.md).
 
-## Billing: search units
+## Billing: search units and tokens
 
-Rerank is metered in search units, not tokens: one unit is approximately one
-query over up to 100 documents. Set `cost_per_1k_searches` on a model's
-`[[providers.models]]` block to price it:
+Rerank billing units vary by upstream: Cohere and Pinecone bill in **search
+units** (one unit is approximately one query over up to 100 documents),
+while Jina and Voyage bill in **tokens**. Set `cost_per_1k_searches` on a
+model's `[[providers.models]]` block to price the search-unit case:
 
 ```toml
 [[providers.models]]
@@ -54,7 +55,16 @@ cost_per_1k_searches = 2.0
 
 Search units are counted on the `lumen_rerank_search_units_total{model,
 provider}` Prometheus counter for every request, upstream-reported when
-available, otherwise a gateway estimate. See
+available, otherwise a gateway estimate (`usage.estimated: true`).
+
+Independently of the billing unit, every `/v1/rerank` response also carries a
+`usage.total_tokens` count (ADR 003), for uniform token observability across
+capabilities: Jina and Voyage surface their upstream-reported token count
+unflagged; every other provider (Cohere, TEI, Pinecone, ...) gets a
+gateway-derived `query + documents` heuristic flagged
+`"tokens_estimated": true`. This token count also feeds
+`lumen_tokens_total{capability="rerank",...}` and `usage_log`, alongside the
+search-unit accounting - see
 [Token accounting & cost](../operations/token-accounting.md).
 
 ## One model, two capabilities

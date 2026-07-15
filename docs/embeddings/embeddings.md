@@ -59,6 +59,18 @@ text - `cohere`, `tei`, `ollama`, `jina`, `voyage`, `mistral` - reject it
 before any upstream call with `LM-1001` (400), naming the provider and the
 rejected shape. See [Error codes](../errors.md).
 
+## Unknown fields and `input_type` (Cohere)
+
+Unlike `/v1/chat/completions`, unknown request fields on `/v1/embeddings` are
+captured but never re-serialized into the outgoing provider body - they stop
+at the gateway rather than being forwarded, since a strict OpenAI-compatible
+upstream may reject fields it does not recognize. The one field the gateway
+itself reads is `input_type`, consumed only by the Cohere translation to
+override Cohere's query-vs-document intent (`search_query`,
+`search_document`, `classification`, `clustering`; defaults to
+`search_document`). An unrecognized `input_type` is rejected with `LM-1001`
+before any upstream call. See [Providers - cohere](../providers.md#cohere).
+
 ## Strict mode
 
 By default a provider silently drops a request field it cannot honor (for
