@@ -57,6 +57,7 @@ wiremock = { workspace = true }
 serde_json = { workspace = true }
 criterion = { workspace = true }
 async-trait = { workspace = true }
+tempfile = { workspace = true }
 
 [[bench]]
 name = "gateway_overhead"

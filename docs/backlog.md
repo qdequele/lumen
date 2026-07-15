@@ -21,8 +21,6 @@ milestone.
   not modelled - only string and string-batch. Add if a provider needs it.
 - Rerank `documents` accepts only strings; Cohere also allows objects. Reduce
   object documents to text at the edge when a provider requires it.
-- Config: consider a `--check-config` subcommand that validates and exits, for
-  CI / deploy pipelines, once the CLI surface grows.
 - Error taxonomy (revisit in M4): `ProviderError::Cancelled` currently maps to
   `GatewayError::Internal` (500 / `internal`). Once real streaming/provider
   calls exist, a client-initiated cancel should not inflate `internal` metrics -
