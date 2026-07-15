@@ -865,6 +865,137 @@ async fn gemini_streaming_translates_fragments_to_openai_chunks() {
 }
 
 #[tokio::test]
+async fn gemini_tool_calling_non_streaming_round_trip() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1beta/models/gemini-2.0-flash:generateContent"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "candidates": [{
+                "content": {
+                    "role": "model",
+                    "parts": [{
+                        "functionCall": { "name": "get_weather", "args": { "city": "Paris" } }
+                    }]
+                },
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 9, "candidatesTokenCount": 5, "totalTokenCount": 14
+            }
+        })))
+        .mount(&upstream)
+        .await;
+
+    let base = common::spawn_with(google_registry(&upstream.uri()), LIMIT).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&json!({
+            "model": "gemini",
+            "messages": [{ "role": "user", "content": "weather in Paris?" }],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Weather lookup",
+                    "parameters": {
+                        "type": "object",
+                        "properties": { "city": { "type": "string" } },
+                        "required": ["city"]
+                    }
+                }
+            }],
+            "tool_choice": "auto"
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    // Downstream: an OpenAI tool-call message with null content.
+    assert!(body["choices"][0]["message"]["content"].is_null());
+    let call = &body["choices"][0]["message"]["tool_calls"][0];
+    assert_eq!(call["type"], "function");
+    assert_eq!(call["function"]["name"], "get_weather");
+    assert_eq!(call["function"]["arguments"], "{\"city\":\"Paris\"}");
+    assert_eq!(body["choices"][0]["finish_reason"], "tool_calls");
+
+    // Upstream: OpenAI tools mapped to Gemini functionDeclarations + toolConfig.
+    let requests = upstream.received_requests().await.unwrap();
+    let sent: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    let decl = &sent["tools"][0]["functionDeclarations"][0];
+    assert_eq!(decl["name"], "get_weather");
+    assert_eq!(decl["parameters"]["properties"]["city"]["type"], "string");
+    assert_eq!(sent["toolConfig"]["functionCallingConfig"]["mode"], "AUTO");
+}
+
+#[tokio::test]
+async fn gemini_streaming_function_call_translates_to_tool_calls() {
+    let upstream = MockServer::start().await;
+    let body = [json!({
+        "candidates": [{
+            "content": {
+                "role": "model",
+                "parts": [{
+                    "functionCall": { "name": "get_weather", "args": { "city": "Paris" } }
+                }]
+            },
+            "finishReason": "STOP"
+        }],
+        "usageMetadata": {
+            "promptTokenCount": 9, "candidatesTokenCount": 5, "totalTokenCount": 14
+        }
+    })]
+    .iter()
+    .map(|data| format!("data: {data}\n\n"))
+    .collect::<String>();
+
+    Mock::given(method("POST"))
+        .and(path(
+            "/v1beta/models/gemini-2.0-flash:streamGenerateContent",
+        ))
+        .and(query_param("alt", "sse"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(body),
+        )
+        .mount(&upstream)
+        .await;
+
+    let base = common::spawn_with(google_registry(&upstream.uri()), LIMIT).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&json!({
+            "model": "gemini",
+            "messages": [{ "role": "user", "content": "weather in Paris?" }],
+            "tools": [{
+                "type": "function",
+                "function": { "name": "get_weather" }
+            }],
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let text = resp.text().await.unwrap();
+
+    assert!(text.ends_with("data: [DONE]\n\n"), "got: {text}");
+    let chunks = sse_data_frames(&text);
+    // role, tool-call delta, finish.
+    assert_eq!(chunks.len(), 3, "got: {text}");
+    assert_eq!(chunks[0]["choices"][0]["delta"]["role"], "assistant");
+    let call = &chunks[1]["choices"][0]["delta"]["tool_calls"][0];
+    assert_eq!(call["index"], 0);
+    assert_eq!(call["function"]["name"], "get_weather");
+    assert_eq!(call["function"]["arguments"], "{\"city\":\"Paris\"}");
+    assert_eq!(chunks[2]["choices"][0]["finish_reason"], "tool_calls");
+}
+
+#[tokio::test]
 async fn upstream_stream_without_done_yields_fg3010_error_frame() {
     let upstream = MockServer::start().await;
     // Two valid chunks, then the body just ends - no `data: [DONE]`.
