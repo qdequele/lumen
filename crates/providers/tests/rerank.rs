@@ -380,3 +380,102 @@ async fn tei_passes_rerank_conformance_suite() {
 async fn voyage_passes_rerank_conformance_suite() {
     run_conformance(&VoyageFixture).await;
 }
+
+// --------------------------------------------------------------------------
+// Token-based rerank usage (issue #10) - Jina and Voyage bill in tokens, not
+// search units; their `usage.total_tokens` must surface as
+// `RerankUsage.total_tokens`, upstream-reported (never gateway-derived at the
+// provider layer).
+// --------------------------------------------------------------------------
+
+#[tokio::test]
+async fn jina_surfaces_upstream_total_tokens() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "results": [{ "index": 0, "relevance_score": 0.9 }],
+            "usage": { "total_tokens": 42 }
+        })))
+        .mount(&mock)
+        .await;
+    let provider = JinaFixture.build(mock.uri());
+
+    let resp = provider
+        .rerank(request(&["x"]), CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert_eq!(resp.usage.total_tokens, 42);
+    assert_eq!(
+        resp.usage.tokens_estimated, None,
+        "upstream-reported tokens must not be flagged estimated"
+    );
+    assert_eq!(resp.usage.search_units, 0);
+}
+
+#[tokio::test]
+async fn jina_without_usage_reports_zero_tokens_for_gateway_fallback() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "results": [{ "index": 0, "relevance_score": 0.9 }]
+        })))
+        .mount(&mock)
+        .await;
+    let provider = JinaFixture.build(mock.uri());
+
+    let resp = provider
+        .rerank(request(&["x"]), CancellationToken::new())
+        .await
+        .unwrap();
+
+    // No upstream usage: the provider reports 0 so the gateway (not the
+    // provider) derives a local estimate (ADR 003).
+    assert_eq!(resp.usage.total_tokens, 0);
+    assert_eq!(resp.usage.tokens_estimated, None);
+}
+
+#[tokio::test]
+async fn voyage_surfaces_upstream_total_tokens() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [{ "index": 0, "relevance_score": 0.9 }],
+            "usage": { "total_tokens": 17 }
+        })))
+        .mount(&mock)
+        .await;
+    let provider = VoyageFixture.build(mock.uri());
+
+    let resp = provider
+        .rerank(request(&["x"]), CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert_eq!(resp.usage.total_tokens, 17);
+    assert_eq!(
+        resp.usage.tokens_estimated, None,
+        "upstream-reported tokens must not be flagged estimated"
+    );
+    assert_eq!(resp.usage.search_units, 0);
+}
+
+#[tokio::test]
+async fn voyage_without_usage_reports_zero_tokens_for_gateway_fallback() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [{ "index": 0, "relevance_score": 0.9 }]
+        })))
+        .mount(&mock)
+        .await;
+    let provider = VoyageFixture.build(mock.uri());
+
+    let resp = provider
+        .rerank(request(&["x"]), CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert_eq!(resp.usage.total_tokens, 0);
+    assert_eq!(resp.usage.tokens_estimated, None);
+}

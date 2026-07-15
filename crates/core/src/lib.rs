@@ -233,6 +233,7 @@ mod tests {
             usage: RerankUsage {
                 search_units: 1,
                 estimated: None,
+                ..Default::default()
             },
         };
         let json = serde_json::to_value(&resp).unwrap();

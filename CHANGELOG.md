@@ -115,6 +115,22 @@ All notable changes to LUMEN are documented here. The format is based on
   unrecognized `input_type` is rejected with `LM-1001` before any upstream
   call. See `docs/providers.md` § cohere.
 
+### Added - Token-based rerank usage for Jina/Voyage (issue #10)
+
+- `RerankUsage` gains `total_tokens` and `tokens_estimated`, additive to the
+  existing `search_units`/`estimated` pair. Jina and Voyage bill rerank in
+  tokens rather than search units and report `usage.total_tokens`; the
+  gateway now surfaces that upstream count unflagged (`tokens_estimated`
+  omitted), instead of always synthesising a local estimate.
+- Every rerank response now carries a `total_tokens` count for uniform
+  observability (ADR 003): when the upstream does not report one (Cohere,
+  TEI, or Jina/Voyage without `usage`), the gateway falls back to the
+  existing `query + documents` heuristic and flags it
+  `"tokens_estimated": true`.
+- `POST /v1/rerank` accounting (`lumen_tokens_total{...,estimated}` and
+  `usage_log.estimated`) now reflects whether the *token* count was
+  upstream-reported or gateway-derived, rather than always `true`.
+
 ### Fixed
 
 - **Dedicated client-cancel error code (issue #11).** A client-initiated

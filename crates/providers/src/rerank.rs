@@ -134,6 +134,7 @@ mod tests {
                 usage: RerankUsage {
                     search_units: 1,
                     estimated: None,
+                    ..Default::default()
                 },
             })
         }
