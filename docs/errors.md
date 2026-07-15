@@ -31,7 +31,7 @@ code prefix groups by cause: `1xxx` request, `2xxx` routing, `3xxx` upstream,
 | `LM-2001` | 404  | The requested model id was not found.                          |
 | `LM-2002` | 400  | The model exists but does not serve the requested capability.  |
 | `LM-2003` | 400  | An image content part was sent to a model without the `image` modality (chat vision M8 and embeddings M9). |
-| `LM-2004` | 400  | A remote image URL was sent to a provider that only accepts inline base64 image data (chat vision M8). |
+| `LM-2004` | 400  | A remote image URL was sent to a provider that only accepts inline base64 image data (chat vision M8). Checked before any upstream call for the primary route; if a fail-over reaches an image-incapable fallback further down the chain, the same code and status surface there too, naming the fallback provider - never the generic `LM-3002` a translation failure would otherwise produce (GH #13). |
 | `LM-2005` | 400  | A remote image URL was supplied to `/v1/embeddings` but server-side image fetching is disabled (`[image_fetch] enabled = false`). Inline the image as a `data:` URI or enable fetching (M9). |
 | `LM-2006` | 400  | A remote image URL was rejected by a fetch guard (scheme, host/prefix allowlist, private-IP block, size cap, per-request count cap, or non-image content type). The specific reason is logged server-side, never returned (M9). |
 | `LM-2007` | 502  | A permitted image fetch failed at the remote host (network error, timeout, or error status). `type: upstream_error` (M9). |

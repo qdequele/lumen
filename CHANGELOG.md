@@ -6,6 +6,20 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **LM-2004 pre-flight now covers the whole fallback chain, not just the
+  primary route.** The remote-image-URL check in the chat handler only
+  inspected `chain[0]`; if the primary provider accepted remote URLs (e.g.
+  OpenAI) but a fail-over reached an image-incapable model (e.g. Gemini), the
+  fallback's translation failure surfaced as a generic `LM-3002` (502) instead
+  of the honest `LM-2004` (400) client error. Added a dedicated
+  `ProviderError::ImageUrlNotSupported` variant (deterministic, never
+  retried, never faults the circuit breaker - matching `Translation`'s
+  fallback-stopping semantics) so this specific failure is classified
+  correctly no matter which link in the chain hits it, without eagerly
+  rejecting requests a fallback would never actually need to serve (GH #13).
+
 ### Added - Endpoint latency observability
 
 - **Every endpoint now measures and publishes its latency.** A new middleware

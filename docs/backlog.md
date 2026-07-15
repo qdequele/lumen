@@ -232,14 +232,6 @@ milestone.
 
 ## Noted while building M8 (vision / image input)
 
-- **`LM-2004` pre-flight is primary-only.** A remote `http(s)` image URL is
-  rejected up front (`LM-2004`, 400) only when the model's *primary* provider
-  can't fetch it (Gemini). If the primary accepts URLs (OpenAI) but a Gemini
-  model is a *fallback*, a fail-over to Gemini surfaces as `LM-3002` (502,
-  translation error) rather than a client 4xx - safe (never fetched, no retry
-  loop) but a soft break of the 4xx/5xx separation (rule 8). Options if it ever
-  bites: scan the whole chain in the pre-flight (rejects some primary-servable
-  requests), or add a dedicated client-input `ProviderError` mapped to a 4xx.
 - **Per-image token heuristic for the estimation fallback.** When an upstream
   reports no usage, image parts currently count `0` (text-only estimate). Add a
   tile-based heuristic (OpenAI's ~85 base + 170/tile by resolution) so vision
