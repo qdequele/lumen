@@ -62,43 +62,44 @@ in CI via buildx (`release.yml`).
 ## Results - loaded head-to-head vs LiteLLM (recorded baseline)
 
 Recorded by `bench/run.sh` (see `bench/README.md`); full raw output is
-committed at [`bench/results/20260715T134031Z/`](../bench/results/20260715T134031Z/report.md).
+committed at [`bench/results/20260715T231135Z/`](../bench/results/20260715T231135Z/report.md).
 
 | Target | p50 | p95 | p99 | req/s |
 |---|---|---|---|---|
-| direct (mock, no gateway) | 3.46 ms | 65.92 ms | 306.92 ms | 2740.0 |
-| lumen | 3.95 ms | 11.41 ms | 98.92 ms | 6998.9 |
-| litellm v1.92.0 | 226.96 ms | 359.84 ms | 1072.08 ms | 191.0 |
+| direct (mock, no gateway) | 6.91 ms | 204.99 ms | 836.43 ms | 1191.7 |
+| lumen | 9.44 ms | 36.57 ms | 220.57 ms | 2733.5 |
+| litellm v1.92.0 | 323.75 ms | 656.67 ms | 6490.29 ms | 111.3 |
 
-RAM under load (`docker stats`, sampled mid-run): **lumen ~7 MB**, **litellm
-~1.02 GB**.
+RAM under load (`docker stats`, sampled mid-run): **lumen ~7.6 MB**,
+**litellm ~1.03 GB**.
 
 Environment this specific run was recorded in: Darwin arm64, Docker 29.4.0,
-k6 v2.0.0, LUMEN at commit `243ff0d`, LiteLLM
+k6 v2.0.0, LUMEN at commit `51fc809`, LiteLLM
 `ghcr.io/berriai/litellm:v1.92.0@sha256:9ef6f45bc0104940571765e610c52a1d761b5ec85efcd193795281086ee61277`,
 mockserver `5.15.0@sha256:0f9ef78c94894ac3e70135d156193b25e23872575d58e2228344964273b4af6b`.
 
 **Caveat, stated honestly**: this run was recorded on a shared development
 host (not dedicated benchmarking hardware), which is visible in the noisy
-direct-baseline numbers above (a 0 ms mock should not itself show ~307 ms
-p99; that is host contention, not proxy overhead). Treat the *absolute*
+direct-baseline numbers above (a 0 ms mock should not itself show ~836 ms
+p99; the mockserver JVM saturates a core by itself, so the direct phase
+measures host contention as much as transport). Treat the *absolute*
 numbers as illustrative, not authoritative. The *relative* comparison -
 lumen vs litellm, same mock, same host, same run - is the meaningful part:
-LUMEN's p50/p99 stayed within single/double-digit milliseconds of the noisy
-direct baseline while LiteLLM's grew by two orders of magnitude, and LUMEN
-sustained ~37× the throughput at roughly 1/150th the RAM. Re-run
-`bench/run.sh` on dedicated hardware for numbers to make capacity decisions
-on; see "Updating the pinned versions" in `bench/README.md` for how to
-refresh this baseline (new pinned image, new `results/` directory, update
-the link above).
+LUMEN added ~2.5 ms at p50 over direct (9.44 vs 6.91 ms) and its tail stayed
+*below* the noisy direct baseline, while LiteLLM's p50 grew by ~47× (323.75
+ms) and its p99 reached 6.5 s. LUMEN sustained ~25× LiteLLM's throughput at
+roughly 1/140th the RAM. Re-run `bench/run.sh` on dedicated hardware for
+numbers to make capacity decisions on; see "Updating the pinned versions" in
+`bench/README.md` for how to refresh this baseline (new pinned image, new
+`results/` directory, update the link above).
 
 ## Targets
 
 | # | Target | Status |
 |---|---|---|
-| 1 | < 1 ms added **p99** off-network | **Met (median), with margin.** The gateway's per-request CPU work is ~3.2 µs median; even a 100× tail would sit at ~0.3 ms, well under 1 ms. Under concurrent load and a real localhost hop (the k6 harness above), LUMEN's own p99 was 98.92 ms against a 306.92 ms *direct-to-mock* p99 on the same noisy host - i.e. the gateway added no measurable tail latency of its own in that run; the recorded p99 is dominated by host contention, not the proxy. |
-| 2 | < 25 MB RAM under load | **Met.** 8.8 MB idle (in-process measurement); ~7 MB observed mid-load in the head-to-head run above, consistent with the idle figure - memory is bounded by design (backpressure + bounded channels, usage log drops rather than grows, proven by criterion 5, the 500-concurrent test). |
-| 3 | throughput ≥ 95 % of direct | **Not cleanly isolable in this run** - the direct-to-mock baseline itself was depressed by host contention (2740 req/s vs LUMEN's 6998.9 req/s, i.e. LUMEN measured *faster* than "direct" because three containers were fighting for the same noisy host's CPU and the direct target had no backpressure/connection reuse tuning). This is a measurement environment artifact, not a claim that the gateway is faster than a bypass. Re-run on isolated/dedicated hardware for a trustworthy direct-vs-gateway throughput ratio. |
+| 1 | < 1 ms added **p99** off-network | **Met (median), with margin.** The gateway's per-request CPU work is ~3.2 µs median; even a 100× tail would sit at ~0.3 ms, well under 1 ms. Under concurrent load and a real localhost hop (the k6 harness above), LUMEN's own p99 was 220.57 ms against an 836.43 ms *direct-to-mock* p99 on the same noisy host - i.e. the gateway added no measurable tail latency of its own in that run; the recorded p99 is dominated by host contention, not the proxy. |
+| 2 | < 25 MB RAM under load | **Met.** 8.8 MB idle (in-process measurement); ~7.6 MB observed mid-load in the head-to-head run above, consistent with the idle figure - memory is bounded by design (backpressure + bounded channels, usage log drops rather than grows, proven by criterion 5, the 500-concurrent test). |
+| 3 | throughput ≥ 95 % of direct | **Not cleanly isolable in this run** - the direct-to-mock baseline itself was depressed by host contention (1191.7 req/s vs LUMEN's 2733.5 req/s, i.e. LUMEN measured *faster* than "direct" because the mockserver JVM saturates a core on its own and the direct target had no backpressure/connection reuse tuning). This is a measurement environment artifact, not a claim that the gateway is faster than a bypass. Re-run on isolated/dedicated hardware for a trustworthy direct-vs-gateway throughput ratio. |
 
 Honest summary: the **off-network overhead is measured and is microseconds**,
 comfortably inside the pillar-1 budget. The **full loaded head-to-head vs

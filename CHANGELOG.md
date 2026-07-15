@@ -6,6 +6,14 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed
+
+- **Refreshed the LUMEN-vs-LiteLLM baseline** (`bench/run.sh` at commit
+  `51fc809`): new committed run `bench/results/20260715T231135Z/` and updated
+  numbers in `docs/perf-baseline.md`. Same relative story as the previous
+  baseline: ~2.5 ms added p50 over direct-to-mock for LUMEN vs ~317 ms for
+  LiteLLM, ~25x LiteLLM's throughput at ~7.6 MB vs ~1.03 GB RAM under load.
+
 ### Fixed
 
 - **`LUMEN_MASTER_KEY` was folded into the config and broke `--check-config`
