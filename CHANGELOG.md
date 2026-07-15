@@ -6,6 +6,19 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added - Per-image vision token heuristic for the estimation fallback
+
+- The local prompt-token estimation fallback (`estimate_chat_prompt`, ADR 003)
+  no longer counts an image content part as `0` tokens. Each image part now
+  contributes a flat per-image estimate: `85` tokens for `"detail": "low"`
+  (OpenAI's exact, resolution-independent low-detail cost) or `765` tokens for
+  `"detail": "high"`/`"auto"`/unset (an approximation of OpenAI's tile formula
+  for a typical ~1024x1024 image, since the gateway does not decode image
+  bytes on the request path to learn the real dimensions - see the ADR 003
+  vision addendum). This only affects requests where the upstream reports no
+  `usage` at all; upstream-reported usage was already accurate and is
+  untouched. Fixes #9.
+
 ### Added - Endpoint latency observability
 
 - **Every endpoint now measures and publishes its latency.** A new middleware

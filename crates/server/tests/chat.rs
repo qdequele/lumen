@@ -256,8 +256,9 @@ async fn image_to_a_non_vision_model_is_rejected_with_lm_2003() {
 /// upstream byte-for-byte (no re-shaping), and - since this mock upstream
 /// reports no `usage` at all - the response still carries a non-zero,
 /// honestly-labelled `estimated` token count rather than a silent zero
-/// (ADR 003 §8: the text-only estimation fallback still fires for a vision
-/// request; only the image part contributes 0).
+/// (ADR 003 addendum: the estimation fallback fires for a vision request;
+/// the image part now contributes the flat per-image heuristic from
+/// `lumen_core::tokens`, not 0 - see issue #9).
 #[tokio::test]
 async fn openai_family_forwards_image_parts_verbatim() {
     let upstream = MockServer::start().await;
@@ -316,14 +317,14 @@ async fn openai_family_forwards_image_parts_verbatim() {
     assert_eq!(sent["messages"][0]["content"][0]["text"], "what is this?");
 
     // No upstream usage → the local estimator ran, flagged honestly, never a
-    // silent zero. The image part contributes 0 to the estimate (ADR 003
-    // addendum): "what is this?" (13 bytes) => 4 text tokens + the 4-token
-    // per-message overhead = 8, exactly what a text-only message would
-    // yield - pinning this value proves the image part is NOT silently
-    // double- or mis-counted, not merely that the count is positive.
+    // silent zero. "what is this?" (13 bytes) => 4 text tokens + the 4-token
+    // per-message overhead + the flat per-image heuristic (no `detail`, so
+    // the default 765-token estimate, issue #9) = 773 - pinning this value
+    // proves the image part is counted exactly once, at the documented
+    // amount, not silently dropped back to 0.
     let got: Value = resp.json().await.unwrap();
     assert_eq!(got["usage"]["estimated"], true);
-    assert_eq!(got["usage"]["prompt_tokens"], 8);
+    assert_eq!(got["usage"]["prompt_tokens"], 773);
 }
 
 #[tokio::test]
