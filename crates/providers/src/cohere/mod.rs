@@ -1,8 +1,12 @@
-//! Cohere provider (API v2) - embeddings and reranking.
+//! Cohere provider (API v2) - chat (Command R / R+), embeddings and
+//! reranking.
 //!
 //! Cohere's wire schema differs from the internal (OpenAI/Cohere-inspired)
 //! types in both directions, so this module translates:
 //!
+//! * chat: `POST /v2/chat` - request/response translation lives in [`chat`],
+//!   SSE streaming-event translation in [`stream`] (see their module docs -
+//!   the wire shape is OpenAI-adjacent, closer than Anthropic's);
 //! * embed: `POST /v2/embed` takes `{ model, texts, input_type, embedding_types }`
 //!   and returns `{ embeddings: { float: [[..]] }, meta: { billed_units } }`.
 //!   `input_type` defaults to `search_document` but a caller may override it
@@ -15,18 +19,25 @@
 //! The gateway (`crate::rerank`) owns ordering, `top_n` clamping and document
 //! echoing, so the rerank translation only carries indices, scores and usage.
 
+mod chat;
+mod stream;
+
 use async_trait::async_trait;
+use bytes::Bytes;
+use futures::stream::BoxStream;
 use lumen_core::{
-    ContentPart, EmbedData, EmbedInput, EmbedItem, EmbedRequest, EmbedResponse, EmbedUsage,
-    EmbeddingProvider, ProviderError, RerankProvider, RerankRequest, RerankResponse, RerankResult,
-    RerankUsage,
+    ChatChunk, ChatProvider, ChatRequest, ChatResponse, ContentPart, EmbedData, EmbedInput,
+    EmbedItem, EmbedRequest, EmbedResponse, EmbedUsage, EmbeddingProvider, ProviderError,
+    RerankProvider, RerankRequest, RerankResponse, RerankResult, RerankUsage,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fmt;
 use tokio_util::sync::CancellationToken;
 
-use crate::http::post_json;
+use self::stream::CohereTranslator;
+use crate::chat::{items_to_chunks, items_to_sse_bytes, translate_sse_stream, StreamItem};
+use crate::http::{open_stream, post_json};
 
 /// Default Cohere API base (no version suffix; paths add `/v2/...`).
 const DEFAULT_BASE_URL: &str = "https://api.cohere.com";
@@ -73,6 +84,82 @@ impl fmt::Debug for CohereProvider {
             .field("base_url", &self.base_url)
             .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
             .finish_non_exhaustive()
+    }
+}
+
+// ---- Chat ------------------------------------------------------------------
+
+impl CohereProvider {
+    /// Open the upstream stream and translate its events (shared by both
+    /// streaming trait methods).
+    async fn open_translated_stream(
+        &self,
+        req: ChatRequest,
+        cancel: CancellationToken,
+    ) -> Result<BoxStream<'static, Result<StreamItem, ProviderError>>, ProviderError> {
+        let url = format!("{}/v2/chat", self.base_url);
+        let body = chat::translate_request(&req, true);
+
+        let bytes = open_stream(
+            &self.client,
+            &url,
+            &body,
+            self.api_key.as_deref(),
+            &self.provider_name,
+            &cancel,
+        )
+        .await?;
+        Ok(translate_sse_stream(
+            bytes,
+            CohereTranslator::new(&req.model),
+        ))
+    }
+}
+
+#[async_trait]
+impl ChatProvider for CohereProvider {
+    async fn chat(
+        &self,
+        req: ChatRequest,
+        cancel: CancellationToken,
+    ) -> Result<ChatResponse, ProviderError> {
+        let url = format!("{}/v2/chat", self.base_url);
+        let body = chat::translate_request(&req, false);
+
+        let bytes = post_json(
+            &self.client,
+            &url,
+            &body,
+            self.api_key.as_deref(),
+            &self.provider_name,
+            &cancel,
+        )
+        .await?;
+
+        let parsed: chat::CohereChatResponse = serde_json::from_slice(&bytes)
+            .map_err(|e| ProviderError::Translation(format!("cohere chat response: {e}")))?;
+        Ok(chat::translate_response(parsed, &req.model))
+    }
+
+    async fn chat_stream(
+        &self,
+        req: ChatRequest,
+        cancel: CancellationToken,
+    ) -> Result<BoxStream<'static, Result<ChatChunk, ProviderError>>, ProviderError> {
+        let items = self.open_translated_stream(req, cancel).await?;
+        Ok(items_to_chunks(items))
+    }
+
+    /// Event-by-event translation to OpenAI SSE frames. `data: [DONE]` is
+    /// emitted only on a genuine upstream `message-end`, so a mid-stream
+    /// upstream death surfaces as a missing terminator (LM-3010 downstream).
+    async fn chat_stream_bytes(
+        &self,
+        req: ChatRequest,
+        cancel: CancellationToken,
+    ) -> Result<BoxStream<'static, Result<Bytes, ProviderError>>, ProviderError> {
+        let items = self.open_translated_stream(req, cancel).await?;
+        Ok(items_to_sse_bytes(items))
     }
 }
 
@@ -366,5 +453,24 @@ impl RerankProvider for CohereProvider {
                 ..Default::default()
             },
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The API key must never reach a log line via `{:?}` (CLAUDE.md rule 5).
+    #[test]
+    fn debug_format_never_leaks_the_api_key() {
+        let provider = CohereProvider::new(
+            reqwest::Client::new(),
+            "cohere-test",
+            None,
+            Some("sk-super-secret-value".to_owned()),
+        );
+        let debugged = format!("{provider:?}");
+        assert!(!debugged.contains("sk-super-secret-value"));
+        assert!(debugged.contains("redacted"));
     }
 }

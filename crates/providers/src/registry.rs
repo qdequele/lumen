@@ -535,10 +535,11 @@ fn build_providers(
                 spec.base_url.clone(),
                 spec.api_key.clone(),
             ));
+            let chat: Arc<dyn ChatProvider> = provider.clone();
             let embed: Arc<dyn EmbeddingProvider> = provider.clone();
             let rerank: Arc<dyn RerankProvider> = provider;
             Ok(BuiltProviders {
-                chat: None,
+                chat: Some(chat),
                 embed: Some(embed),
                 rerank: Some(rerank),
             })
@@ -963,6 +964,26 @@ mod tests {
         assert!(reg.chat_route("cf-multi").is_some());
         assert!(reg.embedding_route("cf-multi").is_some());
         assert!(reg.rerank_route("cf-multi").is_some());
+    }
+
+    #[test]
+    fn cohere_model_resolves_for_chat_embed_and_rerank() {
+        let reg = Registry::build(
+            vec![spec(
+                ProviderKind::Cohere,
+                "cohere",
+                None,
+                vec![model(
+                    "command-r-plus",
+                    &[Capability::Chat, Capability::Embed, Capability::Rerank],
+                )],
+            )],
+            reqwest::Client::new(),
+        )
+        .unwrap();
+        assert!(reg.chat_route("command-r-plus").is_some());
+        assert!(reg.embedding_route("command-r-plus").is_some());
+        assert!(reg.rerank_route("command-r-plus").is_some());
     }
 
     #[test]

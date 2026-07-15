@@ -6,6 +6,32 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added - Cohere chat (Command R / R+)
+
+- The `cohere` provider kind now implements `ChatProvider` alongside its
+  existing embed and rerank capabilities: `POST /v2/chat`, non-streaming and
+  streaming (SSE). Cohere's v2 wire shape is OpenAI-adjacent (roles live
+  directly in `messages`, unlike Anthropic's top-level `system` hoist; an
+  assistant's `tool_calls` are already OpenAI-shaped), so translation is
+  mostly a matter of field renames (`top_p` -> `p`, `stop` -> `stop_sequences`)
+  and `tool_choice` collapsing to Cohere's `REQUIRED`/`NONE` strings (forcing
+  one named tool has no v2 equivalent and falls back to `auto`, dropped with a
+  `debug` trace). `n` (multiple completions) has no v2 equivalent and is
+  likewise dropped with a `debug` trace rather than silently ignored.
+- Streaming translates Cohere's typed SSE events (`message-start`,
+  `content-delta`, `tool-call-start/-delta`, `message-end`) to OpenAI chunks
+  event by event, bounded state only (mirrors the Anthropic/Google streaming
+  translators) - `message-end` is Cohere's sole terminal event and carries
+  both the finish reason and full usage, so it emits the final chunk followed
+  immediately by the stream terminator.
+- Token usage (ADR 003): `usage.tokens` (actual pre-billing counts) is
+  preferred over `usage.billed_units` (what's charged, which can differ e.g.
+  under caching discounts); a response reporting neither leaves `usage: None`
+  so the gateway's local estimator fills in an honestly-flagged count.
+- Every trait method honours `CancellationToken`, including aborting the
+  upstream connection on stream drop (client disconnect), matching every
+  other provider.
+
 ### Fixed - Deterministic 429-storm resilience test
 
 - `health_stays_fast_under_upstream_429_storm` no longer flakes on macOS. The
