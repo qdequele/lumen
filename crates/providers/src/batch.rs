@@ -38,6 +38,7 @@ pub async fn embed_batched(
         encoding_format,
         dimensions,
         user,
+        extra,
     } = req;
     let total_inputs = input.len();
 
@@ -56,6 +57,9 @@ pub async fn embed_batched(
         EmbedInput::Multi(v) => chunk_vec(v, max_batch).map(EmbedInput::Multi).collect(),
     };
 
+    // `extra` (e.g. Cohere's `input_type` override) must reach every sub-batch
+    // identically, or a caller's override would silently apply to only the
+    // first chunk of a request that spills past `max_batch_size`.
     let sub_requests: Vec<EmbedRequest> = sub_inputs
         .into_iter()
         .map(|input| EmbedRequest {
@@ -64,6 +68,7 @@ pub async fn embed_batched(
             encoding_format: encoding_format.clone(),
             dimensions,
             user: user.clone(),
+            extra: extra.clone(),
         })
         .collect();
 

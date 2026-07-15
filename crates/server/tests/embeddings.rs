@@ -46,6 +46,25 @@ fn registry_for(upstream: &str) -> Arc<Registry> {
     Arc::new(Registry::build(specs, http::build_client()).expect("registry builds"))
 }
 
+/// Registry with one Cohere-kind provider pointed at `upstream`, exposing a
+/// single embedding model (issue #22 `input_type` override tests).
+fn registry_for_cohere(upstream: &str) -> Arc<Registry> {
+    let specs = vec![ProviderSpec {
+        name: "cohere".to_owned(),
+        kind: ProviderKind::Cohere,
+        api_key: Some("sk-test-xxx".to_owned()),
+        base_url: Some(upstream.to_owned()),
+        strict: false,
+        models: vec![ModelSpec {
+            id: "embed-multilingual".to_owned(),
+            upstream_id: "embed-v4.0".to_owned(),
+            capabilities: vec![Capability::Embed],
+            modalities: vec!["text".to_owned()],
+        }],
+    }];
+    Arc::new(Registry::build(specs, http::build_client()).expect("registry builds"))
+}
+
 const LIMIT: usize = 10 * 1024 * 1024;
 
 #[tokio::test]
@@ -369,6 +388,62 @@ async fn empty_input_is_400_fg1001() {
     assert_eq!(resp.status(), 400);
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["error"]["code"], "LM-1001");
+}
+
+#[tokio::test]
+async fn unknown_input_type_is_400_lm1001() {
+    let upstream = MockServer::start().await;
+    let base = common::spawn_with(registry_for_cohere(&upstream.uri()), LIMIT).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/embeddings"))
+        .json(&json!({
+            "model": "embed-multilingual",
+            "input": "hello",
+            "input_type": "not_a_real_type"
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 400);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "LM-1001");
+
+    // Rejected before any upstream call.
+    assert!(upstream.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn input_type_override_reaches_cohere_upstream() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v2/embed"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "embeddings": { "float": [[0.1, 0.2]] },
+            "meta": { "billed_units": { "input_tokens": 2 } }
+        })))
+        .mount(&upstream)
+        .await;
+
+    let base = common::spawn_with(registry_for_cohere(&upstream.uri()), LIMIT).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/embeddings"))
+        .json(&json!({
+            "model": "embed-multilingual",
+            "input": "find me the best result",
+            "input_type": "search_query"
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+
+    let requests = upstream.received_requests().await.unwrap();
+    let sent: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(sent["input_type"], "search_query");
 }
 
 #[tokio::test]

@@ -60,8 +60,13 @@ milestone.
 ## Noted while building M3
 
 - Cohere v2 embed requires an `input_type`; the gateway can't know query-vs-
-  document intent, so it always sends `search_document`. Expose a per-request
-  or per-model override (`input_type`) if a caller needs `search_query`.
+  document intent by default, so it sends `search_document` unless overridden.
+  Resolved (issue #22): a caller may set `input_type` as an extra field on the
+  `/v1/embeddings` request body (`search_document`, `search_query`,
+  `classification`, or `clustering`); an unknown value is rejected with
+  `LM-1001` before any upstream call. See `docs/providers.md` § cohere. A
+  per-model default (config-side) is still open if per-request opt-in proves
+  insufficient in practice.
 - `usage.search_units` is only meaningful for Cohere; Jina and Voyage bill
   rerank in tokens, so they report `0`. If token-based rerank usage matters for
   M5 cost counting, widen `RerankUsage` (e.g. add `total_tokens`) rather than

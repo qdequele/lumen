@@ -245,6 +245,94 @@ impl EmbedFixture for CohereEmbedFixture {
 }
 
 // --------------------------------------------------------------------------
+// Cohere `input_type` override (issue #22): a caller passes `input_type` as
+// an OpenAI-embeddings-request extra field; Cohere honors it verbatim,
+// defaulting to `search_document` (the indexing case) when absent.
+// --------------------------------------------------------------------------
+
+#[tokio::test]
+async fn cohere_embed_defaults_input_type_to_search_document() {
+    let mock = MockServer::start().await;
+    CohereEmbedFixture.mount_echo(&mock).await;
+    let provider = CohereEmbedFixture.build(mock.uri());
+
+    // `CohereEcho` echoes each input parsed as an `f32`; a numeric string
+    // input keeps the mock response valid (see `scenario_nominal`).
+    let req = batch_request(vec!["0".into()]);
+    provider.embed(req, CancellationToken::new()).await.unwrap();
+
+    let requests = mock.received_requests().await.unwrap();
+    let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(body["input_type"], "search_document");
+}
+
+#[tokio::test]
+async fn cohere_embed_honors_input_type_override() {
+    let mock = MockServer::start().await;
+    CohereEmbedFixture.mount_echo(&mock).await;
+    let provider = CohereEmbedFixture.build(mock.uri());
+
+    let mut req = batch_request(vec!["0".into()]);
+    req.extra
+        .insert("input_type".to_owned(), json!("search_query"));
+    provider.embed(req, CancellationToken::new()).await.unwrap();
+
+    let requests = mock.received_requests().await.unwrap();
+    let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(body["input_type"], "search_query");
+}
+
+/// Regression (PR #36 review): `EmbedRequest::extra` is a gateway-side carrier
+/// (Cohere reads `input_type` from it in Rust); it must NEVER be serialized
+/// into an outgoing provider body. The OpenAI-compatible near-passthrough
+/// providers (openai, mistral, jina, voyage text paths) serialize the request
+/// struct directly, so without `skip_serializing` on `extra` a caller-supplied
+/// `input_type` (or any unknown field) would forward verbatim and a strict
+/// upstream (vLLM etc.) could reject it.
+async fn assert_extra_not_forwarded(fx: &dyn EmbedFixture) {
+    let mock = MockServer::start().await;
+    fx.mount_echo(&mock).await;
+    let provider = fx.build(mock.uri());
+
+    let mut req = batch_request(vec!["0".into()]);
+    req.extra
+        .insert("input_type".to_owned(), json!("search_query"));
+    req.extra.insert("some_custom_flag".to_owned(), json!(true));
+    provider.embed(req, CancellationToken::new()).await.unwrap();
+
+    let requests = mock.received_requests().await.unwrap();
+    let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert!(
+        body.get("input_type").is_none(),
+        "`input_type` must not reach a non-Cohere upstream, got body: {body}"
+    );
+    assert!(
+        body.get("some_custom_flag").is_none(),
+        "extra fields must not reach the upstream, got body: {body}"
+    );
+}
+
+#[tokio::test]
+async fn openai_embed_does_not_forward_extra_fields() {
+    assert_extra_not_forwarded(&OpenAiFixture).await;
+}
+
+#[tokio::test]
+async fn mistral_embed_does_not_forward_extra_fields() {
+    assert_extra_not_forwarded(&MistralEmbedFixture).await;
+}
+
+#[tokio::test]
+async fn jina_embed_does_not_forward_extra_fields() {
+    assert_extra_not_forwarded(&JinaEmbedFixture).await;
+}
+
+#[tokio::test]
+async fn voyage_embed_does_not_forward_extra_fields() {
+    assert_extra_not_forwarded(&VoyageEmbedFixture).await;
+}
+
+// --------------------------------------------------------------------------
 // TEI fixture - request `inputs`, response is a bare `[[f32]]` array
 // --------------------------------------------------------------------------
 
@@ -405,6 +493,7 @@ fn batch_request(texts: Vec<String>) -> EmbedRequest {
         encoding_format: None,
         dimensions: None,
         user: None,
+        extra: serde_json::Map::new(),
     }
 }
 
@@ -645,6 +734,7 @@ async fn assert_rejects_token_input(fx: &dyn EmbedFixture, provider_label: &str)
             encoding_format: None,
             dimensions: None,
             user: None,
+            extra: serde_json::Map::new(),
         };
         let err = provider
             .embed(req, CancellationToken::new())
@@ -714,6 +804,7 @@ async fn openai_token_input_passes_through_natively() {
         encoding_format: None,
         dimensions: None,
         user: None,
+        extra: serde_json::Map::new(),
     };
     let resp = provider.embed(req, CancellationToken::new()).await.unwrap();
     assert_eq!(resp.data.len(), 1);
@@ -741,6 +832,7 @@ async fn ollama_strict_mode_rejects_dimensions_before_any_call() {
         encoding_format: None,
         dimensions: Some(256),
         user: None,
+        extra: serde_json::Map::new(),
     };
     let err = strict
         .embed(req, CancellationToken::new())
@@ -768,6 +860,7 @@ async fn ollama_non_strict_drops_dimensions_and_embeds() {
         encoding_format: None,
         dimensions: Some(256),
         user: None,
+        extra: serde_json::Map::new(),
     };
     let resp = provider.embed(req, CancellationToken::new()).await.unwrap();
     assert_eq!(resp.data.len(), 2);

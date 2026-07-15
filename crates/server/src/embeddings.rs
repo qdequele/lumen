@@ -21,6 +21,26 @@ use crate::error::ApiError;
 use crate::resilience::model_used_headers;
 use crate::state::AppState;
 
+/// Validate a Cohere `input_type` override (issue #22) up front, regardless of
+/// which provider ultimately serves the request, so an unknown value fails fast
+/// with LM-1001 rather than surfacing as an opaque upstream 400 (or, for a
+/// non-Cohere provider, being silently ignored while the caller believes it
+/// took effect).
+fn validate_input_type(req: &lumen_core::EmbedRequest) -> Result<(), GatewayError> {
+    if let Some(value) = req.extra.get("input_type") {
+        let is_allowed = value
+            .as_str()
+            .is_some_and(|s| lumen_providers::cohere::ALLOWED_INPUT_TYPES.contains(&s));
+        if !is_allowed {
+            return Err(GatewayError::InvalidRequest(format!(
+                "invalid `input_type` {value}: expected one of {:?}",
+                lumen_providers::cohere::ALLOWED_INPUT_TYPES
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Handle an embeddings request.
 pub async fn embeddings(
     State(state): State<AppState>,
@@ -35,6 +55,8 @@ pub async fn embeddings(
     if req.input.is_empty() {
         return Err(GatewayError::InvalidRequest("`input` must not be empty".to_owned()).into());
     }
+
+    validate_input_type(&req)?;
 
     // Resolve the requested model to a fallback chain (primary + configured
     // fallbacks), each re-resolved for the embed capability (M6 §6.2).
