@@ -277,6 +277,56 @@ id = "voyage-rerank"
 upstream_id = "rerank-2"
 capabilities = ["rerank"]
 
+# Mixedbread: reranking (hosted, mxbai-rerank-*). Bearer auth. The endpoint is
+# POST /v1/reranking (`input`/`top_k` on the wire); the gateway translates.
+[[providers]]
+name = "mixedbread"
+kind = "mixedbread"
+api_key_env = "MXBAI_API_KEY"
+
+[[providers.models]]
+id = "mxbai-rerank"
+upstream_id = "mixedbread-ai/mxbai-rerank-large-v1"
+capabilities = ["rerank"]
+
+# Pinecone: hosted reranking. Auth is the `Api-Key` header (not a bearer token).
+# Pinecone reports real usage (rerank_units), carried through as search_units.
+[[providers]]
+name = "pinecone"
+kind = "pinecone"
+api_key_env = "PINECONE_API_KEY"
+
+[[providers.models]]
+id = "pinecone-rerank"
+upstream_id = "pinecone-rerank-v0"
+capabilities = ["rerank"]
+
+# NVIDIA NIM: reranking via `{base}/v1/ranking`. base_url REQUIRED (the NIM
+# root); keyless for self-hosted NIMs (set api_key_env for the hosted API).
+# Scores are raw logits (unbounded, comparable only within one response).
+[[providers]]
+name = "nvidia-nim"
+kind = "nvidia"
+base_url = "http://localhost:8000"
+# api_key_env = "NVIDIA_API_KEY"
+
+[[providers.models]]
+id = "nvidia-rerank"
+upstream_id = "nvidia/llama-3.2-nv-rerankqa-1b-v2"
+capabilities = ["rerank"]
+
+# Together: one entry serves chat + embed (OpenAI-compatible) AND native rerank
+# (LlamaRank, Cohere-shaped `/rerank`). Bearer auth, default base URL.
+[[providers]]
+name = "together"
+kind = "together"
+api_key_env = "TOGETHER_API_KEY"
+
+[[providers.models]]
+id = "llama-rank"
+upstream_id = "Salesforce/Llama-Rank-V1"
+capabilities = ["rerank"]
+
 # TEI (Text Embeddings Inference): self-hosted, keyless. Requires a base_url.
 # Serves one model per process; `upstream_id` is ignored by TEI but kept for
 # your own clarity.

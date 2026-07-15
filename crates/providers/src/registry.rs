@@ -22,9 +22,13 @@ use crate::google::GoogleProvider;
 use crate::jina::JinaProvider;
 use crate::kind::ProviderKind;
 use crate::mistral::MistralProvider;
+use crate::mixedbread::MixedbreadProvider;
+use crate::nvidia::NvidiaProvider;
 use crate::ollama::OllamaProvider;
 use crate::openai::OpenAiProvider;
+use crate::pinecone::PineconeProvider;
 use crate::tei::TeiProvider;
+use crate::together::TogetherRerankProvider;
 use crate::voyage::VoyageProvider;
 
 /// A model exposed by a provider, with its upstream id and capabilities.
@@ -406,18 +410,17 @@ fn build_providers(
     };
 
     match spec.kind {
-        // OpenAI + every OpenAI-compatible host (Groq, Together, Fireworks,
-        // DeepSeek, OpenRouter, Perplexity, xAI, DeepInfra, Hugging Face
-        // router, self-hosted vLLM/llama.cpp/LM Studio) share the OpenAI
-        // provider; only the base URL differs. The base is the explicit
-        // override, else the kind's built-in default. Kinds with no built-in
-        // default (vLLM) must not silently fall through to api.openai.com, so
-        // a missing URL is a build error. Cloudflare Workers AI has its own
-        // arm below: it shares this chat/embed wiring but also builds a
-        // native rerank provider from the same `base_url`.
+        // OpenAI + every OpenAI-compatible host (Groq, Fireworks, DeepSeek,
+        // OpenRouter, Perplexity, xAI, DeepInfra, Hugging Face router,
+        // self-hosted vLLM/llama.cpp/LM Studio) share the OpenAI provider;
+        // only the base URL differs. The base is the explicit override, else
+        // the kind's built-in default. Kinds with no built-in default (vLLM)
+        // must not silently fall through to api.openai.com, so a missing URL
+        // is a build error. Cloudflare Workers AI and Together each have
+        // their own arm below: they share this chat/embed wiring but also
+        // build a native rerank provider from the same `base_url`.
         ProviderKind::Openai
         | ProviderKind::Groq
-        | ProviderKind::Together
         | ProviderKind::Fireworks
         | ProviderKind::Deepseek
         | ProviderKind::Openrouter
@@ -483,6 +486,81 @@ fn build_providers(
             Ok(BuiltProviders {
                 chat: Some(chat),
                 embed: Some(embed),
+                rerank: Some(rerank),
+            })
+        }
+        // Together AI: chat + embed via the same OpenAI-compatible wiring as
+        // above (built-in default base URL, overridable), plus native rerank
+        // (LlamaRank) via Together's own `/rerank` endpoint, which is
+        // Cohere-shaped (see `crate::together`). Mirrors the Cloudflare arm.
+        ProviderKind::Together => {
+            let base_url = spec
+                .base_url
+                .clone()
+                .or_else(|| spec.kind.default_base_url().map(str::to_owned));
+            let chat: Arc<dyn ChatProvider> = Arc::new(OpenAiProvider::new(
+                client.clone(),
+                spec.name.clone(),
+                base_url.clone(),
+                spec.api_key.clone(),
+            ));
+            let embed: Arc<dyn EmbeddingProvider> = Arc::new(OpenAiProvider::new(
+                client.clone(),
+                spec.name.clone(),
+                base_url.clone(),
+                spec.api_key.clone(),
+            ));
+            let rerank: Arc<dyn RerankProvider> = Arc::new(TogetherRerankProvider::new(
+                client.clone(),
+                spec.name.clone(),
+                base_url,
+                spec.api_key.clone(),
+            ));
+            Ok(BuiltProviders {
+                chat: Some(chat),
+                embed: Some(embed),
+                rerank: Some(rerank),
+            })
+        }
+        ProviderKind::Mixedbread => {
+            let rerank: Arc<dyn RerankProvider> = Arc::new(MixedbreadProvider::new(
+                client.clone(),
+                spec.name.clone(),
+                spec.base_url.clone(),
+                spec.api_key.clone(),
+            ));
+            Ok(BuiltProviders {
+                chat: None,
+                embed: None,
+                rerank: Some(rerank),
+            })
+        }
+        ProviderKind::Pinecone => {
+            let rerank: Arc<dyn RerankProvider> = Arc::new(PineconeProvider::new(
+                client.clone(),
+                spec.name.clone(),
+                spec.base_url.clone(),
+                spec.api_key.clone(),
+            ));
+            Ok(BuiltProviders {
+                chat: None,
+                embed: None,
+                rerank: Some(rerank),
+            })
+        }
+        // NVIDIA NIM: rerank via `/v1/ranking`. `base_url` is required (the NIM
+        // root); the key is optional (self-hosted NIMs are keyless).
+        ProviderKind::Nvidia => {
+            let base_url = require_base_url()?;
+            let rerank: Arc<dyn RerankProvider> = Arc::new(NvidiaProvider::new(
+                client.clone(),
+                spec.name.clone(),
+                base_url,
+                spec.api_key.clone(),
+            ));
+            Ok(BuiltProviders {
+                chat: None,
+                embed: None,
                 rerank: Some(rerank),
             })
         }
@@ -984,6 +1062,74 @@ mod tests {
         assert!(reg.chat_route("command-r-plus").is_some());
         assert!(reg.embedding_route("command-r-plus").is_some());
         assert!(reg.rerank_route("command-r-plus").is_some());
+    }
+
+    #[test]
+    fn mixedbread_and_pinecone_resolve_for_rerank_only() {
+        for kind in [ProviderKind::Mixedbread, ProviderKind::Pinecone] {
+            let reg = Registry::build(
+                vec![spec(
+                    kind,
+                    "p",
+                    None,
+                    vec![model("rr", &[Capability::Rerank])],
+                )],
+                reqwest::Client::new(),
+            )
+            .unwrap_or_else(|e| panic!("{kind:?} should build: {e}"));
+            assert!(reg.rerank_route("rr").is_some(), "{kind:?} rerank");
+            assert!(reg.embedding_route("rr").is_none(), "{kind:?} no embed");
+            assert!(reg.chat_route("rr").is_none(), "{kind:?} no chat");
+        }
+    }
+
+    #[test]
+    fn together_resolves_for_chat_embed_and_native_rerank() {
+        let reg = Registry::build(
+            vec![spec(
+                ProviderKind::Together,
+                "together",
+                None,
+                vec![model(
+                    "multi",
+                    &[Capability::Chat, Capability::Embed, Capability::Rerank],
+                )],
+            )],
+            reqwest::Client::new(),
+        )
+        .unwrap();
+        assert!(reg.chat_route("multi").is_some());
+        assert!(reg.embedding_route("multi").is_some());
+        assert!(reg.rerank_route("multi").is_some());
+    }
+
+    #[test]
+    fn nvidia_without_base_url_is_a_build_error() {
+        let result = Registry::build(
+            vec![spec(
+                ProviderKind::Nvidia,
+                "nvidia",
+                None,
+                vec![model("rr", &[Capability::Rerank])],
+            )],
+            reqwest::Client::new(),
+        );
+        assert!(matches!(result, Err(RegistryError::MissingBaseUrl { .. })));
+    }
+
+    #[test]
+    fn nvidia_with_base_url_resolves_for_rerank() {
+        let reg = Registry::build(
+            vec![spec(
+                ProviderKind::Nvidia,
+                "nvidia",
+                Some("http://localhost:8000"),
+                vec![model("rr", &[Capability::Rerank])],
+            )],
+            reqwest::Client::new(),
+        )
+        .expect("nvidia with base_url builds");
+        assert!(reg.rerank_route("rr").is_some());
     }
 
     #[test]

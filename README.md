@@ -173,6 +173,9 @@ Twenty provider kinds: nine **native** integrations plus eleven
 | `cohere`    |      |  ✅   |   ✅   | `api_key_env`         | one model can do embed+rerank  |
 | `jina`      |      |  ✅   |   ✅   | `api_key_env`         |                                |
 | `voyage`    |      |  ✅   |   ✅   | `api_key_env`         |                                |
+| `mixedbread`|      |      |   ✅   | `api_key_env`         | `mxbai-rerank-*`               |
+| `pinecone`  |      |      |   ✅   | `api_key_env`         | `Api-Key` header; reports units |
+| `nvidia`    |      |      |   ✅   | keyless, **`base_url`** | NIM `/v1/ranking`; logit scores |
 | `tei`       |      |  ✅   |   ✅   | keyless, **`base_url`** | self-hosted (Text Embeddings Inference) |
 | `ollama`    |      |  ✅   |        | keyless, **`base_url`** | self-hosted                    |
 
@@ -184,7 +187,8 @@ self-hosted OpenAI-compatible server: vLLM, llama.cpp, LM Studio, …). Anything
 else that speaks the OpenAI format works via `kind = "openai"` + a `base_url`.
 `cloudflare` additionally serves **rerank** (BAAI `bge-reranker-*`) through
 Workers AI's native `/ai/run/{model}` endpoint rather than the OpenAI path -
-see [`docs/providers.md`](docs/providers.md).
+see [`docs/providers.md`](docs/providers.md). The `together` kind additionally
+serves **rerank** (LlamaRank) natively.
 
 Per-provider setup (env var, `base_url`, defaults, batch limits) is in
 [`docs/providers.md`](docs/providers.md).

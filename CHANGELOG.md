@@ -6,6 +6,33 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added - Additional rerank providers (Mixedbread, Pinecone, NVIDIA NIM, Together)
+
+- Four new rerank kinds broaden first-class rerank coverage (issue #19):
+  - **`mixedbread`** (`mxbai-rerank-*`, hosted): bearer auth,
+    `POST /v1/reranking` (note the path: `reranking`, not `rerank`) with the
+    renamed request fields `input`/`top_k` and a `data`-nested response
+    (`results`/`relevance_score` also accepted). Token-billed, so the gateway
+    reports an ADR-003 `estimated` token count.
+  - **`pinecone`** (hosted inference): authenticates with the `Api-Key` header
+    (not a bearer token) plus a pinned `X-Pinecone-API-Version`, sends
+    documents as `{ "text": ... }` objects, and carries the upstream
+    `usage.rerank_units` through as `search_units` (not estimated).
+  - **`nvidia`** (NIM ranking): `base_url` required (the NIM root), key
+    optional (self-hosted NIMs are keyless). Posts to `{base}/v1/ranking` with
+    `query: { text }` / `passages: [{ text }]`; NIM returns a raw **logit**,
+    passed through unchanged as `relevance_score` (unbounded, comparable only
+    within one response, no sigmoid applied). No `top_n` on the wire, so the
+    gateway truncates afterwards (as for TEI).
+  - **`together`**: the existing OpenAI-compatible `together` kind now also
+    serves **rerank** (LlamaRank) natively via its Cohere-shaped `/rerank`
+    endpoint, mirroring how `cloudflare` adds native rerank; one provider entry
+    serves chat, embed and rerank against the same `base_url` and key.
+- All four honour `CancellationToken` (a client disconnect aborts the upstream
+  call), map upstream status codes to `ProviderError` with a retry hint, and
+  keep the API key out of `Debug`/logs. Covered by the shared rerank
+  conformance suite plus dedicated request-shape/auth-header tests.
+
 ### Added - Cohere chat (Command R / R+)
 
 - The `cohere` provider kind now implements `ChatProvider` alongside its
