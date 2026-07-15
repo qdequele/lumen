@@ -46,6 +46,19 @@ pub fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duratio
         .map(Duration::from_secs)
 }
 
+/// Current unix time in whole seconds, for response `created` timestamps.
+///
+/// Providers whose upstream API does not return a creation time (Anthropic,
+/// ...) stamp the translated response with this instead of a hardcoded `0`.
+/// Falls back to `0` on a pre-epoch system clock rather than panicking - a
+/// nonsensical local clock must never take request handling down.
+#[must_use]
+pub fn unix_timestamp() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -102,5 +115,12 @@ mod tests {
             "Wed, 21 Oct 2025 07:28:00 GMT".parse().unwrap(),
         );
         assert_eq!(parse_retry_after(&headers), None);
+    }
+
+    #[test]
+    fn unix_timestamp_is_a_plausible_recent_value() {
+        // Sanity-bounds the result against a fixed past instant (2024-01-01
+        // UTC) without pinning it to an exact wall-clock value.
+        assert!(unix_timestamp() > 1_704_067_200);
     }
 }
