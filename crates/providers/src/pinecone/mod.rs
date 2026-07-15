@@ -167,6 +167,10 @@ impl RerankProvider for PineconeProvider {
             usage: RerankUsage {
                 search_units: parsed.usage.rerank_units,
                 estimated: None,
+                // Pinecone does not report a token count; the gateway derives
+                // one for uniform observability (ADR 003), see
+                // `lumen_server::rerank`.
+                ..Default::default()
             },
         })
     }

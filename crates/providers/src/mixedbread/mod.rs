@@ -1,10 +1,16 @@
 //! Mixedbread provider - reranking (`mxbai-rerank-*`).
 //!
-//! Mixedbread's rerank endpoint (`POST /rerank`) is close to Cohere's but renames
-//! two fields: the request carries `input` (not `documents`) and `top_k` (not
-//! `top_n`); the response nests scored items under `data`, each `{ index, score }`
-//! (accepted as `results` / `relevance_score` too, for robustness against the
-//! Cohere-compatible variant some deployments expose). Auth is a bearer token.
+//! Mixedbread's rerank endpoint is `POST /v1/reranking` - note the path: it is
+//! `reranking`, NOT the `rerank` used by Cohere/Jina/Together. The request is
+//! close to Cohere's but renames two fields: it carries `input` (not
+//! `documents`) and `top_k` (not `top_n`). Auth is a bearer token.
+//!
+//! Response envelope: scored items are expected nested under `data`, each
+//! `{ index, score }`. Public documentation of the exact envelope is thin, so
+//! parsing is deliberately tolerant and also accepts the Cohere-compatible
+//! variant (`results` for the array, `relevance_score` for the score) via serde
+//! aliases; if Mixedbread turns out to use only one of the two shapes the other
+//! alias is simply never exercised.
 //!
 //! Mixedbread bills reranking in tokens rather than search units, so
 //! `usage.search_units` is left at `0` and the gateway derives an ADR-003 token
@@ -100,7 +106,9 @@ impl RerankProvider for MixedbreadProvider {
         req: RerankRequest,
         cancel: CancellationToken,
     ) -> Result<RerankResponse, ProviderError> {
-        let url = format!("{}/rerank", self.base_url);
+        // Mixedbread's path is `/reranking` (with the /v1 prefix carried by
+        // `base_url`), not `/rerank`.
+        let url = format!("{}/reranking", self.base_url);
         let input: Vec<&str> = req
             .documents
             .iter()

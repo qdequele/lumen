@@ -9,10 +9,11 @@ All notable changes to LUMEN are documented here. The format is based on
 ### Added - Additional rerank providers (Mixedbread, Pinecone, NVIDIA NIM, Together)
 
 - Four new rerank kinds broaden first-class rerank coverage (issue #19):
-  - **`mixedbread`** (`mxbai-rerank-*`, hosted): bearer auth, `POST /rerank`
-    with the renamed request fields `input`/`top_k` and a `data`-nested
-    response (`results`/`relevance_score` also accepted). Token-billed, so the
-    gateway reports an ADR-003 `estimated` token count.
+  - **`mixedbread`** (`mxbai-rerank-*`, hosted): bearer auth,
+    `POST /v1/reranking` (note the path: `reranking`, not `rerank`) with the
+    renamed request fields `input`/`top_k` and a `data`-nested response
+    (`results`/`relevance_score` also accepted). Token-billed, so the gateway
+    reports an ADR-003 `estimated` token count.
   - **`pinecone`** (hosted inference): authenticates with the `Api-Key` header
     (not a bearer token) plus a pinned `X-Pinecone-API-Version`, sends
     documents as `{ "text": ... }` objects, and carries the upstream

@@ -310,8 +310,9 @@ capabilities = ["rerank"]
 - **kind**: `mixedbread` · **capabilities**: rerank (hosted, `mxbai-rerank-*`).
 - **Auth**: `api_key_env` (e.g. `MXBAI_API_KEY`), bearer token.
 - **base_url**: optional; defaults to `https://api.mixedbread.com/v1`.
-- **Schema note**: Mixedbread's `/rerank` renames the request fields (`input`
-  instead of `documents`, `top_k` instead of `top_n`) and nests results under
+- **Schema note**: Mixedbread's endpoint is `POST /v1/reranking` (note the
+  path: `reranking`, not `rerank`) and renames the request fields (`input`
+  instead of `documents`, `top_k` instead of `top_n`) with results nested under
   `data`; the gateway translates transparently.
 - **Usage**: billed in tokens, so the gateway reports an `estimated` token count
   (ADR 003) rather than upstream search units.

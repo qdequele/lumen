@@ -277,8 +277,8 @@ id = "voyage-rerank"
 upstream_id = "rerank-2"
 capabilities = ["rerank"]
 
-# Mixedbread: reranking (hosted, mxbai-rerank-*). Bearer auth. The `/rerank`
-# endpoint uses `input`/`top_k` on the wire; the gateway translates for you.
+# Mixedbread: reranking (hosted, mxbai-rerank-*). Bearer auth. The endpoint is
+# POST /v1/reranking (`input`/`top_k` on the wire); the gateway translates.
 [[providers]]
 name = "mixedbread"
 kind = "mixedbread"
