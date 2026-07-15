@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::anthropic::AnthropicProvider;
+use crate::cloudflare::CloudflareRerankProvider;
 use crate::cohere::CohereProvider;
 use crate::google::GoogleProvider;
 use crate::jina::JinaProvider;
@@ -393,12 +394,14 @@ fn build_providers(
 
     match spec.kind {
         // OpenAI + every OpenAI-compatible host (Groq, Together, Fireworks,
-        // DeepSeek, OpenRouter, Perplexity, xAI, DeepInfra, Hugging Face router,
-        // Cloudflare Workers AI, self-hosted vLLM/llama.cpp/LM Studio) share the
-        // OpenAI provider; only the base URL differs. The base is the explicit
-        // override, else the kind's built-in default. Kinds with neither (vLLM,
-        // Cloudflare - its URL carries the account id) must not silently fall
-        // through to api.openai.com, so a missing URL is a build error.
+        // DeepSeek, OpenRouter, Perplexity, xAI, DeepInfra, Hugging Face
+        // router, self-hosted vLLM/llama.cpp/LM Studio) share the OpenAI
+        // provider; only the base URL differs. The base is the explicit
+        // override, else the kind's built-in default. Kinds with no built-in
+        // default (vLLM) must not silently fall through to api.openai.com, so
+        // a missing URL is a build error. Cloudflare Workers AI has its own
+        // arm below: it shares this chat/embed wiring but also builds a
+        // native rerank provider from the same `base_url`.
         ProviderKind::Openai
         | ProviderKind::Groq
         | ProviderKind::Together
@@ -409,7 +412,6 @@ fn build_providers(
         | ProviderKind::Xai
         | ProviderKind::Deepinfra
         | ProviderKind::Huggingface
-        | ProviderKind::Cloudflare
         | ProviderKind::Vllm => {
             let base_url = spec
                 .base_url
@@ -438,6 +440,37 @@ fn build_providers(
                 chat: Some(chat),
                 embed: Some(embed),
                 rerank: None,
+            })
+        }
+        // Cloudflare Workers AI: chat + embed via the same OpenAI-compatible
+        // wiring as above (its `base_url` carries the account id, so it is
+        // always required - never falls through to a built-in default), plus
+        // rerank via the native `/ai/run/{model}` endpoint (bge-reranker-*),
+        // which is not OpenAI-shaped (see `crate::cloudflare`).
+        ProviderKind::Cloudflare => {
+            let base_url = require_base_url()?;
+            let chat: Arc<dyn ChatProvider> = Arc::new(OpenAiProvider::new(
+                client.clone(),
+                spec.name.clone(),
+                Some(base_url.clone()),
+                spec.api_key.clone(),
+            ));
+            let embed: Arc<dyn EmbeddingProvider> = Arc::new(OpenAiProvider::new(
+                client.clone(),
+                spec.name.clone(),
+                Some(base_url.clone()),
+                spec.api_key.clone(),
+            ));
+            let rerank: Arc<dyn RerankProvider> = Arc::new(CloudflareRerankProvider::new(
+                client.clone(),
+                spec.name.clone(),
+                base_url,
+                spec.api_key.clone(),
+            ));
+            Ok(BuiltProviders {
+                chat: Some(chat),
+                embed: Some(embed),
+                rerank: Some(rerank),
             })
         }
         ProviderKind::Mistral => {
@@ -747,6 +780,29 @@ mod tests {
         .unwrap();
         assert!(reg.embedding_route("multi").is_some());
         assert!(reg.rerank_route("multi").is_some());
+    }
+
+    #[test]
+    fn cloudflare_model_resolves_for_chat_embed_and_native_rerank() {
+        // A single `cloudflare` provider entry serves all three capabilities:
+        // chat + embed via the OpenAI-compatible path, rerank via the native
+        // `/ai/run/{model}` endpoint - all against the same `base_url`.
+        let reg = Registry::build(
+            vec![spec(
+                ProviderKind::Cloudflare,
+                "cf",
+                Some("https://api.cloudflare.com/client/v4/accounts/acct123/ai/v1"),
+                vec![model(
+                    "cf-multi",
+                    &[Capability::Chat, Capability::Embed, Capability::Rerank],
+                )],
+            )],
+            reqwest::Client::new(),
+        )
+        .unwrap();
+        assert!(reg.chat_route("cf-multi").is_some());
+        assert!(reg.embedding_route("cf-multi").is_some());
+        assert!(reg.rerank_route("cf-multi").is_some());
     }
 
     #[test]

@@ -13,6 +13,7 @@
 pub mod anthropic;
 pub mod batch;
 pub mod chat;
+pub mod cloudflare;
 pub mod cohere;
 pub mod google;
 pub mod http;
@@ -31,6 +32,7 @@ pub mod voyage;
 
 pub use anthropic::AnthropicProvider;
 pub use batch::embed_batched;
+pub use cloudflare::CloudflareRerankProvider;
 pub use cohere::CohereProvider;
 pub use google::GoogleProvider;
 pub use jina::JinaProvider;

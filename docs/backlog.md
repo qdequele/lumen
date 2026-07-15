@@ -244,9 +244,6 @@ milestone.
   endpoints). Each is a `provider-integrator` task with wiremock tests.
 - **Cohere chat** (Command R/R+) - we ship Cohere embed+rerank; chat is a
   distinct schema.
-- **Cloudflare Workers AI rerank** - the OpenAI-compatible `cloudflare` kind
-  covers chat+embed; bge-reranker uses the native `/ai/run/{model}` endpoint
-  with a Cloudflare-specific response, so rerank needs custom code.
 - **More rerankers**: Mixedbread (mxbai-rerank), Pinecone Rerank, NVIDIA NIM
   rerank, Together LlamaRank - cheap differentiation for a first-class rerank
   gateway.

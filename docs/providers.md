@@ -79,6 +79,12 @@ All OpenAI-compatible kinds use a 2048-input embed batch limit. Anything that
 speaks the OpenAI wire format but isn't listed can still be used via
 `kind = "openai"` with a `base_url` override.
 
+`cloudflare` additionally serves **rerank** (not shown in the table above,
+which covers only the chat/embed OpenAI-compatible path): its BAAI
+`bge-reranker-*` models are served through Workers AI's native
+`/ai/run/{model}` endpoint rather than an OpenAI-compatible one. See
+[`### cloudflare`](#cloudflare) below.
+
 ---
 
 ## openai
@@ -322,10 +328,18 @@ capabilities = ["chat"]
 
 ### cloudflare
 
-Cloudflare **Workers AI** via its OpenAI-compatible endpoint. `base_url` is
-**required** because it embeds your account id; `api_key_env` holds a Cloudflare
-API token. (Workers AI reranking uses a Cloudflare-specific endpoint and is not
-covered by this OpenAI-compatible kind yet - see `docs/backlog.md`.)
+Cloudflare **Workers AI**. Chat and embeddings go through its OpenAI-compatible
+endpoint; reranking (`bge-reranker-*` models) goes through Workers AI's own
+native `POST /ai/run/{model}` endpoint instead, since it is not part of the
+OpenAI-compatible surface - one `[[providers]]` entry serves all three
+capabilities against the same `base_url`. `base_url` is **required** because
+it embeds your account id; `api_key_env` holds a Cloudflare API token.
+
+The native rerank request is `{ query, contexts: [{ text }, ...], top_k }`
+(`top_n` is sent as `top_k`); the response is Cloudflare's standard
+`{ result: { response: [{ id, score }, ...] }, success, errors }` envelope,
+with `id` mapped back onto the original document index. Workers AI reports no
+token usage for this model; LUMEN derives a local estimate per ADR 003.
 
 ```toml
 [[providers]]
@@ -337,6 +351,10 @@ base_url = "https://api.cloudflare.com/client/v4/accounts/YOUR_ACCOUNT_ID/ai/v1"
 id = "cf-llama"
 upstream_id = "@cf/meta/llama-3.1-8b-instruct"
 capabilities = ["chat"]
+[[providers.models]]
+id = "cf-rerank"
+upstream_id = "@cf/baai/bge-reranker-base"
+capabilities = ["rerank"]
 ```
 
 ### vllm
