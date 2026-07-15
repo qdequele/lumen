@@ -108,7 +108,9 @@ pub struct RerankRequest {
     /// Fields of object documents to concatenate for ranking, in order (Cohere's
     /// `rank_fields`). Ignored for bare-string documents. When omitted, object
     /// documents fall back to their `text` field. The gateway reduces each
-    /// object document to a single ranking text at the edge.
+    /// object document to a single ranking text at the edge; note that
+    /// `return_documents` then echoes that REDUCED ranking text (as
+    /// `document.text`), not the original JSON object.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rank_fields: Option<Vec<String>>,
     /// Return at most this many top results. Values larger than the document
@@ -116,7 +118,9 @@ pub struct RerankRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub top_n: Option<u32>,
     /// Echo each result's source document text back in `document`. Defaults to
-    /// `false` to save bandwidth (M3 acceptance criterion 5).
+    /// `false` to save bandwidth (M3 acceptance criterion 5). For object
+    /// documents this echoes the text the gateway actually ranked (the
+    /// `rank_fields` reduction, or the `text` field), never the original object.
     #[serde(default)]
     pub return_documents: bool,
 }

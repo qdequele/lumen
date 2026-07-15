@@ -76,6 +76,9 @@ impl EmbeddingProvider for TeiProvider {
         req: EmbedRequest,
         cancel: CancellationToken,
     ) -> Result<EmbedResponse, ProviderError> {
+        // TEI takes text inputs only; token-id arrays would serialize to an
+        // EMPTY inputs array. Honest 400 before any upstream call (issue #25).
+        crate::mapping::reject_pretokenized_input(&self.provider_name, &req.input)?;
         let url = format!("{}/embed", self.base_url);
         let body = TeiEmbedRequest {
             inputs: req.input.iter().collect(),

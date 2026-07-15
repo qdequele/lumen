@@ -110,6 +110,7 @@ fn anthropic_vision_registry(upstream: &str) -> Arc<Registry> {
         kind: ProviderKind::Anthropic,
         api_key: Some("sk-ant-test".to_owned()),
         base_url: Some(upstream.to_owned()),
+        strict: false,
         models: vec![ModelSpec {
             id: "claude".to_owned(),
             upstream_id: "claude-3-5-sonnet".to_owned(),
@@ -127,6 +128,7 @@ fn google_vision_registry(upstream: &str) -> Arc<Registry> {
         kind: ProviderKind::Google,
         api_key: Some("goog-test".to_owned()),
         base_url: Some(upstream.to_owned()),
+        strict: false,
         models: vec![ModelSpec {
             id: "gemini".to_owned(),
             upstream_id: "gemini-2.0-flash".to_owned(),

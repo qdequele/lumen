@@ -122,6 +122,50 @@ async fn base64_encoding_format_re_encodes_vectors_on_the_way_out() {
 }
 
 #[tokio::test]
+async fn token_input_to_text_only_provider_is_400_fg1001_without_upstream_call() {
+    // A TEI-kind provider cannot consume pre-tokenized input; the gateway must
+    // return an honest 400 (LM-1001) and never contact the upstream (issue #25
+    // review). No mock is mounted: any upstream call would still show up in
+    // `received_requests`.
+    let upstream = MockServer::start().await;
+    let specs = vec![ProviderSpec {
+        name: "tei".to_owned(),
+        kind: ProviderKind::Tei,
+        api_key: None,
+        base_url: Some(upstream.uri()),
+        strict: false,
+        models: vec![ModelSpec {
+            id: "tei-embed".to_owned(),
+            upstream_id: "tei-embed".to_owned(),
+            capabilities: vec![Capability::Embed],
+            modalities: vec!["text".to_owned()],
+        }],
+    }];
+    let registry = Arc::new(Registry::build(specs, http::build_client()).expect("registry builds"));
+    let base = common::spawn_with(registry, LIMIT).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/embeddings"))
+        .json(&json!({ "model": "tei-embed", "input": [[1, 2], [3, 4]] }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 400);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "LM-1001");
+    assert_eq!(body["error"]["type"], "invalid_request");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("pre-tokenized"),
+        "message names the input shape: {body}"
+    );
+    assert!(upstream.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn unknown_model_is_404_fg2001() {
     let upstream = MockServer::start().await;
     let base = common::spawn_with(registry_for(&upstream.uri()), LIMIT).await;

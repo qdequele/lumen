@@ -93,6 +93,20 @@ pub enum ProviderError {
         field: String,
     },
 
+    /// The request carried an input shape the provider cannot consume at all
+    /// (e.g. pre-tokenized token-id arrays sent to a text-only embed API).
+    /// Rejected BEFORE any upstream call so the client gets an honest 400
+    /// (`LM-1001`) instead of an empty result or an opaque upstream error
+    /// (rule 8). A client fault: never retried, never counted against provider
+    /// health.
+    #[error("provider '{provider}' does not support {reason}")]
+    UnsupportedInput {
+        /// The provider that rejected the input.
+        provider: String,
+        /// What the input was (e.g. `pre-tokenized input (token id arrays)`).
+        reason: String,
+    },
+
     /// The upstream signalled rate limiting (HTTP 429).
     #[error("provider '{provider}' rate limited the request")]
     RateLimited {
@@ -121,7 +135,8 @@ impl ProviderError {
             ProviderError::Cancelled
             | ProviderError::Translation(_)
             | ProviderError::ImageUrlNotSupported { .. }
-            | ProviderError::UnsupportedField { .. } => false,
+            | ProviderError::UnsupportedField { .. }
+            | ProviderError::UnsupportedInput { .. } => false,
         }
     }
 
@@ -141,7 +156,8 @@ impl ProviderError {
             ProviderError::Cancelled
             | ProviderError::Translation(_)
             | ProviderError::ImageUrlNotSupported { .. }
-            | ProviderError::UnsupportedField { .. } => false,
+            | ProviderError::UnsupportedField { .. }
+            | ProviderError::UnsupportedInput { .. } => false,
         }
     }
 
@@ -548,6 +564,16 @@ impl GatewayError {
                     p_or(provider, p)
                 ))
             }
+            // The input shape itself cannot be consumed by this provider (e.g.
+            // token-id arrays to a text-only embed API): a client fault → 400
+            // (LM-1001), rejected before any upstream call.
+            ProviderError::UnsupportedInput {
+                provider: p,
+                reason,
+            } => GatewayError::InvalidRequest(format!(
+                "provider '{}' does not support {reason}",
+                p_or(provider, p)
+            )),
             // A client-initiated cancel is not a gateway malfunction: its own
             // LM-6001 / 499, so it never inflates `internal`/5xx metrics or
             // alerts the way `GatewayError::Internal` would (issue #11).
@@ -810,6 +836,10 @@ mod tests {
                 provider: "p".into(),
                 field: "dimensions".into(),
             },
+            ProviderError::UnsupportedInput {
+                provider: "p".into(),
+                reason: "pre-tokenized input".into(),
+            },
         ] {
             assert!(!err.is_retryable(), "{err:?} must not be retried");
             assert!(
@@ -831,6 +861,22 @@ mod tests {
         assert_eq!(err.code(), "LM-1001");
         assert_eq!(err.error_type(), ErrorType::InvalidRequest);
         assert!(matches!(err, GatewayError::InvalidRequest(ref m) if m.contains("dimensions")));
+    }
+
+    #[test]
+    fn unsupported_input_maps_to_400_lm_1001_naming_the_reason() {
+        let err = GatewayError::from_provider(
+            "cohere",
+            ProviderError::UnsupportedInput {
+                provider: "cohere".into(),
+                reason: "pre-tokenized input (token id arrays)".into(),
+            },
+        );
+        assert_eq!(err.code(), "LM-1001");
+        assert_eq!(err.error_type(), ErrorType::InvalidRequest);
+        assert!(
+            matches!(err, GatewayError::InvalidRequest(ref m) if m.contains("pre-tokenized") && m.contains("cohere"))
+        );
     }
 
     #[test]

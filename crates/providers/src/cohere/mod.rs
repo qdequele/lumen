@@ -148,9 +148,9 @@ fn build_cohere_body(req: &EmbedRequest) -> CohereEmbedBody<'_> {
                 embedding_types: ["float"],
             })
         }
-        // Cohere embed takes texts, not token ids; token-array inputs yield no
-        // text fragments (`iter()` is empty for them) and are not a Cohere use
-        // case. They pass through natively only on OpenAI-compatible providers.
+        // Token-array inputs never reach here: `embed()` rejects them up front
+        // (reject_pretokenized_input, issue #25). The arms stay total so a
+        // future call site cannot silently send an empty texts array.
         EmbedInput::Single(_)
         | EmbedInput::Batch(_)
         | EmbedInput::Tokens(_)
@@ -211,6 +211,9 @@ impl EmbeddingProvider for CohereProvider {
         req: EmbedRequest,
         cancel: CancellationToken,
     ) -> Result<EmbedResponse, ProviderError> {
+        // Cohere embed takes texts only; token-id arrays would serialize to an
+        // EMPTY texts array. Honest 400 before any upstream call (issue #25).
+        crate::mapping::reject_pretokenized_input(&self.provider_name, &req.input)?;
         let url = format!("{}/v2/embed", self.base_url);
         let body = build_cohere_body(&req);
 

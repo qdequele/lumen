@@ -21,7 +21,9 @@ milestone.
   not modelled - only string and string-batch.~~ **Resolved (issue #25).**
   `EmbedInput` now models `Tokens` (`[1,2,3]`) and `TokenBatch` (`[[1,2],[3,4]]`);
   they pass through natively on OpenAI-compatible providers and count one token
-  per id in the estimation fallback.
+  per id in the estimation fallback. Text-only providers (Cohere, TEI, Ollama,
+  Jina, Voyage, Mistral) reject them with a 400 (LM-1001) before any upstream
+  call.
 - ~~Rerank `documents` accepts only strings; Cohere also allows objects.~~
   **Resolved (issue #25).** See the M3 note below.
 - `error_type()` collapses 401/402/429 into `invalid_request` because the public
@@ -70,6 +72,8 @@ milestone.
   carries an optional `rank_fields` selector, and the gateway reduces each object
   document to a single ranking text at the edge (selected fields joined, or the
   `text` field when no selector), so providers still only ever see plain text.
+  With `return_documents: true`, an object document echoes that reduced ranking
+  text in `document.text`, not the original JSON object.
 - TEI serves one model per process and ignores the request `model`/`top_n`; the
   gateway truncates to `top_n` after sorting. The configured `upstream_id` is
   informational for TEI. A future health/introspection hook could verify the

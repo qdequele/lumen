@@ -76,6 +76,11 @@ impl EmbeddingProvider for OllamaProvider {
         req: EmbedRequest,
         cancel: CancellationToken,
     ) -> Result<EmbedResponse, ProviderError> {
+        // Ollama's /api/embed takes a string or string array; a token-id array
+        // would be forwarded verbatim and fail opaquely upstream. Honest 400
+        // before any upstream call (issue #25).
+        crate::mapping::reject_pretokenized_input(&self.provider_name, &req.input)?;
+
         // `dimensions` is meaningful (it changes the vector width) and Ollama's
         // embed API cannot honor it. In strict mode reject the request (400,
         // LM-1001) rather than silently returning full-width vectors; otherwise

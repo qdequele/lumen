@@ -72,6 +72,11 @@ impl EmbeddingProvider for JinaProvider {
         req: EmbedRequest,
         cancel: CancellationToken,
     ) -> Result<EmbedResponse, ProviderError> {
+        // Jina's embeddings API takes text (or multimodal objects), never
+        // token-id arrays; the passthrough would forward a raw int array and
+        // fail opaquely upstream. Honest 400 before any call (issue #25).
+        crate::mapping::reject_pretokenized_input(&self.provider_name, &req.input)?;
+
         // OpenAI-compatible schema: near-passthrough for text. A multimodal
         // (content-parts) request translates to Jina's object-`input` array
         // (`{"text":...}` / `{"image":...}`), one element per item; the response
