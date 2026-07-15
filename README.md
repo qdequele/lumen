@@ -237,10 +237,19 @@ header.
 
 ### Config hot reload
 
-`SIGHUP` or a file-watch triggers a reload: the new config is validated, then the
-provider registry is atomically swapped. In-flight requests are unaffected. An
-invalid config is **rejected** - the old config keeps serving and
-`lumen_config_reload_failures_total` increments.
+`SIGHUP`, a file-watch, or an admin provider-key rotation triggers a reload: the
+new config is validated, then the provider registry, price table, resilience
+policy and the runtime-safe `[auth]` knobs (`flush_interval_ms`,
+`retention_days`) are atomically swapped, and DB-stored provider keys are
+re-read. In-flight requests are unaffected. An invalid config is **rejected** -
+the old config keeps serving and `lumen_config_reload_failures_total` increments.
+
+Rotating a DB-stored provider key with `PUT /admin/provider-keys/{name}` applies
+without a restart (the handler requests a reload that re-reads the key from the
+encrypted store). Environment-sourced keys keep precedence. Restart-only, by
+design: the server bind address, `auth.enabled`, `auth.db_path`, and the bounded
+usage-log channel knobs (`usage_channel_capacity`, `usage_batch_max`,
+`usage_flush_ms`).
 
 ### `--check-config`
 

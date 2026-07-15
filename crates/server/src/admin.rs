@@ -6,8 +6,9 @@
 //! * `GET /admin/keys` - list keys (records only, no hashes, no plaintext).
 //! * `PATCH /admin/keys/{id}` - adjust budgets/limits, enable/disable.
 //! * `PUT /admin/provider-keys/{name}` - store a provider API key encrypted
-//!   at rest (AES-256-GCM under the master key); read back at boot for
-//!   providers whose `api_key_env` is unset or empty.
+//!   at rest (AES-256-GCM under the master key) and apply it without a restart
+//!   by requesting a hot reload; used for providers whose `api_key_env` is
+//!   unset or empty (env keeps precedence when set).
 //!
 //! Every change is applied to the database AND the in-memory state, so it
 //! takes effect immediately without a restart.
@@ -111,8 +112,11 @@ pub struct ProviderKeyBody {
 // The body deliberately has no Debug-derived secret exposure: ProviderKeyBody
 // derives Debug for extractor plumbing but is never logged by the handler.
 
-/// Store a provider key encrypted at rest. Takes effect at next boot (the
-/// provider registry is built at startup; hot reload lands in M7).
+/// Store a provider key encrypted at rest and apply it without a restart: the
+/// handler pings the hot-reload trigger, and the reloader re-reads the key from
+/// the encrypted store and rebuilds the provider registry (M7). Providers whose
+/// `api_key_env` resolves keep using the env value (env stays the primary
+/// source); rotation via this route only affects env-keyless providers.
 pub async fn put_provider_key(
     State(state): State<AppState>,
     Path(name): Path<String>,
@@ -130,5 +134,17 @@ pub async fn put_provider_key(
         .store_provider_key(&name, &body.key, master)
         .await
         .map_err(|e| internal(&e))?;
+    // Apply the rotation without a restart: the reloader re-reads provider keys
+    // from the DB (off the request path) and swaps the registry atomically. The
+    // DB write above completed first, so the reload sees the new key.
+    if let Some(trigger) = &state.reload_trigger {
+        trigger.notify_one();
+        tracing::info!(provider = %name, "provider key stored; hot reload requested to apply it");
+    } else {
+        tracing::info!(
+            provider = %name,
+            "provider key stored; no reloader armed, so it applies at next restart"
+        );
+    }
     Ok(StatusCode::NO_CONTENT)
 }

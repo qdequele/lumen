@@ -6,6 +6,28 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added - Hot reload extended to auth knobs + DB provider-key rotation
+
+- **Hot reload now retunes the safe `[auth]` knobs without a restart.** A
+  `SIGHUP`, config-file change, or admin trigger swaps the budget-flush cadence
+  (`auth.flush_interval_ms`) and the usage-log retention window
+  (`auth.retention_days`) into a shared cell the flush/purge background tasks
+  read live on their next tick. The bounded usage-log channel knobs
+  (`usage_channel_capacity`, `usage_batch_max`, `usage_flush_ms`),
+  `auth.db_path`, `auth.enabled` and the server bind address stay boot-time
+  (rebinding a live listener is out of scope); this is documented in the
+  `reload` module and `docs/backlog.md`.
+- **Rotating a DB-stored provider key takes effect without a restart.**
+  `PUT /admin/provider-keys/{name}` now pings the hot-reload trigger after
+  sealing the key; the reloader re-reads provider keys from the encrypted store
+  (off the request path, in the reload task), rebuilds the provider registry and
+  swaps it atomically. Every reload (SIGHUP / file change / trigger) re-reads the
+  DB keys, so a rotation is picked up even without the admin trigger. A DB read
+  error keeps the previous snapshot, so a reload never strips a working key.
+  Environment-sourced keys keep precedence (rotation only affects env-keyless
+  providers). Closes the M5/M7 backlog debt "DB-stored provider keys are
+  boot-time only" and "auth knobs still boot-time".
+
 ### Changed - Rate-limit and usage-log accounting refinements (issue #26, ADR 007)
 
 - **TPM is now settled to real usage, like the budget.** A successful request
