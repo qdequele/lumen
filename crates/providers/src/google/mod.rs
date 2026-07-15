@@ -12,6 +12,22 @@
 //! * responses are `candidates` with a `finishReason` and `usageMetadata`;
 //! * streaming events are partial responses, translated fragment by fragment
 //!   in [`stream`] (bounded state - the text is never accumulated).
+//!
+//! # Provider-native image sources (issue #12)
+//!
+//! An `image_url.url` recognised by `ImageUrl::gemini_file_uri` (a Gemini
+//! Files API URI, or a `gs://` GCS URI) is translated to a
+//! `fileData.fileUri` part and forwarded verbatim - never fetched.
+//!
+//! **`gs://` caveat**: the Gemini **Developer API**
+//! (`generativelanguage.googleapis.com`, this provider's default base URL)
+//! documents `fileData.fileUri` for its own Files API URIs; `gs://` Cloud
+//! Storage URIs are a **Vertex AI** capability. A `gs://` reference is still
+//! parsed and forwarded (the form is Gemini-native, so mismatch routing
+//! stays an honest LM-2008, and `base_url` may point at a Vertex-compatible
+//! gateway), but against the default endpoint the upstream will reject it -
+//! that upstream error, naming this provider, is the honest outcome. See
+//! `docs/providers.md`.
 
 mod stream;
 
@@ -133,6 +149,8 @@ struct GeminiPart {
     text: Option<String>,
     #[serde(rename = "inline_data", skip_serializing_if = "Option::is_none")]
     inline_data: Option<GeminiInlineData>,
+    #[serde(rename = "file_data", skip_serializing_if = "Option::is_none")]
+    file_data: Option<GeminiFileData>,
     /// An assistant tool call: `{ "name": ..., "args": {...} }`. Mutually
     /// exclusive with the other fields.
     #[serde(rename = "functionCall", skip_serializing_if = "Option::is_none")]
@@ -148,12 +166,29 @@ struct GeminiInlineData {
     data: String,
 }
 
+/// A provider-native file reference (issue #12): a Gemini Files API URI or a
+/// GCS URI (`gs://...`). `mime_type` is included only when it could be
+/// confidently inferred from the URI's file extension; otherwise it is
+/// omitted rather than guessed. For a Files API URI that is always safe:
+/// Gemini recorded the mime type at upload time and falls back to it. A
+/// `gs://` object with an unrecognised extension has no such record on the
+/// Developer API - but `gs://` is a Vertex AI capability there anyway (see
+/// the module doc), so the upstream's own error is the honest outcome.
+#[derive(Serialize)]
+struct GeminiFileData {
+    #[serde(rename = "mime_type", skip_serializing_if = "Option::is_none")]
+    mime_type: Option<String>,
+    #[serde(rename = "file_uri")]
+    file_uri: String,
+}
+
 impl GeminiPart {
     /// A plain text part.
     fn text(s: String) -> Self {
         Self {
             text: Some(s),
             inline_data: None,
+            file_data: None,
             function_call: None,
             function_response: None,
         }
@@ -164,6 +199,7 @@ impl GeminiPart {
         Self {
             text: None,
             inline_data: Some(GeminiInlineData { mime_type, data }),
+            file_data: None,
             function_call: None,
             function_response: None,
         }
@@ -174,6 +210,7 @@ impl GeminiPart {
         Self {
             text: None,
             inline_data: None,
+            file_data: None,
             function_call: Some(json!({ "name": name, "args": args })),
             function_response: None,
         }
@@ -184,9 +221,43 @@ impl GeminiPart {
         Self {
             text: None,
             inline_data: None,
+            file_data: None,
             function_call: None,
             function_response: Some(json!({ "name": name, "response": response })),
         }
+    }
+
+    /// A provider-native file/GCS reference (issue #12).
+    fn file(file_uri: String, mime_type: Option<String>) -> Self {
+        Self {
+            text: None,
+            inline_data: None,
+            file_data: Some(GeminiFileData {
+                mime_type,
+                file_uri,
+            }),
+            function_call: None,
+            function_response: None,
+        }
+    }
+}
+
+/// Best-effort image mime type from a file URI's extension (issue #12). Only
+/// a handful of well-known image extensions are recognised; anything else
+/// (including a Gemini Files API URI, which never carries an extension)
+/// yields `None` so the `mime_type` field is simply omitted rather than
+/// guessed.
+fn infer_image_mime_type(uri: &str) -> Option<&'static str> {
+    let path = uri.split(['?', '#']).next().unwrap_or(uri);
+    let (_, ext) = path.rsplit_once('.')?;
+    match ext.to_ascii_lowercase().as_str() {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        "heic" => Some("image/heic"),
+        "heif" => Some("image/heif"),
+        _ => None,
     }
 }
 
@@ -505,6 +576,12 @@ fn gemini_parts(
             let mut out = Vec::with_capacity(parts.len());
             for p in parts {
                 if let Some(img) = &p.image_url {
+                    if let Some(uri) = img.gemini_file_uri() {
+                        // Provider-native GCS / Files API reference (issue #12).
+                        let mime_type = infer_image_mime_type(uri).map(str::to_owned);
+                        out.push(GeminiPart::file(uri.to_owned(), mime_type));
+                        continue;
+                    }
                     let data =
                         img.as_data_uri()
                             .ok_or_else(|| ProviderError::ImageUrlNotSupported {
@@ -665,6 +742,13 @@ impl ChatProvider for GoogleProvider {
     /// in the handler; [`translate_request`] is the defensive fallback path).
     fn accepts_remote_image_url(&self) -> bool {
         false
+    }
+
+    /// Gemini is the only provider that can resolve its own GCS / Files API
+    /// `fileUri` references (issue #12); a mismatch is caught pre-flight
+    /// with `LM-2008`.
+    fn accepts_gemini_file_uri(&self) -> bool {
+        true
     }
 }
 
@@ -1041,5 +1125,103 @@ mod tests {
             }
             Err(other) => panic!("expected ImageUrlNotSupported, got {other:?}"),
         }
+    }
+
+    /// Issue #12: a `gs://` GCS URI becomes a `file_data` part carrying the
+    /// URI verbatim, with a mime type inferred from the extension.
+    #[test]
+    fn gcs_uri_becomes_a_file_data_part_with_inferred_mime_type() {
+        use lumen_core::{ChatMessage, ChatRequest, ContentPart, ImageUrl, MessageContent};
+        let req = ChatRequest {
+            model: "gemini".to_owned(),
+            messages: vec![ChatMessage {
+                role: "user".to_owned(),
+                content: Some(MessageContent::Parts(vec![
+                    ContentPart {
+                        kind: "text".to_owned(),
+                        text: Some("what?".to_owned()),
+                        image_url: None,
+                        extra: serde_json::Map::new(),
+                    },
+                    ContentPart {
+                        kind: "image_url".to_owned(),
+                        text: None,
+                        image_url: Some(ImageUrl {
+                            url: "gs://my-bucket/cat.png".to_owned(),
+                            detail: None,
+                        }),
+                        extra: serde_json::Map::new(),
+                    },
+                ])),
+                name: None,
+                extra: serde_json::Map::new(),
+            }],
+            temperature: None,
+            top_p: None,
+            max_tokens: None,
+            n: None,
+            stop: None,
+            stream: false,
+            extra: serde_json::Map::new(),
+        };
+        let body = serde_json::to_value(translate_request(&req, "google").unwrap()).unwrap();
+        let parts = &body["contents"][0]["parts"];
+        assert_eq!(parts[0]["text"], "what?");
+        assert_eq!(parts[1]["file_data"]["file_uri"], "gs://my-bucket/cat.png");
+        assert_eq!(parts[1]["file_data"]["mime_type"], "image/png");
+        assert!(parts[1].get("inline_data").is_none());
+    }
+
+    /// A Gemini Files API URI never carries a file extension; the gateway
+    /// omits `mime_type` rather than guessing (Gemini already knows it from
+    /// the upload).
+    #[test]
+    fn gemini_files_api_uri_omits_mime_type_when_extension_is_unknown() {
+        use lumen_core::{ChatMessage, ChatRequest, ContentPart, ImageUrl, MessageContent};
+        let req = ChatRequest {
+            model: "gemini".to_owned(),
+            messages: vec![ChatMessage {
+                role: "user".to_owned(),
+                content: Some(MessageContent::Parts(vec![ContentPart {
+                    kind: "image_url".to_owned(),
+                    text: None,
+                    image_url: Some(ImageUrl {
+                        url: "https://generativelanguage.googleapis.com/v1beta/files/abc-123"
+                            .to_owned(),
+                        detail: None,
+                    }),
+                    extra: serde_json::Map::new(),
+                }])),
+                name: None,
+                extra: serde_json::Map::new(),
+            }],
+            temperature: None,
+            top_p: None,
+            max_tokens: None,
+            n: None,
+            stop: None,
+            stream: false,
+            extra: serde_json::Map::new(),
+        };
+        let body = serde_json::to_value(translate_request(&req, "google").unwrap()).unwrap();
+        let part = &body["contents"][0]["parts"][0];
+        assert_eq!(
+            part["file_data"]["file_uri"],
+            "https://generativelanguage.googleapis.com/v1beta/files/abc-123"
+        );
+        assert!(part["file_data"].get("mime_type").is_none());
+    }
+
+    #[test]
+    fn google_provider_accepts_its_own_file_uri() {
+        let provider = GoogleProvider::new(
+            reqwest::Client::new(),
+            "google".to_owned(),
+            None,
+            Some("goog-test".to_owned()),
+        );
+        assert!(provider.accepts_gemini_file_uri());
+        assert!(!provider.accepts_anthropic_file_id());
+        assert!(!provider.accepts_remote_image_url());
     }
 }
