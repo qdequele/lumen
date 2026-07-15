@@ -111,11 +111,14 @@ milestone.
   the mid-stream error-frame tests (`mid_stream_provider_error_becomes_terminal_error_frame`
   and `resilience.rs`).
 
-- **Tools on Gemini**: `translate_request` (google) silently ignores
-  `tools`/`tool_choice`, and the streaming translator reads only `parts[].text`
-  (a `functionCall` would be swallowed). Decide: map to Gemini
-  `functionDeclarations`, or reject explicitly (LM-2002) when `tools` is present
-  on a Google-routed model. Noted in the M4 review.
+- **Tools on Gemini**: RESOLVED (issue #4). `translate_request` (google) now
+  maps OpenAI `tools` to Gemini `tools[].functionDeclarations` and `tool_choice`
+  to `toolConfig.functionCallingConfig`; assistant `tool_calls` become
+  `functionCall` parts, role `tool` messages become `functionResponse` parts,
+  and both the non-streaming and streaming translators surface Gemini
+  `functionCall` parts as OpenAI `tool_calls`. Chose the full mapping over the
+  LM-2002 rejection. Covered by unit tests and wiremock round-trips in
+  `crates/server/tests/chat.rs`.
 
 ## Noted while building M5
 
