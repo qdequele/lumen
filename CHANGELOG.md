@@ -19,6 +19,27 @@ All notable changes to LUMEN are documented here. The format is based on
   map the trailing `STOP` to `finish_reason: "tool_calls"`. A synthetic call
   id (`call_<n>`) is minted since Gemini does not return one.
 
+### Added - `--check-config` validation mode
+
+- New `lumen --check-config [--config <PATH>]` mode for CI / deploy pipelines
+  (issue #21): loads and fully validates the config the same way the server
+  does at boot, including semantic validation and provider registry
+  construction (which catches reference errors such as a missing `base_url`
+  for a self-hosted provider). Prints a clear success or failure message and
+  exits 0 when the config is valid, non-zero otherwise. Binds no listener,
+  opens no database, and contacts no provider, so it is safe to run ahead of
+  a real boot.
+- New `lumen_server::check_config` library function backs the flag, kept
+  separate from `main` so the validation logic stays unit-testable.
+
+### Fixed
+
+- Anthropic chat responses (both `POST /v1/chat/completions` and its SSE
+  stream) now stamp `created` with a real unix timestamp instead of a
+  hardcoded `0`. New shared `providers::mapping::unix_timestamp` helper
+  (clamped to `0` on a pre-epoch clock, no panics) backs both the
+  non-streaming and streaming translation paths.
+
 ### Added - Endpoint latency observability
 
 - **Every endpoint now measures and publishes its latency.** A new middleware

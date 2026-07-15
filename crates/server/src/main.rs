@@ -3,7 +3,7 @@
 //! Thin orchestration only: parse args, load config, initialise logging, then
 //! hand off to the library. `anyhow` is used here (and only here).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -44,20 +44,30 @@ lumen - universal LLM gateway
 
 USAGE:
     lumen [--config <PATH>]
+    lumen --check-config [--config <PATH>]
 
 OPTIONS:
     -c, --config <PATH>    Path to the TOML config file [default: config.toml]
+    --check-config         Validate the config and exit: 0 if valid, non-zero
+                            otherwise. Binds no listener, opens no database,
+                            contacts no provider - safe for CI / deploy
+                            pipelines to run ahead of a real boot.
     -h, --help             Print this help
 ";
 
 fn main() -> ExitCode {
-    let config_path = match parse_args() {
-        Ok(Some(path)) => path,
-        Ok(None) => return ExitCode::SUCCESS, // --help
+    let action = match parse_args() {
+        Ok(action) => action,
         Err(message) => {
             eprintln!("error: {message}\n\n{HELP}");
             return ExitCode::from(2);
         }
+    };
+
+    let config_path = match action {
+        Action::Help => return ExitCode::SUCCESS,
+        Action::CheckConfig(path) => return run_check_config(&path),
+        Action::Serve(path) => path,
     };
 
     // Load and validate config BEFORE the async runtime so a bad config exits
@@ -82,22 +92,42 @@ fn main() -> ExitCode {
     }
 }
 
-/// Parse `--config`/`-c` and `--help`/`-h`. Returns the config path, or `None`
-/// when help was printed, or an error message for bad usage.
-fn parse_args() -> Result<Option<PathBuf>, String> {
+/// What `main` should do, once CLI args are parsed.
+#[derive(Debug, PartialEq, Eq)]
+enum Action {
+    /// Serve using the config at this path.
+    Serve(PathBuf),
+    /// `--check-config`: validate the config at this path and exit.
+    CheckConfig(PathBuf),
+    /// `-h`/`--help`: help was already printed.
+    Help,
+}
+
+/// Parse `--config`/`-c`, `--check-config` and `--help`/`-h`.
+fn parse_args() -> Result<Action, String> {
+    parse_args_from(std::env::args().skip(1))
+}
+
+/// Parse an explicit argument list (excludes `argv[0]`); split out from
+/// [`parse_args`] so the parsing logic is unit-testable without touching the
+/// real process arguments.
+fn parse_args_from(mut args: impl Iterator<Item = String>) -> Result<Action, String> {
     let mut config_path = PathBuf::from("config.toml");
-    let mut args = std::env::args().skip(1);
+    let mut check_config = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-h" | "--help" => {
                 print!("{HELP}");
-                return Ok(None);
+                return Ok(Action::Help);
             }
             "-c" | "--config" => {
                 let value = args
                     .next()
                     .ok_or_else(|| "--config requires a path argument".to_owned())?;
                 config_path = PathBuf::from(value);
+            }
+            "--check-config" => {
+                check_config = true;
             }
             other => {
                 if let Some(value) = other.strip_prefix("--config=") {
@@ -108,7 +138,34 @@ fn parse_args() -> Result<Option<PathBuf>, String> {
             }
         }
     }
-    Ok(Some(config_path))
+    Ok(if check_config {
+        Action::CheckConfig(config_path)
+    } else {
+        Action::Serve(config_path)
+    })
+}
+
+/// `--check-config`: validate `config_path` and print a clear success or
+/// failure message. Exits 0 when the config is valid, non-zero otherwise.
+/// Delegates to [`lumen_server::check_config`], which stays local-only (no
+/// listener, no database, no provider contacted) so it is safe for CI /
+/// deploy pipelines to run ahead of a real boot.
+fn run_check_config(config_path: &Path) -> ExitCode {
+    match lumen_server::check_config(config_path) {
+        Ok(report) => {
+            println!(
+                "config OK: {} ({} provider(s), {} model(s))",
+                config_path.display(),
+                report.provider_count,
+                report.model_count
+            );
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("configuration error: {err}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 /// Build the app and serve until shutdown. Uses its own multi-thread runtime.
@@ -401,4 +458,73 @@ async fn boot_auth_stack(
     });
 
     Ok((runtime, logger, writer, key_backfill))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(values: &[&str]) -> impl Iterator<Item = String> {
+        values
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect::<Vec<_>>()
+            .into_iter()
+    }
+
+    #[test]
+    fn no_args_serves_the_default_config_path() {
+        let action = parse_args_from(args(&[])).expect("no args should parse");
+        assert_eq!(action, Action::Serve(PathBuf::from("config.toml")));
+    }
+
+    #[test]
+    fn short_config_flag_sets_the_path() {
+        let action = parse_args_from(args(&["-c", "custom.toml"])).expect("-c should parse");
+        assert_eq!(action, Action::Serve(PathBuf::from("custom.toml")));
+    }
+
+    #[test]
+    fn long_config_flag_with_equals_sets_the_path() {
+        let action =
+            parse_args_from(args(&["--config=custom.toml"])).expect("--config= should parse");
+        assert_eq!(action, Action::Serve(PathBuf::from("custom.toml")));
+    }
+
+    #[test]
+    fn missing_config_value_is_an_error() {
+        let err = parse_args_from(args(&["--config"])).expect_err("bare --config must error");
+        assert!(err.contains("--config requires a path argument"));
+    }
+
+    #[test]
+    fn unexpected_argument_is_an_error() {
+        let err = parse_args_from(args(&["--bogus"])).expect_err("unknown flag must error");
+        assert!(err.contains("--bogus"));
+    }
+
+    #[test]
+    fn check_config_flag_defaults_to_the_default_config_path() {
+        let action =
+            parse_args_from(args(&["--check-config"])).expect("--check-config should parse");
+        assert_eq!(action, Action::CheckConfig(PathBuf::from("config.toml")));
+    }
+
+    #[test]
+    fn check_config_flag_combines_with_an_explicit_config_path() {
+        let action = parse_args_from(args(&["--check-config", "-c", "ci.toml"]))
+            .expect("--check-config with -c should parse");
+        assert_eq!(action, Action::CheckConfig(PathBuf::from("ci.toml")));
+
+        // Order independence: the path flag may come first too.
+        let action = parse_args_from(args(&["--config=ci.toml", "--check-config"]))
+            .expect("-c with --check-config should parse");
+        assert_eq!(action, Action::CheckConfig(PathBuf::from("ci.toml")));
+    }
+
+    #[test]
+    fn help_flag_wins_and_returns_help() {
+        let action = parse_args_from(args(&["--check-config", "-h"])).expect("-h should parse");
+        assert_eq!(action, Action::Help);
+    }
 }
