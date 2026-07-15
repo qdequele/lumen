@@ -385,8 +385,8 @@ impl EventStreamState {
     /// Close the accounting record with the stream's terminal outcome, so
     /// `usage_log.status` reflects what actually happened (200 = clean end,
     /// 502/504 = in-band error frame). Idempotent; Drop is the safety net
-    /// for client disconnects (which finalize as 200 - the status the
-    /// client's response actually carried).
+    /// for mid-stream client disconnects, which finalize as 499 /
+    /// client-cancelled (issue #11) - never as a fake 200 success.
     fn settle_accounting(&mut self, status: u16) {
         if let Some(mut accounting) = self.accounting.take() {
             accounting.finalize_with_status(status);
@@ -462,6 +462,12 @@ fn to_event_stream(
             Step::Item(Some(Ok(frame))) => {
                 s.got_first_frame = true;
                 s.scan_frame(&frame);
+                if s.saw_done {
+                    // Clean terminator observed: settle now. A client that
+                    // disconnects between receiving `[DONE]` and the final
+                    // poll must still be a 200, not a 499 from the Drop net.
+                    s.settle_accounting(200);
+                }
                 frame
             }
             Step::Item(Some(Err(e))) => {
@@ -627,6 +633,28 @@ mod tests {
         .await;
         assert_eq!(out.len(), 2);
         assert!(out[1].contains("LM-3003") || out[1].contains("upstream_error"));
+    }
+
+    #[tokio::test]
+    async fn mid_stream_cancellation_becomes_a_terminal_lm_6001_frame_not_internal() {
+        // Issue #11: the cooperative-cancellation branch (the provider byte
+        // stream's `select!` on the CancellationToken yields
+        // `Err(ProviderError::Cancelled)` while the stream is being polled)
+        // must surface as the dedicated client-cancel envelope, never as the
+        // LM-5001 / `internal` frame it used to produce.
+        let out = collect(wrap(
+            frames(vec![
+                Ok(Bytes::from_static(b"data: {\"x\":1}\n\n")),
+                Err(ProviderError::Cancelled),
+            ]),
+            guards(30_000, 15_000),
+        ))
+        .await;
+        assert_eq!(out.len(), 2, "got: {out:?}");
+        assert!(out[1].contains("LM-6001"), "got: {}", out[1]);
+        assert!(out[1].contains("client_cancelled"), "got: {}", out[1]);
+        assert!(!out[1].contains("LM-5001"), "got: {}", out[1]);
+        assert!(!out[1].contains("internal"), "got: {}", out[1]);
     }
 
     #[tokio::test(start_paused = true)]

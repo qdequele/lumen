@@ -21,10 +21,6 @@ milestone.
   not modelled - only string and string-batch. Add if a provider needs it.
 - Rerank `documents` accepts only strings; Cohere also allows objects. Reduce
   object documents to text at the edge when a provider requires it.
-- Error taxonomy (revisit in M4): `ProviderError::Cancelled` currently maps to
-  `GatewayError::Internal` (500 / `internal`). Once real streaming/provider
-  calls exist, a client-initiated cancel should not inflate `internal` metrics -
-  consider a dedicated non-5xx variant that isn't alerted on.
 - `error_type()` collapses 401/402/429 into `invalid_request` because the public
   taxonomy only has three `type`s. Fine per `CLAUDE.md`, but note it's coarse.
 - Acceptance criterion "boot < 100 ms" is verified manually (M1); fold a real

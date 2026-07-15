@@ -12,6 +12,12 @@
 //! (502/503/504 / `upstream_error`, always naming the provider), and an
 //! internal gateway error (500 / `internal`). A gateway malfunction must never
 //! be reported as a misleading 401 (lesson: OpenRouter outages).
+//!
+//! One more situation sits outside that three-way split: a client-initiated
+//! cancel (499 / `client_cancelled`, `LM-6xxx`, see `docs/adr/006-*.md`). The
+//! gateway didn't malfunction and the client isn't at fault, so it is kept
+//! out of both `internal` and `invalid_request` rather than inflating either
+//! (issue #11).
 
 use crate::capability::Capability;
 use serde::Serialize;
@@ -164,6 +170,10 @@ pub enum ErrorType {
     UpstreamError,
     /// The gateway itself malfunctioned (500).
     Internal,
+    /// The client disconnected before the request completed (issue #11).
+    /// Kept distinct from `Internal` so a client hanging up never inflates
+    /// the internal-error metrics/alerts a gateway malfunction would.
+    ClientCancelled,
 }
 
 /// An error the gateway returns to the client.
@@ -300,6 +310,14 @@ pub enum GatewayError {
     /// An internal gateway malfunction. The detail is logged, never returned.
     #[error("internal error: {0}")]
     Internal(String),
+
+    // ---- Client-cancellation (LM-6xxx, issue #11) ----------------------------
+    /// The client disconnected before the request completed and the upstream
+    /// call was aborted. Deliberately its own variant rather than
+    /// `Internal`: the gateway didn't malfunction, so this must never count
+    /// against, or alert on, internal/5xx error rates.
+    #[error("client cancelled the request")]
+    ClientCancelled,
 }
 
 impl GatewayError {
@@ -338,6 +356,7 @@ impl GatewayError {
             } => "LM-4003",
             GatewayError::Unauthorized => "LM-4004",
             GatewayError::Internal(_) => "LM-5001",
+            GatewayError::ClientCancelled => "LM-6001",
         }
     }
 
@@ -357,6 +376,11 @@ impl GatewayError {
             GatewayError::ModelNotFound(_) => 404,
             GatewayError::PayloadTooLarge { .. } => 413,
             GatewayError::QuotaExceeded { .. } | GatewayError::UpstreamRateLimited { .. } => 429,
+            // Nonstandard, but the conventional "client closed request" status
+            // (nginx 499): the client is normally already gone, so this status
+            // exists for logs/metrics, not for anything the client reads. Not
+            // a 5xx - never counted against internal-error rates (issue #11).
+            GatewayError::ClientCancelled => 499,
             GatewayError::Internal(_) => 500,
             GatewayError::Upstream { .. }
             | GatewayError::UpstreamInvalidResponse { .. }
@@ -398,6 +422,7 @@ impl GatewayError {
             | GatewayError::CircuitOpen { .. }
             | GatewayError::UpstreamRateLimited { .. } => ErrorType::UpstreamError,
             GatewayError::Internal(_) => ErrorType::Internal,
+            GatewayError::ClientCancelled => ErrorType::ClientCancelled,
         }
     }
 
@@ -484,10 +509,10 @@ impl GatewayError {
                     provider: p_or(provider, p),
                 }
             }
-            // Cancellation is normally handled before a body is produced; if it
-            // does surface, treat it as an internal condition rather than a
-            // misleading client/upstream error.
-            ProviderError::Cancelled => GatewayError::Internal("request cancelled".to_owned()),
+            // A client-initiated cancel is not a gateway malfunction: its own
+            // LM-6001 / 499, so it never inflates `internal`/5xx metrics or
+            // alerts the way `GatewayError::Internal` would (issue #11).
+            ProviderError::Cancelled => GatewayError::ClientCancelled,
         }
     }
 }
@@ -649,6 +674,8 @@ mod tests {
             .code(),
             "LM-3020"
         );
+        // Client-cancellation (issue #11): its own prefix, never LM-5001.
+        assert_eq!(GatewayError::ClientCancelled.code(), "LM-6001");
     }
 
     #[test]
@@ -883,5 +910,37 @@ mod tests {
         };
         assert_eq!(ge.http_status(), 429);
         assert_eq!(ge.retry_after(), Some(Duration::from_secs(3)));
+    }
+
+    // Issue #11: a client-initiated cancel must not inflate `internal`
+    // metrics/alerts (previously mapped to `GatewayError::Internal`, 500).
+    #[test]
+    fn cancelled_maps_to_a_dedicated_non_5xx_variant_not_internal() {
+        let ge = GatewayError::from_provider("openai", ProviderError::Cancelled);
+        match ge {
+            GatewayError::ClientCancelled => {}
+            other => panic!("expected ClientCancelled, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn client_cancelled_is_not_a_5xx_and_has_a_distinct_error_type() {
+        let err = GatewayError::ClientCancelled;
+        assert_eq!(err.code(), "LM-6001");
+        assert_eq!(err.http_status(), 499);
+        assert!(
+            err.http_status() < 500,
+            "client cancellation must not surface as a 5xx: {}",
+            err.http_status()
+        );
+        assert_eq!(err.error_type(), ErrorType::ClientCancelled);
+        assert_ne!(err.error_type(), ErrorType::Internal);
+    }
+
+    #[test]
+    fn client_cancelled_envelope_carries_its_own_type() {
+        let json = serde_json::to_value(GatewayError::ClientCancelled.to_envelope()).unwrap();
+        assert_eq!(json["error"]["code"], "LM-6001");
+        assert_eq!(json["error"]["type"], "client_cancelled");
     }
 }

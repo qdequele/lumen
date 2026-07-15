@@ -113,6 +113,11 @@ const fn status_str(status: u16) -> &'static str {
         413 => "413",
         422 => "422",
         429 => "429",
+        // LM-6001 client-cancellation (issue #11): its own label, distinct
+        // from both the generic "4xx" class and (crucially) "500"/"5xx" - a
+        // client hanging up must never be counted against internal-error
+        // rates or alerts.
+        499 => "499",
         500 => "500",
         502 => "502",
         503 => "503",
@@ -184,6 +189,16 @@ mod tests {
         assert_eq!(status_str(599), "5xx");
         assert_eq!(status_str(302), "3xx");
         assert_eq!(status_str(101), "1xx");
+    }
+
+    // Issue #11: the client-cancellation status (LM-6001, HTTP 499) gets its
+    // own label rather than being folded into the generic "4xx" class, so it
+    // is distinguishable in `/metrics` from both real client errors and the
+    // `5xx`/`500` internal-error bucket it used to inflate.
+    #[test]
+    fn client_cancelled_status_gets_its_own_label_not_5xx() {
+        assert_eq!(status_str(499), "499");
+        assert_ne!(status_str(499), "5xx");
     }
 
     #[test]

@@ -47,6 +47,22 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ### Fixed
 
+- **Dedicated client-cancel error code (issue #11).** A client-initiated
+  cancel (`ProviderError::Cancelled`, typically a disconnect mid-request) no
+  longer maps to `GatewayError::Internal` (`LM-5001`, 500). It now has its own
+  `GatewayError::ClientCancelled` (`LM-6001`, HTTP 499,
+  `type: client_cancelled`), documented in `docs/errors.md` and
+  `docs/adr/006-client-cancellation-error-code.md`. `499` (the conventional
+  "client closed request" status) keeps it out of the `5xx` class entirely, so
+  `lumen_http_request_duration_seconds`/`lumen_request_duration_seconds` and any
+  alert built on `status=~"5.."` no longer count a client hanging up as an
+  internal gateway malfunction.
+- A mid-stream client disconnect now settles the request's accounting record
+  (`usage_log.status` and the `lumen_request_duration_seconds` sample) at 499
+  instead of a hardcoded 200: previously the most common real-world cancel
+  was silently recorded as a success. A stream whose `data: [DONE]`
+  terminator was already delivered still settles as 200 even if the client
+  disconnects immediately after.
 - **LM-2004 pre-flight now covers the whole fallback chain, not just the
   primary route.** The remote-image-URL check in the chat handler only
   inspected `chain[0]`; if the primary provider accepted remote URLs (e.g.
