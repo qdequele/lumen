@@ -16,7 +16,9 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use lumen_core::{ProviderError, RerankDocument, RerankProvider, RerankRequest};
-use lumen_providers::{rerank, CohereProvider, JinaProvider, TeiProvider, VoyageProvider};
+use lumen_providers::{
+    rerank, CloudflareRerankProvider, CohereProvider, JinaProvider, TeiProvider, VoyageProvider,
+};
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 use wiremock::matchers::method;
@@ -209,6 +211,57 @@ impl RerankFixture for VoyageFixture {
 }
 
 // --------------------------------------------------------------------------
+// Cloudflare fixture - native `/ai/run/{model}` envelope:
+//   { result: { response: [{ id, score }] }, success: true, errors: [], messages: [] }
+// --------------------------------------------------------------------------
+
+struct CloudflareFixture;
+
+#[async_trait]
+impl RerankFixture for CloudflareFixture {
+    fn build(&self, base_url: String) -> Arc<dyn RerankProvider> {
+        Arc::new(CloudflareRerankProvider::new(
+            reqwest::Client::new(),
+            "cloudflare-test",
+            base_url,
+            Some("sk-test-xxx".to_owned()),
+        ))
+    }
+
+    async fn mount_scored(&self, mock: &MockServer) {
+        let response: Vec<_> = SCORES
+            .iter()
+            .map(|(i, s)| json!({ "id": i, "score": s }))
+            .collect();
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "result": { "response": response },
+                "success": true,
+                "errors": [],
+                "messages": []
+            })))
+            .mount(mock)
+            .await;
+    }
+
+    async fn mount_delayed(&self, mock: &MockServer, delay: Duration) {
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({
+                        "result": { "response": [{ "id": 0, "score": 1.0 }] },
+                        "success": true,
+                        "errors": [],
+                        "messages": []
+                    }))
+                    .set_delay(delay),
+            )
+            .mount(mock)
+            .await;
+    }
+}
+
+// --------------------------------------------------------------------------
 // Shared error mounts (schema-agnostic) and request helper
 // --------------------------------------------------------------------------
 
@@ -379,6 +432,11 @@ async fn tei_passes_rerank_conformance_suite() {
 #[tokio::test]
 async fn voyage_passes_rerank_conformance_suite() {
     run_conformance(&VoyageFixture).await;
+}
+
+#[tokio::test]
+async fn cloudflare_passes_rerank_conformance_suite() {
+    run_conformance(&CloudflareFixture).await;
 }
 
 // --------------------------------------------------------------------------

@@ -131,6 +131,21 @@ All notable changes to LUMEN are documented here. The format is based on
   `usage_log.estimated`) now reflects whether the *token* count was
   upstream-reported or gateway-derived, rather than always `true`.
 
+### Added - Cloudflare Workers AI rerank (native endpoint)
+
+- The `cloudflare` kind now serves **rerank** in addition to chat/embed.
+  Workers AI's `bge-reranker-*` models are not part of the OpenAI-compatible
+  surface, so reranking is translated against Cloudflare's native
+  `POST /ai/run/{model}` endpoint (`{ query, contexts, top_k }` in,
+  `{ result: { response: [{ id, score }] }, success, errors }` out) rather
+  than the OpenAI-compatible path used for chat/embed. One `[[providers]]`
+  entry with `kind = "cloudflare"` now serves all three capabilities against
+  the same account-scoped `base_url`; the native endpoint's URL is derived by
+  stripping a trailing `/ai/v1` (or `/v1`) suffix to reach the account root.
+  Cloudflare reports no token usage for this model, so `usage` follows the
+  same ADR 003 fallback as TEI (a gateway-derived estimate, marked
+  `estimated`).
+
 ### Fixed
 
 - **Dedicated client-cancel error code (issue #11).** A client-initiated
