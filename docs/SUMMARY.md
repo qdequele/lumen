@@ -21,6 +21,10 @@
 - [Batching](embeddings/batching.md)
 - [Multimodal embeddings](embeddings/multimodal.md)
 
+# Reranking
+
+- [Reranking](reranking/reranking.md)
+
 # Reference
 
 - [Providers](providers.md)
