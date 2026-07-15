@@ -6,6 +6,24 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added - Richer per-kind health probes (#23)
+
+- The background health-check task (`resilience.health_check_enabled`) now
+  uses a real liveness endpoint for every self-hosted, keyless provider kind,
+  not just TEI: **vLLM** (server-root `GET /health`; a trailing `/v1` in the
+  configured `base_url` is stripped, since the documented convention is
+  `base_url = "http://host:8000/v1"`) and **Ollama**
+  (`GET {base_url}/api/version`), both built for this exact use. A non-2xx
+  response on these now correctly marks the provider `down`, same as TEI.
+- Keyed vendor kinds (OpenAI, Anthropic, the OpenAI-compatible hosts, ...)
+  keep the bare `base_url` reachability probe (any HTTP response counts as
+  `up`) - an unauthenticated call to a real endpoint like `/models` would 401
+  a healthy server, which is a worse signal, and the probe task does not carry
+  provider API keys. This is the explicit default match arm in
+  `ProbeTarget::probe_url`/`is_liveness_endpoint`, so any new `ProviderKind`
+  (several are landing in parallel PRs) automatically inherits bare
+  reachability until it earns a real probe.
+
 ### Added - AWS Bedrock provider (SigV4, Converse API)
 
 - **New `bedrock` provider kind: chat via the AWS Bedrock Converse API.** One

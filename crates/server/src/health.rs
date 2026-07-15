@@ -118,12 +118,39 @@ pub struct ProbeTarget {
 }
 
 impl ProbeTarget {
-    /// The URL to GET: a real liveness endpoint where the kind has one (TEI
-    /// serves `/health`), otherwise the base URL for host reachability.
+    /// The URL to GET: a real liveness endpoint where the kind exposes a
+    /// cheap, *unauthenticated* one, otherwise the base URL for bare host
+    /// reachability.
+    ///
+    /// Only self-hosted/keyless kinds get a real liveness endpoint here: TEI
+    /// and vLLM both serve `/health` (built for container liveness probes),
+    /// and Ollama serves `/api/version`. Keyed vendor kinds (OpenAI,
+    /// Anthropic, the OpenAI-compatible hosts, ...) have no endpoint that is
+    /// both reliable *and* unauthenticated - hitting `/models` without the
+    /// configured API key would 401 a perfectly healthy server, which is a
+    /// worse signal than bare reachability. That is deliberately left as
+    /// future work (see `docs/backlog.md`); the `_` arm below is also the
+    /// integration point for any new `ProviderKind` - it inherits bare
+    /// reachability until it earns a real probe.
     fn probe_url(&self) -> String {
         match self.kind {
             lumen_providers::ProviderKind::Tei => {
                 format!("{}/health", self.url.trim_end_matches('/'))
+            }
+            // vLLM serves /health at the SERVER ROOT, but the documented
+            // base_url convention for OpenAI-compatible kinds carries a /v1
+            // suffix (the chat/embeddings paths are built as {base}/chat/...).
+            // Strip that suffix so a healthy server is not probed at the
+            // nonexistent /v1/health and wrongly marked down.
+            lumen_providers::ProviderKind::Vllm => {
+                let base = self.url.trim_end_matches('/');
+                let root = base.strip_suffix("/v1").unwrap_or(base);
+                format!("{root}/health")
+            }
+            // Ollama's documented base_url is the server root (no /v1), and
+            // /api/version hangs directly off it.
+            lumen_providers::ProviderKind::Ollama => {
+                format!("{}/api/version", self.url.trim_end_matches('/'))
             }
             _ => self.url.clone(),
         }
@@ -133,7 +160,12 @@ impl ProbeTarget {
     /// server is up but *not ready* → down) or just checks reachability (any
     /// response means the host is up).
     fn is_liveness_endpoint(&self) -> bool {
-        matches!(self.kind, lumen_providers::ProviderKind::Tei)
+        matches!(
+            self.kind,
+            lumen_providers::ProviderKind::Tei
+                | lumen_providers::ProviderKind::Vllm
+                | lumen_providers::ProviderKind::Ollama
+        )
     }
 }
 
@@ -249,14 +281,53 @@ mod tests {
         assert_eq!(tei.probe_url(), "http://tei:8080/health");
         assert!(tei.is_liveness_endpoint());
 
+        // vLLM's documented base_url shape carries the OpenAI-compatible /v1
+        // prefix (docs/providers.md), but the server exposes /health at the
+        // SERVER ROOT - the probe must strip the /v1 segment, or a healthy
+        // vLLM would 404 and be marked down.
+        let vllm = ProbeTarget {
+            name: "vllm".to_owned(),
+            url: "http://vllm:8000/v1".to_owned(),
+            kind: ProviderKind::Vllm,
+        };
+        assert_eq!(vllm.probe_url(), "http://vllm:8000/health");
+        assert!(vllm.is_liveness_endpoint());
+
+        // A base_url without the /v1 suffix (or with a trailing slash) still
+        // lands on root /health.
+        let vllm_root = ProbeTarget {
+            name: "vllm-root".to_owned(),
+            url: "http://vllm:8000/".to_owned(),
+            kind: ProviderKind::Vllm,
+        };
+        assert_eq!(vllm_root.probe_url(), "http://vllm:8000/health");
+        let vllm_v1_slash = ProbeTarget {
+            name: "vllm-v1-slash".to_owned(),
+            url: "http://vllm:8000/v1/".to_owned(),
+            kind: ProviderKind::Vllm,
+        };
+        assert_eq!(vllm_v1_slash.probe_url(), "http://vllm:8000/health");
+
         let ollama = ProbeTarget {
             name: "ollama".to_owned(),
             url: "http://ollama:11434".to_owned(),
             kind: ProviderKind::Ollama,
         };
-        // No known liveness endpoint → bare reachability against the base URL.
-        assert_eq!(ollama.probe_url(), "http://ollama:11434");
-        assert!(!ollama.is_liveness_endpoint());
+        // Ollama's daemon exposes an unauthenticated, cheap /api/version.
+        assert_eq!(ollama.probe_url(), "http://ollama:11434/api/version");
+        assert!(ollama.is_liveness_endpoint());
+
+        let openai = ProbeTarget {
+            name: "openai".to_owned(),
+            url: "https://api.openai.com/v1".to_owned(),
+            kind: ProviderKind::Openai,
+        };
+        // Vendor kinds that require an API key have no reliable *unauthenticated*
+        // liveness endpoint (hitting `/models` without a key would 401 a healthy
+        // server) → keep the bare-reachability fallback. This is the default
+        // arm every new `ProviderKind` inherits until it earns a real probe.
+        assert_eq!(openai.probe_url(), "https://api.openai.com/v1");
+        assert!(!openai.is_liveness_endpoint());
     }
 
     #[test]
@@ -265,5 +336,182 @@ mod tests {
         assert_eq!(json["status"], "unknown");
         assert!(json.get("checked_at").is_none());
         assert!(json.get("latency_ms").is_none());
+    }
+
+    // -- probe_once against real wiremock upstreams --------------------------
+    //
+    // These prove the down/up decision, not just URL construction: a kind with
+    // a true liveness endpoint must go `down` on a non-2xx from that endpoint,
+    // while a bare-reachability kind must stay `up` even on a 404 (any response
+    // proves the host is reachable).
+
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn liveness_endpoint_non_2xx_marks_the_provider_down() {
+        use lumen_providers::ProviderKind;
+
+        let upstream = MockServer::start().await;
+        // vLLM serves /health at the server ROOT; the documented base_url
+        // carries /v1. Mount only root /health so a probe that wrongly hits
+        // /v1/health would get wiremock's default 404 instead.
+        Mock::given(method("GET"))
+            .and(path("/health"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&upstream)
+            .await;
+
+        let targets = vec![ProbeTarget {
+            name: "vllm".to_owned(),
+            url: format!("{}/v1", upstream.uri()),
+            kind: ProviderKind::Vllm,
+        }];
+        let health = ProviderHealth::with_providers(&["vllm".to_owned()]);
+        probe_once(
+            &reqwest::Client::new(),
+            &targets,
+            &health,
+            None,
+            Duration::from_secs(5),
+        )
+        .await;
+
+        let snap = health.snapshot();
+        assert_eq!(snap["vllm"].status, HealthState::Down);
+        assert_eq!(
+            snap["vllm"].detail.as_deref(),
+            Some("liveness returned HTTP 503")
+        );
+    }
+
+    #[tokio::test]
+    async fn healthy_vllm_with_v1_base_url_is_marked_up() {
+        use lumen_providers::ProviderKind;
+
+        // Regression guard: with the documented `base_url = ".../v1"` shape,
+        // a probe that naively appends /health would hit /v1/health, 404, and
+        // mark a HEALTHY vLLM down. Only root /health answers 200 here; any
+        // other path gets wiremock's default 404 (a liveness non-2xx = down),
+        // so this test fails unless the probe strips the /v1 segment.
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/health"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&upstream)
+            .await;
+
+        let targets = vec![ProbeTarget {
+            name: "vllm".to_owned(),
+            url: format!("{}/v1", upstream.uri()),
+            kind: ProviderKind::Vllm,
+        }];
+        let health = ProviderHealth::with_providers(&["vllm".to_owned()]);
+        probe_once(
+            &reqwest::Client::new(),
+            &targets,
+            &health,
+            None,
+            Duration::from_secs(5),
+        )
+        .await;
+
+        let snap = health.snapshot();
+        assert_eq!(snap["vllm"].status, HealthState::Up);
+        assert_eq!(snap["vllm"].detail.as_deref(), Some("liveness ok"));
+    }
+
+    #[tokio::test]
+    async fn ollama_liveness_endpoint_non_2xx_marks_it_down() {
+        use lumen_providers::ProviderKind;
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/version"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&upstream)
+            .await;
+
+        let targets = vec![ProbeTarget {
+            name: "ollama".to_owned(),
+            url: upstream.uri(),
+            kind: ProviderKind::Ollama,
+        }];
+        let health = ProviderHealth::with_providers(&["ollama".to_owned()]);
+        probe_once(
+            &reqwest::Client::new(),
+            &targets,
+            &health,
+            None,
+            Duration::from_secs(5),
+        )
+        .await;
+
+        assert_eq!(health.snapshot()["ollama"].status, HealthState::Down);
+    }
+
+    #[tokio::test]
+    async fn ollama_liveness_endpoint_2xx_marks_it_up() {
+        use lumen_providers::ProviderKind;
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/version"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "version": "0.5.1"
+            })))
+            .mount(&upstream)
+            .await;
+
+        let targets = vec![ProbeTarget {
+            name: "ollama".to_owned(),
+            url: upstream.uri(),
+            kind: ProviderKind::Ollama,
+        }];
+        let health = ProviderHealth::with_providers(&["ollama".to_owned()]);
+        probe_once(
+            &reqwest::Client::new(),
+            &targets,
+            &health,
+            None,
+            Duration::from_secs(5),
+        )
+        .await;
+
+        let snap = health.snapshot();
+        assert_eq!(snap["ollama"].status, HealthState::Up);
+        assert_eq!(snap["ollama"].detail.as_deref(), Some("liveness ok"));
+    }
+
+    #[tokio::test]
+    async fn bare_reachability_kind_stays_up_on_a_404() {
+        use lumen_providers::ProviderKind;
+
+        // A kind with no per-kind liveness endpoint (e.g. a keyed vendor API)
+        // probes the bare base URL; even a 404 there proves the host answered.
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&upstream)
+            .await;
+
+        let targets = vec![ProbeTarget {
+            name: "openai".to_owned(),
+            url: upstream.uri(),
+            kind: ProviderKind::Openai,
+        }];
+        let health = ProviderHealth::with_providers(&["openai".to_owned()]);
+        probe_once(
+            &reqwest::Client::new(),
+            &targets,
+            &health,
+            None,
+            Duration::from_secs(5),
+        )
+        .await;
+
+        let snap = health.snapshot();
+        assert_eq!(snap["openai"].status, HealthState::Up);
+        assert_eq!(snap["openai"].detail.as_deref(), Some("reachable"));
     }
 }

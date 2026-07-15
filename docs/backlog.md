@@ -183,10 +183,14 @@ milestone.
   model) actually seen; bounded by the configured surface, never by client
   input. If a future dynamic-model feature lets clients mint arbitrary model
   ids, add an LRU cap.
-- **Health probe is a bare GET to `base_url`.** It proves reachability, not that
-  the model endpoint works (no auth, no real inference). A per-kind lightweight
-  liveness call (e.g. `GET /v1/models`) would be truer; deferred to keep the
-  probe provider-agnostic and free.
+- **Health probe is a bare GET to `base_url` for keyed vendor kinds.** TEI,
+  vLLM and Ollama now get a real, unauthenticated liveness endpoint (DEBT-3,
+  issue #23). Keyed vendor kinds (OpenAI, Anthropic, the OpenAI-compatible
+  hosts, ...) still get bare reachability only: their liveness routes
+  (`GET /v1/models`, etc.) require an API key the probe task does not carry,
+  and an unauthenticated call there would 401 a healthy server - a worse
+  signal than bare reachability. Plumbing provider credentials into the probe
+  task to unlock this is deferred to keep the probe free and side-effect-free.
 
 ## M7 (release) - deferred
 
@@ -215,9 +219,12 @@ milestone.
   preserving circuit-breaker state. (Auth knobs + server bind still boot-time.)
 - **Key-material zeroization (DEBT-2)** - done. `MasterKey` wipes on drop and
   the raw `LUMEN_MASTER_KEY` string is zeroized after use.
-- **Richer health probe (DEBT-3)** - done for TEI (`/health` liveness; non-2xx =
-  down). Other kinds keep bare host-reachability (no reliable unauthenticated
-  liveness endpoint); a per-kind probe for vendor APIs remains out of scope.
+- **Richer health probe (DEBT-3, issue #23)** - done for the self-hosted,
+  keyless kinds: TEI (`/health`), vLLM (`/health`) and Ollama
+  (`/api/version`), each a real liveness endpoint (non-2xx = down). Keyed
+  vendor kinds keep bare host-reachability (no reliable *unauthenticated*
+  liveness endpoint); a per-kind, authenticated probe for vendor APIs remains
+  out of scope (see the M6 entry above).
 
 ## Noted while building M8 (vision - image input to chat)
 
