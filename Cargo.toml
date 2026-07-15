@@ -87,6 +87,8 @@ hex = "0.4"
 wiremock = "0.6"
 criterion = { version = "0.5", features = ["async_tokio"] }
 tempfile = "3"
+# Real-signal integration tests only (crates/server/tests): sending an actual
+# SIGTERM/SIGINT to a spawned child process, cfg(unix)-gated.
 libc = "0.2"
 
 [workspace.lints.rust]
