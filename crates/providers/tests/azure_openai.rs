@@ -55,6 +55,7 @@ fn embed_request() -> EmbedRequest {
         encoding_format: None,
         dimensions: None,
         user: None,
+        extra: serde_json::Map::new(),
     }
 }
 
@@ -193,6 +194,70 @@ async fn embed_nominal_hits_the_embeddings_deployment_url() {
     assert_eq!(resp.data[0].embedding, vec![0.1, 0.2]);
     // The documented Azure/OpenAI embeddings array ceiling.
     assert_eq!(provider.max_batch_size(), 2048);
+}
+
+#[tokio::test]
+async fn deployment_name_with_reserved_characters_stays_one_encoded_path_segment() {
+    let mock = MockServer::start().await;
+    // Catch-all: assertions are made on the URL the server actually received.
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(chat_response_body()))
+        .mount(&mock)
+        .await;
+
+    let provider = AzureProvider::new(
+        reqwest::Client::new(),
+        "azure-test",
+        &mock.uri(),
+        Some(API_KEY.to_owned()),
+    );
+
+    // A hostile/typo'd upstream_id: '/'-'?'-'&'-'#' must not be able to
+    // rewrite the URL structure (path traversal, query smuggling, fragment).
+    let mut req = chat_request();
+    req.model = "my deploy/../x?a=b&c#frag".to_owned();
+    provider.chat(req, CancellationToken::new()).await.unwrap();
+
+    let requests = mock.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].url.path(),
+        "/openai/deployments/my%20deploy%2F..%2Fx%3Fa%3Db%26c%23frag/chat/completions",
+        "the deployment must be exactly one percent-encoded path segment"
+    );
+    assert_eq!(requests[0].url.query(), Some("api-version=2024-10-21"));
+}
+
+#[tokio::test]
+async fn base_url_with_extra_unrelated_query_params_still_extracts_api_version() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/openai/deployments/{DEPLOYMENT}/chat/completions"
+        )))
+        .and(query_param("api-version", "2024-06-01"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(chat_response_body()))
+        .mount(&mock)
+        .await;
+
+    // api-version buried among unrelated params (which are NOT forwarded -
+    // only api-version is part of the provider's URL contract).
+    let provider = AzureProvider::new(
+        reqwest::Client::new(),
+        "azure-test",
+        &format!("{}/?foo=bar&api-version=2024-06-01&baz=1", mock.uri()),
+        Some(API_KEY.to_owned()),
+    );
+
+    provider
+        .chat(chat_request(), CancellationToken::new())
+        .await
+        .unwrap();
+
+    let requests = mock.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    // Exactly the api-version pair: unrelated base_url params are dropped.
+    assert_eq!(requests[0].url.query(), Some("api-version=2024-06-01"));
 }
 
 // ---------------------------------------------------------------------------

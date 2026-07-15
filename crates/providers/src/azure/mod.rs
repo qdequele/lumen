@@ -94,16 +94,54 @@ impl AzureProvider {
     /// `{endpoint}/openai/deployments/{deployment}/{path}?api-version={version}`.
     /// `deployment` is `req.model`: the router already rewrote it to the
     /// model's `upstream_id` before calling this provider.
+    ///
+    /// The deployment name and the api-version value are percent-encoded, so
+    /// a hostile or typo'd value can never rewrite the URL structure (path
+    /// traversal via `/`, query smuggling via `?`/`&`/`=`, fragment via `#`).
+    /// The deployment always stays exactly one opaque path segment.
     fn deployment_url(&self, deployment: &str, path: &str) -> String {
         format!(
-            "{}/openai/deployments/{deployment}/{path}?api-version={}",
-            self.endpoint, self.api_version
+            "{}/openai/deployments/{}/{path}?api-version={}",
+            self.endpoint,
+            percent_encode(deployment),
+            percent_encode(&self.api_version)
         )
     }
 
     /// The single `api-key` auth header (never a bearer token).
     fn headers(&self) -> [(&str, &str); 1] {
         [("api-key", self.api_key.as_deref().unwrap_or(""))]
+    }
+}
+
+/// Percent-encode a URL path segment or query value: every byte outside the
+/// RFC 3986 `unreserved` set (`A-Z a-z 0-9 - . _ ~`) becomes `%XX`. Stricter
+/// than the minimum for either position, which keeps one tiny, obviously
+/// correct encoder for both (a dependency on the `url`/`percent-encoding`
+/// crates just for two values is not warranted).
+fn percent_encode(input: &str) -> String {
+    // Worst case every byte expands to three characters.
+    let mut out = String::with_capacity(input.len().saturating_mul(3));
+    for &byte in input.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(char::from(byte));
+            }
+            _ => {
+                out.push('%');
+                out.push(hex_digit(byte >> 4));
+                out.push(hex_digit(byte & 0x0F));
+            }
+        }
+    }
+    out
+}
+
+/// The uppercase hex digit for a nibble (always `0..=15` at the call sites).
+const fn hex_digit(nibble: u8) -> char {
+    match nibble {
+        0..=9 => (b'0' + nibble) as char,
+        _ => (b'A' + nibble - 10) as char,
     }
 }
 
@@ -252,6 +290,78 @@ mod tests {
         assert_eq!(
             url,
             "https://my-resource.openai.azure.com/openai/deployments/my-gpt4o-deployment/chat/completions?api-version=2024-10-21"
+        );
+    }
+
+    #[test]
+    fn split_handles_extra_unrelated_query_params_in_any_order() {
+        // api-version after an unrelated param.
+        let (endpoint, version) = split_endpoint_and_version(
+            "https://my-resource.openai.azure.com/?foo=bar&api-version=2024-06-01",
+        );
+        assert_eq!(endpoint, "https://my-resource.openai.azure.com");
+        assert_eq!(version, "2024-06-01");
+        // api-version before an unrelated param.
+        let (_, version) = split_endpoint_and_version(
+            "https://my-resource.openai.azure.com/?api-version=2024-06-01&foo=bar",
+        );
+        assert_eq!(version, "2024-06-01");
+        // Only unrelated params: fall back to the default.
+        let (_, version) =
+            split_endpoint_and_version("https://my-resource.openai.azure.com/?foo=bar");
+        assert_eq!(version, DEFAULT_API_VERSION);
+    }
+
+    #[test]
+    fn deployment_url_percent_encodes_reserved_characters() {
+        let provider = AzureProvider::new(
+            reqwest::Client::new(),
+            "azure-test",
+            "https://my-resource.openai.azure.com",
+            Some("sk-test-xxx".to_owned()),
+        );
+        // A hostile/typo'd deployment name must stay ONE opaque path segment:
+        // '/' must not create extra segments, '?'/'#' must not start a query
+        // or fragment, '&'/'=' must not smuggle query pairs, and a space must
+        // not produce an invalid URL.
+        let url = provider.deployment_url("my deploy/../x?a=b&c#frag", "chat/completions");
+        assert_eq!(
+            url,
+            "https://my-resource.openai.azure.com/openai/deployments/\
+             my%20deploy%2F..%2Fx%3Fa%3Db%26c%23frag/chat/completions?api-version=2024-10-21"
+        );
+    }
+
+    #[test]
+    fn api_version_query_value_is_percent_encoded() {
+        // An operator-supplied version with reserved characters must not be
+        // able to inject extra query parameters into the upstream URL.
+        let provider = AzureProvider::new(
+            reqwest::Client::new(),
+            "azure-test",
+            "https://my-resource.openai.azure.com/?api-version=2024-06-01&x=y",
+            Some("sk-test-xxx".to_owned()),
+        );
+        let url = provider.deployment_url("d", "embeddings");
+        assert!(
+            url.ends_with("/openai/deployments/d/embeddings?api-version=2024-06-01"),
+            "unexpected url: {url}"
+        );
+        // A version value that itself carries reserved characters is encoded.
+        let (_, version) = split_endpoint_and_version(
+            "https://my-resource.openai.azure.com/?api-version=2024 06 01&sig=a=b",
+        );
+        assert_eq!(version, "2024 06 01");
+        let provider = AzureProvider::new(
+            reqwest::Client::new(),
+            "azure-test",
+            "https://my-resource.openai.azure.com/?api-version=2024 06 01",
+            Some("sk-test-xxx".to_owned()),
+        );
+        let url = provider.deployment_url("d", "embeddings");
+        assert!(
+            url.ends_with("?api-version=2024%2006%2001"),
+            "unexpected url: {url}"
         );
     }
 
