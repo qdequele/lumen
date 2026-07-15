@@ -49,6 +49,11 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ### Fixed - Test determinism
 
+- `monitoring/smoke.py` now exercises the Gemini tool-calling roundtrip
+  (`check_chat_tools` added to the `google (gemini)` provider block, skipped
+  like the others when `GEMINI_API_KEY` is absent) and its module docstring
+  and `monitoring/README.md` no longer claim Gemini tool calls are
+  unexercised, now that Gemini tool calling has shipped (issue #4).
 - `resilience.rs::health_stays_fast_under_upstream_429_storm` no longer panics
   on a client-side TCP connect reset/broken-pipe under its 500-concurrent-request
   storm (a saturated OS accept backlog on some hosts, not gateway behaviour):
