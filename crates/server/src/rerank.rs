@@ -115,16 +115,49 @@ pub async fn rerank_handler(
         response.usage.tokens_estimated = Some(true);
     }
 
+    // Cost is search-unit based and independent of the token count.
     let cost = pricing.search_cost(&executed.model_used, search_units);
-    accounting.finish(&Outcome {
-        tokens_in,
-        tokens_out: 0,
-        estimated: tokens_in_estimated,
-        search_units: Some(search_units),
-        media: lumen_core::MediaUsage::default(),
-        cost,
-        status: 200,
-    });
+
+    // Settle accounting (ADR 003). Upstream-reported token counts (Jina,
+    // Voyage) settle inline, unflagged - there is nothing to refine. A
+    // gateway-estimated count settles inline with the byte heuristic; when the
+    // opt-in accurate tokenizer refines this model, the close is instead
+    // deferred to a background task that recounts (query x documents) with
+    // exact BPE on the blocking pool - the response is never delayed, only
+    // usage_log/Prometheus gain precision. In practice rerank model ids rarely
+    // match an OpenAI tiktoken family, so this refinement is usually a no-op.
+    if tokens_in_estimated && state.token_counter.refines(&executed.model_used) {
+        accounting.mark_completed();
+        let counter = std::sync::Arc::clone(&state.token_counter);
+        let model = executed.model_used.clone();
+        let query = req.query.clone();
+        let docs: Vec<String> = req.documents.iter().map(|d| d.text().to_owned()).collect();
+        tokio::spawn(async move {
+            let tokens_in = counter
+                .refine_rerank(&model, query, docs)
+                .await
+                .unwrap_or(estimated_tokens);
+            accounting.finish(&Outcome {
+                tokens_in,
+                tokens_out: 0,
+                estimated: true,
+                search_units: Some(search_units),
+                media: lumen_core::MediaUsage::default(),
+                cost,
+                status: 200,
+            });
+        });
+    } else {
+        accounting.finish(&Outcome {
+            tokens_in,
+            tokens_out: 0,
+            estimated: tokens_in_estimated,
+            search_units: Some(search_units),
+            media: lumen_core::MediaUsage::default(),
+            cost,
+            status: 200,
+        });
+    }
 
     Ok((model_used_headers(&executed.model_used), Json(response)).into_response())
 }

@@ -21,7 +21,7 @@ use lumen_telemetry::tokens::{Direction, TokenMetrics, TokenSample};
 use lumen_telemetry::LatencyMetrics;
 use serde_json::Value;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// The measured result of one finished request.
 #[derive(Debug, Clone, Default)]
@@ -72,6 +72,10 @@ pub struct Accounting {
     usage: Option<UsageLogger>,
     pricing: Arc<CostTable>,
     started: Instant,
+    /// End-to-end latency frozen at response time (see
+    /// [`mark_completed`](Accounting::mark_completed)); `None` = measure at
+    /// [`finish`](Accounting::finish).
+    completed: Option<Duration>,
 }
 
 impl Accounting {
@@ -142,6 +146,7 @@ impl Accounting {
             usage: state.usage.clone(),
             pricing,
             started: Instant::now(),
+            completed: None,
         })
     }
 
@@ -181,6 +186,15 @@ impl Accounting {
         }
     }
 
+    /// Freeze the request's end-to-end latency NOW. Called by a handler that
+    /// defers [`finish`](Accounting::finish) to a background task (opt-in
+    /// accurate token refinement, ADR 003), so the latency histogram and
+    /// `usage_log.latency_ms` measure the request the client saw, not the
+    /// deferred refinement.
+    pub fn mark_completed(&mut self) {
+        self.completed = Some(self.started.elapsed());
+    }
+
     /// The shared price table (for computing the outcome's cost).
     #[must_use]
     pub fn pricing(&self) -> &CostTable {
@@ -215,8 +229,10 @@ impl Accounting {
 
         // One clock read closes the record: the log event, the histogram and
         // `usage_log.latency_ms` all report the same measurement. Streaming
-        // finishes when the stream ends, so this covers the full stream.
-        let elapsed = self.started.elapsed();
+        // finishes when the stream ends, so this covers the full stream. A
+        // handler that deferred this close to a background refinement task
+        // froze the latency at response time via `mark_completed`.
+        let elapsed = self.completed.unwrap_or_else(|| self.started.elapsed());
         let metadata_json = self.metadata.as_ref().map(RequestMetadata::to_json);
 
         // ADR 002 sink 1, log half: the full metadata rides the structured
@@ -534,6 +550,7 @@ mod tests {
             usage: None,
             pricing: Arc::new(CostTable::default()),
             started: Instant::now(),
+            completed: None,
         }
     }
 

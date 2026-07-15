@@ -48,6 +48,7 @@ tracing-subscriber = { workspace = true }
 figment = { workspace = true }
 notify = { workspace = true }
 zeroize = { workspace = true }
+tiktoken-rs.workspace = true
 
 [dev-dependencies]
 reqwest = { workspace = true }

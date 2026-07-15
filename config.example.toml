@@ -72,6 +72,34 @@ retention_days = 30               # purge usage_log rows older than this
 metadata_labels = []              # e.g. ["team", "env"]
 
 # ---------------------------------------------------------------------------
+# Token estimation strategy (ADR 003) - OPTIONAL, defaults to "heuristic".
+#
+# Token counts are a first-class output of every request. When an upstream
+# reports usage, that authoritative count always wins (estimated = false).
+# When it does NOT (e.g. TEI embeddings, some streams), LUMEN estimates
+# locally and flags the count `estimated = true`. This knob picks the estimator:
+#
+#   "heuristic" (default) - a cheap ~4-bytes-per-token byte count. Zero added
+#                           latency, allocation-light, always hot-path-safe.
+#   "accurate"            - exact per-model BPE (tiktoken) for OpenAI-family
+#                           models: cl100k_base for gpt-4 / gpt-3.5 /
+#                           text-embedding-3, o200k_base for gpt-4o / o1 / o3 /
+#                           gpt-4.1 / gpt-5 (matched on YOUR model id / alias).
+#                           Non-OpenAI models keep the heuristic. The response
+#                           envelope still carries the heuristic estimate (the
+#                           request is never delayed); the accurate count is
+#                           computed AFTER the response by a background task
+#                           (BPE on the blocking pool, spawn_blocking) and
+#                           lands in Prometheus and usage_log - the accounting
+#                           surfaces. Only fires when an upstream omitted
+#                           usage. Encoders are built once at startup.
+#                           Streaming input counts remain heuristic (the
+#                           stream is not buffered).
+# ---------------------------------------------------------------------------
+[tokenizer]
+mode = "heuristic"                # "heuristic" (default) or "accurate"
+
+# ---------------------------------------------------------------------------
 # Resilience: retries, fallbacks, circuit breaker, timeouts, health checks.
 #
 # Every value below is the built-in default - the whole section is optional.

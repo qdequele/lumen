@@ -23,6 +23,7 @@ pub mod rerank;
 pub mod resilience;
 pub mod routes;
 pub mod state;
+pub mod tokenizer;
 
 pub use app::build_app;
 pub use config::{Config, ConfigError};

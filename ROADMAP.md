@@ -50,9 +50,9 @@ Spec: `specs/milestones/M4-chat-streaming.md`
 - [x] Local token estimation when the upstream returns none (streaming included), marked `estimated` (ADR 003)
 - [x] Per-request metadata header (`x-lumen-metadata`, Cloudflare AI Gateway style) → logs + `usage_log` + Prometheus labels via allowlist (ADR 002)
 
-Note: local estimation = byte heuristic (inline, hot-path-safe);
-the precise opt-in tokenizer (spawn_blocking) ships in the backlog - see
-`docs/backlog.md` § M5.
+Note: local estimation = byte heuristic (inline, hot-path-safe) by default;
+the precise opt-in tokenizer (`[tokenizer] mode = "accurate"`, tiktoken via
+spawn_blocking) shipped in issue #8 - see the ADR 003 addendum.
 Spec: `specs/milestones/M5-auth-budgets.md`
 
 ## M6 - Resilience ✅

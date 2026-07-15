@@ -4,6 +4,7 @@ use crate::auth::AuthRuntime;
 use crate::health::ProviderHealth;
 use crate::pricing::CostTable;
 use crate::resilience::ResilienceRuntime;
+use crate::tokenizer::TokenCounter;
 use arc_swap::ArcSwap;
 use lumen_auth::usage::UsageLogger;
 use lumen_providers::image_fetch::ImageFetchPolicy;
@@ -75,6 +76,10 @@ pub struct AppState {
     /// without a restart (the reloader re-reads the key from the DB). `None` =
     /// no reloader (e.g. tests, or a watcher-setup failure at boot).
     pub reload_trigger: Option<Arc<tokio::sync::Notify>>,
+    /// Local token-estimation strategy (ADR 003). Default: the byte heuristic;
+    /// `accurate` mode holds pre-built BPE encoders. Shared, never rebuilt on
+    /// the request path.
+    pub token_counter: Arc<TokenCounter>,
 }
 
 impl AppState {
@@ -105,7 +110,15 @@ impl AppState {
             body_limit: 10 * 1024 * 1024,
             image_fetch: Arc::new(ImageFetchPolicy::default()),
             reload_trigger: None,
+            token_counter: Arc::new(TokenCounter::Heuristic),
         }
+    }
+
+    /// Attach the token counter (builder style). Default is the byte heuristic.
+    #[must_use]
+    pub fn with_token_counter(mut self, token_counter: Arc<TokenCounter>) -> Self {
+        self.token_counter = token_counter;
+        self
     }
 
     /// Attach the guarded image-fetch policy (builder style).
