@@ -6,6 +6,18 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed - Dedicated client-cancel error code (issue #11)
+
+- A client-initiated cancel (`ProviderError::Cancelled`, typically a
+  disconnect mid-request) no longer maps to `GatewayError::Internal` (`LM-5001`,
+  500). It now has its own `GatewayError::ClientCancelled` (`LM-6001`, HTTP
+  499, `type: client_cancelled`), documented in `docs/errors.md` and
+  `docs/adr/006-client-cancellation-error-code.md`. `499` (the conventional
+  "client closed request" status) keeps it out of the `5xx` class entirely, so
+  `lumen_http_request_duration_seconds`/`lumen_request_duration_seconds` and any
+  alert built on `status=~"5.."` no longer count a client hanging up as an
+  internal gateway malfunction.
+
 ### Added - Endpoint latency observability
 
 - **Every endpoint now measures and publishes its latency.** A new middleware

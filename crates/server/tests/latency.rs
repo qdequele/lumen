@@ -6,6 +6,7 @@
 mod common;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use lumen_core::Capability;
 use lumen_providers::{http, ModelSpec, ProviderKind, ProviderSpec, Registry};
@@ -155,4 +156,64 @@ async fn chat_requests_feed_the_per_model_latency_histogram() {
     assert!(line.contains(r#"status="200""#), "{line}");
     // The HTTP-level histogram sees the same request under its route.
     assert!(out.contains(r#"path="/v1/chat/completions""#), "{out}");
+}
+
+// Issue #11: a client-initiated cancel must not inflate the `internal`/5xx
+// metrics an operator alerts on. Mirrors the disconnect pattern used by
+// `client_disconnect_during_slow_upstream_does_not_hang_server` (embeddings
+// tests) and `streaming_client_disconnect_does_not_hang_server` (chat tests).
+#[tokio::test]
+async fn client_disconnect_does_not_inflate_the_internal_error_status_label() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({
+                    "id": "chatcmpl-1",
+                    "object": "chat.completion",
+                    "created": 1,
+                    "model": "gpt-4o-2024-08-06",
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "hi"},
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4}
+                }))
+                .set_delay(Duration::from_secs(3)),
+        )
+        .mount(&upstream)
+        .await;
+
+    let base = common::spawn_with(openai_registry(&upstream.uri()), LIMIT).await;
+
+    // Client gives up well before the 3s upstream delay - a genuine cancel.
+    let result = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .timeout(Duration::from_millis(200))
+        .json(&json!({
+            "model": "gpt",
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .send()
+        .await;
+    assert!(result.is_err(), "client should have timed out");
+
+    let out = scrape_metrics(&base).await;
+    // Neither histogram may record a `500` (or generic `5xx`) sample for this
+    // cancelled call - that's exactly the "internal" bucket an operator
+    // alerts on, and a client hanging up is not a gateway malfunction.
+    assert!(
+        !out.contains(r#"status="500""#),
+        "client cancel must not surface as an internal 500:\n{out}"
+    );
+    assert!(
+        !out.contains(r#"status="5xx""#),
+        "client cancel must not surface as a 5xx class label:\n{out}"
+    );
+
+    // Server stays responsive afterwards.
+    let health = reqwest::get(format!("{base}/health")).await.unwrap();
+    assert_eq!(health.status(), 200);
 }

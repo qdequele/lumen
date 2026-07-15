@@ -23,10 +23,6 @@ milestone.
   object documents to text at the edge when a provider requires it.
 - Config: consider a `--check-config` subcommand that validates and exits, for
   CI / deploy pipelines, once the CLI surface grows.
-- Error taxonomy (revisit in M4): `ProviderError::Cancelled` currently maps to
-  `GatewayError::Internal` (500 / `internal`). Once real streaming/provider
-  calls exist, a client-initiated cancel should not inflate `internal` metrics -
-  consider a dedicated non-5xx variant that isn't alerted on.
 - `error_type()` collapses 401/402/429 into `invalid_request` because the public
   taxonomy only has three `type`s. Fine per `CLAUDE.md`, but note it's coarse.
 - Acceptance criterion "boot < 100 ms" is verified manually (M1); fold a real
