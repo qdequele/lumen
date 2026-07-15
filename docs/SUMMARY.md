@@ -8,6 +8,13 @@
 - [Quickstart](getting-started/quickstart.md)
 - [Configuration basics](getting-started/configuration.md)
 
+# Chat
+
+- [Chat completions](chat/completions.md)
+- [Streaming](chat/streaming.md)
+- [Vision (image input)](chat/vision.md)
+- [Tool calling](chat/tool-calling.md)
+
 # Reference
 
 - [Providers](providers.md)
