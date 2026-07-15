@@ -125,7 +125,7 @@ health_check_interval_ms = 30000  # probe cadence (must not be 0 when enabled)
 #
 # Each `[[providers]]` block declares one upstream. `kind` selects the built-in
 # implementation: openai | anthropic | cohere | ollama | tei | jina | voyage |
-# mistral | google. `name` is your own label and must be unique.
+# mistral | google | azure. `name` is your own label and must be unique.
 #
 # Each `[[providers.models]]` block exposes a model to clients:
 #   id            the id clients send (owned entirely by you)
@@ -196,6 +196,11 @@ base_url = "http://localhost:11434"
 # be overridden per provider. Applies to every model this provider serves.
 first_token_timeout_ms = 60000
 total_timeout_ms = 120000
+# strict = false   # optional (default false). When true, reject a request that
+                   # sets an unsupported-but-meaningful field this provider
+                   # cannot honor (Ollama: `dimensions`) with a 400 (LM-1001),
+                   # instead of silently dropping it. `encoding_format` is always
+                   # handled at the response edge and is never affected.
 
 [[providers.models]]
 id = "nomic-embed"
@@ -264,6 +269,24 @@ base_url = "http://localhost:8081"
 id = "bge-reranker"
 upstream_id = "BAAI/bge-reranker-large"
 capabilities = ["rerank"]
+
+# Azure OpenAI: chat + embeddings, reusing the OpenAI JSON schema. Auth is the
+# `api-key` header (never a bearer token); routing is by URL path
+# (/openai/deployments/{deployment}/...), not the `model` field, so each
+# model's `upstream_id` below must be the Azure DEPLOYMENT NAME, not an
+# OpenAI model id. `base_url` is required (every Azure resource endpoint is
+# operator-specific) and may carry an `?api-version=YYYY-MM-DD` override;
+# omitted, a pinned built-in default applies (see `crates/providers/src/azure`).
+[[providers]]
+name = "azure-openai"
+kind = "azure"
+api_key_env = "AZURE_OPENAI_API_KEY"
+base_url = "https://my-resource.openai.azure.com?api-version=2024-10-21"
+
+[[providers.models]]
+id = "azure-gpt-4o"
+upstream_id = "my-gpt4o-deployment"   # the Azure deployment name
+capabilities = ["chat"]
 
 # ---------------------------------------------------------------------------
 # Multimodal image fetching (M9) - OFF by default.

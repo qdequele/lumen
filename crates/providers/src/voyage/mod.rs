@@ -4,7 +4,8 @@
 //! rerank endpoint differs from Cohere's in two field names: the request uses
 //! `top_k` (not `top_n`) and the response nests results under `data` (not
 //! `results`). Voyage bills reranking in tokens, so `usage.search_units` is
-//! reported as `0`.
+//! reported as `0`; `usage.total_tokens` carries Voyage's reported token
+//! count instead (ADR 003, issue #10).
 
 use async_trait::async_trait;
 use lumen_core::{
@@ -96,6 +97,7 @@ impl VoyageProvider {
                 object: "embedding".to_owned(),
                 index: u32::try_from(index).unwrap_or(u32::MAX),
                 embedding: d.embedding,
+                encoding: lumen_core::EmbeddingEncoding::default(),
             })
             .collect();
         Ok(EmbedResponse {
@@ -183,6 +185,11 @@ impl EmbeddingProvider for VoyageProvider {
         req: EmbedRequest,
         cancel: CancellationToken,
     ) -> Result<EmbedResponse, ProviderError> {
+        // Voyage's embeddings API takes text only, never token-id arrays; the
+        // passthrough would forward a raw int array and fail opaquely upstream.
+        // Honest 400 before any call (issue #25).
+        crate::mapping::reject_pretokenized_input(&self.provider_name, &req.input)?;
+
         // Multimodal (content-parts) requests go to Voyage's dedicated
         // `/multimodalembeddings` endpoint; text-only requests stay on the
         // OpenAI-compatible near-passthrough path.
@@ -225,6 +232,15 @@ struct VoyageRerankResponse {
     /// Voyage nests results under `data`, not `results`.
     #[serde(default)]
     data: Vec<VoyageRerankResult>,
+    /// Voyage bills reranking in tokens; absent when the upstream omits usage.
+    #[serde(default)]
+    usage: Option<VoyageRerankUsage>,
+}
+
+#[derive(Deserialize)]
+struct VoyageRerankUsage {
+    #[serde(default)]
+    total_tokens: u32,
 }
 
 #[derive(Deserialize)]
@@ -276,10 +292,15 @@ impl RerankProvider for VoyageProvider {
                     document: None,
                 })
                 .collect(),
-            // Voyage bills in tokens, not search units; the field does not apply.
+            // Voyage bills in tokens, not search units; `search_units` does
+            // not apply. `total_tokens` carries the upstream-reported count
+            // (issue #10); 0 when the upstream omitted `usage`, which the
+            // gateway then falls back to a local estimate for (ADR 003).
             usage: RerankUsage {
                 search_units: 0,
                 estimated: None,
+                total_tokens: parsed.usage.map_or(0, |u| u.total_tokens),
+                ..Default::default()
             },
         })
     }

@@ -5,8 +5,28 @@
 //! other non-2xx → fatal upstream error. Providers translate their own success
 //! bodies but share this failure classification.
 
-use lumen_core::ProviderError;
+use lumen_core::{EmbedInput, ProviderError};
 use std::time::Duration;
+
+/// Reject pre-tokenized embedding input (token-id arrays) for providers whose
+/// APIs only take text. Called BEFORE any upstream call so the client gets an
+/// honest 400 (`LM-1001`) instead of an empty result (Cohere/TEI would send an
+/// empty texts array) or an opaque upstream error (rule 8). OpenAI-compatible
+/// passthrough providers consume token arrays natively and never call this.
+///
+/// # Errors
+///
+/// Returns [`ProviderError::UnsupportedInput`] when `input` is `Tokens` or
+/// `TokenBatch`; `Ok(())` for every text/multimodal shape.
+pub fn reject_pretokenized_input(provider: &str, input: &EmbedInput) -> Result<(), ProviderError> {
+    match input {
+        EmbedInput::Tokens(_) | EmbedInput::TokenBatch(_) => Err(ProviderError::UnsupportedInput {
+            provider: provider.to_owned(),
+            reason: "pre-tokenized input (token id arrays)".to_owned(),
+        }),
+        EmbedInput::Single(_) | EmbedInput::Batch(_) | EmbedInput::Multi(_) => Ok(()),
+    }
+}
 
 /// Classify a non-success upstream status into a [`ProviderError`].
 #[must_use]

@@ -17,6 +17,7 @@ fn registry() -> Arc<Registry> {
             kind: ProviderKind::Cohere,
             api_key: Some("sk-test-xxx".to_owned()),
             base_url: None,
+            strict: false,
             models: vec![ModelSpec {
                 id: "multi".to_owned(),
                 upstream_id: "embed-v4.0".to_owned(),
@@ -30,6 +31,7 @@ fn registry() -> Arc<Registry> {
             kind: ProviderKind::Openai,
             api_key: Some("sk-test-xxx".to_owned()),
             base_url: None,
+            strict: false,
             models: vec![ModelSpec {
                 id: "gpt".to_owned(),
                 upstream_id: "gpt-4o".to_owned(),

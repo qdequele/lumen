@@ -1,8 +1,9 @@
 # Providers
 
-LUMEN ships twenty built-in provider kinds - nine native integrations (their own
-request/response translation) plus eleven **OpenAI-compatible** hosts that reuse
-the OpenAI path with a per-kind base URL. Each `[[providers]]` block in your
+LUMEN ships twenty-one built-in provider kinds - ten native integrations (their own
+request/response translation, including deployment-routed `azure`) plus eleven
+**OpenAI-compatible** hosts that reuse the OpenAI path with a per-kind base URL.
+Each `[[providers]]` block in your
 config selects one with a `kind` string and gives it a unique `name` (your own
 label). Each `[[providers.models]]` block under it exposes a model to clients:
 
@@ -57,6 +58,7 @@ Rules that apply to every provider:
 | `voyage`    |      |  ✅   |   ✅   | required      | optional       | 128               |
 | `tei`       |      |  ✅   |   ✅   | keyless       | **required**   | 32                |
 | `ollama`    |      |  ✅   |        | keyless       | **required**   | 512               |
+| `azure`     |  ✅  |  ✅   |        | required      | **required**   | 2048              |
 
 OpenAI-compatible hosts (chat + embed via the OpenAI path; a host that only
 serves chat simply has no embed models configured):
@@ -78,6 +80,12 @@ serves chat simply has no embed models configured):
 All OpenAI-compatible kinds use a 2048-input embed batch limit. Anything that
 speaks the OpenAI wire format but isn't listed can still be used via
 `kind = "openai"` with a `base_url` override.
+
+`cloudflare` additionally serves **rerank** (not shown in the table above,
+which covers only the chat/embed OpenAI-compatible path): its BAAI
+`bge-reranker-*` models are served through Workers AI's native
+`/ai/run/{model}` endpoint rather than an OpenAI-compatible one. See
+[`### cloudflare`](#cloudflare) below.
 
 ---
 
@@ -172,6 +180,17 @@ capabilities = ["chat"]
 - **Auth**: `api_key_env` (e.g. `COHERE_API_KEY`), bearer token.
 - **Embed batch limit**: 96.
 - **Cost**: rerank is billed in search units (`cost_per_1k_searches`).
+- **`input_type` override**: Cohere's embed v2 API requires an `input_type`
+  and the gateway cannot know query-vs-document intent, so it defaults to
+  `search_document` (the indexing case). Set `input_type` as an extra field on
+  the `/v1/embeddings` request body to override it per request, e.g.
+  `{"model": "embed-multilingual", "input": "...", "input_type": "search_query"}`.
+  Allowed values: `search_document`, `search_query`, `classification`,
+  `clustering`. An unrecognized value is rejected with `LM-1001` before any
+  upstream call. The field is consumed at the gateway: only the Cohere
+  translation reads it, and it is never forwarded in the outgoing body of any
+  other provider (a strict OpenAI-compatible upstream such as vLLM could
+  reject unknown fields).
 
 ```toml
 [[providers]]
@@ -272,6 +291,45 @@ upstream_id = "nomic-embed-text"
 capabilities = ["embed"]
 ```
 
+## azure
+
+- **kind**: `azure` · **capabilities**: chat, embed. Reuses the OpenAI JSON
+  schema verbatim; only the URL, auth, and routing differ from `openai`.
+- **Auth**: `api_key_env`, sent as the `api-key` header (never a bearer token).
+- **base_url**: **required** - your Azure resource endpoint, e.g.
+  `https://<resource>.openai.azure.com` (no shared public default, every
+  resource is operator-specific). Optionally append `?api-version=YYYY-MM-DD`
+  to pin a specific Azure API version; omitted, LUMEN uses a pinned recent
+  default (see the `azure` module doc comment for the exact value).
+- **Deployment routing**: Azure routes by URL path
+  (`/openai/deployments/{deployment}/...`), not by the `model` field in the
+  body. Set each model's `upstream_id` to the **Azure deployment name** - the
+  same `upstream_id` mechanism every other kind uses for aliasing already
+  carries it through.
+- **Embed batch limit**: 2048 (same array-size ceiling as the OpenAI
+  embedding models Azure hosts).
+- **Known gap**: there is no dedicated `api_version` config field yet (it
+  would need a matching `crates/server` config change); the `base_url` query
+  string is the workaround above.
+
+```toml
+[[providers]]
+name = "azure-openai"
+kind = "azure"
+api_key_env = "AZURE_OPENAI_API_KEY"
+base_url = "https://my-resource.openai.azure.com?api-version=2024-10-21"
+
+[[providers.models]]
+id = "gpt-4o"
+upstream_id = "my-gpt4o-deployment"   # the Azure deployment name
+capabilities = ["chat"]
+
+[[providers.models]]
+id = "azure-embed"
+upstream_id = "my-embedding-deployment"
+capabilities = ["embed"]
+```
+
 ---
 
 ## OpenAI-compatible hosts
@@ -311,10 +369,18 @@ capabilities = ["chat"]
 
 ### cloudflare
 
-Cloudflare **Workers AI** via its OpenAI-compatible endpoint. `base_url` is
-**required** because it embeds your account id; `api_key_env` holds a Cloudflare
-API token. (Workers AI reranking uses a Cloudflare-specific endpoint and is not
-covered by this OpenAI-compatible kind yet - see `docs/backlog.md`.)
+Cloudflare **Workers AI**. Chat and embeddings go through its OpenAI-compatible
+endpoint; reranking (`bge-reranker-*` models) goes through Workers AI's own
+native `POST /ai/run/{model}` endpoint instead, since it is not part of the
+OpenAI-compatible surface - one `[[providers]]` entry serves all three
+capabilities against the same `base_url`. `base_url` is **required** because
+it embeds your account id; `api_key_env` holds a Cloudflare API token.
+
+The native rerank request is `{ query, contexts: [{ text }, ...], top_k }`
+(`top_n` is sent as `top_k`); the response is Cloudflare's standard
+`{ result: { response: [{ id, score }, ...] }, success, errors }` envelope,
+with `id` mapped back onto the original document index. Workers AI reports no
+token usage for this model; LUMEN derives a local estimate per ADR 003.
 
 ```toml
 [[providers]]
@@ -326,6 +392,10 @@ base_url = "https://api.cloudflare.com/client/v4/accounts/YOUR_ACCOUNT_ID/ai/v1"
 id = "cf-llama"
 upstream_id = "@cf/meta/llama-3.1-8b-instruct"
 capabilities = ["chat"]
+[[providers.models]]
+id = "cf-rerank"
+upstream_id = "@cf/baai/bge-reranker-base"
+capabilities = ["rerank"]
 ```
 
 ### vllm

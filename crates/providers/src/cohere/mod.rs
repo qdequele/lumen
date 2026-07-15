@@ -4,7 +4,11 @@
 //! types in both directions, so this module translates:
 //!
 //! * embed: `POST /v2/embed` takes `{ model, texts, input_type, embedding_types }`
-//!   and returns `{ embeddings: { float: [[..]] }, meta: { billed_units } }`;
+//!   and returns `{ embeddings: { float: [[..]] }, meta: { billed_units } }`.
+//!   `input_type` defaults to `search_document` but a caller may override it
+//!   (e.g. `search_query`) via the `input_type` field on an otherwise
+//!   OpenAI-shaped `/v1/embeddings` request (issue #22) - see
+//!   [`ALLOWED_INPUT_TYPES`] and [`resolve_input_type`];
 //! * rerank: `POST /v2/rerank` takes `{ model, query, documents, top_n }` and
 //!   returns `{ results: [{ index, relevance_score }], meta: { billed_units } }`.
 //!
@@ -18,6 +22,7 @@ use lumen_core::{
     RerankUsage,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::fmt;
 use tokio_util::sync::CancellationToken;
 
@@ -86,9 +91,9 @@ enum CohereEmbedBody<'a> {
 struct CohereEmbedRequest<'a> {
     model: &'a str,
     texts: Vec<&'a str>,
-    /// Required by v2. The gateway does not know query-vs-document intent, so it
-    /// defaults to `search_document` (the indexing case).
-    input_type: &'static str,
+    /// Required by v2. Defaults to `search_document` (the indexing case) but
+    /// honors a caller's override (issue #22) - see [`resolve_input_type`].
+    input_type: &'a str,
     embedding_types: [&'static str; 1],
 }
 
@@ -98,7 +103,7 @@ struct CohereEmbedRequest<'a> {
 struct CohereEmbedMultiRequest<'a> {
     model: &'a str,
     inputs: Vec<CohereInput<'a>>,
-    input_type: &'static str,
+    input_type: &'a str,
     embedding_types: [&'static str; 1],
 }
 
@@ -122,13 +127,37 @@ struct CohereImageUrl<'a> {
 }
 
 /// Cohere's `input_type` for the indexing case (the gateway does not know
-/// query-vs-document intent).
-const INPUT_TYPE: &str = "search_document";
+/// query-vs-document intent unless the caller says so - see
+/// [`resolve_input_type`]).
+const DEFAULT_INPUT_TYPE: &str = "search_document";
+
+/// Cohere embed v2's accepted `input_type` values. A request `input_type`
+/// outside this set is rejected at the gateway edge with `LM-1001` before any
+/// upstream call is made (`crates/server/src/embeddings.rs`), so any value
+/// reaching [`resolve_input_type`] is already trusted.
+pub const ALLOWED_INPUT_TYPES: [&str; 4] = [
+    "search_document",
+    "search_query",
+    "classification",
+    "clustering",
+];
+
+/// Resolve the effective `input_type`: the caller's override carried in
+/// `EmbedRequest::extra` (issue #22 - a caller sets `"input_type":
+/// "search_query"` on an otherwise OpenAI-shaped `/v1/embeddings` request), or
+/// the `search_document` indexing default when absent.
+fn resolve_input_type(req: &EmbedRequest) -> &str {
+    req.extra
+        .get("input_type")
+        .and_then(Value::as_str)
+        .unwrap_or(DEFAULT_INPUT_TYPE)
+}
 
 /// Build the request body, choosing the text `texts` shape or the multimodal
 /// `inputs` content-array shape (used whenever the input is a content-parts
 /// batch, so per-item grouping and images are preserved).
 fn build_cohere_body(req: &EmbedRequest) -> CohereEmbedBody<'_> {
+    let input_type = resolve_input_type(req);
     match &req.input {
         EmbedInput::Multi(items) => {
             let inputs = items
@@ -144,14 +173,20 @@ fn build_cohere_body(req: &EmbedRequest) -> CohereEmbedBody<'_> {
             CohereEmbedBody::Multi(CohereEmbedMultiRequest {
                 model: &req.model,
                 inputs,
-                input_type: INPUT_TYPE,
+                input_type,
                 embedding_types: ["float"],
             })
         }
-        EmbedInput::Single(_) | EmbedInput::Batch(_) => CohereEmbedBody::Text(CohereEmbedRequest {
+        // Token-array inputs never reach here: `embed()` rejects them up front
+        // (reject_pretokenized_input, issue #25). The arms stay total so a
+        // future call site cannot silently send an empty texts array.
+        EmbedInput::Single(_)
+        | EmbedInput::Batch(_)
+        | EmbedInput::Tokens(_)
+        | EmbedInput::TokenBatch(_) => CohereEmbedBody::Text(CohereEmbedRequest {
             model: &req.model,
             texts: req.input.iter().collect(),
-            input_type: INPUT_TYPE,
+            input_type,
             embedding_types: ["float"],
         }),
     }
@@ -205,6 +240,9 @@ impl EmbeddingProvider for CohereProvider {
         req: EmbedRequest,
         cancel: CancellationToken,
     ) -> Result<EmbedResponse, ProviderError> {
+        // Cohere embed takes texts only; token-id arrays would serialize to an
+        // EMPTY texts array. Honest 400 before any upstream call (issue #25).
+        crate::mapping::reject_pretokenized_input(&self.provider_name, &req.input)?;
         let url = format!("{}/v2/embed", self.base_url);
         let body = build_cohere_body(&req);
 
@@ -230,6 +268,7 @@ impl EmbeddingProvider for CohereProvider {
                 object: "embedding".to_owned(),
                 index: u32::try_from(index).unwrap_or(u32::MAX),
                 embedding,
+                encoding: lumen_core::EmbeddingEncoding::default(),
             })
             .collect();
 
@@ -321,6 +360,10 @@ impl RerankProvider for CohereProvider {
             usage: RerankUsage {
                 search_units: parsed.meta.billed_units.search_units,
                 estimated: None,
+                // Cohere does not report a token count; the gateway derives
+                // one for uniform observability (ADR 003), see
+                // `lumen_server::rerank`.
+                ..Default::default()
             },
         })
     }

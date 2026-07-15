@@ -1,13 +1,20 @@
 //! Embedding types, mirroring the OpenAI `embeddings` schema.
+//!
+//! Unknown request fields are captured into a [`serde(flatten)`] `extra` map
+//! (the same idiom as [`crate::chat::ChatRequest`]) so provider translation
+//! code can consume provider-specific parameters - e.g. Cohere's `input_type`
+//! (search_query vs search_document, see `docs/providers.md` § cohere).
+//! Unlike the chat path, `extra` is never re-serialized into an outgoing
+//! provider body: unknown fields stop at the gateway (see the field docs on
+//! [`EmbedRequest::extra`]).
 
 use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::{Map, Value};
 
 use crate::chat::ContentPart;
 
-/// Input to an embedding request: a single string, a text batch, or a
-/// multimodal batch of content-parts items.
-///
-/// (Token-array inputs are intentionally not modelled in v1.)
+/// Input to an embedding request: a single string, a text batch, a pre-tokenized
+/// input (token ids), or a multimodal batch of content-parts items.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum EmbedInput {
@@ -15,9 +22,19 @@ pub enum EmbedInput {
     Single(String),
     /// A batch of texts (`"input": ["a","b"]`), embedded and returned in order.
     Batch(Vec<String>),
+    /// A single pre-tokenized input as an array of token ids
+    /// (`"input": [1,2,3]`). Counts as one item (OpenAI semantics). Untagged
+    /// order tries `Single`/`Batch` first, so this only matches an all-integer
+    /// array.
+    Tokens(Vec<u32>),
+    /// A batch of pre-tokenized inputs (`"input": [[1,2],[3,4]]`), each an array
+    /// of token ids, embedded and returned in order. Matches an array of
+    /// all-integer arrays (tried before `Multi`, whose items are strings or
+    /// content-part objects).
+    TokenBatch(Vec<Vec<u32>>),
     /// A multimodal batch (`"input": ["a", [{parts}], ...]`): each item is a
     /// string or an array of content parts. Only entered when at least one item
-    /// is a parts array (untagged order tries `Single`/`Batch` first).
+    /// is a parts array (untagged order tries the text/token variants first).
     Multi(Vec<EmbedItem>),
 }
 
@@ -33,12 +50,14 @@ pub enum EmbedItem {
 }
 
 impl EmbedInput {
-    /// Number of individual items in this input.
+    /// Number of individual items in this input. A single token array counts as
+    /// one item (one embedding); a token batch counts each inner array.
     #[must_use]
     pub fn len(&self) -> usize {
         match self {
-            EmbedInput::Single(_) => 1,
+            EmbedInput::Single(_) | EmbedInput::Tokens(_) => 1,
             EmbedInput::Batch(v) => v.len(),
+            EmbedInput::TokenBatch(v) => v.len(),
             EmbedInput::Multi(v) => v.len(),
         }
     }
@@ -47,9 +66,22 @@ impl EmbedInput {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         match self {
-            EmbedInput::Single(_) => false,
+            EmbedInput::Single(_) | EmbedInput::Tokens(_) => false,
             EmbedInput::Batch(v) => v.is_empty(),
+            EmbedInput::TokenBatch(v) => v.is_empty(),
             EmbedInput::Multi(v) => v.is_empty(),
+        }
+    }
+
+    /// Total number of token ids across pre-tokenized inputs (`0` for text and
+    /// multimodal inputs). Used by the estimation fallback: one token id is one
+    /// token, with no byte heuristic.
+    #[must_use]
+    pub fn token_count(&self) -> u64 {
+        match self {
+            EmbedInput::Tokens(ids) => ids.len() as u64,
+            EmbedInput::TokenBatch(batches) => batches.iter().map(|ids| ids.len() as u64).sum(),
+            EmbedInput::Single(_) | EmbedInput::Batch(_) | EmbedInput::Multi(_) => 0,
         }
     }
 
@@ -57,7 +89,10 @@ impl EmbedInput {
     #[must_use]
     pub fn has_image(&self) -> bool {
         match self {
-            EmbedInput::Single(_) | EmbedInput::Batch(_) => false,
+            EmbedInput::Single(_)
+            | EmbedInput::Batch(_)
+            | EmbedInput::Tokens(_)
+            | EmbedInput::TokenBatch(_) => false,
             EmbedInput::Multi(items) => items.iter().any(|item| match item {
                 EmbedItem::Text(_) => false,
                 EmbedItem::Parts(parts) => parts.iter().any(|p| p.image().is_some()),
@@ -80,6 +115,9 @@ impl EmbedInput {
         let fragments: Vec<&str> = match self {
             EmbedInput::Single(s) => vec![s.as_str()],
             EmbedInput::Batch(v) => v.iter().map(String::as_str).collect(),
+            // Pre-tokenized inputs carry no text; token counting handles them
+            // via `token_count`.
+            EmbedInput::Tokens(_) | EmbedInput::TokenBatch(_) => Vec::new(),
             EmbedInput::Multi(items) => items
                 .iter()
                 .flat_map(|item| -> Vec<&str> {
@@ -107,6 +145,18 @@ pub struct EmbedRequest {
     pub dimensions: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
+    /// Any additional fields (e.g. Cohere's `input_type` override) captured
+    /// verbatim on deserialization and available to provider translation code.
+    ///
+    /// `skip_serializing`: unlike `ChatRequest::extra`, this map is a
+    /// gateway-side carrier only, NEVER re-serialized. The OpenAI-compatible
+    /// near-passthrough providers (openai, mistral, jina, voyage) serialize
+    /// the whole request as the outgoing body, and a strict upstream (vLLM
+    /// etc.) may reject unknown fields; providers that consume an extra field
+    /// (Cohere reads `input_type`) do so from the Rust field and write it into
+    /// their own body struct.
+    #[serde(flatten, skip_serializing)]
+    pub extra: Map<String, Value>,
 }
 
 /// Token accounting for embeddings.
@@ -122,16 +172,69 @@ pub struct EmbedUsage {
     pub estimated: Option<bool>,
 }
 
+/// How an [`EmbedData`] vector is serialized back to the client. Mirrors the
+/// OpenAI `encoding_format` request parameter (`"float"` / `"base64"`). Purely
+/// an output concern: internally the vector is always `Vec<f32>` and this never
+/// participates in deserialization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EmbeddingEncoding {
+    /// A JSON array of floats (the default).
+    #[default]
+    Float,
+    /// A base64 string of little-endian `f32` bytes (OpenAI's `"base64"`).
+    Base64,
+}
+
 /// A single embedding vector with its position in the batch.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct EmbedData {
     /// Always `"embedding"`.
     pub object: String,
     pub index: u32,
     /// The vector. Deserializes from either a float array or OpenAI's base64
-    /// form (little-endian f32 bytes); always serialized back as a float array.
+    /// form (little-endian f32 bytes); held internally as `Vec<f32>`.
     #[serde(deserialize_with = "deserialize_embedding")]
     pub embedding: Vec<f32>,
+    /// Output encoding chosen for the *client* response (set at the request
+    /// edge from `encoding_format`). Never present on the wire IN: it defaults
+    /// to [`EmbeddingEncoding::Float`] and is not deserialized.
+    #[serde(default, skip_deserializing)]
+    pub encoding: EmbeddingEncoding,
+}
+
+impl Serialize for EmbedData {
+    /// Serialize `embedding` per the chosen [`EmbeddingEncoding`]: a float array
+    /// by default, or an OpenAI-style base64 string of little-endian `f32` bytes
+    /// when `encoding_format: "base64"` was requested.
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut st = serializer.serialize_struct("EmbedData", 3)?;
+        st.serialize_field("object", &self.object)?;
+        st.serialize_field("index", &self.index)?;
+        match self.encoding {
+            EmbeddingEncoding::Float => st.serialize_field("embedding", &self.embedding)?,
+            EmbeddingEncoding::Base64 => {
+                st.serialize_field("embedding", &encode_embedding_base64(&self.embedding))?;
+            }
+        }
+        st.end()
+    }
+}
+
+/// Encode an embedding as OpenAI's base64 form: the little-endian bytes of each
+/// `f32`, concatenated, then standard base64. Inverse of the base64 branch of
+/// [`deserialize_embedding`].
+#[must_use]
+pub fn encode_embedding_base64(embedding: &[f32]) -> String {
+    use base64::Engine;
+    let mut bytes = Vec::with_capacity(embedding.len() * 4);
+    for f in embedding {
+        bytes.extend_from_slice(&f.to_le_bytes());
+    }
+    base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
 /// Deserialize an embedding as a float array or an OpenAI base64 string.
@@ -180,4 +283,88 @@ pub struct EmbedResponse {
     pub model: String,
     #[serde(default)]
     pub usage: EmbedUsage,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn single_token_array_parses_as_tokens_one_item() {
+        let input: EmbedInput = serde_json::from_str("[1,2,3]").expect("valid token array");
+        assert!(matches!(input, EmbedInput::Tokens(_)));
+        assert_eq!(input.len(), 1);
+        assert!(!input.is_empty());
+        assert_eq!(input.token_count(), 3);
+        // No text fragments; the estimator relies on `token_count` instead.
+        assert_eq!(input.text_iter().count(), 0);
+    }
+
+    #[test]
+    fn nested_token_arrays_parse_as_token_batch() {
+        let input: EmbedInput = serde_json::from_str("[[1,2],[3,4,5]]").expect("valid token batch");
+        assert!(matches!(input, EmbedInput::TokenBatch(_)));
+        assert_eq!(input.len(), 2);
+        assert_eq!(input.token_count(), 5);
+    }
+
+    #[test]
+    fn token_variants_round_trip_as_integer_arrays() {
+        let req: EmbedRequest =
+            serde_json::from_str(r#"{"model":"m","input":[1,2,3]}"#).expect("valid request");
+        let back = serde_json::to_value(&req).expect("serialize");
+        assert_eq!(back["input"], serde_json::json!([1, 2, 3]));
+
+        let req: EmbedRequest =
+            serde_json::from_str(r#"{"model":"m","input":[[1,2],[3,4]]}"#).expect("valid request");
+        let back = serde_json::to_value(&req).expect("serialize");
+        assert_eq!(back["input"], serde_json::json!([[1, 2], [3, 4]]));
+    }
+
+    #[test]
+    fn string_batch_still_wins_over_tokens() {
+        // Untagged order: an all-strings array stays `Batch`, empty stays `Batch`.
+        let input: EmbedInput = serde_json::from_str(r#"["a","b"]"#).expect("valid batch");
+        assert!(matches!(input, EmbedInput::Batch(_)));
+        let empty: EmbedInput = serde_json::from_str("[]").expect("valid empty batch");
+        assert!(matches!(empty, EmbedInput::Batch(_)));
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn embed_data_serializes_as_float_array_by_default() {
+        let data = EmbedData {
+            object: "embedding".to_owned(),
+            index: 0,
+            embedding: vec![1.0, 2.0],
+            encoding: EmbeddingEncoding::default(),
+        };
+        let v = serde_json::to_value(&data).expect("serialize");
+        assert_eq!(v["embedding"], serde_json::json!([1.0, 2.0]));
+    }
+
+    #[test]
+    fn embed_data_serializes_as_base64_when_requested() {
+        let data = EmbedData {
+            object: "embedding".to_owned(),
+            index: 0,
+            embedding: vec![1.0, 2.0],
+            encoding: EmbeddingEncoding::Base64,
+        };
+        let v = serde_json::to_value(&data).expect("serialize");
+        let b64 = v["embedding"].as_str().expect("base64 string");
+        // Round-trips back through the base64 deserializer to the same floats.
+        let json = format!(r#"{{"object":"embedding","index":0,"embedding":"{b64}"}}"#);
+        let back: EmbedData = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.embedding, vec![1.0, 2.0]);
+    }
+
+    #[test]
+    fn base64_encode_is_inverse_of_decode() {
+        let floats = vec![-0.5f32, 0.25, 1234.5];
+        let b64 = encode_embedding_base64(&floats);
+        let json = format!(r#"{{"object":"embedding","index":0,"embedding":"{b64}"}}"#);
+        let back: EmbedData = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.embedding, floats);
+    }
 }

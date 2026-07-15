@@ -21,6 +21,26 @@ use crate::error::ApiError;
 use crate::resilience::model_used_headers;
 use crate::state::AppState;
 
+/// Validate a Cohere `input_type` override (issue #22) up front, regardless of
+/// which provider ultimately serves the request, so an unknown value fails fast
+/// with LM-1001 rather than surfacing as an opaque upstream 400 (or, for a
+/// non-Cohere provider, being silently ignored while the caller believes it
+/// took effect).
+fn validate_input_type(req: &lumen_core::EmbedRequest) -> Result<(), GatewayError> {
+    if let Some(value) = req.extra.get("input_type") {
+        let is_allowed = value
+            .as_str()
+            .is_some_and(|s| lumen_providers::cohere::ALLOWED_INPUT_TYPES.contains(&s));
+        if !is_allowed {
+            return Err(GatewayError::InvalidRequest(format!(
+                "invalid `input_type` {value}: expected one of {:?}",
+                lumen_providers::cohere::ALLOWED_INPUT_TYPES
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Handle an embeddings request.
 pub async fn embeddings(
     State(state): State<AppState>,
@@ -35,6 +55,8 @@ pub async fn embeddings(
     if req.input.is_empty() {
         return Err(GatewayError::InvalidRequest("`input` must not be empty".to_owned()).into());
     }
+
+    validate_input_type(&req)?;
 
     // Resolve the requested model to a fallback chain (primary + configured
     // fallbacks), each re-resolved for the embed capability (M6 §6.2).
@@ -151,6 +173,17 @@ pub async fn embeddings(
         cost,
         status: 200,
     });
+
+    // Honor the client's requested output encoding (OpenAI `encoding_format`).
+    // Providers always decode to `Vec<f32>` internally; re-encode to base64 on
+    // the way out when asked, so the choice works for EVERY provider (Ollama and
+    // TEI have no upstream encoding_format). Any other value serializes as the
+    // default float array.
+    if req.encoding_format.as_deref() == Some("base64") {
+        for item in &mut response.data {
+            item.encoding = lumen_core::EmbeddingEncoding::Base64;
+        }
+    }
 
     Ok((model_used_headers(&executed.model_used), Json(response)).into_response())
 }

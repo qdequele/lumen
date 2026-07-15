@@ -15,7 +15,8 @@
 use std::cmp::Ordering;
 
 use lumen_core::{
-    ProviderError, RerankProvider, RerankRequest, RerankResponse, RerankResultDocument,
+    ProviderError, RerankDocument, RerankProvider, RerankRequest, RerankResponse,
+    RerankResultDocument,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -27,6 +28,24 @@ pub async fn rerank(
     mut req: RerankRequest,
     cancel: &CancellationToken,
 ) -> Result<RerankResponse, ProviderError> {
+    // Reduce object documents to a single ranking text at the edge, per
+    // `rank_fields`, so every downstream provider only ever sees plain text.
+    // A no-op for requests that are already all bare strings and set no
+    // `rank_fields` (the common path allocates nothing here).
+    if req.rank_fields.is_some()
+        || req
+            .documents
+            .iter()
+            .any(|d| matches!(d, RerankDocument::Object(_)))
+    {
+        let rank_fields = req.rank_fields.take();
+        let reduced: Vec<RerankDocument> = std::mem::take(&mut req.documents)
+            .into_iter()
+            .map(|d| RerankDocument::Text(d.into_rank_text(rank_fields.as_deref())))
+            .collect();
+        req.documents = reduced;
+    }
+
     let n_docs = req.documents.len();
 
     // Clamp top_n to the document count (silent - spec 3.1). Done before the
@@ -85,6 +104,7 @@ mod tests {
     struct StubProvider {
         results: Vec<RerankResult>,
         seen_top_n: std::sync::Mutex<Vec<Option<u32>>>,
+        seen_docs: std::sync::Mutex<Vec<String>>,
     }
 
     impl StubProvider {
@@ -92,6 +112,7 @@ mod tests {
             Self {
                 results,
                 seen_top_n: std::sync::Mutex::new(Vec::new()),
+                seen_docs: std::sync::Mutex::new(Vec::new()),
             }
         }
     }
@@ -104,11 +125,16 @@ mod tests {
             _cancel: CancellationToken,
         ) -> Result<RerankResponse, ProviderError> {
             self.seen_top_n.lock().expect("lock").push(req.top_n);
+            // Capture the text the provider actually receives (documents must be
+            // reduced to plain text at the edge before this point).
+            *self.seen_docs.lock().expect("lock") =
+                req.documents.iter().map(|d| d.text().to_owned()).collect();
             Ok(RerankResponse {
                 results: self.results.clone(),
                 usage: RerankUsage {
                     search_units: 1,
                     estimated: None,
+                    ..Default::default()
                 },
             })
         }
@@ -130,6 +156,7 @@ mod tests {
                 .iter()
                 .map(|s| lumen_core::RerankDocument::Text((*s).to_owned()))
                 .collect(),
+            rank_fields: None,
             top_n,
             return_documents,
         }
@@ -196,5 +223,42 @@ mod tests {
             .await
             .unwrap();
         assert!(resp.results[0].document.is_none());
+    }
+
+    #[tokio::test]
+    async fn object_documents_are_reduced_to_text_by_rank_fields_before_the_provider() {
+        let provider = StubProvider::new(vec![result(0, 0.9), result(1, 0.8)]);
+        let req: RerankRequest = serde_json::from_str(
+            r#"{
+                "model":"m",
+                "query":"q",
+                "documents":[
+                    {"title":"T1","body":"B1"},
+                    {"title":"T2","body":"B2"}
+                ],
+                "rank_fields":["title","body"]
+            }"#,
+        )
+        .unwrap();
+        let _ = rerank(&provider, req, &CancellationToken::new())
+            .await
+            .unwrap();
+        // The provider only ever saw plain concatenated text, never the objects.
+        let seen = provider.seen_docs.lock().unwrap();
+        assert_eq!(seen.as_slice(), &["T1\nB1".to_owned(), "T2\nB2".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn object_documents_without_rank_fields_fall_back_to_text_field() {
+        let provider = StubProvider::new(vec![result(0, 0.9)]);
+        let req: RerankRequest = serde_json::from_str(
+            r#"{"model":"m","query":"q","documents":[{"text":"hi","other":1}]}"#,
+        )
+        .unwrap();
+        let _ = rerank(&provider, req, &CancellationToken::new())
+            .await
+            .unwrap();
+        let seen = provider.seen_docs.lock().unwrap();
+        assert_eq!(seen.as_slice(), &["hi".to_owned()]);
     }
 }

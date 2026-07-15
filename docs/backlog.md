@@ -17,10 +17,15 @@ milestone.
 
 ## Noted while building M1
 
-- Token-array inputs for `/v1/embeddings` (`input` as arrays of token ids) are
-  not modelled - only string and string-batch. Add if a provider needs it.
-- Rerank `documents` accepts only strings; Cohere also allows objects. Reduce
-  object documents to text at the edge when a provider requires it.
+- ~~Token-array inputs for `/v1/embeddings` (`input` as arrays of token ids) are
+  not modelled - only string and string-batch.~~ **Resolved (issue #25).**
+  `EmbedInput` now models `Tokens` (`[1,2,3]`) and `TokenBatch` (`[[1,2],[3,4]]`);
+  they pass through natively on OpenAI-compatible providers and count one token
+  per id in the estimation fallback. Text-only providers (Cohere, TEI, Ollama,
+  Jina, Voyage, Mistral) reject them with a 400 (LM-1001) before any upstream
+  call.
+- ~~Rerank `documents` accepts only strings; Cohere also allows objects.~~
+  **Resolved (issue #25).** See the M3 note below.
 - `error_type()` collapses 401/402/429 into `invalid_request` because the public
   taxonomy only has three `type`s. Fine per `CLAUDE.md`, but note it's coarse.
 - Acceptance criterion "boot < 100 ms" is verified manually (M1); fold a real
@@ -31,12 +36,18 @@ milestone.
 
 ## Noted while building M2
 
-- Embedding output is always a float array in v1. Base64 embeddings are decoded
+- ~~Embedding output is always a float array in v1. Base64 embeddings are decoded
   on the way IN (a client requesting `encoding_format: "base64"` won't error),
-  but we do not re-encode on the way OUT. Add base64 *output* if a client needs it.
-- Ollama drops the OpenAI-only `dimensions` field with a `debug!` log; a client
-  asking for a specific dimension silently gets full-width vectors. Consider a
-  400 (LM-1001) when an unsupported-but-meaningful field is set under a strict mode.
+  but we do not re-encode on the way OUT.~~ **Resolved (issue #25).** When
+  `encoding_format: "base64"` is requested, the gateway re-encodes each vector as
+  OpenAI-style base64 at the response edge, so it works for every provider
+  (including Ollama and TEI, which have no upstream `encoding_format`).
+- ~~Ollama drops the OpenAI-only `dimensions` field with a `debug!` log; a client
+  asking for a specific dimension silently gets full-width vectors.~~ **Resolved
+  (issue #25).** A per-provider `strict = true` makes Ollama reject a request that
+  sets `dimensions` with a 400 (LM-1001) instead of silently dropping it; the
+  default stays lenient. `encoding_format` is no longer lost either (handled at
+  the edge, above).
 - `LM-1002` (payload too large, 413) is emitted by `RequestBodyLimitLayer` as a
   raw 413 without our JSON error envelope. Map the tower-http rejection to
   `GatewayError::PayloadTooLarge` for a consistent body.
@@ -49,15 +60,25 @@ milestone.
 ## Noted while building M3
 
 - Cohere v2 embed requires an `input_type`; the gateway can't know query-vs-
-  document intent, so it always sends `search_document`. Expose a per-request
-  or per-model override (`input_type`) if a caller needs `search_query`.
+  document intent by default, so it sends `search_document` unless overridden.
+  Resolved (issue #22): a caller may set `input_type` as an extra field on the
+  `/v1/embeddings` request body (`search_document`, `search_query`,
+  `classification`, or `clustering`); an unknown value is rejected with
+  `LM-1001` before any upstream call. See `docs/providers.md` § cohere. A
+  per-model default (config-side) is still open if per-request opt-in proves
+  insufficient in practice.
 - `usage.search_units` is only meaningful for Cohere; Jina and Voyage bill
-  rerank in tokens, so they report `0`. If token-based rerank usage matters for
-  M5 cost counting, widen `RerankUsage` (e.g. add `total_tokens`) rather than
-  overloading `search_units`.
-- Rerank `documents` accept string or `{text}` only. Cohere also allows
-  arbitrary objects with a `rank_fields` selector - out of scope; reduce to text
-  at the edge if a provider needs it.
+  rerank in tokens. Resolved (issue #10): `RerankUsage` now carries a separate
+  `total_tokens`/`tokens_estimated` pair, upstream-reported for Jina/Voyage and
+  gateway-derived (from `query + documents`) for every other provider.
+- ~~Rerank `documents` accept string or `{text}` only. Cohere also allows
+  arbitrary objects with a `rank_fields` selector - out of scope.~~ **Resolved
+  (issue #25).** `RerankDocument::Object` now keeps all fields; the request
+  carries an optional `rank_fields` selector, and the gateway reduces each object
+  document to a single ranking text at the edge (selected fields joined, or the
+  `text` field when no selector), so providers still only ever see plain text.
+  With `return_documents: true`, an object document echoes that reduced ranking
+  text in `document.text`, not the original JSON object.
 - TEI serves one model per process and ignores the request `model`/`top_n`; the
   gateway truncates to `top_n` after sorting. The configured `upstream_id` is
   informational for TEI. A future health/introspection hook could verify the
@@ -218,14 +239,16 @@ milestone.
 ## Provider coverage - next candidates (post-rename)
 
 - **Tier-2 clouds need dedicated kinds** (different auth/schema, not
-  OpenAI-compatible): Azure OpenAI (deployment routing + api-version), AWS
-  Bedrock (SigV4, per-model schemas), Google Vertex AI (GCP OAuth, regional
-  endpoints). Each is a `provider-integrator` task with wiremock tests.
+  OpenAI-compatible): ~~Azure OpenAI (deployment routing + api-version)~~
+  (shipped - `kind = "azure"`), AWS Bedrock (SigV4, per-model schemas),
+  Google Vertex AI (GCP OAuth, regional endpoints). Each is a
+  `provider-integrator` task with wiremock tests.
+- **Azure: dedicated `api_version` config field** - a desired fast-follow to
+  the shipped `azure` kind, which currently reads the version from an
+  `?api-version=...` query string on `base_url`. A first-class field needs a
+  matching `ProviderSpec` + `crates/server/src/config.rs` change.
 - **Cohere chat** (Command R/R+) - we ship Cohere embed+rerank; chat is a
   distinct schema.
-- **Cloudflare Workers AI rerank** - the OpenAI-compatible `cloudflare` kind
-  covers chat+embed; bge-reranker uses the native `/ai/run/{model}` endpoint
-  with a Cloudflare-specific response, so rerank needs custom code.
 - **More rerankers**: Mixedbread (mxbai-rerank), Pinecone Rerank, NVIDIA NIM
   rerank, Together LlamaRank - cheap differentiation for a first-class rerank
   gateway.

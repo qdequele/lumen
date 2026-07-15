@@ -30,7 +30,10 @@ pub use chat::{
     ChatChoice, ChatChunk, ChatChunkChoice, ChatDelta, ChatMessage, ChatRequest, ChatResponse,
     ContentPart, DataUri, ImageUrl, MessageContent, Usage,
 };
-pub use embed::{EmbedData, EmbedInput, EmbedItem, EmbedRequest, EmbedResponse, EmbedUsage};
+pub use embed::{
+    encode_embedding_base64, EmbedData, EmbedInput, EmbedItem, EmbedRequest, EmbedResponse,
+    EmbedUsage, EmbeddingEncoding,
+};
 pub use error::{ErrorBody, ErrorEnvelope, ErrorType, GatewayError, ProviderError, QuotaKind};
 pub use media::{measure_media, MediaTypeUsage, MediaUsage};
 pub use provider::{ChatProvider, EmbeddingProvider, RerankProvider};
@@ -172,6 +175,28 @@ mod tests {
     }
 
     #[test]
+    fn embed_request_captures_input_type_via_extra_without_reserializing_it() {
+        // A caller-supplied `input_type` (Cohere's search_query vs
+        // search_document override, issue #22) is captured into `extra` for
+        // provider translation code, but is NOT re-serialized: the
+        // OpenAI-compatible passthrough providers send the serialized request
+        // as the outgoing body and unknown fields must stop at the gateway.
+        let raw = r#"{"model":"m","input":"hello","input_type":"search_query"}"#;
+        let req: EmbedRequest = serde_json::from_str(raw).unwrap();
+        assert_eq!(
+            req.extra.get("input_type").and_then(|v| v.as_str()),
+            Some("search_query")
+        );
+        let back = serde_json::to_value(&req).unwrap();
+        assert!(
+            back.get("input_type").is_none(),
+            "extra fields must not re-serialize, got: {back}"
+        );
+        assert_eq!(back["model"], "m");
+        assert_eq!(back["input"], "hello");
+    }
+
+    #[test]
     fn rerank_request_parses_cohere_shape() {
         let req: RerankRequest = serde_json::from_str(
             r#"{"model":"rerank-v3","query":"q","documents":["d1","d2"],"top_n":1}"#,
@@ -208,6 +233,7 @@ mod tests {
             usage: RerankUsage {
                 search_units: 1,
                 estimated: None,
+                ..Default::default()
             },
         };
         let json = serde_json::to_value(&resp).unwrap();

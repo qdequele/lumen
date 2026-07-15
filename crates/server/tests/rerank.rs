@@ -21,6 +21,7 @@ fn registry_for(upstream: &str) -> Arc<Registry> {
         kind: ProviderKind::Cohere,
         api_key: Some("sk-test-xxx".to_owned()),
         base_url: Some(upstream.to_owned()),
+        strict: false,
         models: vec![
             ModelSpec {
                 id: "rerank-fast".to_owned(),
@@ -250,4 +251,170 @@ async fn upstream_5xx_propagates_as_502_fg3003() {
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["error"]["code"], "LM-3003");
     assert_eq!(body["error"]["type"], "upstream_error");
+}
+
+// --------------------------------------------------------------------------
+// Token-based rerank usage (issue #10) - Jina/Voyage bill in tokens, not
+// search units. `usage.total_tokens`, when the upstream reports it, must
+// surface un-flagged (not estimated); when absent, the gateway must fall
+// back to a local, non-zero estimate flagged `tokens_estimated: true`.
+// --------------------------------------------------------------------------
+
+/// Registry with one Jina-kind provider pointed at `upstream`, exposing a
+/// rerank model.
+fn registry_for_jina(upstream: &str) -> Arc<Registry> {
+    let specs = vec![ProviderSpec {
+        name: "jina".to_owned(),
+        kind: ProviderKind::Jina,
+        api_key: Some("sk-test-xxx".to_owned()),
+        base_url: Some(upstream.to_owned()),
+        strict: false,
+        models: vec![ModelSpec {
+            id: "jina-rerank".to_owned(),
+            upstream_id: "jina-reranker-v2".to_owned(),
+            capabilities: vec![Capability::Rerank],
+            modalities: vec!["text".to_owned()],
+        }],
+    }];
+    Arc::new(Registry::build(specs, http::build_client()).expect("registry builds"))
+}
+
+/// Registry with one Voyage-kind provider pointed at `upstream`, exposing a
+/// rerank model.
+fn registry_for_voyage(upstream: &str) -> Arc<Registry> {
+    let specs = vec![ProviderSpec {
+        name: "voyage".to_owned(),
+        kind: ProviderKind::Voyage,
+        api_key: Some("sk-test-xxx".to_owned()),
+        base_url: Some(upstream.to_owned()),
+        strict: false,
+        models: vec![ModelSpec {
+            id: "voyage-rerank".to_owned(),
+            upstream_id: "rerank-2".to_owned(),
+            capabilities: vec![Capability::Rerank],
+            modalities: vec!["text".to_owned()],
+        }],
+    }];
+    Arc::new(Registry::build(specs, http::build_client()).expect("registry builds"))
+}
+
+#[tokio::test]
+async fn jina_upstream_total_tokens_surface_as_not_estimated() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/rerank"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "results": [{ "index": 0, "relevance_score": 0.9 }],
+            "usage": { "total_tokens": 42 }
+        })))
+        .mount(&upstream)
+        .await;
+
+    let base = common::spawn_with(registry_for_jina(&upstream.uri()), LIMIT).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/rerank"))
+        .json(&json!({ "model": "jina-rerank", "query": "q", "documents": ["a"] }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["usage"]["total_tokens"], 42);
+    // Upstream-reported: never flagged estimated.
+    assert!(body["usage"].get("tokens_estimated").is_none());
+}
+
+#[tokio::test]
+async fn jina_missing_usage_falls_back_to_local_token_estimate() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/rerank"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "results": [{ "index": 0, "relevance_score": 0.9 }]
+        })))
+        .mount(&upstream)
+        .await;
+
+    let base = common::spawn_with(registry_for_jina(&upstream.uri()), LIMIT).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/rerank"))
+        .json(&json!({
+            "model": "jina-rerank",
+            "query": "best fruit for pie",
+            "documents": ["apple", "banana"]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    let tokens = body["usage"]["total_tokens"]
+        .as_u64()
+        .expect("total_tokens");
+    assert!(tokens > 0, "gateway must derive a non-zero local estimate");
+    assert_eq!(body["usage"]["tokens_estimated"], true);
+}
+
+#[tokio::test]
+async fn voyage_upstream_total_tokens_surface_as_not_estimated() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/rerank"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [{ "index": 0, "relevance_score": 0.9 }],
+            "usage": { "total_tokens": 17 }
+        })))
+        .mount(&upstream)
+        .await;
+
+    let base = common::spawn_with(registry_for_voyage(&upstream.uri()), LIMIT).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/rerank"))
+        .json(&json!({ "model": "voyage-rerank", "query": "q", "documents": ["a"] }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["usage"]["total_tokens"], 17);
+    assert!(body["usage"].get("tokens_estimated").is_none());
+}
+
+#[tokio::test]
+async fn voyage_missing_usage_falls_back_to_local_token_estimate() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/rerank"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [{ "index": 0, "relevance_score": 0.9 }]
+        })))
+        .mount(&upstream)
+        .await;
+
+    let base = common::spawn_with(registry_for_voyage(&upstream.uri()), LIMIT).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/rerank"))
+        .json(&json!({
+            "model": "voyage-rerank",
+            "query": "best fruit for pie",
+            "documents": ["apple", "banana"]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    let tokens = body["usage"]["total_tokens"]
+        .as_u64()
+        .expect("total_tokens");
+    assert!(tokens > 0, "gateway must derive a non-zero local estimate");
+    assert_eq!(body["usage"]["tokens_estimated"], true);
 }

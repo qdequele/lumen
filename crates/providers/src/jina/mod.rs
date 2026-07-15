@@ -3,7 +3,9 @@
 //! Jina's embeddings endpoint is OpenAI-compatible, so the embed path is a
 //! near-passthrough (like [`crate::openai`]). Reranking (`POST /rerank`) is
 //! Cohere-shaped but bills in tokens rather than search units, so
-//! `usage.search_units` is reported as `0` (the value does not apply).
+//! `usage.search_units` is reported as `0` (the value does not apply);
+//! `usage.total_tokens` carries Jina's reported token count instead (ADR
+//! 003, issue #10).
 
 use async_trait::async_trait;
 use lumen_core::{
@@ -72,6 +74,11 @@ impl EmbeddingProvider for JinaProvider {
         req: EmbedRequest,
         cancel: CancellationToken,
     ) -> Result<EmbedResponse, ProviderError> {
+        // Jina's embeddings API takes text (or multimodal objects), never
+        // token-id arrays; the passthrough would forward a raw int array and
+        // fail opaquely upstream. Honest 400 before any call (issue #25).
+        crate::mapping::reject_pretokenized_input(&self.provider_name, &req.input)?;
+
         // OpenAI-compatible schema: near-passthrough for text. A multimodal
         // (content-parts) request translates to Jina's object-`input` array
         // (`{"text":...}` / `{"image":...}`), one element per item; the response
@@ -146,12 +153,21 @@ struct JinaRerankRequest<'a> {
 struct JinaRerankResponse {
     #[serde(default)]
     results: Vec<JinaRerankResult>,
+    /// Jina bills reranking in tokens; absent when the upstream omits usage.
+    #[serde(default)]
+    usage: Option<JinaRerankUsage>,
 }
 
 #[derive(Deserialize)]
 struct JinaRerankResult {
     index: u32,
     relevance_score: f32,
+}
+
+#[derive(Deserialize)]
+struct JinaRerankUsage {
+    #[serde(default)]
+    total_tokens: u32,
 }
 
 #[async_trait]
@@ -197,10 +213,15 @@ impl RerankProvider for JinaProvider {
                     document: None,
                 })
                 .collect(),
-            // Jina bills in tokens, not search units; the field does not apply.
+            // Jina bills in tokens, not search units; `search_units` does not
+            // apply. `total_tokens` carries the upstream-reported count
+            // (issue #10); 0 when the upstream omitted `usage`, which the
+            // gateway then falls back to a local estimate for (ADR 003).
             usage: RerankUsage {
                 search_units: 0,
                 estimated: None,
+                total_tokens: parsed.usage.map_or(0, |u| u.total_tokens),
+                ..Default::default()
             },
         })
     }

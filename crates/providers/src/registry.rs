@@ -14,6 +14,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::anthropic::AnthropicProvider;
+use crate::azure::AzureProvider;
+use crate::cloudflare::CloudflareRerankProvider;
 use crate::cohere::CohereProvider;
 use crate::google::GoogleProvider;
 use crate::jina::JinaProvider;
@@ -50,6 +52,10 @@ pub struct ProviderSpec {
     pub api_key: Option<String>,
     /// Base URL override.
     pub base_url: Option<String>,
+    /// Reject requests that set an unsupported-but-meaningful field (rather than
+    /// silently dropping it). Currently honored by Ollama for `dimensions`
+    /// (issue #25). Defaults to `false` (lenient).
+    pub strict: bool,
     /// Models this provider serves.
     pub models: Vec<ModelSpec>,
 }
@@ -63,6 +69,7 @@ impl std::fmt::Debug for ProviderSpec {
             .field("kind", &self.kind)
             .field("api_key", &self.api_key.as_ref().map(|_| "REDACTED"))
             .field("base_url", &self.base_url)
+            .field("strict", &self.strict)
             .field("models", &self.models)
             .finish()
     }
@@ -388,12 +395,14 @@ fn build_providers(
 
     match spec.kind {
         // OpenAI + every OpenAI-compatible host (Groq, Together, Fireworks,
-        // DeepSeek, OpenRouter, Perplexity, xAI, DeepInfra, Hugging Face router,
-        // Cloudflare Workers AI, self-hosted vLLM/llama.cpp/LM Studio) share the
-        // OpenAI provider; only the base URL differs. The base is the explicit
-        // override, else the kind's built-in default. Kinds with neither (vLLM,
-        // Cloudflare - its URL carries the account id) must not silently fall
-        // through to api.openai.com, so a missing URL is a build error.
+        // DeepSeek, OpenRouter, Perplexity, xAI, DeepInfra, Hugging Face
+        // router, self-hosted vLLM/llama.cpp/LM Studio) share the OpenAI
+        // provider; only the base URL differs. The base is the explicit
+        // override, else the kind's built-in default. Kinds with no built-in
+        // default (vLLM) must not silently fall through to api.openai.com, so
+        // a missing URL is a build error. Cloudflare Workers AI has its own
+        // arm below: it shares this chat/embed wiring but also builds a
+        // native rerank provider from the same `base_url`.
         ProviderKind::Openai
         | ProviderKind::Groq
         | ProviderKind::Together
@@ -404,7 +413,6 @@ fn build_providers(
         | ProviderKind::Xai
         | ProviderKind::Deepinfra
         | ProviderKind::Huggingface
-        | ProviderKind::Cloudflare
         | ProviderKind::Vllm => {
             let base_url = spec
                 .base_url
@@ -433,6 +441,37 @@ fn build_providers(
                 chat: Some(chat),
                 embed: Some(embed),
                 rerank: None,
+            })
+        }
+        // Cloudflare Workers AI: chat + embed via the same OpenAI-compatible
+        // wiring as above (its `base_url` carries the account id, so it is
+        // always required - never falls through to a built-in default), plus
+        // rerank via the native `/ai/run/{model}` endpoint (bge-reranker-*),
+        // which is not OpenAI-shaped (see `crate::cloudflare`).
+        ProviderKind::Cloudflare => {
+            let base_url = require_base_url()?;
+            let chat: Arc<dyn ChatProvider> = Arc::new(OpenAiProvider::new(
+                client.clone(),
+                spec.name.clone(),
+                Some(base_url.clone()),
+                spec.api_key.clone(),
+            ));
+            let embed: Arc<dyn EmbeddingProvider> = Arc::new(OpenAiProvider::new(
+                client.clone(),
+                spec.name.clone(),
+                Some(base_url.clone()),
+                spec.api_key.clone(),
+            ));
+            let rerank: Arc<dyn RerankProvider> = Arc::new(CloudflareRerankProvider::new(
+                client.clone(),
+                spec.name.clone(),
+                base_url,
+                spec.api_key.clone(),
+            ));
+            Ok(BuiltProviders {
+                chat: Some(chat),
+                embed: Some(embed),
+                rerank: Some(rerank),
             })
         }
         ProviderKind::Mistral => {
@@ -469,6 +508,7 @@ fn build_providers(
                 client.clone(),
                 spec.name.clone(),
                 base_url,
+                spec.strict,
             ));
             Ok(BuiltProviders {
                 chat: None,
@@ -550,6 +590,24 @@ fn build_providers(
                 rerank: None,
             })
         }
+        ProviderKind::Azure => {
+            // Every Azure resource endpoint is operator-specific - there is no
+            // shared public default (unlike `openai`).
+            let base_url = require_base_url()?;
+            let provider = Arc::new(AzureProvider::new(
+                client.clone(),
+                spec.name.clone(),
+                &base_url,
+                spec.api_key.clone(),
+            ));
+            let chat: Arc<dyn ChatProvider> = provider.clone();
+            let embed: Arc<dyn EmbeddingProvider> = provider;
+            Ok(BuiltProviders {
+                chat: Some(chat),
+                embed: Some(embed),
+                rerank: None,
+            })
+        }
     }
 }
 
@@ -576,6 +634,7 @@ mod tests {
             kind,
             api_key: Some("sk-test-xxx".to_owned()),
             base_url: base_url.map(str::to_owned),
+            strict: false,
             models,
         }
     }
@@ -690,6 +749,38 @@ mod tests {
     }
 
     #[test]
+    fn azure_without_base_url_is_a_build_error() {
+        // Azure has no shared public default endpoint (every resource is
+        // operator-specific), unlike `openai`.
+        let result = Registry::build(
+            vec![spec(
+                ProviderKind::Azure,
+                "azure",
+                None,
+                vec![model("m", &[Capability::Chat])],
+            )],
+            reqwest::Client::new(),
+        );
+        assert!(matches!(result, Err(RegistryError::MissingBaseUrl { .. })));
+    }
+
+    #[test]
+    fn azure_with_base_url_resolves_chat_and_embed() {
+        let reg = Registry::build(
+            vec![spec(
+                ProviderKind::Azure,
+                "azure",
+                Some("https://my-resource.openai.azure.com"),
+                vec![model("m", &[Capability::Chat, Capability::Embed])],
+            )],
+            reqwest::Client::new(),
+        )
+        .unwrap();
+        assert!(reg.chat_route("m").is_some());
+        assert!(reg.embedding_route("m").is_some());
+    }
+
+    #[test]
     fn tei_without_base_url_is_a_build_error() {
         let result = Registry::build(
             vec![spec(
@@ -740,6 +831,29 @@ mod tests {
         .unwrap();
         assert!(reg.embedding_route("multi").is_some());
         assert!(reg.rerank_route("multi").is_some());
+    }
+
+    #[test]
+    fn cloudflare_model_resolves_for_chat_embed_and_native_rerank() {
+        // A single `cloudflare` provider entry serves all three capabilities:
+        // chat + embed via the OpenAI-compatible path, rerank via the native
+        // `/ai/run/{model}` endpoint - all against the same `base_url`.
+        let reg = Registry::build(
+            vec![spec(
+                ProviderKind::Cloudflare,
+                "cf",
+                Some("https://api.cloudflare.com/client/v4/accounts/acct123/ai/v1"),
+                vec![model(
+                    "cf-multi",
+                    &[Capability::Chat, Capability::Embed, Capability::Rerank],
+                )],
+            )],
+            reqwest::Client::new(),
+        )
+        .unwrap();
+        assert!(reg.chat_route("cf-multi").is_some());
+        assert!(reg.embedding_route("cf-multi").is_some());
+        assert!(reg.rerank_route("cf-multi").is_some());
     }
 
     #[test]

@@ -4,63 +4,124 @@
 //! spec: a request carries a `query` and `documents` (each a bare string or a
 //! `{ "text": ... }` object); the response carries `results` ordered by
 //! descending `relevance_score`, each result's `index` pointing back to the
-//! original document position, plus a `usage.search_units` count.
+//! original document position, plus a `usage.search_units` count and (ADR
+//! 003) a `usage.total_tokens` count for token-billing providers.
 //!
 //! Providers translate their own wire schema to/from these types; the gateway
 //! (see `lumen_providers::rerank`) guarantees ordering, `top_n` clamping and
 //! optional document echoing regardless of what the upstream does.
 
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 
-/// A document to rerank: either a bare string or `{ "text": "..." }`.
+/// A document to rerank: a bare string, `{ "text": "..." }`, or (Cohere) an
+/// arbitrary JSON object whose fields are selected by the request's
+/// [`rank_fields`](RerankRequest::rank_fields).
 ///
-/// Both forms carry only text in v1 (Cohere also allows arbitrary objects with
-/// a `rank_fields` selector - intentionally out of scope, see `docs/backlog.md`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Object documents are reduced to a single ranking text at the gateway edge
+/// (see `lumen_providers::rerank`) before any provider is called, so providers
+/// still only ever see plain text. When `rank_fields` is set, the named fields
+/// are stringified and joined; otherwise the object's `text` field is used.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum RerankDocument {
     /// A bare string document.
     Text(String),
-    /// An object document; only its `text` field is used.
-    Object {
-        /// The document text.
-        text: String,
-    },
+    /// An object document. `{ "text": "..." }` is the common case; any other
+    /// fields are kept so `rank_fields` can select them.
+    Object(Map<String, Value>),
 }
 
 impl RerankDocument {
-    /// Borrow the document text, regardless of which form it took.
+    /// Borrow the document text, regardless of which form it took. An object
+    /// without a string `text` field borrows the empty string (the ranking text
+    /// is computed separately by [`into_rank_text`](Self::into_rank_text)).
     #[must_use]
     pub fn text(&self) -> &str {
         match self {
-            RerankDocument::Text(s) | RerankDocument::Object { text: s } => s,
+            RerankDocument::Text(s) => s,
+            RerankDocument::Object(map) => {
+                map.get("text").and_then(Value::as_str).unwrap_or_default()
+            }
         }
     }
 
-    /// Consume the document, yielding its text.
+    /// Consume the document, yielding its `text` (the empty string for an object
+    /// without a string `text` field).
     #[must_use]
     pub fn into_text(self) -> String {
         match self {
-            RerankDocument::Text(s) | RerankDocument::Object { text: s } => s,
+            RerankDocument::Text(s) => s,
+            RerankDocument::Object(mut map) => match map.remove("text") {
+                Some(Value::String(s)) => s,
+                _ => String::new(),
+            },
         }
+    }
+
+    /// Consume the document, reducing it to the single text used for ranking.
+    ///
+    /// Bare strings are returned unchanged (`rank_fields` never applies to
+    /// them). For object documents: when `rank_fields` is `Some` and non-empty,
+    /// the selected fields' values are stringified (strings verbatim, other JSON
+    /// values via their compact JSON form) and joined with newlines in selector
+    /// order, skipping absent fields (Cohere semantics); otherwise the object's
+    /// `text` field is used.
+    #[must_use]
+    pub fn into_rank_text(self, rank_fields: Option<&[String]>) -> String {
+        match self {
+            RerankDocument::Text(s) => s,
+            RerankDocument::Object(map) => match rank_fields {
+                Some(fields) if !fields.is_empty() => fields
+                    .iter()
+                    .filter_map(|f| map.get(f).map(value_to_text))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                _ => map
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .unwrap_or_default(),
+            },
+        }
+    }
+}
+
+/// Stringify a JSON value for ranking: strings verbatim, everything else via its
+/// compact JSON representation.
+fn value_to_text(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
     }
 }
 
 /// A rerank request.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RerankRequest {
     /// Client-facing model id.
     pub model: String,
     /// The query to score documents against.
     pub query: String,
-    /// Documents to score. Accepts bare strings or `{ "text": ... }` objects.
+    /// Documents to score. Accepts bare strings, `{ "text": ... }` objects, or
+    /// arbitrary objects whose fields are selected by `rank_fields`.
     pub documents: Vec<RerankDocument>,
+    /// Fields of object documents to concatenate for ranking, in order (Cohere's
+    /// `rank_fields`). Ignored for bare-string documents. When omitted, object
+    /// documents fall back to their `text` field. The gateway reduces each
+    /// object document to a single ranking text at the edge; note that
+    /// `return_documents` then echoes that REDUCED ranking text (as
+    /// `document.text`), not the original JSON object.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rank_fields: Option<Vec<String>>,
     /// Return at most this many top results. Values larger than the document
     /// count are clamped silently by the gateway.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub top_n: Option<u32>,
     /// Echo each result's source document text back in `document`. Defaults to
-    /// `false` to save bandwidth (M3 acceptance criterion 5).
+    /// `false` to save bandwidth (M3 acceptance criterion 5). For object
+    /// documents this echoes the text the gateway actually ranked (the
+    /// `rank_fields` reduction, or the `text` field), never the original object.
     #[serde(default)]
     pub return_documents: bool,
 }
@@ -87,6 +148,15 @@ pub struct RerankResult {
 }
 
 /// Billing/accounting for a rerank call.
+///
+/// Rerank is billed in **search units** by Cohere and in **tokens** by
+/// Jina/Voyage (ADR 003). Both counts are carried independently rather than
+/// overloading one field: `search_units` is Cohere's billing unit,
+/// `total_tokens` is the token count of `query + documents` that Jina/Voyage
+/// report (and that the gateway derives for every other provider, for
+/// uniform observability). Each count has its own `*_estimated` flag since a
+/// response can carry a real `search_units` alongside a derived
+/// `total_tokens`, or vice versa.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct RerankUsage {
     /// Number of search units billed (Cohere's unit; one per rerank call over a
@@ -97,6 +167,16 @@ pub struct RerankUsage {
     /// upstream reported none (ADR 003); omitted for upstream-reported usage.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub estimated: Option<bool>,
+    /// Token count of `query + documents`, for providers that bill rerank in
+    /// tokens (Jina, Voyage) - and, per ADR 003, for every provider so
+    /// observability stays uniform. Upstream-reported when available
+    /// (Jina/Voyage's `usage.total_tokens`), otherwise gateway-derived.
+    #[serde(default)]
+    pub total_tokens: u32,
+    /// `Some(true)` when the gateway derived `total_tokens` itself because the
+    /// upstream reported none (ADR 003); omitted for upstream-reported usage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens_estimated: Option<bool>,
 }
 
 /// A rerank response, ordered by descending `relevance_score`.
@@ -107,4 +187,64 @@ pub struct RerankResponse {
     /// Usage accounting.
     #[serde(default)]
     pub usage: RerankUsage,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn arbitrary_object_document_preserves_all_fields() {
+        let doc: RerankDocument =
+            serde_json::from_str(r#"{"title":"T","body":"B","score":3}"#).expect("valid object");
+        assert!(matches!(doc, RerankDocument::Object(_)));
+        // No `text` field: `text()` borrows the empty string.
+        assert_eq!(doc.text(), "");
+    }
+
+    #[test]
+    fn text_object_still_exposes_text() {
+        let doc: RerankDocument =
+            serde_json::from_str(r#"{"text":"hello","extra":1}"#).expect("valid object");
+        assert_eq!(doc.text(), "hello");
+        assert_eq!(doc.clone().into_text(), "hello");
+        // Without rank_fields, ranking text is the `text` field.
+        assert_eq!(doc.into_rank_text(None), "hello");
+    }
+
+    #[test]
+    fn rank_fields_concatenate_selected_fields_in_order() {
+        let doc: RerankDocument =
+            serde_json::from_str(r#"{"title":"T","body":"B","meta":"M"}"#).expect("valid object");
+        let fields = vec!["body".to_owned(), "title".to_owned()];
+        // Selector order, not document order; absent fields skipped.
+        assert_eq!(doc.into_rank_text(Some(&fields)), "B\nT");
+    }
+
+    #[test]
+    fn rank_fields_stringify_non_string_values() {
+        let doc: RerankDocument =
+            serde_json::from_str(r#"{"n":42,"flag":true}"#).expect("valid object");
+        let fields = vec!["n".to_owned(), "flag".to_owned()];
+        assert_eq!(doc.into_rank_text(Some(&fields)), "42\ntrue");
+    }
+
+    #[test]
+    fn rank_fields_do_not_apply_to_bare_strings() {
+        let doc = RerankDocument::Text("bare".to_owned());
+        let fields = vec!["title".to_owned()];
+        assert_eq!(doc.into_rank_text(Some(&fields)), "bare");
+    }
+
+    #[test]
+    fn request_parses_rank_fields() {
+        let req: RerankRequest = serde_json::from_str(
+            r#"{"model":"m","query":"q","documents":[{"title":"a"}],"rank_fields":["title"]}"#,
+        )
+        .expect("valid request");
+        assert_eq!(
+            req.rank_fields.as_deref(),
+            Some(["title".to_owned()].as_slice())
+        );
+    }
 }

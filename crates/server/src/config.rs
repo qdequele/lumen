@@ -353,6 +353,12 @@ pub struct ProviderConfig {
     /// [`ResilienceConfig::total_timeout_ms`]).
     #[serde(default)]
     pub total_timeout_ms: Option<u64>,
+    /// Reject requests that set an unsupported-but-meaningful field instead of
+    /// silently dropping it (issue #25). Currently honored by Ollama for
+    /// `dimensions`: strict returns a 400 (`LM-1001`); lenient (the default)
+    /// drops it with a debug log.
+    #[serde(default)]
+    pub strict: bool,
     /// Models this provider exposes.
     #[serde(default)]
     pub models: Vec<ModelConfig>,
@@ -778,6 +784,7 @@ impl Config {
                     .as_ref()
                     .and_then(|var| std::env::var(var).ok()),
                 base_url: p.base_url.clone(),
+                strict: p.strict,
                 models: p
                     .models
                     .iter()

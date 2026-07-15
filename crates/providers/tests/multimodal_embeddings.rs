@@ -37,6 +37,7 @@ fn multimodal_request(model: &str) -> EmbedRequest {
         encoding_format: None,
         dimensions: None,
         user: None,
+        extra: serde_json::Map::new(),
     }
 }
 
@@ -84,6 +85,36 @@ async fn cohere_multimodal_uses_inputs_content_array() {
 }
 
 #[tokio::test]
+async fn cohere_multimodal_honors_input_type_override() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "embeddings": { "float": [[0.1, 0.2]] },
+            "meta": { "billed_units": { "input_tokens": 5 } }
+        })))
+        .mount(&upstream)
+        .await;
+
+    let provider: Arc<dyn EmbeddingProvider> = Arc::new(CohereProvider::new(
+        http::build_client(),
+        "cohere-test",
+        Some(upstream.uri()),
+        Some("sk-x".to_owned()),
+    ));
+
+    let mut req = multimodal_request("embed-v4.0");
+    req.extra
+        .insert("input_type".to_owned(), json!("search_query"));
+    provider
+        .embed(req, CancellationToken::new())
+        .await
+        .expect("embed ok");
+
+    let body = sent_body(&upstream).await;
+    assert_eq!(body["input_type"], "search_query");
+}
+
+#[tokio::test]
 async fn cohere_text_only_still_uses_texts() {
     let upstream = MockServer::start().await;
     Mock::given(method("POST"))
@@ -107,6 +138,7 @@ async fn cohere_text_only_still_uses_texts() {
         encoding_format: None,
         dimensions: None,
         user: None,
+        extra: serde_json::Map::new(),
     };
     provider.embed(req, CancellationToken::new()).await.unwrap();
 
@@ -180,6 +212,7 @@ async fn voyage_text_only_uses_openai_embeddings_endpoint() {
         encoding_format: None,
         dimensions: None,
         user: None,
+        extra: serde_json::Map::new(),
     };
     provider.embed(req, CancellationToken::new()).await.unwrap();
 
@@ -229,6 +262,7 @@ async fn jina_multimodal_uses_input_object_array() {
         encoding_format: None,
         dimensions: None,
         user: None,
+        extra: serde_json::Map::new(),
     };
     provider.embed(req, CancellationToken::new()).await.unwrap();
 

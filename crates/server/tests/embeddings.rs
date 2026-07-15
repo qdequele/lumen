@@ -21,6 +21,7 @@ fn registry_for(upstream: &str) -> Arc<Registry> {
         kind: ProviderKind::Openai,
         api_key: Some("sk-test-xxx".to_owned()),
         base_url: Some(upstream.to_owned()),
+        strict: false,
         models: vec![
             ModelSpec {
                 id: "embed-small".to_owned(),
@@ -41,6 +42,25 @@ fn registry_for(upstream: &str) -> Arc<Registry> {
                 modalities: vec!["text".to_owned(), "image".to_owned()],
             },
         ],
+    }];
+    Arc::new(Registry::build(specs, http::build_client()).expect("registry builds"))
+}
+
+/// Registry with one Cohere-kind provider pointed at `upstream`, exposing a
+/// single embedding model (issue #22 `input_type` override tests).
+fn registry_for_cohere(upstream: &str) -> Arc<Registry> {
+    let specs = vec![ProviderSpec {
+        name: "cohere".to_owned(),
+        kind: ProviderKind::Cohere,
+        api_key: Some("sk-test-xxx".to_owned()),
+        base_url: Some(upstream.to_owned()),
+        strict: false,
+        models: vec![ModelSpec {
+            id: "embed-multilingual".to_owned(),
+            upstream_id: "embed-v4.0".to_owned(),
+            capabilities: vec![Capability::Embed],
+            modalities: vec!["text".to_owned()],
+        }],
     }];
     Arc::new(Registry::build(specs, http::build_client()).expect("registry builds"))
 }
@@ -79,6 +99,89 @@ async fn happy_path_returns_openai_format_and_resolves_alias() {
     let requests = upstream.received_requests().await.unwrap();
     let sent: Value = serde_json::from_slice(&requests[0].body).unwrap();
     assert_eq!(sent["model"], "text-embedding-3-small");
+}
+
+#[tokio::test]
+async fn base64_encoding_format_re_encodes_vectors_on_the_way_out() {
+    let upstream = MockServer::start().await;
+    // Upstream returns a plain float array; the gateway must re-encode it as
+    // base64 because the CLIENT asked for encoding_format: "base64" (issue #25).
+    Mock::given(method("POST"))
+        .and(path("/embeddings"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "object": "list",
+            "data": [{ "object": "embedding", "index": 0, "embedding": [1.0, 2.0] }],
+            "model": "text-embedding-3-small",
+            "usage": { "prompt_tokens": 3, "total_tokens": 3 }
+        })))
+        .mount(&upstream)
+        .await;
+
+    let base = common::spawn_with(registry_for(&upstream.uri()), LIMIT).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/embeddings"))
+        .json(&json!({
+            "model": "embed-small",
+            "input": "hello",
+            "encoding_format": "base64"
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    // The vector is now a base64 string, not a float array.
+    let b64 = body["data"][0]["embedding"]
+        .as_str()
+        .expect("base64 string embedding");
+    let expected = lumen_core::encode_embedding_base64(&[1.0, 2.0]);
+    assert_eq!(b64, expected);
+}
+
+#[tokio::test]
+async fn token_input_to_text_only_provider_is_400_fg1001_without_upstream_call() {
+    // A TEI-kind provider cannot consume pre-tokenized input; the gateway must
+    // return an honest 400 (LM-1001) and never contact the upstream (issue #25
+    // review). No mock is mounted: any upstream call would still show up in
+    // `received_requests`.
+    let upstream = MockServer::start().await;
+    let specs = vec![ProviderSpec {
+        name: "tei".to_owned(),
+        kind: ProviderKind::Tei,
+        api_key: None,
+        base_url: Some(upstream.uri()),
+        strict: false,
+        models: vec![ModelSpec {
+            id: "tei-embed".to_owned(),
+            upstream_id: "tei-embed".to_owned(),
+            capabilities: vec![Capability::Embed],
+            modalities: vec!["text".to_owned()],
+        }],
+    }];
+    let registry = Arc::new(Registry::build(specs, http::build_client()).expect("registry builds"));
+    let base = common::spawn_with(registry, LIMIT).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/embeddings"))
+        .json(&json!({ "model": "tei-embed", "input": [[1, 2], [3, 4]] }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 400);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "LM-1001");
+    assert_eq!(body["error"]["type"], "invalid_request");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("pre-tokenized"),
+        "message names the input shape: {body}"
+    );
+    assert!(upstream.received_requests().await.unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -285,6 +388,62 @@ async fn empty_input_is_400_fg1001() {
     assert_eq!(resp.status(), 400);
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["error"]["code"], "LM-1001");
+}
+
+#[tokio::test]
+async fn unknown_input_type_is_400_lm1001() {
+    let upstream = MockServer::start().await;
+    let base = common::spawn_with(registry_for_cohere(&upstream.uri()), LIMIT).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/embeddings"))
+        .json(&json!({
+            "model": "embed-multilingual",
+            "input": "hello",
+            "input_type": "not_a_real_type"
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 400);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "LM-1001");
+
+    // Rejected before any upstream call.
+    assert!(upstream.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn input_type_override_reaches_cohere_upstream() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v2/embed"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "embeddings": { "float": [[0.1, 0.2]] },
+            "meta": { "billed_units": { "input_tokens": 2 } }
+        })))
+        .mount(&upstream)
+        .await;
+
+    let base = common::spawn_with(registry_for_cohere(&upstream.uri()), LIMIT).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/embeddings"))
+        .json(&json!({
+            "model": "embed-multilingual",
+            "input": "find me the best result",
+            "input_type": "search_query"
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+
+    let requests = upstream.received_requests().await.unwrap();
+    let sent: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(sent["input_type"], "search_query");
 }
 
 #[tokio::test]

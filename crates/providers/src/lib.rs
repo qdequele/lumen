@@ -11,8 +11,10 @@
 #![forbid(unsafe_code)]
 
 pub mod anthropic;
+pub mod azure;
 pub mod batch;
 pub mod chat;
+pub mod cloudflare;
 pub mod cohere;
 pub mod google;
 pub mod http;
@@ -30,7 +32,9 @@ pub mod tei;
 pub mod voyage;
 
 pub use anthropic::AnthropicProvider;
+pub use azure::AzureProvider;
 pub use batch::embed_batched;
+pub use cloudflare::CloudflareRerankProvider;
 pub use cohere::CohereProvider;
 pub use google::GoogleProvider;
 pub use jina::JinaProvider;

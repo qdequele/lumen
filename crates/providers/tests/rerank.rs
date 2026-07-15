@@ -16,7 +16,9 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use lumen_core::{ProviderError, RerankDocument, RerankProvider, RerankRequest};
-use lumen_providers::{rerank, CohereProvider, JinaProvider, TeiProvider, VoyageProvider};
+use lumen_providers::{
+    rerank, CloudflareRerankProvider, CohereProvider, JinaProvider, TeiProvider, VoyageProvider,
+};
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 use wiremock::matchers::method;
@@ -209,6 +211,57 @@ impl RerankFixture for VoyageFixture {
 }
 
 // --------------------------------------------------------------------------
+// Cloudflare fixture - native `/ai/run/{model}` envelope:
+//   { result: { response: [{ id, score }] }, success: true, errors: [], messages: [] }
+// --------------------------------------------------------------------------
+
+struct CloudflareFixture;
+
+#[async_trait]
+impl RerankFixture for CloudflareFixture {
+    fn build(&self, base_url: String) -> Arc<dyn RerankProvider> {
+        Arc::new(CloudflareRerankProvider::new(
+            reqwest::Client::new(),
+            "cloudflare-test",
+            base_url,
+            Some("sk-test-xxx".to_owned()),
+        ))
+    }
+
+    async fn mount_scored(&self, mock: &MockServer) {
+        let response: Vec<_> = SCORES
+            .iter()
+            .map(|(i, s)| json!({ "id": i, "score": s }))
+            .collect();
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "result": { "response": response },
+                "success": true,
+                "errors": [],
+                "messages": []
+            })))
+            .mount(mock)
+            .await;
+    }
+
+    async fn mount_delayed(&self, mock: &MockServer, delay: Duration) {
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({
+                        "result": { "response": [{ "id": 0, "score": 1.0 }] },
+                        "success": true,
+                        "errors": [],
+                        "messages": []
+                    }))
+                    .set_delay(delay),
+            )
+            .mount(mock)
+            .await;
+    }
+}
+
+// --------------------------------------------------------------------------
 // Shared error mounts (schema-agnostic) and request helper
 // --------------------------------------------------------------------------
 
@@ -238,6 +291,7 @@ fn request(docs: &[&str]) -> RerankRequest {
             .iter()
             .map(|s| RerankDocument::Text((*s).to_owned()))
             .collect(),
+        rank_fields: None,
         top_n: None,
         return_documents: false,
     }
@@ -378,4 +432,108 @@ async fn tei_passes_rerank_conformance_suite() {
 #[tokio::test]
 async fn voyage_passes_rerank_conformance_suite() {
     run_conformance(&VoyageFixture).await;
+}
+
+#[tokio::test]
+async fn cloudflare_passes_rerank_conformance_suite() {
+    run_conformance(&CloudflareFixture).await;
+}
+
+// --------------------------------------------------------------------------
+// Token-based rerank usage (issue #10) - Jina and Voyage bill in tokens, not
+// search units; their `usage.total_tokens` must surface as
+// `RerankUsage.total_tokens`, upstream-reported (never gateway-derived at the
+// provider layer).
+// --------------------------------------------------------------------------
+
+#[tokio::test]
+async fn jina_surfaces_upstream_total_tokens() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "results": [{ "index": 0, "relevance_score": 0.9 }],
+            "usage": { "total_tokens": 42 }
+        })))
+        .mount(&mock)
+        .await;
+    let provider = JinaFixture.build(mock.uri());
+
+    let resp = provider
+        .rerank(request(&["x"]), CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert_eq!(resp.usage.total_tokens, 42);
+    assert_eq!(
+        resp.usage.tokens_estimated, None,
+        "upstream-reported tokens must not be flagged estimated"
+    );
+    assert_eq!(resp.usage.search_units, 0);
+}
+
+#[tokio::test]
+async fn jina_without_usage_reports_zero_tokens_for_gateway_fallback() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "results": [{ "index": 0, "relevance_score": 0.9 }]
+        })))
+        .mount(&mock)
+        .await;
+    let provider = JinaFixture.build(mock.uri());
+
+    let resp = provider
+        .rerank(request(&["x"]), CancellationToken::new())
+        .await
+        .unwrap();
+
+    // No upstream usage: the provider reports 0 so the gateway (not the
+    // provider) derives a local estimate (ADR 003).
+    assert_eq!(resp.usage.total_tokens, 0);
+    assert_eq!(resp.usage.tokens_estimated, None);
+}
+
+#[tokio::test]
+async fn voyage_surfaces_upstream_total_tokens() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [{ "index": 0, "relevance_score": 0.9 }],
+            "usage": { "total_tokens": 17 }
+        })))
+        .mount(&mock)
+        .await;
+    let provider = VoyageFixture.build(mock.uri());
+
+    let resp = provider
+        .rerank(request(&["x"]), CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert_eq!(resp.usage.total_tokens, 17);
+    assert_eq!(
+        resp.usage.tokens_estimated, None,
+        "upstream-reported tokens must not be flagged estimated"
+    );
+    assert_eq!(resp.usage.search_units, 0);
+}
+
+#[tokio::test]
+async fn voyage_without_usage_reports_zero_tokens_for_gateway_fallback() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [{ "index": 0, "relevance_score": 0.9 }]
+        })))
+        .mount(&mock)
+        .await;
+    let provider = VoyageFixture.build(mock.uri());
+
+    let resp = provider
+        .rerank(request(&["x"]), CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert_eq!(resp.usage.total_tokens, 0);
+    assert_eq!(resp.usage.tokens_estimated, None);
 }

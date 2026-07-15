@@ -122,6 +122,12 @@ impl EmbeddingProvider for MistralProvider {
         req: EmbedRequest,
         cancel: CancellationToken,
     ) -> Result<EmbedResponse, ProviderError> {
+        // Mistral's embeddings API takes strings only (unlike OpenAI, it does
+        // not accept token-id arrays); the passthrough would forward a raw int
+        // array and fail opaquely upstream. Honest 400 before any call
+        // (issue #25).
+        crate::mapping::reject_pretokenized_input(&self.provider_name, &req.input)?;
+
         // OpenAI-compatible schema: near-passthrough in both directions.
         let url = format!("{}/embeddings", self.base_url);
         let bytes = post_json(

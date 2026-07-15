@@ -22,6 +22,27 @@ All notable changes to LUMEN are documented here. The format is based on
   256 default). What the test asserts is unchanged: /health stays under the
   same bound during the storm and all 500 requests complete with 429/503.
 
+### Added - Azure OpenAI provider (deployment routing + api-version)
+
+- New `azure` provider kind (chat + embeddings): reuses the OpenAI JSON
+  wire schema verbatim (near-passthrough, like `mistral`), with the three
+  Azure-specific deltas bridged in `crates/providers/src/azure`:
+  - URL construction is deployment-routed:
+    `{endpoint}/openai/deployments/{deployment}/{chat/completions|embeddings}?api-version=...`,
+    not the generic OpenAI-compatible `base_url`-swap path.
+  - Auth is the `api-key` header, never a bearer token.
+  - Deployment routing reuses the existing `upstream_id` aliasing mechanism -
+    set a model's `upstream_id` to the Azure deployment name, no new config
+    field needed (the router already rewrites `req.model` to `upstream_id`
+    before calling the provider).
+  - `api-version` is selected via a `?api-version=YYYY-MM-DD` query string on
+    `base_url`, defaulting to a pinned recent version when omitted. There is
+    no dedicated `api_version` config field yet - see the module doc comment
+    and `docs/providers.md#azure` for the known gap and workaround.
+- `base_url` is required for `azure` (every Azure resource endpoint is
+  operator-specific; there is no shared public default).
+- `config.example.toml` and `docs/providers.md` updated with a worked example.
+
 ### Added - Provider-native file/GCS image URI sources (issue #12)
 
 - Chat vision content parts now accept two provider-native image references
@@ -84,6 +105,83 @@ All notable changes to LUMEN are documented here. The format is based on
   a real boot.
 - New `lumen_server::check_config` library function backs the flag, kept
   separate from `main` so the validation logic stays unit-testable.
+
+### Added - Embeddings/rerank input format gaps (issue #25)
+
+- **Token-array embedding inputs.** `POST /v1/embeddings` now accepts
+  pre-tokenized `input`: a single token-id array (`[1,2,3]`, one item) or a batch
+  of them (`[[1,2],[3,4]]`). They pass through natively on OpenAI-compatible
+  providers and count one token per id in the estimation fallback. String and
+  string-batch inputs are unchanged (untagged order tries them first).
+  Providers whose APIs only take text (Cohere, TEI, Ollama, Jina, Voyage,
+  Mistral) reject token-array input with an honest 400 (`LM-1001`,
+  `ProviderError::UnsupportedInput`) BEFORE any upstream call, instead of
+  sending an empty or garbled body upstream (rule 8).
+- **base64 embedding output.** When a client sets `encoding_format: "base64"`,
+  each vector is re-encoded as OpenAI-style base64 (little-endian `f32` bytes) at
+  the response edge. Because the gateway always holds vectors as `Vec<f32>`
+  internally, this works for every provider, including Ollama and TEI that have
+  no upstream `encoding_format`. Any other value serializes as a float array.
+- **Rerank object documents with `rank_fields`.** `RerankDocument` object
+  documents now keep all their fields, and the request accepts an optional
+  Cohere-style `rank_fields` selector. Each object document is reduced to a
+  single ranking text at the gateway edge (selected fields joined with newlines,
+  or the `text` field when no selector), so providers still only ever see plain
+  text. Note: with `return_documents: true`, an object document's echoed
+  `document.text` is that reduced ranking text, not the original JSON object.
+- **Ollama strict mode.** A new per-provider `strict = true` (config
+  `[[providers]] strict`) makes Ollama reject a request that sets `dimensions`
+  (which it cannot honor) with a 400 (`LM-1001`) naming the field, instead of
+  silently returning full-width vectors. The default stays lenient (drops the
+  field with a debug log). Backed by a new `ProviderError::UnsupportedField`
+  that maps to a client 400 and is never retried or failed over.
+
+### Added - Cohere embed `input_type` override (#22)
+
+- `POST /v1/embeddings` now accepts an `input_type` extra field so a caller
+  can override Cohere's query-vs-document intent (`search_query`,
+  `search_document`, `classification`, `clustering`) instead of always
+  getting the `search_document` default - materially affects retrieval
+  quality for query-time embeddings. `EmbedRequest` gained an `extra` map
+  (the `serde(flatten)` idiom `ChatRequest` already uses) that captures
+  unknown request fields for provider translation code and survives automatic
+  batching intact. Unlike the chat path, `extra` is never re-serialized into
+  an outgoing provider body: only the Cohere translation consumes
+  `input_type`, and unknown fields stop at the gateway rather than being
+  forwarded to OpenAI-compatible upstreams (which may be strict). An
+  unrecognized `input_type` is rejected with `LM-1001` before any upstream
+  call. See `docs/providers.md` § cohere.
+
+### Added - Token-based rerank usage for Jina/Voyage (issue #10)
+
+- `RerankUsage` gains `total_tokens` and `tokens_estimated`, additive to the
+  existing `search_units`/`estimated` pair. Jina and Voyage bill rerank in
+  tokens rather than search units and report `usage.total_tokens`; the
+  gateway now surfaces that upstream count unflagged (`tokens_estimated`
+  omitted), instead of always synthesising a local estimate.
+- Every rerank response now carries a `total_tokens` count for uniform
+  observability (ADR 003): when the upstream does not report one (Cohere,
+  TEI, or Jina/Voyage without `usage`), the gateway falls back to the
+  existing `query + documents` heuristic and flags it
+  `"tokens_estimated": true`.
+- `POST /v1/rerank` accounting (`lumen_tokens_total{...,estimated}` and
+  `usage_log.estimated`) now reflects whether the *token* count was
+  upstream-reported or gateway-derived, rather than always `true`.
+
+### Added - Cloudflare Workers AI rerank (native endpoint)
+
+- The `cloudflare` kind now serves **rerank** in addition to chat/embed.
+  Workers AI's `bge-reranker-*` models are not part of the OpenAI-compatible
+  surface, so reranking is translated against Cloudflare's native
+  `POST /ai/run/{model}` endpoint (`{ query, contexts, top_k }` in,
+  `{ result: { response: [{ id, score }] }, success, errors }` out) rather
+  than the OpenAI-compatible path used for chat/embed. One `[[providers]]`
+  entry with `kind = "cloudflare"` now serves all three capabilities against
+  the same account-scoped `base_url`; the native endpoint's URL is derived by
+  stripping a trailing `/ai/v1` (or `/v1`) suffix to reach the account root.
+  Cloudflare reports no token usage for this model, so `usage` follows the
+  same ADR 003 fallback as TEI (a gateway-derived estimate, marked
+  `estimated`).
 
 ### Fixed
 
