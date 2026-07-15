@@ -178,7 +178,10 @@ impl ImageUrl {
     /// (`gs://bucket/object`) or a URI returned by the Gemini Files API
     /// (`https://generativelanguage.googleapis.com/...`). Both map straight
     /// onto Gemini's `fileData.fileUri`; the gateway never dereferences
-    /// either.
+    /// either. Note that the Gemini Developer API only resolves its own
+    /// Files API URIs - `gs://` is a Vertex AI capability, forwarded
+    /// verbatim and rejected by the default upstream (see the caveat in
+    /// `docs/providers.md`).
     #[must_use]
     pub fn gemini_file_uri(&self) -> Option<&str> {
         if self.url.starts_with("gs://")

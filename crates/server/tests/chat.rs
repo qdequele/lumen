@@ -595,6 +595,88 @@ async fn gemini_gcs_uri_forwards_as_a_file_data_part() {
     assert!(part.get("inline_data").is_none());
 }
 
+/// Issue #12 (review fix): a Gemini Files API URI is an `https://` URL, so it
+/// satisfies `is_remote()` too. It must NOT be caught by the `LM-2004`
+/// remote-URL pre-flight (Google declines fetchable URLs) - a provider-native
+/// reference bound for its own provider passes through and reaches Gemini as
+/// `fileData.fileUri`.
+#[tokio::test]
+async fn gemini_files_api_uri_forwards_as_a_file_data_part() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1beta/models/gemini-2.0-flash:generateContent"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "candidates": [{
+                "content": { "role": "model", "parts": [{ "text": "a cat" }] },
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 5,
+                "candidatesTokenCount": 2,
+                "totalTokenCount": 7
+            }
+        })))
+        .mount(&upstream)
+        .await;
+
+    let base = common::spawn_with(google_vision_registry(&upstream.uri()), LIMIT).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&json!({
+            "model": "gemini",
+            "messages": [{"role":"user","content":[
+                {"type":"text","text":"what is this?"},
+                {"type":"image_url","image_url":{"url":"https://generativelanguage.googleapis.com/v1beta/files/abc-123"}}
+            ]}]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+
+    let requests = upstream.received_requests().await.unwrap();
+    let sent: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    let part = &sent["contents"][0]["parts"][1];
+    assert_eq!(
+        part["file_data"]["file_uri"],
+        "https://generativelanguage.googleapis.com/v1beta/files/abc-123"
+    );
+    // No extension on a Files API URI: mime_type omitted, never guessed.
+    assert!(part["file_data"].get("mime_type").is_none());
+    assert!(part.get("inline_data").is_none());
+}
+
+/// Issue #12 (review fix): the same Files API URI bound for a non-Google
+/// primary is `LM-2008` (provider-native source mismatch), NOT `LM-2004`
+/// (generic remote URL) and NOT forwarded - the upstream is never contacted.
+#[tokio::test]
+async fn gemini_files_api_uri_sent_to_anthropic_is_400_lm_2008() {
+    let upstream = MockServer::start().await;
+    let base = common::spawn_with(anthropic_vision_registry(&upstream.uri()), LIMIT).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&json!({
+            "model": "claude",
+            "messages": [{"role":"user","content":[
+                {"type":"text","text":"what is this?"},
+                {"type":"image_url","image_url":{"url":"https://generativelanguage.googleapis.com/v1beta/files/abc-123"}}
+            ]}],
+            "max_tokens": 100
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 400);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "LM-2008");
+    assert_eq!(body["error"]["type"], "invalid_request");
+    assert!(upstream.received_requests().await.unwrap().is_empty());
+}
+
 /// Issue #12: an Anthropic-native `file_id` sent to a provider that is not
 /// Anthropic is an honest `LM-2008` client error, not a 502 - the upstream
 /// is never contacted.

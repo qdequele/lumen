@@ -12,6 +12,22 @@
 //! * responses are `candidates` with a `finishReason` and `usageMetadata`;
 //! * streaming events are partial responses, translated fragment by fragment
 //!   in [`stream`] (bounded state - the text is never accumulated).
+//!
+//! # Provider-native image sources (issue #12)
+//!
+//! An `image_url.url` recognised by `ImageUrl::gemini_file_uri` (a Gemini
+//! Files API URI, or a `gs://` GCS URI) is translated to a
+//! `fileData.fileUri` part and forwarded verbatim - never fetched.
+//!
+//! **`gs://` caveat**: the Gemini **Developer API**
+//! (`generativelanguage.googleapis.com`, this provider's default base URL)
+//! documents `fileData.fileUri` for its own Files API URIs; `gs://` Cloud
+//! Storage URIs are a **Vertex AI** capability. A `gs://` reference is still
+//! parsed and forwarded (the form is Gemini-native, so mismatch routing
+//! stays an honest LM-2008, and `base_url` may point at a Vertex-compatible
+//! gateway), but against the default endpoint the upstream will reject it -
+//! that upstream error, naming this provider, is the honest outcome. See
+//! `docs/providers.md`.
 
 mod stream;
 
@@ -114,11 +130,14 @@ struct GeminiInlineData {
     data: String,
 }
 
-/// A provider-native file reference (issue #12): a GCS URI (`gs://...`) or a
-/// Gemini Files API URI. `mime_type` is included only when it could be
-/// confidently inferred from the URI's extension - Gemini already knows the
-/// mime type of a file it stored via the Files API, so omitting it lets the
-/// upstream fall back to its own record rather than the gateway guessing.
+/// A provider-native file reference (issue #12): a Gemini Files API URI or a
+/// GCS URI (`gs://...`). `mime_type` is included only when it could be
+/// confidently inferred from the URI's file extension; otherwise it is
+/// omitted rather than guessed. For a Files API URI that is always safe:
+/// Gemini recorded the mime type at upload time and falls back to it. A
+/// `gs://` object with an unrecognised extension has no such record on the
+/// Developer API - but `gs://` is a Vertex AI capability there anyway (see
+/// the module doc), so the upstream's own error is the honest outcome.
 #[derive(Serialize)]
 struct GeminiFileData {
     #[serde(rename = "mime_type", skip_serializing_if = "Option::is_none")]

@@ -152,9 +152,15 @@ fn enforce_image_support(
         });
     }
     // LM-2004: if the PRIMARY provider can't take a remote URL, reject one.
+    // A provider-native reference is excluded even when it is also an
+    // `https://` URL (a Gemini Files API URI is both): it is not a URL the
+    // provider would have to fetch, and the LM-2008 checks below own its
+    // routing verdict.
     let has_remote_url = req.messages.iter().any(|m| {
         matches!(m.content.as_ref(), Some(lumen_core::MessageContent::Parts(parts))
-            if parts.iter().any(|p| p.image_url.as_ref().is_some_and(lumen_core::ImageUrl::is_remote)))
+        if parts.iter().any(|p| p.image_url.as_ref().is_some_and(|i| {
+            i.is_remote() && i.gemini_file_uri().is_none() && i.anthropic_file_id().is_none()
+        })))
     });
     if has_remote_url && !chain[0].route.provider.accepts_remote_image_url() {
         return Err(GatewayError::ImageUrlNotSupported {

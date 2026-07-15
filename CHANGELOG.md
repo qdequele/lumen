@@ -18,7 +18,13 @@ All notable changes to LUMEN are documented here. The format is based on
 - Gemini translates a `gs://`/Files API URI to a `fileData.fileUri` part
   instead of `inlineData`; the mime type is included only when it can be
   confidently inferred from the URI's extension, otherwise omitted so Gemini
-  falls back to the mime type it recorded at upload time.
+  falls back to the mime type it recorded at upload time. Caveat: the Gemini
+  Developer API (the `google` kind's default endpoint) only resolves its own
+  Files API URIs; `gs://` is a Vertex AI capability, forwarded verbatim and
+  rejected by the default upstream (documented in `docs/providers.md`).
+- A Gemini Files API URI is also an `https://` URL; it is exempt from the
+  `LM-2004` remote-URL pre-flight so it reaches Gemini as `fileData.fileUri`
+  instead of being wrongly rejected.
 - Sending a provider-native reference to a provider that cannot resolve it
   (e.g. an Anthropic `file_id` routed to Gemini) is now rejected before any
   upstream call with a new `LM-2008` (400) client error, instead of surfacing
