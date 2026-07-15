@@ -191,11 +191,13 @@ milestone.
   provider may set `connect_timeout_ms`; it then gets its own (unpooled)
   `reqwest::Client` built at registry construction, while every non-overriding
   provider keeps sharing the one pooled client. See the ADR 005 amendment.
-- **First-frame-peek streaming retry.** Streaming retry/fallback happens only at
-  the *open* phase (send + status). A stream that opens 200 then errors on its
-  very first frame is treated as committed (clean SSE error frame, no retry).
-  Peeking the first frame before committing would let that case retry too -
-  more code, marginal benefit; deferred.
+- ~~**First-frame-peek streaming retry.**~~ DONE (issue #7, 2026-07-15). The
+  commitment point moved from the *open* phase to the first *content frame*: the
+  streaming path now peeks the first upstream frame, so a stream that opens 200
+  then errors or closes before any content frame fails over (and penalises the
+  breaker) instead of committing to a terminal SSE error. Buffers at most one
+  frame, bounded by `first_token`, cancellation-safe. See ADR 005, 2026-07-15
+  amendment; `crates/router/src/peek.rs`.
 - **Circuit-breaker map is unbounded by design.** One entry per (provider,
   model) actually seen; bounded by the configured surface, never by client
   input. If a future dynamic-model feature lets clients mint arbitrary model

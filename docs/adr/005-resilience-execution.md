@@ -1,6 +1,6 @@
 # ADR 005 - Resilience execution model (retries, fallback, circuit breaker, timeouts)
 
-- Status: accepted (amended 2026-07-15: per-provider connect timeout, see below)
+- Status: accepted (amended 2026-07-15: per-provider connect timeout and first-frame-peek streaming retry, see below)
 - Date: 2026-07-13
 
 ## Context
@@ -189,3 +189,57 @@ specs on every hot reload, changing (adding, editing or removing) a provider's
 `connect_timeout_ms` takes effect on `SIGHUP`/file-change reload with no restart,
 exactly like the other two per-provider timeout overrides. Config validation
 rejects a `connect_timeout_ms` of `0`, matching the other overrides.
+
+---
+
+## Amendment - 2026-07-15: first-frame-peek streaming retry (issue #7)
+
+Supersedes the "2xx-then-immediate-error is deliberately treated as committed"
+carve-out above (the parenthetical in *Streaming: retry/fallback only at the
+open phase*) and the matching `docs/backlog.md` deferral. The rest of the
+original decision stands unchanged.
+
+### Decision
+
+The commitment point for a streaming response moves from the **open** (2xx +
+headers) to the **first content frame**. After the open succeeds, the streaming
+closure PEEKS the first upstream frame before committing:
+
+- first item is a content frame (`Ok`) - **commit**: the peeked frame is
+  re-attached ahead of the untouched remainder (a single `Bytes`, moved not
+  copied) and the reconstructed stream is handed to the existing
+  `to_event_stream` guards. From here nothing retries (mid-stream errors still
+  become a terminal SSE error frame - LM-3010/LM-3003 - exactly as before);
+- first item is an error (`Err`), or the stream ends before any frame (`None`) -
+  a **pre-commit failure**: the closure returns `Err`, so the executor retries,
+  falls over to the next link, and charges the circuit breaker *identically to
+  an open failure*. A `None` is surfaced as the new
+  `ProviderError::EmptyStream` (retryable, provider-fault, mapped to LM-3010).
+
+### Boundaries and invariants preserved
+
+- **Zero-copy / bounded buffering (pillar 1, ADR 004).** The peek buffers **at
+  most one frame**, never the stream. The committed body is byte-identical to
+  the upstream.
+- **Cancellation.** The peek races the request `CancellationToken`; a client
+  disconnect during the peek window returns `ProviderError::Cancelled` and drops
+  the stream, aborting the upstream. `Cancelled` is neither retryable nor a
+  provider fault, so no fallback is attempted and the breaker is untouched.
+- **Time bound.** The peek runs inside the closure the executor already wraps in
+  the per-attempt `first_token` timeout, so a silent upstream (headers, then no
+  bytes) trips `FirstTokenTimeout` and fails over rather than hanging.
+- **Still non-retryable (unchanged): everything post-commit.** Once a content
+  frame is forwarded, a later mid-stream error, a missing `[DONE]` (LM-3010) or a
+  first-token gap on a subsequent frame is a terminal SSE error, never a retry.
+
+### Consequence for the breaker note above
+
+The recorded trade-off ("the breaker only ever sees the open phase") is now
+narrower: a provider that opens 200 then fails on its **first** frame *does* now
+count against its breaker. Only failures *after* the first committed content
+frame remain invisible to the breaker (the frame guards still give the client a
+clean terminal error each time).
+
+The peek lives in `crates/router/src/peek.rs` (generic over the frame type,
+unit-tested for commit / error / empty / cancel / timeout); wiremock acceptance
+tests are in `crates/server/tests/resilience.rs`.
