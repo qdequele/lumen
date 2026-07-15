@@ -601,9 +601,18 @@ impl Config {
         if !path.exists() {
             return Err(ConfigError::NotFound { path: label });
         }
-        let figment = Figment::new()
-            .merge(Toml::file(path))
-            .merge(Env::prefixed("LUMEN_").split("__"));
+        let figment = Figment::new().merge(Toml::file(path)).merge(
+            Env::prefixed("LUMEN_")
+                // `LUMEN_MASTER_KEY` is a secret read directly from the
+                // process environment by `boot_auth_stack` (main.rs), never
+                // a config field. `Config` denies unknown fields, so without
+                // this exclusion setting the var (required whenever
+                // `auth.enabled = true`) makes every load - including
+                // `--check-config` and real boots - fail with an
+                // "unknown field: found `master_key`" parse error.
+                .ignore(&["master_key"])
+                .split("__"),
+        );
         Self::from_figment(&figment, &label)
     }
 
@@ -1068,6 +1077,29 @@ mod tests {
             jail.set_env("LUMEN_SERVER__PORT", "9090");
             let cfg = Config::load(Path::new("config.toml")).unwrap();
             assert_eq!(cfg.server.port, 9090);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn master_key_env_var_is_never_folded_into_the_config() {
+        // LUMEN_MASTER_KEY is a secret consumed directly by `boot_auth_stack`
+        // via `std::env::var`, never a config field. Setting it (as any real
+        // `auth.enabled = true` deployment must) previously made `Config::load`
+        // - and therefore `--check-config` and every real boot - fail with
+        // "unknown field: found 'master_key'" because `Config` denies unknown
+        // fields. This must load cleanly and must not surface `master_key`
+        // anywhere in the parsed config.
+        #[allow(clippy::result_large_err)]
+        figment::Jail::expect_with(|jail| {
+            jail.create_file("config.toml", VALID)?;
+            jail.set_env(
+                "LUMEN_MASTER_KEY",
+                "a".repeat(64), // 64 hex chars, matches the real format
+            );
+            let cfg = Config::load(Path::new("config.toml")).unwrap();
+            // Sanity: the rest of the env-override mechanism still works.
+            assert_eq!(cfg.server.port, 8080);
             Ok(())
         });
     }
