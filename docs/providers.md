@@ -1,9 +1,9 @@
 # Providers
 
-LUMEN ships twenty-one built-in provider kinds - ten native integrations (their own
-request/response translation, including deployment-routed `azure`) plus eleven
-**OpenAI-compatible** hosts that reuse the OpenAI path with a per-kind base URL.
-Each `[[providers]]` block in your
+LUMEN ships twenty-two built-in provider kinds - eleven native integrations
+(their own request/response translation, including deployment-routed `azure`
+and SigV4-signed `bedrock`) plus eleven **OpenAI-compatible** hosts that reuse
+the OpenAI path with a per-kind base URL. Each `[[providers]]` block in your
 config selects one with a `kind` string and gives it a unique `name` (your own
 label). Each `[[providers.models]]` block under it exposes a model to clients:
 
@@ -54,6 +54,7 @@ Rules that apply to every provider:
 | `anthropic` |  ✅  |       |        | required      | optional       | -                 |
 | `google`    |  ✅  |       |        | required      | optional       | -                 |
 | `vertex_ai` |  ✅  |       |        | required (SA JSON) | **required** (GCP region) | - |
+| `bedrock`   |  ✅  |       |        | AWS SigV4     | optional       | -                 |
 | `cohere`    |  ✅  |  ✅   |   ✅   | required      | optional       | 96                |
 | `jina`      |      |  ✅   |   ✅   | required      | optional       | 2048              |
 | `voyage`    |      |  ✅   |   ✅   | required      | optional       | 128               |
@@ -216,6 +217,55 @@ base_url = "us-central1"   # GCP region
 id = "gemini-flash-vertex"
 upstream_id = "gemini-2.0-flash"
 capabilities = ["chat"]
+```
+
+## bedrock
+
+- **kind**: `bedrock` · **capabilities**: chat only.
+- **Auth**: AWS Signature Version 4 (SigV4), not a bearer key. Credentials are
+  read from the standard AWS environment variables (`AWS_ACCESS_KEY_ID`,
+  `AWS_SECRET_ACCESS_KEY`, and optionally `AWS_SESSION_TOKEN` for temporary
+  credentials) **on every request**, so values updated in the process
+  environment (or a config hot reload) take effect without a restart.
+  `api_key_env` is optional and, if set, overrides only the secret access key.
+  The secret and session token are never logged or shown in `Debug`.
+- **Credential scope (v1)**: only static keys and pre-issued STS session tokens.
+  There is no AWS credential-provider chain (no IMDS/instance roles, SSO,
+  profiles or `credential_process`); an expired session token keeps failing
+  with 403 until the environment supplies a fresh one.
+- **API**: the Bedrock **Converse** API (`POST /model/{modelId}/converse` and
+  `/converse-stream`), which gives one uniform schema across the Anthropic,
+  Meta Llama, Amazon Titan/Nova, Mistral and Cohere model families. The legacy
+  per-model `InvokeModel` schemas are intentionally not implemented (Converse
+  covers the same models).
+- **Region / base_url**: set `base_url` to the runtime endpoint for your region,
+  `https://bedrock-runtime.{region}.amazonaws.com`; the region is parsed back out
+  of it for the SigV4 signing scope. VPC/PrivateLink endpoint hosts
+  (`bedrock-runtime.{region}.vpce.amazonaws.com`, including a `vpce-…`-prefixed
+  DNS name) are recognised too. For any other custom endpoint the region comes
+  from `AWS_REGION` / `AWS_DEFAULT_REGION`; if no source yields a region, startup
+  fails with a clear error rather than silently signing for a wrong region.
+- **Translation**: OpenAI ⇄ Converse is bidirectional, including system prompts,
+  `inferenceConfig` (max tokens, temperature, top-p, stop sequences), tools, and
+  streaming. Streaming arrives as AWS event-stream binary frames, decoded and
+  translated to OpenAI chunks. Usage (`inputTokens` / `outputTokens`) is mapped
+  per ADR 003.
+- **Images**: only inline `data:` URIs are supported (Converse takes raw image
+  bytes); a remote image URL is rejected (`LM-2004`) since Bedrock cannot fetch
+  one.
+
+```toml
+[[providers]]
+name = "bedrock"
+kind = "bedrock"
+base_url = "https://bedrock-runtime.us-east-1.amazonaws.com"
+# api_key_env = "AWS_SECRET_ACCESS_KEY"   # optional secret override
+
+[[providers.models]]
+id = "bedrock-claude-3-5-sonnet"
+upstream_id = "anthropic.claude-3-5-sonnet-20241022-v2:0"
+capabilities = ["chat"]
+modalities = ["text", "image"]
 ```
 
 ## cohere

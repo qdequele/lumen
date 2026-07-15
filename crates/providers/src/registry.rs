@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use crate::anthropic::AnthropicProvider;
 use crate::azure::AzureProvider;
+use crate::bedrock::{self, BedrockProvider};
 use crate::cloudflare::CloudflareRerankProvider;
 use crate::cohere::CohereProvider;
 use crate::google::vertex::VertexProvider;
@@ -90,6 +91,18 @@ pub enum RegistryError {
         name: String,
         /// Its kind, for the operator's benefit.
         kind: &'static str,
+    },
+
+    /// A Bedrock provider whose AWS region could not be determined. Signing
+    /// with a guessed default region would only fail later with an opaque
+    /// upstream 403, so this is surfaced at build time instead.
+    #[error(
+        "provider '{name}' (kind 'bedrock') needs an AWS region: set base_url to a \
+         bedrock-runtime.<region> endpoint, or export AWS_REGION / AWS_DEFAULT_REGION"
+    )]
+    MissingRegion {
+        /// The offending provider's name.
+        name: String,
     },
 
     /// Two providers declared the same model id. The registry is the last line
@@ -723,6 +736,33 @@ fn build_providers(
                 rerank: None,
             })
         }
+        ProviderKind::Bedrock => {
+            // The signing region comes from the endpoint host (standard or VPC
+            // shapes) or from AWS_REGION / AWS_DEFAULT_REGION; a region that
+            // cannot be determined is a BUILD error - silently signing for a
+            // default region would just 403 at request time. Credentials are
+            // re-read from the AWS environment variables on every request (with
+            // the optional api_key override for the secret), so a missing key
+            // here is not a build error: the provider reports it at request
+            // time, and rotated values are picked up without a reload.
+            let region = bedrock::resolve_region(spec.base_url.as_deref()).ok_or_else(|| {
+                RegistryError::MissingRegion {
+                    name: spec.name.clone(),
+                }
+            })?;
+            let chat: Arc<dyn ChatProvider> = Arc::new(BedrockProvider::new_with_env_credentials(
+                client.clone(),
+                spec.name.clone(),
+                region,
+                spec.base_url.clone(),
+                spec.api_key.clone(),
+            ));
+            Ok(BuiltProviders {
+                chat: Some(chat),
+                embed: None,
+                rerank: None,
+            })
+        }
     }
 }
 
@@ -893,6 +933,42 @@ mod tests {
         .unwrap();
         assert!(reg.chat_route("m").is_some());
         assert!(reg.embedding_route("m").is_some());
+    }
+
+    #[test]
+    fn bedrock_with_regional_endpoint_builds_and_serves_chat() {
+        let reg = Registry::build(
+            vec![spec(
+                ProviderKind::Bedrock,
+                "bedrock",
+                Some("https://bedrock-runtime.eu-west-1.amazonaws.com"),
+                vec![model("claude", &[Capability::Chat])],
+            )],
+            reqwest::Client::new(),
+        )
+        .unwrap();
+        assert!(reg.chat_route("claude").is_some());
+    }
+
+    #[test]
+    fn bedrock_with_undeterminable_region_is_a_build_error() {
+        // Only this test (and the resolve_region fallback) touches these vars;
+        // clearing them makes the custom endpoint's region undeterminable.
+        std::env::remove_var("AWS_REGION");
+        std::env::remove_var("AWS_DEFAULT_REGION");
+        let result = Registry::build(
+            vec![spec(
+                ProviderKind::Bedrock,
+                "bedrock",
+                Some("http://127.0.0.1:8080"),
+                vec![model("m", &[Capability::Chat])],
+            )],
+            reqwest::Client::new(),
+        );
+        assert!(
+            matches!(result, Err(RegistryError::MissingRegion { .. })),
+            "a custom endpoint with no region source must fail the build"
+        );
     }
 
     #[test]

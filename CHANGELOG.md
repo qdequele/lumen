@@ -6,6 +6,39 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added - AWS Bedrock provider (SigV4, Converse API)
+
+- **New `bedrock` provider kind: chat via the AWS Bedrock Converse API.** One
+  uniform schema (`POST /model/{modelId}/converse` and `/converse-stream`)
+  covers the Anthropic, Meta Llama, Amazon Titan/Nova, Mistral and Cohere model
+  families, so the legacy per-model `InvokeModel` schemas are intentionally not
+  implemented. Bidirectional OpenAI ⇄ Converse translation including system
+  prompts, `inferenceConfig`, tools, images (inline `data:` URIs) and usage
+  (`inputTokens`/`outputTokens`, mapped per ADR 003).
+- **AWS Signature Version 4 request signing**, hand-rolled over `hmac` + `sha2`
+  (pure-Rust, rustls-compatible, no OpenSSL and no AWS SDK runtime) to keep the
+  dependency and RAM footprint aligned with the project pillars. The canonical
+  request path is double-encoded per the non-S3 SigV4 rule (wire `%3A`, signed
+  `%253A`), so versioned model ids containing `:` sign correctly; verified by
+  known-answer tests against AWS's published `aws-sig-v4-test-suite` vectors
+  (`get-vanilla`, `post-vanilla`) plus a double-encoding KAT. Credentials are
+  re-read from the standard AWS environment variables (`AWS_ACCESS_KEY_ID`,
+  `AWS_SECRET_ACCESS_KEY`, optional `AWS_SESSION_TOKEN`) on every request, so
+  rotated values apply without a restart; only static keys and pre-issued STS
+  tokens are supported (no IMDS/SSO chain). The secret and session token are
+  never logged and never appear in `Debug`. The signing region is resolved from
+  the `bedrock-runtime.{region}` endpoint host (standard and VPC/PrivateLink
+  shapes) or from `AWS_REGION` / `AWS_DEFAULT_REGION`; an undeterminable region
+  is a startup error, never a silent default.
+- **Streaming** parses the AWS event-stream binary framing
+  (`vnd.amazon.eventstream`: prelude, headers, payload, CRCs) into OpenAI chunks;
+  CRC validation is skipped (TLS assures integrity) but frame lengths are checked
+  exactly. Cancellation aborts the in-flight upstream request like every other
+  provider. Wiremock tests cover signed-header well-formedness, the Converse
+  round-trip, event-stream frame parsing from byte fixtures, streaming
+  translation, partial-stream (no fabricated `[DONE]`), cancellation, and
+  secret hygiene.
+
 ### Added - Additional rerank providers (Mixedbread, Pinecone, NVIDIA NIM, Together)
 
 - Four new rerank kinds broaden first-class rerank coverage (issue #19):

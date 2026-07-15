@@ -74,6 +74,11 @@ aes-gcm = "0.10"
 rand = "0.9"
 zeroize = "1"
 
+# SigV4 request signing (AWS Bedrock). Pure-Rust, rustls-compatible, no OpenSSL.
+sha2 = "0.10"
+hmac = "0.12"
+hex = "0.4"
+
 # Testing
 wiremock = "0.6"
 criterion = { version = "0.5", features = ["async_tokio"] }
