@@ -288,10 +288,21 @@ fn anthropic_content(content: Option<&MessageContent>, text: &str) -> serde_json
 }
 
 /// Translate one OpenAI `image_url` into an Anthropic image source block.
-/// `data:` URIs become a `base64` source; remote URLs a `url` source (Anthropic
-/// fetches it). The gateway never fetches the URL itself.
+/// An `anthropic-file:<file_id>` reference (issue #12) becomes a `file`
+/// source pointing at a pre-uploaded Files API object; `data:` URIs become a
+/// `base64` source; remote URLs a `url` source (Anthropic fetches it). The
+/// gateway never fetches the URL itself. A mismatched provider-native
+/// reference (e.g. a Gemini `gs://` URI reaching this path via a fallback
+/// chain) falls through to the `url` source, same as any other opaque
+/// string - the resolved primary's pre-flight (`LM-2008`) is what makes the
+/// common case an honest 400 rather than a confusing upstream error.
 fn anthropic_image_block(image: &ImageUrl) -> serde_json::Value {
-    if let Some(data) = image.as_data_uri() {
+    if let Some(file_id) = image.anthropic_file_id() {
+        json!({
+            "type": "image",
+            "source": { "type": "file", "file_id": file_id },
+        })
+    } else if let Some(data) = image.as_data_uri() {
         json!({
             "type": "image",
             "source": { "type": "base64", "media_type": data.media_type, "data": data.base64_data },
@@ -518,6 +529,13 @@ impl ChatProvider for AnthropicProvider {
     ) -> Result<BoxStream<'static, Result<Bytes, ProviderError>>, ProviderError> {
         let items = self.open_translated_stream(req, cancel).await?;
         Ok(items_to_sse_bytes(items))
+    }
+
+    /// Anthropic is the only provider that can resolve its own Files API
+    /// `file_id` references (issue #12); a mismatch is caught pre-flight
+    /// with `LM-2008`.
+    fn accepts_anthropic_file_id(&self) -> bool {
+        true
     }
 }
 
@@ -875,6 +893,57 @@ mod tests {
         assert_eq!(block["type"], "image");
         assert_eq!(block["source"]["type"], "url");
         assert_eq!(block["source"]["url"], "https://ex.com/c.png");
+    }
+
+    /// Issue #12: an `anthropic-file:<file_id>` reference becomes a `file`
+    /// source block pointing at the pre-uploaded Files API object, not a
+    /// `url`/`base64` source.
+    #[test]
+    fn anthropic_file_id_becomes_a_file_source_block() {
+        use lumen_core::{ChatMessage, ChatRequest, ContentPart, ImageUrl, MessageContent};
+        let req = ChatRequest {
+            model: "claude".to_owned(),
+            messages: vec![ChatMessage {
+                role: "user".to_owned(),
+                content: Some(MessageContent::Parts(vec![ContentPart {
+                    kind: "image_url".to_owned(),
+                    text: None,
+                    image_url: Some(ImageUrl {
+                        url: "anthropic-file:file_011CNvxvfvyGnGnDtjPtzY9J".to_owned(),
+                        detail: None,
+                    }),
+                    extra: serde_json::Map::new(),
+                }])),
+                name: None,
+                extra: serde_json::Map::new(),
+            }],
+            temperature: None,
+            top_p: None,
+            max_tokens: None,
+            n: None,
+            stop: None,
+            stream: false,
+            extra: serde_json::Map::new(),
+        };
+        let body = serde_json::to_value(translate_request(&req, false)).unwrap();
+        let block = &body["messages"][0]["content"][0];
+        assert_eq!(block["type"], "image");
+        assert_eq!(block["source"]["type"], "file");
+        assert_eq!(block["source"]["file_id"], "file_011CNvxvfvyGnGnDtjPtzY9J");
+        assert!(block["source"].get("data").is_none());
+        assert!(block["source"].get("url").is_none());
+    }
+
+    #[test]
+    fn anthropic_provider_accepts_its_own_file_id() {
+        let provider = AnthropicProvider::new(
+            reqwest::Client::new(),
+            "anthropic".to_owned(),
+            None,
+            Some("sk-ant-test".to_owned()),
+        );
+        assert!(provider.accepts_anthropic_file_id());
+        assert!(!provider.accepts_gemini_file_uri());
     }
 
     #[test]

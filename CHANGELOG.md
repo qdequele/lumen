@@ -6,6 +6,24 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added - Provider-native file/GCS image URI sources (issue #12)
+
+- Chat vision content parts now accept two provider-native image references
+  alongside inline `data:` URIs and remote `http(s)` URLs: an Anthropic Files
+  API reference, spelled `anthropic-file:<file_id>` in the `url` field, and a
+  Gemini-native file/GCS reference (`gs://bucket/object`, or a Gemini Files
+  API URI under `https://generativelanguage.googleapis.com/`).
+- Anthropic translates `anthropic-file:<file_id>` to a `source: {type: "file",
+  file_id}` content block instead of `base64`/`url`.
+- Gemini translates a `gs://`/Files API URI to a `fileData.fileUri` part
+  instead of `inlineData`; the mime type is included only when it can be
+  confidently inferred from the URI's extension, otherwise omitted so Gemini
+  falls back to the mime type it recorded at upload time.
+- Sending a provider-native reference to a provider that cannot resolve it
+  (e.g. an Anthropic `file_id` routed to Gemini) is now rejected before any
+  upstream call with a new `LM-2008` (400) client error, instead of surfacing
+  as a translation failure (502) from the mismatched provider.
+
 ### Added - Endpoint latency observability
 
 - **Every endpoint now measures and publishes its latency.** A new middleware

@@ -35,6 +35,7 @@ code prefix groups by cause: `1xxx` request, `2xxx` routing, `3xxx` upstream,
 | `LM-2005` | 400  | A remote image URL was supplied to `/v1/embeddings` but server-side image fetching is disabled (`[image_fetch] enabled = false`). Inline the image as a `data:` URI or enable fetching (M9). |
 | `LM-2006` | 400  | A remote image URL was rejected by a fetch guard (scheme, host/prefix allowlist, private-IP block, size cap, per-request count cap, or non-image content type). The specific reason is logged server-side, never returned (M9). |
 | `LM-2007` | 502  | A permitted image fetch failed at the remote host (network error, timeout, or error status). `type: upstream_error` (M9). |
+| `LM-2008` | 400  | A provider-native image source (Anthropic `file_id`, spelled `anthropic-file:<id>`; Gemini `fileUri`, a `gs://` GCS URI or a Gemini Files API URI) was sent to a provider that cannot resolve it - the resolved primary provider must match the reference's own provider. |
 | `LM-2010` | 400  | A rerank request supplied no `documents` to score.             |
 
 ## Upstream errors - `LM-3xxx` · `type: upstream_error`

@@ -185,6 +185,20 @@ pub enum GatewayError {
     #[error("provider '{provider}' requires inline base64 image data; remote image URLs are not supported")]
     ImageUrlNotSupported { provider: String },
 
+    /// A provider-native image source (Anthropic `file_id`, Gemini `fileUri`
+    /// / GCS URI) was supplied, but the resolved primary provider is not the
+    /// one that reference belongs to. Rejected before any upstream call: an
+    /// honest client error rather than the 502 a translation failure would
+    /// otherwise produce (`source` names the reference kind, e.g.
+    /// `"anthropic-file"` or `"gemini-file"`).
+    #[error(
+        "provider '{provider}' does not support the '{source_kind}' provider-native image source"
+    )]
+    ImageSourceNotSupported {
+        provider: String,
+        source_kind: &'static str,
+    },
+
     /// A remote image URL was supplied to `/v1/embeddings` but server-side image
     /// fetching is disabled (M9). The operator must enable `[image_fetch]` or
     /// the client must inline the image as a `data:` URI.
@@ -293,6 +307,7 @@ impl GatewayError {
             GatewayError::UnsupportedCapability { .. } => "LM-2002",
             GatewayError::ImageInputNotSupported { .. } => "LM-2003",
             GatewayError::ImageUrlNotSupported { .. } => "LM-2004",
+            GatewayError::ImageSourceNotSupported { .. } => "LM-2008",
             GatewayError::ImageFetchDisabled => "LM-2005",
             GatewayError::ImageUrlRejected => "LM-2006",
             GatewayError::ImageFetchFailed => "LM-2007",
@@ -330,6 +345,7 @@ impl GatewayError {
             | GatewayError::EmptyDocuments
             | GatewayError::ImageInputNotSupported { .. }
             | GatewayError::ImageUrlNotSupported { .. }
+            | GatewayError::ImageSourceNotSupported { .. }
             | GatewayError::ImageFetchDisabled
             | GatewayError::ImageUrlRejected => 400,
             GatewayError::Unauthorized => 401,
@@ -359,6 +375,7 @@ impl GatewayError {
             | GatewayError::UnsupportedCapability { .. }
             | GatewayError::ImageInputNotSupported { .. }
             | GatewayError::ImageUrlNotSupported { .. }
+            | GatewayError::ImageSourceNotSupported { .. }
             | GatewayError::ImageFetchDisabled
             | GatewayError::ImageUrlRejected
             | GatewayError::EmptyDocuments
@@ -562,6 +579,14 @@ mod tests {
         assert_eq!(GatewayError::ImageFetchFailed.code(), "LM-2007");
         assert_eq!(GatewayError::ImageUrlRejected.http_status(), 400);
         assert_eq!(GatewayError::ImageFetchFailed.http_status(), 502);
+        // Provider-native image source misrouted to the wrong provider (issue #12).
+        let mismatch = GatewayError::ImageSourceNotSupported {
+            provider: "openai".into(),
+            source_kind: "anthropic-file",
+        };
+        assert_eq!(mismatch.code(), "LM-2008");
+        assert_eq!(mismatch.http_status(), 400);
+        assert_eq!(mismatch.error_type(), ErrorType::InvalidRequest);
         // Streaming upstream faults (M4).
         assert_eq!(
             GatewayError::UpstreamStreamInterrupted {

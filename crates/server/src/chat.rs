@@ -124,7 +124,9 @@ pub async fn chat(
 
 /// Reject image inputs the resolved route cannot serve, before any upstream
 /// call: `LM-2003` if the model is not declared vision-capable, `LM-2004` if a
-/// remote image URL is bound for a provider that only takes inline base64.
+/// remote image URL is bound for a provider that only takes inline base64,
+/// `LM-2008` if a provider-native image source (Anthropic `file_id`, Gemini
+/// `fileUri`) is bound for a provider that cannot resolve it (issue #12).
 fn enforce_image_support(
     state: &AppState,
     client_model: &str,
@@ -157,6 +159,29 @@ fn enforce_image_support(
     if has_remote_url && !chain[0].route.provider.accepts_remote_image_url() {
         return Err(GatewayError::ImageUrlNotSupported {
             provider: chain[0].route.provider_name.clone(),
+        });
+    }
+    // LM-2008: a provider-native image source bound for the wrong provider
+    // (issue #12) - an honest client error, not a translation failure
+    // surfaced as a 502.
+    let has_mismatched_anthropic_file = req.messages.iter().any(|m| {
+        matches!(m.content.as_ref(), Some(lumen_core::MessageContent::Parts(parts))
+            if parts.iter().any(|p| p.image_url.as_ref().is_some_and(|i| i.anthropic_file_id().is_some())))
+    });
+    if has_mismatched_anthropic_file && !chain[0].route.provider.accepts_anthropic_file_id() {
+        return Err(GatewayError::ImageSourceNotSupported {
+            provider: chain[0].route.provider_name.clone(),
+            source_kind: "anthropic-file",
+        });
+    }
+    let has_mismatched_gemini_file = req.messages.iter().any(|m| {
+        matches!(m.content.as_ref(), Some(lumen_core::MessageContent::Parts(parts))
+            if parts.iter().any(|p| p.image_url.as_ref().is_some_and(|i| i.gemini_file_uri().is_some())))
+    });
+    if has_mismatched_gemini_file && !chain[0].route.provider.accepts_gemini_file_uri() {
+        return Err(GatewayError::ImageSourceNotSupported {
+            provider: chain[0].route.provider_name.clone(),
+            source_kind: "gemini-file",
         });
     }
     Ok(())
