@@ -64,13 +64,41 @@ fn chat_body(model: &str) -> Value {
     })
 }
 
+/// POST a chat request, retrying a handful of times on a client-side
+/// transport-level failure (never on a received HTTP response) before
+/// giving up.
+///
+/// Under `health_stays_fast_under_upstream_429_storm`'s hundreds of
+/// concurrent connects, a saturated OS accept backlog can reset a fraction of
+/// the TCP handshakes outright (`is_connect()`) or drop the connection while
+/// the request body is still being written, surfacing as a broken-pipe
+/// `SendRequest` error (`is_request()`) - both are artifacts of the test
+/// host's networking stack under a burst this size, not gateway behaviour,
+/// and neither is what any test in this file asserts on. Retrying only these
+/// pre-response transport failures keeps every status-code assertion exactly
+/// as strict as before; it just stops a transient reset from panicking the
+/// whole task.
 async fn post_chat(base: &str, model: &str) -> reqwest::Response {
-    reqwest::Client::new()
-        .post(format!("{base}/v1/chat/completions"))
-        .json(&json!({ "model": model, "messages": [{ "role": "user", "content": "hi" }] }))
-        .send()
-        .await
-        .expect("request sent")
+    const MAX_TRANSPORT_RETRIES: u32 = 8;
+    let body = json!({ "model": model, "messages": [{ "role": "user", "content": "hi" }] });
+    let mut attempt = 0;
+    loop {
+        match reqwest::Client::new()
+            .post(format!("{base}/v1/chat/completions"))
+            .json(&body)
+            .send()
+            .await
+        {
+            Ok(resp) => return resp,
+            Err(err)
+                if (err.is_connect() || err.is_request()) && attempt < MAX_TRANSPORT_RETRIES =>
+            {
+                attempt += 1;
+                tokio::time::sleep(Duration::from_millis(20 * u64::from(attempt))).await;
+            }
+            Err(err) => panic!("request send failed after {attempt} transport retries: {err:?}"),
+        }
+    }
 }
 
 /// A single primary provider, small backoffs. `{url}` is the upstream.
@@ -694,6 +722,19 @@ async fn streaming_silent_upstream_first_token_times_out_then_falls_over() {
     );
 }
 
+/// Concurrent-request count for the storm test. Defaults to the CI-scale
+/// 500 (unchanged); override with `LUMEN_RESILIENCE_STORM_SIZE` on a host
+/// whose OS accept backlog can't tolerate that many near-simultaneous
+/// connects (see `storm_chat`'s kernel-level connect-retry for the primary
+/// fix - this is an escape hatch for hosts where even that isn't enough
+/// headroom).
+fn storm_size() -> usize {
+    std::env::var("LUMEN_RESILIENCE_STORM_SIZE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(500)
+}
+
 // Criterion 5: under a storm of upstream 429s, /health stays fast and every
 // request completes (no unbounded queue, no hang).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -737,17 +778,18 @@ async fn health_stays_fast_under_upstream_429_storm() {
         .expect("health warm-up");
     assert_eq!(warmup.status(), 200);
 
-    // Fire 500 concurrent requests through one pooled client. A single client
-    // (rather than one per task) lets finished connections be reused by
-    // still-queued requests instead of piling more handshakes onto the
-    // backlog, and the timeout turns a wedged gateway into a loud failure
-    // instead of a hung test.
+    // Fire the storm (CI-scale default 500; see `storm_size`) through one
+    // pooled client. A single client (rather than one per task) lets finished
+    // connections be reused by still-queued requests instead of piling more
+    // handshakes onto the backlog, and the timeout turns a wedged gateway
+    // into a loud failure instead of a hung test.
     let storm_client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
         .expect("storm client");
-    let mut tasks = Vec::new();
-    for _ in 0..500 {
+    let size = storm_size();
+    let mut tasks = Vec::with_capacity(size);
+    for _ in 0..size {
         let base = base.clone();
         let storm_client = storm_client.clone();
         tasks.push(tokio::spawn(async move {
@@ -783,7 +825,7 @@ async fn health_stays_fast_under_upstream_429_storm() {
         assert!(status == 429 || status == 503, "unexpected status {status}");
         completed += 1;
     }
-    assert_eq!(completed, 500);
+    assert_eq!(completed, size);
 }
 
 // Criterion 6: a 429 with `Retry-After: 1` forces at least a ~1 s wait before

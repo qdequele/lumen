@@ -1,0 +1,6 @@
+# fuzz/ is its own cargo workspace (see Cargo.toml comment) - keep its build
+# artifacts, generated corpus, and crash artifacts out of the main repo.
+/target
+/corpus
+/artifacts
+Cargo.lock

@@ -602,8 +602,17 @@ async fn scenario_malformed_response(fx: &dyn EmbedFixture) {
 
 async fn scenario_cancellation_aborts_upstream(fx: &dyn EmbedFixture) {
     let mock = MockServer::start().await;
-    // Upstream would take 2s; we cancel almost immediately.
-    fx.mount_delayed(&mock, Duration::from_secs(2)).await;
+    // Upstream would take 3s; we cancel almost immediately. The delay (and
+    // the elapsed bound below) has headroom beyond the bare minimum needed
+    // on a quiet host: this suite runs across every provider fixture, and
+    // under full workspace-test parallelism (many `#[tokio::test]`s
+    // contending for the same CPUs) real-time sleeps and task wakeups can
+    // slip by hundreds of ms - this test flaked once under exactly that
+    // load. A wider margin keeps the assertion just as meaningful (still
+    // asserting the call returns in a small fraction of the mocked delay,
+    // proving upstream was never awaited to completion) while tolerating
+    // realistic scheduler jitter.
+    fx.mount_delayed(&mock, Duration::from_secs(3)).await;
     let provider = fx.build(mock.uri());
 
     let cancel = CancellationToken::new();
@@ -626,9 +635,9 @@ async fn scenario_cancellation_aborts_upstream(fx: &dyn EmbedFixture) {
         matches!(result, Err(ProviderError::Cancelled)),
         "expected Cancelled, got {result:?}"
     );
-    // Returned well before the 2s upstream delay → the call was aborted.
+    // Returned well before the 3s upstream delay → the call was aborted.
     assert!(
-        elapsed < Duration::from_secs(1),
+        elapsed < Duration::from_secs(2),
         "cancellation should abort promptly, took {elapsed:?}"
     );
     // The upstream did receive the request (it reached the provider edge).

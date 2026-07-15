@@ -6,14 +6,25 @@
 #   OPENAI_API_KEY=sk-mock TARGET=http://localhost:4000 k6 run bench/k6-added-latency.js   # litellm
 #   OPENAI_API_KEY=sk-mock TARGET=http://localhost:1080 k6 run bench/k6-added-latency.js   # direct (baseline)
 #
+# Or just run `bench/run.sh`, which drives all of the above and writes a
+# timestamped report under bench/results/. See bench/README.md.
+#
 # Added latency = gateway p50/p99 − direct p50/p99. Record RAM with
-# `docker stats --no-stream lumen litellm`. See bench/README.md.
+# `docker stats --no-stream lumen litellm`.
+#
+# All third-party images are pinned by tag + digest for reproducibility;
+# bump both together when refreshing the baseline (see bench/README.md
+# "Updating the pinned versions").
 
 services:
   # A zero-logic OpenAI-compatible upstream: constant response, ~0 ms compute,
   # so the measured latency is transport + proxy overhead, not model time.
   mock-upstream:
-    image: mockserver/mockserver:5.15.0
+    image: mockserver/mockserver:5.15.0@sha256:0f9ef78c94894ac3e70135d156193b25e23872575d58e2228344964273b4af6b
+    # Fixed name (rather than the compose-project-prefixed default) so
+    # `docker stats`/`docker inspect` invocations in bench/run.sh and
+    # bench/README.md are stable regardless of the project/directory name.
+    container_name: mock-upstream
     ports:
       - "1080:1080"
     environment:
@@ -25,6 +36,7 @@ services:
     build:
       context: ..
       dockerfile: Dockerfile
+    container_name: lumen
     ports:
       - "8080:8080"
     environment:
@@ -36,7 +48,8 @@ services:
       - mock-upstream
 
   litellm:
-    image: ghcr.io/berriai/litellm:main-latest
+    image: ghcr.io/berriai/litellm:v1.92.0@sha256:9ef6f45bc0104940571765e610c52a1d761b5ec85efcd193795281086ee61277
+    container_name: litellm
     ports:
       - "4000:4000"
     environment:

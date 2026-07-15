@@ -30,5 +30,33 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "anthropic_translate_request"
+path = "fuzz_targets/anthropic_translate_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "anthropic_translate_response"
+path = "fuzz_targets/anthropic_translate_response.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "google_translate_request"
+path = "fuzz_targets/google_translate_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "google_translate_response"
+path = "fuzz_targets/google_translate_response.rs"
+test = false
+doc = false
+bench = false
+
 # Standalone workspace: keep the fuzz crate out of the main build graph.
 [workspace]
