@@ -72,10 +72,12 @@ Spec: `specs/milestones/M6-resilience.md`
 Spec: `specs/milestones/M7-release.md`
 
 Note: off-network overhead measured (~3 µs median, 10.6 MB image, idle RSS
-8.8 MB); the loaded comparison vs LiteLLM is provided as a reproducible harness
-(`bench/`) - see `docs/perf-baseline.md`. cargo-audit/deny/fuzz wired into CI
-(binaries not installed in the dev environment). amd64 image via buildx CI;
-arm64 verified locally (`docker run`).
+8.8 MB); the loaded comparison vs LiteLLM is a reproducible one-command
+harness (`bench/run.sh`) with a recorded, committed baseline - see
+`docs/perf-baseline.md`. cargo-audit/deny/fuzz wired into CI (binaries not
+installed in the dev environment; fuzz now also covers the Anthropic/Google
+`translate_request`/`translate_response` paths directly, issue #27). amd64
+image via buildx CI; arm64 verified locally (`docker run`).
 
 ## M8 - Vision (image input to chat) ✅
 - [x] Core types: `MessageContent`/`ContentPart`/`ImageUrl` (`content` is a string OR an array of parts), `text()`/`has_image()`

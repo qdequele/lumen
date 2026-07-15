@@ -61,11 +61,9 @@ async-trait = { workspace = true }
 tempfile = { workspace = true }
 
 [target.'cfg(unix)'.dev-dependencies]
-libc = { workspace = true }
-
-[target.'cfg(unix)'.dev-dependencies]
-# tests/signal_shutdown.rs only: send a real SIGTERM/SIGINT to a spawned
-# `lumen` child process.
+# tests/resilience.rs (fd-limit raise for the 429 storm) and
+# tests/signal_shutdown.rs (send a real SIGTERM/SIGINT to a spawned `lumen`
+# child process).
 libc = { workspace = true }
 
 [[bench]]

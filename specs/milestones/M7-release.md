@@ -13,8 +13,10 @@ Prove the promises (public benchmarks), package, document. Output = tagged v0.1.
 
 Note: overhead excluding network measured (~3 µs median) and idle RSS 8.8 MB → targets 1
 and 2 met with margin; the loaded comparison vs LiteLLM (throughput,
-p50/p99, RAM under load) is provided as a reproducible harness `bench/` but
-not run in the dev environment (gap documented honestly).
+p50/p99, RAM under load) is a reproducible one-command harness (`bench/run.sh`)
+with a recorded, committed baseline under `bench/results/` (issue #27) - see
+`docs/perf-baseline.md` for the numbers and the honest caveat about the
+recording host.
 
 ### 7.2 Packaging
 - [x] Static binary `x86_64-unknown-linux-musl` + `aarch64`; check the size (< 25 MB stripped)
@@ -40,17 +42,18 @@ stored in the database (boot snapshot) - hardened after review.
 - [x] `SECURITY.md`, default HTTP security headers
 
 Note: `deny.toml` + CI job `supply-chain` (audit + deny). Fuzz: crate `fuzz/`
-(targets `sse_parser`, `chat_request`) + weekly workflow; the Anthropic translation
-is reached via the shared SSE parser - direct fuzzing of the `translate_*` fns deferred
-to the backlog (private fns). audit/deny/fuzz binaries not installed in dev, wired
-in CI.
+(targets `sse_parser`, `chat_request`, plus `anthropic_translate_request`,
+`anthropic_translate_response`, `google_translate_request`,
+`google_translate_response` added in issue #27 via a `#[cfg(fuzzing)]` shim
+over the private `translate_*` fns) + weekly workflow. audit/deny/fuzz
+binaries not installed in dev, wired in CI.
 
 ### 7.5 Documentation (delegate to docs-writer)
 - [x] README with 5-minute quickstart, providers×capabilities table, benchmarks
 - [x] Per-provider guides, complete docs/errors.md, CHANGELOG v0.1.0
 
 ## Acceptance criteria
-1. [x] `docs/perf-baseline.md` published - targets 1 & 2 met (measured), target 3 (loaded throughput) documented honestly with a reproducible harness.
+1. [x] `docs/perf-baseline.md` published - targets 1 & 2 met (measured), target 3 (loaded throughput) documented honestly with a reproducible harness and a committed recorded baseline (issue #27).
 2. [x] Docker image: the README's `docker run` works - verified on arm64 locally; amd64 via buildx CI.
 3. [x] Reload with a broken config → service intact, `lumen_config_reload_failures_total` incremented (tested).
 4. [x] cargo audit/deny wired in CI (green expected; binaries not installed in the dev environment).

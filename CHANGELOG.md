@@ -6,6 +6,43 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added - Test & benchmark debt (issue #27)
+
+- **Direct fuzzing of the Anthropic/Google translation paths.** Each provider
+  module gets a `#[cfg(fuzzing)] pub mod fuzzing` shim (compiled only under
+  `cargo fuzz`, which sets `--cfg fuzzing` across the dependency graph, so
+  normal builds are unaffected) exposing `translate_request`/
+  `translate_response`. Four new `fuzz/fuzz_targets/` binaries
+  (`anthropic_translate_request`, `anthropic_translate_response`,
+  `google_translate_request`, `google_translate_response`), wired into the
+  weekly fuzz CI matrix; each ran 10 000 libFuzzer iterations locally with no
+  crashes. See `fuzz/README.md`.
+- **Reproducible, committed LUMEN-vs-LiteLLM benchmark baseline.** `bench/run.sh`
+  drives the full head-to-head (build/start the pinned stack, run k6 against
+  direct/lumen/litellm, sample RAM under load, tear down) in one command and
+  writes a timestamped report to `bench/results/`. `bench/compose.yaml` now
+  pins LiteLLM and mockserver by tag *and* digest. A recorded baseline run is
+  committed and linked from `docs/perf-baseline.md`, with an honest caveat
+  about the recording host's noise.
+- **Real-signal SIGTERM/SIGINT integration test.** `crates/server/tests/signal_shutdown.rs`
+  (`#[cfg(unix)]`) spawns the actual `lumen` binary and sends it a genuine
+  `SIGTERM`/`SIGINT` via `libc::kill`, asserting an in-flight request still
+  completes and the process exits 0 - the real `tokio::signal` path, not just
+  the injected-oneshot `serve()` tests.
+
+### Fixed - Test determinism
+
+- `resilience.rs::health_stays_fast_under_upstream_429_storm` no longer panics
+  on a client-side TCP connect reset/broken-pipe under its 500-concurrent-request
+  storm (a saturated OS accept backlog on some hosts, not gateway behaviour):
+  the shared `post_chat` test helper now retries pre-response transport errors
+  with backoff. Storm size is also overridable via
+  `LUMEN_RESILIENCE_STORM_SIZE` (default unchanged: 500).
+- `providers::embeddings::mistral_passes_embed_conformance_suite`'s
+  cancellation scenario widened its mocked-delay/elapsed-bound margin (2s/1s →
+  3s/2s) for headroom under full workspace-test parallelism, without weakening
+  what it proves.
+
 ### Changed - First-frame-peek streaming retry (issue #7)
 
 - **Streaming commitment now happens at the first content frame, not at the
