@@ -238,6 +238,7 @@ fn request(docs: &[&str]) -> RerankRequest {
             .iter()
             .map(|s| RerankDocument::Text((*s).to_owned()))
             .collect(),
+        rank_fields: None,
         top_n: None,
         return_documents: false,
     }

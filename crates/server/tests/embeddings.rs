@@ -21,6 +21,7 @@ fn registry_for(upstream: &str) -> Arc<Registry> {
         kind: ProviderKind::Openai,
         api_key: Some("sk-test-xxx".to_owned()),
         base_url: Some(upstream.to_owned()),
+        strict: false,
         models: vec![
             ModelSpec {
                 id: "embed-small".to_owned(),
@@ -79,6 +80,45 @@ async fn happy_path_returns_openai_format_and_resolves_alias() {
     let requests = upstream.received_requests().await.unwrap();
     let sent: Value = serde_json::from_slice(&requests[0].body).unwrap();
     assert_eq!(sent["model"], "text-embedding-3-small");
+}
+
+#[tokio::test]
+async fn base64_encoding_format_re_encodes_vectors_on_the_way_out() {
+    let upstream = MockServer::start().await;
+    // Upstream returns a plain float array; the gateway must re-encode it as
+    // base64 because the CLIENT asked for encoding_format: "base64" (issue #25).
+    Mock::given(method("POST"))
+        .and(path("/embeddings"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "object": "list",
+            "data": [{ "object": "embedding", "index": 0, "embedding": [1.0, 2.0] }],
+            "model": "text-embedding-3-small",
+            "usage": { "prompt_tokens": 3, "total_tokens": 3 }
+        })))
+        .mount(&upstream)
+        .await;
+
+    let base = common::spawn_with(registry_for(&upstream.uri()), LIMIT).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/embeddings"))
+        .json(&json!({
+            "model": "embed-small",
+            "input": "hello",
+            "encoding_format": "base64"
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    // The vector is now a base64 string, not a float array.
+    let b64 = body["data"][0]["embedding"]
+        .as_str()
+        .expect("base64 string embedding");
+    let expected = lumen_core::encode_embedding_base64(&[1.0, 2.0]);
+    assert_eq!(b64, expected);
 }
 
 #[tokio::test]

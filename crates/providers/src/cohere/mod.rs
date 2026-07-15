@@ -148,7 +148,13 @@ fn build_cohere_body(req: &EmbedRequest) -> CohereEmbedBody<'_> {
                 embedding_types: ["float"],
             })
         }
-        EmbedInput::Single(_) | EmbedInput::Batch(_) => CohereEmbedBody::Text(CohereEmbedRequest {
+        // Cohere embed takes texts, not token ids; token-array inputs yield no
+        // text fragments (`iter()` is empty for them) and are not a Cohere use
+        // case. They pass through natively only on OpenAI-compatible providers.
+        EmbedInput::Single(_)
+        | EmbedInput::Batch(_)
+        | EmbedInput::Tokens(_)
+        | EmbedInput::TokenBatch(_) => CohereEmbedBody::Text(CohereEmbedRequest {
             model: &req.model,
             texts: req.input.iter().collect(),
             input_type: INPUT_TYPE,
@@ -230,6 +236,7 @@ impl EmbeddingProvider for CohereProvider {
                 object: "embedding".to_owned(),
                 index: u32::try_from(index).unwrap_or(u32::MAX),
                 embedding,
+                encoding: lumen_core::EmbeddingEncoding::default(),
             })
             .collect();
 

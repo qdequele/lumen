@@ -196,6 +196,11 @@ base_url = "http://localhost:11434"
 # be overridden per provider. Applies to every model this provider serves.
 first_token_timeout_ms = 60000
 total_timeout_ms = 120000
+# strict = false   # optional (default false). When true, reject a request that
+                   # sets an unsupported-but-meaningful field this provider
+                   # cannot honor (Ollama: `dimensions`) with a 400 (LM-1001),
+                   # instead of silently dropping it. `encoding_format` is always
+                   # handled at the response edge and is never affected.
 
 [[providers.models]]
 id = "nomic-embed"

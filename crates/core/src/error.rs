@@ -81,6 +81,18 @@ pub enum ProviderError {
     #[error("provider '{provider}' requires inline base64 image data; remote image URLs are not supported")]
     ImageUrlNotSupported { provider: String },
 
+    /// The client set a request field the provider cannot honor, and the
+    /// provider is running in strict mode (rather than silently dropping it).
+    /// A client fault: never retried, never counted against provider health,
+    /// and surfaced as a 400 (`LM-1001`). Names the field and provider.
+    #[error("provider '{provider}' does not support the '{field}' field")]
+    UnsupportedField {
+        /// The provider that rejected the field.
+        provider: String,
+        /// The offending request field (e.g. `dimensions`).
+        field: String,
+    },
+
     /// The upstream signalled rate limiting (HTTP 429).
     #[error("provider '{provider}' rate limited the request")]
     RateLimited {
@@ -108,7 +120,8 @@ impl ProviderError {
             | ProviderError::RateLimited { .. } => true,
             ProviderError::Cancelled
             | ProviderError::Translation(_)
-            | ProviderError::ImageUrlNotSupported { .. } => false,
+            | ProviderError::ImageUrlNotSupported { .. }
+            | ProviderError::UnsupportedField { .. } => false,
         }
     }
 
@@ -127,7 +140,8 @@ impl ProviderError {
             | ProviderError::RateLimited { .. } => true,
             ProviderError::Cancelled
             | ProviderError::Translation(_)
-            | ProviderError::ImageUrlNotSupported { .. } => false,
+            | ProviderError::ImageUrlNotSupported { .. }
+            | ProviderError::UnsupportedField { .. } => false,
         }
     }
 
@@ -526,6 +540,14 @@ impl GatewayError {
                     provider: p_or(provider, p),
                 }
             }
+            // The client set a field the provider cannot honor under strict mode:
+            // a client fault → 400 (LM-1001), never retried or failed over.
+            ProviderError::UnsupportedField { provider: p, field } => {
+                GatewayError::InvalidRequest(format!(
+                    "provider '{}' does not support the '{field}' field",
+                    p_or(provider, p)
+                ))
+            }
             // A client-initiated cancel is not a gateway malfunction: its own
             // LM-6001 / 499, so it never inflates `internal`/5xx metrics or
             // alerts the way `GatewayError::Internal` would (issue #11).
@@ -784,6 +806,10 @@ mod tests {
                 provider: "p".into(),
             },
             ProviderError::Cancelled,
+            ProviderError::UnsupportedField {
+                provider: "p".into(),
+                field: "dimensions".into(),
+            },
         ] {
             assert!(!err.is_retryable(), "{err:?} must not be retried");
             assert!(
@@ -791,6 +817,20 @@ mod tests {
                 "{err:?} must not fault the breaker"
             );
         }
+    }
+
+    #[test]
+    fn unsupported_field_maps_to_400_lm_1001_naming_the_field() {
+        let err = GatewayError::from_provider(
+            "ollama",
+            ProviderError::UnsupportedField {
+                provider: "ollama".into(),
+                field: "dimensions".into(),
+            },
+        );
+        assert_eq!(err.code(), "LM-1001");
+        assert_eq!(err.error_type(), ErrorType::InvalidRequest);
+        assert!(matches!(err, GatewayError::InvalidRequest(ref m) if m.contains("dimensions")));
     }
 
     #[test]

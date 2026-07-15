@@ -159,6 +159,7 @@ impl EmbedFixture for OllamaFixture {
             reqwest::Client::new(),
             "ollama-test",
             base_url,
+            false,
         ))
     }
 
@@ -622,4 +623,53 @@ async fn openai_5000_inputs_yields_exactly_three_calls_in_order() {
         assert_eq!(d.embedding[0], i as f32);
     }
     assert_eq!(resp.usage.total_tokens, 5000);
+}
+
+/// Issue #25: in strict mode Ollama rejects `dimensions` (which it cannot honor)
+/// with `UnsupportedField` before any upstream call, so it surfaces as 400
+/// (`LM-1001`) rather than silently returning full-width vectors.
+#[tokio::test]
+async fn ollama_strict_mode_rejects_dimensions_before_any_call() {
+    let mock = MockServer::start().await;
+    // Mount an echo so a non-strict path WOULD succeed; strict must not reach it.
+    OllamaFixture.mount_echo(&mock).await;
+    let strict = OllamaProvider::new(reqwest::Client::new(), "ollama-strict", mock.uri(), true);
+
+    let req = EmbedRequest {
+        model: "test-model".to_owned(),
+        input: EmbedInput::Batch(vec!["0".into()]),
+        encoding_format: None,
+        dimensions: Some(256),
+        user: None,
+    };
+    let err = strict
+        .embed(req, CancellationToken::new())
+        .await
+        .expect_err("strict mode must reject dimensions");
+    assert!(
+        matches!(err, ProviderError::UnsupportedField { ref field, .. } if field == "dimensions"),
+        "unexpected error: {err:?}"
+    );
+    // Never reached the upstream.
+    assert_eq!(mock.received_requests().await.unwrap().len(), 0);
+}
+
+/// Issue #25: the default (non-strict) mode silently drops `dimensions` and
+/// still embeds, preserving backward-compatible behavior.
+#[tokio::test]
+async fn ollama_non_strict_drops_dimensions_and_embeds() {
+    let mock = MockServer::start().await;
+    OllamaFixture.mount_echo(&mock).await;
+    let provider = OllamaFixture.build(mock.uri());
+
+    let req = EmbedRequest {
+        model: "test-model".to_owned(),
+        input: EmbedInput::Batch(vec!["0".into(), "1".into()]),
+        encoding_format: None,
+        dimensions: Some(256),
+        user: None,
+    };
+    let resp = provider.embed(req, CancellationToken::new()).await.unwrap();
+    assert_eq!(resp.data.len(), 2);
+    assert_eq!(mock.received_requests().await.unwrap().len(), 1);
 }

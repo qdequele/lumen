@@ -23,6 +23,7 @@ fn openai_registry(upstream: &str) -> Arc<Registry> {
         kind: ProviderKind::Openai,
         api_key: Some("sk-test-xxx".to_owned()),
         base_url: Some(upstream.to_owned()),
+        strict: false,
         models: vec![ModelSpec {
             id: "gpt".to_owned(),
             upstream_id: "gpt-4o-2024-08-06".to_owned(),

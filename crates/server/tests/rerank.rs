@@ -21,6 +21,7 @@ fn registry_for(upstream: &str) -> Arc<Registry> {
         kind: ProviderKind::Cohere,
         api_key: Some("sk-test-xxx".to_owned()),
         base_url: Some(upstream.to_owned()),
+        strict: false,
         models: vec![
             ModelSpec {
                 id: "rerank-fast".to_owned(),

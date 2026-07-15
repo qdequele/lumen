@@ -23,7 +23,7 @@ code prefix groups by cause: `1xxx` request, `2xxx` routing, `3xxx` upstream,
 
 | Code      | HTTP | Meaning                                                        |
 |-----------|------|----------------------------------------------------------------|
-| `LM-1001` | 400  | Malformed or invalid request body / parameters.                |
+| `LM-1001` | 400  | Malformed or invalid request body / parameters. Also returned when a provider in `strict` mode is sent an unsupported-but-meaningful field it cannot honor (e.g. `dimensions` to Ollama); the message names the field and provider. |
 | `LM-1002` | 413  | Request body exceeded the configured size limit.               |
 
 ## Routing & capability-request errors - `LM-2xxx` · `type: invalid_request`

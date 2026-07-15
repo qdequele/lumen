@@ -50,6 +50,7 @@ fn openai_registry(upstream: &str) -> Arc<Registry> {
         kind: ProviderKind::Openai,
         api_key: Some("sk-test-xxx".to_owned()),
         base_url: Some(upstream.to_owned()),
+        strict: false,
         models: vec![
             ModelSpec {
                 id: "gpt".to_owned(),
@@ -74,6 +75,7 @@ fn anthropic_registry(upstream: &str) -> Arc<Registry> {
         kind: ProviderKind::Anthropic,
         api_key: Some("sk-ant-test".to_owned()),
         base_url: Some(upstream.to_owned()),
+        strict: false,
         models: vec![ModelSpec {
             id: "claude".to_owned(),
             upstream_id: "claude-3-5-sonnet".to_owned(),
@@ -90,6 +92,7 @@ fn google_registry(upstream: &str) -> Arc<Registry> {
         kind: ProviderKind::Google,
         api_key: Some("goog-test".to_owned()),
         base_url: Some(upstream.to_owned()),
+        strict: false,
         models: vec![ModelSpec {
             id: "gemini".to_owned(),
             upstream_id: "gemini-2.0-flash".to_owned(),
@@ -165,6 +168,7 @@ async fn openai_compatible_kind_routes_through_the_openai_path() {
         kind: ProviderKind::Groq,
         api_key: Some("gsk-test".to_owned()),
         base_url: Some(upstream.uri()), // override the built-in api.groq.com default
+        strict: false,
         models: vec![ModelSpec {
             id: "fast".to_owned(),
             upstream_id: "llama-3.3-70b".to_owned(),

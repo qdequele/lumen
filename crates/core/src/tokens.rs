@@ -100,9 +100,12 @@ pub fn estimate_chat_prompt(req: &ChatRequest) -> u64 {
 }
 
 /// Estimate the input tokens of an embeddings request (sum over the batch).
+/// Pre-tokenized inputs (token-id arrays) contribute one token per id, with no
+/// byte heuristic; text inputs use the byte-per-token heuristic.
 #[must_use]
 pub fn estimate_embed_input(req: &EmbedRequest) -> u64 {
-    req.input.iter().map(estimate_text).sum()
+    let text: u64 = req.input.iter().map(estimate_text).sum();
+    text.saturating_add(req.input.token_count())
 }
 
 /// Estimate the tokens processed by a rerank request: the query is compared
@@ -207,6 +210,17 @@ mod tests {
             serde_json::from_str(r#"{"model":"m","input":["abcd","efghijkl"]}"#)
                 .expect("valid request");
         assert_eq!(estimate_embed_input(&req), 3);
+    }
+
+    #[test]
+    fn embed_token_arrays_count_one_per_id() {
+        let single: EmbedRequest =
+            serde_json::from_str(r#"{"model":"m","input":[1,2,3,4]}"#).expect("valid request");
+        assert_eq!(estimate_embed_input(&single), 4);
+
+        let batch: EmbedRequest = serde_json::from_str(r#"{"model":"m","input":[[1,2],[3,4,5]]}"#)
+            .expect("valid request");
+        assert_eq!(estimate_embed_input(&batch), 5);
     }
 
     #[test]
