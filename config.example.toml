@@ -204,6 +204,26 @@ cost_per_1m_output = 15.0
 # upstream_id = "gemini-2.0-flash"
 # capabilities = ["chat"]
 
+# AWS Bedrock: chat via the Converse API (one uniform schema across the
+# Anthropic / Meta / Amazon / Mistral model families). Auth is AWS SigV4, NOT a
+# bearer key: credentials come from the standard AWS environment variables
+# (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and optionally
+# `AWS_SESSION_TOKEN`), so `api_key_env` is not required. The region drives the
+# endpoint host; set `base_url` to the runtime endpoint for your region (the
+# region is parsed back out of it for the signing scope). `upstream_id` is the
+# Bedrock model id and may include a version suffix with a colon.
+[[providers]]
+name = "bedrock"
+kind = "bedrock"
+base_url = "https://bedrock-runtime.us-east-1.amazonaws.com"
+# api_key_env = "AWS_SECRET_ACCESS_KEY"   # optional: overrides the env secret
+
+[[providers.models]]
+id = "bedrock-claude-3-5-sonnet"
+upstream_id = "anthropic.claude-3-5-sonnet-20241022-v2:0"
+capabilities = ["chat"]
+modalities = ["text", "image"]
+
 # Ollama: local, keyless. Requires a base_url.
 [[providers]]
 name = "ollama-local"

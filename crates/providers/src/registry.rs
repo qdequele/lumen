@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use crate::anthropic::AnthropicProvider;
 use crate::azure::AzureProvider;
+use crate::bedrock::{self, BedrockProvider};
 use crate::cloudflare::CloudflareRerankProvider;
 use crate::cohere::CohereProvider;
 use crate::google::vertex::VertexProvider;
@@ -717,6 +718,28 @@ fn build_providers(
                 message: e.to_string(),
             })?;
             let chat: Arc<dyn ChatProvider> = Arc::new(provider);
+            Ok(BuiltProviders {
+                chat: Some(chat),
+                embed: None,
+                rerank: None,
+            })
+        }
+        ProviderKind::Bedrock => {
+            // Region is parsed from a standard runtime endpoint if configured,
+            // else defaults inside the provider. Credentials come from the AWS
+            // environment variables (with the optional api_key override for the
+            // secret), so a missing key here is not a build error: the provider
+            // reports it at request time instead.
+            let region = bedrock::region_from_base_url(spec.base_url.as_deref())
+                .unwrap_or_else(|| bedrock::DEFAULT_REGION.to_owned());
+            let credentials = bedrock::Credentials::from_env(spec.api_key.clone());
+            let chat: Arc<dyn ChatProvider> = Arc::new(BedrockProvider::new(
+                client.clone(),
+                spec.name.clone(),
+                region,
+                spec.base_url.clone(),
+                credentials,
+            ));
             Ok(BuiltProviders {
                 chat: Some(chat),
                 embed: None,

@@ -13,6 +13,7 @@
 pub mod anthropic;
 pub mod azure;
 pub mod batch;
+pub mod bedrock;
 pub mod chat;
 pub mod cloudflare;
 pub mod cohere;
@@ -38,6 +39,7 @@ pub mod voyage;
 pub use anthropic::AnthropicProvider;
 pub use azure::AzureProvider;
 pub use batch::embed_batched;
+pub use bedrock::BedrockProvider;
 pub use cloudflare::CloudflareRerankProvider;
 pub use cohere::CohereProvider;
 pub use google::vertex::VertexProvider;

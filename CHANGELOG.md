@@ -6,6 +6,31 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added - AWS Bedrock provider (SigV4, Converse API)
+
+- **New `bedrock` provider kind: chat via the AWS Bedrock Converse API.** One
+  uniform schema (`POST /model/{modelId}/converse` and `/converse-stream`)
+  covers the Anthropic, Meta Llama, Amazon Titan/Nova, Mistral and Cohere model
+  families, so the legacy per-model `InvokeModel` schemas are intentionally not
+  implemented. Bidirectional OpenAI ⇄ Converse translation including system
+  prompts, `inferenceConfig`, tools, images (inline `data:` URIs) and usage
+  (`inputTokens`/`outputTokens`, mapped per ADR 003).
+- **AWS Signature Version 4 request signing**, hand-rolled over `hmac` + `sha2`
+  (pure-Rust, rustls-compatible, no OpenSSL and no AWS SDK runtime) to keep the
+  dependency and RAM footprint aligned with the project pillars. Credentials are
+  read from the standard AWS environment variables (`AWS_ACCESS_KEY_ID`,
+  `AWS_SECRET_ACCESS_KEY`, optional `AWS_SESSION_TOKEN`); the secret and session
+  token are never logged and never appear in `Debug`. Region drives the
+  `bedrock-runtime.{region}.amazonaws.com` endpoint and the signing scope.
+- **Streaming** parses the AWS event-stream binary framing
+  (`vnd.amazon.eventstream`: prelude, headers, payload, CRCs) into OpenAI chunks;
+  CRC validation is skipped (TLS assures integrity) but frame lengths are checked
+  exactly. Cancellation aborts the in-flight upstream request like every other
+  provider. Wiremock tests cover signed-header well-formedness, the Converse
+  round-trip, event-stream frame parsing from byte fixtures, streaming
+  translation, partial-stream (no fabricated `[DONE]`), cancellation, and
+  secret hygiene.
+
 ### Added - Additional rerank providers (Mixedbread, Pinecone, NVIDIA NIM, Together)
 
 - Four new rerank kinds broaden first-class rerank coverage (issue #19):

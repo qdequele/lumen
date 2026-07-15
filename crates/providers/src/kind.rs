@@ -32,6 +32,8 @@ pub enum ProviderKind {
     Pinecone,
     /// NVIDIA NIM reranking (`/v1/ranking`); `base_url` required, key optional.
     Nvidia,
+    /// AWS Bedrock via the Converse API (SigV4 auth, per-region endpoint).
+    Bedrock,
     // --- OpenAI-compatible hosts (served by the OpenAI provider with a
     //     per-kind base URL; chat + embeddings). ------------------------------
     Groq,
@@ -71,6 +73,7 @@ impl ProviderKind {
             ProviderKind::Mixedbread => "mixedbread",
             ProviderKind::Pinecone => "pinecone",
             ProviderKind::Nvidia => "nvidia",
+            ProviderKind::Bedrock => "bedrock",
             ProviderKind::Groq => "groq",
             ProviderKind::Together => "together",
             ProviderKind::Fireworks => "fireworks",
@@ -129,12 +132,19 @@ impl ProviderKind {
     ///
     /// Local, self-hosted providers (Ollama, TEI, vLLM) are keyless. NVIDIA NIM
     /// is treated as keyless-optional: self-hosted NIMs run without a key, while
-    /// the hosted API still works when one is supplied.
+    /// the hosted API still works when one is supplied. Bedrock is also keyless
+    /// in the LUMEN `api_key` sense: it authenticates with AWS SigV4 credentials
+    /// drawn from the standard AWS environment variables, not a bearer key (an
+    /// optional `api_key_env` may still override the secret).
     #[must_use]
     pub const fn requires_api_key(self) -> bool {
         !matches!(
             self,
-            ProviderKind::Ollama | ProviderKind::Tei | ProviderKind::Vllm | ProviderKind::Nvidia
+            ProviderKind::Ollama
+                | ProviderKind::Tei
+                | ProviderKind::Vllm
+                | ProviderKind::Nvidia
+                | ProviderKind::Bedrock
         )
     }
 }
