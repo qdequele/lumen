@@ -9,7 +9,12 @@
 //!   response (client disconnect) cancels the token and aborts the upstream.
 //!
 //! Errors that occur before streaming starts are returned as a normal JSON error
-//! envelope; a mid-stream error is emitted as a terminal SSE error frame.
+//! envelope. The commitment point is the first *content frame*, not the open:
+//! the streaming path peeks the first upstream frame (ADR 005, 2026-07-15
+//! amendment), so an upstream that opens 200 then errors or closes before any
+//! content frame still falls over instead of committing. Once the first content
+//! frame is forwarded the request is committed and a later mid-stream error is
+//! emitted as a terminal SSE error frame (never retried).
 //!
 //! The streaming body is wrapped in three guards (see [`to_event_stream`]):
 //!
@@ -49,8 +54,9 @@ use crate::state::{AppState, StreamGuards};
 /// Both modes run through the M6 resilience executor: the requested model plus
 /// its configured fallbacks are tried in turn with retries, circuit breaking
 /// and the per-model timeouts (ADR 005). For streaming, retry/fallback happen
-/// only while *opening* the upstream byte stream - once the first frame is
-/// forwarded the request is committed and the M4 frame guards take over.
+/// while *opening* the upstream byte stream AND while peeking its first frame
+/// (ADR 005, 2026-07-15 amendment) - once the first content frame is forwarded
+/// the request is committed and the M4 frame guards take over (no more retry).
 pub async fn chat(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -206,11 +212,12 @@ struct ChatExec<'a> {
     estimated_input: u64,
 }
 
-/// Streaming path: open the upstream byte stream with retry/fallback (only
-/// before the first frame, spec 6.2), then hand it to the M4 frame guards.
+/// Streaming path: open the upstream byte stream and peek its first frame with
+/// retry/fallback (only before the first content frame reaches the client,
+/// spec 6.2 + ADR 005 2026-07-15), then hand it to the M4 frame guards.
 /// Zero-copy passthrough where the upstream speaks OpenAI SSE; typed providers
-/// translate event by event (ADR 004). An open failure surfaces as a JSON error
-/// envelope (headers not sent yet).
+/// translate event by event (ADR 004). An open or peek failure surfaces as a
+/// JSON error envelope (headers not sent yet).
 async fn chat_streaming(
     ctx: &ChatExec<'_>,
     guard: DropGuard,
@@ -223,6 +230,7 @@ async fn chat_streaming(
         ctx.cancel,
         |i| {
             let provider = ctx.chain[i].route.provider.clone();
+            let provider_name = ctx.chain[i].route.provider_name.clone();
             let cancel = ctx.cancel.clone();
             let mut attempt_req = ctx.req.clone();
             attempt_req.stream = true;
@@ -230,16 +238,31 @@ async fn chat_streaming(
                 .route
                 .upstream_id
                 .clone_into(&mut attempt_req.model);
-            async move { provider.chat_stream_bytes(attempt_req, cancel).await }
+            async move {
+                // Open, then PEEK the first frame before committing (ADR 005,
+                // 2026-07-15 amendment). An upstream that opens 200 then errors
+                // or closes before any content frame is a pre-commit failure
+                // (retry / fallback, breaker penalised), not a terminal SSE
+                // error. The whole open + peek is bounded by the executor's
+                // per-attempt first_token timeout, so a silent upstream fails
+                // over too. Once a content frame arrives we commit and the M4
+                // frame guards own the rest (no mid-stream retry).
+                let stream = provider
+                    .chat_stream_bytes(attempt_req, cancel.clone())
+                    .await?;
+                lumen_router::peek::peek_first_frame(stream, &provider_name, &cancel).await
+            }
         },
     )
     .await?;
     // (an early return above drops `accounting`, refunding the reservation)
     accounting.served_by(&executed.model_used, &executed.provider_used);
 
-    // A fresh first-frame deadline now that the stream is open (the open phase
-    // already had its own first-token budget). The M4 frame guards
-    // (LM-3010/3011, heartbeat) own the stream from here - no more retries.
+    // A fresh first-frame deadline for the committed stream. The peek already
+    // consumed (and re-attached) the first content frame, so this frame is
+    // immediate and the deadline effectively only backstops the heartbeat; the
+    // M4 frame guards (LM-3010/3011, heartbeat) own the stream from here - no
+    // more retries.
     let deadline = tokio::time::Instant::now() + ctx.exec.first_token;
     let stream_accounting = StreamAccounting::new(accounting, ctx.estimated_input);
     let body = Body::from_stream(to_event_stream(

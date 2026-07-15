@@ -12,6 +12,7 @@
 
 pub mod circuit;
 pub mod executor;
+pub mod peek;
 pub mod retry;
 
 use lumen_core::{Capability, GatewayError};

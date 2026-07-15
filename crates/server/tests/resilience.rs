@@ -513,6 +513,187 @@ async fn storm_chat(client: &reqwest::Client, base: &str) -> reqwest::StatusCode
     }
 }
 
+// First-frame-peek (issue #7, ADR 005 2026-07-15): a stream that opens 200 then
+// closes before any content frame is a PRE-COMMIT failure. The peek fails it
+// over to the fallback (client sees a clean successful stream) AND penalises the
+// primary's breaker - proven here by a second request that skips the primary
+// entirely (threshold 1). Contrast with `streaming_failure_after_first_chunk_is_
+// not_retried` above, where a content frame already committed the response.
+#[tokio::test]
+async fn streaming_empty_first_frame_falls_over_and_penalises_the_breaker() {
+    let primary = MockServer::start().await;
+    let fallback = MockServer::start().await;
+    // 200 + event-stream headers, but an EMPTY body: the stream opens then ends
+    // before delivering a single content frame.
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).insert_header("content-type", "text/event-stream"))
+        .mount(&primary)
+        .await;
+    // A healthy SSE stream: one content frame then the terminator.
+    let good = "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n\
+                data: [DONE]\n\n";
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(good),
+        )
+        .mount(&fallback)
+        .await;
+
+    // One attempt per link (no retries), breaker opens after a single failure.
+    let base = spawn(&config_from(&fallback_config(
+        &primary.uri(),
+        &fallback.uri(),
+        1,
+        1,
+        30_000,
+    )))
+    .await;
+
+    let stream_once = || async {
+        reqwest::Client::new()
+            .post(format!("{base}/v1/chat/completions"))
+            .json(&json!({
+                "model": "gpt",
+                "messages": [{ "role": "user", "content": "hi" }],
+                "stream": true
+            }))
+            .send()
+            .await
+            .unwrap()
+    };
+
+    // Request 1: primary empty-streams → peek fails over to the fallback, and the
+    // client gets a clean, successful stream with no error frame.
+    let resp = stream_once().await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers()
+            .get("x-lumen-model-used")
+            .and_then(|v| v.to_str().ok()),
+        Some("claude-fb"),
+        "the peek must fall over to the fallback"
+    );
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("\"content\":\"hello\""), "body: {body}");
+    assert!(body.contains("[DONE]"), "body: {body}");
+    assert!(!body.contains("LM-3"), "no error frame expected: {body}");
+
+    // Request 2: the primary's breaker was penalised by the failed peek and is
+    // now open, so the primary is skipped entirely (its hit count stays at 1).
+    let resp = stream_once().await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers()
+            .get("x-lumen-model-used")
+            .and_then(|v| v.to_str().ok()),
+        Some("claude-fb")
+    );
+
+    assert_eq!(
+        primary.received_requests().await.unwrap().len(),
+        1,
+        "the failed peek must open the breaker so the primary is skipped next time"
+    );
+    assert_eq!(fallback.received_requests().await.unwrap().len(), 2);
+}
+
+// First-frame-peek (issue #7): a silent upstream that opens but sends no bytes
+// must fail over on the first_token timeout, not hang the peek. (wiremock cannot
+// send headers then stall the body, so the whole response is delayed past the
+// first_token window; the peek-window bound itself is unit-tested in
+// `router::peek`.)
+#[tokio::test]
+async fn streaming_silent_upstream_first_token_times_out_then_falls_over() {
+    let primary = MockServer::start().await;
+    let fallback = MockServer::start().await;
+    // Primary "opens" but only after a delay far beyond the first_token window.
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_delay(Duration::from_secs(5)),
+        )
+        .mount(&primary)
+        .await;
+    let good = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n\
+                data: [DONE]\n\n";
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(good),
+        )
+        .mount(&fallback)
+        .await;
+
+    // A short first_token so the silent primary trips it quickly; one attempt.
+    let cfg = format!(
+        r#"
+        [server]
+        first_token_timeout_ms = 300
+
+        [resilience]
+        retry_max_attempts = 1
+        retry_base_ms = 10
+        retry_max_ms = 50
+
+        [[providers]]
+        name = "primary"
+        kind = "openai"
+        base_url = "{}"
+        [[providers.models]]
+        id = "gpt"
+        capabilities = ["chat"]
+        fallbacks = ["claude-fb"]
+
+        [[providers]]
+        name = "fallback"
+        kind = "openai"
+        base_url = "{}"
+        [[providers.models]]
+        id = "claude-fb"
+        capabilities = ["chat"]
+        "#,
+        primary.uri(),
+        fallback.uri()
+    );
+    let base = spawn(&config_from(&cfg)).await;
+
+    let started = Instant::now();
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&json!({
+            "model": "gpt",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers()
+            .get("x-lumen-model-used")
+            .and_then(|v| v.to_str().ok()),
+        Some("claude-fb"),
+        "the silent primary must fail over on the first_token timeout"
+    );
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("\"content\":\"hi\""), "body: {body}");
+    // It failed over promptly (well under the primary's 5 s delay).
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "did not fail over on the first_token timeout: {:?}",
+        started.elapsed()
+    );
+}
+
 // Criterion 5: under a storm of upstream 429s, /health stays fast and every
 // request completes (no unbounded queue, no hang).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

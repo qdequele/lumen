@@ -10,9 +10,13 @@
 //! embeddings and reranking alike.
 //!
 //! Streaming reuses this unchanged: the closure *opens* the upstream byte
-//! stream, so a retry/fallback can only happen before the first byte reaches
-//! the client (spec 6.1/6.2). Once the stream opens, the caller's frame guards
-//! own the rest and never retry.
+//! stream and then peeks its first frame (ADR 005, 2026-07-15 amendment), so a
+//! retry/fallback can happen right up to - but not past - the first *content
+//! frame* reaching the client (spec 6.1/6.2). A peek failure (first frame is an
+//! upstream error, or the stream ends before any content frame) returns an
+//! `Err` from the closure, so it is retried, failed over and charged to the
+//! breaker exactly like an open failure. Once a content frame is forwarded, the
+//! caller's frame guards own the rest and never retry.
 
 use std::future::Future;
 use std::time::Duration;
@@ -333,6 +337,36 @@ mod tests {
             fallback_calls.load(Ordering::SeqCst),
             0,
             "4xx must not fall back"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_attempt_returns_without_falling_back() {
+        // A client disconnect during the (streaming) attempt surfaces as
+        // `Cancelled`: neither retryable nor a provider fault, so no fallback is
+        // consulted and the breaker is not penalised (issue #7, peek path).
+        let chain = links(&[("openai", "gpt-4o"), ("anthropic", "claude")]);
+        let cb = breakers();
+        let cancel = CancellationToken::new();
+        let fallback_calls = AtomicUsize::new(0);
+        let err = execute(&chain, &cb, &config(3), &cancel, |i| {
+            if i == 1 {
+                fallback_calls.fetch_add(1, Ordering::SeqCst);
+            }
+            async move { Err::<(), _>(ProviderError::Cancelled) }
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), "LM-6001"); // client cancelled (issue #11, 499)
+        assert_eq!(
+            fallback_calls.load(Ordering::SeqCst),
+            0,
+            "a cancellation must not fall back"
+        );
+        assert_eq!(
+            cb.get("openai", "gpt-4o").state(),
+            crate::circuit::CircuitState::Closed,
+            "a cancellation must not penalise the breaker"
         );
     }
 

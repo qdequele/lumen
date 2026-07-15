@@ -60,6 +60,14 @@ pub enum ProviderError {
     #[error("provider '{provider}' is unreachable")]
     Unavailable { provider: String },
 
+    /// The upstream opened a streaming response (2xx) but ended before
+    /// delivering a single content frame. Surfaced by the first-frame peek
+    /// (ADR 005, 2026-07-15 amendment) so an empty stream flows through the
+    /// retry/fallback executor like any other pre-commit failure; retryable and
+    /// a provider-health signal. Maps to LM-3010.
+    #[error("provider '{provider}' opened a stream but sent no content frame")]
+    EmptyStream { provider: String },
+
     /// The downstream client disconnected; the upstream call was aborted.
     #[error("request cancelled")]
     Cancelled,
@@ -131,6 +139,7 @@ impl ProviderError {
             | ProviderError::ConnectTimeout { .. }
             | ProviderError::FirstTokenTimeout { .. }
             | ProviderError::Unavailable { .. }
+            | ProviderError::EmptyStream { .. }
             | ProviderError::RateLimited { .. } => true,
             ProviderError::Cancelled
             | ProviderError::Translation(_)
@@ -152,6 +161,7 @@ impl ProviderError {
             | ProviderError::ConnectTimeout { .. }
             | ProviderError::FirstTokenTimeout { .. }
             | ProviderError::Unavailable { .. }
+            | ProviderError::EmptyStream { .. }
             | ProviderError::RateLimited { .. } => true,
             ProviderError::Cancelled
             | ProviderError::Translation(_)
@@ -535,6 +545,13 @@ impl GatewayError {
             ProviderError::Unavailable { provider: p } => GatewayError::UpstreamUnavailable {
                 provider: p_or(provider, p),
             },
+            // An upstream that opened then delivered nothing is the same
+            // client-visible outcome as a stream that dies without its
+            // terminator: LM-3010. (Reached only if every link empty-streams;
+            // otherwise the peek falls over to a healthy link.)
+            ProviderError::EmptyStream { provider: p } => GatewayError::UpstreamStreamInterrupted {
+                provider: p_or(provider, p),
+            },
             ProviderError::RateLimited {
                 provider: p,
                 retry_after,
@@ -810,6 +827,9 @@ mod tests {
                 provider: "p".into(),
             },
             ProviderError::Unavailable {
+                provider: "p".into(),
+            },
+            ProviderError::EmptyStream {
                 provider: "p".into(),
             },
             ProviderError::RateLimited {

@@ -6,6 +6,24 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed - First-frame-peek streaming retry (issue #7)
+
+- **Streaming commitment now happens at the first content frame, not at the
+  open.** After the upstream stream opens (2xx + headers), the gateway peeks the
+  first frame before committing the response. An upstream that opens `200` then
+  errors, or closes, before delivering any content frame is now a *pre-commit*
+  failure: it retries and falls over per the existing resilience policy (and
+  penalises the provider's circuit breaker) instead of sending the client a
+  terminal SSE error frame. Once the first content frame arrives the request is
+  committed and the M4 frame guards own the rest, unchanged (a mid-stream error
+  is still a terminal error frame, never retried).
+- The peek buffers at most one frame (zero-copy, ADR 004), is bounded by the
+  per-attempt `first_token` timeout (a silent upstream fails over), and aborts
+  the upstream on a client disconnect during the peek window (no fallback).
+- New `ProviderError::EmptyStream` (retryable, provider-fault) models an upstream
+  that opened but sent no content frame; it maps to the existing `LM-3010` when
+  every link in the chain empty-streams. See ADR 005, 2026-07-15 amendment.
+
 ### Added - Opt-in accurate per-model tokenizer (ADR 003)
 
 - New `[tokenizer]` config section with `mode = "heuristic"` (default) or
