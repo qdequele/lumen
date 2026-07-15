@@ -720,10 +720,12 @@ confidently inferred from the URI's file extension (`.png`, `.jpg`, ...);
 otherwise it is omitted rather than guessed. Files API URIs carry no
 extension, and Gemini already knows the mime type recorded at upload time.
 
-**Accounting.** Upstream-reported `usage` already folds in image tokens; when
-an upstream reports no usage, the local estimation fallback counts text only
-(images contribute `0`) and the response is still flagged `"estimated": true` -
-see the [ADR 003 addendum](adr/003-token-accounting.md#addendum-m8--vision--image-input).
+**Accounting.** Upstream-reported `usage` is authoritative and already folds in
+image tokens. When an upstream reports no usage at all, the local estimation
+fallback counts each image content part with a flat per-image heuristic (85
+tokens at `"detail": "low"`, 765 tokens otherwise) rather than counting it as
+zero, and the response is still flagged `"estimated": true` - see the
+[ADR 003 addendum](adr/003-token-accounting.md#addendum-m8--vision--image-input).
 
 ## Fallbacks across providers
 

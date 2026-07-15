@@ -64,7 +64,8 @@ It also covers the advanced features:
   Mistral - the model must emit a `get_weather` `tool_calls` response
   (`finish_reason: "tool_calls"`, arguments parsed), then ground its final
   answer in the tool result we send back. Streamed `tool_calls` deltas are
-  checked on OpenAI. (The Gemini translation does not cover tools.)
+  checked on OpenAI. (Gemini also translates tool calls; this suite does not
+  yet exercise it.)
 - **Multimodal embeddings (M9)**: a mixed batch (plain text item + text+image
   content-parts item) on Cohere embed-v4, then asserts the M9 media
   accounting appeared on `/metrics` (`lumen_media_total{capability="embed",

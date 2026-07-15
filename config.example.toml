@@ -156,9 +156,12 @@ health_check_interval_ms = 30000  # probe cadence (must not be 0 when enabled)
 # Providers
 #
 # Each `[[providers]]` block declares one upstream. `kind` selects the built-in
-# implementation: openai | anthropic | cohere | ollama | tei | jina | voyage |
-# mistral | google | azure | vertex_ai. `name` is your own label and must be
-# unique.
+# implementation - one of the native integrations (openai | anthropic | google |
+# azure | vertex_ai | bedrock | mistral | cohere | jina | voyage | mixedbread |
+# pinecone | nvidia | tei | ollama) or one of the OpenAI-compatible hosts (groq |
+# together | fireworks | deepseek | openrouter | perplexity | xai | deepinfra |
+# huggingface | cloudflare | vllm). See docs/providers.md for the full matrix.
+# `name` is your own label and must be unique.
 #
 # Each `[[providers.models]]` block exposes a model to clients:
 #   id            the id clients send (owned entirely by you)

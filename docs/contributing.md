@@ -9,14 +9,6 @@ It covers development setup, the validation bar (`cargo test` / `clippy`
 pedantic / `fmt`), the Definition of Done, commit and PR conventions, the ADR
 process, and the full issue-label taxonomy.
 
-## The label axes at a glance
-
-Issues are classified along four independent axes - one label from each
-relevant axis; `scope:` may be multiple or omitted for cross-cutting work.
-
-| Axis | Labels |
-|------|--------|
-| **Type** | `bug`, `enhancement`, `documentation`, `question`, `good first issue`, `help wanted` |
-| **`priority:`** | `high`, `medium`, `low` |
-| **`area:`** | `providers`, `streaming`, `tokenizer`, `observability`, `config`, `resilience`, `testing`, `vision` |
-| **`scope:`** | `chat`, `embedding`, `reranking` |
+Issues are classified along four axes (Type, priority:, area:, scope:); the
+canonical taxonomy with label meanings is in
+[CONTRIBUTING.md](https://github.com/qdequele/lumen/blob/main/CONTRIBUTING.md#issue--pr-labels).
