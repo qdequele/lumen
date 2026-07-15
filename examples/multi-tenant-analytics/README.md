@@ -54,15 +54,9 @@ admin API and budget enforcement.
 
 - `--check-config` on this scenario's config does **not** need
   `LUMEN_MASTER_KEY` set: it only parses and validates `config.toml`
-  (providers, models, `[auth]` shape), it never touches the master key -
-  that is read straight from the environment at actual server startup, in
-  `main.rs`, not through the config loader. In fact, do **not** export
-  `LUMEN_MASTER_KEY` before running `--check-config` on any scenario in this
-  repository: the config loader merges every `LUMEN_`-prefixed environment
-  variable into the config as a field (`figment`'s `Env::prefixed("LUMEN_")`),
-  and `master_key` is not a recognized top-level config field, so a set
-  `LUMEN_MASTER_KEY` makes `--check-config` fail with an "unknown field"
-  error on every scenario, not just this one.
+  (providers, models, `[auth]` shape). The master key is a secret read
+  straight from the environment at actual server startup, in `main.rs`; the
+  config loader explicitly ignores it, so having it exported is harmless.
 - The `db_path = "examples-multi-tenant.db"` SQLite file is created next to
   wherever the gateway is started from and is gitignored; delete it to reset
   the scenario's virtual keys and usage log.

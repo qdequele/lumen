@@ -136,12 +136,8 @@ export LUMEN_MASTER_KEY=...   # same value as terminal 1
 ./examples/multi-tenant-analytics/run.sh
 ```
 
-`--check-config` on this scenario does not need `LUMEN_MASTER_KEY` set: it
-only validates `config.toml`, the master key is read separately at actual
-server startup. Do not export `LUMEN_MASTER_KEY` while running
-`--check-config` on any scenario: the config loader merges every
-`LUMEN_`-prefixed environment variable into the config, and `master_key` is
-not a recognized field, so a set `LUMEN_MASTER_KEY` makes `--check-config`
-fail on every scenario, not just this one.
+`--check-config` on this scenario does not need `LUMEN_MASTER_KEY` set: the
+master key is a secret read from the environment at actual server startup,
+never part of the config file (and the config loader explicitly ignores it).
 
 [examples/multi-tenant-analytics on GitHub](https://github.com/qdequele/lumen/tree/main/examples/multi-tenant-analytics)
