@@ -450,6 +450,36 @@ fn translate_response(resp: AnthropicResponse, requested_model: &str) -> ChatRes
     }
 }
 
+/// Fuzz-only shims over the private translation functions above.
+///
+/// `cargo fuzz` builds the whole dependency graph (including this crate)
+/// with `--cfg fuzzing` set, so these functions compile only under
+/// `cargo +nightly fuzz run ...` and add nothing to normal builds (`cargo
+/// build`/`clippy`/`test` never set this cfg). This is the least invasive
+/// way to reach `translate_request`/`translate_response`: no visibility
+/// changes to the wire types (`AnthropicRequest`/`AnthropicResponse` stay
+/// private), no new public API surface outside fuzzing builds.
+#[cfg(fuzzing)]
+pub mod fuzzing {
+    use super::{translate_request, translate_response, AnthropicResponse};
+    use lumen_core::ChatRequest;
+
+    /// Translate an arbitrary `ChatRequest` and serialize the result; must
+    /// never panic regardless of message shape, tool traffic, or `extra`.
+    pub fn fuzz_translate_request(req: &ChatRequest, stream: bool) {
+        let translated = translate_request(req, stream);
+        let _ = serde_json::to_vec(&translated);
+    }
+
+    /// Deserialize arbitrary bytes as an Anthropic response and translate
+    /// whatever parses; must never panic on malformed or adversarial input.
+    pub fn fuzz_translate_response(data: &[u8], requested_model: &str) {
+        if let Ok(resp) = serde_json::from_slice::<AnthropicResponse>(data) {
+            let _ = translate_response(resp, requested_model);
+        }
+    }
+}
+
 impl AnthropicProvider {
     /// Open the upstream stream and translate its events (shared by both
     /// streaming trait methods).

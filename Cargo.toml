@@ -89,6 +89,14 @@ criterion = { version = "0.5", features = ["async_tokio"] }
 tempfile = "3"
 libc = "0.2"
 
+[workspace.lints.rust]
+# `cargo fuzz` sets `--cfg fuzzing` across the whole dependency graph so the
+# fuzz-only shims in crates/providers (anthropic::fuzzing, google::fuzzing)
+# can reach the private translate_request/translate_response functions
+# without widening their normal-build visibility. Declare the cfg so
+# `unexpected_cfgs` doesn't flag it under `cargo clippy -D warnings`.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }
+
 [workspace.lints.clippy]
 # Pedantic is on across the workspace (CLAUDE.md rule 6).
 pedantic = { level = "warn", priority = -1 }

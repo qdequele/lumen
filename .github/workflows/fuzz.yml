@@ -13,7 +13,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [sse_parser, chat_request]
+        target:
+          [
+            sse_parser,
+            chat_request,
+            anthropic_translate_request,
+            anthropic_translate_response,
+            google_translate_request,
+            google_translate_response,
+          ]
     steps:
       - uses: actions/checkout@v4
 
