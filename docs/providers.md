@@ -179,7 +179,10 @@ capabilities = ["chat"]
   `{"model": "embed-multilingual", "input": "...", "input_type": "search_query"}`.
   Allowed values: `search_document`, `search_query`, `classification`,
   `clustering`. An unrecognized value is rejected with `LM-1001` before any
-  upstream call. Ignored (harmlessly) by every other provider.
+  upstream call. The field is consumed at the gateway: only the Cohere
+  translation reads it, and it is never forwarded in the outgoing body of any
+  other provider (a strict OpenAI-compatible upstream such as vLLM could
+  reject unknown fields).
 
 ```toml
 [[providers]]

@@ -1,9 +1,12 @@
 //! Embedding types, mirroring the OpenAI `embeddings` schema.
 //!
-//! Unknown fields are preserved through a [`serde(flatten)`] `extra` map (the
-//! same idiom as [`crate::chat::ChatRequest`]), so provider-specific
-//! parameters - e.g. Cohere's `input_type` (search_query vs search_document,
-//! see `docs/providers.md` § cohere) - pass through untouched.
+//! Unknown request fields are captured into a [`serde(flatten)`] `extra` map
+//! (the same idiom as [`crate::chat::ChatRequest`]) so provider translation
+//! code can consume provider-specific parameters - e.g. Cohere's `input_type`
+//! (search_query vs search_document, see `docs/providers.md` § cohere).
+//! Unlike the chat path, `extra` is never re-serialized into an outgoing
+//! provider body: unknown fields stop at the gateway (see the field docs on
+//! [`EmbedRequest::extra`]).
 
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
@@ -142,9 +145,17 @@ pub struct EmbedRequest {
     pub dimensions: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
-    /// Any additional fields (e.g. Cohere's `input_type` override) preserved
-    /// verbatim and available to provider translation code.
-    #[serde(flatten)]
+    /// Any additional fields (e.g. Cohere's `input_type` override) captured
+    /// verbatim on deserialization and available to provider translation code.
+    ///
+    /// `skip_serializing`: unlike `ChatRequest::extra`, this map is a
+    /// gateway-side carrier only, NEVER re-serialized. The OpenAI-compatible
+    /// near-passthrough providers (openai, mistral, jina, voyage) serialize
+    /// the whole request as the outgoing body, and a strict upstream (vLLM
+    /// etc.) may reject unknown fields; providers that consume an extra field
+    /// (Cohere reads `input_type`) do so from the Rust field and write it into
+    /// their own body struct.
+    #[serde(flatten, skip_serializing)]
     pub extra: Map<String, Value>,
 }
 

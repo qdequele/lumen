@@ -175,10 +175,12 @@ mod tests {
     }
 
     #[test]
-    fn embed_request_preserves_input_type_via_extra() {
+    fn embed_request_captures_input_type_via_extra_without_reserializing_it() {
         // A caller-supplied `input_type` (Cohere's search_query vs
-        // search_document override, issue #22) survives round-trip via `extra`,
-        // the same idiom `ChatRequest` uses for provider-specific fields.
+        // search_document override, issue #22) is captured into `extra` for
+        // provider translation code, but is NOT re-serialized: the
+        // OpenAI-compatible passthrough providers send the serialized request
+        // as the outgoing body and unknown fields must stop at the gateway.
         let raw = r#"{"model":"m","input":"hello","input_type":"search_query"}"#;
         let req: EmbedRequest = serde_json::from_str(raw).unwrap();
         assert_eq!(
@@ -186,7 +188,12 @@ mod tests {
             Some("search_query")
         );
         let back = serde_json::to_value(&req).unwrap();
-        assert_eq!(back["input_type"], "search_query");
+        assert!(
+            back.get("input_type").is_none(),
+            "extra fields must not re-serialize, got: {back}"
+        );
+        assert_eq!(back["model"], "m");
+        assert_eq!(back["input"], "hello");
     }
 
     #[test]
