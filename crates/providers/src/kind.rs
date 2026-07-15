@@ -19,6 +19,10 @@ pub enum ProviderKind {
     Voyage,
     Mistral,
     Google,
+    /// Azure OpenAI: deployment-routed URLs + `api-version`, `api-key` auth.
+    /// Not OpenAI-compatible (own URL scheme), so it is NOT part of
+    /// [`is_openai_compatible`](ProviderKind::is_openai_compatible).
+    Azure,
     // --- OpenAI-compatible hosts (served by the OpenAI provider with a
     //     per-kind base URL; chat + embeddings). ------------------------------
     Groq,
@@ -53,6 +57,7 @@ impl ProviderKind {
             ProviderKind::Voyage => "voyage",
             ProviderKind::Mistral => "mistral",
             ProviderKind::Google => "google",
+            ProviderKind::Azure => "azure",
             ProviderKind::Groq => "groq",
             ProviderKind::Together => "together",
             ProviderKind::Fireworks => "fireworks",
@@ -116,5 +121,22 @@ impl ProviderKind {
             self,
             ProviderKind::Ollama | ProviderKind::Tei | ProviderKind::Vllm
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn azure_is_a_native_kind_requiring_its_own_base_url_and_api_key() {
+        // Azure's URL scheme (deployment routing + api-version) is not the
+        // generic OpenAI-compatible path, so it must stay out of both the
+        // "compatible" set and the built-in default-base-URL table - every
+        // Azure resource endpoint is operator-specific.
+        assert!(!ProviderKind::Azure.is_openai_compatible());
+        assert_eq!(ProviderKind::Azure.default_base_url(), None);
+        assert!(ProviderKind::Azure.requires_api_key());
+        assert_eq!(ProviderKind::Azure.as_str(), "azure");
     }
 }

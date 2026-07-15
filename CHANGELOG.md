@@ -6,6 +6,27 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added - Azure OpenAI provider (deployment routing + api-version)
+
+- New `azure` provider kind (chat + embeddings): reuses the OpenAI JSON
+  wire schema verbatim (near-passthrough, like `mistral`), with the three
+  Azure-specific deltas bridged in `crates/providers/src/azure`:
+  - URL construction is deployment-routed:
+    `{endpoint}/openai/deployments/{deployment}/{chat/completions|embeddings}?api-version=...`,
+    not the generic OpenAI-compatible `base_url`-swap path.
+  - Auth is the `api-key` header, never a bearer token.
+  - Deployment routing reuses the existing `upstream_id` aliasing mechanism -
+    set a model's `upstream_id` to the Azure deployment name, no new config
+    field needed (the router already rewrites `req.model` to `upstream_id`
+    before calling the provider).
+  - `api-version` is selected via a `?api-version=YYYY-MM-DD` query string on
+    `base_url`, defaulting to a pinned recent version when omitted. There is
+    no dedicated `api_version` config field yet - see the module doc comment
+    and `docs/providers.md#azure` for the known gap and workaround.
+- `base_url` is required for `azure` (every Azure resource endpoint is
+  operator-specific; there is no shared public default).
+- `config.example.toml` and `docs/providers.md` updated with a worked example.
+
 ### Added - Provider-native file/GCS image URI sources (issue #12)
 
 - Chat vision content parts now accept two provider-native image references

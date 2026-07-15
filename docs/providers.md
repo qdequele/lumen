@@ -1,8 +1,9 @@
 # Providers
 
-LUMEN ships twenty built-in provider kinds - nine native integrations (their own
-request/response translation) plus eleven **OpenAI-compatible** hosts that reuse
-the OpenAI path with a per-kind base URL. Each `[[providers]]` block in your
+LUMEN ships twenty-one built-in provider kinds - ten native integrations (their own
+request/response translation, including deployment-routed `azure`) plus eleven
+**OpenAI-compatible** hosts that reuse the OpenAI path with a per-kind base URL.
+Each `[[providers]]` block in your
 config selects one with a `kind` string and gives it a unique `name` (your own
 label). Each `[[providers.models]]` block under it exposes a model to clients:
 
@@ -57,6 +58,7 @@ Rules that apply to every provider:
 | `voyage`    |      |  ✅   |   ✅   | required      | optional       | 128               |
 | `tei`       |      |  ✅   |   ✅   | keyless       | **required**   | 32                |
 | `ollama`    |      |  ✅   |        | keyless       | **required**   | 512               |
+| `azure`     |  ✅  |  ✅   |        | required      | **required**   | 2048              |
 
 OpenAI-compatible hosts (chat + embed via the OpenAI path; a host that only
 serves chat simply has no embed models configured):
@@ -286,6 +288,45 @@ total_timeout_ms = 120000
 [[providers.models]]
 id = "nomic-embed"
 upstream_id = "nomic-embed-text"
+capabilities = ["embed"]
+```
+
+## azure
+
+- **kind**: `azure` · **capabilities**: chat, embed. Reuses the OpenAI JSON
+  schema verbatim; only the URL, auth, and routing differ from `openai`.
+- **Auth**: `api_key_env`, sent as the `api-key` header (never a bearer token).
+- **base_url**: **required** - your Azure resource endpoint, e.g.
+  `https://<resource>.openai.azure.com` (no shared public default, every
+  resource is operator-specific). Optionally append `?api-version=YYYY-MM-DD`
+  to pin a specific Azure API version; omitted, LUMEN uses a pinned recent
+  default (see the `azure` module doc comment for the exact value).
+- **Deployment routing**: Azure routes by URL path
+  (`/openai/deployments/{deployment}/...`), not by the `model` field in the
+  body. Set each model's `upstream_id` to the **Azure deployment name** - the
+  same `upstream_id` mechanism every other kind uses for aliasing already
+  carries it through.
+- **Embed batch limit**: 2048 (same array-size ceiling as the OpenAI
+  embedding models Azure hosts).
+- **Known gap**: there is no dedicated `api_version` config field yet (it
+  would need a matching `crates/server` config change); the `base_url` query
+  string is the workaround above.
+
+```toml
+[[providers]]
+name = "azure-openai"
+kind = "azure"
+api_key_env = "AZURE_OPENAI_API_KEY"
+base_url = "https://my-resource.openai.azure.com?api-version=2024-10-21"
+
+[[providers.models]]
+id = "gpt-4o"
+upstream_id = "my-gpt4o-deployment"   # the Azure deployment name
+capabilities = ["chat"]
+
+[[providers.models]]
+id = "azure-embed"
+upstream_id = "my-embedding-deployment"
 capabilities = ["embed"]
 ```
 

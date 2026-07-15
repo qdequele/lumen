@@ -239,9 +239,14 @@ milestone.
 ## Provider coverage - next candidates (post-rename)
 
 - **Tier-2 clouds need dedicated kinds** (different auth/schema, not
-  OpenAI-compatible): Azure OpenAI (deployment routing + api-version), AWS
-  Bedrock (SigV4, per-model schemas), Google Vertex AI (GCP OAuth, regional
-  endpoints). Each is a `provider-integrator` task with wiremock tests.
+  OpenAI-compatible): ~~Azure OpenAI (deployment routing + api-version)~~
+  (shipped - `kind = "azure"`), AWS Bedrock (SigV4, per-model schemas),
+  Google Vertex AI (GCP OAuth, regional endpoints). Each is a
+  `provider-integrator` task with wiremock tests.
+- **Azure: dedicated `api_version` config field** - a desired fast-follow to
+  the shipped `azure` kind, which currently reads the version from an
+  `?api-version=...` query string on `base_url`. A first-class field needs a
+  matching `ProviderSpec` + `crates/server/src/config.rs` change.
 - **Cohere chat** (Command R/R+) - we ship Cohere embed+rerank; chat is a
   distinct schema.
 - **More rerankers**: Mixedbread (mxbai-rerank), Pinecone Rerank, NVIDIA NIM
