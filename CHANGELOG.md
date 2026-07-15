@@ -6,6 +6,14 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- Anthropic chat responses (both `POST /v1/chat/completions` and its SSE
+  stream) now stamp `created` with a real unix timestamp instead of a
+  hardcoded `0`. New shared `providers::mapping::unix_timestamp` helper
+  (clamped to `0` on a pre-epoch clock, no panics) backs both the
+  non-streaming and streaming translation paths.
+
 ### Added - Endpoint latency observability
 
 - **Every endpoint now measures and publishes its latency.** A new middleware

@@ -422,7 +422,7 @@ fn translate_response(resp: AnthropicResponse, requested_model: &str) -> ChatRes
     ChatResponse {
         id: resp.id,
         object: "chat.completion".to_owned(),
-        created: 0, // Anthropic does not return a creation timestamp.
+        created: crate::mapping::unix_timestamp(), // Anthropic returns no creation time.
         model,
         choices: vec![ChatChoice {
             index: 0,
@@ -600,6 +600,26 @@ mod tests {
         assert_eq!(usage.prompt_tokens, 10);
         assert_eq!(usage.completion_tokens, 5);
         assert_eq!(usage.total_tokens, 15);
+    }
+
+    /// Anthropic responses carry no creation time; the gateway must stamp a
+    /// real unix timestamp instead of the historical hardcoded `0`.
+    #[test]
+    fn response_created_is_a_real_unix_timestamp_not_zero() {
+        let resp = AnthropicResponse {
+            id: "msg_1".to_owned(),
+            content: vec![text_block("hi")],
+            model: "claude-x".to_owned(),
+            stop_reason: Some("end_turn".to_owned()),
+            usage: AnthropicUsage {
+                input_tokens: 1,
+                output_tokens: 1,
+            },
+        };
+        let out = translate_response(resp, "claude-x");
+        // Sanity-bound against a fixed past instant (2024-01-01 UTC) rather
+        // than pinning an exact wall-clock value.
+        assert!(out.created > 1_704_067_200);
     }
 
     /// Criterion 3: an OpenAI request WITH tools translates to the exact
