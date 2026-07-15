@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::anthropic::AnthropicProvider;
+use crate::azure::AzureProvider;
 use crate::cloudflare::CloudflareRerankProvider;
 use crate::cohere::CohereProvider;
 use crate::google::GoogleProvider;
@@ -589,6 +590,24 @@ fn build_providers(
                 rerank: None,
             })
         }
+        ProviderKind::Azure => {
+            // Every Azure resource endpoint is operator-specific - there is no
+            // shared public default (unlike `openai`).
+            let base_url = require_base_url()?;
+            let provider = Arc::new(AzureProvider::new(
+                client.clone(),
+                spec.name.clone(),
+                &base_url,
+                spec.api_key.clone(),
+            ));
+            let chat: Arc<dyn ChatProvider> = provider.clone();
+            let embed: Arc<dyn EmbeddingProvider> = provider;
+            Ok(BuiltProviders {
+                chat: Some(chat),
+                embed: Some(embed),
+                rerank: None,
+            })
+        }
     }
 }
 
@@ -727,6 +746,38 @@ mod tests {
         )
         .expect("vllm with base_url builds");
         assert!(reg.chat_route("m").is_some());
+    }
+
+    #[test]
+    fn azure_without_base_url_is_a_build_error() {
+        // Azure has no shared public default endpoint (every resource is
+        // operator-specific), unlike `openai`.
+        let result = Registry::build(
+            vec![spec(
+                ProviderKind::Azure,
+                "azure",
+                None,
+                vec![model("m", &[Capability::Chat])],
+            )],
+            reqwest::Client::new(),
+        );
+        assert!(matches!(result, Err(RegistryError::MissingBaseUrl { .. })));
+    }
+
+    #[test]
+    fn azure_with_base_url_resolves_chat_and_embed() {
+        let reg = Registry::build(
+            vec![spec(
+                ProviderKind::Azure,
+                "azure",
+                Some("https://my-resource.openai.azure.com"),
+                vec![model("m", &[Capability::Chat, Capability::Embed])],
+            )],
+            reqwest::Client::new(),
+        )
+        .unwrap();
+        assert!(reg.chat_route("m").is_some());
+        assert!(reg.embedding_route("m").is_some());
     }
 
     #[test]
