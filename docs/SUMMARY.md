@@ -25,6 +25,12 @@
 
 - [Reranking](reranking/reranking.md)
 
+# Operations
+
+- [Token accounting & cost](operations/token-accounting.md)
+- [Metrics & dashboards](operations/metrics.md)
+- [Usage log & multi-tenant metadata](operations/usage-log.md)
+
 # Reference
 
 - [Providers](providers.md)
