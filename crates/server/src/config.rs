@@ -45,6 +45,32 @@ pub struct Config {
     /// Guarded server-side image fetching for multimodal embeddings (M9).
     #[serde(default)]
     pub image_fetch: ImageFetchConfig,
+    /// Local token-estimation strategy (ADR 003). Default: the byte heuristic.
+    #[serde(default)]
+    pub tokenizer: TokenizerConfig,
+}
+
+/// Opt-in accurate tokenizer (ADR 003). The estimation fallback (used only when
+/// an upstream reports no usage) defaults to the cheap byte heuristic; set
+/// `mode = "accurate"` for exact per-model BPE counting off the hot path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TokenizerConfig {
+    /// Which local estimation strategy to use.
+    #[serde(default)]
+    pub mode: TokenizerMode,
+}
+
+/// Local token-estimation strategy for the ADR 003 fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TokenizerMode {
+    /// The cheap ~4-bytes-per-token heuristic: zero cost, hot-path-safe.
+    #[default]
+    Heuristic,
+    /// Exact per-model BPE (tiktoken) for OpenAI-family models, heuristic
+    /// fallback for the rest. Runs on the blocking pool via `spawn_blocking`.
+    Accurate,
 }
 
 /// Retries, circuit breaker, timeouts and background health checks (M6).
@@ -1227,6 +1253,19 @@ mod tests {
         for spec in cfg.provider_specs() {
             assert_eq!(spec.connect_timeout_ms, None);
         }
+    }
+
+    #[test]
+    fn tokenizer_mode_defaults_to_heuristic_and_parses_accurate() {
+        let cfg = load_str("").unwrap();
+        assert_eq!(cfg.tokenizer.mode, TokenizerMode::Heuristic);
+        let cfg = load_str("[tokenizer]\nmode = \"accurate\"\n").unwrap();
+        assert_eq!(cfg.tokenizer.mode, TokenizerMode::Accurate);
+        // An unknown mode is rejected at parse time.
+        assert!(matches!(
+            load_str("[tokenizer]\nmode = \"exact\"\n").unwrap_err(),
+            ConfigError::Parse { .. }
+        ));
     }
 
     #[test]

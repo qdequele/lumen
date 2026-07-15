@@ -116,6 +116,11 @@ pub async fn rerank_handler(
     }
 
     let cost = pricing.search_cost(&executed.model_used, search_units);
+    // Rerank tokens are always gateway-estimated (uniform observability per
+    // ADR 003); the billing unit is `search_units`. When the accurate tokenizer
+    // is opted in this is an exact per-model BPE count (query x documents) run
+    // off the hot path; otherwise the byte heuristic (== `estimated_tokens`).
+    let tokens_in = state.token_counter.count_rerank(&req).await;
     accounting.finish(&Outcome {
         tokens_in,
         tokens_out: 0,

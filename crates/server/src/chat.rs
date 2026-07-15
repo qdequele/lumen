@@ -291,20 +291,25 @@ async fn chat_non_streaming(
     let served_model = executed.model_used.clone();
     settle_non_streaming(
         accounting,
+        &ctx.state.token_counter,
+        ctx.req,
         &served_model,
-        ctx.estimated_input,
         &mut response,
-    );
+    )
+    .await;
     Ok((model_used_headers(&served_model), Json(response)).into_response())
 }
 
 /// Close the books on a non-streaming completion (ADR 003): upstream usage
 /// when reported, else local estimates - never a silent zero. The estimate is
-/// surfaced (flagged) in the response body too.
-fn settle_non_streaming(
+/// surfaced (flagged) in the response body too. When the operator opted into
+/// the accurate tokenizer, the fallback is an exact per-model BPE count run off
+/// the tokio runtime (`spawn_blocking`); otherwise it is the byte heuristic.
+async fn settle_non_streaming(
     accounting: Accounting,
+    counter: &crate::tokenizer::TokenCounter,
+    req: &ChatRequest,
     client_model: &str,
-    estimated_input: u64,
     response: &mut lumen_core::ChatResponse,
 ) {
     let reported = response
@@ -317,17 +322,17 @@ fn settle_non_streaming(
             false,
         )
     } else {
-        let output: u64 = response
+        // Upstream reported nothing: estimate locally (accurate or heuristic),
+        // off the hot path. Concatenate the completion text so a single BPE
+        // pass counts the whole output.
+        let tokens_in = counter.count_chat_prompt(req).await;
+        let output_text: String = response
             .choices
             .iter()
-            .map(|c| {
-                c.message
-                    .content
-                    .as_ref()
-                    .map_or(0, |c| tokens::estimate_text(&c.text()))
-            })
-            .sum();
-        (estimated_input, output, true)
+            .filter_map(|c| c.message.content.as_ref().map(|c| c.text()))
+            .collect();
+        let tokens_out = counter.count_text(client_model, &output_text).await;
+        (tokens_in, tokens_out, true)
     };
     if estimated {
         response.usage = Some(Usage {

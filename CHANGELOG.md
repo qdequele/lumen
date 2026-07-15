@@ -6,6 +6,26 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added - Opt-in accurate per-model tokenizer (ADR 003)
+
+- New `[tokenizer]` config section with `mode = "heuristic"` (default) or
+  `"accurate"`. The default is unchanged: the cheap byte heuristic, zero added
+  latency, allocation-light, hot-path-safe. `"accurate"` opts into exact
+  per-model BPE counting (`tiktoken-rs`) for the local estimation fallback.
+- Accurate mode selects the tiktoken vocabulary by model prefix: `cl100k_base`
+  for `gpt-4` / `gpt-3.5` / `text-embedding-3`, `o200k_base` for `gpt-4o` /
+  `o1` / `o3` / `gpt-4.1` / `gpt-5`. Non-OpenAI models (Claude, Mistral,
+  Llama, ...) fall back to the byte heuristic, as does any tokenizer failure -
+  counting never fails or rejects a request.
+- The BPE pass runs on the blocking pool via `tokio::task::spawn_blocking`, so
+  it never occupies a tokio worker (repo rule 2), and fires only when an
+  upstream reported no usage (chat non-streaming, embeddings, rerank). Encoders
+  are built once at startup, never on the request path. Local counts stay
+  flagged `estimated = true`; upstream-reported usage always wins. Streaming
+  input counts remain heuristic (the stream is not buffered).
+- New dependency `tiktoken-rs` (pure Rust, MIT; pulls no OpenSSL, honoring the
+  rustls-only mandate).
+
 ### Added - Per-provider connect timeout (issue #24)
 
 - A provider block may now set `connect_timeout_ms`, joining the existing

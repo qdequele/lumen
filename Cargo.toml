@@ -67,6 +67,10 @@ notify = "7"
 arc-swap = "1"
 dashmap = "6"
 
+# Tokenization (opt-in accurate per-model token counting, ADR 003). Pure Rust,
+# no C toolchain, no openssl - honors the rustls-only mandate.
+tiktoken-rs = "0.12"
+
 # Storage & crypto (M5: virtual keys, budgets, usage log)
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros", "derive"] }
 blake3 = "1"

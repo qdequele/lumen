@@ -24,6 +24,7 @@ use lumen_server::{
     reload::{spawn_config_reloader, AuthKnobs, ProviderKeySource, ReloadTargets},
     resilience::ResilienceRuntime,
     state::AppState,
+    tokenizer::TokenCounter,
 };
 use lumen_telemetry::{
     logging::init_logging, LatencyMetrics, Metrics, ReloadMetrics, ResilienceMetrics, TokenMetrics,
@@ -283,13 +284,22 @@ fn run(config: Config, config_path: PathBuf) -> anyhow::Result<()> {
 
         let image_fetch = build_image_fetch_policy(&config);
 
+        // ADR 003: build the token counter once at boot. In `accurate` mode this
+        // constructs the BPE encoders here (off the request path); the default
+        // heuristic is free.
+        let token_counter = Arc::new(TokenCounter::from_config(&config.tokenizer));
+        if token_counter.is_accurate() {
+            tracing::info!("accurate per-model tokenizer enabled (tiktoken, spawn_blocking)");
+        }
+
         let mut state = AppState::new(metrics, registry, tokens, latency)
             .with_guards(guards)
             .with_pricing_cell(pricing)
             .with_resilience(resilience)
             .with_health(health)
             .with_body_limit(config.server.body_limit)
-            .with_image_fetch(image_fetch);
+            .with_image_fetch(image_fetch)
+            .with_token_counter(token_counter);
         // Expose the reload trigger only when the reloader is actually armed.
         if reload_armed {
             state = state.with_reload_trigger(Arc::clone(&reload_trigger));

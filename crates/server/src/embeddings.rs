@@ -148,11 +148,13 @@ pub async fn embeddings(
     accounting.served_by(&executed.model_used, &executed.provider_used);
 
     // ADR 003: upstream usage when reported, else the local estimate - never
-    // a silent zero (e.g. TEI reports nothing).
+    // a silent zero (e.g. TEI reports nothing). The fallback is the accurate
+    // per-model BPE count when opted in (off the hot path via spawn_blocking),
+    // otherwise the byte heuristic.
     let (tokens_in, estimated) = if response.usage.prompt_tokens > 0 {
         (u64::from(response.usage.prompt_tokens), false)
     } else {
-        (estimated_input, true)
+        (state.token_counter.count_embed_input(&req).await, true)
     };
     if estimated {
         // Surface the estimate in the response too (flagged, per ADR 003).
