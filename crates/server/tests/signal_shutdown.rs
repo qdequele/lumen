@@ -240,3 +240,59 @@ port = {port}
     let after = reqwest::get(format!("{base}/health")).await;
     assert!(after.is_err(), "expected connection to fail post-shutdown");
 }
+
+#[tokio::test]
+async fn real_boot_with_auth_enabled_and_master_key_set_reaches_health() {
+    // Regression test for the `LUMEN_MASTER_KEY` config-merge bug: unlike
+    // `tests/check_config.rs`, which only exercises `--check-config`, this
+    // spawns the real `lumen` binary in normal serve mode (`Action::Serve`)
+    // with `[auth] enabled = true`, which *requires* `LUMEN_MASTER_KEY` to
+    // be set (see `boot_auth_stack` in main.rs). `main()` calls
+    // `Config::load` before `run()` ever reaches `boot_auth_stack`, so any
+    // real deployment with auth enabled hit the exact same "unknown field:
+    // found `master_key`" parse failure as `--check-config` - this is not a
+    // `--check-config`-only bug. A green `/health` response here proves the
+    // fix unblocks the documented auth setup end to end, not just the
+    // config-validation shortcut.
+    let port = free_port();
+    let db_path =
+        std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("real-boot-auth-master-key.db");
+    let _ = std::fs::remove_file(&db_path);
+    let config = write_temp_config(
+        "real-boot-auth",
+        &format!(
+            r#"
+[server]
+host = "127.0.0.1"
+port = {port}
+
+[auth]
+enabled = true
+db_path = "{db_path}"
+"#,
+            db_path = db_path.display(),
+        ),
+    );
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_lumen"))
+        .arg("--config")
+        .arg(&config)
+        .env("LUMEN_MASTER_KEY", "a".repeat(64))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn lumen binary");
+
+    let base = format!("http://127.0.0.1:{port}");
+    // If the config-merge bug were present, `main()` would print a
+    // "configuration error" and exit before ever binding the port, so
+    // `wait_until_ready` would time out and fail this test.
+    wait_until_ready(&base, Duration::from_secs(10)).await;
+
+    send_signal(&child, libc::SIGTERM);
+    let status = wait_for_exit(&mut child, Duration::from_secs(10)).await;
+    if !status.success() {
+        dump_output(child, "real-boot-auth");
+        panic!("lumen did not exit cleanly after SIGTERM: {status:?}");
+    }
+}
