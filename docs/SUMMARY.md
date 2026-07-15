@@ -15,13 +15,9 @@
 - [003 - Token accounting](adr/003-token-accounting.md)
 - [004 - Streaming passthrough](adr/004-streaming-passthrough.md)
 - [005 - Resilience execution](adr/005-resilience-execution.md)
+- [006 - Client cancellation error code](adr/006-client-cancellation-error-code.md)
 
 # Project
 
 - [Backlog](backlog.md)
 - [Contributing](contributing.md)
-
-# Design & planning
-
-- [Vision image input - design](superpowers/specs/2026-07-14-vision-image-input-design.md)
-- [Vision image input - plan](superpowers/plans/2026-07-14-vision-image-input.md)
