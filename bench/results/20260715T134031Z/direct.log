@@ -1,0 +1,142 @@
+
+         /\      Grafana   /‾‾/  
+    /\  /  \     |\  __   /  /   
+   /  \/    \    | |/ /  /   ‾‾\ 
+  /          \   |   (  |  (‾)  |
+ / __________ \  |_|\_\  \_____/ 
+
+
+     execution: local
+        script: /Users/quentindequelen/Projects/Meilisearch/_side_projects/Lumen/.claude/worktrees/agent-a7117d19dfa6df216/bench/k6-added-latency.js
+        output: -
+
+     scenarios: (100.00%) 1 scenario, 50 max VUs, 1m0s max duration (incl. graceful stop):
+              * load: 50 looping VUs for 30s (gracefulStop: 30s)
+
+
+running (0m01.0s), 50/50 VUs, 30 complete and 0 interrupted iterations
+load   [   3% ] 50 VUs  01.0s/30s
+
+running (0m02.0s), 50/50 VUs, 45 complete and 0 interrupted iterations
+load   [   7% ] 50 VUs  02.0s/30s
+
+running (0m03.0s), 50/50 VUs, 127 complete and 0 interrupted iterations
+load   [  10% ] 50 VUs  03.0s/30s
+
+running (0m04.0s), 50/50 VUs, 260 complete and 0 interrupted iterations
+load   [  13% ] 50 VUs  04.0s/30s
+
+running (0m05.0s), 50/50 VUs, 400 complete and 0 interrupted iterations
+load   [  17% ] 50 VUs  05.0s/30s
+
+running (0m06.0s), 50/50 VUs, 751 complete and 0 interrupted iterations
+load   [  20% ] 50 VUs  06.0s/30s
+
+running (0m07.0s), 50/50 VUs, 1326 complete and 0 interrupted iterations
+load   [  23% ] 50 VUs  07.0s/30s
+
+running (0m08.0s), 50/50 VUs, 1871 complete and 0 interrupted iterations
+load   [  27% ] 50 VUs  08.0s/30s
+
+running (0m09.0s), 50/50 VUs, 2486 complete and 0 interrupted iterations
+load   [  30% ] 50 VUs  09.0s/30s
+
+running (0m10.0s), 50/50 VUs, 3265 complete and 0 interrupted iterations
+load   [  33% ] 50 VUs  10.0s/30s
+
+running (0m11.0s), 50/50 VUs, 3751 complete and 0 interrupted iterations
+load   [  37% ] 50 VUs  11.0s/30s
+
+running (0m12.0s), 50/50 VUs, 5176 complete and 0 interrupted iterations
+load   [  40% ] 50 VUs  12.0s/30s
+
+running (0m13.0s), 50/50 VUs, 6152 complete and 0 interrupted iterations
+load   [  43% ] 50 VUs  13.0s/30s
+
+running (0m14.0s), 50/50 VUs, 6746 complete and 0 interrupted iterations
+load   [  47% ] 50 VUs  14.0s/30s
+
+running (0m15.0s), 50/50 VUs, 8117 complete and 0 interrupted iterations
+load   [  50% ] 50 VUs  15.0s/30s
+
+running (0m16.0s), 50/50 VUs, 8455 complete and 0 interrupted iterations
+load   [  53% ] 50 VUs  16.0s/30s
+
+running (0m17.0s), 50/50 VUs, 8631 complete and 0 interrupted iterations
+load   [  57% ] 50 VUs  17.0s/30s
+
+running (0m18.0s), 50/50 VUs, 10666 complete and 0 interrupted iterations
+load   [  60% ] 50 VUs  18.0s/30s
+
+running (0m19.0s), 50/50 VUs, 14258 complete and 0 interrupted iterations
+load   [  63% ] 50 VUs  19.0s/30s
+
+running (0m20.0s), 50/50 VUs, 18864 complete and 0 interrupted iterations
+load   [  67% ] 50 VUs  20.0s/30s
+
+running (0m21.0s), 50/50 VUs, 20801 complete and 0 interrupted iterations
+load   [  70% ] 50 VUs  21.0s/30s
+
+running (0m22.0s), 50/50 VUs, 26015 complete and 0 interrupted iterations
+load   [  73% ] 50 VUs  22.0s/30s
+
+running (0m23.0s), 50/50 VUs, 33659 complete and 0 interrupted iterations
+load   [  77% ] 50 VUs  23.0s/30s
+
+running (0m24.0s), 50/50 VUs, 38711 complete and 0 interrupted iterations
+load   [  80% ] 50 VUs  24.0s/30s
+
+running (0m25.0s), 50/50 VUs, 42601 complete and 0 interrupted iterations
+load   [  83% ] 50 VUs  25.0s/30s
+
+running (0m26.0s), 50/50 VUs, 46143 complete and 0 interrupted iterations
+load   [  87% ] 50 VUs  26.0s/30s
+
+running (0m27.0s), 50/50 VUs, 55274 complete and 0 interrupted iterations
+load   [  90% ] 50 VUs  27.0s/30s
+
+running (0m28.0s), 50/50 VUs, 67220 complete and 0 interrupted iterations
+load   [  93% ] 50 VUs  28.0s/30s
+
+running (0m29.0s), 50/50 VUs, 76977 complete and 0 interrupted iterations
+load   [  97% ] 50 VUs  29.0s/30s
+
+running (0m30.0s), 50/50 VUs, 82604 complete and 0 interrupted iterations
+load   [ 100% ] 50 VUs  30.0s/30s
+
+
+  █ THRESHOLDS 
+
+    http_req_duration
+    ✗ 'p(99)<50' p(99)=306.92ms
+
+
+  █ TOTAL RESULTS 
+
+    checks_total.......: 82720   2740.018971/s
+    checks_succeeded...: 100.00% 82720 out of 82720
+    checks_failed......: 0.00%   0 out of 82720
+
+    ✓ status is 200
+
+    HTTP
+    http_req_duration..............: avg=18.08ms min=191µs    med=3.46ms max=2.57s p(90)=21.49ms p(95)=65.92ms p(99)=306.92ms
+      { expected_response:true }...: avg=18.08ms min=191µs    med=3.46ms max=2.57s p(90)=21.49ms p(95)=65.92ms p(99)=306.92ms
+    http_req_failed................: 0.00% 0 out of 82720
+    http_reqs......................: 82720 2740.018971/s
+
+    EXECUTION
+    iteration_duration.............: avg=18.15ms min=219.29µs med=3.51ms max=2.58s p(90)=21.63ms p(95)=66.01ms p(99)=307.6ms 
+    iterations.....................: 82720 2740.018971/s
+    vus............................: 50    min=50         max=50
+    vus_max........................: 50    min=50         max=50
+
+    NETWORK
+    data_received..................: 37 MB 1.2 MB/s
+    data_sent......................: 20 MB 649 kB/s
+
+
+
+
+running (0m30.2s), 00/50 VUs, 82720 complete and 0 interrupted iterations
+load ✓ [ 100% ] 50 VUs  30s

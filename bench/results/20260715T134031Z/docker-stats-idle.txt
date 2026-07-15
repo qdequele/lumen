@@ -1,0 +1,4 @@
+CONTAINER ID   NAME            CPU %     MEM USAGE / LIMIT     MEM %     NET I/O           BLOCK I/O        PIDS
+58ae6b3a2b98   lumen           0.00%     5.039MiB / 7.818GiB   0.06%     184MB / 206MB     8.63MB / 0B      10
+6a21493020f9   litellm         0.15%     1.033GiB / 7.818GiB   13.21%    5.15MB / 13.2MB   158MB / 59.8MB   17
+21b42429f2e8   mock-upstream   104.21%   867.9MiB / 7.818GiB   10.84%    104MB / 152MB     125MB / 115kB    40

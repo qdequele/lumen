@@ -1,0 +1,2 @@
+CONTAINER ID   NAME      CPU %     MEM USAGE / LIMIT     MEM %     NET I/O           BLOCK I/O     PIDS
+58ae6b3a2b98   lumen     140.83%   6.898MiB / 7.818GiB   0.09%     60.6MB / 67.8MB   8.63MB / 0B   10

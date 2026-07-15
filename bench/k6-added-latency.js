@@ -11,8 +11,15 @@ export const options = {
   scenarios: {
     load: { executor: "constant-vus", vus: 50, duration: "30s" },
   },
+  // p99 isn't in k6's default summary trend stats; the head-to-head report
+  // (bench/run.sh) needs it alongside the defaults.
+  summaryTrendStats: ["avg", "min", "med", "max", "p(90)", "p(95)", "p(99)"],
   thresholds: {
-    // Sanity: nothing should be pathologically slow against a 0 ms mock.
+    // Sanity: nothing should be pathologically slow against a 0 ms mock. This
+    // is a "did something break" guard, not a strict pass/fail gate - a busy
+    // or virtualized host can blow through it without the gateway itself
+    // being at fault, so bench/run.sh does not abort the harness on a
+    // threshold breach; it still records and reports the real percentiles.
     http_req_duration: ["p(99)<50"],
   },
 };
