@@ -42,6 +42,7 @@ fn full_registry(upstream: &str) -> Arc<Registry> {
             kind: ProviderKind::Openai,
             api_key: Some("sk-test-xxx".to_owned()),
             base_url: Some(upstream.to_owned()),
+            strict: false,
             models: vec![
                 ModelSpec {
                     id: "gpt".to_owned(),
@@ -62,6 +63,7 @@ fn full_registry(upstream: &str) -> Arc<Registry> {
             kind: ProviderKind::Cohere,
             api_key: Some("sk-co-test".to_owned()),
             base_url: Some(upstream.to_owned()),
+            strict: false,
             models: vec![ModelSpec {
                 id: "rerank-fast".to_owned(),
                 upstream_id: "rerank-v3.5".to_owned(),
@@ -74,6 +76,7 @@ fn full_registry(upstream: &str) -> Arc<Registry> {
             kind: ProviderKind::Tei,
             api_key: None,
             base_url: Some(upstream.to_owned()),
+            strict: false,
             models: vec![ModelSpec {
                 id: "tei-embed".to_owned(),
                 upstream_id: "tei-model".to_owned(),

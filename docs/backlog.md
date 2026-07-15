@@ -17,10 +17,15 @@ milestone.
 
 ## Noted while building M1
 
-- Token-array inputs for `/v1/embeddings` (`input` as arrays of token ids) are
-  not modelled - only string and string-batch. Add if a provider needs it.
-- Rerank `documents` accepts only strings; Cohere also allows objects. Reduce
-  object documents to text at the edge when a provider requires it.
+- ~~Token-array inputs for `/v1/embeddings` (`input` as arrays of token ids) are
+  not modelled - only string and string-batch.~~ **Resolved (issue #25).**
+  `EmbedInput` now models `Tokens` (`[1,2,3]`) and `TokenBatch` (`[[1,2],[3,4]]`);
+  they pass through natively on OpenAI-compatible providers and count one token
+  per id in the estimation fallback. Text-only providers (Cohere, TEI, Ollama,
+  Jina, Voyage, Mistral) reject them with a 400 (LM-1001) before any upstream
+  call.
+- ~~Rerank `documents` accepts only strings; Cohere also allows objects.~~
+  **Resolved (issue #25).** See the M3 note below.
 - `error_type()` collapses 401/402/429 into `invalid_request` because the public
   taxonomy only has three `type`s. Fine per `CLAUDE.md`, but note it's coarse.
 - Acceptance criterion "boot < 100 ms" is verified manually (M1); fold a real
@@ -31,12 +36,18 @@ milestone.
 
 ## Noted while building M2
 
-- Embedding output is always a float array in v1. Base64 embeddings are decoded
+- ~~Embedding output is always a float array in v1. Base64 embeddings are decoded
   on the way IN (a client requesting `encoding_format: "base64"` won't error),
-  but we do not re-encode on the way OUT. Add base64 *output* if a client needs it.
-- Ollama drops the OpenAI-only `dimensions` field with a `debug!` log; a client
-  asking for a specific dimension silently gets full-width vectors. Consider a
-  400 (LM-1001) when an unsupported-but-meaningful field is set under a strict mode.
+  but we do not re-encode on the way OUT.~~ **Resolved (issue #25).** When
+  `encoding_format: "base64"` is requested, the gateway re-encodes each vector as
+  OpenAI-style base64 at the response edge, so it works for every provider
+  (including Ollama and TEI, which have no upstream `encoding_format`).
+- ~~Ollama drops the OpenAI-only `dimensions` field with a `debug!` log; a client
+  asking for a specific dimension silently gets full-width vectors.~~ **Resolved
+  (issue #25).** A per-provider `strict = true` makes Ollama reject a request that
+  sets `dimensions` with a 400 (LM-1001) instead of silently dropping it; the
+  default stays lenient. `encoding_format` is no longer lost either (handled at
+  the edge, above).
 - `LM-1002` (payload too large, 413) is emitted by `RequestBodyLimitLayer` as a
   raw 413 without our JSON error envelope. Map the tower-http rejection to
   `GatewayError::PayloadTooLarge` for a consistent body.
@@ -55,9 +66,14 @@ milestone.
   rerank in tokens, so they report `0`. If token-based rerank usage matters for
   M5 cost counting, widen `RerankUsage` (e.g. add `total_tokens`) rather than
   overloading `search_units`.
-- Rerank `documents` accept string or `{text}` only. Cohere also allows
-  arbitrary objects with a `rank_fields` selector - out of scope; reduce to text
-  at the edge if a provider needs it.
+- ~~Rerank `documents` accept string or `{text}` only. Cohere also allows
+  arbitrary objects with a `rank_fields` selector - out of scope.~~ **Resolved
+  (issue #25).** `RerankDocument::Object` now keeps all fields; the request
+  carries an optional `rank_fields` selector, and the gateway reduces each object
+  document to a single ranking text at the edge (selected fields joined, or the
+  `text` field when no selector), so providers still only ever see plain text.
+  With `return_documents: true`, an object document echoes that reduced ranking
+  text in `document.text`, not the original JSON object.
 - TEI serves one model per process and ignores the request `model`/`top_n`; the
   gateway truncates to `top_n` after sorting. The configured `upstream_id` is
   informational for TEI. A future health/introspection hook could verify the

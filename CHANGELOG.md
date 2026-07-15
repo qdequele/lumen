@@ -69,6 +69,36 @@ All notable changes to LUMEN are documented here. The format is based on
 - New `lumen_server::check_config` library function backs the flag, kept
   separate from `main` so the validation logic stays unit-testable.
 
+### Added - Embeddings/rerank input format gaps (issue #25)
+
+- **Token-array embedding inputs.** `POST /v1/embeddings` now accepts
+  pre-tokenized `input`: a single token-id array (`[1,2,3]`, one item) or a batch
+  of them (`[[1,2],[3,4]]`). They pass through natively on OpenAI-compatible
+  providers and count one token per id in the estimation fallback. String and
+  string-batch inputs are unchanged (untagged order tries them first).
+  Providers whose APIs only take text (Cohere, TEI, Ollama, Jina, Voyage,
+  Mistral) reject token-array input with an honest 400 (`LM-1001`,
+  `ProviderError::UnsupportedInput`) BEFORE any upstream call, instead of
+  sending an empty or garbled body upstream (rule 8).
+- **base64 embedding output.** When a client sets `encoding_format: "base64"`,
+  each vector is re-encoded as OpenAI-style base64 (little-endian `f32` bytes) at
+  the response edge. Because the gateway always holds vectors as `Vec<f32>`
+  internally, this works for every provider, including Ollama and TEI that have
+  no upstream `encoding_format`. Any other value serializes as a float array.
+- **Rerank object documents with `rank_fields`.** `RerankDocument` object
+  documents now keep all their fields, and the request accepts an optional
+  Cohere-style `rank_fields` selector. Each object document is reduced to a
+  single ranking text at the gateway edge (selected fields joined with newlines,
+  or the `text` field when no selector), so providers still only ever see plain
+  text. Note: with `return_documents: true`, an object document's echoed
+  `document.text` is that reduced ranking text, not the original JSON object.
+- **Ollama strict mode.** A new per-provider `strict = true` (config
+  `[[providers]] strict`) makes Ollama reject a request that sets `dimensions`
+  (which it cannot honor) with a 400 (`LM-1001`) naming the field, instead of
+  silently returning full-width vectors. The default stays lenient (drops the
+  field with a debug log). Backed by a new `ProviderError::UnsupportedField`
+  that maps to a client 400 and is never retried or failed over.
+
 ### Fixed
 
 - **Dedicated client-cancel error code (issue #11).** A client-initiated

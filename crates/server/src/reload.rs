@@ -437,6 +437,7 @@ mod tests {
                 kind: ProviderKind::Openai,
                 api_key: Some("env-key".to_owned()), // already resolved from env
                 base_url: None,
+                strict: false,
                 models: Vec::new(),
             },
             ProviderSpec {
@@ -444,6 +445,7 @@ mod tests {
                 kind: ProviderKind::Cohere,
                 api_key: None, // env var unset → would go out unauthenticated
                 base_url: None,
+                strict: false,
                 models: Vec::new(),
             },
         ];

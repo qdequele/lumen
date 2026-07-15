@@ -96,6 +96,7 @@ impl VoyageProvider {
                 object: "embedding".to_owned(),
                 index: u32::try_from(index).unwrap_or(u32::MAX),
                 embedding: d.embedding,
+                encoding: lumen_core::EmbeddingEncoding::default(),
             })
             .collect();
         Ok(EmbedResponse {
@@ -183,6 +184,11 @@ impl EmbeddingProvider for VoyageProvider {
         req: EmbedRequest,
         cancel: CancellationToken,
     ) -> Result<EmbedResponse, ProviderError> {
+        // Voyage's embeddings API takes text only, never token-id arrays; the
+        // passthrough would forward a raw int array and fail opaquely upstream.
+        // Honest 400 before any call (issue #25).
+        crate::mapping::reject_pretokenized_input(&self.provider_name, &req.input)?;
+
         // Multimodal (content-parts) requests go to Voyage's dedicated
         // `/multimodalembeddings` endpoint; text-only requests stay on the
         // OpenAI-compatible near-passthrough path.

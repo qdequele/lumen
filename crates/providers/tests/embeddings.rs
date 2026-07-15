@@ -159,6 +159,7 @@ impl EmbedFixture for OllamaFixture {
             reqwest::Client::new(),
             "ollama-test",
             base_url,
+            false,
         ))
     }
 
@@ -622,4 +623,153 @@ async fn openai_5000_inputs_yields_exactly_three_calls_in_order() {
         assert_eq!(d.embedding[0], i as f32);
     }
     assert_eq!(resp.usage.total_tokens, 5000);
+}
+
+/// Issue #25 review: providers that cannot consume pre-tokenized input must
+/// reject it with an honest client error BEFORE any upstream call, instead of
+/// sending an empty/garbled body upstream (rule 8: never a misleading error).
+async fn assert_rejects_token_input(fx: &dyn EmbedFixture, provider_label: &str) {
+    let mock = MockServer::start().await;
+    // Mount an echo: if the guard is missing, the call reaches the upstream and
+    // the received-requests assertion below catches it.
+    fx.mount_echo(&mock).await;
+    let provider = fx.build(mock.uri());
+
+    for input in [
+        EmbedInput::Tokens(vec![1, 2, 3]),
+        EmbedInput::TokenBatch(vec![vec![1, 2], vec![3]]),
+    ] {
+        let req = EmbedRequest {
+            model: "test-model".to_owned(),
+            input,
+            encoding_format: None,
+            dimensions: None,
+            user: None,
+        };
+        let err = provider
+            .embed(req, CancellationToken::new())
+            .await
+            .expect_err("token input must be rejected");
+        assert!(
+            matches!(err, ProviderError::UnsupportedInput { .. }),
+            "{provider_label}: unexpected error {err:?}"
+        );
+    }
+    assert_eq!(
+        mock.received_requests().await.unwrap().len(),
+        0,
+        "{provider_label}: upstream must never be contacted for token input"
+    );
+}
+
+#[tokio::test]
+async fn cohere_rejects_token_input_before_any_call() {
+    assert_rejects_token_input(&CohereEmbedFixture, "cohere").await;
+}
+
+#[tokio::test]
+async fn tei_rejects_token_input_before_any_call() {
+    assert_rejects_token_input(&TeiEmbedFixture, "tei").await;
+}
+
+#[tokio::test]
+async fn ollama_rejects_token_input_before_any_call() {
+    assert_rejects_token_input(&OllamaFixture, "ollama").await;
+}
+
+#[tokio::test]
+async fn jina_rejects_token_input_before_any_call() {
+    assert_rejects_token_input(&JinaEmbedFixture, "jina").await;
+}
+
+#[tokio::test]
+async fn voyage_rejects_token_input_before_any_call() {
+    assert_rejects_token_input(&VoyageEmbedFixture, "voyage").await;
+}
+
+#[tokio::test]
+async fn mistral_rejects_token_input_before_any_call() {
+    assert_rejects_token_input(&MistralEmbedFixture, "mistral").await;
+}
+
+/// The OpenAI-compatible passthrough must keep accepting token arrays: they
+/// serialize natively as integer arrays and OpenAI consumes them.
+#[tokio::test]
+async fn openai_token_input_passes_through_natively() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "object": "list",
+            "data": [{ "object": "embedding", "index": 0, "embedding": [0.1] }],
+            "model": "test-model",
+            "usage": { "prompt_tokens": 3, "total_tokens": 3 }
+        })))
+        .mount(&mock)
+        .await;
+    let provider = OpenAiFixture.build(mock.uri());
+
+    let req = EmbedRequest {
+        model: "test-model".to_owned(),
+        input: EmbedInput::Tokens(vec![1, 2, 3]),
+        encoding_format: None,
+        dimensions: None,
+        user: None,
+    };
+    let resp = provider.embed(req, CancellationToken::new()).await.unwrap();
+    assert_eq!(resp.data.len(), 1);
+
+    // The upstream received the raw integer array, untouched.
+    let requests = mock.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    let sent: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(sent["input"], json!([1, 2, 3]));
+}
+
+/// Issue #25: in strict mode Ollama rejects `dimensions` (which it cannot honor)
+/// with `UnsupportedField` before any upstream call, so it surfaces as 400
+/// (`LM-1001`) rather than silently returning full-width vectors.
+#[tokio::test]
+async fn ollama_strict_mode_rejects_dimensions_before_any_call() {
+    let mock = MockServer::start().await;
+    // Mount an echo so a non-strict path WOULD succeed; strict must not reach it.
+    OllamaFixture.mount_echo(&mock).await;
+    let strict = OllamaProvider::new(reqwest::Client::new(), "ollama-strict", mock.uri(), true);
+
+    let req = EmbedRequest {
+        model: "test-model".to_owned(),
+        input: EmbedInput::Batch(vec!["0".into()]),
+        encoding_format: None,
+        dimensions: Some(256),
+        user: None,
+    };
+    let err = strict
+        .embed(req, CancellationToken::new())
+        .await
+        .expect_err("strict mode must reject dimensions");
+    assert!(
+        matches!(err, ProviderError::UnsupportedField { ref field, .. } if field == "dimensions"),
+        "unexpected error: {err:?}"
+    );
+    // Never reached the upstream.
+    assert_eq!(mock.received_requests().await.unwrap().len(), 0);
+}
+
+/// Issue #25: the default (non-strict) mode silently drops `dimensions` and
+/// still embeds, preserving backward-compatible behavior.
+#[tokio::test]
+async fn ollama_non_strict_drops_dimensions_and_embeds() {
+    let mock = MockServer::start().await;
+    OllamaFixture.mount_echo(&mock).await;
+    let provider = OllamaFixture.build(mock.uri());
+
+    let req = EmbedRequest {
+        model: "test-model".to_owned(),
+        input: EmbedInput::Batch(vec!["0".into(), "1".into()]),
+        encoding_format: None,
+        dimensions: Some(256),
+        user: None,
+    };
+    let resp = provider.embed(req, CancellationToken::new()).await.unwrap();
+    assert_eq!(resp.data.len(), 2);
+    assert_eq!(mock.received_requests().await.unwrap().len(), 1);
 }

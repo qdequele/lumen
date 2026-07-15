@@ -152,5 +152,16 @@ pub async fn embeddings(
         status: 200,
     });
 
+    // Honor the client's requested output encoding (OpenAI `encoding_format`).
+    // Providers always decode to `Vec<f32>` internally; re-encode to base64 on
+    // the way out when asked, so the choice works for EVERY provider (Ollama and
+    // TEI have no upstream encoding_format). Any other value serializes as the
+    // default float array.
+    if req.encoding_format.as_deref() == Some("base64") {
+        for item in &mut response.data {
+            item.encoding = lumen_core::EmbeddingEncoding::Base64;
+        }
+    }
+
     Ok((model_used_headers(&executed.model_used), Json(response)).into_response())
 }

@@ -50,6 +50,10 @@ pub struct ProviderSpec {
     pub api_key: Option<String>,
     /// Base URL override.
     pub base_url: Option<String>,
+    /// Reject requests that set an unsupported-but-meaningful field (rather than
+    /// silently dropping it). Currently honored by Ollama for `dimensions`
+    /// (issue #25). Defaults to `false` (lenient).
+    pub strict: bool,
     /// Models this provider serves.
     pub models: Vec<ModelSpec>,
 }
@@ -63,6 +67,7 @@ impl std::fmt::Debug for ProviderSpec {
             .field("kind", &self.kind)
             .field("api_key", &self.api_key.as_ref().map(|_| "REDACTED"))
             .field("base_url", &self.base_url)
+            .field("strict", &self.strict)
             .field("models", &self.models)
             .finish()
     }
@@ -469,6 +474,7 @@ fn build_providers(
                 client.clone(),
                 spec.name.clone(),
                 base_url,
+                spec.strict,
             ));
             Ok(BuiltProviders {
                 chat: None,
@@ -576,6 +582,7 @@ mod tests {
             kind,
             api_key: Some("sk-test-xxx".to_owned()),
             base_url: base_url.map(str::to_owned),
+            strict: false,
             models,
         }
     }

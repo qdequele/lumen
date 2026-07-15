@@ -45,10 +45,14 @@ pub async fn embed_batched(
     // each sub-request keeps its shape (text batch stays a text batch, a
     // multimodal batch stays multimodal).
     let sub_inputs: Vec<EmbedInput> = match input {
-        // A single item never reaches here (len == 1 <= max_batch fast path),
-        // but keep the arm total and correct.
+        // Single-item shapes never reach here (len == 1 <= max_batch fast path),
+        // but keep the arms total and correct.
         EmbedInput::Single(s) => vec![EmbedInput::Single(s)],
+        EmbedInput::Tokens(ids) => vec![EmbedInput::Tokens(ids)],
         EmbedInput::Batch(v) => chunk_vec(v, max_batch).map(EmbedInput::Batch).collect(),
+        EmbedInput::TokenBatch(v) => chunk_vec(v, max_batch)
+            .map(EmbedInput::TokenBatch)
+            .collect(),
         EmbedInput::Multi(v) => chunk_vec(v, max_batch).map(EmbedInput::Multi).collect(),
     };
 

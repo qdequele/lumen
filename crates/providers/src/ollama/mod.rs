@@ -26,20 +26,27 @@ pub struct OllamaProvider {
     client: reqwest::Client,
     provider_name: String,
     base_url: String,
+    /// When `true`, reject a request that sets `dimensions` (which Ollama cannot
+    /// honor) with a 400 (`LM-1001`) instead of silently dropping it.
+    strict: bool,
 }
 
 impl OllamaProvider {
     /// Construct a provider pointed at `base_url` (trailing slash trimmed).
+    /// `strict` controls whether an unsupported-but-meaningful field
+    /// (`dimensions`) is rejected (400) or silently dropped (a `debug!` log).
     #[must_use]
     pub fn new(
         client: reqwest::Client,
         provider_name: impl Into<String>,
         base_url: impl Into<String>,
+        strict: bool,
     ) -> Self {
         Self {
             client,
             provider_name: provider_name.into(),
             base_url: base_url.into().trim_end_matches('/').to_owned(),
+            strict,
         }
     }
 }
@@ -69,12 +76,26 @@ impl EmbeddingProvider for OllamaProvider {
         req: EmbedRequest,
         cancel: CancellationToken,
     ) -> Result<EmbedResponse, ProviderError> {
-        // Unsupported OpenAI-only fields are dropped with a trace, never
-        // silently: Ollama's embed API has no encoding_format / dimensions.
-        if req.encoding_format.is_some() || req.dimensions.is_some() {
+        // Ollama's /api/embed takes a string or string array; a token-id array
+        // would be forwarded verbatim and fail opaquely upstream. Honest 400
+        // before any upstream call (issue #25).
+        crate::mapping::reject_pretokenized_input(&self.provider_name, &req.input)?;
+
+        // `dimensions` is meaningful (it changes the vector width) and Ollama's
+        // embed API cannot honor it. In strict mode reject the request (400,
+        // LM-1001) rather than silently returning full-width vectors; otherwise
+        // drop it with a trace. `encoding_format` is not lost here: the gateway
+        // re-encodes the output at the request edge, so it needs no handling.
+        if req.dimensions.is_some() {
+            if self.strict {
+                return Err(ProviderError::UnsupportedField {
+                    provider: self.provider_name.clone(),
+                    field: "dimensions".to_owned(),
+                });
+            }
             tracing::debug!(
                 provider = %self.provider_name,
-                "dropping unsupported fields (encoding_format/dimensions) for Ollama embed"
+                "dropping unsupported 'dimensions' field for Ollama embed"
             );
         }
 
@@ -116,6 +137,7 @@ fn translate_response(resp: OllamaEmbedResponse, requested_model: &str) -> Embed
             // `index` is bounded by the batch size, far below u32::MAX.
             index: u32::try_from(index).unwrap_or(u32::MAX),
             embedding,
+            encoding: lumen_core::EmbeddingEncoding::default(),
         })
         .collect();
 
