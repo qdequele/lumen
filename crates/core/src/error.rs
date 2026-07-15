@@ -12,6 +12,12 @@
 //! (502/503/504 / `upstream_error`, always naming the provider), and an
 //! internal gateway error (500 / `internal`). A gateway malfunction must never
 //! be reported as a misleading 401 (lesson: OpenRouter outages).
+//!
+//! One more situation sits outside that three-way split: a client-initiated
+//! cancel (499 / `client_cancelled`, `LM-6xxx`, see `docs/adr/006-*.md`). The
+//! gateway didn't malfunction and the client isn't at fault, so it is kept
+//! out of both `internal` and `invalid_request` rather than inflating either
+//! (issue #11).
 
 use crate::capability::Capability;
 use serde::Serialize;
@@ -62,6 +68,19 @@ pub enum ProviderError {
     #[error("translation error: {0}")]
     Translation(String),
 
+    /// The provider handling this attempt only accepts inline base64 image
+    /// data, but the request carried a remote (`http`/`https`) image URL.
+    ///
+    /// Distinct from [`Translation`](ProviderError::Translation): this is a
+    /// client-input problem (LM-2004), not a malformed/unparseable upstream
+    /// response. It surfaces when the LM-2004 pre-flight in the handler only
+    /// inspected the primary route (`chain[0]`) and a fallback link that
+    /// cannot take a remote URL (e.g. Gemini) ends up being attempted - the
+    /// gateway never fetches the URL on the caller's behalf, so the honest
+    /// answer is a 4xx naming the incapable provider, not a 502 (GH #13).
+    #[error("provider '{provider}' requires inline base64 image data; remote image URLs are not supported")]
+    ImageUrlNotSupported { provider: String },
+
     /// The upstream signalled rate limiting (HTTP 429).
     #[error("provider '{provider}' rate limited the request")]
     RateLimited {
@@ -75,7 +94,9 @@ impl ProviderError {
     /// Whether retrying this call (on the same provider, or a fallback) may
     /// succeed. Retryable: 5xx upstream, connect/read timeouts, unreachable
     /// host, 429. Never retryable: a client-fault 4xx, a schema/translation
-    /// error (deterministic), or a cancellation (M6 §6.1 - never retry 4xx).
+    /// error (deterministic), an image-incapable provider (deterministic -
+    /// no fallback further down the chain is any more likely to fetch the
+    /// URL), or a cancellation (M6 §6.1 - never retry 4xx).
     #[must_use]
     pub const fn is_retryable(&self) -> bool {
         match self {
@@ -85,13 +106,16 @@ impl ProviderError {
             | ProviderError::FirstTokenTimeout { .. }
             | ProviderError::Unavailable { .. }
             | ProviderError::RateLimited { .. } => true,
-            ProviderError::Cancelled | ProviderError::Translation(_) => false,
+            ProviderError::Cancelled
+            | ProviderError::Translation(_)
+            | ProviderError::ImageUrlNotSupported { .. } => false,
         }
     }
 
     /// Whether this failure indicates the *provider* is unhealthy and should
     /// count against its circuit breaker. A deterministic client/translation
-    /// error or a cancellation says nothing about provider health.
+    /// error, an image-incapable provider, or a cancellation says nothing
+    /// about provider health.
     #[must_use]
     pub const fn is_provider_fault(&self) -> bool {
         match self {
@@ -101,7 +125,9 @@ impl ProviderError {
             | ProviderError::FirstTokenTimeout { .. }
             | ProviderError::Unavailable { .. }
             | ProviderError::RateLimited { .. } => true,
-            ProviderError::Cancelled | ProviderError::Translation(_) => false,
+            ProviderError::Cancelled
+            | ProviderError::Translation(_)
+            | ProviderError::ImageUrlNotSupported { .. } => false,
         }
     }
 
@@ -144,6 +170,10 @@ pub enum ErrorType {
     UpstreamError,
     /// The gateway itself malfunctioned (500).
     Internal,
+    /// The client disconnected before the request completed (issue #11).
+    /// Kept distinct from `Internal` so a client hanging up never inflates
+    /// the internal-error metrics/alerts a gateway malfunction would.
+    ClientCancelled,
 }
 
 /// An error the gateway returns to the client.
@@ -184,6 +214,20 @@ pub enum GatewayError {
     /// image URL was supplied (Gemini). The gateway never fetches the URL.
     #[error("provider '{provider}' requires inline base64 image data; remote image URLs are not supported")]
     ImageUrlNotSupported { provider: String },
+
+    /// A provider-native image source (Anthropic `file_id`, Gemini `fileUri`
+    /// / GCS URI) was supplied, but the resolved primary provider is not the
+    /// one that reference belongs to. Rejected before any upstream call: an
+    /// honest client error rather than the 502 a translation failure would
+    /// otherwise produce (`source` names the reference kind, e.g.
+    /// `"anthropic-file"` or `"gemini-file"`).
+    #[error(
+        "provider '{provider}' does not support the '{source_kind}' provider-native image source"
+    )]
+    ImageSourceNotSupported {
+        provider: String,
+        source_kind: &'static str,
+    },
 
     /// A remote image URL was supplied to `/v1/embeddings` but server-side image
     /// fetching is disabled (M9). The operator must enable `[image_fetch]` or
@@ -280,6 +324,14 @@ pub enum GatewayError {
     /// An internal gateway malfunction. The detail is logged, never returned.
     #[error("internal error: {0}")]
     Internal(String),
+
+    // ---- Client-cancellation (LM-6xxx, issue #11) ----------------------------
+    /// The client disconnected before the request completed and the upstream
+    /// call was aborted. Deliberately its own variant rather than
+    /// `Internal`: the gateway didn't malfunction, so this must never count
+    /// against, or alert on, internal/5xx error rates.
+    #[error("client cancelled the request")]
+    ClientCancelled,
 }
 
 impl GatewayError {
@@ -293,6 +345,7 @@ impl GatewayError {
             GatewayError::UnsupportedCapability { .. } => "LM-2002",
             GatewayError::ImageInputNotSupported { .. } => "LM-2003",
             GatewayError::ImageUrlNotSupported { .. } => "LM-2004",
+            GatewayError::ImageSourceNotSupported { .. } => "LM-2008",
             GatewayError::ImageFetchDisabled => "LM-2005",
             GatewayError::ImageUrlRejected => "LM-2006",
             GatewayError::ImageFetchFailed => "LM-2007",
@@ -318,6 +371,7 @@ impl GatewayError {
             } => "LM-4003",
             GatewayError::Unauthorized => "LM-4004",
             GatewayError::Internal(_) => "LM-5001",
+            GatewayError::ClientCancelled => "LM-6001",
         }
     }
 
@@ -330,6 +384,7 @@ impl GatewayError {
             | GatewayError::EmptyDocuments
             | GatewayError::ImageInputNotSupported { .. }
             | GatewayError::ImageUrlNotSupported { .. }
+            | GatewayError::ImageSourceNotSupported { .. }
             | GatewayError::ImageFetchDisabled
             | GatewayError::ImageUrlRejected => 400,
             GatewayError::Unauthorized => 401,
@@ -337,6 +392,11 @@ impl GatewayError {
             GatewayError::ModelNotFound(_) => 404,
             GatewayError::PayloadTooLarge { .. } => 413,
             GatewayError::QuotaExceeded { .. } | GatewayError::UpstreamRateLimited { .. } => 429,
+            // Nonstandard, but the conventional "client closed request" status
+            // (nginx 499): the client is normally already gone, so this status
+            // exists for logs/metrics, not for anything the client reads. Not
+            // a 5xx - never counted against internal-error rates (issue #11).
+            GatewayError::ClientCancelled => 499,
             GatewayError::Internal(_) => 500,
             GatewayError::Upstream { .. }
             | GatewayError::UpstreamInvalidResponse { .. }
@@ -359,6 +419,7 @@ impl GatewayError {
             | GatewayError::UnsupportedCapability { .. }
             | GatewayError::ImageInputNotSupported { .. }
             | GatewayError::ImageUrlNotSupported { .. }
+            | GatewayError::ImageSourceNotSupported { .. }
             | GatewayError::ImageFetchDisabled
             | GatewayError::ImageUrlRejected
             | GatewayError::EmptyDocuments
@@ -378,6 +439,7 @@ impl GatewayError {
             | GatewayError::CircuitOpen { .. }
             | GatewayError::UpstreamRateLimited { .. } => ErrorType::UpstreamError,
             GatewayError::Internal(_) => ErrorType::Internal,
+            GatewayError::ClientCancelled => ErrorType::ClientCancelled,
         }
     }
 
@@ -455,10 +517,19 @@ impl GatewayError {
             ProviderError::Translation(_) => GatewayError::UpstreamInvalidResponse {
                 provider: provider.to_owned(),
             },
-            // Cancellation is normally handled before a body is produced; if it
-            // does surface, treat it as an internal condition rather than a
-            // misleading client/upstream error.
-            ProviderError::Cancelled => GatewayError::Internal("request cancelled".to_owned()),
+            // The resolved link cannot take a remote image URL (LM-2004): a
+            // client-input problem, never the provider's fault, even when it
+            // surfaces from a fallback link rather than the pre-flight check
+            // (GH #13). Never a 502.
+            ProviderError::ImageUrlNotSupported { provider: p } => {
+                GatewayError::ImageUrlNotSupported {
+                    provider: p_or(provider, p),
+                }
+            }
+            // A client-initiated cancel is not a gateway malfunction: its own
+            // LM-6001 / 499, so it never inflates `internal`/5xx metrics or
+            // alerts the way `GatewayError::Internal` would (issue #11).
+            ProviderError::Cancelled => GatewayError::ClientCancelled,
         }
     }
 }
@@ -562,6 +633,14 @@ mod tests {
         assert_eq!(GatewayError::ImageFetchFailed.code(), "LM-2007");
         assert_eq!(GatewayError::ImageUrlRejected.http_status(), 400);
         assert_eq!(GatewayError::ImageFetchFailed.http_status(), 502);
+        // Provider-native image source misrouted to the wrong provider (issue #12).
+        let mismatch = GatewayError::ImageSourceNotSupported {
+            provider: "openai".into(),
+            source_kind: "anthropic-file",
+        };
+        assert_eq!(mismatch.code(), "LM-2008");
+        assert_eq!(mismatch.http_status(), 400);
+        assert_eq!(mismatch.error_type(), ErrorType::InvalidRequest);
         // Streaming upstream faults (M4).
         assert_eq!(
             GatewayError::UpstreamStreamInterrupted {
@@ -620,6 +699,8 @@ mod tests {
             .code(),
             "LM-3020"
         );
+        // Client-cancellation (issue #11): its own prefix, never LM-5001.
+        assert_eq!(GatewayError::ClientCancelled.code(), "LM-6001");
     }
 
     #[test]
@@ -699,6 +780,9 @@ mod tests {
                 retryable: false,
             },
             ProviderError::Translation("bad json".into()),
+            ProviderError::ImageUrlNotSupported {
+                provider: "p".into(),
+            },
             ProviderError::Cancelled,
         ] {
             assert!(!err.is_retryable(), "{err:?} must not be retried");
@@ -819,6 +903,31 @@ mod tests {
     }
 
     #[test]
+    fn provider_image_url_not_supported_becomes_lm_2004_not_502() {
+        // GH #13: when this failure surfaces from a fallback link deep in the
+        // chain (not the LM-2004 pre-flight, which only inspects the primary),
+        // it must still be the honest 4xx - never the generic 502 that a plain
+        // `ProviderError::Translation` would produce.
+        let ge = GatewayError::from_provider(
+            "primary-router-name",
+            ProviderError::ImageUrlNotSupported {
+                provider: "gemini-fallback".into(),
+            },
+        );
+        assert_eq!(ge.code(), "LM-2004");
+        assert_eq!(ge.http_status(), 400);
+        assert_eq!(ge.error_type(), ErrorType::InvalidRequest);
+        match ge {
+            GatewayError::ImageUrlNotSupported { provider } => {
+                // The provider embedded in the error (the fallback that was
+                // actually attempted) wins over the router-supplied name.
+                assert_eq!(provider, "gemini-fallback");
+            }
+            other => panic!("expected ImageUrlNotSupported, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn rate_limited_carries_retry_after() {
         let ge = GatewayError::UpstreamRateLimited {
             provider: "openai".into(),
@@ -826,5 +935,37 @@ mod tests {
         };
         assert_eq!(ge.http_status(), 429);
         assert_eq!(ge.retry_after(), Some(Duration::from_secs(3)));
+    }
+
+    // Issue #11: a client-initiated cancel must not inflate `internal`
+    // metrics/alerts (previously mapped to `GatewayError::Internal`, 500).
+    #[test]
+    fn cancelled_maps_to_a_dedicated_non_5xx_variant_not_internal() {
+        let ge = GatewayError::from_provider("openai", ProviderError::Cancelled);
+        match ge {
+            GatewayError::ClientCancelled => {}
+            other => panic!("expected ClientCancelled, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn client_cancelled_is_not_a_5xx_and_has_a_distinct_error_type() {
+        let err = GatewayError::ClientCancelled;
+        assert_eq!(err.code(), "LM-6001");
+        assert_eq!(err.http_status(), 499);
+        assert!(
+            err.http_status() < 500,
+            "client cancellation must not surface as a 5xx: {}",
+            err.http_status()
+        );
+        assert_eq!(err.error_type(), ErrorType::ClientCancelled);
+        assert_ne!(err.error_type(), ErrorType::Internal);
+    }
+
+    #[test]
+    fn client_cancelled_envelope_carries_its_own_type() {
+        let json = serde_json::to_value(GatewayError::ClientCancelled.to_envelope()).unwrap();
+        assert_eq!(json["error"]["code"], "LM-6001");
+        assert_eq!(json["error"]["type"], "client_cancelled");
     }
 }

@@ -126,6 +126,40 @@ fn fallback_config(
     )
 }
 
+/// Primary (OpenAI, accepts remote image URLs) with a Gemini fallback (which
+/// only takes inline base64 image data). The primary model declares the
+/// `image` modality so a remote image URL clears the LM-2003 vision-capable
+/// gate; only the fallback link cannot serve it.
+fn image_capable_primary_with_gemini_fallback_config(primary: &str, fallback: &str) -> String {
+    format!(
+        r#"
+        [resilience]
+        retry_max_attempts = 1
+        retry_base_ms = 5
+        retry_max_ms = 20
+
+        [[providers]]
+        name = "primary"
+        kind = "openai"
+        base_url = "{primary}"
+        [[providers.models]]
+        id = "gpt"
+        capabilities = ["chat"]
+        modalities = ["text", "image"]
+        fallbacks = ["gemini-fb"]
+
+        [[providers]]
+        name = "fallback"
+        kind = "google"
+        base_url = "{fallback}"
+        [[providers.models]]
+        id = "gemini-fb"
+        capabilities = ["chat"]
+        modalities = ["text", "image"]
+        "#
+    )
+}
+
 // Criterion 1: 500, 500, 200 → success, exactly three upstream calls, and the
 // two backoffs are actually waited.
 #[tokio::test]
@@ -216,6 +250,59 @@ async fn falls_back_to_second_provider_and_advertises_it() {
     // Primary tried twice (its retry budget), fallback once.
     assert_eq!(primary.received_requests().await.unwrap().len(), 2);
     assert_eq!(fallback.received_requests().await.unwrap().len(), 1);
+}
+
+// GH #13 / LM-2004: the primary (OpenAI) accepts a remote image URL, so the
+// LM-2004 pre-flight (which only inspects `chain[0]`) lets the request
+// through. The primary then fails and the chain falls back to Gemini, which
+// cannot take a remote URL. That must surface as the honest LM-2004 client
+// error (400), not an upstream LM-3002 (502) - a fail-over is not the
+// client's fault when it happens, but *this specific* failure (an
+// image-incapable fallback) is a client-input problem, not the fallback
+// provider's fault.
+#[tokio::test]
+async fn fallback_incapable_of_remote_image_url_is_lm_2004_not_502() {
+    let primary = MockServer::start().await;
+    let fallback = MockServer::start().await;
+    // Primary always fails, forcing a fail-over to the Gemini fallback. The
+    // fallback mock is never given a mapping - it must never be hit.
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&primary)
+        .await;
+
+    let base = spawn(&config_from(
+        &image_capable_primary_with_gemini_fallback_config(&primary.uri(), &fallback.uri()),
+    ))
+    .await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&json!({
+            "model": "gpt",
+            "messages": [{"role":"user","content":[
+                {"type":"text","text":"what is this?"},
+                {"type":"image_url","image_url":{"url":"https://example.com/x.png"}}
+            ]}]
+        }))
+        .send()
+        .await
+        .expect("request sent");
+
+    assert_eq!(
+        resp.status(),
+        400,
+        "an image-incapable fallback must surface as a client error, not a 502"
+    );
+    let body: Value = resp.json().await.expect("json body");
+    assert_eq!(body["error"]["code"], "LM-2004");
+
+    // The primary was tried (and exhausted its retry budget); the fallback
+    // was never actually contacted over HTTP - the remote URL is rejected in
+    // translation, before any request leaves the gateway.
+    assert!(!primary.received_requests().await.unwrap().is_empty());
+    assert!(fallback.received_requests().await.unwrap().is_empty());
 }
 
 // Criterion 3: 5 failures open the circuit; the next request skips the primary

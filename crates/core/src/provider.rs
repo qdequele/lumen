@@ -70,6 +70,22 @@ pub trait ChatProvider: Send + Sync {
     fn accepts_remote_image_url(&self) -> bool {
         true
     }
+
+    /// Whether this provider can resolve an Anthropic-native `file_id` image
+    /// source (`ImageUrl::anthropic_file_id`). Only the Anthropic provider
+    /// does; the gateway rejects a mismatch with `LM-2008` before any
+    /// upstream call rather than sending a reference the resolved provider
+    /// cannot use.
+    fn accepts_anthropic_file_id(&self) -> bool {
+        false
+    }
+
+    /// Whether this provider can resolve a Gemini-native file/GCS image
+    /// source (`ImageUrl::gemini_file_uri`). Only the Google provider does;
+    /// the gateway rejects a mismatch with `LM-2008` before any upstream call.
+    fn accepts_gemini_file_uri(&self) -> bool {
+        false
+    }
 }
 
 /// A provider that can produce text embeddings.

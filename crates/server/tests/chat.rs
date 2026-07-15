@@ -100,6 +100,40 @@ fn google_registry(upstream: &str) -> Arc<Registry> {
     Arc::new(Registry::build(specs, http::build_client()).expect("registry builds"))
 }
 
+/// Vision-capable variant of [`anthropic_registry`] (issue #12 tests).
+fn anthropic_vision_registry(upstream: &str) -> Arc<Registry> {
+    let specs = vec![ProviderSpec {
+        name: "anthropic".to_owned(),
+        kind: ProviderKind::Anthropic,
+        api_key: Some("sk-ant-test".to_owned()),
+        base_url: Some(upstream.to_owned()),
+        models: vec![ModelSpec {
+            id: "claude".to_owned(),
+            upstream_id: "claude-3-5-sonnet".to_owned(),
+            capabilities: vec![Capability::Chat],
+            modalities: vec!["text".to_owned(), "image".to_owned()],
+        }],
+    }];
+    Arc::new(Registry::build(specs, http::build_client()).expect("registry builds"))
+}
+
+/// Vision-capable variant of [`google_registry`] (issue #12 tests).
+fn google_vision_registry(upstream: &str) -> Arc<Registry> {
+    let specs = vec![ProviderSpec {
+        name: "google".to_owned(),
+        kind: ProviderKind::Google,
+        api_key: Some("goog-test".to_owned()),
+        base_url: Some(upstream.to_owned()),
+        models: vec![ModelSpec {
+            id: "gemini".to_owned(),
+            upstream_id: "gemini-2.0-flash".to_owned(),
+            capabilities: vec![Capability::Chat],
+            modalities: vec!["text".to_owned(), "image".to_owned()],
+        }],
+    }];
+    Arc::new(Registry::build(specs, http::build_client()).expect("registry builds"))
+}
+
 fn openai_chat_body(model: &str) -> Value {
     json!({
         "object": "chat.completion",
@@ -467,6 +501,238 @@ async fn google_gemini_translation_round_trip() {
     assert_eq!(sent["systemInstruction"]["parts"][0]["text"], "sois bref");
     assert_eq!(sent["contents"][0]["role"], "user");
     assert_eq!(sent["contents"][0]["parts"][0]["text"], "bonjour");
+}
+
+/// Issue #12: an `anthropic-file:<file_id>` image source reaches Anthropic
+/// as a `source: {type: "file", file_id}` block, not a `url`/`base64` one.
+#[tokio::test]
+async fn anthropic_file_id_forwards_as_a_file_source_block() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "msg_1",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-3-5-sonnet",
+            "content": [{ "type": "text", "text": "a cat" }],
+            "stop_reason": "end_turn",
+            "usage": { "input_tokens": 12, "output_tokens": 3 }
+        })))
+        .mount(&upstream)
+        .await;
+
+    let base = common::spawn_with(anthropic_vision_registry(&upstream.uri()), LIMIT).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&json!({
+            "model": "claude",
+            "messages": [{"role":"user","content":[
+                {"type":"text","text":"what is this?"},
+                {"type":"image_url","image_url":{"url":"anthropic-file:file_011CNvxvfvyGnGnDtjPtzY9J"}}
+            ]}],
+            "max_tokens": 100
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+
+    let requests = upstream.received_requests().await.unwrap();
+    let sent: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    let block = &sent["messages"][0]["content"][1];
+    assert_eq!(block["type"], "image");
+    assert_eq!(block["source"]["type"], "file");
+    assert_eq!(block["source"]["file_id"], "file_011CNvxvfvyGnGnDtjPtzY9J");
+    assert!(block["source"].get("data").is_none());
+    assert!(block["source"].get("url").is_none());
+}
+
+/// Issue #12: a `gs://` GCS URI image source reaches Gemini as a
+/// `fileData.fileUri` part, not an `inline_data` one.
+#[tokio::test]
+async fn gemini_gcs_uri_forwards_as_a_file_data_part() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1beta/models/gemini-2.0-flash:generateContent"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "candidates": [{
+                "content": { "role": "model", "parts": [{ "text": "a cat" }] },
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 5,
+                "candidatesTokenCount": 2,
+                "totalTokenCount": 7
+            }
+        })))
+        .mount(&upstream)
+        .await;
+
+    let base = common::spawn_with(google_vision_registry(&upstream.uri()), LIMIT).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&json!({
+            "model": "gemini",
+            "messages": [{"role":"user","content":[
+                {"type":"text","text":"what is this?"},
+                {"type":"image_url","image_url":{"url":"gs://my-bucket/cat.png"}}
+            ]}]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+
+    let requests = upstream.received_requests().await.unwrap();
+    let sent: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    let part = &sent["contents"][0]["parts"][1];
+    assert_eq!(part["file_data"]["file_uri"], "gs://my-bucket/cat.png");
+    assert_eq!(part["file_data"]["mime_type"], "image/png");
+    assert!(part.get("inline_data").is_none());
+}
+
+/// Issue #12 (review fix): a Gemini Files API URI is an `https://` URL, so it
+/// satisfies `is_remote()` too. It must NOT be caught by the `LM-2004`
+/// remote-URL pre-flight (Google declines fetchable URLs) - a provider-native
+/// reference bound for its own provider passes through and reaches Gemini as
+/// `fileData.fileUri`.
+#[tokio::test]
+async fn gemini_files_api_uri_forwards_as_a_file_data_part() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1beta/models/gemini-2.0-flash:generateContent"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "candidates": [{
+                "content": { "role": "model", "parts": [{ "text": "a cat" }] },
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 5,
+                "candidatesTokenCount": 2,
+                "totalTokenCount": 7
+            }
+        })))
+        .mount(&upstream)
+        .await;
+
+    let base = common::spawn_with(google_vision_registry(&upstream.uri()), LIMIT).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&json!({
+            "model": "gemini",
+            "messages": [{"role":"user","content":[
+                {"type":"text","text":"what is this?"},
+                {"type":"image_url","image_url":{"url":"https://generativelanguage.googleapis.com/v1beta/files/abc-123"}}
+            ]}]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+
+    let requests = upstream.received_requests().await.unwrap();
+    let sent: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    let part = &sent["contents"][0]["parts"][1];
+    assert_eq!(
+        part["file_data"]["file_uri"],
+        "https://generativelanguage.googleapis.com/v1beta/files/abc-123"
+    );
+    // No extension on a Files API URI: mime_type omitted, never guessed.
+    assert!(part["file_data"].get("mime_type").is_none());
+    assert!(part.get("inline_data").is_none());
+}
+
+/// Issue #12 (review fix): the same Files API URI bound for a non-Google
+/// primary is `LM-2008` (provider-native source mismatch), NOT `LM-2004`
+/// (generic remote URL) and NOT forwarded - the upstream is never contacted.
+#[tokio::test]
+async fn gemini_files_api_uri_sent_to_anthropic_is_400_lm_2008() {
+    let upstream = MockServer::start().await;
+    let base = common::spawn_with(anthropic_vision_registry(&upstream.uri()), LIMIT).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&json!({
+            "model": "claude",
+            "messages": [{"role":"user","content":[
+                {"type":"text","text":"what is this?"},
+                {"type":"image_url","image_url":{"url":"https://generativelanguage.googleapis.com/v1beta/files/abc-123"}}
+            ]}],
+            "max_tokens": 100
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 400);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "LM-2008");
+    assert_eq!(body["error"]["type"], "invalid_request");
+    assert!(upstream.received_requests().await.unwrap().is_empty());
+}
+
+/// Issue #12: an Anthropic-native `file_id` sent to a provider that is not
+/// Anthropic is an honest `LM-2008` client error, not a 502 - the upstream
+/// is never contacted.
+#[tokio::test]
+async fn anthropic_file_id_sent_to_google_is_400_lm_2008() {
+    let upstream = MockServer::start().await;
+    let base = common::spawn_with(google_vision_registry(&upstream.uri()), LIMIT).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&json!({
+            "model": "gemini",
+            "messages": [{"role":"user","content":[
+                {"type":"text","text":"what is this?"},
+                {"type":"image_url","image_url":{"url":"anthropic-file:file_011CNvxvfvyGnGnDtjPtzY9J"}}
+            ]}]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 400);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "LM-2008");
+    assert_eq!(body["error"]["type"], "invalid_request");
+    assert!(upstream.received_requests().await.unwrap().is_empty());
+}
+
+/// Issue #12: a Gemini-native `gs://` / Files API URI sent to a provider
+/// that is not Google is an honest `LM-2008` client error, not a 502 - the
+/// upstream is never contacted.
+#[tokio::test]
+async fn gemini_file_uri_sent_to_anthropic_is_400_lm_2008() {
+    let upstream = MockServer::start().await;
+    let base = common::spawn_with(anthropic_vision_registry(&upstream.uri()), LIMIT).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&json!({
+            "model": "claude",
+            "messages": [{"role":"user","content":[
+                {"type":"text","text":"what is this?"},
+                {"type":"image_url","image_url":{"url":"gs://my-bucket/cat.png"}}
+            ]}],
+            "max_tokens": 100
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 400);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "LM-2008");
+    assert_eq!(body["error"]["type"], "invalid_request");
+    assert!(upstream.received_requests().await.unwrap().is_empty());
 }
 
 /// Build an upstream OpenAI-style SSE body of `n` chunk frames + `[DONE]`, with

@@ -402,6 +402,41 @@ remote image URL passes pre-flight and, only if the primary then fails over to
 Gemini, surfaces as an upstream `LM-3002` (502) - the gateway still never
 fetches the URL. Configure inline `data:` URIs when a Gemini fallback is in play.
 
+**Provider-native image sources (issue #12).** Two provider-native reference
+forms are recognised in the `image_url.url` field, for callers whose images
+are already uploaded to the provider:
+
+| Reference form in `url` | Translated for | Becomes |
+|---|---|---|
+| `anthropic-file:<file_id>` | `anthropic` | `source: {type: "file", file_id}` (Anthropic Files API) |
+| `https://generativelanguage.googleapis.com/...` (Gemini Files API URI) | `google` | `fileData.fileUri` |
+| `gs://bucket/object` (Cloud Storage URI) | `google` | `fileData.fileUri` |
+
+A provider-native reference routed to a model whose **primary** provider is
+not the reference's own provider is rejected pre-flight with `LM-2008` (400) -
+an honest client error instead of a confusing upstream failure. A Gemini
+Files API URI is also an `https://` URL, but it is exempt from the `LM-2004`
+remote-URL check: it is not a URL the provider would have to fetch, and its
+routing verdict belongs to the `LM-2008` check.
+
+> **`gs://` caveat.** The gateway forwards a `gs://` URI to Gemini verbatim,
+> but the Gemini **Developer API** (`generativelanguage.googleapis.com`, the
+> default `base_url` of the `google` kind) documents `fileData.fileUri` for
+> its own Files API URIs; Cloud Storage `gs://` URIs are a **Vertex AI**
+> capability. Against the default endpoint a `gs://` reference is passed
+> through and will be rejected *by the upstream* (surfacing as an upstream
+> error naming `google`). It is still parsed and forwarded because the
+> reference form is Gemini-native (mismatch routing stays an honest
+> `LM-2008`), `base_url` may point at a Vertex-compatible gateway, and the
+> upstream - never the gateway - is the authority on which URI forms it
+> accepts. Upload via the Gemini Files API and pass the returned URI when
+> targeting the Developer API.
+
+For the mime type of a `fileData` part: it is included only when it can be
+confidently inferred from the URI's file extension (`.png`, `.jpg`, ...);
+otherwise it is omitted rather than guessed. Files API URIs carry no
+extension, and Gemini already knows the mime type recorded at upload time.
+
 **Accounting.** Upstream-reported `usage` already folds in image tokens; when
 an upstream reports no usage, the local estimation fallback counts text only
 (images contribute `0`) and the response is still flagged `"estimated": true` -

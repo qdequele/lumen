@@ -22,6 +22,30 @@ All notable changes to LUMEN are documented here. The format is based on
   256 default). What the test asserts is unchanged: /health stays under the
   same bound during the storm and all 500 requests complete with 429/503.
 
+### Added - Provider-native file/GCS image URI sources (issue #12)
+
+- Chat vision content parts now accept two provider-native image references
+  alongside inline `data:` URIs and remote `http(s)` URLs: an Anthropic Files
+  API reference, spelled `anthropic-file:<file_id>` in the `url` field, and a
+  Gemini-native file/GCS reference (`gs://bucket/object`, or a Gemini Files
+  API URI under `https://generativelanguage.googleapis.com/`).
+- Anthropic translates `anthropic-file:<file_id>` to a `source: {type: "file",
+  file_id}` content block instead of `base64`/`url`.
+- Gemini translates a `gs://`/Files API URI to a `fileData.fileUri` part
+  instead of `inlineData`; the mime type is included only when it can be
+  confidently inferred from the URI's extension, otherwise omitted so Gemini
+  falls back to the mime type it recorded at upload time. Caveat: the Gemini
+  Developer API (the `google` kind's default endpoint) only resolves its own
+  Files API URIs; `gs://` is a Vertex AI capability, forwarded verbatim and
+  rejected by the default upstream (documented in `docs/providers.md`).
+- A Gemini Files API URI is also an `https://` URL; it is exempt from the
+  `LM-2004` remote-URL pre-flight so it reaches Gemini as `fileData.fileUri`
+  instead of being wrongly rejected.
+- Sending a provider-native reference to a provider that cannot resolve it
+  (e.g. an Anthropic `file_id` routed to Gemini) is now rejected before any
+  upstream call with a new `LM-2008` (400) client error, instead of surfacing
+  as a translation failure (502) from the mismatched provider.
+
 ### Added - Per-image vision token heuristic for the estimation fallback
 
 - The local prompt-token estimation fallback (`estimate_chat_prompt`, ADR 003)
@@ -63,6 +87,33 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ### Fixed
 
+- **Dedicated client-cancel error code (issue #11).** A client-initiated
+  cancel (`ProviderError::Cancelled`, typically a disconnect mid-request) no
+  longer maps to `GatewayError::Internal` (`LM-5001`, 500). It now has its own
+  `GatewayError::ClientCancelled` (`LM-6001`, HTTP 499,
+  `type: client_cancelled`), documented in `docs/errors.md` and
+  `docs/adr/006-client-cancellation-error-code.md`. `499` (the conventional
+  "client closed request" status) keeps it out of the `5xx` class entirely, so
+  `lumen_http_request_duration_seconds`/`lumen_request_duration_seconds` and any
+  alert built on `status=~"5.."` no longer count a client hanging up as an
+  internal gateway malfunction.
+- A mid-stream client disconnect now settles the request's accounting record
+  (`usage_log.status` and the `lumen_request_duration_seconds` sample) at 499
+  instead of a hardcoded 200: previously the most common real-world cancel
+  was silently recorded as a success. A stream whose `data: [DONE]`
+  terminator was already delivered still settles as 200 even if the client
+  disconnects immediately after.
+- **LM-2004 pre-flight now covers the whole fallback chain, not just the
+  primary route.** The remote-image-URL check in the chat handler only
+  inspected `chain[0]`; if the primary provider accepted remote URLs (e.g.
+  OpenAI) but a fail-over reached an image-incapable model (e.g. Gemini), the
+  fallback's translation failure surfaced as a generic `LM-3002` (502) instead
+  of the honest `LM-2004` (400) client error. Added a dedicated
+  `ProviderError::ImageUrlNotSupported` variant (deterministic, never
+  retried, never faults the circuit breaker - matching `Translation`'s
+  fallback-stopping semantics) so this specific failure is classified
+  correctly no matter which link in the chain hits it, without eagerly
+  rejecting requests a fallback would never actually need to serve (GH #13).
 - Anthropic chat responses (both `POST /v1/chat/completions` and its SSE
   stream) now stamp `created` with a real unix timestamp instead of a
   hardcoded `0`. New shared `providers::mapping::unix_timestamp` helper

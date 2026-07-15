@@ -6,6 +6,7 @@
 mod common;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use lumen_core::Capability;
 use lumen_providers::{http, ModelSpec, ProviderKind, ProviderSpec, Registry};
@@ -155,4 +156,133 @@ async fn chat_requests_feed_the_per_model_latency_histogram() {
     assert!(line.contains(r#"status="200""#), "{line}");
     // The HTTP-level histogram sees the same request under its route.
     assert!(out.contains(r#"path="/v1/chat/completions""#), "{out}");
+}
+
+/// A raw TCP "upstream" that streams SSE frames forever (no `[DONE]`), so a
+/// client disconnect always lands MID-stream. Same shape as
+/// `spawn_abort_detecting_upstream` in the chat tests: it stops when it
+/// observes the gateway's FIN (a 0-byte read).
+async fn spawn_endless_sse_upstream() -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind upstream");
+    let addr = listener.local_addr().expect("upstream addr");
+
+    tokio::spawn(async move {
+        let Ok((mut socket, _)) = listener.accept().await else {
+            return;
+        };
+        let mut req = [0u8; 4096];
+        let _ = socket.read(&mut req).await;
+        let (mut rd, mut wr) = socket.split();
+        let head =
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n";
+        if wr.write_all(head.as_bytes()).await.is_err() {
+            return;
+        }
+        let frame = "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"x\"}}]}\n\n";
+        let write_loop = async {
+            loop {
+                if wr.write_all(frame.as_bytes()).await.is_err() {
+                    break;
+                }
+                let _ = wr.flush().await;
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        let read_eof = async {
+            let mut buf = [0u8; 256];
+            loop {
+                match rd.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+        };
+        tokio::select! {
+            () = write_loop => {},
+            () = read_eof => {},
+        }
+    });
+
+    format!("http://{addr}")
+}
+
+// Issue #11 acceptance test: a mid-stream client disconnect must be recorded
+// as a `status="499"` sample on `lumen_request_duration_seconds` - the
+// dedicated client-cancel classification - and never as an internal
+// `500`/`5xx` sample. Before the fix this disconnect settled as a fake
+// `status="200"` success (StreamAccounting's drop safety net hardcoded 200),
+// so the positive `499` assertion below fails on the pre-fix commit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mid_stream_client_disconnect_is_recorded_as_499_not_500_or_200() {
+    let upstream_url = spawn_endless_sse_upstream().await;
+    let base = common::spawn_with(openai_registry(&upstream_url), LIMIT).await;
+
+    let client = reqwest::Client::new();
+    let mut resp = client
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&json!({
+            "model": "gpt",
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": true
+        }))
+        .send()
+        .await
+        .expect("open the stream");
+    assert_eq!(resp.status(), 200);
+
+    // Read one streamed frame (the stream is live), then disconnect by
+    // dropping the response - a genuine mid-stream client cancel.
+    let first = resp.chunk().await.expect("first chunk");
+    assert!(first.is_some(), "expected at least one streamed frame");
+    drop(resp);
+
+    // The gateway settles accounting when it observes the disconnect (the
+    // body stream is dropped asynchronously); poll /metrics until the sample
+    // lands rather than sleeping a fixed amount.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let out = loop {
+        let out = scrape_metrics(&base).await;
+        let recorded = out
+            .lines()
+            .any(|l| l.starts_with("lumen_request_duration_seconds_count") && l.contains("chat"));
+        if recorded || std::time::Instant::now() > deadline {
+            break out;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+
+    // Positive: the cancelled stream produced exactly the 499 classification.
+    let line = out
+        .lines()
+        .find(|l| l.starts_with("lumen_request_duration_seconds_count") && l.contains("chat"))
+        .unwrap_or_else(|| panic!("no chat duration sample after disconnect:\n{out}"));
+    assert!(
+        line.contains(r#"status="499""#),
+        "a mid-stream client cancel must be recorded as 499, got: {line}"
+    );
+
+    // Negative: it must not masquerade as a success or an internal failure.
+    assert!(
+        !line.contains(r#"status="200""#),
+        "client cancel must not be recorded as a 200 success: {line}"
+    );
+    assert!(
+        !out.contains(r#"status="500""#),
+        "client cancel must not surface as an internal 500:\n{out}"
+    );
+    assert!(
+        !out.contains(r#"status="5xx""#),
+        "client cancel must not surface as a 5xx class label:\n{out}"
+    );
+
+    // Server stays responsive afterwards.
+    let health = reqwest::get(format!("{base}/health"))
+        .await
+        .expect("health");
+    assert_eq!(health.status(), 200);
 }

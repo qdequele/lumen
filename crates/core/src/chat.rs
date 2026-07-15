@@ -163,6 +163,37 @@ impl ImageUrl {
     pub fn is_remote(&self) -> bool {
         self.url.starts_with("http://") || self.url.starts_with("https://")
     }
+
+    /// A reference to a file already uploaded to Anthropic's Files API,
+    /// spelled `anthropic-file:<file_id>` in the `url` field (never a real
+    /// network scheme - the gateway forwards the id verbatim in a
+    /// `source: {type: "file", file_id}` block and never dereferences it).
+    #[must_use]
+    pub fn anthropic_file_id(&self) -> Option<&str> {
+        let id = self.url.strip_prefix("anthropic-file:")?;
+        (!id.is_empty()).then_some(id)
+    }
+
+    /// A Gemini-native file reference: a Google Cloud Storage URI
+    /// (`gs://bucket/object`) or a URI returned by the Gemini Files API
+    /// (`https://generativelanguage.googleapis.com/...`). Both map straight
+    /// onto Gemini's `fileData.fileUri`; the gateway never dereferences
+    /// either. Note that the Gemini Developer API only resolves its own
+    /// Files API URIs - `gs://` is a Vertex AI capability, forwarded
+    /// verbatim and rejected by the default upstream (see the caveat in
+    /// `docs/providers.md`).
+    #[must_use]
+    pub fn gemini_file_uri(&self) -> Option<&str> {
+        if self.url.starts_with("gs://")
+            || self
+                .url
+                .starts_with("https://generativelanguage.googleapis.com/")
+        {
+            Some(self.url.as_str())
+        } else {
+            None
+        }
+    }
 }
 
 /// A chat completion request in OpenAI format.
@@ -333,5 +364,58 @@ mod tests {
         ]}"#;
         let m: ChatMessage = serde_json::from_str(json).unwrap();
         assert_eq!(m.content.as_ref().unwrap().text(), "");
+    }
+
+    #[test]
+    fn anthropic_file_id_is_recognised_and_others_are_not() {
+        let file = ImageUrl {
+            url: "anthropic-file:file_011CNvxvfvyGnGnDtjPtzY9J".to_owned(),
+            detail: None,
+        };
+        assert_eq!(
+            file.anthropic_file_id(),
+            Some("file_011CNvxvfvyGnGnDtjPtzY9J")
+        );
+        assert!(file.gemini_file_uri().is_none());
+
+        // An empty id after the scheme is not a valid reference.
+        let empty = ImageUrl {
+            url: "anthropic-file:".to_owned(),
+            detail: None,
+        };
+        assert!(empty.anthropic_file_id().is_none());
+
+        // A plain data URI or remote URL never parses as a file id.
+        let data = ImageUrl {
+            url: "data:image/png;base64,AAAA".to_owned(),
+            detail: None,
+        };
+        assert!(data.anthropic_file_id().is_none());
+    }
+
+    #[test]
+    fn gemini_file_uri_recognises_gcs_and_files_api_uris() {
+        let gcs = ImageUrl {
+            url: "gs://my-bucket/cat.png".to_owned(),
+            detail: None,
+        };
+        assert_eq!(gcs.gemini_file_uri(), Some("gs://my-bucket/cat.png"));
+        assert!(gcs.anthropic_file_id().is_none());
+
+        let files_api = ImageUrl {
+            url: "https://generativelanguage.googleapis.com/v1beta/files/abc-123".to_owned(),
+            detail: None,
+        };
+        assert_eq!(
+            files_api.gemini_file_uri(),
+            Some("https://generativelanguage.googleapis.com/v1beta/files/abc-123")
+        );
+
+        // A generic remote URL (even https) is not a Gemini-native reference.
+        let remote = ImageUrl {
+            url: "https://example.com/cat.png".to_owned(),
+            detail: None,
+        };
+        assert!(remote.gemini_file_uri().is_none());
     }
 }
