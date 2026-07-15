@@ -1,0 +1,20 @@
+# Multi-tenant accounting: metadata labels on Prometheus + virtual keys with
+# a hard budget. Needs OPENAI_API_KEY and LUMEN_MASTER_KEY (64 hex chars).
+[telemetry]
+metadata_labels = ["org_id", "team_id", "project_id"]
+
+[auth]
+enabled = true
+db_path = "examples-multi-tenant.db"
+
+[[providers]]
+name = "openai"
+kind = "openai"
+api_key_env = "OPENAI_API_KEY"
+
+[[providers.models]]
+id = "gpt-4o"
+upstream_id = "gpt-4o-2024-08-06"
+capabilities = ["chat"]
+cost_per_1m_input = 2.5
+cost_per_1m_output = 10.0

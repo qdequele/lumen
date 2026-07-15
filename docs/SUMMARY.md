@@ -34,6 +34,10 @@
 - [Resilience tuning](operations/resilience.md)
 - [Deployment](operations/deployment.md)
 
+# Examples
+
+- [Examples](examples.md)
+
 # Reference
 
 - [Providers](providers.md)

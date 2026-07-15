@@ -1,0 +1,21 @@
+# RAG retrieval pair: embeddings (OpenAI) + reranking (Cohere).
+# Needs OPENAI_API_KEY and COHERE_API_KEY.
+[[providers]]
+name = "openai"
+kind = "openai"
+api_key_env = "OPENAI_API_KEY"
+
+[[providers.models]]
+id = "text-embedding-3-small"
+capabilities = ["embed"]
+
+[[providers]]
+name = "cohere"
+kind = "cohere"
+api_key_env = "COHERE_API_KEY"
+
+[[providers.models]]
+id = "rerank-english"
+upstream_id = "rerank-v3.5"
+capabilities = ["rerank"]
+cost_per_1k_searches = 2.0

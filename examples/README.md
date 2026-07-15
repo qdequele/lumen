@@ -12,6 +12,10 @@ up).
 - **multi-provider-fallback**: cross-vendor chat fallback, OpenAI primary
   with an Anthropic fallback model, and how to watch the circuit breaker
   trip and the fallback fire.
+- **rag-pipeline**: the two calls behind a RAG pipeline, embeddings via
+  OpenAI at index time and reranking via Cohere at query time.
+- **multi-tenant-analytics**: per-tenant cost attribution, virtual keys
+  with a hard budget plus `x-lumen-metadata` turned into Prometheus labels.
 
 More scenarios live alongside these; see each directory's own `README.md`
 for what it adds.
