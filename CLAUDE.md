@@ -81,13 +81,16 @@ A provider implements 1 to N traits. The router routes by (capability, model).
    Bump the versions in `Cargo.toml` when it is safe, then re-run the
    validation (step 4) - clippy pedantic may introduce new lints with
    each Rust version. Note any notable bump in `CHANGELOG.md`.
-1. Read `ROADMAP.md` → identify the current milestone (first unchecked).
-2. Read the corresponding `specs/milestones/M<N>-*.md`.
-3. For each task of the milestone: write the tests FIRST, then the implementation.
+1. Identify the work: an open GitHub issue, a bug report, or a feature request.
+   (The initial M1-M7 build-out is complete; the project is now in
+   maintenance/enhancement mode. Consult `docs/backlog.md` and `docs/adr/` for
+   context and prior decisions.)
+2. Scope the task: read the relevant crate(s) and any related ADR in `docs/adr/`.
+3. For each task: write the tests FIRST, then the implementation.
 4. Validate: `cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings && cargo fmt --check`.
-5. Check the boxes in ROADMAP.md and the milestone file. Add an entry in `CHANGELOG.md`.
+5. Add an entry in `CHANGELOG.md`.
 6. Atomic commit per task: `feat(router): fallback chain with circuit breaker`.
-7. If an architecture choice is not covered by the specs: write a short ADR in `docs/adr/NNN-titre.md` BEFORE implementing.
+7. If an architecture choice is not already covered by an ADR: write a short ADR in `docs/adr/NNN-titre.md` BEFORE implementing.
 
 ## Definition of Done (per task)
 - [ ] Unit tests + at least 1 integration test (wiremock)
@@ -102,13 +105,13 @@ cargo test --workspace                # tests
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --check
 cargo run -p server -- --config config.example.toml
-cargo bench                           # benchmarks criterion (M7)
+cargo bench                           # benchmarks (criterion)
 ```
 
 ## Available subagents (.claude/agents/)
 - `provider-integrator`: adds a new provider (repeatable pattern)
 - `test-writer`: writes the tests before the implementation
-- `code-reviewer`: read-only review after each milestone
+- `code-reviewer`: read-only review after each task, before committing
 - `perf-auditor`: tracks allocations, copies, runtime blocking
 - `docs-writer`: user docs, README, config examples
 
