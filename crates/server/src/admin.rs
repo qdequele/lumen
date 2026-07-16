@@ -29,13 +29,25 @@ use lumen_core::GatewayError;
 use serde::{Deserialize, Serialize};
 
 /// `POST /admin/keys` response: the record plus the one-time plaintext key.
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 pub struct CreatedKey {
     /// The clear virtual key. Shown exactly once - store it now.
     pub key: String,
     /// The created record.
     #[serde(flatten)]
     pub record: VirtualKeyRecord,
+}
+
+// STRICT rule 5: the plaintext must be unrepresentable through `Debug`, so a
+// stray `{:?}` in a log line or error chain can never leak it. Serialization
+// (the one intended exposure) goes through `Serialize` only.
+impl std::fmt::Debug for CreatedKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CreatedKey")
+            .field("key", &"REDACTED")
+            .field("record", &self.record)
+            .finish()
+    }
 }
 
 /// Map an auth-layer failure to an opaque 500 - never a misleading 401.
@@ -405,7 +417,31 @@ const fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_rfc3339, parse_time_param};
+    use super::*;
+
+    #[test]
+    fn created_key_debug_never_shows_the_plaintext() {
+        let created = CreatedKey {
+            key: "fg-super-secret-plaintext".to_owned(),
+            record: VirtualKeyRecord {
+                id: "id-1".to_owned(),
+                name: "debug-test".to_owned(),
+                budget_max: None,
+                budget_spent: 0.0,
+                rpm_limit: None,
+                tpm_limit: None,
+                expires_at: None,
+                disabled: false,
+                created_at: 0,
+            },
+        };
+        let dbg = format!("{created:?}");
+        assert!(
+            !dbg.contains("fg-super-secret-plaintext"),
+            "Debug output leaked the plaintext: {dbg}"
+        );
+        assert!(dbg.contains("REDACTED"), "Debug output was: {dbg}");
+    }
 
     #[test]
     fn unix_seconds_pass_through() {

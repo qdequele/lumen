@@ -15,8 +15,14 @@ All notable changes to LUMEN are documented here. The format is based on
   gated by the same `LUMEN_MASTER_KEY` env var as the /admin API, and prints
   the record plus the one-time plaintext (stdout only, never logged) in the
   same JSON shape as the admin route. `keys list` prints the records (no
-  hashes, no plaintext). Documented in `docs/operations/keys-budgets.md`, and
-  the quickstart now links the bootstrap step.
+  hashes, no plaintext). Non-finite (`NaN`/`inf`) and negative budget/limit
+  values are refused at parse time (a `NaN` budget would silently mint an
+  UNLIMITED key), every value flag accepts both `--flag value` and
+  `--flag=value`, and the hot-reload path now re-syncs the in-memory
+  virtual-key table from the DB so a CLI-created key becomes live on the next
+  reload with no restart (in-memory spend is preserved). Documented in
+  `docs/operations/keys-budgets.md`, and the quickstart now links the
+  bootstrap step.
 - **`GET /admin/usage`: usage and spend reporting over HTTP** (issue #64).
   The `usage_log` table finally has a query surface: a master-key-gated
   admin route returning aggregates per group - request counts split by

@@ -14,7 +14,11 @@
 //! - the **resilience policy** (retry/timeouts/fallbacks), circuit-breaker
 //!   state preserved;
 //! - the safe **auth knobs** ([`AuthKnobs`]: budget-flush cadence and usage-log
-//!   retention window), read live by the background tasks on their next tick.
+//!   retention window), read live by the background tasks on their next tick;
+//! - the **virtual-key table**, re-synced from the auth DB so keys created
+//!   offline (e.g. `lumen keys create`) become live without a restart;
+//!   existing entries keep their in-memory spend (memory stays the source of
+//!   truth for accrued spend after boot).
 //!
 //! Read once at boot and therefore **restart-only** (documented in
 //! `docs/backlog.md`): the server bind address (rebinding a live listener is
@@ -155,6 +159,12 @@ pub struct ReloadTargets {
     /// Live auth knobs swapped from the reloaded config; `Some` only when auth
     /// is enabled.
     pub auth_knobs: Option<Arc<AuthKnobs>>,
+    /// The live auth runtime (in-memory key table + store); `Some` only when
+    /// auth is enabled. On each reload the virtual-key table is re-read from
+    /// the DB so keys created offline (e.g. `lumen keys create`) become live
+    /// without a restart; existing entries only have their limits re-applied
+    /// and keep their in-memory spend.
+    pub auth_runtime: Option<Arc<crate::auth::AuthRuntime>>,
 }
 
 /// Re-load `path`, validate it, and (only on success) atomically swap the
@@ -341,6 +351,24 @@ pub async fn reload_once(path: &Path, targets: &Arc<ReloadTargets>) {
             ),
         }
     }
+    // Virtual keys created offline (e.g. `lumen keys create` straight against
+    // the DB) become live here: re-read the table and upsert into the
+    // in-memory state. New hashes are inserted; existing entries only have
+    // their limits re-applied and keep their in-memory spend. A DB error
+    // keeps the current table (a sick DB never locks anyone out).
+    if let Some(runtime) = &targets.auth_runtime {
+        match runtime.store.load_auth_entries().await {
+            Ok(entries) => {
+                for (hash, record) in entries {
+                    runtime.keys.upsert(hash, &record);
+                }
+            }
+            Err(error) => tracing::warn!(
+                %error,
+                "virtual-key refresh failed; keeping the current in-memory key table"
+            ),
+        }
+    }
     let path = path.to_path_buf();
     let targets = Arc::clone(targets);
     let joined = tokio::task::spawn_blocking(move || {
@@ -443,6 +471,7 @@ mod tests {
             key_backfill: Arc::new(ArcSwap::from_pointee(HashMap::new())),
             key_source: None,
             auth_knobs: None,
+            auth_runtime: None,
         }
     }
 
@@ -620,6 +649,7 @@ mod tests {
             key_backfill: Arc::new(ArcSwap::from_pointee(boot_backfill)),
             key_source: Some(source),
             auth_knobs: None,
+            auth_runtime: None,
         });
 
         // Rotate the DB key, then run one reload through the real entry point.
@@ -639,6 +669,61 @@ mod tests {
         assert!(
             registry.rerank_route("rr").is_some(),
             "registry still routes"
+        );
+    }
+
+    #[tokio::test]
+    async fn reload_picks_up_a_virtual_key_created_offline_in_the_db() {
+        use crate::auth::{now_unix, AuthRuntime};
+        use lumen_auth::key::hash_key;
+        use lumen_auth::state::AuthState;
+        use lumen_auth::store::{KeyStore, NewKey};
+
+        let dir = tempdir();
+        let path = write_config(&dir, ONE_MODEL);
+        let registry = registry_from(&path);
+
+        // A live auth runtime whose in-memory table was loaded at "boot",
+        // before the offline key existed.
+        let store = KeyStore::in_memory().await.expect("store");
+        let runtime = Arc::new(AuthRuntime {
+            keys: AuthState::load(Vec::new()),
+            store: store.clone(),
+            admin_token_hash: hash_key("admin"),
+            master: None,
+        });
+
+        // Simulate `lumen keys create`: a key written straight to the DB,
+        // which the live in-memory table has never seen.
+        let (plaintext, _record) = store
+            .create_key(NewKey {
+                name: "cli-created".to_owned(),
+                ..NewKey::default()
+            })
+            .await
+            .expect("create key offline");
+        assert!(
+            runtime
+                .keys
+                .authenticate(plaintext.reveal(), now_unix())
+                .is_none(),
+            "the offline-created key must not be live before the reload"
+        );
+
+        let mut t = targets(
+            Arc::clone(&registry),
+            ReloadMetrics::register(&Metrics::new()).unwrap(),
+        );
+        t.auth_runtime = Some(Arc::clone(&runtime));
+        let t = Arc::new(t);
+        reload_once(&path, &t).await;
+
+        assert!(
+            runtime
+                .keys
+                .authenticate(plaintext.reveal(), now_unix())
+                .is_some(),
+            "a config reload must make the offline-created key live, no restart"
         );
     }
 

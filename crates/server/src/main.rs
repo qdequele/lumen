@@ -3,6 +3,7 @@
 //! Thin orchestration only: parse args, load config, initialise logging, then
 //! hand off to the library. `anyhow` is used here (and only here).
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
@@ -97,7 +98,14 @@ fn main() -> ExitCode {
     let action = match parse_args() {
         Ok(action) => action,
         Err(message) => {
-            eprintln!("error: {message}\n\n{HELP}");
+            // A failure under `lumen keys ...` gets the keys help, not the
+            // server help.
+            let help = if std::env::args().nth(1).as_deref() == Some("keys") {
+                KEYS_HELP
+            } else {
+                HELP
+            };
+            eprintln!("error: {message}\n\n{help}");
             return ExitCode::from(2);
         }
     };
@@ -218,10 +226,19 @@ fn parse_args_from(mut args: impl Iterator<Item = String>) -> Result<Action, Str
     })
 }
 
-/// `--flag <value>`: pull the value or fail naming the flag.
-fn value_of(flag: &str, args: &mut impl Iterator<Item = String>) -> Result<String, String> {
-    args.next()
-        .ok_or_else(|| format!("{flag} requires a value"))
+/// The value of a `--flag`: the inline `--flag=value` part when present,
+/// otherwise the next argument; fails naming the flag.
+fn flag_value(
+    flag: &str,
+    inline: Option<String>,
+    args: &mut impl Iterator<Item = String>,
+) -> Result<String, String> {
+    match inline {
+        Some(value) => Ok(value),
+        None => args
+            .next()
+            .ok_or_else(|| format!("{flag} requires a value")),
+    }
 }
 
 /// Parse a `--flag` value as a number, failing with the flag name on error.
@@ -232,7 +249,7 @@ fn number_of<T: std::str::FromStr>(flag: &str, value: &str) -> Result<T, String>
 }
 
 /// Parse everything after `lumen keys`: the `create`/`list` subcommand and
-/// its flags.
+/// its flags. Every value flag accepts both `--flag value` and `--flag=value`.
 fn parse_keys_args(mut args: impl Iterator<Item = String>) -> Result<Action, String> {
     let missing = "keys requires a subcommand: create | list".to_owned();
     let sub = args.next().ok_or_else(|| missing.clone())?;
@@ -254,44 +271,45 @@ fn parse_keys_args(mut args: impl Iterator<Item = String>) -> Result<Action, Str
     let mut expires_at: Option<i64> = None;
 
     while let Some(arg) = args.next() {
-        match arg.as_str() {
+        // Split `--flag=value` so every value flag accepts both spellings.
+        let (flag, inline) = match arg.split_once('=') {
+            Some((f, v)) if f.starts_with("--") => (f.to_owned(), Some(v.to_owned())),
+            _ => (arg.clone(), None),
+        };
+        match flag.as_str() {
             "-h" | "--help" => {
                 print!("{KEYS_HELP}");
                 return Ok(Action::Help);
             }
-            "-c" | "--config" => config = PathBuf::from(value_of("--config", &mut args)?),
-            "--name" if create => name = Some(value_of("--name", &mut args)?),
+            "-c" | "--config" => {
+                config = PathBuf::from(flag_value("--config", inline, &mut args)?);
+            }
+            "--name" if create => name = Some(flag_value("--name", inline, &mut args)?),
             "--budget-max" if create => {
                 budget_max = Some(number_of(
                     "--budget-max",
-                    &value_of("--budget-max", &mut args)?,
+                    &flag_value("--budget-max", inline, &mut args)?,
                 )?);
             }
             "--rpm-limit" if create => {
                 rpm_limit = Some(number_of(
                     "--rpm-limit",
-                    &value_of("--rpm-limit", &mut args)?,
+                    &flag_value("--rpm-limit", inline, &mut args)?,
                 )?);
             }
             "--tpm-limit" if create => {
                 tpm_limit = Some(number_of(
                     "--tpm-limit",
-                    &value_of("--tpm-limit", &mut args)?,
+                    &flag_value("--tpm-limit", inline, &mut args)?,
                 )?);
             }
             "--expires-at" if create => {
                 expires_at = Some(number_of(
                     "--expires-at",
-                    &value_of("--expires-at", &mut args)?,
+                    &flag_value("--expires-at", inline, &mut args)?,
                 )?);
             }
-            other => {
-                if let Some(value) = other.strip_prefix("--config=") {
-                    config = PathBuf::from(value);
-                } else {
-                    return Err(format!("unexpected argument '{other}' for `keys {sub}`"));
-                }
-            }
+            _ => return Err(format!("unexpected argument '{arg}' for `keys {sub}`")),
         }
     }
 
@@ -301,6 +319,27 @@ fn parse_keys_args(mut args: impl Iterator<Item = String>) -> Result<Action, Str
     let name = name.ok_or_else(|| "keys create requires --name <NAME>".to_owned())?;
     if name.trim().is_empty() {
         return Err("--name must not be blank".to_owned());
+    }
+    // A non-finite budget (NaN/inf) would slip through as "unlimited" and a
+    // negative budget/limit/expiry would mint a key that is dead on arrival -
+    // both silently defeat the hard-budget contract, so refuse them here.
+    if let Some(v) = budget_max {
+        if !v.is_finite() || v < 0.0 {
+            return Err(format!(
+                "--budget-max must be a finite, non-negative amount of USD, got '{v}'"
+            ));
+        }
+    }
+    if let Some(v) = rpm_limit.filter(|v| *v < 0) {
+        return Err(format!("--rpm-limit must not be negative, got '{v}'"));
+    }
+    if let Some(v) = tpm_limit.filter(|v| *v < 0) {
+        return Err(format!("--tpm-limit must not be negative, got '{v}'"));
+    }
+    if let Some(v) = expires_at.filter(|v| *v < 0) {
+        return Err(format!(
+            "--expires-at must be a non-negative unix timestamp, got '{v}'"
+        ));
     }
     Ok(Action::Keys(KeysAction::Create {
         config,
@@ -522,14 +561,7 @@ fn run(config: Config, config_path: PathBuf) -> anyhow::Result<()> {
                     Some(boot.auth_knobs),
                 )
             } else {
-                (
-                    None,
-                    None,
-                    None,
-                    std::collections::HashMap::new(),
-                    None,
-                    None,
-                )
+                (None, None, None, HashMap::new(), None, None)
             };
 
         // The shared client sets the default (process-wide) connect timeout and
@@ -563,6 +595,7 @@ fn run(config: Config, config_path: PathBuf) -> anyhow::Result<()> {
             key_backfill: Arc::new(ArcSwap::from_pointee(boot_backfill)),
             key_source,
             auth_knobs,
+            auth_runtime: auth_runtime.clone(),
         };
         let reload_armed = arm_config_reload(config_path, reload_targets, &reload_trigger);
 
@@ -701,7 +734,7 @@ struct AuthBoot {
     /// The usage writer task (drained on shutdown).
     usage_writer: tokio::task::JoinHandle<()>,
     /// Boot-time DB provider-key snapshot (seeds the hot-reload backfill cell).
-    key_backfill: std::collections::HashMap<String, String>,
+    key_backfill: HashMap<String, String>,
     /// DB key source the reloader re-reads on every reload (rotation support).
     key_source: Arc<ProviderKeySource>,
     /// Live auth knobs the flush/purge tasks read and a reload retunes.
@@ -733,7 +766,7 @@ async fn boot_auth_stack(
     // env var is unset (env vars stay the primary source). The snapshot is
     // handed to the hot-reload path so a reload re-applies these keys instead
     // of stripping them (they are absent from the env-only spec rebuild).
-    let mut key_backfill = std::collections::HashMap::new();
+    let mut key_backfill = HashMap::new();
     for spec in provider_specs.iter_mut() {
         if spec.api_key.is_none() {
             if let Some(key) = store
@@ -1020,5 +1053,73 @@ mod tests {
     fn keys_help_returns_help() {
         let action = parse_args_from(args(&["keys", "--help"])).expect("keys --help should parse");
         assert_eq!(action, Action::Help);
+    }
+
+    #[test]
+    fn keys_create_rejects_a_non_finite_budget() {
+        // NaN and infinity parse as f64 but would silently become an
+        // UNLIMITED budget: they must be refused, not accepted.
+        for bad in ["NaN", "nan", "inf", "-inf", "infinity"] {
+            let err = parse_args_from(args(&[
+                "keys",
+                "create",
+                "--name",
+                "x",
+                "--budget-max",
+                bad,
+            ]))
+            .expect_err("a non-finite budget must error");
+            assert!(err.contains("--budget-max"), "error for '{bad}' was: {err}");
+        }
+    }
+
+    #[test]
+    fn keys_create_rejects_negative_values() {
+        let cases = [
+            ("--budget-max", "-5"),
+            ("--rpm-limit", "-1"),
+            ("--tpm-limit", "-100"),
+            ("--expires-at", "-1"),
+        ];
+        for (flag, value) in cases {
+            let err = parse_args_from(args(&["keys", "create", "--name", "x", flag, value]))
+                .expect_err("a negative value must error");
+            assert!(err.contains(flag), "error for '{flag} {value}' was: {err}");
+        }
+    }
+
+    #[test]
+    fn keys_flags_accept_the_equals_form() {
+        let action = parse_args_from(args(&[
+            "keys",
+            "create",
+            "--config=prod.toml",
+            "--name=team-search",
+            "--budget-max=50.5",
+            "--rpm-limit=60",
+            "--tpm-limit=100000",
+            "--expires-at=1752537600",
+        ]))
+        .expect("keys create with --flag=value should parse");
+        assert_eq!(
+            action,
+            Action::Keys(KeysAction::Create {
+                config: PathBuf::from("prod.toml"),
+                name: "team-search".to_owned(),
+                budget_max: Some(50.5),
+                rpm_limit: Some(60),
+                tpm_limit: Some(100_000),
+                expires_at: Some(1_752_537_600),
+            })
+        );
+
+        let action = parse_args_from(args(&["keys", "list", "--config=prod.toml"]))
+            .expect("keys list with --config= should parse");
+        assert_eq!(
+            action,
+            Action::Keys(KeysAction::List {
+                config: PathBuf::from("prod.toml"),
+            })
+        );
     }
 }

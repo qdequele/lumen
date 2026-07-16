@@ -163,6 +163,7 @@ async fn rotating_a_db_provider_key_takes_effect_on_reload_without_restart() {
             vec!["cohere".to_owned()],
         ))),
         auth_knobs: None,
+        auth_runtime: None,
     });
     reload_once(&path, &targets).await;
 

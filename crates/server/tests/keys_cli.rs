@@ -188,6 +188,78 @@ fn keys_create_refuses_a_config_with_auth_disabled() {
 }
 
 #[test]
+fn keys_list_requires_the_master_key_env() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (config_path, _db_path) = write_auth_config(&dir);
+
+    let output = lumen()
+        .args(["keys", "list", "--config"])
+        .arg(&config_path)
+        .env_remove("LUMEN_MASTER_KEY")
+        .output()
+        .expect("run lumen keys list");
+
+    assert!(
+        !output.status.success(),
+        "listing keys without the master key must fail"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("LUMEN_MASTER_KEY"),
+        "stderr must name the missing env var: {stderr}"
+    );
+}
+
+#[test]
+fn keys_parse_errors_exit_2_and_print_the_keys_help() {
+    // Missing --name is a parse error: exit code 2 (like every arg error)
+    // and the KEYS help on stderr, not the top-level server help.
+    let output = lumen()
+        .args(["keys", "create"])
+        .output()
+        .expect("run lumen keys create with no name");
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "arg errors must exit with code 2"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--name"),
+        "stderr must name the missing flag: {stderr}"
+    );
+    assert!(
+        stderr.contains("lumen keys create --name"),
+        "stderr must show the keys usage, not the server usage: {stderr}"
+    );
+    assert!(
+        !stderr.contains("--check-config"),
+        "the top-level server help must not be printed for a keys error: {stderr}"
+    );
+}
+
+#[test]
+fn keys_create_rejects_non_finite_and_negative_budgets_at_the_binary_level() {
+    for bad in ["NaN", "inf", "-5"] {
+        let output = lumen()
+            .args(["keys", "create", "--name", "x", "--budget-max", bad])
+            .output()
+            .expect("run lumen keys create with a bad budget");
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "'--budget-max {bad}' must be refused with exit code 2"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("--budget-max"),
+            "stderr for '{bad}' must name the flag: {stderr}"
+        );
+    }
+}
+
+#[test]
 fn help_text_documents_the_keys_subcommand() {
     let output = lumen().arg("--help").output().expect("run lumen --help");
     assert!(output.status.success());
