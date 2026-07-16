@@ -199,6 +199,7 @@ fn cohere_vision_registry(upstream: &str) -> Arc<Registry> {
         base_url: Some(upstream.to_owned()),
         strict: false,
         connect_timeout_ms: None,
+        api_version: None,
         models: vec![ModelSpec {
             id: "command-a-vision".to_owned(),
             upstream_id: "command-a-vision-07-2025".to_owned(),

@@ -282,9 +282,10 @@ modalities = ["text", "image"]
   counts) over `usage.billed_units` (what's charged); a response reporting
   neither leaves the gateway's local estimator to fill in an honestly-flagged
   count (ADR 003).
-- **Vision (issue #73)**: a message carrying image parts is translated to
-  Cohere v2 content blocks (`text` / `image_url`, OpenAI-shaped); a text-only
-  message keeps the plain-string form. Declare
+- **Vision (issue #73)**: a user message carrying image parts is translated
+  to Cohere v2 content blocks (`text` / `image_url`, OpenAI-shaped); a
+  text-only message keeps the plain-string form, and non-user roles always
+  flatten to text (Cohere only admits image content on user messages). Declare
   `modalities = ["text", "image"]` on a vision model (Command-A-Vision) to
   opt in. Both inline `data:` URIs and remote `http(s)` URLs are forwarded
   (Cohere fetches remote URLs itself, so `LM-2004` does not apply); the

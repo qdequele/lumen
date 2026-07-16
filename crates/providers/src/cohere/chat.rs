@@ -13,11 +13,13 @@
 //!   `"NONE"` strings (omitted for `"auto"`) - forcing one specific tool is
 //!   not supported upstream and is dropped with a `debug` trace, falling back
 //!   to `auto`;
-//! * vision (issue #73, Command-A-Vision): a message with image parts becomes
-//!   an array of v2 content blocks (`text` / `image_url`, OpenAI-shaped, see
-//!   [`cohere_content`]); a text-only message keeps the plain-string fast
-//!   path. Both remote URLs and `data:` URIs are accepted upstream, so the
-//!   default `accepts_remote_image_url` (true) is correct for this kind;
+//! * vision (issue #73, Command-A-Vision): a **user** message with image
+//!   parts becomes an array of v2 content blocks (`text` / `image_url`,
+//!   OpenAI-shaped, see [`cohere_content`]); a text-only message keeps the
+//!   plain-string fast path, and non-user roles always flatten to text
+//!   (Cohere only admits image content on user messages). Both remote URLs
+//!   and `data:` URIs are accepted upstream, so the default
+//!   `accepts_remote_image_url` (true) is correct for this kind;
 //! * response: `message.content` is an array of typed blocks (only `type:
 //!   "text"` is emitted for a pure-text reply) instead of a bare string;
 //!   `finish_reason` is `COMPLETE`/`STOP_SEQUENCE`/`MAX_TOKENS`/`TOOL_CALL`/
@@ -89,16 +91,26 @@ fn has_tool_calls(m: &ChatMessage) -> bool {
 /// an array of `text`/`image_url` blocks with part order preserved
 /// (issue #73, Command-A-Vision).
 ///
+/// Only a **user** message gets the blocks path: Cohere's v2 schemas admit
+/// `ImageContent` on `UserMessageV2` only, so an image part on a system or
+/// assistant message keeps the text flattening (emitting a block there would
+/// draw an upstream 4xx instead of the established flatten behavior).
+///
 /// Cohere v2's vision blocks are OpenAI-shaped -
 /// `{"type":"image_url","image_url":{"url",...,"detail"?}}` - and the
 /// upstream accepts both remote `http(s)` URLs (which Cohere fetches itself)
 /// and inline `data:` URIs, so the [`lumen_core::ImageUrl`] serializes verbatim: no URL
 /// rewriting, `detail` forwarded untouched. Provider-native references
-/// (Anthropic `file_id`, Gemini `fileUri`) never reach this path: the
-/// gateway's pre-flight rejects them for the cohere kind with `LM-2008`.
+/// (Anthropic `file_id`, Gemini `fileUri`) do not reach this path when
+/// cohere is the primary provider: the gateway's pre-flight rejects them
+/// with `LM-2008`. (The pre-flight inspects only the primary, so a failover
+/// from another primary can still deliver one here; it is then forwarded
+/// verbatim and rejected by the upstream, same as the other translators.)
 fn cohere_content(m: &ChatMessage) -> Value {
     match m.content.as_ref() {
-        Some(MessageContent::Parts(parts)) if parts.iter().any(|p| p.image_url.is_some()) => {
+        Some(MessageContent::Parts(parts))
+            if m.role == "user" && parts.iter().any(|p| p.image_url.is_some()) =>
+        {
             let mut blocks = Vec::with_capacity(parts.len());
             for p in parts {
                 if let Some(img) = &p.image_url {
@@ -527,6 +539,50 @@ mod tests {
                     "type": "image_url",
                     "image_url": { "url": "https://example.com/cat.png" }
                 },
+            ]))
+        );
+    }
+
+    /// Cohere's v2 schemas admit `ImageContent` only on `UserMessageV2`: a
+    /// non-user message carrying an image part must keep the flattened-text
+    /// form (blocks there would draw an upstream 4xx), while the same parts
+    /// on a user message become v2 blocks.
+    #[test]
+    fn image_blocks_are_gated_on_the_user_role() {
+        let parts = vec![
+            ContentPart {
+                kind: "text".to_owned(),
+                text: Some("look at".to_owned()),
+                image_url: None,
+                extra: Map::new(),
+            },
+            ContentPart {
+                kind: "image_url".to_owned(),
+                text: None,
+                image_url: Some(lumen_core::ImageUrl {
+                    url: "data:image/png;base64,AAAA".to_owned(),
+                    detail: None,
+                }),
+                extra: Map::new(),
+            },
+        ];
+        let mk = |role: &str| ChatMessage {
+            role: role.to_owned(),
+            content: Some(MessageContent::Parts(parts.clone())),
+            name: None,
+            extra: Map::new(),
+        };
+        let req = base_request(vec![mk("system"), mk("assistant"), mk("user")]);
+        let out = translate_request(&req, false);
+        // System and assistant: flattened to their text, no blocks.
+        assert_eq!(out.messages[0].content, Some(json!("look at")));
+        assert_eq!(out.messages[1].content, Some(json!("look at")));
+        // User: the v2 blocks path.
+        assert_eq!(
+            out.messages[2].content,
+            Some(json!([
+                { "type": "text", "text": "look at" },
+                { "type": "image_url", "image_url": { "url": "data:image/png;base64,AAAA" } },
             ]))
         );
     }
