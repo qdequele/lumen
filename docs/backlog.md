@@ -17,6 +17,13 @@ milestone.
 - Postgres backend for the auth/usage store (a `postgres` sqlx feature flag;
   the queries in `crates/auth` are simple enough to stay portable, so this is
   cheap to add if a deployment ever needs it - v1 is SQLite only)
+- `/v1/batches` (OpenAI async batch jobs API) - explicit v1 non-goal: batch
+  jobs imply persistent job state and scheduling, which sits poorly with the
+  DB-off-the-request-path and single-binary pillars. Note:
+  `crates/providers/src/batch.rs` is embedding request sub-batching, unrelated
+  to this API surface.
+- `/v1/files` (OpenAI file upload/storage API) - explicit v1 non-goal: blob
+  storage state, same rationale as `/v1/batches`.
 
 ## Noted while building M1
 
