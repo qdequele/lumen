@@ -206,11 +206,17 @@ pub fn resolve_region(base_url: Option<&str>) -> Option<String> {
 }
 
 /// OpenAI chat fields the Converse API has no equivalent for (issue #72): no
-/// JSON mode / structured output, no sampling seed, no logprobs, no
-/// parallel-tool-call control. Rejected (strict) or dropped with a trace
-/// (lenient) before any upstream call.
-const UNSUPPORTED_CHAT_FIELDS: &[&str] =
-    &["response_format", "seed", "logprobs", "parallel_tool_calls"];
+/// JSON mode / structured output, no sampling seed, no logprobs (nor
+/// `top_logprobs`), no logit biasing, no parallel-tool-call control. Rejected
+/// (strict) or dropped with a trace (lenient) before any upstream call.
+const UNSUPPORTED_CHAT_FIELDS: &[&str] = &[
+    "response_format",
+    "seed",
+    "logprobs",
+    "top_logprobs",
+    "logit_bias",
+    "parallel_tool_calls",
+];
 
 /// An AWS Bedrock chat provider (Converse API).
 pub struct BedrockProvider {
@@ -1076,6 +1082,8 @@ mod tests {
             ("response_format", json!({ "type": "json_object" })),
             ("seed", json!(42)),
             ("logprobs", json!(true)),
+            ("top_logprobs", json!(5)),
+            ("logit_bias", json!({ "50256": -100 })),
             ("parallel_tool_calls", json!(false)),
         ] {
             let mut req = request(vec![msg("user", "hi")]);

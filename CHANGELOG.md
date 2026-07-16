@@ -98,7 +98,9 @@ All notable changes to LUMEN are documented here. The format is based on
   combos now honor the per-provider `strict` flag (the issue #25 pattern):
   strict rejects with an honest 400 (`LM-1001`) naming the field and provider
   before any upstream call, lenient (default) drops with a `debug` log.
-  Per-provider matrix documented in `docs/providers.md`.
+  `top_logprobs` and `logit_bias` get the same strict/lenient treatment on
+  all four translated kinds. Per-provider matrix documented in
+  `docs/providers.md`.
 - **`LUMEN_MASTER_KEY` was folded into the config and broke `--check-config`
   and every real auth-enabled boot.** `Config::load` merged all `LUMEN_*`
   environment variables into the config via `figment::providers::Env`, so

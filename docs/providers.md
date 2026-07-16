@@ -721,23 +721,28 @@ capabilities = ["chat", "embed"]
 ## OpenAI chat extras on translated providers
 
 OpenAI-compatible kinds forward every unmodeled request field verbatim, so
-`response_format`, `seed`, `logprobs` and `parallel_tool_calls` simply work
-there. The translated chat kinds rebuild the upstream request field by field,
-so each of these is either **mapped** onto a native equivalent or explicitly
-**unsupported** (issue #72) - never silently lost:
+`response_format`, `seed`, `logprobs`, `top_logprobs`, `logit_bias` and
+`parallel_tool_calls` simply work there. The translated chat kinds rebuild
+the upstream request field by field, so each of these is either **mapped**
+onto a native equivalent or explicitly **unsupported** (issue #72) - never
+silently lost:
 
 | Field | `anthropic` | `google` / `vertex_ai` | `bedrock` | `cohere` |
 |-----------------------|-------------|------------------------|-----------|----------|
 | `response_format` | unsupported | mapped¹ | unsupported | mapped² |
 | `seed` | unsupported | mapped (`generationConfig.seed`) | unsupported | mapped |
 | `logprobs` | unsupported | unsupported | unsupported | unsupported³ |
+| `top_logprobs` | unsupported | unsupported | unsupported | unsupported³ |
+| `logit_bias` | unsupported | unsupported | unsupported | unsupported |
 | `parallel_tool_calls` | mapped⁴ | unsupported | unsupported | unsupported |
 
 ¹ `{"type": "json_object"}` becomes `generationConfig.responseMimeType:
 "application/json"`; `{"type": "json_schema"}` additionally carries
 `json_schema.schema` as `generationConfig.responseSchema`, with JSON Schema
 keywords Gemini's OpenAPI-subset schema rejects (`additionalProperties`,
-`$schema`) stripped recursively.
+`$schema`) stripped recursively. Note that `additionalProperties: false` is
+therefore **dropped, not enforced**, on Gemini: the model may still emit
+extra keys (each strip is logged at `debug` level).
 
 ² Cohere v2 has no separate `json_schema` type: OpenAI's
 `{"type": "json_schema", "json_schema": {"schema": ...}}` collapses onto
@@ -745,8 +750,9 @@ Cohere's `{"type": "json_object", "json_schema": <schema>}`; `json_object`
 and `text` pass through as-is.
 
 ³ Cohere v2 does accept a `logprobs` flag upstream, but its response shape is
-not translated back to OpenAI's, so the gateway treats it as unsupported
-rather than returning a malformed response.
+not translated back to OpenAI's (and `top_logprobs` rides that same response
+shape), so the gateway treats both as unsupported rather than returning a
+malformed response.
 
 ⁴ `parallel_tool_calls: false` becomes Anthropic's
 `tool_choice.disable_parallel_tool_use: true` (defaulting the choice to

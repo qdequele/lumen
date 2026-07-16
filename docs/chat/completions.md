@@ -45,7 +45,8 @@ name.
 
 Verbatim passthrough applies to OpenAI-compatible providers. On the
 **translated** kinds (`anthropic`, `google`, `vertex_ai`, `bedrock`,
-`cohere`), `response_format`, `seed`, `logprobs` and `parallel_tool_calls`
+`cohere`), `response_format`, `seed`, `logprobs`, `top_logprobs`,
+`logit_bias` and `parallel_tool_calls`
 are mapped natively where the upstream supports them and otherwise dropped
 with a debug log - or rejected up front with `LM-1001` when the provider sets
 `strict = true`. See the

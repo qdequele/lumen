@@ -288,8 +288,11 @@ pub(super) fn translate_request(req: &ChatRequest, stream: bool) -> CohereChatRe
             .extra
             .get("response_format")
             .and_then(translate_response_format),
-        // A non-numeric seed is invalid OpenAI input anyway; dropped, not guessed.
-        seed: req.extra.get("seed").filter(|v| v.is_number()).cloned(),
+        // Cohere's `seed` is a non-negative integer (0..=u64::MAX per its
+        // OpenAPI schema); a non-integer or negative value is dropped, not
+        // guessed (a float would forward here while Gemini drops it, and a
+        // negative i64 would pass `is_i64()` but Cohere would reject it).
+        seed: req.extra.get("seed").filter(|v| v.is_u64()).cloned(),
         stream,
     }
 }
@@ -808,8 +811,19 @@ mod tests {
         assert_eq!(out["seed"], 42);
         assert!(out.get("response_format").is_none());
 
-        // A non-numeric seed is invalid OpenAI input: dropped, not forwarded.
+        // A non-integer seed is invalid OpenAI input: dropped, not forwarded
+        // (a float must not slip through here while Gemini drops it).
         req.extra.insert("seed".to_owned(), json!("not-a-number"));
+        let out = serde_json::to_value(translate_request(&req, false)).unwrap();
+        assert!(out.get("seed").is_none());
+        req.extra.insert("seed".to_owned(), json!(42.5));
+        let out = serde_json::to_value(translate_request(&req, false)).unwrap();
+        assert!(out.get("seed").is_none());
+
+        // Cohere's `seed` is non-negative (0..=u64::MAX); a negative i64 is
+        // valid JSON and valid OpenAI input but not a valid Cohere seed, so
+        // it must be dropped too, not forwarded verbatim.
+        req.extra.insert("seed".to_owned(), json!(-1));
         let out = serde_json::to_value(translate_request(&req, false)).unwrap();
         assert!(out.get("seed").is_none());
     }

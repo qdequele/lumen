@@ -309,7 +309,8 @@ total_timeout_ms = 120000
                    # cannot honor with a 400 (LM-1001) instead of silently
                    # dropping it. Ollama: `dimensions`. Translated chat kinds
                    # (anthropic, google, vertex_ai, bedrock, cohere):
-                   # response_format / seed / logprobs / parallel_tool_calls
+                   # response_format / seed / logprobs / top_logprobs /
+                   # logit_bias / parallel_tool_calls
                    # where no native mapping exists (docs/providers.md, "OpenAI
                    # chat extras on translated providers"). `encoding_format` is
                    # always handled at the response edge and is never affected.

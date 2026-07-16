@@ -47,11 +47,17 @@ const MAX_BATCH_SIZE: usize = 96;
 
 /// OpenAI chat fields the v2 chat translation cannot honor (issue #72):
 /// `logprobs` exists upstream but its response shape is not translated back
-/// to OpenAI's, and `parallel_tool_calls` has no v2 equivalent. Rejected
+/// to OpenAI's (`top_logprobs` rides the same response shape), and
+/// `logit_bias` / `parallel_tool_calls` have no v2 equivalent. Rejected
 /// (strict) or dropped with a trace (lenient) before any upstream call.
 /// `response_format` and `seed` are NOT here: they map natively in
 /// [`chat::translate_request`](self::chat).
-const UNSUPPORTED_CHAT_FIELDS: &[&str] = &["logprobs", "parallel_tool_calls"];
+const UNSUPPORTED_CHAT_FIELDS: &[&str] = &[
+    "logprobs",
+    "top_logprobs",
+    "logit_bias",
+    "parallel_tool_calls",
+];
 
 /// A Cohere provider serving embeddings and reranking.
 pub struct CohereProvider {

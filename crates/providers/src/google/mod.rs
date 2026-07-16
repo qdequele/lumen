@@ -53,12 +53,18 @@ use crate::http::{open_stream_with_headers, post_json_with_headers};
 /// Default Gemini API base (the path adds `/v1beta/models/...`).
 const DEFAULT_BASE_URL: &str = "https://generativelanguage.googleapis.com";
 
-/// OpenAI chat fields `generateContent` has no equivalent for (issue #72).
-/// Rejected (strict) or dropped with a trace (lenient) before any upstream
-/// call, by both the Gemini Developer API provider and Vertex AI.
-/// `response_format` and `seed` are NOT here: they map natively onto
-/// `generationConfig` in [`translate_request`].
-pub(crate) const UNSUPPORTED_CHAT_FIELDS: &[&str] = &["logprobs", "parallel_tool_calls"];
+/// OpenAI chat fields `generateContent` has no equivalent for (issue #72):
+/// no OpenAI-shaped logprobs (nor `top_logprobs`), no logit biasing, no
+/// parallel-tool-call control. Rejected (strict) or dropped with a trace
+/// (lenient) before any upstream call, by both the Gemini Developer API
+/// provider and Vertex AI. `response_format` and `seed` are NOT here: they
+/// map natively onto `generationConfig` in [`translate_request`].
+pub(crate) const UNSUPPORTED_CHAT_FIELDS: &[&str] = &[
+    "logprobs",
+    "top_logprobs",
+    "logit_bias",
+    "parallel_tool_calls",
+];
 
 /// A Google Gemini chat provider.
 pub struct GoogleProvider {
@@ -670,7 +676,11 @@ fn translate_response_format(
             }
             (Some(JSON_MIME.to_owned()), schema)
         }
-        Some("text") | None => (None, None),
+        Some("text") => (None, None),
+        None => {
+            tracing::debug!("gemini chat: response_format without a type string dropped");
+            (None, None)
+        }
         Some(other) => {
             tracing::debug!(
                 response_format_type = other,
@@ -689,8 +699,15 @@ fn sanitize_gemini_schema(schema: &mut serde_json::Value) {
     let Some(map) = schema.as_object_mut() else {
         return;
     };
-    map.remove("additionalProperties");
-    map.remove("$schema");
+    for keyword in ["additionalProperties", "$schema"] {
+        if map.remove(keyword).is_some() {
+            tracing::debug!(
+                keyword,
+                "gemini chat: stripped a JSON Schema keyword Gemini's \
+                 responseSchema does not accept (it is dropped, not enforced)"
+            );
+        }
+    }
     if let Some(props) = map.get_mut("properties").and_then(|v| v.as_object_mut()) {
         for sub in props.values_mut() {
             sanitize_gemini_schema(sub);
@@ -1463,6 +1480,8 @@ mod tests {
 
         for (field, value) in [
             ("logprobs", json!(true)),
+            ("top_logprobs", json!(5)),
+            ("logit_bias", json!({ "50256": -100 })),
             ("parallel_tool_calls", json!(false)),
         ] {
             let mut req = request(vec![msg("user", "hi")]);
