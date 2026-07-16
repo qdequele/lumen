@@ -329,34 +329,44 @@ async fn time_window_accepts_unix_and_rfc3339() {
     let base_ts = 1_784_073_600_i64;
     let mut early = row(base_ts - 3_600);
     early.model = "early".to_owned();
+    // Both window edges are inclusive: rows at exactly `since` and exactly
+    // `until` must be counted.
+    let mut at_since = row(base_ts);
+    at_since.model = "at-since".to_owned();
     let mut inside = row(base_ts + 60);
     inside.model = "inside".to_owned();
+    let mut at_until = row(base_ts + 3_600);
+    at_until.model = "at-until".to_owned();
     let mut late = row(base_ts + 7_200);
     late.model = "late".to_owned();
     h.store
-        .insert_usage(&[early, inside, late])
+        .insert_usage(&[early, at_since, inside, at_until, late])
         .await
         .expect("seed");
 
-    // Unix-seconds window around `inside` only.
+    let assert_window = |body: &Value| {
+        let groups = body["groups"].as_array().expect("groups");
+        assert_eq!(groups.len(), 3, "inclusive edges + inside: {body}");
+        group(body, "at-since");
+        group(body, "inside");
+        group(body, "at-until");
+        assert_eq!(body["since"], base_ts);
+        assert_eq!(body["until"], base_ts + 3_600);
+    };
+
+    // Unix-seconds window.
     let query = format!("?since={}&until={}", base_ts, base_ts + 3_600);
     let body: Value = h.usage(&query).await.json().await.expect("json");
-    assert_eq!(body["groups"].as_array().expect("groups").len(), 1);
-    assert_eq!(body["groups"][0]["group"], "inside");
-    assert_eq!(body["since"], base_ts);
-    assert_eq!(body["until"], base_ts + 3_600);
+    assert_window(&body);
 
-    // The same window, spelled in RFC3339 (with an offset variant).
+    // The same window, spelled in RFC3339 (with a %2B-encoded offset).
     let body: Value = h
         .usage("?since=2026-07-15T00:00:00Z&until=2026-07-15T03:00:00%2B02:00")
         .await
         .json()
         .await
         .expect("json");
-    assert_eq!(body["groups"].as_array().expect("groups").len(), 1);
-    assert_eq!(body["groups"][0]["group"], "inside");
-    assert_eq!(body["since"], base_ts);
-    assert_eq!(body["until"], base_ts + 3_600);
+    assert_window(&body);
 }
 
 #[tokio::test]

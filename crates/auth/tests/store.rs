@@ -262,6 +262,36 @@ async fn usage_summary_aggregates_filters_and_groups() {
 }
 
 #[tokio::test]
+async fn usage_summary_groups_by_model_used_separately_from_model() {
+    // A fallback-served request: requested "gpt-test", served by "gpt-mini".
+    let store = KeyStore::in_memory().await.expect("open store");
+    let mut fell_back = usage("k", 100);
+    fell_back.model_used = "gpt-mini".to_owned();
+    store
+        .insert_usage(&[usage("k", 100), fell_back])
+        .await
+        .expect("seed");
+
+    let filter = UsageFilter {
+        since: 0,
+        until: 200,
+        limit: 10,
+        ..UsageFilter::default()
+    };
+    let by_model = store
+        .usage_summary(&filter, UsageGroupBy::Model)
+        .await
+        .expect("summary");
+    assert_eq!(by_model.len(), 1, "both requested the same model");
+    let by_model_used = store
+        .usage_summary(&filter, UsageGroupBy::ModelUsed)
+        .await
+        .expect("summary");
+    assert_eq!(by_model_used.len(), 2, "but two different models served");
+    assert!(by_model_used.iter().any(|g| g.group == "gpt-mini"));
+}
+
+#[tokio::test]
 async fn usage_summary_orders_by_cost_and_honors_the_limit() {
     let store = KeyStore::in_memory().await.expect("open store");
     let mut rows = Vec::new();

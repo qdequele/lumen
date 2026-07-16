@@ -164,7 +164,7 @@ const MAX_GROUP_LIMIT: u32 = 1_000;
 
 /// `GET /admin/usage` query parameters. Unknown parameters are rejected
 /// (400 `LM-1001`), so a typo never silently widens a report.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UsageParams {
     /// Only rows for this virtual key id.

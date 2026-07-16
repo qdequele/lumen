@@ -22,7 +22,11 @@ All notable changes to LUMEN are documented here. The format is based on
   directly against SQLite - admin-only, off the hot path - and rows reach
   it through the batched writer, so the last flush interval may lag. New
   `usage_log.provider` column (migration 0004) records the provider that
-  actually served each request; pre-existing rows report an empty provider.
+  actually served each request (admission refusals carry the requested
+  model's primary provider); pre-existing rows report an empty provider.
+  Rolling back to a pre-0004 binary only requires clearing the migration
+  ledger (`DELETE FROM _sqlx_migrations WHERE version = 4`); the extra
+  column itself is harmless to older binaries.
 - **`GET /v1/models/{id}` (OpenAI retrieve-model)** (issue #67): returns the
   same per-model object as the corresponding `GET /v1/models` list entry (id,
   `object: "model"`, `owned_by`, `capabilities`, `modalities`), served from the

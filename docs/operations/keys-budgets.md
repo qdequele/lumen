@@ -131,7 +131,7 @@ Query parameters (all optional):
 |---|---|---|
 | `key_id` | Only rows for this virtual key id. | all keys |
 | `model` | Only rows for this client-facing model id. | all models |
-| `provider` | Only rows served by this provider instance. | all providers |
+| `provider` | Only rows attributed to this provider instance. | all providers |
 | `capability` | `chat`, `embed` or `rerank`. | all capabilities |
 | `since` | Window start (inclusive): unix seconds or RFC3339. | `until` - 24 h |
 | `until` | Window end (inclusive): unix seconds or RFC3339. | now |
@@ -188,6 +188,15 @@ Two accounting notes:
   includes admission refusals (402/429): they consumed zero tokens, and
   zero is exact. `estimated_requests` counts rows whose token counts were
   locally estimated per ADR 003.
+- **Provider attribution on refusals.** Rows served by a provider carry the
+  provider that actually served them (under a fallback this may differ from
+  the primary). Admission-refusal rows (402/429) never reached a provider;
+  they carry the requested model's primary provider, so per-provider
+  reports still see the traffic that was headed there.
+
+One encoding note: an RFC3339 `+HH:MM` offset contains a `+`, which in a
+query string means a space - percent-encode it as `%2B`
+(`until=2026-07-15T03:00:00%2B02:00`), or use `Z`/unix seconds.
 
 ## Operator notes
 
