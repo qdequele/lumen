@@ -58,7 +58,7 @@ A provider implements 1 to N traits. The router routes by (capability, model).
 - **Runtime**: tokio (multi-thread), axum, tower, hyper
 - **HTTP client**: reqwest (rustls, NOT openssl)
 - **Serialization**: serde + serde_json
-- **DB**: sqlx + SQLite by default; Postgres behind the `postgres` feature flag
+- **DB**: sqlx + SQLite (Postgres support is a v2 backlog item, see `docs/backlog.md`)
 - **Errors**: thiserror in libs, anyhow ONLY in main.rs
 - **Logs**: tracing + tracing-subscriber (JSON in prod)
 - **Config**: figment (TOML + env vars), hot reload via notify
