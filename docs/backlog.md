@@ -14,6 +14,9 @@ milestone.
 - Distributed rate limiting (Redis)
 - OTLP tracing export
 - WASM plugin system
+- Postgres backend for the auth/usage store (a `postgres` sqlx feature flag;
+  the queries in `crates/auth` are simple enough to stay portable, so this is
+  cheap to add if a deployment ever needs it - v1 is SQLite only)
 
 ## Noted while building M1
 

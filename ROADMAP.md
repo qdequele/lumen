@@ -115,7 +115,7 @@ opt-in, off the streaming hot path, time-bounded. Chat vision (M8) keeps
 "never fetch".
 
 ## Backlog v2 (do not implement)
-Admin UI, semantic cache, audio (STT/TTS), image generation/output, guardrails, distributed rate limiting (Redis), OTLP tracing, WASM plugin.
+Admin UI, semantic cache, audio (STT/TTS), image generation/output, guardrails, distributed rate limiting (Redis), OTLP tracing, WASM plugin, Postgres backend for the auth/usage store.
 
 Note: M8 shipped the first, narrowest slice of the "multimodal (images/audio)"
 non-goal - image input to chat only (see above). M9 added image input to
