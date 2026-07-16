@@ -328,18 +328,26 @@ milestone.
 
 - **Tier-2 clouds need dedicated kinds** (different auth/schema, not
   OpenAI-compatible): ~~Azure OpenAI (deployment routing + api-version)~~
-  (shipped - `kind = "azure"`), AWS Bedrock (SigV4, per-model schemas),
-  Google Vertex AI (GCP OAuth, regional endpoints). Each is a
-  `provider-integrator` task with wiremock tests.
+  (shipped - `kind = "azure"`), ~~AWS Bedrock (SigV4, per-model schemas)~~
+  (shipped - `kind = "bedrock"`, Converse API + SigV4,
+  `crates/providers/src/bedrock/`), ~~Google Vertex AI (GCP OAuth, regional
+  endpoints)~~ (shipped - `kind = "vertex_ai"`,
+  `crates/providers/src/google/vertex/`).
 - **Azure: dedicated `api_version` config field** - a desired fast-follow to
   the shipped `azure` kind, which currently reads the version from an
   `?api-version=...` query string on `base_url`. A first-class field needs a
   matching `ProviderSpec` + `crates/server/src/config.rs` change.
-- **Cohere chat** (Command R/R+) - we ship Cohere embed+rerank; chat is a
-  distinct schema.
-- **More rerankers**: Mixedbread (mxbai-rerank), Pinecone Rerank, NVIDIA NIM
-  rerank, Together LlamaRank - cheap differentiation for a first-class rerank
-  gateway.
+- ~~**Cohere chat** (Command R/R+) - we ship Cohere embed+rerank; chat is a
+  distinct schema.~~ **Resolved** (shipped -
+  `crates/providers/src/cohere/chat.rs`, text chat + streaming + tools). The
+  remaining slice is vision/image input only: the chat translation maps
+  content with `image_url: None`, tracked as issue #73.
+- **More rerankers**: ~~Mixedbread (mxbai-rerank)~~ (shipped -
+  `kind = "mixedbread"`), ~~Pinecone Rerank~~ (shipped - `kind = "pinecone"`),
+  ~~NVIDIA NIM rerank~~ (shipped - `kind = "nvidia"`), ~~Together LlamaRank~~
+  (shipped - `kind = "together"`). All four live under
+  `crates/providers/src/`; the section's "cheap differentiation for a
+  first-class rerank gateway" goal is done.
 
 ## Noted while building M8 (vision / image input)
 
