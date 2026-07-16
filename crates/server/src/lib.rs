@@ -261,6 +261,34 @@ mod tests {
     }
 
     #[test]
+    fn check_config_rejects_an_embed_model_on_a_kind_with_no_upstream_embeddings() {
+        // Groq (like perplexity and xai) has no upstream /embeddings API, so a
+        // config declaring an embed model there must fail at load time rather
+        // than 404 on the first request (issue #74).
+        let file = write_temp_config(
+            r#"
+            [[providers]]
+            name = "groq-main"
+            kind = "groq"
+
+            [[providers.models]]
+            id = "groq-embed"
+            capabilities = ["embed"]
+            "#,
+        );
+        let err = check_config(file.path()).expect_err("groq embed model must be rejected");
+        assert!(
+            matches!(
+                err,
+                ConfigCheckError::Registry(
+                    lumen_providers::RegistryError::NoUpstreamEmbeddings { .. }
+                )
+            ),
+            "expected NoUpstreamEmbeddings, got: {err:?}"
+        );
+    }
+
+    #[test]
     fn check_config_rejects_a_provider_missing_its_required_base_url() {
         // The registry (not Config::validate) is where a missing base_url on
         // a kind with no vendor default (e.g. vllm) is caught - so

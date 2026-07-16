@@ -128,6 +128,29 @@ impl ProviderKind {
         }
     }
 
+    /// Whether this kind's upstream actually serves an embeddings API.
+    ///
+    /// `false` only for hosted OpenAI-compatible kinds that share the OpenAI
+    /// embed wiring but whose upstream exposes no `/embeddings` endpoint
+    /// (Groq, DeepSeek, OpenRouter, Perplexity, xAI, verified 2026-07): an
+    /// embed model declared there could only ever 404 at request time, so the
+    /// registry rejects it at build time instead. Every other kind returns
+    /// `true`, permissively: self-hosted or catalog-dependent kinds (`vllm`,
+    /// `huggingface`, `cloudflare`) let the operator decide what is served,
+    /// and kinds with no embed implementation at all (e.g. `anthropic`) are
+    /// already covered by the registry's unsupported-capability warning.
+    #[must_use]
+    pub const fn supports_embeddings(self) -> bool {
+        !matches!(
+            self,
+            ProviderKind::Groq
+                | ProviderKind::Deepseek
+                | ProviderKind::Openrouter
+                | ProviderKind::Perplexity
+                | ProviderKind::Xai
+        )
+    }
+
     /// Whether this provider requires an API key to be configured.
     ///
     /// Local, self-hosted providers (Ollama, TEI, vLLM) are keyless. NVIDIA NIM
@@ -152,6 +175,39 @@ impl ProviderKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hosted_kinds_without_an_upstream_embeddings_api_report_it() {
+        // Verified against upstream API docs (issue #74): these hosted
+        // OpenAI-compatible kinds serve chat only - no /embeddings endpoint -
+        // so an embed model there could only ever 404 at request time.
+        for kind in [
+            ProviderKind::Groq,
+            ProviderKind::Deepseek,
+            ProviderKind::Openrouter,
+            ProviderKind::Perplexity,
+            ProviderKind::Xai,
+        ] {
+            assert!(!kind.supports_embeddings(), "{kind:?} has no upstream API");
+        }
+        // Hosts that genuinely serve embeddings, plus self-hosted or
+        // catalog-dependent kinds where the operator controls what is served,
+        // stay permissive.
+        for kind in [
+            ProviderKind::Openai,
+            ProviderKind::Together,
+            ProviderKind::Fireworks,
+            ProviderKind::Deepinfra,
+            ProviderKind::Huggingface,
+            ProviderKind::Cloudflare,
+            ProviderKind::Vllm,
+            ProviderKind::Azure,
+            ProviderKind::Cohere,
+            ProviderKind::Voyage,
+        ] {
+            assert!(kind.supports_embeddings(), "{kind:?} serves embeddings");
+        }
+    }
 
     #[test]
     fn azure_is_a_native_kind_requiring_its_own_base_url_and_api_key() {
