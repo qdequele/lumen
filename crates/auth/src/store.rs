@@ -82,6 +82,9 @@ pub struct UsageRecord {
     /// Model that actually served the request - the same as `model` unless a
     /// fallback fired (M6 §6.2).
     pub model_used: String,
+    /// Provider instance that served the request (issue #64). Empty for rows
+    /// written before the column existed.
+    pub provider: String,
     /// `chat` | `embed` | `rerank`.
     pub capability: String,
     /// Input/prompt tokens.
@@ -106,6 +109,130 @@ pub struct UsageRecord {
     pub metadata: Option<String>,
     /// Unix seconds.
     pub ts: i64,
+}
+
+/// Filters for a [`KeyStore::usage_summary`] query. All string filters are
+/// exact matches; the time window is inclusive on both ends (unix seconds).
+#[derive(Debug, Clone, Default)]
+pub struct UsageFilter {
+    /// Only rows for this virtual key id.
+    pub key_id: Option<String>,
+    /// Only rows for this client-facing model id.
+    pub model: Option<String>,
+    /// Only rows served by this provider instance.
+    pub provider: Option<String>,
+    /// Only rows of this capability (`chat` | `embed` | `rerank`).
+    pub capability: Option<String>,
+    /// Window start, unix seconds (inclusive).
+    pub since: i64,
+    /// Window end, unix seconds (inclusive).
+    pub until: i64,
+    /// Maximum number of groups returned - the bound on the result size.
+    pub limit: i64,
+}
+
+/// The dimension a [`KeyStore::usage_summary`] aggregates over. A closed set:
+/// each variant maps to a fixed SQL expression, so nothing caller-supplied
+/// ever reaches the query text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsageGroupBy {
+    /// Group by the client-facing model id the client requested.
+    Model,
+    /// Group by the model that actually served the request (fallbacks).
+    ModelUsed,
+    /// Group by the provider instance that served the request.
+    Provider,
+    /// Group by capability (`chat` | `embed` | `rerank`).
+    Capability,
+    /// Group by virtual key id (rows without a key group under `""`).
+    KeyId,
+    /// Group by the HTTP status returned to the client.
+    Status,
+    /// No grouping: one aggregate row over every matching request.
+    Total,
+}
+
+impl UsageGroupBy {
+    /// Parse the wire name (`model`, `model_used`, `provider`, `capability`,
+    /// `key_id`, `status`, `total`). `None` for anything else.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "model" => Some(Self::Model),
+            "model_used" => Some(Self::ModelUsed),
+            "provider" => Some(Self::Provider),
+            "capability" => Some(Self::Capability),
+            "key_id" => Some(Self::KeyId),
+            "status" => Some(Self::Status),
+            "total" => Some(Self::Total),
+            _ => None,
+        }
+    }
+
+    /// The canonical wire name (inverse of [`parse`](Self::parse)).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Model => "model",
+            Self::ModelUsed => "model_used",
+            Self::Provider => "provider",
+            Self::Capability => "capability",
+            Self::KeyId => "key_id",
+            Self::Status => "status",
+            Self::Total => "total",
+        }
+    }
+
+    /// The SQL expression the summary groups by - a fixed whitelist, never
+    /// caller-supplied text.
+    const fn group_expr(self) -> &'static str {
+        match self {
+            Self::Model => "model",
+            Self::ModelUsed => "model_used",
+            Self::Provider => "provider",
+            Self::Capability => "capability",
+            Self::KeyId => "COALESCE(key_id, '')",
+            Self::Status => "CAST(status AS TEXT)",
+            Self::Total => "'total'",
+        }
+    }
+}
+
+/// One aggregate row of a [`KeyStore::usage_summary`]: request counts by
+/// status class, token totals, the estimated-vs-upstream split (ADR 003),
+/// search units, media accounting and cost.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct UsageAggregate {
+    /// The group value (a model id, provider name, ... per the grouping).
+    pub group: String,
+    /// Total requests in the group, whatever their status.
+    pub requests: i64,
+    /// Requests answered 2xx.
+    pub requests_ok: i64,
+    /// Requests answered 4xx (budget/quota refusals, bad requests, client
+    /// disconnects recorded as 499).
+    pub requests_client_error: i64,
+    /// Requests answered 5xx (upstream and internal failures).
+    pub requests_server_error: i64,
+    /// Input/prompt tokens.
+    pub tokens_in: i64,
+    /// Output/completion tokens.
+    pub tokens_out: i64,
+    /// `tokens_in + tokens_out`.
+    pub tokens_total: i64,
+    /// Requests whose token counts were locally estimated (ADR 003).
+    pub estimated_requests: i64,
+    /// Requests whose counts came from the upstream response (including
+    /// zero-consumption admission refusals, which are exact).
+    pub upstream_requests: i64,
+    /// Rerank search units, where the provider bills in them.
+    pub search_units: i64,
+    /// Media items (images, ...) across the group's requests (M9).
+    pub media_count: i64,
+    /// Total decoded media bytes across the group's requests (M9).
+    pub media_bytes: i64,
+    /// Cost in USD, from the configured price table.
+    pub cost: f64,
 }
 
 /// Handle to the SQLite database (pooled; cheap to clone).
@@ -307,12 +434,13 @@ impl KeyStore {
         for rec in batch {
             sqlx::query(
                 "INSERT INTO usage_log \
-                 (key_id, model, model_used, capability, tokens_in, tokens_out, search_units, media_count, media_bytes, estimated, cost, latency_ms, status, metadata, ts) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 (key_id, model, model_used, provider, capability, tokens_in, tokens_out, search_units, media_count, media_bytes, estimated, cost, latency_ms, status, metadata, ts) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(&rec.key_id)
             .bind(&rec.model)
             .bind(&rec.model_used)
+            .bind(&rec.provider)
             .bind(&rec.capability)
             .bind(rec.tokens_in)
             .bind(rec.tokens_out)
@@ -341,6 +469,90 @@ impl KeyStore {
             .await?
             .rows_affected();
         Ok(deleted)
+    }
+
+    /// Aggregate the usage log per `group_by`, under `filter` (issue #64).
+    ///
+    /// Serves `GET /admin/usage` - an admin read, off the request path by
+    /// design (the request path only ever touches the bounded channel). The
+    /// `WHERE` clause always carries the `ts` window, so the scan rides
+    /// `idx_usage_log_ts`; a `key_id` filter rides `idx_usage_log_key_id`.
+    /// Groups are ordered by cost (descending, then group name) and capped at
+    /// `filter.limit` rows, so the result stays bounded whatever the table
+    /// holds.
+    pub async fn usage_summary(
+        &self,
+        filter: &UsageFilter,
+        group_by: UsageGroupBy,
+    ) -> Result<Vec<UsageAggregate>, AuthError> {
+        // The SQL text is assembled ONLY from fixed fragments (the group
+        // expression is a closed enum); every caller value arrives as a bind.
+        let mut sql = format!(
+            "SELECT {expr} AS grp, \
+             COUNT(*) AS requests, \
+             SUM(CASE WHEN status BETWEEN 200 AND 299 THEN 1 ELSE 0 END) AS requests_ok, \
+             SUM(CASE WHEN status BETWEEN 400 AND 499 THEN 1 ELSE 0 END) AS requests_client_error, \
+             SUM(CASE WHEN status >= 500 THEN 1 ELSE 0 END) AS requests_server_error, \
+             SUM(tokens_in) AS tokens_in, \
+             SUM(tokens_out) AS tokens_out, \
+             SUM(CASE WHEN estimated THEN 1 ELSE 0 END) AS estimated_requests, \
+             SUM(COALESCE(search_units, 0)) AS search_units, \
+             SUM(media_count) AS media_count, \
+             SUM(media_bytes) AS media_bytes, \
+             SUM(cost) AS cost \
+             FROM usage_log WHERE ts >= ? AND ts <= ?",
+            expr = group_by.group_expr()
+        );
+        for (present, clause) in [
+            (filter.key_id.is_some(), " AND key_id = ?"),
+            (filter.model.is_some(), " AND model = ?"),
+            (filter.provider.is_some(), " AND provider = ?"),
+            (filter.capability.is_some(), " AND capability = ?"),
+        ] {
+            if present {
+                sql.push_str(clause);
+            }
+        }
+        sql.push_str(" GROUP BY grp ORDER BY cost DESC, grp ASC LIMIT ?");
+
+        let mut query = sqlx::query(&sql).bind(filter.since).bind(filter.until);
+        for value in [
+            &filter.key_id,
+            &filter.model,
+            &filter.provider,
+            &filter.capability,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            query = query.bind(value);
+        }
+        let rows = query.bind(filter.limit).fetch_all(&self.pool).await?;
+
+        let mut groups = Vec::with_capacity(rows.len());
+        for row in rows {
+            let requests: i64 = row.try_get("requests")?;
+            let tokens_in: i64 = row.try_get("tokens_in")?;
+            let tokens_out: i64 = row.try_get("tokens_out")?;
+            let estimated_requests: i64 = row.try_get("estimated_requests")?;
+            groups.push(UsageAggregate {
+                group: row.try_get("grp")?,
+                requests,
+                requests_ok: row.try_get("requests_ok")?,
+                requests_client_error: row.try_get("requests_client_error")?,
+                requests_server_error: row.try_get("requests_server_error")?,
+                tokens_in,
+                tokens_out,
+                tokens_total: tokens_in.saturating_add(tokens_out),
+                estimated_requests,
+                upstream_requests: requests.saturating_sub(estimated_requests),
+                search_units: row.try_get("search_units")?,
+                media_count: row.try_get("media_count")?,
+                media_bytes: row.try_get("media_bytes")?,
+                cost: row.try_get("cost")?,
+            });
+        }
+        Ok(groups)
     }
 
     /// Number of usage rows (tests and diagnostics).

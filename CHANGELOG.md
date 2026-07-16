@@ -8,6 +8,21 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ### Added
 
+- **`GET /admin/usage`: usage and spend reporting over HTTP** (issue #64).
+  The `usage_log` table finally has a query surface: a master-key-gated
+  admin route returning aggregates per group - request counts split by
+  status class, token totals, the estimated-vs-upstream split (ADR 003),
+  rerank search units, media counts and cost. Filters: `key_id`, `model`,
+  `provider`, `capability` and an inclusive `since`/`until` window (unix
+  seconds or RFC3339); `group_by` picks the dimension (`model` default,
+  `model_used`, `provider`, `capability`, `key_id`, `status`, `total`) and
+  `limit` (default 100, max 1000) bounds the result, with `truncated`
+  flagging cutoffs (most expensive groups win). Defaults: last 24 hours,
+  grouped by model. Invalid parameters are 400 `LM-1001`. The read runs
+  directly against SQLite - admin-only, off the hot path - and rows reach
+  it through the batched writer, so the last flush interval may lag. New
+  `usage_log.provider` column (migration 0004) records the provider that
+  actually served each request; pre-existing rows report an empty provider.
 - **`GET /v1/models/{id}` (OpenAI retrieve-model)** (issue #67): returns the
   same per-model object as the corresponding `GET /v1/models` list entry (id,
   `object: "model"`, `owned_by`, `capabilities`, `modalities`), served from the

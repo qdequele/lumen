@@ -18,6 +18,15 @@ visible on [`/metrics`](metrics.md).
 Rows age out on their own: `retention_days` purges `usage_log` rows older
 than that many days.
 
+## Querying it over HTTP
+
+`GET /admin/usage` (master-key gated, like every `/admin/*` route) returns
+aggregates over these rows - filtered by key, model, provider, capability
+and time window, grouped by the dimension you choose. Because rows arrive
+through the bounded channel above, requests from the last flush interval
+may not be visible yet. See
+[Keys, quotas & budgets](keys-budgets.md#usage--spend-reporting-get-adminusage).
+
 ## `x-lumen-metadata`
 
 Clients may attach a per-request metadata header, canonically

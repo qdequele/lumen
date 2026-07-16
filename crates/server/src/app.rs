@@ -38,8 +38,8 @@ use crate::error::ApiError;
 /// * `/health`, `/health/providers`, `/metrics` - operational, never
 ///   authenticated, no I/O (`/health` never depends on provider state);
 /// * `/v1/*` - the API surface; virtual-key auth when enabled (M5);
-/// * `/admin/*` - key management; mounted only when auth is enabled,
-///   protected by the master key.
+/// * `/admin/*` - key management and usage reporting; mounted only when auth
+///   is enabled, protected by the master key.
 ///
 /// The body-size limit is read from `state.body_limit` - the single source of
 /// truth also surfaced in the `LM-1002` message - rather than a second
@@ -99,6 +99,7 @@ pub fn build_app(state: AppState) -> Router {
             .route("/admin/keys", post(admin::create_key).get(admin::list_keys))
             .route("/admin/keys/{id}", patch(admin::patch_key))
             .route("/admin/provider-keys/{name}", put(admin::put_provider_key))
+            .route("/admin/usage", get(admin::usage_report))
             .route_layer(middleware::from_fn_with_state(
                 state.clone(),
                 auth::require_master_key,

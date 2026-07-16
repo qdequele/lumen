@@ -55,6 +55,7 @@ together, so they take effect immediately with no restart.
 | `GET` | `/admin/keys` | List keys (records only - no hashes, no plaintext). |
 | `PATCH` | `/admin/keys/{id}` | Adjust budget/limits, or enable/disable a key. |
 | `PUT` | `/admin/provider-keys/{name}` | Store a provider API key encrypted at rest. |
+| `GET` | `/admin/usage` | Aggregated usage and spend from the usage log. |
 
 ### Create a key
 
@@ -112,6 +113,81 @@ re-reads provider keys from the encrypted store (off the request path) and
 rebuilds the provider registry - a rotated key takes effect without a
 restart. Environment-sourced keys keep precedence over a stored key. See
 [Deployment - Hot reload](deployment.md#hot-reload).
+
+### Usage & spend reporting (`GET /admin/usage`)
+
+Aggregates the [usage log](usage-log.md) per key, model, provider or
+capability - the HTTP query surface over the same rows the batched writer
+persists:
+
+```bash
+curl -s "http://localhost:8080/admin/usage?group_by=provider&since=2026-07-15T00:00:00Z" \
+  -H "Authorization: Bearer $LUMEN_MASTER_KEY"
+```
+
+Query parameters (all optional):
+
+| Parameter | Meaning | Default |
+|---|---|---|
+| `key_id` | Only rows for this virtual key id. | all keys |
+| `model` | Only rows for this client-facing model id. | all models |
+| `provider` | Only rows served by this provider instance. | all providers |
+| `capability` | `chat`, `embed` or `rerank`. | all capabilities |
+| `since` | Window start (inclusive): unix seconds or RFC3339. | `until` - 24 h |
+| `until` | Window end (inclusive): unix seconds or RFC3339. | now |
+| `group_by` | `model`, `model_used`, `provider`, `capability`, `key_id`, `status` or `total`. | `model` |
+| `limit` | Maximum groups returned, 1 to 1000. | 100 |
+
+The response echoes the effective window and grouping, then one aggregate
+per group - request counts split by status class, token totals, the
+estimated-vs-upstream split ([ADR 003](../adr/003-token-accounting.md)),
+rerank search units, media counts and cost:
+
+```json
+{
+  "since": 1784073600,
+  "until": 1784160000,
+  "group_by": "provider",
+  "truncated": false,
+  "groups": [
+    {
+      "group": "openai",
+      "requests": 1204,
+      "requests_ok": 1180,
+      "requests_client_error": 20,
+      "requests_server_error": 4,
+      "tokens_in": 803211,
+      "tokens_out": 121408,
+      "tokens_total": 924619,
+      "estimated_requests": 17,
+      "upstream_requests": 1187,
+      "search_units": 0,
+      "media_count": 3,
+      "media_bytes": 402133,
+      "cost": 12.41
+    }
+  ]
+}
+```
+
+Groups are ordered by cost (highest first) and capped at `limit`; when more
+groups matched, `truncated` is `true` and the returned groups are the most
+expensive ones. A window that matches nothing is a normal `200` with an
+empty `groups` array. Invalid filters, timestamps, `group_by` values or
+limits are `400` `LM-1001`.
+
+Two accounting notes:
+
+- **Recent requests may lag.** Usage rows travel through the bounded
+  channel and its batched writer (see
+  [Usage log](usage-log.md#never-on-the-request-path)), so requests from
+  the last flush interval (`usage_flush_ms`, default 2 s) may not appear
+  yet - and entries dropped under a jammed channel
+  (`lumen_usage_log_dropped_total`) never will.
+- **`upstream_requests` counts rows whose numbers are exact**, which
+  includes admission refusals (402/429): they consumed zero tokens, and
+  zero is exact. `estimated_requests` counts rows whose token counts were
+  locally estimated per ADR 003.
 
 ## Operator notes
 
