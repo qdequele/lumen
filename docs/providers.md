@@ -510,6 +510,11 @@ capabilities = ["rerank"]
   passthrough), cancellation, and token accounting (upstream `usage` when
   Ollama reports it, otherwise a local count marked `estimated`, ADR 003) all
   work exactly as for the `openai` kind.
+- **`api_key` asymmetry**: if you set an `api_key_env` on this kind (e.g. an
+  Ollama server behind an authenticated reverse proxy), the chat path sends it
+  as a bearer token but the native embed path currently sends no
+  Authorization header at all - keep the embed route unauthenticated at the
+  proxy, or front only `/v1` with auth.
 - **Embed batch limit**: 512.
 - **Tip**: a local model may take a while to load into VRAM on its first call -
   relax `first_token_timeout_ms` / `total_timeout_ms` on the provider block (see

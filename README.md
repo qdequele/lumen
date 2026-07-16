@@ -183,7 +183,7 @@ Twenty provider kinds: nine **native** integrations plus eleven
 | `pinecone`  |      |      |   ✅   | `api_key_env`         | `Api-Key` header; reports units |
 | `nvidia`    |      |      |   ✅   | keyless, **`base_url`** | NIM `/v1/ranking`; logit scores |
 | `tei`       |      |  ✅   |   ✅   | keyless, **`base_url`** | self-hosted (Text Embeddings Inference) |
-| `ollama`    |      |  ✅   |        | keyless, **`base_url`** | self-hosted                    |
+| `ollama`    |  ✅  |  ✅   |        | keyless, **`base_url`** | self-hosted; chat via its OpenAI-compatible `/v1` |
 
 **OpenAI-compatible hosts** (chat + embed, reusing the OpenAI path with a
 built-in base URL): `groq`, `together`, `fireworks`, `deepseek`, `openrouter`,

@@ -377,3 +377,12 @@ milestone.
   Anthropic translator today, but honest handling would be a 400 before the
   upstream call. Candidate: a shared role-aware content check in the M8
   pre-flight instead of per-translator conventions.
+- **Remote image URLs on OpenAI-compatible-path providers whose upstream only
+  accepts base64** (noted while wiring ollama chat, issue #63). Every kind
+  served by the shared OpenAI provider inherits
+  `accepts_remote_image_url() = true`, including `ollama` (its `/v1` chat
+  endpoint takes base64 `data:` URIs only). So a remote `http(s)` image URL on
+  a vision-declared ollama model skips the `LM-2004` pre-flight and fails
+  opaquely upstream instead of as an honest client 4xx. Candidate fix: gate
+  `accepts_remote_image_url()` on the provider kind (or a per-spec flag)
+  rather than on the implementing provider type.
