@@ -367,6 +367,21 @@ async fn model_retrieve_sits_behind_virtual_key_auth() {
     assert_eq!(resp.status(), 401);
     let body: Value = resp.json().await.expect("json");
     assert_eq!(body["error"]["code"], "LM-4004");
+    assert_eq!(body["error"]["type"], "invalid_request");
+
+    // A slash-containing path (HF-style id) without a key must ALSO be the
+    // 401 envelope, not a bare route-miss 404: the wildcard retrieve route
+    // has to sit inside the same auth layer.
+    let resp = h
+        .client
+        .get(format!("{}/v1/models/mistralai/mistral-7b", h.base))
+        .send()
+        .await
+        .expect("send");
+    assert_eq!(resp.status(), 401);
+    let body: Value = resp.json().await.expect("json");
+    assert_eq!(body["error"]["code"], "LM-4004");
+    assert_eq!(body["error"]["type"], "invalid_request");
 
     // A valid virtual key gets the model object.
     let key = h.create_key(None, None, None).await;

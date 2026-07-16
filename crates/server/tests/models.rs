@@ -38,12 +38,22 @@ fn registry() -> Arc<Registry> {
             api_version: None,
             strict: false,
             connect_timeout_ms: None,
-            models: vec![ModelSpec {
-                id: "gpt".to_owned(),
-                upstream_id: "gpt-4o".to_owned(),
-                capabilities: vec![Capability::Chat],
-                modalities: vec!["text".to_owned()],
-            }],
+            models: vec![
+                ModelSpec {
+                    id: "gpt".to_owned(),
+                    upstream_id: "gpt-4o".to_owned(),
+                    capabilities: vec![Capability::Chat],
+                    modalities: vec!["text".to_owned()],
+                },
+                ModelSpec {
+                    // A slash-containing id (HF-style), legal in config: the
+                    // retrieve route must match it across path segments.
+                    id: "mistralai/mistral-7b".to_owned(),
+                    upstream_id: "mistralai/Mistral-7B-Instruct-v0.3".to_owned(),
+                    capabilities: vec![Capability::Chat],
+                    modalities: vec!["text".to_owned()],
+                },
+            ],
         },
     ];
     Arc::new(
@@ -68,7 +78,7 @@ async fn lists_configured_models_with_capabilities() {
 
     assert_eq!(body["object"], "list");
     let data = body["data"].as_array().unwrap();
-    assert_eq!(data.len(), 2);
+    assert_eq!(data.len(), 3);
 
     let multi = data.iter().find(|m| m["id"] == "multi").unwrap();
     assert_eq!(multi["object"], "model");
@@ -118,6 +128,59 @@ async fn retrieve_known_model_matches_its_list_entry() {
     // Belt and braces on the OpenAI-shape fields.
     assert_eq!(retrieved["object"], "model");
     assert_eq!(retrieved["owned_by"], "cohere");
+}
+
+#[tokio::test]
+async fn retrieve_slash_id_model_matches_its_list_entry() {
+    let base = common::spawn_with(registry(), LIMIT).await;
+
+    let list: Value = reqwest::get(format!("{base}/v1/models"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let list_entry = list["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == "mistralai/mistral-7b")
+        .unwrap()
+        .clone();
+
+    // Raw slash in the path (not percent-encoded), the way OpenAI-style
+    // clients send HF-style ids.
+    let resp = reqwest::get(format!("{base}/v1/models/mistralai/mistral-7b"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let retrieved: Value = resp.json().await.unwrap();
+
+    assert_eq!(retrieved, list_entry);
+    assert_eq!(retrieved["id"], "mistralai/mistral-7b");
+    assert_eq!(retrieved["object"], "model");
+
+    // The multi-segment route must not shadow the literal list route.
+    let list_again = reqwest::get(format!("{base}/v1/models")).await.unwrap();
+    assert_eq!(list_again.status(), 200);
+    let body: Value = list_again.json().await.unwrap();
+    assert_eq!(body["object"], "list");
+}
+
+#[tokio::test]
+async fn retrieve_unknown_slash_path_is_404_lm2001() {
+    let base = common::spawn_with(registry(), LIMIT).await;
+
+    let resp = reqwest::get(format!("{base}/v1/models/no-such/model"))
+        .await
+        .unwrap();
+    // A route miss would be an empty-body 404; the envelope proves the
+    // wildcard route matched and the handler produced the taxonomy error.
+    assert_eq!(resp.status(), 404);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "LM-2001");
+    assert_eq!(body["error"]["type"], "invalid_request");
+    assert_eq!(body["error"]["message"], "model 'no-such/model' not found");
 }
 
 #[tokio::test]
