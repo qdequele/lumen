@@ -189,6 +189,33 @@ fn google_vision_registry(upstream: &str) -> Arc<Registry> {
     )
 }
 
+/// Vision-capable Cohere registry (issue #73 tests): one Command-A-Vision
+/// model declaring the `image` modality.
+fn cohere_vision_registry(upstream: &str) -> Arc<Registry> {
+    let specs = vec![ProviderSpec {
+        name: "cohere".to_owned(),
+        kind: ProviderKind::Cohere,
+        api_key: Some("co-test".to_owned()),
+        base_url: Some(upstream.to_owned()),
+        strict: false,
+        connect_timeout_ms: None,
+        models: vec![ModelSpec {
+            id: "command-a-vision".to_owned(),
+            upstream_id: "command-a-vision-07-2025".to_owned(),
+            capabilities: vec![Capability::Chat],
+            modalities: vec!["text".to_owned(), "image".to_owned()],
+        }],
+    }];
+    Arc::new(
+        Registry::build(
+            specs,
+            http::build_client(),
+            std::time::Duration::from_secs(300),
+        )
+        .expect("registry builds"),
+    )
+}
+
 fn openai_chat_body(model: &str) -> Value {
     json!({
         "object": "chat.completion",
@@ -797,6 +824,166 @@ async fn gemini_file_uri_sent_to_anthropic_is_400_lm_2008() {
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["error"]["code"], "LM-2008");
     assert_eq!(body["error"]["type"], "invalid_request");
+    assert!(upstream.received_requests().await.unwrap().is_empty());
+}
+
+/// Issue #73: an inline `data:` URI image routed to a Cohere vision model
+/// reaches `/v2/chat` as v2 content blocks (text + `image_url`), not
+/// flattened text - and the upstream-reported usage stays authoritative
+/// (ADR 003), never overwritten by the estimator.
+#[tokio::test]
+async fn cohere_forwards_image_parts_as_v2_content_blocks() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v2/chat"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "chat_vis_1",
+            "finish_reason": "COMPLETE",
+            "message": {
+                "role": "assistant",
+                "content": [{ "type": "text", "text": "a cat" }]
+            },
+            "usage": { "tokens": { "input_tokens": 21, "output_tokens": 3 } }
+        })))
+        .mount(&upstream)
+        .await;
+
+    let base = common::spawn_with(cohere_vision_registry(&upstream.uri()), LIMIT).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&json!({
+            "model": "command-a-vision",
+            "messages": [{"role":"user","content":[
+                {"type":"text","text":"what is this?"},
+                {"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}
+            ]}]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+
+    let requests = upstream.received_requests().await.unwrap();
+    let sent: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    let content = sent["messages"][0]["content"]
+        .as_array()
+        .expect("image-bearing message must be an array of v2 blocks");
+    assert_eq!(content[0]["type"], "text");
+    assert_eq!(content[0]["text"], "what is this?");
+    assert_eq!(content[1]["type"], "image_url");
+    assert_eq!(content[1]["image_url"]["url"], "data:image/png;base64,AAAA");
+
+    // Upstream usage is authoritative: no `estimated` flag, counts verbatim.
+    let got: Value = resp.json().await.unwrap();
+    assert_eq!(got["usage"]["prompt_tokens"], 21);
+    assert_eq!(got["usage"]["completion_tokens"], 3);
+    assert!(got["usage"].get("estimated").is_none());
+}
+
+/// Issue #73: Cohere v2 fetches remote `http(s)` image URLs itself, so the
+/// `LM-2004` pre-flight must NOT fire - the URL is forwarded verbatim inside
+/// a v2 `image_url` block. This upstream reports no usage at all, so the
+/// ADR 003 estimation fallback fires with the per-image heuristic (85 tokens
+/// at detail low, 765 otherwise), honestly flagged - never a silent zero.
+#[tokio::test]
+async fn cohere_accepts_and_forwards_a_remote_image_url() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v2/chat"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "chat_vis_2",
+            "finish_reason": "COMPLETE",
+            "message": {
+                "role": "assistant",
+                "content": [{ "type": "text", "text": "a cat" }]
+            }
+            // Deliberately no "usage" - exercises the estimation fallback.
+        })))
+        .mount(&upstream)
+        .await;
+
+    let base = common::spawn_with(cohere_vision_registry(&upstream.uri()), LIMIT).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&json!({
+            "model": "command-a-vision",
+            "messages": [{"role":"user","content":[
+                {"type":"text","text":"what is this?"},
+                {"type":"image_url","image_url":{"url":"https://example.com/cat.png"}}
+            ]}]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+
+    let requests = upstream.received_requests().await.unwrap();
+    let sent: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    let block = &sent["messages"][0]["content"][1];
+    assert_eq!(block["type"], "image_url");
+    assert_eq!(block["image_url"]["url"], "https://example.com/cat.png");
+
+    // No upstream usage: the local estimator ran, flagged honestly. Same
+    // arithmetic as the OpenAI-family test above: 4 text tokens + 4 per-
+    // message overhead + 765 (no `detail`) = 773.
+    let got: Value = resp.json().await.unwrap();
+    assert_eq!(got["usage"]["estimated"], true);
+    assert_eq!(got["usage"]["prompt_tokens"], 773);
+}
+
+/// Issue #73: the provider-native reference forms stay honest 400s for the
+/// cohere kind - an Anthropic Files API reference cannot be resolved by
+/// Cohere, so it is `LM-2008` pre-flight, upstream never contacted.
+#[tokio::test]
+async fn anthropic_file_id_sent_to_cohere_is_400_lm_2008() {
+    let upstream = MockServer::start().await;
+    let base = common::spawn_with(cohere_vision_registry(&upstream.uri()), LIMIT).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&json!({
+            "model": "command-a-vision",
+            "messages": [{"role":"user","content":[
+                {"type":"text","text":"what is this?"},
+                {"type":"image_url","image_url":{"url":"anthropic-file:file_011CNvxvfvyGnGnDtjPtzY9J"}}
+            ]}]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 400);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "LM-2008");
+    assert!(upstream.received_requests().await.unwrap().is_empty());
+}
+
+/// Issue #73: same for a Gemini-native `gs://` reference routed to Cohere.
+#[tokio::test]
+async fn gemini_file_uri_sent_to_cohere_is_400_lm_2008() {
+    let upstream = MockServer::start().await;
+    let base = common::spawn_with(cohere_vision_registry(&upstream.uri()), LIMIT).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&json!({
+            "model": "command-a-vision",
+            "messages": [{"role":"user","content":[
+                {"type":"text","text":"what is this?"},
+                {"type":"image_url","image_url":{"url":"gs://my-bucket/cat.png"}}
+            ]}]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 400);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "LM-2008");
     assert!(upstream.received_requests().await.unwrap().is_empty());
 }
 

@@ -18,6 +18,25 @@ All notable changes to LUMEN are documented here. The format is based on
   default. Setting `api_version` on any other kind is a boot-time config
   validation error.
 
+### Fixed
+
+- **Cohere chat silently dropped image parts (issue #73).** The v2 chat
+  translator flattened every message to plain text via `MessageContent::text()`,
+  so a correctly-declared Command-A-Vision model (`modalities = ["text",
+  "image"]` on the `cohere` kind) answered as if the user sent text only.
+  Messages carrying image parts are now translated to Cohere v2 content
+  blocks (`{"type":"text",...}` / `{"type":"image_url","image_url":{...}}`),
+  order preserved, `detail` forwarded untouched; text-only messages keep the
+  plain-string fast path. Cohere fetches remote `http(s)` URLs itself, so
+  both URL forms pass through and the default `accepts_remote_image_url`
+  (true) stands; provider-native references (`anthropic-file:`, `gs://`,
+  Gemini Files API URIs) stay honest `LM-2008` pre-flight rejections.
+  Upstream usage remains authoritative for vision requests, with the
+  ADR 003 per-image estimation fallback when the upstream reports none.
+  Covered by translator unit tests plus wiremock conformance tests at the
+  provider and gateway levels (wire-shape, remote-URL pass-through, LM-2008
+  verdicts, cancellation).
+
 ### Changed
 
 - **Refreshed the LUMEN-vs-LiteLLM baseline** (`bench/run.sh` at commit

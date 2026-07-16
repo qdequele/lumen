@@ -13,6 +13,11 @@
 //!   `"NONE"` strings (omitted for `"auto"`) - forcing one specific tool is
 //!   not supported upstream and is dropped with a `debug` trace, falling back
 //!   to `auto`;
+//! * vision (issue #73, Command-A-Vision): a message with image parts becomes
+//!   an array of v2 content blocks (`text` / `image_url`, OpenAI-shaped, see
+//!   [`cohere_content`]); a text-only message keeps the plain-string fast
+//!   path. Both remote URLs and `data:` URIs are accepted upstream, so the
+//!   default `accepts_remote_image_url` (true) is correct for this kind;
 //! * response: `message.content` is an array of typed blocks (only `type:
 //!   "text"` is emitted for a pure-text reply) instead of a bare string;
 //!   `finish_reason` is `COMPLETE`/`STOP_SEQUENCE`/`MAX_TOKENS`/`TOOL_CALL`/
@@ -79,6 +84,38 @@ fn has_tool_calls(m: &ChatMessage) -> bool {
     m.extra.get("tool_calls").is_some_and(Value::is_array)
 }
 
+/// Build a Cohere v2 message `content`: a plain string when there are no
+/// images (the fast path, and what text-only clients have always sent), else
+/// an array of `text`/`image_url` blocks with part order preserved
+/// (issue #73, Command-A-Vision).
+///
+/// Cohere v2's vision blocks are OpenAI-shaped -
+/// `{"type":"image_url","image_url":{"url",...,"detail"?}}` - and the
+/// upstream accepts both remote `http(s)` URLs (which Cohere fetches itself)
+/// and inline `data:` URIs, so the [`lumen_core::ImageUrl`] serializes verbatim: no URL
+/// rewriting, `detail` forwarded untouched. Provider-native references
+/// (Anthropic `file_id`, Gemini `fileUri`) never reach this path: the
+/// gateway's pre-flight rejects them for the cohere kind with `LM-2008`.
+fn cohere_content(m: &ChatMessage) -> Value {
+    match m.content.as_ref() {
+        Some(MessageContent::Parts(parts)) if parts.iter().any(|p| p.image_url.is_some()) => {
+            let mut blocks = Vec::with_capacity(parts.len());
+            for p in parts {
+                if let Some(img) = &p.image_url {
+                    blocks.push(json!({ "type": "image_url", "image_url": img }));
+                } else if p.kind == "text" {
+                    if let Some(t) = &p.text {
+                        blocks.push(json!({ "type": "text", "text": t }));
+                    }
+                }
+            }
+            Value::Array(blocks)
+        }
+        // No images (string, text-only parts, or none): a plain string.
+        _ => Value::String(text_of(m)),
+    }
+}
+
 /// Translate one OpenAI-shaped message to Cohere v2's shape.
 fn translate_message(m: &ChatMessage) -> CohereMessage {
     match m.role.as_str() {
@@ -112,7 +149,7 @@ fn translate_message(m: &ChatMessage) -> CohereMessage {
         }
         role => CohereMessage {
             role: role.to_owned(),
-            content: Some(json!(text_of(m))),
+            content: Some(cohere_content(m)),
             tool_call_id: None,
             tool_calls: Vec::new(),
         },
@@ -437,6 +474,61 @@ mod tests {
         let out = translate_request(&req, false);
         assert_eq!(out.tools.len(), 1);
         assert_eq!(out.tools[0]["function"]["name"], "get_weather");
+    }
+
+    /// Issue #73: a message carrying image parts becomes an array of Cohere
+    /// v2 content blocks - text parts as `{"type":"text",...}`, image parts
+    /// as `{"type":"image_url","image_url":{...}}` - order preserved, the
+    /// URL form (`data:` URI or remote) and the `detail` hint untouched.
+    #[test]
+    fn image_parts_become_cohere_v2_content_blocks() {
+        let parts_msg = ChatMessage {
+            role: "user".to_owned(),
+            content: Some(MessageContent::Parts(vec![
+                ContentPart {
+                    kind: "text".to_owned(),
+                    text: Some("what is this?".to_owned()),
+                    image_url: None,
+                    extra: Map::new(),
+                },
+                ContentPart {
+                    kind: "image_url".to_owned(),
+                    text: None,
+                    image_url: Some(lumen_core::ImageUrl {
+                        url: "data:image/png;base64,AAAA".to_owned(),
+                        detail: Some("low".to_owned()),
+                    }),
+                    extra: Map::new(),
+                },
+                ContentPart {
+                    kind: "image_url".to_owned(),
+                    text: None,
+                    image_url: Some(lumen_core::ImageUrl {
+                        url: "https://example.com/cat.png".to_owned(),
+                        detail: None,
+                    }),
+                    extra: Map::new(),
+                },
+            ])),
+            name: None,
+            extra: Map::new(),
+        };
+        let req = base_request(vec![parts_msg]);
+        let out = translate_request(&req, false);
+        assert_eq!(
+            out.messages[0].content,
+            Some(json!([
+                { "type": "text", "text": "what is this?" },
+                {
+                    "type": "image_url",
+                    "image_url": { "url": "data:image/png;base64,AAAA", "detail": "low" }
+                },
+                {
+                    "type": "image_url",
+                    "image_url": { "url": "https://example.com/cat.png" }
+                },
+            ]))
+        );
     }
 
     #[test]
