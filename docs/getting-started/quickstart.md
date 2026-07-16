@@ -61,6 +61,11 @@ By default auth is **off**, so these requests need no `Authorization` header.
 Providers whose API-key env var is unset are only rejected when a request
 actually routes to them, so a partial set of keys is fine.
 
+If you turn auth on (`[auth] enabled = true`), bootstrap your first virtual
+key with `lumen keys create --name bootstrap` - it runs offline against the
+auth database, before the server is ever started. See
+[Keys, quotas & budgets](../operations/keys-budgets.md#bootstrapping-the-first-key-cli).
+
 ## 3. Chat
 
 ```bash

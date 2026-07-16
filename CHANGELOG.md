@@ -8,6 +8,15 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ### Added
 
+- **`lumen keys create` / `lumen keys list`: offline virtual-key bootstrap**
+  (issue #68). Creating the first virtual key no longer requires starting the
+  server and crafting an authenticated curl against `POST /admin/keys`: the
+  new `keys` subcommand opens the SQLite store at `auth.db_path` directly,
+  gated by the same `LUMEN_MASTER_KEY` env var as the /admin API, and prints
+  the record plus the one-time plaintext (stdout only, never logged) in the
+  same JSON shape as the admin route. `keys list` prints the records (no
+  hashes, no plaintext). Documented in `docs/operations/keys-budgets.md`, and
+  the quickstart now links the bootstrap step.
 - **`GET /admin/usage`: usage and spend reporting over HTTP** (issue #64).
   The `usage_log` table finally has a query surface: a master-key-gated
   admin route returning aggregates per group - request counts split by
