@@ -132,13 +132,26 @@ impl ProviderKind {
     ///
     /// `false` only for hosted OpenAI-compatible kinds that share the OpenAI
     /// embed wiring but whose upstream exposes no `/embeddings` endpoint
-    /// (Groq, DeepSeek, OpenRouter, Perplexity, xAI, verified 2026-07): an
-    /// embed model declared there could only ever 404 at request time, so the
-    /// registry rejects it at build time instead. Every other kind returns
-    /// `true`, permissively: self-hosted or catalog-dependent kinds (`vllm`,
-    /// `huggingface`, `cloudflare`) let the operator decide what is served,
-    /// and kinds with no embed implementation at all (e.g. `anthropic`) are
-    /// already covered by the registry's unsupported-capability warning.
+    /// (Groq, DeepSeek, OpenRouter, Perplexity, xAI, checked against vendor
+    /// API docs 2026-07; the xAI entry could not be corroborated by
+    /// unauthenticated probing, since api.x.ai answers 401 rather than 404 on
+    /// `/v1/embeddings`, so it rests on the docs alone). An embed model
+    /// declared there could only ever 404 at request time, so the registry
+    /// rejects it at build time instead. The check applies only when the
+    /// provider uses the kind's default base URL: a custom `base_url` (an
+    /// operator-run proxy in front of the host) bypasses it. Every other kind
+    /// returns `true`, permissively: self-hosted or catalog-dependent kinds
+    /// (`vllm`, `huggingface`, `cloudflare`) let the operator decide what is
+    /// served, and kinds with no embed implementation at all (e.g.
+    /// `anthropic`) are already covered by the registry's
+    /// unsupported-capability warning.
+    ///
+    /// This method exists only because the OpenAI-compatible registry arm
+    /// builds the embed wiring unconditionally for every kind it covers, so
+    /// nothing else distinguishes "wired but guaranteed to 404" from "wired
+    /// and served". Chat and rerank need no counterpart: their wiring is
+    /// already built per kind, so a kind that cannot serve them simply builds
+    /// no implementation and hits the unsupported-capability warning.
     #[must_use]
     pub const fn supports_embeddings(self) -> bool {
         !matches!(

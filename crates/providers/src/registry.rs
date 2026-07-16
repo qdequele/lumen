@@ -138,13 +138,17 @@ pub enum RegistryError {
     },
 
     /// A model declared `embed` on a hosted kind whose upstream has no
-    /// embeddings API (see [`ProviderKind::supports_embeddings`]). Such a
-    /// request could only ever 404 upstream, so it is rejected at build time
-    /// (config load or hot reload) instead of failing on the first request.
+    /// embeddings API (see [`ProviderKind::supports_embeddings`]), while the
+    /// provider points at the vendor's default base URL. Such a request could
+    /// only ever 404 upstream, so it is rejected at build time (config load
+    /// or hot reload) instead of failing on the first request. A custom
+    /// `base_url` (an operator-run proxy in front of the host) bypasses the
+    /// check.
     #[error(
         "model '{model}' on provider '{name}' declares the 'embed' capability, \
          but kind '{kind}' has no upstream embeddings API; remove the \
-         capability or serve the model from a provider that offers embeddings"
+         capability, or, to front this host with an embedding-capable \
+         endpoint, set a base_url (or use kind = \"openai\")"
     )]
     NoUpstreamEmbeddings {
         /// The offending provider's name.
@@ -425,8 +429,12 @@ fn build_inner(
                 // A hosted kind with no upstream embeddings API would accept
                 // the model here (its OpenAI-compatible wiring builds an embed
                 // provider) and then 404 on every request: reject at build
-                // time instead (issue #74).
-                if !spec.kind.supports_embeddings() {
+                // time instead (issue #74). Only when the provider points at
+                // the vendor's own default base URL, though: a custom
+                // `base_url` means the operator fronts the kind with their own
+                // endpoint (a proxy or gateway), which may well serve
+                // embeddings, so the override is the escape hatch.
+                if spec.base_url.is_none() && !spec.kind.supports_embeddings() {
                     return Err(RegistryError::NoUpstreamEmbeddings {
                         name: spec.name.clone(),
                         kind: spec.kind.as_str(),
@@ -1031,8 +1039,10 @@ mod tests {
     #[test]
     fn embed_on_a_hosted_kind_with_no_upstream_embeddings_api_is_a_build_error() {
         // Groq, DeepSeek, OpenRouter, Perplexity and xAI have no upstream
-        // /embeddings endpoint: an embed model there could only ever 404 at
-        // request time, so the registry rejects it at build time (issue #74).
+        // /embeddings endpoint: an embed model there (with no base_url
+        // override, i.e. pointing at the vendor's own API) could only ever
+        // 404 at request time, so the registry rejects it at build time
+        // (issue #74).
         for kind in [
             ProviderKind::Groq,
             ProviderKind::Deepseek,
@@ -1066,6 +1076,25 @@ mod tests {
                 Ok(_) => panic!("{kind:?} embed model must not build"),
             }
         }
+    }
+
+    #[test]
+    fn embed_on_an_embeddingless_kind_with_a_custom_base_url_builds() {
+        // A custom base_url means the operator fronts the host with their own
+        // endpoint (a proxy or gateway) that may serve embeddings, so the
+        // upstream-capability rejection must not fire.
+        let reg = Registry::build(
+            vec![spec(
+                ProviderKind::Groq,
+                "groq-proxy",
+                Some("http://gateway.internal:8080/v1"),
+                vec![model("emb-model", &[Capability::Embed])],
+            )],
+            reqwest::Client::new(),
+            Duration::from_secs(300),
+        )
+        .expect("a base_url override is the escape hatch: the build must pass");
+        assert!(reg.embedding_route("emb-model").is_some());
     }
 
     #[test]

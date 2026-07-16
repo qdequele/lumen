@@ -193,7 +193,8 @@ self-hosted OpenAI-compatible server: vLLM, llama.cpp, LM Studio, …). Anything
 else that speaks the OpenAI format works via `kind = "openai"` + a `base_url`.
 Note that `groq`, `deepseek`, `openrouter`, `perplexity` and `xai` serve chat
 only (no upstream embeddings API): declaring `embed` on them is rejected at
-config load. See the capability table in
+config load, unless a custom `base_url` fronts the host with an
+embedding-capable proxy. See the capability table in
 [`docs/providers.md`](docs/providers.md).
 `cloudflare` additionally serves **rerank** (BAAI `bge-reranker-*`) through
 Workers AI's native `/ai/run/{model}` endpoint rather than the OpenAI path -

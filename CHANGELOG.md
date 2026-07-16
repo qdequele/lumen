@@ -44,9 +44,11 @@ All notable changes to LUMEN are documented here. The format is based on
   OpenAI embed wiring but expose no upstream `/embeddings` endpoint, so the
   failure was certain. Backed by a new `ProviderKind::supports_embeddings()`
   capability table; `fireworks`, `together`, `deepinfra`, `huggingface`,
-  `cloudflare` and `vllm` embed models keep working, and an embed-less host
-  that later ships embeddings can still be reached via `kind = "openai"`
-  with a `base_url` override. `docs/providers.md` capability table updated.
+  `cloudflare` and `vllm` embed models keep working. The check only applies
+  when the provider uses the kind's default base URL: a custom `base_url`
+  (an operator-run proxy that may serve embeddings) bypasses it, and
+  `kind = "openai"` with a `base_url` override works as before.
+  `docs/providers.md` capability table updated.
 
 ### Changed
 
