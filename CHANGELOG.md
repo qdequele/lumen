@@ -8,6 +8,16 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ### Added
 
+- **Chat support for the native `ollama` kind** (issue #63). A model declaring
+  `capabilities = ["chat"]` on an `ollama` provider now resolves and serves
+  `POST /v1/chat/completions`, streaming and non-streaming. Chat reuses the
+  shared OpenAI-compatible implementation pointed at `{base_url}/v1` (Ollama's
+  OpenAI-compatible surface on the same server root as the native `/api/embed`
+  path), so zero-copy SSE passthrough (ADR 004), cancellation on client
+  disconnect, and ADR 003 token accounting (upstream usage when present, else
+  a local count marked `estimated`) all apply. The `/api/version` health probe
+  and the embed path are unchanged. Documented in `docs/providers.md` and
+  `config.example.toml`.
 - **First-class `api_version` config field for the `azure` kind** (issue
   #65). The Azure OpenAI API version no longer has to be smuggled into
   `base_url` as an `?api-version=...` query string: providers of

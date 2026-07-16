@@ -696,8 +696,24 @@ fn build_providers(
                 rerank: None,
             })
         }
+        // Ollama: native embeddings via `{root}/api/embed`, chat via its
+        // OpenAI-compatible surface, which lives under `/v1` on the SAME
+        // server root the embed path uses. The documented `base_url` shape
+        // for this kind is the server root (no `/v1` - the health probe also
+        // appends `/api/version` to it), so the chat provider gets
+        // `{root}/v1` appended here and reuses the shared OpenAI
+        // implementation - streaming (zero-copy passthrough, ADR 004),
+        // cancellation, and ADR 003 token accounting come along with it
+        // (issue #63).
         ProviderKind::Ollama => {
             let base_url = require_base_url()?;
+            let chat_base_url = format!("{}/v1", base_url.trim_end_matches('/'));
+            let chat: Arc<dyn ChatProvider> = Arc::new(OpenAiProvider::new(
+                client.clone(),
+                spec.name.clone(),
+                Some(chat_base_url),
+                spec.api_key.clone(), // keyless in practice; forwarded if set
+            ));
             let embed: Arc<dyn EmbeddingProvider> = Arc::new(OllamaProvider::new(
                 client.clone(),
                 spec.name.clone(),
@@ -705,7 +721,7 @@ fn build_providers(
                 spec.strict,
             ));
             Ok(BuiltProviders {
-                chat: None,
+                chat: Some(chat),
                 embed: Some(embed),
                 rerank: None,
             })
@@ -980,6 +996,26 @@ mod tests {
         assert!(reg.embedding_route("chat-1").is_none());
         assert!(reg.knows_model("chat-1"));
         assert!(!reg.knows_model("does-not-exist"));
+    }
+
+    #[test]
+    fn ollama_resolves_chat_and_embed() {
+        // Issue #63: the native ollama kind serves chat via Ollama's
+        // OpenAI-compatible /v1 surface, alongside its native embed path.
+        let reg = Registry::build(
+            vec![spec(
+                ProviderKind::Ollama,
+                "ollama",
+                Some("http://localhost:11434"),
+                vec![model("m", &[Capability::Chat, Capability::Embed])],
+            )],
+            reqwest::Client::new(),
+            Duration::from_secs(300),
+        )
+        .expect("ollama with base_url builds");
+        assert!(reg.chat_route("m").is_some(), "ollama chat must resolve");
+        assert!(reg.embedding_route("m").is_some(), "ollama embed");
+        assert!(reg.rerank_route("m").is_none(), "ollama has no rerank");
     }
 
     #[test]
