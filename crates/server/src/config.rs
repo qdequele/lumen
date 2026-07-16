@@ -467,9 +467,12 @@ impl From<LogFormatConfig> for LogFormat {
 }
 
 /// Per-provider knob validation: timeout overrides must not be 0, and
-/// `api_version` must be non-blank and only appear on the `azure` kind
-/// (issue #65) - every other kind would silently ignore it, so a boot-time
-/// error beats a misconfigured provider discovered at request time.
+/// `api_version` must be non-blank, carry no leading/trailing whitespace
+/// (a padded value would be percent-encoded verbatim into the request URL
+/// and fail upstream with an Azure 4xx only at request time), and only
+/// appear on the `azure` kind (issue #65) - every other kind would silently
+/// ignore it, so a boot-time error beats a misconfigured provider
+/// discovered at request time.
 fn validate_provider_knobs(
     provider: &ProviderConfig,
     err: &impl Fn(String) -> ConfigError,
@@ -487,9 +490,10 @@ fn validate_provider_knobs(
         }
     }
     if let Some(api_version) = &provider.api_version {
-        if api_version.trim().is_empty() {
+        if api_version.is_empty() || api_version.trim() != api_version {
             return Err(err(format!(
-                "provider '{}': api_version must not be empty",
+                "provider '{}': api_version must be non-empty with no leading or \
+                 trailing whitespace",
                 provider.name
             )));
         }
@@ -1389,6 +1393,29 @@ mod tests {
         "#;
         let err = load_str(toml).unwrap_err();
         assert!(err.to_string().contains("api_version"), "{err}");
+    }
+
+    #[test]
+    fn padded_api_version_is_rejected() {
+        // " 2024-10-21" would be percent-encoded verbatim into the request
+        // URL (api-version=%202024-10-21) and fail only at request time with
+        // an Azure 4xx, so surrounding whitespace is rejected at boot.
+        for padded in [" 2024-10-21", "2024-10-21 ", "\t2024-10-21\n"] {
+            let toml = format!(
+                r#"
+                    [[providers]]
+                    name = "azure"
+                    kind = "azure"
+                    base_url = "https://my-resource.openai.azure.com"
+                    api_version = {padded:?}
+                    [[providers.models]]
+                    id = "gpt"
+                    capabilities = ["chat"]
+                "#
+            );
+            let err = load_str(&toml).unwrap_err();
+            assert!(err.to_string().contains("api_version"), "{err}");
+        }
     }
 
     #[test]

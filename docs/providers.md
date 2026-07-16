@@ -517,8 +517,10 @@ capabilities = ["embed"]
   the older form still works: append `?api-version=YYYY-MM-DD` to `base_url`.
   Precedence: the explicit `api_version` field wins over a `base_url` query
   string, which wins over LUMEN's pinned built-in default (see the `azure`
-  module doc comment for the exact value). `api_version` is azure-only:
-  setting it on any other kind is rejected at boot.
+  module doc comment for the exact value). Any query parameters on `base_url`
+  other than `api-version` are ignored when building request URLs.
+  `api_version` is azure-only: setting it on any other kind is rejected at
+  boot.
 - **Deployment routing**: Azure routes by URL path
   (`/openai/deployments/{deployment}/...`), not by the `model` field in the
   body. Set each model's `upstream_id` to the **Azure deployment name** - the
