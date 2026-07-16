@@ -4,7 +4,14 @@
 //! * `POST /admin/keys` - create a key. The response is the ONLY place the
 //!   plaintext key ever appears; it is never stored and never logged.
 //! * `GET /admin/keys` - list keys (records only, no hashes, no plaintext).
+//!   `?include_deleted=true` also shows soft-deleted tombstones.
 //! * `PATCH /admin/keys/{id}` - adjust budgets/limits, enable/disable.
+//! * `DELETE /admin/keys/{id}` - soft-delete: the row becomes a tombstone
+//!   (usage-log attribution and audit history survive) and the key stops
+//!   authenticating immediately.
+//! * `POST /admin/keys/{id}/rotate` - mint a new secret for an existing key;
+//!   same one-time-plaintext contract as creation, identity and budget state
+//!   preserved.
 //! * `PUT /admin/provider-keys/{name}` - store a provider API key encrypted
 //!   at rest (AES-256-GCM under the master key) and apply it without a restart
 //!   by requesting a hot reload; used for providers whose `api_key_env` is
@@ -88,12 +95,26 @@ pub async fn create_key(
     ))
 }
 
-/// List every key (no secrets: ids, names, budgets, limits, flags).
+/// `GET /admin/keys` query parameters.
+#[derive(Debug, Default, Deserialize)]
+pub struct ListKeysParams {
+    /// Also list soft-deleted tombstones (default: active keys only).
+    #[serde(default)]
+    pub include_deleted: bool,
+}
+
+/// List every active key (no secrets: ids, names, budgets, limits, flags).
+/// `?include_deleted=true` adds soft-deleted tombstones for auditing.
 pub async fn list_keys(
     State(state): State<AppState>,
+    Query(params): Query<ListKeysParams>,
 ) -> Result<Json<Vec<VirtualKeyRecord>>, ApiError> {
     let auth = runtime(&state)?;
-    let keys = auth.store.list_keys().await.map_err(|e| internal(&e))?;
+    let keys = auth
+        .store
+        .list_keys(params.include_deleted)
+        .await
+        .map_err(|e| internal(&e))?;
     Ok(Json(keys))
 }
 
@@ -116,6 +137,55 @@ pub async fn patch_key(
     // Reflect the change in the live table (spend is preserved).
     auth.keys.apply(&updated);
     Ok(Json(updated))
+}
+
+/// Delete a key - a **soft delete** by design: `usage_log` rows reference
+/// the key id, so removing the row would orphan usage history, and the
+/// tombstone keeps the audit trail (see `docs/operations/keys-budgets.md`).
+/// The key stops authenticating on the very next request (the live table is
+/// updated like `patch_key`), disappears from the default list, and any
+/// further PATCH/DELETE/rotate on the id behaves like an unknown id
+/// (400 `LM-1001`) - it can never be resurrected by accident.
+pub async fn delete_key(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let auth = runtime(&state)?;
+    auth.store
+        .delete_key(&id)
+        .await
+        .map_err(|e| internal(&e))?
+        .ok_or_else(|| GatewayError::InvalidRequest(format!("unknown key id '{id}'")))?;
+    // Evict from the live table: the deleted key is refused immediately.
+    auth.keys.remove(&id);
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Rotate a key's secret: mint a new plaintext through the exact generation
+/// path used at creation, store its hash, and return the new plaintext in
+/// the same one-time response shape as `POST /admin/keys`. The record's id,
+/// name, budgets, accrued spend and quotas are all preserved (the live entry
+/// is kept, only its hash alias changes), so `usage_log` attribution is
+/// unbroken. The old plaintext stops authenticating immediately; an unknown
+/// or deleted id is a 400 `LM-1001`, like `patch_key`.
+pub async fn rotate_key(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<CreatedKey>, ApiError> {
+    let auth = runtime(&state)?;
+    let (plaintext, record) = auth
+        .store
+        .rotate_key(&id)
+        .await
+        .map_err(|e| internal(&e))?
+        .ok_or_else(|| GatewayError::InvalidRequest(format!("unknown key id '{id}'")))?;
+    // Swap the live alias: the old plaintext dies and the new one works
+    // right away, with spend and quota windows carried over.
+    auth.keys.rotate(hash_key(plaintext.reveal()), &record);
+    Ok(Json(CreatedKey {
+        key: plaintext.reveal().to_owned(),
+        record,
+    }))
 }
 
 /// `PUT /admin/provider-keys/{name}` body.
@@ -433,6 +503,7 @@ mod tests {
                 expires_at: None,
                 disabled: false,
                 created_at: 0,
+                deleted_at: None,
             },
         };
         let dbg = format!("{created:?}");

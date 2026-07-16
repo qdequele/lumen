@@ -75,8 +75,10 @@ together, so they take effect immediately with no restart.
 | Method | Path | Purpose |
 |---|---|---|
 | `POST` | `/admin/keys` | Create a virtual key. |
-| `GET` | `/admin/keys` | List keys (records only - no hashes, no plaintext). |
+| `GET` | `/admin/keys` | List active keys (records only - no hashes, no plaintext). `?include_deleted=true` adds tombstones. |
 | `PATCH` | `/admin/keys/{id}` | Adjust budget/limits, or enable/disable a key. |
+| `DELETE` | `/admin/keys/{id}` | Soft-delete a key (tombstone; stops authenticating immediately). |
+| `POST` | `/admin/keys/{id}/rotate` | Mint a new secret for an existing key (one-time plaintext, identity and spend preserved). |
 | `PUT` | `/admin/provider-keys/{name}` | Store a provider API key encrypted at rest. |
 | `GET` | `/admin/usage` | Aggregated usage and spend from the usage log. |
 
@@ -109,7 +111,8 @@ response is the **only place the plaintext key ever appears**:
   "tpm_limit": 100000,
   "expires_at": null,
   "disabled": false,
-  "created_at": 1752537600
+  "created_at": 1752537600,
+  "deleted_at": null
 }
 ```
 
@@ -117,6 +120,48 @@ Store `key` now - it is never shown again. `PATCH /admin/keys/{id}` takes
 the same budget/quota fields (plus `disabled`) to adjust an existing key;
 fields left out of the patch are unchanged, and an unknown id returns 400
 `LM-1001`.
+
+### Rotate a key (`POST /admin/keys/{id}/rotate`)
+
+A lost or leaked key does not have to be replaced by a new one: rotation
+mints a fresh secret for the **same** key record.
+
+```bash
+curl -s -X POST http://localhost:8080/admin/keys/<id>/rotate \
+  -H "Authorization: Bearer $LUMEN_MASTER_KEY"
+```
+
+The response has the exact same shape as creation - the new plaintext in
+`key`, shown exactly once, plus the record. Everything else is preserved:
+the `id` (so `usage_log` attribution is unbroken), the name, budgets,
+accrued spend and quotas. The swap is applied to the in-memory table too,
+so the old plaintext stops authenticating on the very next request and the
+new one works without a restart. An unknown or deleted id returns 400
+`LM-1001`.
+
+### Delete a key (`DELETE /admin/keys/{id}`)
+
+```bash
+curl -s -X DELETE http://localhost:8080/admin/keys/<id> \
+  -H "Authorization: Bearer $LUMEN_MASTER_KEY"
+```
+
+Returns `204 No Content`. Deletion is a **soft delete** by design:
+`usage_log` rows reference the key id, so removing the row would orphan the
+key's usage history. Instead the row is tombstoned (`deleted_at` is set) and
+kept for attribution and audit. A deleted key:
+
+- stops authenticating **immediately** (the in-memory table is updated, no
+  restart needed), and never loads again at boot;
+- disappears from `GET /admin/keys`; pass `?include_deleted=true` to list
+  tombstones (the audit view);
+- rejects any further `PATCH`, `DELETE` or rotate with 400 `LM-1001`, like
+  an unknown id - it cannot be resurrected by accident.
+
+Retention of the tombstoned rows follows your usage-log retention policy:
+they are plain rows in the same database, with no plaintext and no hash
+that still authenticates. If you only want to pause a key, use
+`PATCH {"disabled": true}` instead - that one is reversible.
 
 ### Store a provider key (`PUT /admin/provider-keys/{name}`)
 

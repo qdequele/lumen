@@ -98,8 +98,140 @@ async fn list_keys_returns_all_records() {
     let store = KeyStore::in_memory().await.expect("open store");
     store.create_key(new_key("a")).await.expect("a");
     store.create_key(new_key("b")).await.expect("b");
-    let all = store.list_keys().await.expect("list");
+    let all = store.list_keys(false).await.expect("list");
     assert_eq!(all.len(), 2);
+}
+
+#[tokio::test]
+async fn delete_key_tombstones_without_touching_usage_history() {
+    let store = KeyStore::in_memory().await.expect("open store");
+    let (plaintext, record) = store.create_key(new_key("gone")).await.expect("create");
+    store
+        .insert_usage(&[usage(&record.id, 1)])
+        .await
+        .expect("usage");
+
+    let deleted = store
+        .delete_key(&record.id)
+        .await
+        .expect("delete")
+        .expect("key exists");
+    assert!(
+        deleted.deleted_at.is_some(),
+        "tombstone carries a timestamp"
+    );
+
+    // Soft delete: the usage history keeps its key_id attribution.
+    assert_eq!(store.count_usage().await.expect("count"), 1);
+    // The hash no longer authenticates...
+    assert!(store
+        .find_by_hash(&hash_key(plaintext.reveal()))
+        .await
+        .expect("lookup")
+        .is_none());
+    // ...and a restarted gateway would not load the key either.
+    assert!(store.load_auth_entries().await.expect("entries").is_empty());
+}
+
+#[tokio::test]
+async fn deleted_keys_are_hidden_from_the_default_list_but_visible_on_request() {
+    let store = KeyStore::in_memory().await.expect("open store");
+    let (_, keep) = store.create_key(new_key("keep")).await.expect("keep");
+    let (_, drop) = store.create_key(new_key("drop")).await.expect("drop");
+    store
+        .delete_key(&drop.id)
+        .await
+        .expect("delete")
+        .expect("key exists");
+
+    let visible = store.list_keys(false).await.expect("list");
+    assert_eq!(visible.len(), 1);
+    assert_eq!(visible[0].id, keep.id);
+
+    let all = store.list_keys(true).await.expect("list all");
+    assert_eq!(all.len(), 2);
+    let tombstone = all.iter().find(|k| k.id == drop.id).expect("tombstone");
+    assert!(tombstone.deleted_at.is_some());
+}
+
+#[tokio::test]
+async fn a_deleted_key_rejects_further_patch_delete_and_rotate() {
+    let store = KeyStore::in_memory().await.expect("open store");
+    let (_, record) = store.create_key(new_key("dead")).await.expect("create");
+    store
+        .delete_key(&record.id)
+        .await
+        .expect("delete")
+        .expect("key exists");
+
+    // A tombstone behaves like an unknown id: it cannot be resurrected.
+    assert!(store
+        .update_key(&record.id, KeyPatch::default())
+        .await
+        .expect("patch")
+        .is_none());
+    assert!(store
+        .delete_key(&record.id)
+        .await
+        .expect("delete")
+        .is_none());
+    assert!(store
+        .rotate_key(&record.id)
+        .await
+        .expect("rotate")
+        .is_none());
+}
+
+#[tokio::test]
+async fn rotate_key_swaps_the_hash_and_preserves_the_record() {
+    let store = KeyStore::in_memory().await.expect("open store");
+    let (old_plaintext, record) = store.create_key(new_key("spin")).await.expect("create");
+    store
+        .persist_budgets(&[(record.id.clone(), 4.5)])
+        .await
+        .expect("flush");
+
+    let (new_plaintext, rotated) = store
+        .rotate_key(&record.id)
+        .await
+        .expect("rotate")
+        .expect("key exists");
+
+    // Same generation contract as creation, and a genuinely new secret.
+    assert!(new_plaintext.reveal().starts_with("fg-"));
+    assert_eq!(new_plaintext.reveal().len(), 3 + 64);
+    assert_ne!(new_plaintext.reveal(), old_plaintext.reveal());
+
+    // Identity, budgets, spend and limits are all preserved.
+    assert_eq!(rotated.id, record.id);
+    assert_eq!(rotated.name, "spin");
+    assert_eq!(rotated.budget_max, Some(10.0));
+    assert_eq!(rotated.budget_spent, 4.5);
+    assert_eq!(rotated.rpm_limit, Some(60));
+
+    // The old hash stops resolving; the new one resolves to the same record.
+    assert!(store
+        .find_by_hash(&hash_key(old_plaintext.reveal()))
+        .await
+        .expect("old lookup")
+        .is_none());
+    let via_new = store
+        .find_by_hash(&hash_key(new_plaintext.reveal()))
+        .await
+        .expect("new lookup")
+        .expect("key exists");
+    assert_eq!(via_new.id, record.id);
+
+    // Neither plaintext ever lands at rest.
+    let dump = store.debug_dump().await.expect("dump");
+    assert!(!dump.contains(old_plaintext.reveal()));
+    assert!(!dump.contains(new_plaintext.reveal()));
+}
+
+#[tokio::test]
+async fn rotate_of_unknown_key_returns_none() {
+    let store = KeyStore::in_memory().await.expect("open store");
+    assert!(store.rotate_key("nope").await.expect("rotate").is_none());
 }
 
 #[tokio::test]
@@ -149,7 +281,7 @@ async fn persist_budgets_survives_reload() {
         .await
         .expect("flush");
 
-    let reloaded = store.list_keys().await.expect("list");
+    let reloaded = store.list_keys(false).await.expect("list");
     assert_eq!(reloaded[0].budget_spent, 10.0);
 }
 
@@ -367,7 +499,7 @@ async fn expired_and_disabled_flags_load_correctly() {
         .await
         .expect("patch");
 
-    let all = store.list_keys().await.expect("list");
+    let all = store.list_keys(false).await.expect("list");
     assert_eq!(all[0].expires_at, Some(123));
     assert!(all[0].disabled);
 }

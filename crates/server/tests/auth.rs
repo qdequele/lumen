@@ -1098,6 +1098,265 @@ async fn admin_lifecycle_create_use_patch_disable() {
 }
 
 #[tokio::test]
+async fn admin_delete_stops_authentication_immediately_and_hides_the_key() {
+    let upstream = MockServer::start().await;
+    mount_openai_embeddings(&upstream, 1).await;
+    let h = spawn_auth(full_registry(&upstream.uri()), &[]).await;
+
+    let created = h
+        .client
+        .post(format!("{}/admin/keys", h.base))
+        .bearer_auth(master())
+        .json(&json!({ "name": "doomed" }))
+        .send()
+        .await
+        .expect("create");
+    assert_eq!(created.status(), 201);
+    let body: Value = created.json().await.expect("json");
+    let plaintext = body["key"].as_str().expect("key").to_owned();
+    let id = body["id"].as_str().expect("id").to_owned();
+
+    // The key works before deletion.
+    let before = h
+        .client
+        .post(format!("{}/v1/embeddings", h.base))
+        .bearer_auth(&plaintext)
+        .json(&embed_body())
+        .send()
+        .await
+        .expect("send");
+    assert_eq!(before.status(), 200);
+
+    // DELETE tombstones the key.
+    let deleted = h
+        .client
+        .delete(format!("{}/admin/keys/{id}", h.base))
+        .bearer_auth(master())
+        .send()
+        .await
+        .expect("delete");
+    assert_eq!(deleted.status(), 204);
+
+    // It stops authenticating IMMEDIATELY - no restart.
+    let after = h
+        .client
+        .post(format!("{}/v1/embeddings", h.base))
+        .bearer_auth(&plaintext)
+        .json(&embed_body())
+        .send()
+        .await
+        .expect("send");
+    assert_eq!(after.status(), 401);
+
+    // Hidden from the default list...
+    let list: Value = h
+        .client
+        .get(format!("{}/admin/keys", h.base))
+        .bearer_auth(master())
+        .send()
+        .await
+        .expect("list")
+        .json()
+        .await
+        .expect("json");
+    assert!(
+        list.as_array()
+            .expect("array")
+            .iter()
+            .all(|k| k["id"] != *id),
+        "deleted key must not appear by default: {list}"
+    );
+    // ...but visible as a tombstone with ?include_deleted=true.
+    let all: Value = h
+        .client
+        .get(format!("{}/admin/keys?include_deleted=true", h.base))
+        .bearer_auth(master())
+        .send()
+        .await
+        .expect("list all")
+        .json()
+        .await
+        .expect("json");
+    let tombstone = all
+        .as_array()
+        .expect("array")
+        .iter()
+        .find(|k| k["id"] == *id)
+        .expect("tombstone listed");
+    assert!(tombstone["deleted_at"].is_i64());
+
+    // Further PATCH or DELETE behaves like an unknown id: 400 LM-1001.
+    let patch = h
+        .client
+        .patch(format!("{}/admin/keys/{id}", h.base))
+        .bearer_auth(master())
+        .json(&json!({ "disabled": false }))
+        .send()
+        .await
+        .expect("patch");
+    assert_eq!(patch.status(), 400);
+    let patch_body: Value = patch.json().await.expect("json");
+    assert_eq!(patch_body["error"]["code"], "LM-1001");
+
+    let again = h
+        .client
+        .delete(format!("{}/admin/keys/{id}", h.base))
+        .bearer_auth(master())
+        .send()
+        .await
+        .expect("delete again");
+    assert_eq!(again.status(), 400);
+}
+
+#[tokio::test]
+async fn admin_rotate_swaps_the_plaintext_live_and_preserves_spend() {
+    let upstream = MockServer::start().await;
+    mount_openai_embeddings(&upstream, 1).await;
+    let h = spawn_auth(full_registry(&upstream.uri()), &[]).await;
+
+    // $2 budget at $1 per request: spend half of it on the OLD key.
+    let created = h
+        .client
+        .post(format!("{}/admin/keys", h.base))
+        .bearer_auth(master())
+        .json(&json!({ "name": "rotator", "budget_max": 2.0 }))
+        .send()
+        .await
+        .expect("create");
+    assert_eq!(created.status(), 201);
+    let body: Value = created.json().await.expect("json");
+    let old_key = body["key"].as_str().expect("key").to_owned();
+    let id = body["id"].as_str().expect("id").to_owned();
+
+    let spend = h
+        .client
+        .post(format!("{}/v1/embeddings", h.base))
+        .bearer_auth(&old_key)
+        .json(&embed_body())
+        .send()
+        .await
+        .expect("send");
+    assert_eq!(spend.status(), 200);
+
+    // Rotate: same response contract as creation.
+    let rotated = h
+        .client
+        .post(format!("{}/admin/keys/{id}/rotate", h.base))
+        .bearer_auth(master())
+        .send()
+        .await
+        .expect("rotate");
+    assert_eq!(rotated.status(), 200);
+    let rotated_body: Value = rotated.json().await.expect("json");
+    let new_key = rotated_body["key"].as_str().expect("key").to_owned();
+    assert!(new_key.starts_with("fg-"));
+    assert_ne!(new_key, old_key, "rotation must mint a new secret");
+    assert_eq!(rotated_body["id"], *id, "identity is preserved");
+    assert_eq!(rotated_body["budget_max"], 2.0);
+    assert_eq!(rotated_body["name"], "rotator");
+
+    // The new plaintext never lands at rest.
+    let dump = h.store.debug_dump().await.expect("dump");
+    assert!(!dump.contains(&new_key), "rotated plaintext stored!");
+
+    // The old plaintext stops working IMMEDIATELY...
+    let old_denied = h
+        .client
+        .post(format!("{}/v1/embeddings", h.base))
+        .bearer_auth(&old_key)
+        .json(&embed_body())
+        .send()
+        .await
+        .expect("send");
+    assert_eq!(old_denied.status(), 401);
+
+    // ...the new one works without a restart and inherits the spend: the
+    // second dollar fits the $2 budget, the third request is refused. If
+    // rotation had reset the spend this third call would still pass.
+    let second = h
+        .client
+        .post(format!("{}/v1/embeddings", h.base))
+        .bearer_auth(&new_key)
+        .json(&embed_body())
+        .send()
+        .await
+        .expect("send");
+    assert_eq!(second.status(), 200);
+    let third = h
+        .client
+        .post(format!("{}/v1/embeddings", h.base))
+        .bearer_auth(&new_key)
+        .json(&embed_body())
+        .send()
+        .await
+        .expect("send");
+    assert_eq!(third.status(), 402, "spend must survive rotation");
+}
+
+#[tokio::test]
+async fn admin_delete_and_rotate_unknown_id_is_400_lm1001() {
+    let upstream = MockServer::start().await;
+    let h = spawn_auth(full_registry(&upstream.uri()), &[]).await;
+
+    let del = h
+        .client
+        .delete(format!("{}/admin/keys/nope", h.base))
+        .bearer_auth(master())
+        .send()
+        .await
+        .expect("delete");
+    assert_eq!(del.status(), 400);
+    let del_body: Value = del.json().await.expect("json");
+    assert_eq!(del_body["error"]["code"], "LM-1001");
+
+    let rot = h
+        .client
+        .post(format!("{}/admin/keys/nope/rotate", h.base))
+        .bearer_auth(master())
+        .send()
+        .await
+        .expect("rotate");
+    assert_eq!(rot.status(), 400);
+    let rot_body: Value = rot.json().await.expect("json");
+    assert_eq!(rot_body["error"]["code"], "LM-1001");
+}
+
+#[tokio::test]
+async fn admin_delete_and_rotate_require_the_master_key() {
+    let upstream = MockServer::start().await;
+    let h = spawn_auth(full_registry(&upstream.uri()), &[]).await;
+    let vkey = h.create_key(None, None, None).await;
+
+    for (request, label) in [
+        (
+            h.client.delete(format!("{}/admin/keys/x", h.base)),
+            "delete no auth",
+        ),
+        (
+            h.client.post(format!("{}/admin/keys/x/rotate", h.base)),
+            "rotate no auth",
+        ),
+    ] {
+        let resp = request.send().await.expect(label);
+        assert_eq!(resp.status(), 401, "{label}");
+    }
+    // A virtual key is NOT an admin key on these routes either.
+    for (request, label) in [
+        (
+            h.client.delete(format!("{}/admin/keys/x", h.base)),
+            "delete vkey",
+        ),
+        (
+            h.client.post(format!("{}/admin/keys/x/rotate", h.base)),
+            "rotate vkey",
+        ),
+    ] {
+        let resp = request.bearer_auth(&vkey).send().await.expect(label);
+        assert_eq!(resp.status(), 401, "{label}");
+    }
+}
+
+#[tokio::test]
 async fn stored_provider_keys_are_encrypted_at_rest() {
     let upstream = MockServer::start().await;
     let h = spawn_auth(full_registry(&upstream.uri()), &[]).await;

@@ -97,7 +97,11 @@ pub fn build_app(state: AppState) -> Router {
     if state.auth.is_some() {
         let admin_routes = Router::new()
             .route("/admin/keys", post(admin::create_key).get(admin::list_keys))
-            .route("/admin/keys/{id}", patch(admin::patch_key))
+            .route(
+                "/admin/keys/{id}",
+                patch(admin::patch_key).delete(admin::delete_key),
+            )
+            .route("/admin/keys/{id}/rotate", post(admin::rotate_key))
             .route("/admin/provider-keys/{name}", put(admin::put_provider_key))
             .route("/admin/usage", get(admin::usage_report))
             .route_layer(middleware::from_fn_with_state(
