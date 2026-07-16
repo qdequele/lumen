@@ -220,14 +220,34 @@ capabilities = ["chat"]
 cost_per_1m_input = 3.0
 cost_per_1m_output = 15.0
 
-# Google Vertex AI: chat (Gemini models on GCP). Distinct from kind = "google"
-# (the public Gemini Developer API): Vertex uses regional endpoints and GCP
-# service-account OAuth. `api_key_env` names a var holding the FULL
-# service-account key JSON (the key file contents, not a path):
+# Google Gemini (public Gemini Developer API): chat + embeddings. The key
+# rides the `x-goog-api-key` header, never the URL. Embeddings go through
+# `batchEmbedContents` (up to 100 inputs per upstream call; larger requests
+# are split by the gateway).
+# [[providers]]
+# name = "google"
+# kind = "google"
+# api_key_env = "GEMINI_API_KEY"
+#
+# [[providers.models]]
+# id = "gemini-2.0-flash"
+# capabilities = ["chat"]
+#
+# [[providers.models]]
+# id = "gemini-embedding-001"
+# capabilities = ["embed"]
+
+# Google Vertex AI: chat + embeddings (Gemini models on GCP). Distinct from
+# kind = "google" (the public Gemini Developer API): Vertex uses regional
+# endpoints and GCP service-account OAuth. `api_key_env` names a var holding
+# the FULL service-account key JSON (the key file contents, not a path):
 #   export VERTEX_SA_JSON="$(cat service-account.json)"
 # `base_url` carries the GCP region; the project id comes from the JSON. LUMEN
 # exchanges an RS256-signed JWT for a short-lived access token and caches it in
-# memory (refreshed 60 s before expiry) - the key is never logged.
+# memory (refreshed 60 s before expiry) - the key is never logged. Embeddings
+# use the `:predict` endpoint, one input per upstream call (the gateway fans
+# batches out concurrently; gemini-embedding-001 takes a single instance per
+# request).
 # [[providers]]
 # name = "vertex"
 # kind = "vertex_ai"
@@ -238,6 +258,11 @@ cost_per_1m_output = 15.0
 # id = "gemini-flash-vertex"
 # upstream_id = "gemini-2.0-flash"
 # capabilities = ["chat"]
+#
+# [[providers.models]]
+# id = "gemini-embedding-vertex"
+# upstream_id = "gemini-embedding-001"
+# capabilities = ["embed"]
 
 # AWS Bedrock: chat via the Converse API (one uniform schema across the
 # Anthropic / Meta / Amazon / Mistral model families). Auth is AWS SigV4, NOT a

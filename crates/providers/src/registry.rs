@@ -813,16 +813,20 @@ fn build_providers(
                 rerank: Some(rerank),
             })
         }
+        // Gemini Developer API: chat via `generateContent`, embeddings via
+        // `batchEmbedContents` (issue #62) - one instance behind both traits.
         ProviderKind::Google => {
-            let chat: Arc<dyn ChatProvider> = Arc::new(GoogleProvider::new(
+            let provider = Arc::new(GoogleProvider::new(
                 client.clone(),
                 spec.name.clone(),
                 spec.base_url.clone(),
                 spec.api_key.clone(),
             ));
+            let chat: Arc<dyn ChatProvider> = provider.clone();
+            let embed: Arc<dyn EmbeddingProvider> = provider;
             Ok(BuiltProviders {
                 chat: Some(chat),
-                embed: None,
+                embed: Some(embed),
                 rerank: None,
             })
         }
@@ -862,10 +866,14 @@ fn build_providers(
                 name: spec.name.clone(),
                 message: e.to_string(),
             })?;
-            let chat: Arc<dyn ChatProvider> = Arc::new(provider);
+            // Chat via `generateContent`, embeddings via `:predict` (issue
+            // #62) - the same authenticated instance behind both traits.
+            let provider = Arc::new(provider);
+            let chat: Arc<dyn ChatProvider> = provider.clone();
+            let embed: Arc<dyn EmbeddingProvider> = provider;
             Ok(BuiltProviders {
                 chat: Some(chat),
-                embed: None,
+                embed: Some(embed),
                 rerank: None,
             })
         }
@@ -1424,6 +1432,58 @@ mod tests {
             Duration::from_secs(300),
         );
         assert!(matches!(garbage, Err(RegistryError::ProviderConfig { .. })));
+    }
+
+    /// Issue #62: the google (Gemini API) kind serves embeddings, so a model
+    /// declaring both capabilities resolves for both from one provider entry.
+    #[test]
+    fn google_model_resolves_for_chat_and_embed() {
+        let reg = Registry::build(
+            vec![spec(
+                ProviderKind::Google,
+                "google",
+                None,
+                vec![
+                    model("gemini-flash", &[Capability::Chat]),
+                    model("gemini-embedding-001", &[Capability::Embed]),
+                ],
+            )],
+            reqwest::Client::new(),
+            Duration::from_secs(300),
+        )
+        .unwrap();
+        assert!(reg.chat_route("gemini-flash").is_some());
+        assert!(reg.embedding_route("gemini-embedding-001").is_some());
+    }
+
+    /// Issue #62: vertex_ai serves embeddings via `:predict` with the same
+    /// OAuth/regional wiring as chat.
+    #[test]
+    fn vertex_ai_model_resolves_for_embed() {
+        let creds = serde_json::json!({
+            "type": "service_account",
+            "project_id": "proj",
+            "client_email": "svc@proj.iam.gserviceaccount.com",
+            "private_key": include_str!("google/vertex/testdata/test_private_key.pem"),
+            "token_uri": "https://oauth2.googleapis.com/token",
+        })
+        .to_string();
+        let reg = Registry::build(
+            vec![ProviderSpec {
+                name: "vertex".to_owned(),
+                kind: ProviderKind::VertexAi,
+                api_key: Some(creds),
+                base_url: Some("us-central1".to_owned()),
+                strict: false,
+                connect_timeout_ms: None,
+                api_version: None,
+                models: vec![model("gemini-embedding-001", &[Capability::Embed])],
+            }],
+            reqwest::Client::new(),
+            Duration::from_secs(300),
+        )
+        .expect("vertex_ai builds");
+        assert!(reg.embedding_route("gemini-embedding-001").is_some());
     }
 
     #[test]
