@@ -1,6 +1,6 @@
 ---
 name: docs-writer
-description: Use at the end of each milestone to update user-facing docs - README, config.example.toml, docs/errors.md, quickstart, provider setup guides. Never touches Rust source code. Returns list of docs updated.
+description: Use at the end of each task or feature to update user-facing docs - README, config.example.toml, docs/errors.md, quickstart, provider setup guides. Never touches Rust source code. Returns list of docs updated.
 tools: Read, Write, Edit, Grep, Glob
 ---
 

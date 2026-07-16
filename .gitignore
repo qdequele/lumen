@@ -27,3 +27,9 @@ examples-multi-tenant.db
 .idea/
 .vscode/
 *.swp
+
+# Superpowers / SDD process artifacts (removed from the repo, keep them out)
+/.superpowers/
+/docs/superpowers/
+/ROADMAP.md
+/specs/
