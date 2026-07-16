@@ -28,6 +28,45 @@ pub fn reject_pretokenized_input(provider: &str, input: &EmbedInput) -> Result<(
     }
 }
 
+/// Handle OpenAI request fields a translated provider's wire schema cannot
+/// express (issue #72). OpenAI-compatible providers forward `ChatRequest.extra`
+/// verbatim, so these fields silently work there; a translated provider must
+/// either reject or knowingly drop them, never lose them invisibly.
+///
+/// Called BEFORE any upstream call. In strict mode the first offending field
+/// is rejected with an honest 400 (`LM-1001`, rule 8) naming the field and
+/// provider; lenient mode (the default) drops each with a `debug!` trace,
+/// matching the Ollama `dimensions` precedent (issue #25). A field set to
+/// JSON `null` counts as absent (OpenAI treats it as unset).
+///
+/// # Errors
+///
+/// Returns [`ProviderError::UnsupportedField`] in strict mode when `extra`
+/// carries any of `unsupported`; `Ok(())` otherwise.
+pub fn check_unsupported_chat_fields(
+    provider: &str,
+    strict: bool,
+    extra: &serde_json::Map<String, serde_json::Value>,
+    unsupported: &[&str],
+) -> Result<(), ProviderError> {
+    for &field in unsupported {
+        if extra.get(field).is_some_and(|v| !v.is_null()) {
+            if strict {
+                return Err(ProviderError::UnsupportedField {
+                    provider: provider.to_owned(),
+                    field: field.to_owned(),
+                });
+            }
+            tracing::debug!(
+                provider,
+                field,
+                "dropping chat request field this provider cannot honor"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Classify a non-success upstream status into a [`ProviderError`].
 #[must_use]
 pub fn classify_status(
@@ -142,5 +181,38 @@ mod tests {
         // Sanity-bounds the result against a fixed past instant (2024-01-01
         // UTC) without pinning it to an exact wall-clock value.
         assert!(unix_timestamp() > 1_704_067_200);
+    }
+
+    #[test]
+    fn strict_mode_rejects_the_first_unsupported_chat_field_naming_it() {
+        let mut extra = serde_json::Map::new();
+        extra.insert(
+            "response_format".to_owned(),
+            serde_json::json!({ "type": "json_object" }),
+        );
+        let err = check_unsupported_chat_fields("anthropic", true, &extra, &["response_format"])
+            .unwrap_err();
+        match err {
+            ProviderError::UnsupportedField { provider, field } => {
+                assert_eq!(provider, "anthropic");
+                assert_eq!(field, "response_format");
+            }
+            other => panic!("expected UnsupportedField, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lenient_mode_accepts_unsupported_chat_fields() {
+        let mut extra = serde_json::Map::new();
+        extra.insert("seed".to_owned(), serde_json::json!(42));
+        extra.insert("logprobs".to_owned(), serde_json::json!(true));
+        assert!(check_unsupported_chat_fields("p", false, &extra, &["seed", "logprobs"]).is_ok());
+    }
+
+    #[test]
+    fn null_valued_and_absent_fields_pass_even_in_strict_mode() {
+        let mut extra = serde_json::Map::new();
+        extra.insert("seed".to_owned(), serde_json::Value::Null);
+        assert!(check_unsupported_chat_fields("p", true, &extra, &["seed", "logprobs"]).is_ok());
     }
 }

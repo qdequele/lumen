@@ -172,6 +172,69 @@ async fn nominal_non_streaming_request_translates_both_ways() {
     assert_eq!(auth, format!("Bearer {DUMMY_KEY}"));
 }
 
+/// Issue #72: `response_format` and `seed` map natively onto Cohere v2's own
+/// fields instead of being silently dropped - proven on the actual wire body.
+#[tokio::test]
+async fn response_format_and_seed_reach_the_cohere_wire() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v2/chat"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(nominal_body()))
+        .mount(&mock)
+        .await;
+
+    let p = provider(mock.uri());
+    let mut req = request("command-r-plus", "as json please", false);
+    req.extra.insert(
+        "response_format".to_owned(),
+        json!({
+            "type": "json_schema",
+            "json_schema": {
+                "name": "city",
+                "schema": { "type": "object", "properties": { "name": { "type": "string" } } }
+            }
+        }),
+    );
+    req.extra.insert("seed".to_owned(), json!(42));
+    p.chat(req, CancellationToken::new()).await.unwrap();
+
+    let sent: Value =
+        serde_json::from_slice(&mock.received_requests().await.unwrap()[0].body).unwrap();
+    assert_eq!(sent["response_format"]["type"], "json_object");
+    assert_eq!(sent["response_format"]["json_schema"]["type"], "object");
+    assert_eq!(sent["seed"], 42);
+}
+
+/// Issue #72: strict mode turns fields the v2 translation cannot honor into
+/// an honest pre-flight rejection - the mock records ZERO upstream requests.
+#[tokio::test]
+async fn strict_mode_rejects_logprobs_before_any_upstream_call() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v2/chat"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(nominal_body()))
+        .mount(&mock)
+        .await;
+
+    let p = provider(mock.uri()).with_strict(true);
+    let mut req = request("command-r-plus", "hi", false);
+    req.extra.insert("logprobs".to_owned(), json!(true));
+    let err = p.chat(req, CancellationToken::new()).await.unwrap_err();
+
+    assert!(
+        matches!(
+            &err,
+            ProviderError::UnsupportedField { provider, field }
+                if provider == "cohere-test" && field == "logprobs"
+        ),
+        "expected UnsupportedField, got {err:?}"
+    );
+    assert!(
+        mock.received_requests().await.unwrap().is_empty(),
+        "strict rejection must happen before any upstream call"
+    );
+}
+
 #[tokio::test]
 async fn missing_usage_leaves_none_for_the_gateway_to_estimate() {
     let mock = MockServer::start().await;

@@ -33,6 +33,12 @@
 //!
 //! `n` (multiple completions) has no Cohere v2 equivalent and is dropped with
 //! a `debug` trace rather than silently ignored.
+//!
+//! `response_format` and `seed` map natively (issue #72): Cohere v2 supports
+//! JSON mode (`{"type": "json_object", "json_schema"?: <schema>}` - OpenAI's
+//! `json_schema` type collapses onto it) and a sampling seed. `logprobs` and
+//! `parallel_tool_calls` have no translated equivalent and are handled by the
+//! strict/lenient pre-flight in the provider (`super`).
 
 use lumen_core::{ChatChoice, ChatMessage, ChatRequest, ChatResponse, MessageContent, Usage};
 use serde::{Deserialize, Serialize};
@@ -56,6 +62,15 @@ pub(super) struct CohereChatRequest {
     pub(super) tools: Vec<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) tool_choice: Option<Value>,
+    /// Cohere v2 supports JSON mode natively (issue #72): `{"type": "text" |
+    /// "json_object", "json_schema"?: <schema>}` - see
+    /// [`translate_response_format`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) response_format: Option<Value>,
+    /// Cohere v2 supports a sampling seed natively (issue #72); the client's
+    /// integer passes through verbatim.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) seed: Option<Value>,
     /// Only serialized on the streaming path.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub(super) stream: bool,
@@ -215,6 +230,36 @@ fn translate_tool_choice(choice: &Value) -> Option<Value> {
     }
 }
 
+/// OpenAI `response_format` -> Cohere v2 `response_format` (issue #72).
+/// `{"type": "text"}` and `{"type": "json_object"}` pass through; OpenAI's
+/// `{"type": "json_schema", "json_schema": {name, schema, ...}}` becomes
+/// Cohere's `{"type": "json_object", "json_schema": <schema>}` (Cohere has no
+/// separate `json_schema` type - the schema rides on `json_object`). Unknown
+/// shapes are dropped with a `debug` trace, not guessed.
+fn translate_response_format(format: &Value) -> Option<Value> {
+    match format.get("type").and_then(Value::as_str) {
+        Some("text") => Some(json!({ "type": "text" })),
+        Some("json_object") => Some(json!({ "type": "json_object" })),
+        Some("json_schema") => Some(format.pointer("/json_schema/schema").map_or_else(
+            || {
+                tracing::debug!(
+                    "cohere chat: response_format type json_schema without a \
+                     json_schema.schema object; JSON mode applied without a schema"
+                );
+                json!({ "type": "json_object" })
+            },
+            |schema| json!({ "type": "json_object", "json_schema": schema }),
+        )),
+        other => {
+            tracing::debug!(
+                response_format_type = other,
+                "cohere chat: unrecognised response_format shape dropped"
+            );
+            None
+        }
+    }
+}
+
 /// Build the Cohere v2 request body from an OpenAI-shaped [`ChatRequest`].
 /// `stream` is set explicitly by the calling path, never taken from the
 /// client's request (the gateway decides which upstream mode it needs).
@@ -239,6 +284,12 @@ pub(super) fn translate_request(req: &ChatRequest, stream: bool) -> CohereChatRe
             .unwrap_or_default(),
         tools: translate_tools(req),
         tool_choice: req.extra.get("tool_choice").and_then(translate_tool_choice),
+        response_format: req
+            .extra
+            .get("response_format")
+            .and_then(translate_response_format),
+        // A non-numeric seed is invalid OpenAI input anyway; dropped, not guessed.
+        seed: req.extra.get("seed").filter(|v| v.is_number()).cloned(),
         stream,
     }
 }
@@ -708,6 +759,59 @@ mod tests {
             .as_array()
             .unwrap();
         assert_eq!(calls[0]["id"], "call_9");
+    }
+
+    /// Issue #72: `response_format` maps through natively - `json_object`
+    /// verbatim, OpenAI's `json_schema` collapsed onto Cohere's
+    /// `json_object` + `json_schema` shape.
+    #[test]
+    fn response_format_json_object_and_json_schema_map_natively() {
+        let mut req = base_request(vec![msg("user", "hi")]);
+        req.extra.insert(
+            "response_format".to_owned(),
+            json!({ "type": "json_object" }),
+        );
+        let out = serde_json::to_value(translate_request(&req, false)).unwrap();
+        assert_eq!(out["response_format"], json!({ "type": "json_object" }));
+
+        req.extra.insert(
+            "response_format".to_owned(),
+            json!({
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "city",
+                    "strict": true,
+                    "schema": {
+                        "type": "object",
+                        "properties": { "name": { "type": "string" } },
+                        "required": ["name"]
+                    }
+                }
+            }),
+        );
+        let out = serde_json::to_value(translate_request(&req, false)).unwrap();
+        assert_eq!(out["response_format"]["type"], "json_object");
+        assert_eq!(out["response_format"]["json_schema"]["type"], "object");
+        // OpenAI's wrapper metadata (name/strict) is not part of the schema.
+        assert!(out["response_format"]["json_schema"].get("name").is_none());
+    }
+
+    /// Issue #72: `seed` passes through verbatim; an unknown response_format
+    /// shape is dropped, not guessed.
+    #[test]
+    fn seed_passes_through_and_unknown_response_format_is_dropped() {
+        let mut req = base_request(vec![msg("user", "hi")]);
+        req.extra.insert("seed".to_owned(), json!(42));
+        req.extra
+            .insert("response_format".to_owned(), json!({ "type": "surprise" }));
+        let out = serde_json::to_value(translate_request(&req, false)).unwrap();
+        assert_eq!(out["seed"], 42);
+        assert!(out.get("response_format").is_none());
+
+        // A non-numeric seed is invalid OpenAI input: dropped, not forwarded.
+        req.extra.insert("seed".to_owned(), json!("not-a-number"));
+        let out = serde_json::to_value(translate_request(&req, false)).unwrap();
+        assert!(out.get("seed").is_none());
     }
 
     #[test]

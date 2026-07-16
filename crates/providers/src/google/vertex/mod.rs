@@ -47,6 +47,10 @@ pub struct VertexProvider {
     /// gateway still boots, like every other provider missing its key) but all
     /// requests fail with a provider-named upstream error.
     state: Option<Ready>,
+    /// When `true`, reject a request that sets an OpenAI field Gemini cannot
+    /// honor ([`super::UNSUPPORTED_CHAT_FIELDS`]) with a 400 (`LM-1001`)
+    /// instead of silently dropping it (issue #72).
+    strict: bool,
 }
 
 /// The fully-configured state: resolved endpoints plus a token source.
@@ -158,6 +162,7 @@ impl VertexProvider {
                 client,
                 provider_name,
                 state: None,
+                strict: false,
             });
         };
         let key = ServiceAccountKey::from_json(raw).map_err(|_| {
@@ -192,7 +197,17 @@ impl VertexProvider {
                 endpoint_base,
                 auth,
             }),
+            strict: false,
         })
+    }
+
+    /// Set strict mode: reject (400, `LM-1001`) rather than drop request
+    /// fields Gemini cannot honor (issue #72). Defaults to `false` (lenient:
+    /// drop with a `debug!` trace).
+    #[must_use]
+    pub fn with_strict(mut self, strict: bool) -> Self {
+        self.strict = strict;
+        self
     }
 
     /// The ready state, or the request-time error for an unconfigured provider:
@@ -212,6 +227,12 @@ impl VertexProvider {
         req: ChatRequest,
         cancel: CancellationToken,
     ) -> Result<BoxStream<'static, Result<StreamItem, ProviderError>>, ProviderError> {
+        crate::mapping::check_unsupported_chat_fields(
+            &self.provider_name,
+            self.strict,
+            &req.extra,
+            super::UNSUPPORTED_CHAT_FIELDS,
+        )?;
         let ready = self.ready()?;
         let token = ready.auth.token(&cancel).await?;
         let url = ready.model_url(&req.model, true);
@@ -239,6 +260,12 @@ impl ChatProvider for VertexProvider {
         req: ChatRequest,
         cancel: CancellationToken,
     ) -> Result<ChatResponse, ProviderError> {
+        crate::mapping::check_unsupported_chat_fields(
+            &self.provider_name,
+            self.strict,
+            &req.extra,
+            super::UNSUPPORTED_CHAT_FIELDS,
+        )?;
         let ready = self.ready()?;
         let token = ready.auth.token(&cancel).await?;
         let url = ready.model_url(&req.model, false);

@@ -45,6 +45,14 @@ const DEFAULT_BASE_URL: &str = "https://api.cohere.com";
 /// Cohere's documented maximum number of texts per embed request.
 const MAX_BATCH_SIZE: usize = 96;
 
+/// OpenAI chat fields the v2 chat translation cannot honor (issue #72):
+/// `logprobs` exists upstream but its response shape is not translated back
+/// to OpenAI's, and `parallel_tool_calls` has no v2 equivalent. Rejected
+/// (strict) or dropped with a trace (lenient) before any upstream call.
+/// `response_format` and `seed` are NOT here: they map natively in
+/// [`chat::translate_request`](self::chat).
+const UNSUPPORTED_CHAT_FIELDS: &[&str] = &["logprobs", "parallel_tool_calls"];
+
 /// A Cohere provider serving embeddings and reranking.
 pub struct CohereProvider {
     client: reqwest::Client,
@@ -52,6 +60,10 @@ pub struct CohereProvider {
     base_url: String,
     /// Bearer token. Redacted from `Debug`; never logged.
     api_key: Option<String>,
+    /// When `true`, reject a chat request that sets an OpenAI field the v2
+    /// translation cannot honor ([`UNSUPPORTED_CHAT_FIELDS`]) with a 400
+    /// (`LM-1001`) instead of silently dropping it (issue #72).
+    strict: bool,
 }
 
 impl CohereProvider {
@@ -72,7 +84,17 @@ impl CohereProvider {
             provider_name: provider_name.into(),
             base_url,
             api_key,
+            strict: false,
         }
+    }
+
+    /// Set strict mode: reject (400, `LM-1001`) rather than drop chat request
+    /// fields the v2 translation cannot honor (issue #72). Defaults to `false`
+    /// (lenient: drop with a `debug!` trace).
+    #[must_use]
+    pub fn with_strict(mut self, strict: bool) -> Self {
+        self.strict = strict;
+        self
     }
 }
 
@@ -97,6 +119,12 @@ impl CohereProvider {
         req: ChatRequest,
         cancel: CancellationToken,
     ) -> Result<BoxStream<'static, Result<StreamItem, ProviderError>>, ProviderError> {
+        crate::mapping::check_unsupported_chat_fields(
+            &self.provider_name,
+            self.strict,
+            &req.extra,
+            UNSUPPORTED_CHAT_FIELDS,
+        )?;
         let url = format!("{}/v2/chat", self.base_url);
         let body = chat::translate_request(&req, true);
 
@@ -123,6 +151,12 @@ impl ChatProvider for CohereProvider {
         req: ChatRequest,
         cancel: CancellationToken,
     ) -> Result<ChatResponse, ProviderError> {
+        crate::mapping::check_unsupported_chat_fields(
+            &self.provider_name,
+            self.strict,
+            &req.extra,
+            UNSUPPORTED_CHAT_FIELDS,
+        )?;
         let url = format!("{}/v2/chat", self.base_url);
         let body = chat::translate_request(&req, false);
 

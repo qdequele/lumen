@@ -43,6 +43,14 @@ and forwarded to the upstream untouched, rather than stripped. Provider-specific
 parameters keep working without waiting on a LUMEN release to add them by
 name.
 
+Verbatim passthrough applies to OpenAI-compatible providers. On the
+**translated** kinds (`anthropic`, `google`, `vertex_ai`, `bedrock`,
+`cohere`), `response_format`, `seed`, `logprobs` and `parallel_tool_calls`
+are mapped natively where the upstream supports them and otherwise dropped
+with a debug log - or rejected up front with `LM-1001` when the provider sets
+`strict = true`. See the
+[chat-extras matrix in Providers](../providers.md#openai-chat-extras-on-translated-providers).
+
 ## Routing and request errors
 
 | Code | HTTP | When |

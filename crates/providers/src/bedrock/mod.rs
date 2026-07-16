@@ -205,6 +205,13 @@ pub fn resolve_region(base_url: Option<&str>) -> Option<String> {
         })
 }
 
+/// OpenAI chat fields the Converse API has no equivalent for (issue #72): no
+/// JSON mode / structured output, no sampling seed, no logprobs, no
+/// parallel-tool-call control. Rejected (strict) or dropped with a trace
+/// (lenient) before any upstream call.
+const UNSUPPORTED_CHAT_FIELDS: &[&str] =
+    &["response_format", "seed", "logprobs", "parallel_tool_calls"];
+
 /// An AWS Bedrock chat provider (Converse API).
 pub struct BedrockProvider {
     client: reqwest::Client,
@@ -217,6 +224,10 @@ pub struct BedrockProvider {
     /// Where signing credentials come from (static, env-per-request, or
     /// missing - the latter fails every request with a clear error).
     credentials: CredentialSource,
+    /// When `true`, reject a request that sets an OpenAI field Converse cannot
+    /// honor ([`UNSUPPORTED_CHAT_FIELDS`]) with a 400 (`LM-1001`) instead of
+    /// silently dropping it (issue #72).
+    strict: bool,
 }
 
 impl BedrockProvider {
@@ -277,7 +288,17 @@ impl BedrockProvider {
             region,
             endpoint,
             credentials,
+            strict: false,
         }
+    }
+
+    /// Set strict mode: reject (400, `LM-1001`) rather than drop request
+    /// fields the Converse API cannot honor (issue #72). Defaults to `false`
+    /// (lenient: drop with a `debug!` trace).
+    #[must_use]
+    pub fn with_strict(mut self, strict: bool) -> Self {
+        self.strict = strict;
+        self
     }
 
     /// Resolve the credentials to sign THIS request with. The env source
@@ -423,6 +444,12 @@ impl BedrockProvider {
         cancel: CancellationToken,
     ) -> Result<BoxStream<'static, Result<crate::chat::StreamItem, ProviderError>>, ProviderError>
     {
+        crate::mapping::check_unsupported_chat_fields(
+            &self.provider_name,
+            self.strict,
+            &req.extra,
+            UNSUPPORTED_CHAT_FIELDS,
+        )?;
         let body = serialize_body(&req)?;
         let path = Self::path(&req.model, "converse-stream");
         let bytes = self.open(&path, body, &cancel).await?;
@@ -855,6 +882,12 @@ impl ChatProvider for BedrockProvider {
         req: ChatRequest,
         cancel: CancellationToken,
     ) -> Result<ChatResponse, ProviderError> {
+        crate::mapping::check_unsupported_chat_fields(
+            &self.provider_name,
+            self.strict,
+            &req.extra,
+            UNSUPPORTED_CHAT_FIELDS,
+        )?;
         let body = serialize_body(&req)?;
         let path = Self::path(&req.model, "converse");
         let bytes = self.send(&path, body, &cancel).await?;
@@ -1020,6 +1053,72 @@ mod tests {
         assert!(out.get("inferenceConfig").is_none());
         assert!(out.get("toolConfig").is_none());
         assert!(out.get("system").is_none());
+    }
+
+    /// Issue #72: in strict mode a field Converse cannot honor is an honest
+    /// client rejection (`UnsupportedField` -> 400, LM-1001) BEFORE any
+    /// signing or upstream call - the provider deliberately has no
+    /// credentials, which would fail later with a different error.
+    #[tokio::test]
+    async fn strict_mode_rejects_unsupported_openai_fields_pre_flight() {
+        use lumen_core::ChatProvider as _;
+        use tokio_util::sync::CancellationToken;
+        let provider = BedrockProvider::new(
+            reqwest::Client::new(),
+            "bedrock-test",
+            "us-east-1",
+            Some("http://127.0.0.1:1".to_owned()),
+            None,
+        )
+        .with_strict(true);
+
+        for (field, value) in [
+            ("response_format", json!({ "type": "json_object" })),
+            ("seed", json!(42)),
+            ("logprobs", json!(true)),
+            ("parallel_tool_calls", json!(false)),
+        ] {
+            let mut req = request(vec![msg("user", "hi")]);
+            req.extra.insert(field.to_owned(), value);
+            let err = provider
+                .chat(req.clone(), CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(
+                    &err,
+                    ProviderError::UnsupportedField { provider, field: f }
+                        if provider == "bedrock-test" && f == field
+                ),
+                "expected UnsupportedField for {field}, got {err:?}"
+            );
+            // The streaming path enforces the same pre-flight.
+            let err = provider
+                .chat_stream(req, CancellationToken::new())
+                .await
+                .err()
+                .expect("stream must be rejected too");
+            assert!(matches!(err, ProviderError::UnsupportedField { .. }));
+        }
+    }
+
+    /// Lenient (default) mode drops the fields: the wire body never carries
+    /// them (compile-time: the struct has no such fields).
+    #[test]
+    fn lenient_translation_emits_no_unsupported_fields_on_the_wire() {
+        let mut req = request(vec![msg("user", "hi")]);
+        req.extra.insert(
+            "response_format".to_owned(),
+            json!({ "type": "json_object" }),
+        );
+        req.extra.insert("seed".to_owned(), json!(42));
+        req.extra.insert("logprobs".to_owned(), json!(true));
+        req.extra
+            .insert("parallel_tool_calls".to_owned(), json!(false));
+        let out = serde_json::to_value(translate_request(&req)).unwrap();
+        for field in UNSUPPORTED_CHAT_FIELDS {
+            assert!(out.get(*field).is_none(), "{field} must not reach the wire");
+        }
     }
 
     #[test]

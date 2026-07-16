@@ -65,8 +65,10 @@ pub struct ProviderSpec {
     /// provider's built-in default (issue #65).
     pub api_version: Option<String>,
     /// Reject requests that set an unsupported-but-meaningful field (rather than
-    /// silently dropping it). Currently honored by Ollama for `dimensions`
-    /// (issue #25). Defaults to `false` (lenient).
+    /// silently dropping it). Honored by Ollama for `dimensions` (issue #25) and
+    /// by the translated chat providers (Anthropic, Google/Vertex, Bedrock,
+    /// Cohere) for OpenAI chat fields their upstream schema cannot express
+    /// (issue #72). Defaults to `false` (lenient: drop with a `debug!` trace).
     pub strict: bool,
     /// Per-provider connection-establishment timeout, in ms. When set, this
     /// provider is given its OWN [`reqwest::Client`] (built at registry
@@ -693,12 +695,15 @@ fn build_providers(
             })
         }
         ProviderKind::Anthropic => {
-            let chat: Arc<dyn ChatProvider> = Arc::new(AnthropicProvider::new(
-                client.clone(),
-                spec.name.clone(),
-                spec.base_url.clone(),
-                spec.api_key.clone(),
-            ));
+            let chat: Arc<dyn ChatProvider> = Arc::new(
+                AnthropicProvider::new(
+                    client.clone(),
+                    spec.name.clone(),
+                    spec.base_url.clone(),
+                    spec.api_key.clone(),
+                )
+                .with_strict(spec.strict),
+            );
             Ok(BuiltProviders {
                 chat: Some(chat),
                 embed: None,
@@ -752,12 +757,15 @@ fn build_providers(
             })
         }
         ProviderKind::Cohere => {
-            let provider = Arc::new(CohereProvider::new(
-                client.clone(),
-                spec.name.clone(),
-                spec.base_url.clone(),
-                spec.api_key.clone(),
-            ));
+            let provider = Arc::new(
+                CohereProvider::new(
+                    client.clone(),
+                    spec.name.clone(),
+                    spec.base_url.clone(),
+                    spec.api_key.clone(),
+                )
+                .with_strict(spec.strict),
+            );
             let chat: Arc<dyn ChatProvider> = provider.clone();
             let embed: Arc<dyn EmbeddingProvider> = provider.clone();
             let rerank: Arc<dyn RerankProvider> = provider;
@@ -816,12 +824,15 @@ fn build_providers(
         // Gemini Developer API: chat via `generateContent`, embeddings via
         // `batchEmbedContents` (issue #62) - one instance behind both traits.
         ProviderKind::Google => {
-            let provider = Arc::new(GoogleProvider::new(
-                client.clone(),
-                spec.name.clone(),
-                spec.base_url.clone(),
-                spec.api_key.clone(),
-            ));
+            let provider = Arc::new(
+                GoogleProvider::new(
+                    client.clone(),
+                    spec.name.clone(),
+                    spec.base_url.clone(),
+                    spec.api_key.clone(),
+                )
+                .with_strict(spec.strict),
+            );
             let chat: Arc<dyn ChatProvider> = provider.clone();
             let embed: Arc<dyn EmbeddingProvider> = provider;
             Ok(BuiltProviders {
@@ -865,7 +876,8 @@ fn build_providers(
             .map_err(|e| RegistryError::ProviderConfig {
                 name: spec.name.clone(),
                 message: e.to_string(),
-            })?;
+            })?
+            .with_strict(spec.strict);
             // Chat via `generateContent`, embeddings via `:predict` (issue
             // #62) - the same authenticated instance behind both traits.
             let provider = Arc::new(provider);
@@ -891,13 +903,16 @@ fn build_providers(
                     name: spec.name.clone(),
                 }
             })?;
-            let chat: Arc<dyn ChatProvider> = Arc::new(BedrockProvider::new_with_env_credentials(
-                client.clone(),
-                spec.name.clone(),
-                region,
-                spec.base_url.clone(),
-                spec.api_key.clone(),
-            ));
+            let chat: Arc<dyn ChatProvider> = Arc::new(
+                BedrockProvider::new_with_env_credentials(
+                    client.clone(),
+                    spec.name.clone(),
+                    region,
+                    spec.base_url.clone(),
+                    spec.api_key.clone(),
+                )
+                .with_strict(spec.strict),
+            );
             Ok(BuiltProviders {
                 chat: Some(chat),
                 embed: None,

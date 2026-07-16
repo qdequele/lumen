@@ -388,9 +388,13 @@ pub struct ProviderConfig {
     #[serde(default)]
     pub total_timeout_ms: Option<u64>,
     /// Reject requests that set an unsupported-but-meaningful field instead of
-    /// silently dropping it (issue #25). Currently honored by Ollama for
-    /// `dimensions`: strict returns a 400 (`LM-1001`); lenient (the default)
-    /// drops it with a debug log.
+    /// silently dropping it: strict returns a 400 (`LM-1001`); lenient (the
+    /// default) drops the field with a debug log. Honored by Ollama for
+    /// `dimensions` (issue #25) and by the translated chat providers
+    /// (`anthropic`, `google`, `vertex_ai`, `bedrock`, `cohere`) for OpenAI
+    /// chat fields their upstream schema cannot express - e.g.
+    /// `response_format`/`seed`/`logprobs` on Anthropic (issue #72). See
+    /// `docs/providers.md` for the per-provider field matrix.
     #[serde(default)]
     pub strict: bool,
     /// Per-provider connection-establishment timeout override in ms (else the
