@@ -352,6 +352,37 @@ async fn health_and_metrics_stay_open_when_auth_is_enabled() {
     assert_eq!(metrics.status(), 200);
 }
 
+#[tokio::test]
+async fn model_retrieve_sits_behind_virtual_key_auth() {
+    let upstream = MockServer::start().await;
+    let h = spawn_auth(full_registry(&upstream.uri()), &[]).await;
+
+    // No key: 401 with the standard auth envelope, like every /v1 route.
+    let resp = h
+        .client
+        .get(format!("{}/v1/models/gpt", h.base))
+        .send()
+        .await
+        .expect("send");
+    assert_eq!(resp.status(), 401);
+    let body: Value = resp.json().await.expect("json");
+    assert_eq!(body["error"]["code"], "LM-4004");
+
+    // A valid virtual key gets the model object.
+    let key = h.create_key(None, None, None).await;
+    let resp = h
+        .client
+        .get(format!("{}/v1/models/gpt", h.base))
+        .bearer_auth(&key)
+        .send()
+        .await
+        .expect("send");
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.expect("json");
+    assert_eq!(body["id"], "gpt");
+    assert_eq!(body["object"], "model");
+}
+
 // ---- Hard budgets (criteria 1 & 2) -----------------------------------------
 
 #[tokio::test]

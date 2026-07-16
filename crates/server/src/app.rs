@@ -69,6 +69,7 @@ pub fn build_app(state: AppState) -> Router {
 
     let api = Router::new()
         .route("/v1/models", get(models::models))
+        .route("/v1/models/{id}", get(models::model))
         .route("/v1/chat/completions", post(chat::chat))
         .route("/v1/embeddings", post(embeddings::embeddings))
         .route("/v1/rerank", post(rerank::rerank_handler))

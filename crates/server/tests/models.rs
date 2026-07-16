@@ -1,6 +1,8 @@
-//! End-to-end HTTP tests for `GET /v1/models`: the list reflects only the
-//! operator's configuration (no upstream introspection) and reports each
-//! model's capabilities, including multi-capability models.
+//! End-to-end HTTP tests for `GET /v1/models` and `GET /v1/models/{id}`: the
+//! list reflects only the operator's configuration (no upstream
+//! introspection) and reports each model's capabilities, including
+//! multi-capability models; retrieve serves the same per-model object from
+//! the same snapshot, and an unknown id is a 404 `LM-2001`.
 
 mod common;
 
@@ -84,6 +86,52 @@ async fn lists_configured_models_with_capabilities() {
     let gpt = data.iter().find(|m| m["id"] == "gpt").unwrap();
     assert_eq!(gpt["owned_by"], "openai");
     assert_eq!(gpt["capabilities"][0], "chat");
+}
+
+#[tokio::test]
+async fn retrieve_known_model_matches_its_list_entry() {
+    let base = common::spawn_with(registry(), LIMIT).await;
+
+    // The list entry is the reference shape: retrieve must return the exact
+    // same per-model object (issue #67 acceptance criterion 1).
+    let list: Value = reqwest::get(format!("{base}/v1/models"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let list_entry = list["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == "multi")
+        .unwrap()
+        .clone();
+
+    let resp = reqwest::get(format!("{base}/v1/models/multi"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let retrieved: Value = resp.json().await.unwrap();
+
+    assert_eq!(retrieved, list_entry);
+    // Belt and braces on the OpenAI-shape fields.
+    assert_eq!(retrieved["object"], "model");
+    assert_eq!(retrieved["owned_by"], "cohere");
+}
+
+#[tokio::test]
+async fn retrieve_unknown_model_is_404_lm2001() {
+    let base = common::spawn_with(registry(), LIMIT).await;
+
+    let resp = reqwest::get(format!("{base}/v1/models/no-such-model"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "LM-2001");
+    assert_eq!(body["error"]["type"], "invalid_request");
+    assert_eq!(body["error"]["message"], "model 'no-such-model' not found");
 }
 
 #[tokio::test]

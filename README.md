@@ -40,6 +40,7 @@ reference.
 | `POST /v1/embeddings`          | Embeddings, OpenAI format.                              |
 | `POST /v1/rerank`              | Reranking, Cohere format (`query`, `documents`, `top_n`).|
 | `GET  /v1/models`              | Lists configured models with a `capabilities` array.    |
+| `GET  /v1/models/{id}`         | Retrieves one model (same object as the list entry); unknown id is a 404 (`LM-2001`). |
 | `GET  /health`                 | Liveness. No I/O, never touches the DB or providers.    |
 | `GET  /health/providers`       | Background provider-probe results (opt-in, see below).  |
 | `GET  /metrics`                | Prometheus exposition.                                  |

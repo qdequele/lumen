@@ -8,6 +8,13 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ### Added
 
+- **`GET /v1/models/{id}` (OpenAI retrieve-model)** (issue #67): returns the
+  same per-model object as the corresponding `GET /v1/models` list entry (id,
+  `object: "model"`, `owned_by`, `capabilities`, `modalities`), served from the
+  same registry snapshot as the list. An unknown id is a 404 with the standard
+  `LM-2001` envelope, and the route sits behind the same virtual-key auth layer
+  as every other `/v1` route. OpenAI SDK calls like `client.models.retrieve(...)`
+  now work against LUMEN.
 - **Chat support for the native `ollama` kind** (issue #63). A model declaring
   `capabilities = ["chat"]` on an `ollama` provider now resolves and serves
   `POST /v1/chat/completions`, streaming and non-streaming. Chat reuses the
