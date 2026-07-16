@@ -55,6 +55,7 @@ fn openai_registry(upstream: &str) -> Arc<Registry> {
         kind: ProviderKind::Openai,
         api_key: Some("sk-test-xxx".to_owned()),
         base_url: Some(upstream.to_owned()),
+        api_version: None,
         strict: false,
         connect_timeout_ms: None,
         models: vec![
@@ -88,6 +89,7 @@ fn anthropic_registry(upstream: &str) -> Arc<Registry> {
         kind: ProviderKind::Anthropic,
         api_key: Some("sk-ant-test".to_owned()),
         base_url: Some(upstream.to_owned()),
+        api_version: None,
         strict: false,
         connect_timeout_ms: None,
         models: vec![ModelSpec {
@@ -113,6 +115,7 @@ fn google_registry(upstream: &str) -> Arc<Registry> {
         kind: ProviderKind::Google,
         api_key: Some("goog-test".to_owned()),
         base_url: Some(upstream.to_owned()),
+        api_version: None,
         strict: false,
         connect_timeout_ms: None,
         models: vec![ModelSpec {
@@ -139,6 +142,7 @@ fn anthropic_vision_registry(upstream: &str) -> Arc<Registry> {
         kind: ProviderKind::Anthropic,
         api_key: Some("sk-ant-test".to_owned()),
         base_url: Some(upstream.to_owned()),
+        api_version: None,
         strict: false,
         connect_timeout_ms: None,
         models: vec![ModelSpec {
@@ -165,6 +169,7 @@ fn google_vision_registry(upstream: &str) -> Arc<Registry> {
         kind: ProviderKind::Google,
         api_key: Some("goog-test".to_owned()),
         base_url: Some(upstream.to_owned()),
+        api_version: None,
         strict: false,
         connect_timeout_ms: None,
         models: vec![ModelSpec {
@@ -215,6 +220,7 @@ async fn openai_compatible_kind_routes_through_the_openai_path() {
         kind: ProviderKind::Groq,
         api_key: Some("gsk-test".to_owned()),
         base_url: Some(upstream.uri()), // override the built-in api.groq.com default
+        api_version: None,
         strict: false,
         connect_timeout_ms: None,
         models: vec![ModelSpec {

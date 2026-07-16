@@ -21,6 +21,7 @@ fn registry_for(upstream: &str) -> Arc<Registry> {
         kind: ProviderKind::Cohere,
         api_key: Some("sk-test-xxx".to_owned()),
         base_url: Some(upstream.to_owned()),
+        api_version: None,
         strict: false,
         connect_timeout_ms: None,
         models: vec![
@@ -276,6 +277,7 @@ fn registry_for_jina(upstream: &str) -> Arc<Registry> {
         kind: ProviderKind::Jina,
         api_key: Some("sk-test-xxx".to_owned()),
         base_url: Some(upstream.to_owned()),
+        api_version: None,
         strict: false,
         connect_timeout_ms: None,
         models: vec![ModelSpec {
@@ -303,6 +305,7 @@ fn registry_for_voyage(upstream: &str) -> Arc<Registry> {
         kind: ProviderKind::Voyage,
         api_key: Some("sk-test-xxx".to_owned()),
         base_url: Some(upstream.to_owned()),
+        api_version: None,
         strict: false,
         connect_timeout_ms: None,
         models: vec![ModelSpec {

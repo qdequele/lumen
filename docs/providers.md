@@ -511,9 +511,14 @@ capabilities = ["embed"]
 - **Auth**: `api_key_env`, sent as the `api-key` header (never a bearer token).
 - **base_url**: **required** - your Azure resource endpoint, e.g.
   `https://<resource>.openai.azure.com` (no shared public default, every
-  resource is operator-specific). Optionally append `?api-version=YYYY-MM-DD`
-  to pin a specific Azure API version; omitted, LUMEN uses a pinned recent
-  default (see the `azure` module doc comment for the exact value).
+  resource is operator-specific).
+- **api_version**: optional - pins the Azure API version sent as the
+  `api-version` query parameter on every request (issue #65). For back-compat
+  the older form still works: append `?api-version=YYYY-MM-DD` to `base_url`.
+  Precedence: the explicit `api_version` field wins over a `base_url` query
+  string, which wins over LUMEN's pinned built-in default (see the `azure`
+  module doc comment for the exact value). `api_version` is azure-only:
+  setting it on any other kind is rejected at boot.
 - **Deployment routing**: Azure routes by URL path
   (`/openai/deployments/{deployment}/...`), not by the `model` field in the
   body. Set each model's `upstream_id` to the **Azure deployment name** - the
@@ -521,16 +526,14 @@ capabilities = ["embed"]
   carries it through.
 - **Embed batch limit**: 2048 (same array-size ceiling as the OpenAI
   embedding models Azure hosts).
-- **Known gap**: there is no dedicated `api_version` config field yet (it
-  would need a matching `crates/server` config change); the `base_url` query
-  string is the workaround above.
 
 ```toml
 [[providers]]
 name = "azure-openai"
 kind = "azure"
 api_key_env = "AZURE_OPENAI_API_KEY"
-base_url = "https://my-resource.openai.azure.com?api-version=2024-10-21"
+base_url = "https://my-resource.openai.azure.com"
+api_version = "2024-10-21"
 
 [[providers.models]]
 id = "gpt-4o"

@@ -407,13 +407,18 @@ capabilities = ["rerank"]
 # (/openai/deployments/{deployment}/...), not the `model` field, so each
 # model's `upstream_id` below must be the Azure DEPLOYMENT NAME, not an
 # OpenAI model id. `base_url` is required (every Azure resource endpoint is
-# operator-specific) and may carry an `?api-version=YYYY-MM-DD` override;
-# omitted, a pinned built-in default applies (see `crates/providers/src/azure`).
+# operator-specific). The Azure API version is selected by the optional
+# `api_version` field below; for back-compat, `base_url` may instead carry an
+# `?api-version=YYYY-MM-DD` query string. Precedence: the `api_version` field
+# wins over the `base_url` query string, which wins over a pinned built-in
+# default (see `crates/providers/src/azure`). `api_version` is azure-only:
+# setting it on any other kind is a boot-time config error.
 [[providers]]
 name = "azure-openai"
 kind = "azure"
 api_key_env = "AZURE_OPENAI_API_KEY"
-base_url = "https://my-resource.openai.azure.com?api-version=2024-10-21"
+base_url = "https://my-resource.openai.azure.com"
+api_version = "2024-10-21"
 
 [[providers.models]]
 id = "azure-gpt-4o"

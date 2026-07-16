@@ -20,13 +20,12 @@
 //! config field: set a model's `upstream_id` to the Azure **deployment
 //! name**, and by the time this provider runs, `req.model` already carries it.
 //!
-//! **`api-version`.** [`crate::registry::ProviderSpec`] has no dedicated
-//! `api_version` field today - adding one needs a matching `crates/server`
-//! config change, which is out of this crate's scope (flagged in the
-//! provider-integrator report). Until then, the operator selects the
-//! `api-version` via the provider's `base_url`: append
-//! `?api-version=YYYY-MM-DD` and it is used verbatim on every request; omit
-//! it and [`DEFAULT_API_VERSION`] applies.
+//! **`api-version`.** The operator selects the version with the provider's
+//! first-class `api_version` config field (threaded through
+//! [`crate::registry::ProviderSpec`]). For back-compat, appending
+//! `?api-version=YYYY-MM-DD` to `base_url` still works. Precedence (issue
+//! #65): the explicit `api_version` field wins over an `?api-version=...`
+//! query string on `base_url`, which wins over [`DEFAULT_API_VERSION`].
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -41,11 +40,11 @@ use tokio_util::sync::CancellationToken;
 use crate::chat::{enable_stream_usage, single_shot_stream};
 use crate::http::{open_stream_with_headers, post_json_with_headers};
 
-/// Azure OpenAI `api-version` used when the configured `base_url` carries
-/// none. Overridable per provider: append `?api-version=YYYY-MM-DD` to
-/// `base_url`. Pinned rather than "latest" so a given LUMEN build's upstream
-/// wire shape never shifts under an operator without a deliberate config
-/// change.
+/// Azure OpenAI `api-version` used when neither the provider's `api_version`
+/// config field nor an `?api-version=YYYY-MM-DD` query string on `base_url`
+/// supplies one. Pinned rather than "latest" so a given LUMEN build's
+/// upstream wire shape never shifts under an operator without a deliberate
+/// config change.
 const DEFAULT_API_VERSION: &str = "2024-10-21";
 
 /// Azure OpenAI's documented maximum number of inputs per embeddings request
@@ -71,20 +70,40 @@ pub struct AzureProvider {
 impl AzureProvider {
     /// Construct a provider. `base_url` is the Azure resource endpoint
     /// (`https://<resource>.openai.azure.com`), optionally carrying an
-    /// `?api-version=...` override. Required: unlike the public OpenAI kind,
-    /// Azure has no shared default endpoint - every resource is operator
-    /// specific.
+    /// `?api-version=...` override (kept for back-compat). Required: unlike
+    /// the public OpenAI kind, Azure has no shared default endpoint - every
+    /// resource is operator specific.
+    ///
+    /// `api_version` is the first-class config field (issue #65). Precedence:
+    /// an explicit `api_version` wins over an `?api-version=...` query string
+    /// on `base_url`, which wins over [`DEFAULT_API_VERSION`].
     #[must_use]
     pub fn new(
         client: reqwest::Client,
         provider_name: impl Into<String>,
         base_url: &str,
+        api_version: Option<String>,
         api_key: Option<String>,
     ) -> Self {
-        let (endpoint, api_version) = split_endpoint_and_version(base_url);
+        let provider_name = provider_name.into();
+        let (endpoint, url_version) = split_endpoint_and_version(base_url);
+        if let (Some(explicit), Some(from_url)) = (&api_version, &url_version) {
+            if explicit != from_url {
+                tracing::warn!(
+                    provider = %provider_name,
+                    api_version = %explicit,
+                    base_url_api_version = %from_url,
+                    "both the api_version field and an ?api-version= query on \
+                     base_url are set; the explicit api_version field wins"
+                );
+            }
+        }
+        let api_version = api_version
+            .or(url_version)
+            .unwrap_or_else(|| DEFAULT_API_VERSION.to_owned());
         Self {
             client,
-            provider_name: provider_name.into(),
+            provider_name,
             endpoint,
             api_version,
             api_key,
@@ -146,20 +165,19 @@ const fn hex_digit(nibble: u8) -> char {
 }
 
 /// Split a configured `base_url` into its bare endpoint (scheme + host,
-/// trailing slash and any query string stripped) and its `api-version`,
-/// taken from an `?api-version=...` query parameter if present, else
-/// [`DEFAULT_API_VERSION`].
-fn split_endpoint_and_version(base_url: &str) -> (String, String) {
+/// trailing slash and any query string stripped) and the `api-version`
+/// carried by an `?api-version=...` query parameter, `None` when absent
+/// (the caller applies the field/default precedence).
+fn split_endpoint_and_version(base_url: &str) -> (String, Option<String>) {
     let trimmed = base_url.trim_end_matches('/');
     let Some((endpoint, query)) = trimmed.split_once('?') else {
-        return (trimmed.to_owned(), DEFAULT_API_VERSION.to_owned());
+        return (trimmed.to_owned(), None);
     };
     let version = query
         .split('&')
         .find_map(|pair| pair.strip_prefix("api-version="))
         .filter(|v| !v.is_empty())
-        .unwrap_or(DEFAULT_API_VERSION)
-        .to_owned();
+        .map(str::to_owned);
     (endpoint.trim_end_matches('/').to_owned(), version)
 }
 
@@ -267,7 +285,7 @@ mod tests {
             "https://my-resource.openai.azure.com/?api-version=2024-06-01",
         );
         assert_eq!(endpoint, "https://my-resource.openai.azure.com");
-        assert_eq!(version, "2024-06-01");
+        assert_eq!(version.as_deref(), Some("2024-06-01"));
     }
 
     #[test]
@@ -275,7 +293,59 @@ mod tests {
         let (endpoint, version) =
             split_endpoint_and_version("https://my-resource.openai.azure.com");
         assert_eq!(endpoint, "https://my-resource.openai.azure.com");
-        assert_eq!(version, DEFAULT_API_VERSION);
+        assert_eq!(version, None);
+        // The constructor applies the pinned default when neither the field
+        // nor the query string supplies a version.
+        let provider = AzureProvider::new(
+            reqwest::Client::new(),
+            "azure-test",
+            "https://my-resource.openai.azure.com",
+            None,
+            Some("sk-test-xxx".to_owned()),
+        );
+        assert_eq!(provider.api_version, DEFAULT_API_VERSION);
+    }
+
+    #[test]
+    fn explicit_api_version_field_wins_over_the_query_string() {
+        let provider = AzureProvider::new(
+            reqwest::Client::new(),
+            "azure-test",
+            "https://my-resource.openai.azure.com/?api-version=2023-05-15",
+            Some("2025-01-01-preview".to_owned()),
+            Some("sk-test-xxx".to_owned()),
+        );
+        assert_eq!(provider.api_version, "2025-01-01-preview");
+        let url = provider.deployment_url("d", "chat/completions");
+        assert!(
+            url.ends_with("?api-version=2025-01-01-preview"),
+            "unexpected url: {url}"
+        );
+    }
+
+    #[test]
+    fn explicit_api_version_field_wins_over_the_default() {
+        let provider = AzureProvider::new(
+            reqwest::Client::new(),
+            "azure-test",
+            "https://my-resource.openai.azure.com",
+            Some("2025-01-01-preview".to_owned()),
+            Some("sk-test-xxx".to_owned()),
+        );
+        assert_eq!(provider.api_version, "2025-01-01-preview");
+    }
+
+    #[test]
+    fn query_string_version_still_wins_over_the_default_without_the_field() {
+        // Back-compat: the pre-#65 configuration form behaves unchanged.
+        let provider = AzureProvider::new(
+            reqwest::Client::new(),
+            "azure-test",
+            "https://my-resource.openai.azure.com/?api-version=2024-06-01",
+            None,
+            Some("sk-test-xxx".to_owned()),
+        );
+        assert_eq!(provider.api_version, "2024-06-01");
     }
 
     #[test]
@@ -284,6 +354,7 @@ mod tests {
             reqwest::Client::new(),
             "azure-test",
             "https://my-resource.openai.azure.com",
+            None,
             Some("sk-test-xxx".to_owned()),
         );
         let url = provider.deployment_url("my-gpt4o-deployment", "chat/completions");
@@ -300,16 +371,17 @@ mod tests {
             "https://my-resource.openai.azure.com/?foo=bar&api-version=2024-06-01",
         );
         assert_eq!(endpoint, "https://my-resource.openai.azure.com");
-        assert_eq!(version, "2024-06-01");
+        assert_eq!(version.as_deref(), Some("2024-06-01"));
         // api-version before an unrelated param.
         let (_, version) = split_endpoint_and_version(
             "https://my-resource.openai.azure.com/?api-version=2024-06-01&foo=bar",
         );
-        assert_eq!(version, "2024-06-01");
-        // Only unrelated params: fall back to the default.
+        assert_eq!(version.as_deref(), Some("2024-06-01"));
+        // Only unrelated params: nothing to extract (the constructor then
+        // falls back to the default).
         let (_, version) =
             split_endpoint_and_version("https://my-resource.openai.azure.com/?foo=bar");
-        assert_eq!(version, DEFAULT_API_VERSION);
+        assert_eq!(version, None);
     }
 
     #[test]
@@ -318,6 +390,7 @@ mod tests {
             reqwest::Client::new(),
             "azure-test",
             "https://my-resource.openai.azure.com",
+            None,
             Some("sk-test-xxx".to_owned()),
         );
         // A hostile/typo'd deployment name must stay ONE opaque path segment:
@@ -340,6 +413,7 @@ mod tests {
             reqwest::Client::new(),
             "azure-test",
             "https://my-resource.openai.azure.com/?api-version=2024-06-01&x=y",
+            None,
             Some("sk-test-xxx".to_owned()),
         );
         let url = provider.deployment_url("d", "embeddings");
@@ -351,11 +425,12 @@ mod tests {
         let (_, version) = split_endpoint_and_version(
             "https://my-resource.openai.azure.com/?api-version=2024 06 01&sig=a=b",
         );
-        assert_eq!(version, "2024 06 01");
+        assert_eq!(version.as_deref(), Some("2024 06 01"));
         let provider = AzureProvider::new(
             reqwest::Client::new(),
             "azure-test",
             "https://my-resource.openai.azure.com/?api-version=2024 06 01",
+            None,
             Some("sk-test-xxx".to_owned()),
         );
         let url = provider.deployment_url("d", "embeddings");
@@ -371,6 +446,7 @@ mod tests {
             reqwest::Client::new(),
             "azure-test",
             "https://my-resource.openai.azure.com",
+            None,
             Some("sk-test-xxx".to_owned()),
         );
         let dbg = format!("{provider:?}");

@@ -95,6 +95,7 @@ async fn chat_envelope_stays_heuristic_while_metrics_get_the_accurate_count() {
         kind: ProviderKind::Openai,
         api_key: Some("sk-test".to_owned()),
         base_url: Some(upstream.uri()),
+        api_version: None,
         strict: false,
         connect_timeout_ms: None,
         models: vec![ModelSpec {
@@ -161,6 +162,7 @@ async fn embed_envelope_stays_heuristic_while_metrics_get_the_accurate_count() {
         kind: ProviderKind::Openai,
         api_key: Some("sk-test".to_owned()),
         base_url: Some(upstream.uri()),
+        api_version: None,
         strict: false,
         connect_timeout_ms: None,
         models: vec![ModelSpec {
@@ -221,6 +223,7 @@ async fn rerank_metrics_get_the_accurate_count_via_the_deferred_close() {
         kind: ProviderKind::Cohere,
         api_key: Some("sk-test".to_owned()),
         base_url: Some(upstream.uri()),
+        api_version: None,
         strict: false,
         connect_timeout_ms: None,
         models: vec![ModelSpec {

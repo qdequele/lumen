@@ -6,6 +6,18 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **First-class `api_version` config field for the `azure` kind** (issue
+  #65). The Azure OpenAI API version no longer has to be smuggled into
+  `base_url` as an `?api-version=...` query string: providers of
+  `kind = "azure"` accept an optional `api_version` field, threaded through
+  `ProviderSpec` into the provider. Precedence: the explicit `api_version`
+  field wins over an `?api-version=...` query string on `base_url` (which
+  keeps working for back-compat), which wins over the pinned built-in
+  default. Setting `api_version` on any other kind is a boot-time config
+  validation error.
+
 ### Changed
 
 - **Refreshed the LUMEN-vs-LiteLLM baseline** (`bench/run.sh` at commit

@@ -333,10 +333,15 @@ milestone.
   `crates/providers/src/bedrock/`), ~~Google Vertex AI (GCP OAuth, regional
   endpoints)~~ (shipped - `kind = "vertex_ai"`,
   `crates/providers/src/google/vertex/`).
-- **Azure: dedicated `api_version` config field** - a desired fast-follow to
+- ~~**Azure: dedicated `api_version` config field** - a desired fast-follow to
   the shipped `azure` kind, which currently reads the version from an
   `?api-version=...` query string on `base_url`. A first-class field needs a
-  matching `ProviderSpec` + `crates/server/src/config.rs` change.
+  matching `ProviderSpec` + `crates/server/src/config.rs` change.~~
+  **Resolved (issue #65).** The provider config now takes an optional
+  `api_version` field (azure-only, rejected on other kinds at boot), threaded
+  through `ProviderSpec` into `AzureProvider`. Precedence: the explicit field
+  wins over an `?api-version=...` query string on `base_url` (kept for
+  back-compat), which wins over the pinned built-in default.
 - ~~**Cohere chat** (Command R/R+) - we ship Cohere embed+rerank; chat is a
   distinct schema.~~ **Resolved** (shipped -
   `crates/providers/src/cohere/chat.rs`, text chat + streaming + tools). The

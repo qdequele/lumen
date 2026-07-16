@@ -120,6 +120,7 @@ async fn chat_nominal_hits_deployment_url_with_api_version_and_api_key_header() 
         reqwest::Client::new(),
         "azure-test",
         &format!("{}/?api-version=2024-06-01", mock.uri()),
+        None,
         Some(API_KEY.to_owned()),
     );
 
@@ -158,6 +159,7 @@ async fn chat_without_an_explicit_api_version_uses_the_built_in_default() {
         reqwest::Client::new(),
         "azure-test",
         &mock.uri(), // no ?api-version=... override
+        None,        // no first-class api_version either
         Some(API_KEY.to_owned()),
     );
 
@@ -183,6 +185,7 @@ async fn embed_nominal_hits_the_embeddings_deployment_url() {
         reqwest::Client::new(),
         "azure-test",
         &mock.uri(),
+        None,
         Some(API_KEY.to_owned()),
     );
 
@@ -209,6 +212,7 @@ async fn deployment_name_with_reserved_characters_stays_one_encoded_path_segment
         reqwest::Client::new(),
         "azure-test",
         &mock.uri(),
+        None,
         Some(API_KEY.to_owned()),
     );
 
@@ -246,6 +250,7 @@ async fn base_url_with_extra_unrelated_query_params_still_extracts_api_version()
         reqwest::Client::new(),
         "azure-test",
         &format!("{}/?foo=bar&api-version=2024-06-01&baz=1", mock.uri()),
+        None,
         Some(API_KEY.to_owned()),
     );
 
@@ -258,6 +263,73 @@ async fn base_url_with_extra_unrelated_query_params_still_extracts_api_version()
     assert_eq!(requests.len(), 1);
     // Exactly the api-version pair: unrelated base_url params are dropped.
     assert_eq!(requests[0].url.query(), Some("api-version=2024-06-01"));
+}
+
+#[tokio::test]
+async fn explicit_api_version_field_is_used_when_base_url_has_no_query() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/openai/deployments/{DEPLOYMENT}/chat/completions"
+        )))
+        .and(query_param("api-version", "2025-01-01-preview"))
+        .and(header("api-key", API_KEY))
+        .respond_with(ResponseTemplate::new(200).set_body_json(chat_response_body()))
+        .mount(&mock)
+        .await;
+
+    // The first-class config field, no query string on base_url.
+    let provider = AzureProvider::new(
+        reqwest::Client::new(),
+        "azure-test",
+        &mock.uri(),
+        Some("2025-01-01-preview".to_owned()),
+        Some(API_KEY.to_owned()),
+    );
+
+    provider
+        .chat(chat_request(), CancellationToken::new())
+        .await
+        .unwrap();
+
+    let requests = mock.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].url.query(),
+        Some("api-version=2025-01-01-preview")
+    );
+}
+
+#[tokio::test]
+async fn explicit_api_version_field_wins_over_the_base_url_query_string() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(format!("/openai/deployments/{DEPLOYMENT}/embeddings")))
+        .and(query_param("api-version", "2025-01-01-preview"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(embed_response_body()))
+        .mount(&mock)
+        .await;
+
+    // Both forms set: the explicit field wins over the base_url query string.
+    let provider = AzureProvider::new(
+        reqwest::Client::new(),
+        "azure-test",
+        &format!("{}/?api-version=2023-05-15", mock.uri()),
+        Some("2025-01-01-preview".to_owned()),
+        Some(API_KEY.to_owned()),
+    );
+
+    provider
+        .embed(embed_request(), CancellationToken::new())
+        .await
+        .unwrap();
+
+    let requests = mock.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].url.query(),
+        Some("api-version=2025-01-01-preview")
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -285,6 +357,7 @@ async fn chat_stream_forwards_deployment_url_and_upstream_sse_bytes_verbatim() {
         reqwest::Client::new(),
         "azure-test",
         &mock.uri(),
+        None,
         Some(API_KEY.to_owned()),
     );
 
@@ -328,6 +401,7 @@ async fn chat_stream_client_drop_mid_stream_does_not_hang() {
         reqwest::Client::new(),
         "azure-test",
         &mock.uri(),
+        None,
         Some(API_KEY.to_owned()),
     );
 
@@ -378,6 +452,7 @@ async fn rate_limited_429_maps_to_rate_limited_with_retry_after() {
         reqwest::Client::new(),
         "azure-test",
         &mock.uri(),
+        None,
         Some(API_KEY.to_owned()),
     );
 
@@ -401,6 +476,7 @@ async fn upstream_500_maps_to_retryable_upstream_error() {
         reqwest::Client::new(),
         "azure-test",
         &mock.uri(),
+        None,
         Some(API_KEY.to_owned()),
     );
 
@@ -430,6 +506,7 @@ async fn malformed_response_body_maps_to_translation_error() {
         reqwest::Client::new(),
         "azure-test",
         &mock.uri(),
+        None,
         Some(API_KEY.to_owned()),
     );
 
@@ -460,7 +537,13 @@ async fn slow_upstream_beyond_the_client_timeout_maps_to_timeout() {
         .timeout(Duration::from_millis(100))
         .build()
         .unwrap();
-    let provider = AzureProvider::new(client, "azure-test", &mock.uri(), Some(API_KEY.to_owned()));
+    let provider = AzureProvider::new(
+        client,
+        "azure-test",
+        &mock.uri(),
+        None,
+        Some(API_KEY.to_owned()),
+    );
 
     let err = provider
         .chat(chat_request(), CancellationToken::new())
@@ -491,6 +574,7 @@ async fn chat_cancellation_aborts_the_upstream_call() {
         reqwest::Client::new(),
         "azure-test",
         &mock.uri(),
+        None,
         Some(API_KEY.to_owned()),
     );
 
@@ -525,6 +609,7 @@ async fn embed_cancellation_aborts_the_upstream_call() {
         reqwest::Client::new(),
         "azure-test",
         &mock.uri(),
+        None,
         Some(API_KEY.to_owned()),
     );
 
@@ -554,6 +639,7 @@ fn debug_never_shows_the_api_key() {
         reqwest::Client::new(),
         "azure-test",
         "https://my-resource.openai.azure.com",
+        None,
         Some(API_KEY.to_owned()),
     );
     let dbg = format!("{provider:?}");

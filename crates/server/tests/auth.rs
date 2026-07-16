@@ -42,6 +42,7 @@ fn full_registry(upstream: &str) -> Arc<Registry> {
             kind: ProviderKind::Openai,
             api_key: Some("sk-test-xxx".to_owned()),
             base_url: Some(upstream.to_owned()),
+            api_version: None,
             strict: false,
             connect_timeout_ms: None,
             models: vec![
@@ -64,6 +65,7 @@ fn full_registry(upstream: &str) -> Arc<Registry> {
             kind: ProviderKind::Cohere,
             api_key: Some("sk-co-test".to_owned()),
             base_url: Some(upstream.to_owned()),
+            api_version: None,
             strict: false,
             connect_timeout_ms: None,
             models: vec![ModelSpec {
@@ -78,6 +80,7 @@ fn full_registry(upstream: &str) -> Arc<Registry> {
             kind: ProviderKind::Tei,
             api_key: None,
             base_url: Some(upstream.to_owned()),
+            api_version: None,
             strict: false,
             connect_timeout_ms: None,
             models: vec![ModelSpec {

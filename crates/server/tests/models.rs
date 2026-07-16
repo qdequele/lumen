@@ -17,6 +17,7 @@ fn registry() -> Arc<Registry> {
             kind: ProviderKind::Cohere,
             api_key: Some("sk-test-xxx".to_owned()),
             base_url: None,
+            api_version: None,
             strict: false,
             connect_timeout_ms: None,
             models: vec![ModelSpec {
@@ -32,6 +33,7 @@ fn registry() -> Arc<Registry> {
             kind: ProviderKind::Openai,
             api_key: Some("sk-test-xxx".to_owned()),
             base_url: None,
+            api_version: None,
             strict: false,
             connect_timeout_ms: None,
             models: vec![ModelSpec {
