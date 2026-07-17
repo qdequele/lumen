@@ -16,14 +16,16 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use lumen_core::{EmbedInput, EmbedRequest, EmbeddingProvider, ProviderError};
+use lumen_core::{
+    ContentPart, EmbedInput, EmbedItem, EmbedRequest, EmbeddingProvider, ImageUrl, ProviderError,
+};
 use lumen_providers::{
-    batch, CohereProvider, JinaProvider, MistralProvider, OllamaProvider, OpenAiProvider,
-    TeiProvider, VoyageProvider,
+    batch, CohereProvider, GoogleProvider, JinaProvider, MistralProvider, OllamaProvider,
+    OpenAiProvider, TeiProvider, VertexProvider, VoyageProvider,
 };
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
-use wiremock::matchers::method;
+use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 // --------------------------------------------------------------------------
@@ -465,6 +467,170 @@ impl EmbedFixture for VoyageEmbedFixture {
 }
 
 // --------------------------------------------------------------------------
+// Google (Gemini API) fixture - request `requests[].content.parts[].text`,
+// response `{ embeddings: [{ values }] }` (+ optional usageMetadata)
+// --------------------------------------------------------------------------
+
+struct GoogleEmbedFixture;
+
+struct GoogleEcho;
+impl Respond for GoogleEcho {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
+        let empty = Vec::new();
+        let requests = body["requests"].as_array().unwrap_or(&empty);
+        let embeddings: Vec<Value> = requests
+            .iter()
+            .map(|r| {
+                let text = r["content"]["parts"][0]["text"].as_str().unwrap_or("");
+                json!({ "values": [text.parse::<f32>().unwrap_or(f32::NAN)] })
+            })
+            .collect();
+        let n = requests.len();
+        ResponseTemplate::new(200).set_body_json(json!({
+            "embeddings": embeddings,
+            "usageMetadata": { "promptTokenCount": n }
+        }))
+    }
+}
+
+#[async_trait]
+impl EmbedFixture for GoogleEmbedFixture {
+    fn build(&self, base_url: String) -> Arc<dyn EmbeddingProvider> {
+        Arc::new(GoogleProvider::new(
+            reqwest::Client::new(),
+            "google-test",
+            Some(base_url),
+            Some("goog-test-key".to_owned()),
+        ))
+    }
+
+    async fn mount_echo(&self, mock: &MockServer) {
+        Mock::given(method("POST"))
+            .respond_with(GoogleEcho)
+            .mount(mock)
+            .await;
+    }
+
+    async fn mount_delayed(&self, mock: &MockServer, delay: Duration) {
+        let body = json!({
+            "embeddings": [{ "values": [0.0] }],
+            "usageMetadata": { "promptTokenCount": 1 }
+        });
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(body)
+                    .set_delay(delay),
+            )
+            .mount(mock)
+            .await;
+    }
+}
+
+// --------------------------------------------------------------------------
+// Vertex AI fixture - request `instances[].content` (`:predict`), response
+// `{ predictions: [{ embeddings: { values, statistics } }] }`. The OAuth
+// token endpoint lives on its OWN mock server so the shared scenarios'
+// received-request counts on the upstream mock stay exact.
+// --------------------------------------------------------------------------
+
+const VERTEX_TEST_KEY: &str = include_str!("../src/google/vertex/testdata/test_private_key.pem");
+
+struct VertexEmbedFixture {
+    token_server: MockServer,
+}
+
+impl VertexEmbedFixture {
+    async fn new() -> Self {
+        let token_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "ya29.embed-test",
+                "expires_in": 3600,
+                "token_type": "Bearer",
+            })))
+            .mount(&token_server)
+            .await;
+        Self { token_server }
+    }
+}
+
+struct VertexEcho;
+impl Respond for VertexEcho {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
+        let empty = Vec::new();
+        let instances = body["instances"].as_array().unwrap_or(&empty);
+        let predictions: Vec<Value> = instances
+            .iter()
+            .map(|i| {
+                let text = i["content"].as_str().unwrap_or("");
+                json!({
+                    "embeddings": {
+                        "values": [text.parse::<f32>().unwrap_or(f32::NAN)],
+                        "statistics": { "token_count": 1, "truncated": false }
+                    }
+                })
+            })
+            .collect();
+        ResponseTemplate::new(200).set_body_json(json!({ "predictions": predictions }))
+    }
+}
+
+#[async_trait]
+impl EmbedFixture for VertexEmbedFixture {
+    fn build(&self, base_url: String) -> Arc<dyn EmbeddingProvider> {
+        let creds = json!({
+            "type": "service_account",
+            "project_id": "my-project",
+            "client_email": "svc@my-project.iam.gserviceaccount.com",
+            "private_key": VERTEX_TEST_KEY,
+            "token_uri": format!("{}/token", self.token_server.uri()),
+        })
+        .to_string();
+        Arc::new(
+            VertexProvider::new(
+                reqwest::Client::new(),
+                "vertex-test",
+                Some(&creds),
+                Some("my-project".to_owned()),
+                Some("us-central1".to_owned()),
+                Some(base_url),
+            )
+            .expect("vertex provider builds"),
+        )
+    }
+
+    async fn mount_echo(&self, mock: &MockServer) {
+        Mock::given(method("POST"))
+            .respond_with(VertexEcho)
+            .mount(mock)
+            .await;
+    }
+
+    async fn mount_delayed(&self, mock: &MockServer, delay: Duration) {
+        let body = json!({
+            "predictions": [{
+                "embeddings": {
+                    "values": [0.0],
+                    "statistics": { "token_count": 1, "truncated": false }
+                }
+            }]
+        });
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(body)
+                    .set_delay(delay),
+            )
+            .mount(mock)
+            .await;
+    }
+}
+
+// --------------------------------------------------------------------------
 // Shared error mounts (schema-agnostic)
 // --------------------------------------------------------------------------
 
@@ -694,6 +860,17 @@ async fn mistral_passes_embed_conformance_suite() {
     run_conformance(&MistralEmbedFixture).await;
 }
 
+#[tokio::test]
+async fn google_passes_embed_conformance_suite() {
+    run_conformance(&GoogleEmbedFixture).await;
+}
+
+#[tokio::test]
+async fn vertex_passes_embed_conformance_suite() {
+    let fx = VertexEmbedFixture::new().await;
+    run_conformance(&fx).await;
+}
+
 /// M2 acceptance criterion 1, verbatim: 5000 inputs, max_batch 2048 → exactly
 /// 3 upstream calls, 5000 embeddings in order, usage summed.
 #[tokio::test]
@@ -789,6 +966,172 @@ async fn voyage_rejects_token_input_before_any_call() {
 #[tokio::test]
 async fn mistral_rejects_token_input_before_any_call() {
     assert_rejects_token_input(&MistralEmbedFixture, "mistral").await;
+}
+
+#[tokio::test]
+async fn google_rejects_token_input_before_any_call() {
+    assert_rejects_token_input(&GoogleEmbedFixture, "google").await;
+}
+
+#[tokio::test]
+async fn vertex_rejects_token_input_before_any_call() {
+    let fx = VertexEmbedFixture::new().await;
+    assert_rejects_token_input(&fx, "vertex").await;
+}
+
+/// Gemini and Vertex embeddings are text-only: an image-carrying `Multi` input
+/// must be rejected with an honest client error BEFORE any upstream call
+/// (rule 8), never forwarded as a garbled body.
+async fn assert_rejects_image_input(fx: &dyn EmbedFixture, provider_label: &str) {
+    let mock = MockServer::start().await;
+    fx.mount_echo(&mock).await;
+    let provider = fx.build(mock.uri());
+
+    let req = EmbedRequest {
+        model: "test-model".to_owned(),
+        input: EmbedInput::Multi(vec![EmbedItem::Parts(vec![ContentPart {
+            kind: "image_url".to_owned(),
+            text: None,
+            image_url: Some(ImageUrl {
+                url: "data:image/png;base64,QUJD".to_owned(),
+                detail: None,
+            }),
+            extra: serde_json::Map::new(),
+        }])]),
+        encoding_format: None,
+        dimensions: None,
+        user: None,
+        extra: serde_json::Map::new(),
+    };
+    let err = provider
+        .embed(req, CancellationToken::new())
+        .await
+        .expect_err("image input must be rejected");
+    assert!(
+        matches!(err, ProviderError::UnsupportedInput { .. }),
+        "{provider_label}: unexpected error {err:?}"
+    );
+    assert_eq!(
+        mock.received_requests().await.unwrap().len(),
+        0,
+        "{provider_label}: upstream must never be contacted for image input"
+    );
+}
+
+#[tokio::test]
+async fn google_rejects_image_input_before_any_call() {
+    assert_rejects_image_input(&GoogleEmbedFixture, "google").await;
+}
+
+#[tokio::test]
+async fn vertex_rejects_image_input_before_any_call() {
+    let fx = VertexEmbedFixture::new().await;
+    assert_rejects_image_input(&fx, "vertex").await;
+}
+
+/// The google kind must call `models/{model}:batchEmbedContents` with the
+/// key in the `x-goog-api-key` header (never the URL), one inner request per
+/// input carrying the URL-matching `model` path, and `outputDimensionality`
+/// mapped from the OpenAI `dimensions` field.
+#[tokio::test]
+async fn google_embed_hits_batch_embed_contents_with_expected_body() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(
+            "/v1beta/models/gemini-embedding-001:batchEmbedContents",
+        ))
+        .and(wiremock::matchers::header(
+            "x-goog-api-key",
+            "goog-test-key",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "embeddings": [{ "values": [0.1] }, { "values": [0.2] }]
+        })))
+        .expect(1)
+        .mount(&mock)
+        .await;
+    let provider = GoogleEmbedFixture.build(mock.uri());
+
+    let mut req = batch_request(vec!["a".into(), "b".into()]);
+    req.model = "gemini-embedding-001".to_owned();
+    req.dimensions = Some(256);
+    let resp = provider.embed(req, CancellationToken::new()).await.unwrap();
+    assert_eq!(resp.data.len(), 2);
+    // No usageMetadata in this response: zeroed usage, so the gateway derives
+    // the ADR-003 estimate at the request edge.
+    assert_eq!(resp.usage.prompt_tokens, 0);
+    assert_eq!(resp.usage.total_tokens, 0);
+
+    let requests = mock.received_requests().await.unwrap();
+    let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(
+        body,
+        json!({
+            "requests": [
+                {
+                    "model": "models/gemini-embedding-001",
+                    "content": { "parts": [{ "text": "a" }] },
+                    "outputDimensionality": 256
+                },
+                {
+                    "model": "models/gemini-embedding-001",
+                    "content": { "parts": [{ "text": "b" }] },
+                    "outputDimensionality": 256
+                }
+            ]
+        })
+    );
+    // The key must never appear in the URL.
+    assert!(!requests[0].url.as_str().contains("goog-test-key"));
+}
+
+/// The vertex_ai kind must call the regional, project-scoped `:predict`
+/// endpoint (Vertex does not expose `batchEmbedContents`) with Bearer auth,
+/// `instances[].content` per input, `parameters.outputDimensionality` mapped
+/// from `dimensions`, and upstream `statistics.token_count` summed as usage.
+#[tokio::test]
+async fn vertex_embed_hits_predict_with_expected_body_and_sums_usage() {
+    let fx = VertexEmbedFixture::new().await;
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(
+            "/v1/projects/my-project/locations/us-central1/publishers/google/models/gemini-embedding-001:predict",
+        ))
+        .and(wiremock::matchers::header(
+            "authorization",
+            "Bearer ya29.embed-test",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "predictions": [
+                { "embeddings": { "values": [0.1], "statistics": { "token_count": 3, "truncated": false } } },
+                { "embeddings": { "values": [0.2], "statistics": { "token_count": 4, "truncated": false } } }
+            ]
+        })))
+        .expect(1)
+        .mount(&mock)
+        .await;
+    let provider = fx.build(mock.uri());
+
+    let mut req = batch_request(vec!["a".into(), "b".into()]);
+    req.model = "gemini-embedding-001".to_owned();
+    req.dimensions = Some(128);
+    let resp = provider.embed(req, CancellationToken::new()).await.unwrap();
+    assert_eq!(resp.data.len(), 2);
+    assert_eq!(resp.data[0].embedding, vec![0.1]);
+    assert_eq!(resp.data[1].embedding, vec![0.2]);
+    // Upstream-reported usage: summed across predictions, not estimated.
+    assert_eq!(resp.usage.prompt_tokens, 7);
+    assert_eq!(resp.usage.total_tokens, 7);
+
+    let requests = mock.received_requests().await.unwrap();
+    let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(
+        body,
+        json!({
+            "instances": [{ "content": "a" }, { "content": "b" }],
+            "parameters": { "outputDimensionality": 128 }
+        })
+    );
 }
 
 /// The OpenAI-compatible passthrough must keep accepting token arrays: they

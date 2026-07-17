@@ -59,6 +59,19 @@ All notable changes to LUMEN are documented here. The format is based on
   (an operator-run proxy that may serve embeddings) bypasses it, and
   `kind = "openai"` with a `base_url` override works as before.
   `docs/providers.md` capability table updated.
+- **Gemini and Vertex AI embeddings** (issue #62). The `google` kind now
+  serves `/v1/embeddings` through `models/{model}:batchEmbedContents` (batch
+  limit 100, `dimensions` mapped to `outputDimensionality`), and `vertex_ai`
+  through the regional, OAuth-authenticated `:predict` endpoint
+  (`instances[].content`, one input per upstream call because
+  `gemini-embedding-001` takes a single instance; the gateway fans batches out
+  concurrently). Both kinds are text-only: pre-tokenized token-id arrays and
+  image content parts are rejected with an honest `LM-1001` before any
+  upstream call. Token accounting follows ADR 003: Gemini's
+  `usageMetadata.promptTokenCount` and Vertex's summed
+  `statistics.token_count` are reported as upstream usage when present,
+  otherwise the gateway's local estimate (marked `estimated`) applies. Both
+  kinds pass the shared embed conformance suite, including cancellation.
 
 ### Changed
 

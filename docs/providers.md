@@ -52,8 +52,8 @@ Rules that apply to every provider:
 | `openai`    |  ✅  |  ✅   |        | required      | optional       | 2048              |
 | `mistral`   |  ✅  |  ✅   |        | required      | optional       | 512               |
 | `anthropic` |  ✅  |       |        | required      | optional       | -                 |
-| `google`    |  ✅  |       |        | required      | optional       | -                 |
-| `vertex_ai` |  ✅  |       |        | required (SA JSON) | **required** (GCP region) | - |
+| `google`    |  ✅  |  ✅   |        | required      | optional       | 100               |
+| `vertex_ai` |  ✅  |  ✅   |        | required (SA JSON) | **required** (GCP region) | 1 |
 | `bedrock`   |  ✅  |       |        | AWS SigV4     | optional       | -                 |
 | `cohere`    |  ✅  |  ✅   |   ✅   | required      | optional       | 96                |
 | `jina`      |      |  ✅   |   ✅   | required      | optional       | 2048              |
@@ -174,10 +174,19 @@ capabilities = ["chat"]
 
 ## google
 
-- **kind**: `google` · **capabilities**: chat only (Gemini).
+- **kind**: `google` · **capabilities**: chat, embed (Gemini).
 - **Auth**: `api_key_env` (e.g. `GEMINI_API_KEY`). The key rides the
   `x-goog-api-key` header, never the URL.
 - **Translation**: OpenAI ⇄ Gemini, including streaming (`streamGenerateContent`).
+- **Embeddings**: served through `models/{model}:batchEmbedContents`
+  (`gemini-embedding-001`, `text-embedding-004`, ...). One inner request per
+  input; the OpenAI `dimensions` field maps to `outputDimensionality`. The API
+  is text-only: pre-tokenized token-id arrays and image content parts are
+  rejected with `LM-1001` before any upstream call. Usage follows ADR 003:
+  `usageMetadata.promptTokenCount` is reported when the upstream returns it,
+  otherwise the gateway derives a local estimate marked `estimated`.
+- **Embed batch limit**: 100 inputs per upstream call (Gemini's documented
+  `batchEmbedContents` ceiling); the gateway splits larger requests.
 - **base_url**: optional override.
 
 ```toml
@@ -190,14 +199,18 @@ api_key_env = "GEMINI_API_KEY"
 id = "gemini-2.0-flash"
 upstream_id = "gemini-2.0-flash"
 capabilities = ["chat"]
+
+[[providers.models]]
+id = "gemini-embedding-001"
+capabilities = ["embed"]
 ```
 
 ## vertex_ai
 
-- **kind**: `vertex_ai` · **capabilities**: chat only (Gemini models on Google
-  Cloud Vertex AI). Distinct from `google`, which is the public Gemini
-  Developer API: Vertex uses regional endpoints and GCP OAuth instead of a
-  static API key.
+- **kind**: `vertex_ai` · **capabilities**: chat, embed (Gemini and
+  `text-embedding-*` models on Google Cloud Vertex AI). Distinct from
+  `google`, which is the public Gemini Developer API: Vertex uses regional
+  endpoints and GCP OAuth instead of a static API key.
 - **Auth**: `api_key_env` names an env var holding the **full service-account
   key JSON** (the contents of the key file downloaded from GCP, not a path and
   not an API key). LUMEN signs an RS256 JWT assertion with the account's
@@ -211,9 +224,21 @@ capabilities = ["chat"]
   `https://{region}-aiplatform.googleapis.com/v1/projects/{project}/locations/{region}/publishers/google/models/{model}:generateContent`
   (and `:streamGenerateContent?alt=sse` when streaming).
 - **Project id**: taken from the service-account JSON's `project_id`.
-- **Translation**: identical to `google` (same `GenerateContent` wire schema),
-  including streaming. Like Gemini, only inline base64 image data is accepted;
-  remote image URLs are rejected with `LM-2004`.
+- **Translation**: chat is identical to `google` (same `GenerateContent` wire
+  schema), including streaming. Like Gemini, only inline base64 image data is
+  accepted; remote image URLs are rejected with `LM-2004`.
+- **Embeddings**: Vertex does NOT expose `batchEmbedContents`; embeddings go
+  through the prediction API on the same regional, project-scoped path:
+  `.../publishers/google/models/{model}:predict` with `instances[].content`.
+  The OpenAI `dimensions` field maps to `parameters.outputDimensionality`.
+  Text-only: token-id arrays and image parts are rejected with `LM-1001`.
+  Usage follows ADR 003: per-input `statistics.token_count` values are summed
+  and reported as upstream usage; when absent the gateway derives a local
+  estimate marked `estimated`.
+- **Embed batch limit**: 1 input per upstream call. `gemini-embedding-001`
+  accepts a single instance per `:predict` request (other `text-embedding-*`
+  models take more, but the limit is per-model, so the universally safe value
+  is used); the gateway fans larger requests out over concurrent calls.
 
 ```toml
 [[providers]]
@@ -228,6 +253,11 @@ base_url = "us-central1"   # GCP region
 id = "gemini-flash-vertex"
 upstream_id = "gemini-2.0-flash"
 capabilities = ["chat"]
+
+[[providers.models]]
+id = "gemini-embedding-vertex"
+upstream_id = "gemini-embedding-001"
+capabilities = ["embed"]
 ```
 
 ## bedrock

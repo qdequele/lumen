@@ -1,7 +1,8 @@
-//! Google Gemini provider - chat completions with bidirectional translation.
+//! Google Gemini provider - chat completions and embeddings.
 //!
-//! Gemini's `generateContent` API differs from OpenAI in several ways this
-//! module bridges:
+//! Embeddings are served through `batchEmbedContents` (see [`embed`], issue
+//! #62). Gemini's `generateContent` API differs from OpenAI in several ways
+//! this module bridges:
 //!
 //! * auth is an `x-goog-api-key` header (the key is never put in the URL);
 //! * the model is part of the URL path (`/models/{model}:generateContent`,
@@ -29,6 +30,7 @@
 //! that upstream error, naming this provider, is the honest outcome. See
 //! `docs/providers.md`.
 
+mod embed;
 mod stream;
 pub mod vertex;
 

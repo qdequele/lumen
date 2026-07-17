@@ -1,9 +1,10 @@
-//! Google Vertex AI chat provider (regional endpoints, GCP OAuth).
+//! Google Vertex AI provider (regional endpoints, GCP OAuth): chat and
+//! embeddings (embeddings via `:predict` - see [`embed`], issue #62).
 //!
-//! Vertex AI serves the same `GenerateContent` wire schema as the public Gemini
-//! Developer API, so this provider reuses the request/response and streaming
-//! translation from the parent [`google`](super) module verbatim. The delta is
-//! entirely in the transport layer:
+//! For chat, Vertex AI serves the same `GenerateContent` wire schema as the
+//! public Gemini Developer API, so this provider reuses the request/response
+//! and streaming translation from the parent [`google`](super) module
+//! verbatim. The delta is entirely in the transport layer:
 //!
 //! * endpoints are regional and path-scoped to a GCP project:
 //!   `https://{location}-aiplatform.googleapis.com/v1/projects/{project}/`
@@ -22,6 +23,7 @@
 //! `false`.
 
 mod auth;
+mod embed;
 
 use std::fmt;
 
