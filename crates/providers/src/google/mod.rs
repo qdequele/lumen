@@ -53,6 +53,19 @@ use crate::http::{open_stream_with_headers, post_json_with_headers};
 /// Default Gemini API base (the path adds `/v1beta/models/...`).
 const DEFAULT_BASE_URL: &str = "https://generativelanguage.googleapis.com";
 
+/// OpenAI chat fields `generateContent` has no equivalent for (issue #72):
+/// no OpenAI-shaped logprobs (nor `top_logprobs`), no logit biasing, no
+/// parallel-tool-call control. Rejected (strict) or dropped with a trace
+/// (lenient) before any upstream call, by both the Gemini Developer API
+/// provider and Vertex AI. `response_format` and `seed` are NOT here: they
+/// map natively onto `generationConfig` in [`translate_request`].
+pub(crate) const UNSUPPORTED_CHAT_FIELDS: &[&str] = &[
+    "logprobs",
+    "top_logprobs",
+    "logit_bias",
+    "parallel_tool_calls",
+];
+
 /// A Google Gemini chat provider.
 pub struct GoogleProvider {
     client: reqwest::Client,
@@ -61,6 +74,10 @@ pub struct GoogleProvider {
     /// API key sent as `x-goog-api-key`. Redacted from `Debug`; never logged,
     /// and never placed in the URL.
     api_key: Option<String>,
+    /// When `true`, reject a request that sets an OpenAI field Gemini cannot
+    /// honor ([`UNSUPPORTED_CHAT_FIELDS`]) with a 400 (`LM-1001`) instead of
+    /// silently dropping it (issue #72).
+    strict: bool,
 }
 
 impl GoogleProvider {
@@ -81,7 +98,17 @@ impl GoogleProvider {
             provider_name: provider_name.into(),
             base_url,
             api_key,
+            strict: false,
         }
+    }
+
+    /// Set strict mode: reject (400, `LM-1001`) rather than drop request
+    /// fields Gemini cannot honor (issue #72). Defaults to `false` (lenient:
+    /// drop with a `debug!` trace).
+    #[must_use]
+    pub fn with_strict(mut self, strict: bool) -> Self {
+        self.strict = strict;
+        self
     }
 }
 
@@ -274,6 +301,17 @@ struct GeminiGenerationConfig {
     top_p: Option<f32>,
     #[serde(rename = "stopSequences", skip_serializing_if = "Vec::is_empty")]
     stop_sequences: Vec<String>,
+    /// OpenAI `response_format` JSON mode -> `"application/json"` (issue #72).
+    #[serde(rename = "responseMimeType", skip_serializing_if = "Option::is_none")]
+    response_mime_type: Option<String>,
+    /// OpenAI `response_format.json_schema.schema` -> Gemini's OpenAPI-subset
+    /// schema (unsupported JSON Schema keys stripped - see
+    /// [`sanitize_gemini_schema`]).
+    #[serde(rename = "responseSchema", skip_serializing_if = "Option::is_none")]
+    response_schema: Option<serde_json::Value>,
+    /// OpenAI `seed` passes through natively (issue #72).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    seed: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -399,11 +437,20 @@ fn translate_request(
         .as_ref()
         .map(collect_stop_sequences)
         .unwrap_or_default();
+    let (response_mime_type, response_schema) = req
+        .extra
+        .get("response_format")
+        .map(translate_response_format)
+        .unwrap_or_default();
     let generation_config = GeminiGenerationConfig {
         max_output_tokens: req.max_tokens,
         temperature: req.temperature,
         top_p: req.top_p,
         stop_sequences,
+        response_mime_type,
+        response_schema,
+        // A non-integer seed is invalid OpenAI input anyway; dropped, not guessed.
+        seed: req.extra.get("seed").and_then(serde_json::Value::as_i64),
     };
 
     Ok(GeminiRequest {
@@ -603,6 +650,81 @@ fn gemini_parts(
     }
 }
 
+/// OpenAI `response_format` -> Gemini `generationConfig` JSON-mode fields
+/// (issue #72): `{"type": "json_object"}` becomes
+/// `responseMimeType: "application/json"`; `{"type": "json_schema"}`
+/// additionally carries `json_schema.schema` as `responseSchema` (sanitized to
+/// Gemini's OpenAPI subset). `{"type": "text"}` is the default and unknown
+/// shapes are dropped with a `debug` trace, not guessed (matching the
+/// `tool_choice` precedent).
+fn translate_response_format(
+    format: &serde_json::Value,
+) -> (Option<String>, Option<serde_json::Value>) {
+    const JSON_MIME: &str = "application/json";
+    match format.get("type").and_then(|v| v.as_str()) {
+        Some("json_object") => (Some(JSON_MIME.to_owned()), None),
+        Some("json_schema") => {
+            let schema = format.pointer("/json_schema/schema").cloned().map(|mut s| {
+                sanitize_gemini_schema(&mut s);
+                s
+            });
+            if schema.is_none() {
+                tracing::debug!(
+                    "gemini chat: response_format type json_schema without a \
+                     json_schema.schema object; JSON mode applied without a schema"
+                );
+            }
+            (Some(JSON_MIME.to_owned()), schema)
+        }
+        Some("text") => (None, None),
+        None => {
+            tracing::debug!("gemini chat: response_format without a type string dropped");
+            (None, None)
+        }
+        Some(other) => {
+            tracing::debug!(
+                response_format_type = other,
+                "gemini chat: unrecognised response_format type dropped"
+            );
+            (None, None)
+        }
+    }
+}
+
+/// Strip JSON Schema keywords Gemini's OpenAPI-subset `responseSchema` rejects
+/// (`additionalProperties`, `$schema`), recursing only through positions that
+/// hold sub-SCHEMAS (`properties` values, `items`, `anyOf`/`allOf`/`oneOf`
+/// entries) so a property literally named `additionalProperties` is untouched.
+fn sanitize_gemini_schema(schema: &mut serde_json::Value) {
+    let Some(map) = schema.as_object_mut() else {
+        return;
+    };
+    for keyword in ["additionalProperties", "$schema"] {
+        if map.remove(keyword).is_some() {
+            tracing::debug!(
+                keyword,
+                "gemini chat: stripped a JSON Schema keyword Gemini's \
+                 responseSchema does not accept (it is dropped, not enforced)"
+            );
+        }
+    }
+    if let Some(props) = map.get_mut("properties").and_then(|v| v.as_object_mut()) {
+        for sub in props.values_mut() {
+            sanitize_gemini_schema(sub);
+        }
+    }
+    if let Some(items) = map.get_mut("items") {
+        sanitize_gemini_schema(items);
+    }
+    for key in ["anyOf", "allOf", "oneOf"] {
+        if let Some(subs) = map.get_mut(key).and_then(|v| v.as_array_mut()) {
+            for sub in subs {
+                sanitize_gemini_schema(sub);
+            }
+        }
+    }
+}
+
 /// OpenAI `stop` is a string or array of strings; normalise to a list.
 fn collect_stop_sequences(stop: &serde_json::Value) -> Vec<String> {
     match stop {
@@ -696,6 +818,12 @@ impl ChatProvider for GoogleProvider {
         req: ChatRequest,
         cancel: CancellationToken,
     ) -> Result<ChatResponse, ProviderError> {
+        crate::mapping::check_unsupported_chat_fields(
+            &self.provider_name,
+            self.strict,
+            &req.extra,
+            UNSUPPORTED_CHAT_FIELDS,
+        )?;
         // The model is part of the path; the key is a header, never the URL.
         let url = format!(
             "{}/v1beta/models/{}:generateContent",
@@ -772,7 +900,7 @@ pub mod fuzzing {
     /// Translate an arbitrary `ChatRequest` and serialize the result on
     /// success; must never panic regardless of message/image shape.
     pub fn fuzz_translate_request(req: &ChatRequest) {
-        if let Ok(translated) = translate_request(req) {
+        if let Ok(translated) = translate_request(req, "fuzz") {
             let _ = serde_json::to_vec(&translated);
         }
     }
@@ -794,6 +922,12 @@ impl GoogleProvider {
         req: ChatRequest,
         cancel: CancellationToken,
     ) -> Result<BoxStream<'static, Result<StreamItem, ProviderError>>, ProviderError> {
+        crate::mapping::check_unsupported_chat_fields(
+            &self.provider_name,
+            self.strict,
+            &req.extra,
+            UNSUPPORTED_CHAT_FIELDS,
+        )?;
         // `alt=sse` selects SSE framing; the key stays in a header, never the URL.
         let url = format!(
             "{}/v1beta/models/{}:streamGenerateContent?alt=sse",
@@ -1244,6 +1378,133 @@ mod tests {
             "https://generativelanguage.googleapis.com/v1beta/files/abc-123"
         );
         assert!(part["file_data"].get("mime_type").is_none());
+    }
+
+    /// Issue #72: `response_format: {"type": "json_object"}` maps to Gemini's
+    /// native JSON mode instead of being silently dropped.
+    #[test]
+    fn response_format_json_object_maps_to_response_mime_type() {
+        let mut req = request(vec![msg("user", "hi")]);
+        req.extra.insert(
+            "response_format".to_owned(),
+            json!({ "type": "json_object" }),
+        );
+        let body = serde_json::to_value(translate_request(&req, "google").unwrap()).unwrap();
+        assert_eq!(
+            body["generationConfig"]["responseMimeType"],
+            "application/json"
+        );
+        assert!(body["generationConfig"].get("responseSchema").is_none());
+    }
+
+    /// Issue #72: `json_schema` carries the schema through as `responseSchema`,
+    /// with JSON Schema keys Gemini rejects stripped (`additionalProperties`,
+    /// `$schema`) - but a *property* named `additionalProperties` survives.
+    #[test]
+    fn response_format_json_schema_maps_to_sanitized_response_schema() {
+        let mut req = request(vec![msg("user", "hi")]);
+        req.extra.insert(
+            "response_format".to_owned(),
+            json!({
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "city",
+                    "strict": true,
+                    "schema": {
+                        "$schema": "https://json-schema.org/draft/2020-12/schema",
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "name": { "type": "string" },
+                            "additionalProperties": { "type": "boolean" },
+                            "tags": {
+                                "type": "array",
+                                "items": { "type": "object", "additionalProperties": false }
+                            }
+                        },
+                        "required": ["name"]
+                    }
+                }
+            }),
+        );
+        let body = serde_json::to_value(translate_request(&req, "google").unwrap()).unwrap();
+        let cfg = &body["generationConfig"];
+        assert_eq!(cfg["responseMimeType"], "application/json");
+        let schema = &cfg["responseSchema"];
+        assert_eq!(schema["type"], "object");
+        assert!(schema.get("additionalProperties").is_none());
+        assert!(schema.get("$schema").is_none());
+        // The property literally named `additionalProperties` is data, not a
+        // schema keyword: it must survive.
+        assert_eq!(
+            schema["properties"]["additionalProperties"]["type"],
+            "boolean"
+        );
+        assert!(schema["properties"]["tags"]["items"]
+            .get("additionalProperties")
+            .is_none());
+    }
+
+    /// Issue #72: `seed` maps to `generationConfig.seed`; `type: "text"` and
+    /// unknown response_format shapes emit no JSON-mode fields.
+    #[test]
+    fn seed_maps_natively_and_text_or_unknown_formats_are_dropped() {
+        let mut req = request(vec![msg("user", "hi")]);
+        req.extra.insert("seed".to_owned(), json!(42));
+        req.extra
+            .insert("response_format".to_owned(), json!({ "type": "text" }));
+        let body = serde_json::to_value(translate_request(&req, "google").unwrap()).unwrap();
+        assert_eq!(body["generationConfig"]["seed"], 42);
+        assert!(body["generationConfig"].get("responseMimeType").is_none());
+
+        req.extra
+            .insert("response_format".to_owned(), json!({ "type": "surprise" }));
+        let body = serde_json::to_value(translate_request(&req, "google").unwrap()).unwrap();
+        assert!(body["generationConfig"].get("responseMimeType").is_none());
+    }
+
+    /// Issue #72: strict mode rejects fields Gemini cannot honor with an
+    /// honest 400 (`UnsupportedField` -> LM-1001) BEFORE any upstream call
+    /// (the base URL is unroutable on purpose); lenient mode proceeds.
+    #[tokio::test]
+    async fn strict_mode_rejects_logprobs_and_parallel_tool_calls() {
+        use lumen_core::ChatProvider as _;
+        use tokio_util::sync::CancellationToken;
+        let provider = GoogleProvider::new(
+            reqwest::Client::new(),
+            "google-test",
+            Some("http://127.0.0.1:1".to_owned()),
+            Some("goog-test".to_owned()),
+        )
+        .with_strict(true);
+
+        for (field, value) in [
+            ("logprobs", json!(true)),
+            ("top_logprobs", json!(5)),
+            ("logit_bias", json!({ "50256": -100 })),
+            ("parallel_tool_calls", json!(false)),
+        ] {
+            let mut req = request(vec![msg("user", "hi")]);
+            req.extra.insert(field.to_owned(), value);
+            let err = provider
+                .chat(req.clone(), CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(
+                    &err,
+                    ProviderError::UnsupportedField { provider, field: f }
+                        if provider == "google-test" && f == field
+                ),
+                "expected UnsupportedField for {field}, got {err:?}"
+            );
+            let err = provider
+                .chat_stream(req, CancellationToken::new())
+                .await
+                .err()
+                .expect("stream must be rejected too");
+            assert!(matches!(err, ProviderError::UnsupportedField { .. }));
+        }
     }
 
     #[test]

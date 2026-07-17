@@ -38,6 +38,20 @@ const ANTHROPIC_VERSION: &str = "2023-06-01";
 /// Anthropic requires `max_tokens`; used when the client omits it.
 const DEFAULT_MAX_TOKENS: u32 = 4096;
 
+/// OpenAI chat fields the Messages API has no equivalent for (issue #72):
+/// no JSON mode / structured output, no sampling seed, no logprobs (nor
+/// `top_logprobs`), no logit biasing. Rejected (strict) or dropped with a
+/// trace (lenient) before any upstream call. `parallel_tool_calls` is NOT
+/// here: it maps to `tool_choice.disable_parallel_tool_use` in
+/// [`translate_request`].
+const UNSUPPORTED_CHAT_FIELDS: &[&str] = &[
+    "response_format",
+    "seed",
+    "logprobs",
+    "top_logprobs",
+    "logit_bias",
+];
+
 /// An Anthropic chat provider.
 pub struct AnthropicProvider {
     client: reqwest::Client,
@@ -45,6 +59,10 @@ pub struct AnthropicProvider {
     base_url: String,
     /// API key sent as `x-api-key`. Redacted from `Debug`; never logged.
     api_key: Option<String>,
+    /// When `true`, reject a request that sets an OpenAI field the Messages
+    /// API cannot honor ([`UNSUPPORTED_CHAT_FIELDS`]) with a 400 (`LM-1001`)
+    /// instead of silently dropping it (issue #72).
+    strict: bool,
 }
 
 impl AnthropicProvider {
@@ -65,7 +83,17 @@ impl AnthropicProvider {
             provider_name: provider_name.into(),
             base_url,
             api_key,
+            strict: false,
         }
+    }
+
+    /// Set strict mode: reject (400, `LM-1001`) rather than drop request
+    /// fields the Messages API cannot honor (issue #72). Defaults to `false`
+    /// (lenient: drop with a `debug!` trace).
+    #[must_use]
+    pub fn with_strict(mut self, strict: bool) -> Self {
+        self.strict = strict;
+        self
     }
 }
 
@@ -247,6 +275,28 @@ fn translate_request(req: &ChatRequest, stream: bool) -> AnthropicRequest {
         .map(collect_stop_sequences)
         .unwrap_or_default();
 
+    let tools = translate_tools(req);
+    let mut tool_choice = req.extra.get("tool_choice").and_then(translate_tool_choice);
+    // OpenAI `parallel_tool_calls: false` maps to Anthropic's
+    // `tool_choice.disable_parallel_tool_use: true` (issue #72). `true` is the
+    // upstream default on both sides, so it needs no wire field. Only
+    // meaningful alongside tools, and never on `{"type": "none"}` (no tool may
+    // be called at all there).
+    if req
+        .extra
+        .get("parallel_tool_calls")
+        .and_then(serde_json::Value::as_bool)
+        == Some(false)
+        && !tools.is_empty()
+    {
+        let choice = tool_choice.get_or_insert_with(|| json!({ "type": "auto" }));
+        if choice.get("type").and_then(|v| v.as_str()) != Some("none") {
+            if let Some(obj) = choice.as_object_mut() {
+                obj.insert("disable_parallel_tool_use".to_owned(), json!(true));
+            }
+        }
+    }
+
     AnthropicRequest {
         model: req.model.clone(),
         max_tokens: req.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
@@ -259,8 +309,8 @@ fn translate_request(req: &ChatRequest, stream: bool) -> AnthropicRequest {
         temperature: req.temperature,
         top_p: req.top_p,
         stop_sequences,
-        tools: translate_tools(req),
-        tool_choice: req.extra.get("tool_choice").and_then(translate_tool_choice),
+        tools,
+        tool_choice,
         stream,
     }
 }
@@ -488,6 +538,12 @@ impl AnthropicProvider {
         req: ChatRequest,
         cancel: CancellationToken,
     ) -> Result<BoxStream<'static, Result<StreamItem, ProviderError>>, ProviderError> {
+        crate::mapping::check_unsupported_chat_fields(
+            &self.provider_name,
+            self.strict,
+            &req.extra,
+            UNSUPPORTED_CHAT_FIELDS,
+        )?;
         let url = format!("{}/v1/messages", self.base_url);
         let body = translate_request(&req, true);
         let headers = [
@@ -518,6 +574,12 @@ impl ChatProvider for AnthropicProvider {
         req: ChatRequest,
         cancel: CancellationToken,
     ) -> Result<ChatResponse, ProviderError> {
+        crate::mapping::check_unsupported_chat_fields(
+            &self.provider_name,
+            self.strict,
+            &req.extra,
+            UNSUPPORTED_CHAT_FIELDS,
+        )?;
         let url = format!("{}/v1/messages", self.base_url);
         let body = translate_request(&req, false);
         let headers = [
@@ -982,6 +1044,162 @@ mod tests {
         assert_eq!(block["source"]["file_id"], "file_011CNvxvfvyGnGnDtjPtzY9J");
         assert!(block["source"].get("data").is_none());
         assert!(block["source"].get("url").is_none());
+    }
+
+    fn tools_extra() -> serde_json::Map<String, serde_json::Value> {
+        let mut extra = serde_json::Map::new();
+        extra.insert(
+            "tools".to_owned(),
+            json!([{
+                "type": "function",
+                "function": { "name": "get_weather", "parameters": { "type": "object" } }
+            }]),
+        );
+        extra
+    }
+
+    /// Issue #72: OpenAI `parallel_tool_calls: false` maps to Anthropic's
+    /// `tool_choice.disable_parallel_tool_use: true`, defaulting the choice to
+    /// `auto` when the client sent none.
+    #[test]
+    fn parallel_tool_calls_false_maps_to_disable_parallel_tool_use() {
+        let mut extra = tools_extra();
+        extra.insert("parallel_tool_calls".to_owned(), json!(false));
+        let mut req = ChatRequest {
+            model: "claude-x".to_owned(),
+            messages: vec![msg("user", "hi")],
+            temperature: None,
+            top_p: None,
+            max_tokens: Some(64),
+            n: None,
+            stop: None,
+            stream: false,
+            extra,
+        };
+        let out = translate_request(&req, false);
+        assert_eq!(
+            out.tool_choice,
+            Some(json!({ "type": "auto", "disable_parallel_tool_use": true }))
+        );
+
+        // With an explicit tool_choice, the flag merges into it.
+        req.extra
+            .insert("tool_choice".to_owned(), json!("required"));
+        let out = translate_request(&req, false);
+        assert_eq!(
+            out.tool_choice,
+            Some(json!({ "type": "any", "disable_parallel_tool_use": true }))
+        );
+    }
+
+    /// `parallel_tool_calls: true` is the default on both sides; without
+    /// tools the flag is meaningless. Neither emits a `tool_choice`.
+    #[test]
+    fn parallel_tool_calls_true_or_toolless_emits_no_tool_choice() {
+        let mut extra = tools_extra();
+        extra.insert("parallel_tool_calls".to_owned(), json!(true));
+        let mut req = ChatRequest {
+            model: "claude-x".to_owned(),
+            messages: vec![msg("user", "hi")],
+            temperature: None,
+            top_p: None,
+            max_tokens: Some(64),
+            n: None,
+            stop: None,
+            stream: false,
+            extra,
+        };
+        assert_eq!(translate_request(&req, false).tool_choice, None);
+
+        req.extra = serde_json::Map::new();
+        req.extra
+            .insert("parallel_tool_calls".to_owned(), json!(false));
+        assert_eq!(translate_request(&req, false).tool_choice, None);
+    }
+
+    /// Issue #72: in strict mode, a field the Messages API cannot honor is an
+    /// honest client rejection (`UnsupportedField` -> 400, LM-1001) BEFORE any
+    /// upstream call - the base URL below is unroutable on purpose.
+    #[tokio::test]
+    async fn strict_mode_rejects_response_format_seed_and_logprobs() {
+        use tokio_util::sync::CancellationToken;
+        let provider = AnthropicProvider::new(
+            reqwest::Client::new(),
+            "anthropic-test",
+            Some("http://127.0.0.1:1".to_owned()),
+            Some("sk-ant-test".to_owned()),
+        )
+        .with_strict(true);
+
+        for (field, value) in [
+            ("response_format", json!({ "type": "json_object" })),
+            ("seed", json!(42)),
+            ("logprobs", json!(true)),
+            ("top_logprobs", json!(5)),
+            ("logit_bias", json!({ "50256": -100 })),
+        ] {
+            let mut extra = serde_json::Map::new();
+            extra.insert(field.to_owned(), value);
+            let req = ChatRequest {
+                model: "claude-x".to_owned(),
+                messages: vec![msg("user", "hi")],
+                temperature: None,
+                top_p: None,
+                max_tokens: Some(16),
+                n: None,
+                stop: None,
+                stream: false,
+                extra,
+            };
+            let err = provider
+                .chat(req.clone(), CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(
+                    &err,
+                    ProviderError::UnsupportedField { provider, field: f }
+                        if provider == "anthropic-test" && f == field
+                ),
+                "expected UnsupportedField for {field}, got {err:?}"
+            );
+            // The streaming path enforces the same pre-flight.
+            let err = provider
+                .chat_stream(req, CancellationToken::new())
+                .await
+                .err()
+                .expect("stream must be rejected too");
+            assert!(matches!(err, ProviderError::UnsupportedField { .. }));
+        }
+    }
+
+    /// Lenient (default) mode drops the fields: the wire body simply never
+    /// carries them (compile-time: the struct has no such fields) and the
+    /// request is not rejected up front.
+    #[test]
+    fn lenient_translation_emits_no_unsupported_fields_on_the_wire() {
+        let mut extra = serde_json::Map::new();
+        extra.insert(
+            "response_format".to_owned(),
+            json!({ "type": "json_object" }),
+        );
+        extra.insert("seed".to_owned(), json!(42));
+        extra.insert("logprobs".to_owned(), json!(true));
+        let req = ChatRequest {
+            model: "claude-x".to_owned(),
+            messages: vec![msg("user", "hi")],
+            temperature: None,
+            top_p: None,
+            max_tokens: Some(16),
+            n: None,
+            stop: None,
+            stream: false,
+            extra,
+        };
+        let body = serde_json::to_value(translate_request(&req, false)).unwrap();
+        for field in ["response_format", "seed", "logprobs"] {
+            assert!(body.get(field).is_none(), "{field} must not reach the wire");
+        }
     }
 
     #[test]

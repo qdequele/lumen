@@ -83,6 +83,24 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ### Fixed
 
+- **`response_format`, `seed`, `logprobs` and `parallel_tool_calls` were
+  silently dropped by the translated chat providers** (issue #72). These
+  fields pass through verbatim on OpenAI-compatible kinds but the translated
+  kinds (anthropic, google, vertex_ai, bedrock, cohere) rebuilt the upstream
+  request without them, so e.g. JSON mode on a Gemini-routed model silently
+  returned unconstrained text. Now mapped natively where the upstream supports
+  it: Gemini gets `generationConfig.responseMimeType`/`responseSchema` (with
+  JSON Schema keys outside Gemini's OpenAPI subset stripped) and
+  `generationConfig.seed`; Cohere v2 gets `response_format` (OpenAI's
+  `json_schema` type collapsed onto Cohere's `json_object` + `json_schema`)
+  and `seed`; Anthropic maps `parallel_tool_calls: false` to
+  `tool_choice.disable_parallel_tool_use`. Genuinely unsupported field+kind
+  combos now honor the per-provider `strict` flag (the issue #25 pattern):
+  strict rejects with an honest 400 (`LM-1001`) naming the field and provider
+  before any upstream call, lenient (default) drops with a `debug` log.
+  `top_logprobs` and `logit_bias` get the same strict/lenient treatment on
+  all four translated kinds. Per-provider matrix documented in
+  `docs/providers.md`.
 - **`LUMEN_MASTER_KEY` was folded into the config and broke `--check-config`
   and every real auth-enabled boot.** `Config::load` merged all `LUMEN_*`
   environment variables into the config via `figment::providers::Env`, so

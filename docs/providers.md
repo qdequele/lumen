@@ -158,6 +158,10 @@ capabilities = ["chat"]
   with the `x-api-key` / `anthropic-version` headers, not a bearer token.
 - **Translation**: OpenAI ⇄ Anthropic is bidirectional, including tools and
   streaming events, so clients keep using the OpenAI wire format.
+  `parallel_tool_calls: false` maps to `tool_choice.disable_parallel_tool_use`;
+  `response_format`, `seed` and `logprobs` have no Messages API equivalent -
+  see [chat extras](#openai-chat-extras-on-translated-providers) and the
+  `strict` flag.
 - **base_url**: optional override.
 
 ```toml
@@ -178,6 +182,10 @@ capabilities = ["chat"]
 - **Auth**: `api_key_env` (e.g. `GEMINI_API_KEY`). The key rides the
   `x-goog-api-key` header, never the URL.
 - **Translation**: OpenAI ⇄ Gemini, including streaming (`streamGenerateContent`).
+  `response_format` JSON mode maps to `generationConfig.responseMimeType` /
+  `responseSchema` and `seed` to `generationConfig.seed`; `logprobs` and
+  `parallel_tool_calls` have no mapping - see
+  [chat extras](#openai-chat-extras-on-translated-providers).
 - **Embeddings**: served through `models/{model}:batchEmbedContents`
   (`gemini-embedding-001`, `text-embedding-004`, ...). One inner request per
   input; the OpenAI `dimensions` field maps to `outputDimensionality`. The API
@@ -290,7 +298,10 @@ capabilities = ["embed"]
   `inferenceConfig` (max tokens, temperature, top-p, stop sequences), tools, and
   streaming. Streaming arrives as AWS event-stream binary frames, decoded and
   translated to OpenAI chunks. Usage (`inputTokens` / `outputTokens`) is mapped
-  per ADR 003.
+  per ADR 003. Converse has no equivalent for `response_format`, `seed`,
+  `logprobs` or `parallel_tool_calls` - see
+  [chat extras](#openai-chat-extras-on-translated-providers) and the `strict`
+  flag.
 - **Images**: only inline `data:` URIs are supported (Converse takes raw image
   bytes); a remote image URL is rejected (`LM-2004`) since Bedrock cannot fetch
   one.
@@ -319,10 +330,12 @@ modalities = ["text", "image"]
   `system` hoist like Anthropic; `tool_calls` are already OpenAI-shaped), so
   translation is closer to identity than Anthropic's. `tool_choice` collapses
   to Cohere's `REQUIRED`/`NONE` (forcing one specific named tool has no v2
-  equivalent and falls back to `auto`). Usage prefers `usage.tokens` (actual
-  counts) over `usage.billed_units` (what's charged); a response reporting
-  neither leaves the gateway's local estimator to fill in an honestly-flagged
-  count (ADR 003).
+  equivalent and falls back to `auto`). `response_format` and `seed` map onto
+  Cohere's native fields; `logprobs` and `parallel_tool_calls` do not - see
+  [chat extras](#openai-chat-extras-on-translated-providers). Usage prefers
+  `usage.tokens` (actual counts) over `usage.billed_units` (what's charged); a
+  response reporting neither leaves the gateway's local estimator to fill in
+  an honestly-flagged count (ADR 003).
 - **Vision (issue #73)**: a user message carrying image parts is translated
   to Cohere v2 content blocks (`text` / `image_url`, OpenAI-shaped); a
   text-only message keeps the plain-string form, and non-user roles always
@@ -704,6 +717,68 @@ id = "local-llama"
 upstream_id = "meta-llama/Llama-3.1-8B-Instruct"
 capabilities = ["chat", "embed"]
 ```
+
+## OpenAI chat extras on translated providers
+
+OpenAI-compatible kinds forward every unmodeled request field verbatim, so
+`response_format`, `seed`, `logprobs`, `top_logprobs`, `logit_bias` and
+`parallel_tool_calls` simply work there. The translated chat kinds rebuild
+the upstream request field by field, so each of these is either **mapped**
+onto a native equivalent or explicitly **unsupported** (issue #72) - never
+silently lost:
+
+| Field | `anthropic` | `google` / `vertex_ai` | `bedrock` | `cohere` |
+|-----------------------|-------------|------------------------|-----------|----------|
+| `response_format` | unsupported | mapped¹ | unsupported | mapped² |
+| `seed` | unsupported | mapped (`generationConfig.seed`) | unsupported | mapped |
+| `logprobs` | unsupported | unsupported | unsupported | unsupported³ |
+| `top_logprobs` | unsupported | unsupported | unsupported | unsupported³ |
+| `logit_bias` | unsupported | unsupported | unsupported | unsupported |
+| `parallel_tool_calls` | mapped⁴ | unsupported | unsupported | unsupported |
+
+¹ `{"type": "json_object"}` becomes `generationConfig.responseMimeType:
+"application/json"`; `{"type": "json_schema"}` additionally carries
+`json_schema.schema` as `generationConfig.responseSchema`, with JSON Schema
+keywords Gemini's OpenAPI-subset schema rejects (`additionalProperties`,
+`$schema`) stripped recursively. Note that `additionalProperties: false` is
+therefore **dropped, not enforced**, on Gemini: the model may still emit
+extra keys (each strip is logged at `debug` level).
+
+² Cohere v2 has no separate `json_schema` type: OpenAI's
+`{"type": "json_schema", "json_schema": {"schema": ...}}` collapses onto
+Cohere's `{"type": "json_object", "json_schema": <schema>}`; `json_object`
+and `text` pass through as-is.
+
+³ Cohere v2 does accept a `logprobs` flag upstream, but its response shape is
+not translated back to OpenAI's (and `top_logprobs` rides that same response
+shape), so the gateway treats both as unsupported rather than returning a
+malformed response.
+
+⁴ `parallel_tool_calls: false` becomes Anthropic's
+`tool_choice.disable_parallel_tool_use: true` (defaulting the choice to
+`auto` when the request carries tools but no explicit `tool_choice`);
+`true` is the default on both sides and needs no wire field.
+
+What happens to an **unsupported** field depends on the provider's `strict`
+flag (the same switch Ollama uses for embeddings `dimensions`, issue #25):
+
+- `strict = false` (default): the field is dropped and a `debug`-level log
+  line names the provider and field.
+- `strict = true`: the request is rejected before any upstream call with an
+  honest 400 (`LM-1001`) naming the field and provider - never a misleading
+  5xx.
+
+```toml
+[[providers]]
+name = "anthropic"
+kind = "anthropic"
+api_key_env = "ANTHROPIC_API_KEY"
+strict = true   # reject response_format/seed/logprobs instead of dropping
+```
+
+An unrecognised `response_format` **shape** (an unknown `type` value) is
+dropped with a debug log on the mapping providers, matching how unknown
+`tool_choice` shapes are handled: dropped, not guessed.
 
 ## Vision (image input)
 
