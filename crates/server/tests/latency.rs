@@ -23,6 +23,7 @@ fn openai_registry(upstream: &str) -> Arc<Registry> {
         kind: ProviderKind::Openai,
         api_key: Some("sk-test-xxx".to_owned()),
         base_url: Some(upstream.to_owned()),
+        api_version: None,
         strict: false,
         connect_timeout_ms: None,
         models: vec![ModelSpec {

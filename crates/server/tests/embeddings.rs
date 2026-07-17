@@ -21,6 +21,7 @@ fn registry_for(upstream: &str) -> Arc<Registry> {
         kind: ProviderKind::Openai,
         api_key: Some("sk-test-xxx".to_owned()),
         base_url: Some(upstream.to_owned()),
+        api_version: None,
         strict: false,
         connect_timeout_ms: None,
         models: vec![
@@ -62,6 +63,7 @@ fn registry_for_cohere(upstream: &str) -> Arc<Registry> {
         kind: ProviderKind::Cohere,
         api_key: Some("sk-test-xxx".to_owned()),
         base_url: Some(upstream.to_owned()),
+        api_version: None,
         strict: false,
         connect_timeout_ms: None,
         models: vec![ModelSpec {
@@ -168,6 +170,7 @@ async fn token_input_to_text_only_provider_is_400_fg1001_without_upstream_call()
         kind: ProviderKind::Tei,
         api_key: None,
         base_url: Some(upstream.uri()),
+        api_version: None,
         strict: false,
         connect_timeout_ms: None,
         models: vec![ModelSpec {

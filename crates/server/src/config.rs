@@ -373,6 +373,12 @@ pub struct ProviderConfig {
     /// Override the provider's default base URL (required for self-hosted).
     #[serde(default)]
     pub base_url: Option<String>,
+    /// Azure OpenAI `api-version` (the `azure` kind only; setting it on any
+    /// other kind is a boot-time validation error). Takes precedence over an
+    /// `?api-version=...` query string on `base_url` (kept for back-compat),
+    /// which takes precedence over the built-in default (issue #65).
+    #[serde(default)]
+    pub api_version: Option<String>,
     /// Per-provider first-token timeout override in ms (else the global
     /// [`ServerConfig::first_token_timeout_ms`]).
     #[serde(default)]
@@ -458,6 +464,49 @@ impl From<LogFormatConfig> for LogFormat {
             LogFormatConfig::Json => LogFormat::Json,
         }
     }
+}
+
+/// Per-provider knob validation: timeout overrides must not be 0, and
+/// `api_version` must be non-blank, carry no leading/trailing whitespace
+/// (a padded value would be percent-encoded verbatim into the request URL
+/// and fail upstream with an Azure 4xx only at request time), and only
+/// appear on the `azure` kind (issue #65) - every other kind would silently
+/// ignore it, so a boot-time error beats a misconfigured provider
+/// discovered at request time.
+fn validate_provider_knobs(
+    provider: &ProviderConfig,
+    err: &impl Fn(String) -> ConfigError,
+) -> Result<(), ConfigError> {
+    for (field, value) in [
+        ("first_token_timeout_ms", provider.first_token_timeout_ms),
+        ("total_timeout_ms", provider.total_timeout_ms),
+        ("connect_timeout_ms", provider.connect_timeout_ms),
+    ] {
+        if value == Some(0) {
+            return Err(err(format!(
+                "provider '{}': {field} must not be 0",
+                provider.name
+            )));
+        }
+    }
+    if let Some(api_version) = &provider.api_version {
+        if api_version.is_empty() || api_version.trim() != api_version {
+            return Err(err(format!(
+                "provider '{}': api_version must be non-empty with no leading or \
+                 trailing whitespace",
+                provider.name
+            )));
+        }
+        if provider.kind != ProviderKind::Azure {
+            return Err(err(format!(
+                "provider '{}': api_version is only supported by kind 'azure' \
+                 (kind '{}' would ignore it)",
+                provider.name,
+                provider.kind.as_str()
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Prometheus label names: `[a-zA-Z_][a-zA-Z0-9_]*`.
@@ -668,18 +717,7 @@ impl Config {
         self.resilience.validate(path_label)?;
 
         for provider in &self.providers {
-            for (field, value) in [
-                ("first_token_timeout_ms", provider.first_token_timeout_ms),
-                ("total_timeout_ms", provider.total_timeout_ms),
-                ("connect_timeout_ms", provider.connect_timeout_ms),
-            ] {
-                if value == Some(0) {
-                    return Err(err(format!(
-                        "provider '{}': {field} must not be 0",
-                        provider.name
-                    )));
-                }
-            }
+            validate_provider_knobs(provider, &err)?;
         }
 
         let mut provider_names = HashSet::new();
@@ -830,6 +868,7 @@ impl Config {
                     .as_ref()
                     .and_then(|var| std::env::var(var).ok()),
                 base_url: p.base_url.clone(),
+                api_version: p.api_version.clone(),
                 strict: p.strict,
                 connect_timeout_ms: p.connect_timeout_ms,
                 models: p
@@ -1277,6 +1316,114 @@ mod tests {
         "#;
         let err = load_str(toml).unwrap_err();
         assert!(err.to_string().contains("connect_timeout_ms"));
+    }
+
+    #[test]
+    fn azure_api_version_parses_and_reaches_the_spec() {
+        let toml = r#"
+            [[providers]]
+            name = "azure"
+            kind = "azure"
+            base_url = "https://my-resource.openai.azure.com"
+            api_version = "2025-01-01-preview"
+            [[providers.models]]
+            id = "gpt"
+            capabilities = ["chat"]
+        "#;
+        let cfg = load_str(toml).unwrap();
+        assert_eq!(
+            cfg.providers[0].api_version.as_deref(),
+            Some("2025-01-01-preview")
+        );
+        let specs = cfg.provider_specs();
+        assert_eq!(specs[0].api_version.as_deref(), Some("2025-01-01-preview"));
+    }
+
+    #[test]
+    fn azure_api_version_field_coexists_with_a_base_url_query_string() {
+        // Back-compat: both forms parse together; the provider gives the
+        // explicit field precedence over the query-string value at runtime.
+        let toml = r#"
+            [[providers]]
+            name = "azure"
+            kind = "azure"
+            base_url = "https://my-resource.openai.azure.com?api-version=2023-05-15"
+            api_version = "2025-01-01-preview"
+            [[providers.models]]
+            id = "gpt"
+            capabilities = ["chat"]
+        "#;
+        let cfg = load_str(toml).unwrap();
+        let specs = cfg.provider_specs();
+        assert_eq!(specs[0].api_version.as_deref(), Some("2025-01-01-preview"));
+        assert_eq!(
+            specs[0].base_url.as_deref(),
+            Some("https://my-resource.openai.azure.com?api-version=2023-05-15")
+        );
+    }
+
+    #[test]
+    fn api_version_on_a_non_azure_kind_is_rejected() {
+        let toml = r#"
+            [[providers]]
+            name = "openai"
+            kind = "openai"
+            api_version = "2025-01-01-preview"
+            [[providers.models]]
+            id = "gpt"
+            capabilities = ["chat"]
+        "#;
+        let err = load_str(toml).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("api_version"), "{msg}");
+        assert!(msg.contains("azure"), "{msg}");
+    }
+
+    #[test]
+    fn blank_api_version_is_rejected() {
+        let toml = r#"
+            [[providers]]
+            name = "azure"
+            kind = "azure"
+            base_url = "https://my-resource.openai.azure.com"
+            api_version = " "
+            [[providers.models]]
+            id = "gpt"
+            capabilities = ["chat"]
+        "#;
+        let err = load_str(toml).unwrap_err();
+        assert!(err.to_string().contains("api_version"), "{err}");
+    }
+
+    #[test]
+    fn padded_api_version_is_rejected() {
+        // " 2024-10-21" would be percent-encoded verbatim into the request
+        // URL (api-version=%202024-10-21) and fail only at request time with
+        // an Azure 4xx, so surrounding whitespace is rejected at boot.
+        for padded in [" 2024-10-21", "2024-10-21 ", "\t2024-10-21\n"] {
+            let toml = format!(
+                r#"
+                    [[providers]]
+                    name = "azure"
+                    kind = "azure"
+                    base_url = "https://my-resource.openai.azure.com"
+                    api_version = {padded:?}
+                    [[providers.models]]
+                    id = "gpt"
+                    capabilities = ["chat"]
+                "#
+            );
+            let err = load_str(&toml).unwrap_err();
+            assert!(err.to_string().contains("api_version"), "{err}");
+        }
+    }
+
+    #[test]
+    fn provider_without_api_version_leaves_the_spec_none() {
+        let cfg = load_str(VALID).unwrap();
+        for spec in cfg.provider_specs() {
+            assert_eq!(spec.api_version, None);
+        }
     }
 
     #[test]

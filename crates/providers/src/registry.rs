@@ -59,6 +59,11 @@ pub struct ProviderSpec {
     pub api_key: Option<String>,
     /// Base URL override.
     pub base_url: Option<String>,
+    /// Azure OpenAI `api-version` (honored by the `azure` kind only; other
+    /// kinds ignore it with a warning). Wins over an `?api-version=...` query
+    /// string on `base_url` (kept for back-compat), which wins over the
+    /// provider's built-in default (issue #65).
+    pub api_version: Option<String>,
     /// Reject requests that set an unsupported-but-meaningful field (rather than
     /// silently dropping it). Currently honored by Ollama for `dimensions`
     /// (issue #25). Defaults to `false` (lenient).
@@ -83,6 +88,7 @@ impl std::fmt::Debug for ProviderSpec {
             .field("kind", &self.kind)
             .field("api_key", &self.api_key.as_ref().map(|_| "REDACTED"))
             .field("base_url", &self.base_url)
+            .field("api_version", &self.api_version)
             .field("strict", &self.strict)
             .field("connect_timeout_ms", &self.connect_timeout_ms)
             .field("models", &self.models)
@@ -459,6 +465,17 @@ fn build_providers(
         })
     };
 
+    // `api_version` is an Azure-only knob. The server config rejects it on
+    // other kinds at boot; this warning covers callers that build specs
+    // directly (mirrors `warn_unsupported` for capabilities).
+    if spec.api_version.is_some() && spec.kind != ProviderKind::Azure {
+        tracing::warn!(
+            provider = %spec.name,
+            kind = %spec.kind.as_str(),
+            "api_version is only honored by kind 'azure'; ignoring it"
+        );
+    }
+
     match spec.kind {
         // OpenAI + every OpenAI-compatible host (Groq, Fireworks, DeepSeek,
         // OpenRouter, Perplexity, xAI, DeepInfra, Hugging Face router,
@@ -739,6 +756,7 @@ fn build_providers(
                 client.clone(),
                 spec.name.clone(),
                 &base_url,
+                spec.api_version.clone(),
                 spec.api_key.clone(),
             ));
             let chat: Arc<dyn ChatProvider> = provider.clone();
@@ -826,6 +844,7 @@ mod tests {
             kind,
             api_key: Some("sk-test-xxx".to_owned()),
             base_url: base_url.map(str::to_owned),
+            api_version: None,
             strict: false,
             connect_timeout_ms: None,
             models,
@@ -1136,6 +1155,7 @@ mod tests {
                 kind: ProviderKind::VertexAi,
                 api_key: Some(creds.clone()),
                 base_url: Some("us-central1".to_owned()),
+                api_version: None,
                 strict: false,
                 connect_timeout_ms: None,
                 models: vec![model("gemini-flash", &[Capability::Chat])],
@@ -1153,6 +1173,7 @@ mod tests {
                 kind: ProviderKind::VertexAi,
                 api_key: Some(creds),
                 base_url: None,
+                api_version: None,
                 strict: false,
                 connect_timeout_ms: None,
                 models: vec![model("m", &[Capability::Chat])],
@@ -1173,6 +1194,7 @@ mod tests {
                 kind: ProviderKind::VertexAi,
                 api_key: None,
                 base_url: Some("us-central1".to_owned()),
+                api_version: None,
                 strict: false,
                 connect_timeout_ms: None,
                 models: vec![model("m", &[Capability::Chat])],
@@ -1189,6 +1211,7 @@ mod tests {
                 kind: ProviderKind::VertexAi,
                 api_key: Some("sk-test-xxx".to_owned()),
                 base_url: Some("us-central1".to_owned()),
+                api_version: None,
                 strict: false,
                 connect_timeout_ms: None,
                 models: vec![model("m", &[Capability::Chat])],
