@@ -5,9 +5,10 @@ and embeddings come from [Ollama](https://ollama.com), reranking from
 [TEI](https://github.com/huggingface/text-embeddings-inference) (Text
 Embeddings Inference). Everything runs offline once the models are pulled.
 
-Chat is routed through Ollama's OpenAI-compatible endpoint using the `vllm`
-provider kind (it works with any OpenAI-compatible server, not just vLLM),
-while embeddings use the native `ollama` kind directly.
+A single native `ollama` provider serves both capabilities: chat goes
+through Ollama's OpenAI-compatible endpoint (the gateway appends the `/v1`
+itself), embeddings through the native `/api/embed` path - one
+`[[providers]]` block, `base_url` at the server root.
 
 ## Prerequisites
 
@@ -24,7 +25,8 @@ docker run -p 8081:80 -v "$PWD/tei-data:/data" \
 ```
 
 Ollama's first call to a model loads it into VRAM, which is why this config
-raises `first_token_timeout_ms` and `total_timeout_ms` on the chat provider.
+raises `first_token_timeout_ms` and `total_timeout_ms` on the Ollama
+provider.
 
 ## Run it
 
@@ -38,7 +40,7 @@ cargo run -p server -- --config examples/self-hosted/config.toml
 
 ## What it shows
 
-- Chat against `llama` (Ollama's `llama3.2`, via the OpenAI-compatible path).
+- Chat against `llama` (Ollama's `llama3.2`, via its OpenAI-compatible path).
 - Embeddings against `nomic-embed` (Ollama's `nomic-embed-text`, native path).
 - Reranking against `bge-reranker` (TEI's `BAAI/bge-reranker-large`) with two
   documents.

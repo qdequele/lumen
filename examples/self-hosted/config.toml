@@ -1,9 +1,12 @@
-# Fully self-hosted, no API keys: Ollama (chat via its OpenAI-compatible
-# endpoint, embeddings natively) + TEI (rerank). Works offline.
+# Fully self-hosted, no API keys: Ollama (chat + embeddings, one provider)
+# + TEI (rerank). Works offline. The native ollama kind serves chat through
+# Ollama's OpenAI-compatible endpoint (the gateway appends the /v1 itself)
+# and embeddings through the native /api/embed - keep base_url at the
+# server root.
 [[providers]]
-name = "ollama-openai"
-kind = "vllm"                       # any OpenAI-compatible server
-base_url = "http://localhost:11434/v1"
+name = "ollama"
+kind = "ollama"
+base_url = "http://localhost:11434"
 first_token_timeout_ms = 60000      # first call may load the model into VRAM
 total_timeout_ms = 120000
 
@@ -11,11 +14,6 @@ total_timeout_ms = 120000
 id = "llama"
 upstream_id = "llama3.2"
 capabilities = ["chat"]
-
-[[providers]]
-name = "ollama-native"
-kind = "ollama"
-base_url = "http://localhost:11434"
 
 [[providers.models]]
 id = "nomic-embed"

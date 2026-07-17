@@ -261,7 +261,9 @@ upstream_id = "anthropic.claude-3-5-sonnet-20241022-v2:0"
 capabilities = ["chat"]
 modalities = ["text", "image"]
 
-# Ollama: local, keyless. Requires a base_url.
+# Ollama: local, keyless. Requires a base_url - the server ROOT, no /v1.
+# Embeddings use the native /api/embed; chat goes through Ollama's
+# OpenAI-compatible endpoint (the gateway appends the /v1 itself).
 [[providers]]
 name = "ollama-local"
 kind = "ollama"
@@ -283,6 +285,11 @@ total_timeout_ms = 120000
                    # instead of silently dropping it. `encoding_format` is always
                    # handled at the response edge and is never affected.
 connect_timeout_ms = 10000        # own client: relaxed connect for a slow local link
+
+[[providers.models]]
+id = "local-llama"
+upstream_id = "llama3.2"
+capabilities = ["chat"]
 
 [[providers.models]]
 id = "nomic-embed"

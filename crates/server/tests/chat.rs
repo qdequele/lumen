@@ -217,6 +217,34 @@ fn cohere_vision_registry(upstream: &str) -> Arc<Registry> {
     )
 }
 
+/// One native-Ollama-kind provider with a chat model, pointed at `upstream`
+/// as the server ROOT (the documented `ollama` base_url shape, no `/v1`).
+fn ollama_registry(upstream: &str) -> Arc<Registry> {
+    let specs = vec![ProviderSpec {
+        name: "ollama".to_owned(),
+        kind: ProviderKind::Ollama,
+        api_key: None, // keyless, like a real local Ollama
+        base_url: Some(upstream.to_owned()),
+        strict: false,
+        connect_timeout_ms: None,
+        api_version: None,
+        models: vec![ModelSpec {
+            id: "local-llama".to_owned(),
+            upstream_id: "llama3.2".to_owned(),
+            capabilities: vec![Capability::Chat],
+            modalities: vec!["text".to_owned()],
+        }],
+    }];
+    Arc::new(
+        Registry::build(
+            specs,
+            http::build_client(),
+            std::time::Duration::from_secs(300),
+        )
+        .expect("registry builds"),
+    )
+}
+
 fn openai_chat_body(model: &str) -> Value {
     json!({
         "object": "chat.completion",
@@ -281,6 +309,154 @@ async fn openai_compatible_kind_routes_through_the_openai_path() {
     let requests = upstream.received_requests().await.unwrap();
     let sent: Value = serde_json::from_slice(&requests[0].body).unwrap();
     assert_eq!(sent["model"], "llama-3.3-70b");
+}
+
+/// Issue #63: the native `ollama` kind serves chat. Its documented base_url is
+/// the server ROOT (embeddings hit `{root}/api/embed`), while Ollama's
+/// OpenAI-compatible surface lives under `/v1` - so the gateway must join the
+/// chat path as `{root}/v1/chat/completions`, and upstream usage passes
+/// through untouched (ADR 003).
+#[tokio::test]
+async fn ollama_kind_serves_chat_through_its_openai_compatible_v1_path() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_chat_body("llama3.2")))
+        .mount(&upstream)
+        .await;
+
+    let base = common::spawn_with(ollama_registry(&upstream.uri()), LIMIT).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&json!({ "model": "local-llama", "messages": [{ "role": "user", "content": "hi" }] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["object"], "chat.completion");
+    assert_eq!(body["choices"][0]["message"]["content"], "hi there");
+    // Upstream usage is passed through, never re-derived (ADR 003).
+    assert_eq!(body["usage"]["total_tokens"], 10);
+    assert!(body["usage"].get("estimated").is_none());
+
+    // Alias resolved to the upstream id, exactly like the other
+    // OpenAI-compatible kinds.
+    let requests = upstream.received_requests().await.unwrap();
+    let sent: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(sent["model"], "llama3.2");
+}
+
+/// ADR 003 for the ollama chat path: an upstream reply with no `usage` still
+/// yields a non-zero token count, honestly labelled `estimated`.
+#[tokio::test]
+async fn ollama_chat_without_upstream_usage_reports_an_estimated_count() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "c", "object": "chat.completion", "created": 0, "model": "llama3.2",
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": "hi there" },
+                "finish_reason": "stop"
+            }]
+            // Deliberately no "usage" - exercises the estimation fallback.
+        })))
+        .mount(&upstream)
+        .await;
+
+    let base = common::spawn_with(ollama_registry(&upstream.uri()), LIMIT).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&json!({ "model": "local-llama", "messages": [{ "role": "user", "content": "hi" }] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["usage"]["estimated"], true);
+    assert!(
+        body["usage"]["total_tokens"].as_u64().unwrap() > 0,
+        "never a silent zero: {body}"
+    );
+}
+
+/// Issue #63: ollama chat streaming rides the same zero-copy bytes passthrough
+/// as every other OpenAI-compatible kind (ADR 004) - the client receives the
+/// upstream SSE body byte-for-byte, and the upstream was asked to include
+/// usage in the stream (ADR 003 hook).
+#[tokio::test]
+async fn ollama_streaming_passthrough_is_byte_identical() {
+    let upstream = MockServer::start().await;
+    let body = upstream_sse_body(10);
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(body.clone()),
+        )
+        .mount(&upstream)
+        .await;
+
+    let base = common::spawn_with(ollama_registry(&upstream.uri()), LIMIT).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&json!({
+            "model": "local-llama",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let text = resp.text().await.unwrap();
+    assert_eq!(text, body, "zero-copy passthrough must be byte-identical");
+    assert!(text.ends_with("data: [DONE]\n\n"));
+
+    let requests = upstream.received_requests().await.unwrap();
+    let sent: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(sent["stream"], true);
+    assert_eq!(sent["stream_options"]["include_usage"], true);
+}
+
+/// Issue #63: cancellation on the ollama chat path - a client disconnect
+/// mid-stream tears down the upstream connection promptly (the LiteLLM
+/// #22805 lesson), same as the OpenAI kind.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ollama_streaming_client_disconnect_aborts_upstream_connection() {
+    let (upstream_url, rx) = spawn_abort_detecting_upstream().await;
+    let base = common::spawn_with(ollama_registry(&upstream_url), LIMIT).await;
+
+    let client = reqwest::Client::new();
+    let mut resp = client
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&json!({
+            "model": "local-llama",
+            "messages": [{ "role": "user", "content": "x" }],
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // Read the first streamed frame, then disconnect by dropping the response.
+    let first = resp.chunk().await.unwrap();
+    assert!(first.is_some(), "expected at least one streamed frame");
+    drop(resp);
+
+    let closed = tokio::time::timeout(Duration::from_secs(3), rx).await;
+    assert!(
+        matches!(closed, Ok(Ok(()))),
+        "upstream connection was not aborted after client disconnect"
+    );
 }
 
 #[tokio::test]

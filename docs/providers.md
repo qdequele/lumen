@@ -62,7 +62,7 @@ Rules that apply to every provider:
 | `pinecone`  |      |      |   ✅   | required      | optional       | -                 |
 | `nvidia`    |      |      |   ✅   | keyless       | **required**   | -                 |
 | `tei`       |      |  ✅   |   ✅   | keyless       | **required**   | 32                |
-| `ollama`    |      |  ✅   |        | keyless       | **required**   | 512               |
+| `ollama`    |  ✅  |  ✅   |        | keyless       | **required**   | 512               |
 | `azure`     |  ✅  |  ✅   |        | required      | **required**   | 2048              |
 
 The `together` kind (in the OpenAI-compatible table below) additionally serves
@@ -499,9 +499,22 @@ capabilities = ["rerank"]
 
 ## ollama (self-hosted)
 
-- **kind**: `ollama` · **capabilities**: embed.
+- **kind**: `ollama` · **capabilities**: chat, embed.
 - **Auth**: keyless.
-- **base_url**: **required** - points at your Ollama server.
+- **base_url**: **required** - points at your Ollama server **root** (no
+  `/v1`). Embeddings use Ollama's native `POST /api/embed`; chat goes through
+  Ollama's OpenAI-compatible endpoint, which lives under `/v1` on the same
+  root - the gateway appends the `/v1` itself, so keep `base_url` as the bare
+  server root either way.
+- **Chat**: served by the shared OpenAI-compatible path - streaming (SSE
+  passthrough), cancellation, and token accounting (upstream `usage` when
+  Ollama reports it, otherwise a local count marked `estimated`, ADR 003) all
+  work exactly as for the `openai` kind.
+- **`api_key` asymmetry**: if you set an `api_key_env` on this kind (e.g. an
+  Ollama server behind an authenticated reverse proxy), the chat path sends it
+  as a bearer token but the native embed path currently sends no
+  Authorization header at all - keep the embed route unauthenticated at the
+  proxy, or front only `/v1` with auth.
 - **Embed batch limit**: 512.
 - **Tip**: a local model may take a while to load into VRAM on its first call -
   relax `first_token_timeout_ms` / `total_timeout_ms` on the provider block (see
@@ -518,6 +531,11 @@ base_url = "http://localhost:11434"
 first_token_timeout_ms = 60000
 total_timeout_ms = 120000
 connect_timeout_ms = 10000  # optional: own client, relaxed connect deadline
+
+[[providers.models]]
+id = "local-llama"
+upstream_id = "llama3.2"
+capabilities = ["chat"]
 
 [[providers.models]]
 id = "nomic-embed"
@@ -640,7 +658,11 @@ capabilities = ["rerank"]
 ### vllm
 
 Any self-hosted OpenAI-compatible server (vLLM, llama.cpp `--api`, LM Studio,
-SGLang, LocalAI). `base_url` **required**, API key optional.
+SGLang, LocalAI). `base_url` **required**, API key optional. For Ollama,
+prefer the native `ollama` kind (chat + embed, see its section above); its
+OpenAI-compatible endpoint (`http://localhost:11434/v1`) also works under
+this kind, but you lose the native embed path and the `/api/version` health
+probe.
 
 ```toml
 [[providers]]

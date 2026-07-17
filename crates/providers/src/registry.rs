@@ -475,6 +475,15 @@ fn build_inner(
     Ok(inner)
 }
 
+/// Whether an `ollama` base_url mistakenly carries the OpenAI-compatible
+/// `/v1` suffix. The documented shape for this kind is the server ROOT
+/// (`http://localhost:11434`): the registry appends `/v1` itself for chat,
+/// embeddings hang off `/api/embed`, and the health probe off `/api/version`,
+/// so a configured `/v1` breaks all three.
+fn ollama_base_url_has_v1_suffix(base_url: &str) -> bool {
+    base_url.trim_end_matches('/').ends_with("/v1")
+}
+
 /// Warn that a model declares a capability its provider kind cannot serve yet.
 fn warn_unsupported(spec: &ProviderSpec, model_id: &str, capability: &str) {
     tracing::warn!(
@@ -696,8 +705,40 @@ fn build_providers(
                 rerank: None,
             })
         }
+        // Ollama: native embeddings via `{root}/api/embed`, chat via its
+        // OpenAI-compatible surface, which lives under `/v1` on the SAME
+        // server root the embed path uses. The documented `base_url` shape
+        // for this kind is the server root (no `/v1` - the health probe also
+        // appends `/api/version` to it), so the chat provider gets
+        // `{root}/v1` appended here and reuses the shared OpenAI
+        // implementation - streaming (zero-copy passthrough, ADR 004),
+        // cancellation, and ADR 003 token accounting come along with it
+        // (issue #63).
         ProviderKind::Ollama => {
             let base_url = require_base_url()?;
+            // A base_url that already carries the /v1 suffix is misconfigured
+            // for this kind: chat would hit /v1/v1/chat/completions, embed
+            // /v1/api/embed, and the health probe /v1/api/version. Warn
+            // rather than auto-trim - trimming only here would silently fix
+            // chat while leaving embed and the probe broken, hiding the real
+            // problem from the operator.
+            if ollama_base_url_has_v1_suffix(&base_url) {
+                tracing::warn!(
+                    provider = %spec.name,
+                    base_url = %base_url,
+                    "ollama base_url ends in /v1; the documented shape is the \
+                     server root (e.g. http://localhost:11434) - with this \
+                     value chat, embeddings, and the health probe will all \
+                     target wrong paths"
+                );
+            }
+            let chat_base_url = format!("{}/v1", base_url.trim_end_matches('/'));
+            let chat: Arc<dyn ChatProvider> = Arc::new(OpenAiProvider::new(
+                client.clone(),
+                spec.name.clone(),
+                Some(chat_base_url),
+                spec.api_key.clone(), // keyless in practice; forwarded if set
+            ));
             let embed: Arc<dyn EmbeddingProvider> = Arc::new(OllamaProvider::new(
                 client.clone(),
                 spec.name.clone(),
@@ -705,7 +746,7 @@ fn build_providers(
                 spec.strict,
             ));
             Ok(BuiltProviders {
-                chat: None,
+                chat: Some(chat),
                 embed: Some(embed),
                 rerank: None,
             })
@@ -980,6 +1021,41 @@ mod tests {
         assert!(reg.embedding_route("chat-1").is_none());
         assert!(reg.knows_model("chat-1"));
         assert!(!reg.knows_model("does-not-exist"));
+    }
+
+    #[test]
+    fn ollama_resolves_chat_and_embed() {
+        // Issue #63: the native ollama kind serves chat via Ollama's
+        // OpenAI-compatible /v1 surface, alongside its native embed path.
+        let reg = Registry::build(
+            vec![spec(
+                ProviderKind::Ollama,
+                "ollama",
+                Some("http://localhost:11434"),
+                vec![model("m", &[Capability::Chat, Capability::Embed])],
+            )],
+            reqwest::Client::new(),
+            Duration::from_secs(300),
+        )
+        .expect("ollama with base_url builds");
+        assert!(reg.chat_route("m").is_some(), "ollama chat must resolve");
+        assert!(reg.embedding_route("m").is_some(), "ollama embed");
+        assert!(reg.rerank_route("m").is_none(), "ollama has no rerank");
+    }
+
+    #[test]
+    fn ollama_v1_suffix_detection_flags_only_misconfigured_base_urls() {
+        // The build-time warning fires exactly when the operator configured
+        // the OpenAI-compatible /v1 path instead of the documented server
+        // root (the registry appends /v1 itself for chat).
+        assert!(ollama_base_url_has_v1_suffix("http://localhost:11434/v1"));
+        assert!(ollama_base_url_has_v1_suffix("http://localhost:11434/v1/"));
+        assert!(!ollama_base_url_has_v1_suffix("http://localhost:11434"));
+        assert!(!ollama_base_url_has_v1_suffix("http://localhost:11434/"));
+        // A host segment that merely CONTAINS v1 is fine.
+        assert!(!ollama_base_url_has_v1_suffix(
+            "http://ollama-v1.local:11434"
+        ));
     }
 
     #[test]
