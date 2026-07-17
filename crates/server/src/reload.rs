@@ -683,6 +683,46 @@ mod tests {
     }
 
     #[test]
+    fn reload_to_an_embed_model_on_an_embeddingless_kind_is_rejected() {
+        // A groq embed model (no base_url override) is a guaranteed upstream
+        // 404, caught by the registry rebuild (issue #74): the reload must
+        // fail with the registry error and keep the old routing table.
+        let dir = tempdir();
+        let path = write_config(&dir, TWO_MODELS);
+        let registry = registry_from(&path);
+        assert!(registry.embedding_route("embed").is_some());
+
+        let metrics = Metrics::new();
+        let reload = ReloadMetrics::register(&metrics).unwrap();
+        write_config(
+            &dir,
+            r#"
+            [[providers]]
+            name = "groq"
+            kind = "groq"
+            [[providers.models]]
+            id = "groq-embed"
+            capabilities = ["embed"]
+            "#,
+        );
+        let t = targets(Arc::clone(&registry), reload);
+        let err = apply_reload(&path, &t).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ReloadError::Registry(RegistryError::NoUpstreamEmbeddings { .. })
+            ),
+            "expected NoUpstreamEmbeddings, got: {err:?}"
+        );
+
+        // Old routing table intact: the pre-reload models still resolve, and
+        // the rejected model never appeared.
+        assert!(registry.embedding_route("embed").is_some());
+        assert!(registry.chat_route("gpt").is_some());
+        assert!(registry.embedding_route("groq-embed").is_none());
+    }
+
+    #[test]
     fn reload_of_a_deleted_file_is_rejected_and_keeps_the_table() {
         let dir = tempdir();
         let path = write_config(&dir, ONE_MODEL);

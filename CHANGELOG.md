@@ -36,6 +36,19 @@ All notable changes to LUMEN are documented here. The format is based on
   Covered by translator unit tests plus wiremock conformance tests at the
   provider and gateway levels (wire-shape, remote-URL pass-through, LM-2008
   verdicts, cancellation).
+- **A model declaring `embed` on `groq`, `deepseek`, `openrouter`,
+  `perplexity` or `xai` is now rejected at config load** (issue #74; new
+  `RegistryError::NoUpstreamEmbeddings`, surfaced by boot, `--check-config`
+  and hot reload) instead of building silently and 404ing on the first
+  `/v1/embeddings` request. These hosted OpenAI-compatible kinds share the
+  OpenAI embed wiring but expose no upstream `/embeddings` endpoint, so the
+  failure was certain. Backed by a new `ProviderKind::supports_embeddings()`
+  capability table; `fireworks`, `together`, `deepinfra`, `huggingface`,
+  `cloudflare` and `vllm` embed models keep working. The check only applies
+  when the provider uses the kind's default base URL: a custom `base_url`
+  (an operator-run proxy that may serve embeddings) bypasses it, and
+  `kind = "openai"` with a `base_url` override works as before.
+  `docs/providers.md` capability table updated.
 
 ### Changed
 

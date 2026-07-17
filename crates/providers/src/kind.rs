@@ -128,6 +128,42 @@ impl ProviderKind {
         }
     }
 
+    /// Whether this kind's upstream actually serves an embeddings API.
+    ///
+    /// `false` only for hosted OpenAI-compatible kinds that share the OpenAI
+    /// embed wiring but whose upstream exposes no `/embeddings` endpoint
+    /// (Groq, DeepSeek, OpenRouter, Perplexity, xAI, checked against vendor
+    /// API docs 2026-07; the xAI entry could not be corroborated by
+    /// unauthenticated probing, since api.x.ai answers 401 rather than 404 on
+    /// `/v1/embeddings`, so it rests on the docs alone). An embed model
+    /// declared there could only ever 404 at request time, so the registry
+    /// rejects it at build time instead. The check applies only when the
+    /// provider uses the kind's default base URL: a custom `base_url` (an
+    /// operator-run proxy in front of the host) bypasses it. Every other kind
+    /// returns `true`, permissively: self-hosted or catalog-dependent kinds
+    /// (`vllm`, `huggingface`, `cloudflare`) let the operator decide what is
+    /// served, and kinds with no embed implementation at all (e.g.
+    /// `anthropic`) are already covered by the registry's
+    /// unsupported-capability warning.
+    ///
+    /// This method exists only because the OpenAI-compatible registry arm
+    /// builds the embed wiring unconditionally for every kind it covers, so
+    /// nothing else distinguishes "wired but guaranteed to 404" from "wired
+    /// and served". Chat and rerank need no counterpart: their wiring is
+    /// already built per kind, so a kind that cannot serve them simply builds
+    /// no implementation and hits the unsupported-capability warning.
+    #[must_use]
+    pub const fn supports_embeddings(self) -> bool {
+        !matches!(
+            self,
+            ProviderKind::Groq
+                | ProviderKind::Deepseek
+                | ProviderKind::Openrouter
+                | ProviderKind::Perplexity
+                | ProviderKind::Xai
+        )
+    }
+
     /// Whether this provider requires an API key to be configured.
     ///
     /// Local, self-hosted providers (Ollama, TEI, vLLM) are keyless. NVIDIA NIM
@@ -152,6 +188,39 @@ impl ProviderKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hosted_kinds_without_an_upstream_embeddings_api_report_it() {
+        // Verified against upstream API docs (issue #74): these hosted
+        // OpenAI-compatible kinds serve chat only - no /embeddings endpoint -
+        // so an embed model there could only ever 404 at request time.
+        for kind in [
+            ProviderKind::Groq,
+            ProviderKind::Deepseek,
+            ProviderKind::Openrouter,
+            ProviderKind::Perplexity,
+            ProviderKind::Xai,
+        ] {
+            assert!(!kind.supports_embeddings(), "{kind:?} has no upstream API");
+        }
+        // Hosts that genuinely serve embeddings, plus self-hosted or
+        // catalog-dependent kinds where the operator controls what is served,
+        // stay permissive.
+        for kind in [
+            ProviderKind::Openai,
+            ProviderKind::Together,
+            ProviderKind::Fireworks,
+            ProviderKind::Deepinfra,
+            ProviderKind::Huggingface,
+            ProviderKind::Cloudflare,
+            ProviderKind::Vllm,
+            ProviderKind::Azure,
+            ProviderKind::Cohere,
+            ProviderKind::Voyage,
+        ] {
+            assert!(kind.supports_embeddings(), "{kind:?} serves embeddings");
+        }
+    }
 
     #[test]
     fn azure_is_a_native_kind_requiring_its_own_base_url_and_api_key() {

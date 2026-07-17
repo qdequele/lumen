@@ -68,26 +68,37 @@ Rules that apply to every provider:
 The `together` kind (in the OpenAI-compatible table below) additionally serves
 **rerank** (LlamaRank) natively; see its section for the model config.
 
-OpenAI-compatible hosts (chat + embed via the OpenAI path; a host that only
-serves chat simply has no embed models configured):
+OpenAI-compatible hosts (chat + embed via the OpenAI path). The Embed column
+reflects what each host actually serves upstream: `groq`, `deepseek`,
+`openrouter`, `perplexity` and `xai` expose no `/embeddings` endpoint, so a
+model declaring `embed` on those kinds is **rejected at config load** (it
+could only ever 404 at request time) - unless the provider sets a custom
+`base_url`, which is taken to mean an operator-run proxy that may serve
+embeddings:
 
 | `kind`        | Chat | Embed | `api_key_env` | `base_url`   | Default base URL                          |
 |---------------|:----:|:-----:|:-------------:|:------------:|-------------------------------------------|
-| `groq`        |  ✅  |  ✅   | required      | optional     | `https://api.groq.com/openai/v1`          |
+| `groq`        |  ✅  |  no   | required      | optional     | `https://api.groq.com/openai/v1`          |
 | `together`    |  ✅  |  ✅   | required      | optional     | `https://api.together.xyz/v1`             |
 | `fireworks`   |  ✅  |  ✅   | required      | optional     | `https://api.fireworks.ai/inference/v1`   |
-| `deepseek`    |  ✅  |  ✅   | required      | optional     | `https://api.deepseek.com/v1`             |
-| `openrouter`  |  ✅  |  ✅   | required      | optional     | `https://openrouter.ai/api/v1`            |
-| `perplexity`  |  ✅  |  ✅   | required      | optional     | `https://api.perplexity.ai`               |
-| `xai`         |  ✅  |  ✅   | required      | optional     | `https://api.x.ai/v1`                     |
+| `deepseek`    |  ✅  |  no   | required      | optional     | `https://api.deepseek.com/v1`             |
+| `openrouter`  |  ✅  |  no   | required      | optional     | `https://openrouter.ai/api/v1`            |
+| `perplexity`  |  ✅  |  no   | required      | optional     | `https://api.perplexity.ai`               |
+| `xai`         |  ✅  |  no   | required      | optional     | `https://api.x.ai/v1`                     |
 | `deepinfra`   |  ✅  |  ✅   | required      | optional     | `https://api.deepinfra.com/v1/openai`     |
 | `huggingface` |  ✅  |  ✅   | required      | optional     | `https://router.huggingface.co/v1`        |
 | `cloudflare`  |  ✅  |  ✅   | required      | **required** | - (URL embeds your account id)            |
 | `vllm`        |  ✅  |  ✅   | keyless       | **required** | - (your self-hosted server)               |
 
-All OpenAI-compatible kinds use a 2048-input embed batch limit. Anything that
-speaks the OpenAI wire format but isn't listed can still be used via
-`kind = "openai"` with a `base_url` override.
+Self-hosted or catalog-dependent kinds (`vllm`, `huggingface`, `cloudflare`)
+stay permissive: the operator controls what their endpoint serves. If one of
+the embed-less hosts above later ships an embeddings API, point a `kind =
+"openai"` provider at it with a `base_url` override, or file an issue to
+update the capability table.
+
+All embed-serving OpenAI-compatible kinds use a 2048-input embed batch
+limit. Anything that speaks the OpenAI wire format but isn't listed can
+still be used via `kind = "openai"` with a `base_url` override.
 
 `cloudflare` additionally serves **rerank** (not shown in the table above,
 which covers only the chat/embed OpenAI-compatible path): its BAAI
