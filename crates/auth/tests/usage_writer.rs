@@ -9,6 +9,7 @@ fn record(model: &str) -> UsageRecord {
         key_id: None,
         model: model.to_owned(),
         model_used: model.to_owned(),
+        provider: "openai".to_owned(),
         capability: "chat".to_owned(),
         tokens_in: 1,
         tokens_out: 2,

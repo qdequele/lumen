@@ -9,7 +9,7 @@
 
 use lumen_auth::crypto::MasterKey;
 use lumen_auth::key::hash_key;
-use lumen_auth::store::{KeyPatch, KeyStore, NewKey, UsageRecord};
+use lumen_auth::store::{KeyPatch, KeyStore, NewKey, UsageFilter, UsageGroupBy, UsageRecord};
 
 fn new_key(name: &str) -> NewKey {
     NewKey {
@@ -26,6 +26,7 @@ fn usage(key_id: &str, ts: i64) -> UsageRecord {
         key_id: Some(key_id.to_owned()),
         model: "gpt-test".to_owned(),
         model_used: "gpt-test".to_owned(),
+        provider: "openai".to_owned(),
         capability: "chat".to_owned(),
         tokens_in: 12,
         tokens_out: 34,
@@ -183,6 +184,140 @@ async fn usage_metadata_column_roundtrips_json() {
     store.insert_usage(&[rec]).await.expect("insert");
     let dump = store.debug_dump().await.expect("dump");
     assert!(dump.contains(r#"{"team":"search"}"#));
+}
+
+#[tokio::test]
+async fn usage_summary_aggregates_filters_and_groups() {
+    let store = KeyStore::in_memory().await.expect("open store");
+    let mut chat = usage("key-a", 100);
+    chat.estimated = true; // locally estimated counts
+    let mut embed = usage("key-b", 200);
+    embed.capability = "embed".to_owned();
+    embed.model = "embed-small".to_owned();
+    embed.model_used = "embed-small".to_owned();
+    embed.provider = "tei".to_owned();
+    embed.tokens_in = 3;
+    embed.tokens_out = 0;
+    embed.cost = 0.5;
+    let outside = usage("key-a", 900); // outside the window below
+    store
+        .insert_usage(&[chat, embed, outside])
+        .await
+        .expect("seed");
+
+    let filter = UsageFilter {
+        since: 0,
+        until: 500,
+        limit: 10,
+        ..UsageFilter::default()
+    };
+
+    // Grouped by provider: two groups, each with its own aggregates.
+    let groups = store
+        .usage_summary(&filter, UsageGroupBy::Provider)
+        .await
+        .expect("summary");
+    assert_eq!(groups.len(), 2);
+    let openai = groups
+        .iter()
+        .find(|g| g.group == "openai")
+        .expect("openai group");
+    assert_eq!(openai.requests, 1);
+    assert_eq!(openai.tokens_in, 12);
+    assert_eq!(openai.tokens_out, 34);
+    assert_eq!(openai.estimated_requests, 1);
+    let tei = groups.iter().find(|g| g.group == "tei").expect("tei group");
+    assert_eq!(tei.requests, 1);
+    assert_eq!(tei.estimated_requests, 0);
+    assert_eq!(tei.cost, 0.5);
+
+    // Filtered by capability: only the embed row remains.
+    let embed_only = store
+        .usage_summary(
+            &UsageFilter {
+                capability: Some("embed".to_owned()),
+                ..filter.clone()
+            },
+            UsageGroupBy::Model,
+        )
+        .await
+        .expect("summary");
+    assert_eq!(embed_only.len(), 1);
+    assert_eq!(embed_only[0].group, "embed-small");
+
+    // Filtered by key id.
+    let key_a = store
+        .usage_summary(
+            &UsageFilter {
+                key_id: Some("key-a".to_owned()),
+                ..filter.clone()
+            },
+            UsageGroupBy::KeyId,
+        )
+        .await
+        .expect("summary");
+    assert_eq!(key_a.len(), 1);
+    assert_eq!(key_a[0].group, "key-a");
+    assert_eq!(key_a[0].requests, 1);
+}
+
+#[tokio::test]
+async fn usage_summary_groups_by_model_used_separately_from_model() {
+    // A fallback-served request: requested "gpt-test", served by "gpt-mini".
+    let store = KeyStore::in_memory().await.expect("open store");
+    let mut fell_back = usage("k", 100);
+    fell_back.model_used = "gpt-mini".to_owned();
+    store
+        .insert_usage(&[usage("k", 100), fell_back])
+        .await
+        .expect("seed");
+
+    let filter = UsageFilter {
+        since: 0,
+        until: 200,
+        limit: 10,
+        ..UsageFilter::default()
+    };
+    let by_model = store
+        .usage_summary(&filter, UsageGroupBy::Model)
+        .await
+        .expect("summary");
+    assert_eq!(by_model.len(), 1, "both requested the same model");
+    let by_model_used = store
+        .usage_summary(&filter, UsageGroupBy::ModelUsed)
+        .await
+        .expect("summary");
+    assert_eq!(by_model_used.len(), 2, "but two different models served");
+    assert!(by_model_used.iter().any(|g| g.group == "gpt-mini"));
+}
+
+#[tokio::test]
+async fn usage_summary_orders_by_cost_and_honors_the_limit() {
+    let store = KeyStore::in_memory().await.expect("open store");
+    let mut rows = Vec::new();
+    for (model, cost) in [("a", 1.0), ("b", 3.0), ("c", 2.0)] {
+        let mut r = usage("k", 100);
+        r.model = model.to_owned();
+        r.cost = cost;
+        rows.push(r);
+    }
+    store.insert_usage(&rows).await.expect("seed");
+
+    let groups = store
+        .usage_summary(
+            &UsageFilter {
+                since: 0,
+                until: 1_000,
+                limit: 2,
+                ..UsageFilter::default()
+            },
+            UsageGroupBy::Model,
+        )
+        .await
+        .expect("summary");
+    assert_eq!(groups.len(), 2, "limit bounds the result size");
+    assert_eq!(groups[0].group, "b", "most expensive first");
+    assert_eq!(groups[1].group, "c");
 }
 
 #[tokio::test]
