@@ -3,6 +3,10 @@
 //! admin API. The upstream is wiremock; LUMEN sits in front with auth
 //! enabled and an in-memory SQLite store.
 
+// Exact float literals stored and read back unchanged through SQLite REAL
+// columns (`budget_spent`) - strict equality is the correct assertion here.
+#![allow(clippy::float_cmp)]
+
 mod common;
 
 use std::sync::Arc;
@@ -13,7 +17,7 @@ use figment::Figment;
 use lumen_auth::crypto::MasterKey;
 use lumen_auth::key::hash_key;
 use lumen_auth::state::AuthState;
-use lumen_auth::store::{KeyStore, NewKey};
+use lumen_auth::store::{KeyStore, NewKey, VirtualKeyRecord};
 use lumen_auth::usage::{spawn_usage_writer, UsageWriterConfig};
 use lumen_core::Capability;
 use lumen_providers::{http, ModelSpec, ProviderKind, ProviderSpec, Registry};
@@ -1291,6 +1295,147 @@ async fn admin_rotate_swaps_the_plaintext_live_and_preserves_spend() {
         .await
         .expect("send");
     assert_eq!(third.status(), 402, "spend must survive rotation");
+}
+
+#[tokio::test]
+async fn admin_delete_persists_final_spend_before_eviction() {
+    // Regression: once `keys.remove` drops the live entry, the periodic
+    // flusher's `drain_dirty` will never see it again - so the accrued spend
+    // since the last flush must be persisted as part of delete itself, or
+    // the tombstone's `budget_spent` freezes at a stale value.
+    let upstream = MockServer::start().await;
+    mount_openai_embeddings(&upstream, 1).await;
+    let h = spawn_auth(full_registry(&upstream.uri()), &[]).await;
+
+    let created = h
+        .client
+        .post(format!("{}/admin/keys", h.base))
+        .bearer_auth(master())
+        .json(&json!({ "name": "spender", "budget_max": 10.0 }))
+        .send()
+        .await
+        .expect("create");
+    let body: Value = created.json().await.expect("json");
+    let plaintext = body["key"].as_str().expect("key").to_owned();
+    let id = body["id"].as_str().expect("id").to_owned();
+
+    // Spend $1 without ever running the periodic flush - the DB row still
+    // shows budget_spent = 0 at this point.
+    let spend = h
+        .client
+        .post(format!("{}/v1/embeddings", h.base))
+        .bearer_auth(&plaintext)
+        .json(&embed_body())
+        .send()
+        .await
+        .expect("send");
+    assert_eq!(spend.status(), 200);
+
+    let deleted = h
+        .client
+        .delete(format!("{}/admin/keys/{id}", h.base))
+        .bearer_auth(master())
+        .send()
+        .await
+        .expect("delete");
+    assert_eq!(deleted.status(), 204);
+
+    let all = h.store.list_keys(true).await.expect("list all");
+    let tombstone = all.iter().find(|k| k.id == id).expect("tombstone present");
+    assert_eq!(
+        tombstone.budget_spent, 1.0,
+        "the last dollar spent before delete must be persisted, not lost"
+    );
+}
+
+#[tokio::test]
+async fn admin_delete_retry_evicts_a_zombie_key_from_memory() {
+    // Regression: a client that disconnects between the DB tombstone write
+    // and the in-memory eviction - or simply retries after the tombstone
+    // already landed - must not leave the key authenticating from memory
+    // forever. This simulates that missed-eviction race directly (re-
+    // inserting the pre-delete live entry after a real delete already
+    // tombstoned the DB row) and asserts the RETRY still evicts it, even
+    // though the DB half of that second call reports "already gone".
+    let upstream = MockServer::start().await;
+    mount_openai_embeddings(&upstream, 1).await;
+    let h = spawn_auth(full_registry(&upstream.uri()), &[]).await;
+
+    let created = h
+        .client
+        .post(format!("{}/admin/keys", h.base))
+        .bearer_auth(master())
+        .json(&json!({ "name": "zombie" }))
+        .send()
+        .await
+        .expect("create");
+    let body: Value = created.json().await.expect("json");
+    let plaintext = body["key"].as_str().expect("key").to_owned();
+    let id = body["id"].as_str().expect("id").to_owned();
+
+    // A normal delete: DB tombstoned AND memory evicted in the same call.
+    let first = h
+        .client
+        .delete(format!("{}/admin/keys/{id}", h.base))
+        .bearer_auth(master())
+        .send()
+        .await
+        .expect("delete");
+    assert_eq!(first.status(), 204);
+
+    // Simulate the missed-eviction race: reinstate the live entry exactly as
+    // it looked right before deletion, as if `auth.keys.remove` had never
+    // run on the first call (e.g. the client disconnected right after the DB
+    // write completed).
+    let zombie = VirtualKeyRecord {
+        id: id.clone(),
+        name: "zombie".to_owned(),
+        budget_max: None,
+        budget_spent: 0.0,
+        rpm_limit: None,
+        tpm_limit: None,
+        expires_at: None,
+        disabled: false,
+        created_at: 0,
+        deleted_at: None,
+    };
+    h.runtime.keys.upsert(hash_key(&plaintext), &zombie);
+    assert!(
+        h.runtime.keys.authenticate(&plaintext, 0).is_some(),
+        "zombie reinstated for the test"
+    );
+
+    // Retry: the DB row no longer matches (already tombstoned by the first
+    // call) -> the same 400 LM-1001 as any unknown id, but the live table
+    // must STILL be pruned.
+    let retry = h
+        .client
+        .delete(format!("{}/admin/keys/{id}", h.base))
+        .bearer_auth(master())
+        .send()
+        .await
+        .expect("retry delete");
+    assert_eq!(retry.status(), 400);
+    let retry_body: Value = retry.json().await.expect("json");
+    assert_eq!(retry_body["error"]["code"], "LM-1001");
+
+    assert!(
+        h.runtime.keys.authenticate(&plaintext, 0).is_none(),
+        "the retry must repair the missed eviction"
+    );
+    let denied = h
+        .client
+        .post(format!("{}/v1/embeddings", h.base))
+        .bearer_auth(&plaintext)
+        .json(&embed_body())
+        .send()
+        .await
+        .expect("send");
+    assert_eq!(
+        denied.status(),
+        401,
+        "the zombie must not keep authenticating"
+    );
 }
 
 #[tokio::test]

@@ -496,14 +496,23 @@ fn upsert_and_apply_reflect_admin_changes_immediately() {
 #[test]
 fn remove_evicts_a_key_from_the_live_table_immediately() {
     let state = state_with("fg-victim", record("victim"));
-    assert!(state.authenticate("fg-victim", NOW).is_some());
+    let entry = state.authenticate("fg-victim", NOW).expect("key valid");
+    entry
+        .admit(NOW, 1, usd_to_micro(2.0))
+        .expect("admitted")
+        .settle(usd_to_micro(2.0), 1);
 
-    state.remove("victim");
+    let removed = state.remove("victim").expect("entry was live");
+    assert_eq!(
+        removed.spent_micro(),
+        usd_to_micro(2.0),
+        "spend readable for flushing"
+    );
     assert!(state.authenticate("fg-victim", NOW).is_none());
     assert!(state.is_empty(), "both maps are emptied");
 
-    // Removing an unknown id is a harmless no-op.
-    state.remove("victim");
+    // Removing an unknown (or already-removed) id is a harmless no-op.
+    assert!(state.remove("victim").is_none());
 }
 
 #[test]

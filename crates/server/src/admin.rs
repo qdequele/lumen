@@ -29,6 +29,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
 use lumen_auth::key::hash_key;
+use lumen_auth::state::micro_to_usd;
 use lumen_auth::store::{
     KeyPatch, NewKey, UsageAggregate, UsageFilter, UsageGroupBy, VirtualKeyRecord,
 };
@@ -47,7 +48,8 @@ pub struct CreatedKey {
 
 // STRICT rule 5: the plaintext must be unrepresentable through `Debug`, so a
 // stray `{:?}` in a log line or error chain can never leak it. Serialization
-// (the one intended exposure) goes through `Serialize` only.
+// (the one intended exposure) goes through `Serialize` only. Mirrors
+// `PlaintextKey`'s own redacted `Debug`.
 impl std::fmt::Debug for CreatedKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CreatedKey")
@@ -104,11 +106,14 @@ pub struct ListKeysParams {
 }
 
 /// List every active key (no secrets: ids, names, budgets, limits, flags).
-/// `?include_deleted=true` adds soft-deleted tombstones for auditing.
+/// `?include_deleted=true` adds soft-deleted tombstones for auditing. A
+/// malformed query string is a `LM-1001` JSON envelope, like every other
+/// extractor failure in this module - never axum's bare-text rejection.
 pub async fn list_keys(
     State(state): State<AppState>,
-    Query(params): Query<ListKeysParams>,
+    params: Result<Query<ListKeysParams>, QueryRejection>,
 ) -> Result<Json<Vec<VirtualKeyRecord>>, ApiError> {
+    let Query(params) = params.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
     let auth = runtime(&state)?;
     let keys = auth
         .store
@@ -151,13 +156,34 @@ pub async fn delete_key(
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     let auth = runtime(&state)?;
-    auth.store
-        .delete_key(&id)
-        .await
-        .map_err(|e| internal(&e))?
-        .ok_or_else(|| GatewayError::InvalidRequest(format!("unknown key id '{id}'")))?;
-    // Evict from the live table: the deleted key is refused immediately.
-    auth.keys.remove(&id);
+    let deleted = auth.store.delete_key(&id).await.map_err(|e| internal(&e))?;
+    // Evict from the live table UNCONDITIONALLY - whether this call's DB
+    // write actually matched a row (`Some`) or the row was already
+    // tombstoned by an earlier attempt (`None`, e.g. a client retry after a
+    // disconnect that landed the DB write but never reached this line the
+    // first time). Without this, a cancelled request could tombstone the DB
+    // row yet leave the key authenticating from memory forever - only a
+    // restart would notice. Making the eviction unconditional means every
+    // retry repairs a previously missed one, so the zombie window closes on
+    // the very next delete attempt rather than lasting until a restart.
+    if let Some(entry) = auth.keys.remove(&id) {
+        // Flush the final accrued spend now: once the entry is dropped here
+        // the periodic flusher (`drain_dirty`) will never see this id again,
+        // so the tombstone's `budget_spent` would otherwise freeze at
+        // whatever the last periodic flush happened to catch.
+        let spent = micro_to_usd(entry.spent_micro());
+        if let Err(error) = auth.store.persist_budgets(&[(id.clone(), spent)]).await {
+            // Best-effort: the accounting is already backed by the periodic
+            // flush for every other key, so a failure here must not turn a
+            // successful delete into a 500 - log and continue.
+            tracing::warn!(
+                key_id = %id,
+                %error,
+                "failed to persist final spend while deleting a key"
+            );
+        }
+    }
+    deleted.ok_or_else(|| GatewayError::InvalidRequest(format!("unknown key id '{id}'")))?;
     Ok(StatusCode::NO_CONTENT)
 }
 

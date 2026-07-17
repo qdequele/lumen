@@ -334,10 +334,15 @@ impl AuthState {
     /// authenticating on the very next request - no restart. The `by_hash`
     /// side is found by entry identity, so the hash itself never has to
     /// travel back out of the store.
-    pub fn remove(&self, id: &str) {
-        if let Some((_, entry)) = self.by_id.remove(id) {
-            self.by_hash.retain(|_, e| !Arc::ptr_eq(e, &entry));
-        }
+    ///
+    /// Returns the evicted entry so the caller can flush its final accrued
+    /// spend before it is dropped (the periodic flusher will never see this
+    /// id again once it is gone from `by_id`); `None` when the id was not
+    /// live (already removed, or never loaded).
+    pub fn remove(&self, id: &str) -> Option<Arc<KeyEntry>> {
+        let (_, entry) = self.by_id.remove(id)?;
+        self.by_hash.retain(|_, e| !Arc::ptr_eq(e, &entry));
+        Some(entry)
     }
 
     /// Swap the hash an existing key authenticates under (admin rotate).
