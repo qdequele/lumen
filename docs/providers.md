@@ -282,6 +282,16 @@ modalities = ["text", "image"]
   counts) over `usage.billed_units` (what's charged); a response reporting
   neither leaves the gateway's local estimator to fill in an honestly-flagged
   count (ADR 003).
+- **Vision (issue #73)**: a user message carrying image parts is translated
+  to Cohere v2 content blocks (`text` / `image_url`, OpenAI-shaped); a
+  text-only message keeps the plain-string form, and non-user roles always
+  flatten to text (Cohere only admits image content on user messages). Declare
+  `modalities = ["text", "image"]` on a vision model (Command-A-Vision) to
+  opt in. Both inline `data:` URIs and remote `http(s)` URLs are forwarded
+  (Cohere fetches remote URLs itself, so `LM-2004` does not apply); the
+  optional `detail` hint (`low`/`high`/`auto`) passes through untouched.
+  Provider-native references (`anthropic-file:`, `gs://`, Gemini Files API
+  URIs) are rejected pre-flight with `LM-2008`.
 - **Embed batch limit**: 96.
 - **Cost**: rerank is billed in search units (`cost_per_1k_searches`).
 - **`input_type` override**: Cohere's embed v2 API requires an `input_type`
@@ -674,6 +684,7 @@ rejected with `LM-2003` (400, see `docs/errors.md`) before any upstream call.
 | OpenAI-family (`openai` + the OpenAI-compatible kinds) and `vllm` | forwarded verbatim | forwarded verbatim |
 | `azure` | forwarded verbatim (OpenAI wire schema) | forwarded verbatim |
 | `anthropic` | translated to a `base64` image source block | translated to a `url` image source block (Anthropic fetches it) |
+| `cohere` | translated to a v2 `image_url` content block (`data:` URI forwarded inline) | translated to a v2 `image_url` content block (Cohere fetches it) |
 | `google` (Gemini) | translated to `inline_data` | rejected - `LM-2004` |
 | `vertex_ai` | translated to `inline_data` (same as `google`) | rejected - `LM-2004` |
 | `bedrock` | translated to a Converse image block (`png`/`jpeg`/`gif`/`webp`) | rejected - `LM-2004` |

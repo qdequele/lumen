@@ -34,8 +34,9 @@ the whole fallback chain, not just the primary, so a fallback missing the
 ## Per-provider handling
 
 OpenAI-family kinds, `vllm` and `azure` forward image parts verbatim - both
-`data:` URIs and remote URLs. `anthropic` translates both forms into its own
-schema. `google`, `vertex_ai` and `bedrock` translate only inline `data:`
+`data:` URIs and remote URLs. `anthropic` and `cohere` translate both forms
+into their own schema (both upstreams fetch a remote URL themselves).
+`google`, `vertex_ai` and `bedrock` translate only inline `data:`
 URIs into their own schema; a remote `http(s)` URL routed to any of the
 three is rejected pre-flight with `LM-2004` (400), since none of them
 fetches a URL itself and the gateway never fetches a chat image URL on the

@@ -370,3 +370,10 @@ milestone.
   gateway deliberately does not do on the request path.
 - **Provider-native image URI forms.** Anthropic/Gemini file & GCS URI image
   sources (beyond inline base64 + remote URL) are not modelled.
+- **Tool-role messages with image parts are silently flattened** (noted while
+  fixing issue #73). The Cohere translator gates its v2 image blocks on the
+  user role (Cohere's `ToolMessageV2` cannot carry images), so an image part
+  on a `tool` message is flattened to its text - consistent with the
+  Anthropic translator today, but honest handling would be a 400 before the
+  upstream call. Candidate: a shared role-aware content check in the M8
+  pre-flight instead of per-translator conventions.

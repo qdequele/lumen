@@ -14,7 +14,9 @@
 use std::time::{Duration, Instant};
 
 use futures::StreamExt;
-use lumen_core::{ChatMessage, ChatProvider, ChatRequest, MessageContent, ProviderError};
+use lumen_core::{
+    ChatMessage, ChatProvider, ChatRequest, ContentPart, ImageUrl, MessageContent, ProviderError,
+};
 use lumen_providers::CohereProvider;
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
@@ -38,6 +40,55 @@ fn request(model: &str, content: &str, stream: bool) -> ChatRequest {
         messages: vec![ChatMessage {
             role: "user".to_owned(),
             content: Some(MessageContent::Text(content.to_owned())),
+            name: None,
+            extra: serde_json::Map::new(),
+        }],
+        temperature: None,
+        top_p: None,
+        max_tokens: None,
+        n: None,
+        stop: None,
+        stream,
+        extra: serde_json::Map::new(),
+    }
+}
+
+/// A vision request (issue #73): one user message carrying a text part, an
+/// inline `data:` URI image (with a `detail` hint) and a remote URL image.
+fn vision_request(model: &str, stream: bool) -> ChatRequest {
+    let text_part = ContentPart {
+        kind: "text".to_owned(),
+        text: Some("what is this?".to_owned()),
+        image_url: None,
+        extra: serde_json::Map::new(),
+    };
+    let inline_image = ContentPart {
+        kind: "image_url".to_owned(),
+        text: None,
+        image_url: Some(ImageUrl {
+            url: "data:image/png;base64,AAAA".to_owned(),
+            detail: Some("low".to_owned()),
+        }),
+        extra: serde_json::Map::new(),
+    };
+    let remote_image = ContentPart {
+        kind: "image_url".to_owned(),
+        text: None,
+        image_url: Some(ImageUrl {
+            url: "https://example.com/cat.png".to_owned(),
+            detail: None,
+        }),
+        extra: serde_json::Map::new(),
+    };
+    ChatRequest {
+        model: model.to_owned(),
+        messages: vec![ChatMessage {
+            role: "user".to_owned(),
+            content: Some(MessageContent::Parts(vec![
+                text_part,
+                inline_image,
+                remote_image,
+            ])),
             name: None,
             extra: serde_json::Map::new(),
         }],
@@ -309,6 +360,133 @@ async fn cancellation_aborts_the_in_flight_non_streaming_request() {
         "cancellation should abort promptly"
     );
     assert_eq!(mock.received_requests().await.unwrap().len(), 1);
+}
+
+// --------------------------------------------------------------------------
+// Vision (issue #73): image parts become Cohere v2 content blocks
+// --------------------------------------------------------------------------
+
+/// Issue #73: image parts must reach the wire as Cohere v2 content blocks
+/// (`{"type":"text",...}` / `{"type":"image_url","image_url":{...}}`), order
+/// preserved, URL form (`data:` URI or remote URL) and `detail` untouched -
+/// not flattened to text.
+#[tokio::test]
+async fn image_parts_are_sent_as_cohere_v2_content_blocks() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v2/chat"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(nominal_body()))
+        .mount(&mock)
+        .await;
+
+    let p = provider(mock.uri());
+    let resp = p
+        .chat(
+            vision_request("command-a-vision-07-2025", false),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    // Upstream usage stays authoritative for a vision request (ADR 003).
+    let usage = resp.usage.unwrap();
+    assert_eq!(usage.prompt_tokens, 10);
+    assert_eq!(usage.estimated, None);
+
+    let sent: Value =
+        serde_json::from_slice(&mock.received_requests().await.unwrap()[0].body).unwrap();
+    let content = sent["messages"][0]["content"]
+        .as_array()
+        .expect("content must be an array of blocks, not flattened text");
+    assert_eq!(content.len(), 3);
+    assert_eq!(
+        content[0],
+        json!({ "type": "text", "text": "what is this?" })
+    );
+    assert_eq!(
+        content[1],
+        json!({
+            "type": "image_url",
+            "image_url": { "url": "data:image/png;base64,AAAA", "detail": "low" }
+        })
+    );
+    assert_eq!(
+        content[2],
+        json!({
+            "type": "image_url",
+            "image_url": { "url": "https://example.com/cat.png" }
+        })
+    );
+}
+
+/// Text-only messages keep the plain-string fast path (no regression from
+/// the block translation).
+#[tokio::test]
+async fn text_only_message_still_serializes_as_a_plain_string() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v2/chat"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(nominal_body()))
+        .mount(&mock)
+        .await;
+
+    let p = provider(mock.uri());
+    p.chat(
+        request("command-r-plus", "salut", false),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+    let sent: Value =
+        serde_json::from_slice(&mock.received_requests().await.unwrap()[0].body).unwrap();
+    assert_eq!(sent["messages"][0]["content"], "salut");
+}
+
+/// The M8 pre-flight capability hooks (issue #73): Cohere v2 fetches remote
+/// `http(s)` image URLs itself, so `LM-2004` must not fire; the provider-
+/// native Anthropic/Gemini file references stay rejected (`LM-2008`).
+#[test]
+fn vision_capability_hooks_match_cohere_v2() {
+    let p = provider("http://unused.invalid".to_owned());
+    assert!(p.accepts_remote_image_url());
+    assert!(!p.accepts_anthropic_file_id());
+    assert!(!p.accepts_gemini_file_uri());
+}
+
+/// Cancellation still aborts promptly on the vision path (mirrors the
+/// text-only cancellation test above).
+#[tokio::test]
+async fn cancellation_aborts_an_in_flight_vision_request() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v2/chat"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(nominal_body())
+                .set_delay(Duration::from_secs(2)),
+        )
+        .mount(&mock)
+        .await;
+
+    let p = provider(mock.uri());
+    let cancel = CancellationToken::new();
+    let cancel_child = cancel.clone();
+    let req = vision_request("command-a-vision-07-2025", false);
+    let started = Instant::now();
+    let handle = tokio::spawn(async move { p.chat(req, cancel_child).await });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    cancel.cancel();
+
+    let result = handle.await.unwrap();
+    assert!(
+        matches!(result, Err(ProviderError::Cancelled)),
+        "expected Cancelled, got {result:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "cancellation should abort promptly"
+    );
 }
 
 // --------------------------------------------------------------------------
