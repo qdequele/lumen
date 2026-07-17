@@ -471,7 +471,10 @@ fn run_keys_inner(action: KeysAction) -> anyhow::Result<()> {
                 );
             }
             KeysAction::List { .. } => {
-                let records = store.list_keys().await.context("failed to list keys")?;
+                let records = store
+                    .list_keys(false)
+                    .await
+                    .context("failed to list keys")?;
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&records)

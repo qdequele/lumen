@@ -4,7 +4,14 @@
 //! * `POST /admin/keys` - create a key. The response is the ONLY place the
 //!   plaintext key ever appears; it is never stored and never logged.
 //! * `GET /admin/keys` - list keys (records only, no hashes, no plaintext).
+//!   `?include_deleted=true` also shows soft-deleted tombstones.
 //! * `PATCH /admin/keys/{id}` - adjust budgets/limits, enable/disable.
+//! * `DELETE /admin/keys/{id}` - soft-delete: the row becomes a tombstone
+//!   (usage-log attribution and audit history survive) and the key stops
+//!   authenticating immediately.
+//! * `POST /admin/keys/{id}/rotate` - mint a new secret for an existing key;
+//!   same one-time-plaintext contract as creation, identity and budget state
+//!   preserved.
 //! * `PUT /admin/provider-keys/{name}` - store a provider API key encrypted
 //!   at rest (AES-256-GCM under the master key) and apply it without a restart
 //!   by requesting a hot reload; used for providers whose `api_key_env` is
@@ -22,6 +29,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
 use lumen_auth::key::hash_key;
+use lumen_auth::state::micro_to_usd;
 use lumen_auth::store::{
     KeyPatch, NewKey, UsageAggregate, UsageFilter, UsageGroupBy, VirtualKeyRecord,
 };
@@ -40,7 +48,8 @@ pub struct CreatedKey {
 
 // STRICT rule 5: the plaintext must be unrepresentable through `Debug`, so a
 // stray `{:?}` in a log line or error chain can never leak it. Serialization
-// (the one intended exposure) goes through `Serialize` only.
+// (the one intended exposure) goes through `Serialize` only. Mirrors
+// `PlaintextKey`'s own redacted `Debug`.
 impl std::fmt::Debug for CreatedKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CreatedKey")
@@ -88,12 +97,29 @@ pub async fn create_key(
     ))
 }
 
-/// List every key (no secrets: ids, names, budgets, limits, flags).
+/// `GET /admin/keys` query parameters.
+#[derive(Debug, Default, Deserialize)]
+pub struct ListKeysParams {
+    /// Also list soft-deleted tombstones (default: active keys only).
+    #[serde(default)]
+    pub include_deleted: bool,
+}
+
+/// List every active key (no secrets: ids, names, budgets, limits, flags).
+/// `?include_deleted=true` adds soft-deleted tombstones for auditing. A
+/// malformed query string is a `LM-1001` JSON envelope, like every other
+/// extractor failure in this module - never axum's bare-text rejection.
 pub async fn list_keys(
     State(state): State<AppState>,
+    params: Result<Query<ListKeysParams>, QueryRejection>,
 ) -> Result<Json<Vec<VirtualKeyRecord>>, ApiError> {
+    let Query(params) = params.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
     let auth = runtime(&state)?;
-    let keys = auth.store.list_keys().await.map_err(|e| internal(&e))?;
+    let keys = auth
+        .store
+        .list_keys(params.include_deleted)
+        .await
+        .map_err(|e| internal(&e))?;
     Ok(Json(keys))
 }
 
@@ -116,6 +142,76 @@ pub async fn patch_key(
     // Reflect the change in the live table (spend is preserved).
     auth.keys.apply(&updated);
     Ok(Json(updated))
+}
+
+/// Delete a key - a **soft delete** by design: `usage_log` rows reference
+/// the key id, so removing the row would orphan usage history, and the
+/// tombstone keeps the audit trail (see `docs/operations/keys-budgets.md`).
+/// The key stops authenticating on the very next request (the live table is
+/// updated like `patch_key`), disappears from the default list, and any
+/// further PATCH/DELETE/rotate on the id behaves like an unknown id
+/// (400 `LM-1001`) - it can never be resurrected by accident.
+pub async fn delete_key(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let auth = runtime(&state)?;
+    let deleted = auth.store.delete_key(&id).await.map_err(|e| internal(&e))?;
+    // Evict from the live table UNCONDITIONALLY - whether this call's DB
+    // write actually matched a row (`Some`) or the row was already
+    // tombstoned by an earlier attempt (`None`, e.g. a client retry after a
+    // disconnect that landed the DB write but never reached this line the
+    // first time). Without this, a cancelled request could tombstone the DB
+    // row yet leave the key authenticating from memory forever - only a
+    // restart would notice. Making the eviction unconditional means every
+    // retry repairs a previously missed one, so the zombie window closes on
+    // the very next delete attempt rather than lasting until a restart.
+    if let Some(entry) = auth.keys.remove(&id) {
+        // Flush the final accrued spend now: once the entry is dropped here
+        // the periodic flusher (`drain_dirty`) will never see this id again,
+        // so the tombstone's `budget_spent` would otherwise freeze at
+        // whatever the last periodic flush happened to catch.
+        let spent = micro_to_usd(entry.spent_micro());
+        if let Err(error) = auth.store.persist_budgets(&[(id.clone(), spent)]).await {
+            // Best-effort: the accounting is already backed by the periodic
+            // flush for every other key, so a failure here must not turn a
+            // successful delete into a 500 - log and continue.
+            tracing::warn!(
+                key_id = %id,
+                %error,
+                "failed to persist final spend while deleting a key"
+            );
+        }
+    }
+    deleted.ok_or_else(|| GatewayError::InvalidRequest(format!("unknown key id '{id}'")))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Rotate a key's secret: mint a new plaintext through the exact generation
+/// path used at creation, store its hash, and return the new plaintext in
+/// the same one-time response shape as `POST /admin/keys`. The record's id,
+/// name, budgets, accrued spend and quotas are all preserved (the live entry
+/// is kept, only its hash alias changes), so `usage_log` attribution is
+/// unbroken. The old plaintext stops authenticating immediately; an unknown
+/// or deleted id is a 400 `LM-1001`, like `patch_key`.
+pub async fn rotate_key(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<CreatedKey>, ApiError> {
+    let auth = runtime(&state)?;
+    let (plaintext, record) = auth
+        .store
+        .rotate_key(&id)
+        .await
+        .map_err(|e| internal(&e))?
+        .ok_or_else(|| GatewayError::InvalidRequest(format!("unknown key id '{id}'")))?;
+    // Swap the live alias: the old plaintext dies and the new one works
+    // right away, with spend and quota windows carried over.
+    auth.keys.rotate(hash_key(plaintext.reveal()), &record);
+    Ok(Json(CreatedKey {
+        key: plaintext.reveal().to_owned(),
+        record,
+    }))
 }
 
 /// `PUT /admin/provider-keys/{name}` body.
@@ -433,6 +529,7 @@ mod tests {
                 expires_at: None,
                 disabled: false,
                 created_at: 0,
+                deleted_at: None,
             },
         };
         let dbg = format!("{created:?}");

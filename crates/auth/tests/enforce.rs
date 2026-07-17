@@ -22,6 +22,7 @@ fn record(id: &str) -> VirtualKeyRecord {
         expires_at: None,
         disabled: false,
         created_at: 0,
+        deleted_at: None,
     }
 }
 
@@ -490,4 +491,68 @@ fn upsert_and_apply_reflect_admin_changes_immediately() {
     let fresh = record("fresh");
     state.upsert(hash_key("fg-fresh"), &fresh);
     assert!(state.authenticate("fg-fresh", NOW).is_some());
+}
+
+#[test]
+fn remove_evicts_a_key_from_the_live_table_immediately() {
+    let state = state_with("fg-victim", record("victim"));
+    let entry = state.authenticate("fg-victim", NOW).expect("key valid");
+    entry
+        .admit(NOW, 1, usd_to_micro(2.0))
+        .expect("admitted")
+        .settle(usd_to_micro(2.0), 1);
+
+    let removed = state.remove("victim").expect("entry was live");
+    assert_eq!(
+        removed.spent_micro(),
+        usd_to_micro(2.0),
+        "spend readable for flushing"
+    );
+    assert!(state.authenticate("fg-victim", NOW).is_none());
+    assert!(state.is_empty(), "both maps are emptied");
+
+    // Removing an unknown (or already-removed) id is a harmless no-op.
+    assert!(state.remove("victim").is_none());
+}
+
+#[test]
+fn rotate_swaps_the_hash_and_keeps_the_accrued_spend() {
+    let state = state_with(
+        "fg-old",
+        VirtualKeyRecord {
+            budget_max: Some(2.0),
+            ..record("spin")
+        },
+    );
+    let entry = state.authenticate("fg-old", NOW).expect("key valid");
+    entry
+        .admit(NOW, 1, usd_to_micro(1.0))
+        .expect("admitted")
+        .settle(usd_to_micro(1.0), 1);
+
+    state.rotate(
+        hash_key("fg-new"),
+        &VirtualKeyRecord {
+            budget_max: Some(2.0),
+            ..record("spin")
+        },
+    );
+
+    // The old plaintext dies on the spot; the new one resolves to the SAME
+    // entry, spend included: one more dollar fits, a third does not.
+    assert!(state.authenticate("fg-old", NOW).is_none());
+    let rotated = state.authenticate("fg-new", NOW).expect("new key valid");
+    assert_eq!(rotated.spent_micro(), usd_to_micro(1.0));
+    rotated
+        .admit(NOW, 1, usd_to_micro(1.0))
+        .expect("second dollar fits")
+        .settle(usd_to_micro(1.0), 1);
+    assert!(matches!(
+        rotated.admit(NOW, 1, usd_to_micro(1.0)),
+        Err(GatewayError::BudgetExceeded)
+    ));
+
+    // Rotating an id the table has never seen inserts it fresh (defensive).
+    state.rotate(hash_key("fg-ghost"), &record("ghost"));
+    assert!(state.authenticate("fg-ghost", NOW).is_some());
 }

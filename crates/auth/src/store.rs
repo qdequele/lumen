@@ -36,6 +36,10 @@ pub struct VirtualKeyRecord {
     pub disabled: bool,
     /// Creation time, unix seconds.
     pub created_at: i64,
+    /// Soft-delete tombstone (unix seconds); `None` = active. A deleted key
+    /// never authenticates and rejects further updates, but its row stays so
+    /// `usage_log.key_id` attribution survives (issue #66).
+    pub deleted_at: Option<i64>,
 }
 
 /// Parameters for creating a key.
@@ -297,6 +301,7 @@ impl KeyStore {
             expires_at: params.expires_at,
             disabled: false,
             created_at: now_unix(),
+            deleted_at: None,
         };
         sqlx::query(
             "INSERT INTO virtual_keys \
@@ -318,11 +323,12 @@ impl KeyStore {
         Ok((plaintext, record))
     }
 
-    /// Look a key up by the BLAKE3 hash of its plaintext.
+    /// Look a key up by the BLAKE3 hash of its plaintext. Deleted keys are
+    /// invisible here: a tombstoned hash must never authenticate.
     pub async fn find_by_hash(&self, hash: &str) -> Result<Option<VirtualKeyRecord>, AuthError> {
         let record = sqlx::query_as::<_, VirtualKeyRecord>(
-            "SELECT id, name, budget_max, budget_spent, rpm_limit, tpm_limit, expires_at, disabled, created_at \
-             FROM virtual_keys WHERE key_hash = ?",
+            "SELECT id, name, budget_max, budget_spent, rpm_limit, tpm_limit, expires_at, disabled, created_at, deleted_at \
+             FROM virtual_keys WHERE key_hash = ? AND deleted_at IS NULL",
         )
         .bind(hash)
         .fetch_optional(&self.pool)
@@ -330,13 +336,13 @@ impl KeyStore {
         Ok(record)
     }
 
-    /// Every key **with its hash** - exclusively for building the in-memory
-    /// [`AuthState`](crate::state::AuthState) at boot. The hash never leaves
-    /// the auth layer.
+    /// Every **active** key **with its hash** - exclusively for building the
+    /// in-memory [`AuthState`](crate::state::AuthState) at boot. The hash
+    /// never leaves the auth layer; deleted keys never load.
     pub async fn load_auth_entries(&self) -> Result<Vec<(String, VirtualKeyRecord)>, AuthError> {
         let rows = sqlx::query(
-            "SELECT id, key_hash, name, budget_max, budget_spent, rpm_limit, tpm_limit, expires_at, disabled, created_at \
-             FROM virtual_keys",
+            "SELECT id, key_hash, name, budget_max, budget_spent, rpm_limit, tpm_limit, expires_at, disabled, created_at, deleted_at \
+             FROM virtual_keys WHERE deleted_at IS NULL",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -353,25 +359,35 @@ impl KeyStore {
                 expires_at: row.try_get("expires_at")?,
                 disabled: row.try_get("disabled")?,
                 created_at: row.try_get("created_at")?,
+                deleted_at: row.try_get("deleted_at")?,
             };
             entries.push((hash, record));
         }
         Ok(entries)
     }
 
-    /// Every key, hash included nowhere - for boot loading and the admin API.
-    pub async fn list_keys(&self) -> Result<Vec<VirtualKeyRecord>, AuthError> {
-        let records = sqlx::query_as::<_, VirtualKeyRecord>(
-            "SELECT id, name, budget_max, budget_spent, rpm_limit, tpm_limit, expires_at, disabled, created_at \
-             FROM virtual_keys ORDER BY created_at, id",
-        )
+    /// Every active key, hash included nowhere - for the admin API. Pass
+    /// `include_deleted = true` to also see tombstoned keys (audit view).
+    pub async fn list_keys(
+        &self,
+        include_deleted: bool,
+    ) -> Result<Vec<VirtualKeyRecord>, AuthError> {
+        let filter = if include_deleted {
+            ""
+        } else {
+            "WHERE deleted_at IS NULL "
+        };
+        let records = sqlx::query_as::<_, VirtualKeyRecord>(&format!(
+            "SELECT id, name, budget_max, budget_spent, rpm_limit, tpm_limit, expires_at, disabled, created_at, deleted_at \
+             FROM virtual_keys {filter}ORDER BY created_at, id",
+        ))
         .fetch_all(&self.pool)
         .await?;
         Ok(records)
     }
 
     /// Apply a partial update; returns the updated record, or `None` when the
-    /// id does not exist.
+    /// id does not exist (or was deleted - tombstones reject updates).
     pub async fn update_key(
         &self,
         id: &str,
@@ -385,7 +401,7 @@ impl KeyStore {
                tpm_limit = COALESCE(?, tpm_limit), \
                expires_at = COALESCE(?, expires_at), \
                disabled = COALESCE(?, disabled) \
-             WHERE id = ?",
+             WHERE id = ? AND deleted_at IS NULL",
         )
         .bind(patch.name)
         .bind(patch.budget_max)
@@ -400,8 +416,59 @@ impl KeyStore {
         if changed == 0 {
             return Ok(None);
         }
+        self.fetch_key(id).await
+    }
+
+    /// Soft-delete a key: stamp `deleted_at` (and set `disabled` as a belt
+    /// and braces for any pre-tombstone reader) instead of removing the row,
+    /// so `usage_log.key_id` attribution and audit history survive. Returns
+    /// the tombstoned record, or `None` when the id is unknown or already
+    /// deleted - a tombstone cannot be deleted twice.
+    pub async fn delete_key(&self, id: &str) -> Result<Option<VirtualKeyRecord>, AuthError> {
+        let changed = sqlx::query(
+            "UPDATE virtual_keys SET deleted_at = ?, disabled = 1 \
+             WHERE id = ? AND deleted_at IS NULL",
+        )
+        .bind(now_unix())
+        .bind(id)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        if changed == 0 {
+            return Ok(None);
+        }
+        self.fetch_key(id).await
+    }
+
+    /// Rotate a key's secret: generate a fresh plaintext through the same
+    /// path as [`create_key`](Self::create_key) and swap the stored hash.
+    /// Everything else - id, name, budgets, spend, quotas, expiry - is left
+    /// untouched, so `usage_log` attribution is unbroken. Returns `None`
+    /// when the id is unknown or deleted. The returned [`PlaintextKey`] is
+    /// the only copy of the new clear key that will ever exist.
+    pub async fn rotate_key(
+        &self,
+        id: &str,
+    ) -> Result<Option<(PlaintextKey, VirtualKeyRecord)>, AuthError> {
+        let plaintext = generate();
+        let changed =
+            sqlx::query("UPDATE virtual_keys SET key_hash = ? WHERE id = ? AND deleted_at IS NULL")
+                .bind(hash_key(plaintext.reveal()))
+                .bind(id)
+                .execute(&self.pool)
+                .await?
+                .rows_affected();
+        if changed == 0 {
+            return Ok(None);
+        }
+        Ok(self.fetch_key(id).await?.map(|record| (plaintext, record)))
+    }
+
+    /// Fetch one record by id, tombstoned or not (internal re-read after a
+    /// successful write - the caller already checked the row exists).
+    async fn fetch_key(&self, id: &str) -> Result<Option<VirtualKeyRecord>, AuthError> {
         let record = sqlx::query_as::<_, VirtualKeyRecord>(
-            "SELECT id, name, budget_max, budget_spent, rpm_limit, tpm_limit, expires_at, disabled, created_at \
+            "SELECT id, name, budget_max, budget_spent, rpm_limit, tpm_limit, expires_at, disabled, created_at, deleted_at \
              FROM virtual_keys WHERE id = ?",
         )
         .bind(id)
@@ -617,7 +684,7 @@ impl KeyStore {
             // is fixed per table so this stays injection-free.
             let sql = match table {
                 "virtual_keys" => {
-                    "SELECT quote(id)||'|'||quote(key_hash)||'|'||quote(name)||'|'||quote(budget_max)||'|'||quote(budget_spent)||'|'||quote(rpm_limit)||'|'||quote(tpm_limit)||'|'||quote(expires_at)||'|'||quote(disabled)||'|'||quote(created_at) AS r FROM virtual_keys"
+                    "SELECT quote(id)||'|'||quote(key_hash)||'|'||quote(name)||'|'||quote(budget_max)||'|'||quote(budget_spent)||'|'||quote(rpm_limit)||'|'||quote(tpm_limit)||'|'||quote(expires_at)||'|'||quote(disabled)||'|'||quote(created_at)||'|'||quote(deleted_at) AS r FROM virtual_keys"
                 }
                 _ => {
                     "SELECT quote(id)||'|'||quote(key_id)||'|'||quote(model)||'|'||quote(model_used)||'|'||quote(capability)||'|'||quote(tokens_in)||'|'||quote(tokens_out)||'|'||quote(search_units)||'|'||quote(estimated)||'|'||quote(cost)||'|'||quote(latency_ms)||'|'||quote(status)||'|'||coalesce(metadata,'')||'|'||quote(ts) AS r FROM usage_log"

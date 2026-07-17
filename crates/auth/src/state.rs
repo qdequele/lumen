@@ -330,6 +330,39 @@ impl AuthState {
         }
     }
 
+    /// Remove a key from the live table (admin delete). The key stops
+    /// authenticating on the very next request - no restart. The `by_hash`
+    /// side is found by entry identity, so the hash itself never has to
+    /// travel back out of the store.
+    ///
+    /// Returns the evicted entry so the caller can flush its final accrued
+    /// spend before it is dropped (the periodic flusher will never see this
+    /// id again once it is gone from `by_id`); `None` when the id was not
+    /// live (already removed, or never loaded).
+    pub fn remove(&self, id: &str) -> Option<Arc<KeyEntry>> {
+        let (_, entry) = self.by_id.remove(id)?;
+        self.by_hash.retain(|_, e| !Arc::ptr_eq(e, &entry));
+        Some(entry)
+    }
+
+    /// Swap the hash an existing key authenticates under (admin rotate).
+    /// The live entry itself is KEPT - and with it the accrued spend and the
+    /// current quota windows - so rotation never resets budget state. The
+    /// old plaintext stops working immediately; the new one works without a
+    /// restart. An id missing from the live table is inserted fresh from the
+    /// record (defensive - create and boot always populate it).
+    pub fn rotate(&self, new_hash: String, record: &VirtualKeyRecord) {
+        let Some(entry) = self.by_id.get(&record.id).map(|e| Arc::clone(&e)) else {
+            self.upsert(new_hash, record);
+            return;
+        };
+        // Rotation is a rare admin action: a linear sweep of `by_hash` to
+        // evict the old alias is fine, and keeps hashes out of `KeyEntry`.
+        self.by_hash.retain(|_, e| !Arc::ptr_eq(e, &entry));
+        entry.apply_limits(record);
+        self.by_hash.insert(new_hash, entry);
+    }
+
     /// Collect `(key id, spent USD)` for every key whose spend changed since
     /// the last call, marking them clean. Any spend that lands between the
     /// clean-marking and the read re-dirties the entry, so nothing is lost.

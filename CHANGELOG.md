@@ -8,6 +8,18 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ### Added
 
+- **Virtual key deletion and rotation** (issue #66). `DELETE /admin/keys/{id}`
+  soft-deletes a key: the row is tombstoned (`deleted_at` column, migration
+  `0005_key_deleted_at.sql`) rather than removed, so `usage_log.key_id`
+  attribution and audit history survive. A deleted key stops authenticating
+  immediately (the live in-memory table is updated, like PATCH), is hidden
+  from `GET /admin/keys` unless `?include_deleted=true`, and rejects further
+  PATCH/DELETE/rotate with 400 `LM-1001`. `POST /admin/keys/{id}/rotate`
+  mints a new secret through the same generation path as creation and
+  returns it in the same one-time response shape; the id, name, budgets,
+  accrued spend and quota windows are all preserved (the live entry is kept,
+  only its hash alias swaps), so the old plaintext dies on the spot and the
+  new one works without a restart.
 - **`lumen keys create` / `lumen keys list`: offline virtual-key bootstrap**
   (issue #68). Creating the first virtual key no longer requires starting the
   server and crafting an authenticated curl against `POST /admin/keys`: the
