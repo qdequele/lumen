@@ -360,6 +360,19 @@ impl Registry {
     pub fn list_models(&self) -> Vec<LoadedModelSummary> {
         self.inner.load().models.clone()
     }
+
+    /// One exposed model by client-facing id, if configured (for
+    /// `GET /v1/models/{id}`). Reads the same snapshot as [`Self::list_models`],
+    /// so a retrieve can never disagree with the list.
+    #[must_use]
+    pub fn model(&self, model_id: &str) -> Option<LoadedModelSummary> {
+        self.inner
+            .load()
+            .models
+            .iter()
+            .find(|m| m.id == model_id)
+            .cloned()
+    }
 }
 
 fn build_inner(

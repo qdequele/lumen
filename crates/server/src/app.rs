@@ -69,6 +69,15 @@ pub fn build_app(state: AppState) -> Router {
 
     let api = Router::new()
         .route("/v1/models", get(models::models))
+        // Wildcard, not a single-segment `{id}`: model ids may legally
+        // contain slashes (HF-style, e.g. "mistralai/Mistral-7B"). A
+        // single-segment param would leave such paths unrouted - a bare 404
+        // outside the LM envelope AND outside the auth layer below. The
+        // wildcard captures the whole remainder (slashes included, one or
+        // more segments) into the same handler; the literal `/v1/models`
+        // above still takes priority, so the list route is not shadowed.
+        // (matchit rejects registering `{id}` and `{*id}` side by side.)
+        .route("/v1/models/{*id}", get(models::model))
         .route("/v1/chat/completions", post(chat::chat))
         .route("/v1/embeddings", post(embeddings::embeddings))
         .route("/v1/rerank", post(rerank::rerank_handler))
