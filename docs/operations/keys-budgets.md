@@ -42,6 +42,29 @@ With auth on, every `/v1/*` request is checked against a **virtual key**:
 
 See [Error codes](../errors.md) for the full taxonomy.
 
+## Bootstrapping the first key (CLI)
+
+On a fresh deployment there is no usable client key yet, and the admin API
+requires a running server. `lumen keys` closes that loop: it runs **offline**,
+straight against the SQLite file at `auth.db_path` - no server needed.
+
+```bash
+export LUMEN_MASTER_KEY=<64 hex chars>   # same gate as the /admin API
+lumen keys create --config config.toml --name team-search \
+  --budget-max 50 --rpm-limit 60 --tpm-limit 100000
+lumen keys list --config config.toml
+```
+
+`keys create` prints the record plus the **one-time plaintext key** as a JSON
+object on stdout (the same shape as `POST /admin/keys`, shown below) and never
+logs it. `--budget-max`, `--rpm-limit`, `--tpm-limit` and `--expires-at` are
+optional, exactly like their JSON counterparts; `keys list` prints the records
+only (no hashes, no plaintext).
+
+If the server is already running, `keys list` is safe, but a key created by
+the CLI only joins the live in-memory key table at the next restart or config
+reload - prefer `POST /admin/keys` against the running server in that case.
+
 ## The admin API
 
 Every route under `/admin/*` is mounted only when `[auth].enabled = true`,

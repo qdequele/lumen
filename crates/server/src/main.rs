@@ -3,6 +3,7 @@
 //! Thin orchestration only: parse args, load config, initialise logging, then
 //! hand off to the library. `anyhow` is used here (and only here).
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
@@ -46,6 +47,7 @@ lumen - universal LLM gateway
 USAGE:
     lumen [--config <PATH>]
     lumen --check-config [--config <PATH>]
+    lumen keys <create|list> [OPTIONS]
 
 OPTIONS:
     -c, --config <PATH>    Path to the TOML config file [default: config.toml]
@@ -54,13 +56,56 @@ OPTIONS:
                             contacts no provider - safe for CI / deploy
                             pipelines to run ahead of a real boot.
     -h, --help             Print this help
+
+SUBCOMMANDS:
+    keys create            Create a virtual key directly in the auth database
+                            (offline bootstrap - no running server needed).
+    keys list              List virtual keys (records only, never secrets).
+
+Run `lumen keys --help` for the key-management options.
+";
+
+const KEYS_HELP: &str = "\
+lumen keys - manage virtual keys directly in the auth database
+
+Runs offline against the SQLite file at `auth.db_path`; the server does not
+need to be up. Requires `[auth] enabled = true` in the config and the
+LUMEN_MASTER_KEY environment variable (the same gate as the /admin API).
+
+If the server IS running, `keys list` is safe, but a key created here only
+joins the live in-memory key table at the next restart or config reload -
+prefer `POST /admin/keys` against the running server in that case.
+
+USAGE:
+    lumen keys create --name <NAME> [OPTIONS]
+    lumen keys list [OPTIONS]
+
+OPTIONS:
+    -c, --config <PATH>      Path to the TOML config file [default: config.toml]
+    --name <NAME>            Human-readable key label (create: required)
+    --budget-max <USD>       Hard budget in USD [default: unlimited]
+    --rpm-limit <N>          Requests-per-minute cap [default: unlimited]
+    --tpm-limit <N>          Tokens-per-minute cap [default: unlimited]
+    --expires-at <UNIX>      Expiry as unix seconds [default: never]
+    -h, --help               Print this help
+
+`keys create` prints the record plus the one-time plaintext key as JSON on
+stdout (the same shape as POST /admin/keys). The plaintext is shown exactly
+once and never logged - store it now.
 ";
 
 fn main() -> ExitCode {
     let action = match parse_args() {
         Ok(action) => action,
         Err(message) => {
-            eprintln!("error: {message}\n\n{HELP}");
+            // A failure under `lumen keys ...` gets the keys help, not the
+            // server help.
+            let help = if std::env::args().nth(1).as_deref() == Some("keys") {
+                KEYS_HELP
+            } else {
+                HELP
+            };
+            eprintln!("error: {message}\n\n{help}");
             return ExitCode::from(2);
         }
     };
@@ -68,6 +113,7 @@ fn main() -> ExitCode {
     let config_path = match action {
         Action::Help => return ExitCode::SUCCESS,
         Action::CheckConfig(path) => return run_check_config(&path),
+        Action::Keys(keys) => return run_keys(keys),
         Action::Serve(path) => path,
     };
 
@@ -94,17 +140,46 @@ fn main() -> ExitCode {
 }
 
 /// What `main` should do, once CLI args are parsed.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq)]
 enum Action {
     /// Serve using the config at this path.
     Serve(PathBuf),
     /// `--check-config`: validate the config at this path and exit.
     CheckConfig(PathBuf),
+    /// `keys create` / `keys list`: offline key management, then exit.
+    Keys(KeysAction),
     /// `-h`/`--help`: help was already printed.
     Help,
 }
 
-/// Parse `--config`/`-c`, `--check-config` and `--help`/`-h`.
+/// The `keys` subcommand (issue #68): manage virtual keys directly in the
+/// auth database, without a running server.
+#[derive(Debug, PartialEq)]
+enum KeysAction {
+    /// `keys create`: mint a key and print its one-time plaintext.
+    Create {
+        /// Config file to read `auth.db_path` from.
+        config: PathBuf,
+        /// Human-readable label (required, non-blank).
+        name: String,
+        /// Hard budget in USD; `None` = unlimited.
+        budget_max: Option<f64>,
+        /// Requests-per-minute cap; `None` = unlimited.
+        rpm_limit: Option<i64>,
+        /// Tokens-per-minute cap; `None` = unlimited.
+        tpm_limit: Option<i64>,
+        /// Expiry as unix seconds; `None` = never.
+        expires_at: Option<i64>,
+    },
+    /// `keys list`: print every record (never plaintext, never hashes).
+    List {
+        /// Config file to read `auth.db_path` from.
+        config: PathBuf,
+    },
+}
+
+/// Parse `--config`/`-c`, `--check-config`, `--help`/`-h` and the `keys`
+/// subcommand.
 fn parse_args() -> Result<Action, String> {
     parse_args_from(std::env::args().skip(1))
 }
@@ -115,7 +190,12 @@ fn parse_args() -> Result<Action, String> {
 fn parse_args_from(mut args: impl Iterator<Item = String>) -> Result<Action, String> {
     let mut config_path = PathBuf::from("config.toml");
     let mut check_config = false;
+    let mut first = true;
     while let Some(arg) = args.next() {
+        if first && arg == "keys" {
+            return parse_keys_args(args);
+        }
+        first = false;
         match arg.as_str() {
             "-h" | "--help" => {
                 print!("{HELP}");
@@ -146,6 +226,131 @@ fn parse_args_from(mut args: impl Iterator<Item = String>) -> Result<Action, Str
     })
 }
 
+/// The value of a `--flag`: the inline `--flag=value` part when present,
+/// otherwise the next argument; fails naming the flag.
+fn flag_value(
+    flag: &str,
+    inline: Option<String>,
+    args: &mut impl Iterator<Item = String>,
+) -> Result<String, String> {
+    match inline {
+        Some(value) => Ok(value),
+        None => args
+            .next()
+            .ok_or_else(|| format!("{flag} requires a value")),
+    }
+}
+
+/// Parse a `--flag` value as a number, failing with the flag name on error.
+fn number_of<T: std::str::FromStr>(flag: &str, value: &str) -> Result<T, String> {
+    value
+        .parse()
+        .map_err(|_| format!("{flag} expects a number, got '{value}'"))
+}
+
+/// Parse everything after `lumen keys`: the `create`/`list` subcommand and
+/// its flags. Every value flag accepts both `--flag value` and `--flag=value`.
+fn parse_keys_args(mut args: impl Iterator<Item = String>) -> Result<Action, String> {
+    let missing = "keys requires a subcommand: create | list".to_owned();
+    let sub = args.next().ok_or_else(|| missing.clone())?;
+    let create = match sub.as_str() {
+        "create" => true,
+        "list" => false,
+        "-h" | "--help" => {
+            print!("{KEYS_HELP}");
+            return Ok(Action::Help);
+        }
+        other => return Err(format!("unknown keys subcommand '{other}' - {missing}")),
+    };
+
+    let mut config = PathBuf::from("config.toml");
+    let mut name: Option<String> = None;
+    let mut budget_max: Option<f64> = None;
+    let mut rpm_limit: Option<i64> = None;
+    let mut tpm_limit: Option<i64> = None;
+    let mut expires_at: Option<i64> = None;
+
+    while let Some(arg) = args.next() {
+        // Split `--flag=value` so every value flag accepts both spellings.
+        let (flag, inline) = match arg.split_once('=') {
+            Some((f, v)) if f.starts_with("--") => (f.to_owned(), Some(v.to_owned())),
+            _ => (arg.clone(), None),
+        };
+        match flag.as_str() {
+            "-h" | "--help" => {
+                print!("{KEYS_HELP}");
+                return Ok(Action::Help);
+            }
+            "-c" | "--config" => {
+                config = PathBuf::from(flag_value("--config", inline, &mut args)?);
+            }
+            "--name" if create => name = Some(flag_value("--name", inline, &mut args)?),
+            "--budget-max" if create => {
+                budget_max = Some(number_of(
+                    "--budget-max",
+                    &flag_value("--budget-max", inline, &mut args)?,
+                )?);
+            }
+            "--rpm-limit" if create => {
+                rpm_limit = Some(number_of(
+                    "--rpm-limit",
+                    &flag_value("--rpm-limit", inline, &mut args)?,
+                )?);
+            }
+            "--tpm-limit" if create => {
+                tpm_limit = Some(number_of(
+                    "--tpm-limit",
+                    &flag_value("--tpm-limit", inline, &mut args)?,
+                )?);
+            }
+            "--expires-at" if create => {
+                expires_at = Some(number_of(
+                    "--expires-at",
+                    &flag_value("--expires-at", inline, &mut args)?,
+                )?);
+            }
+            _ => return Err(format!("unexpected argument '{arg}' for `keys {sub}`")),
+        }
+    }
+
+    if !create {
+        return Ok(Action::Keys(KeysAction::List { config }));
+    }
+    let name = name.ok_or_else(|| "keys create requires --name <NAME>".to_owned())?;
+    if name.trim().is_empty() {
+        return Err("--name must not be blank".to_owned());
+    }
+    // A non-finite budget (NaN/inf) would slip through as "unlimited" and a
+    // negative budget/limit/expiry would mint a key that is dead on arrival -
+    // both silently defeat the hard-budget contract, so refuse them here.
+    if let Some(v) = budget_max {
+        if !v.is_finite() || v < 0.0 {
+            return Err(format!(
+                "--budget-max must be a finite, non-negative amount of USD, got '{v}'"
+            ));
+        }
+    }
+    if let Some(v) = rpm_limit.filter(|v| *v < 0) {
+        return Err(format!("--rpm-limit must not be negative, got '{v}'"));
+    }
+    if let Some(v) = tpm_limit.filter(|v| *v < 0) {
+        return Err(format!("--tpm-limit must not be negative, got '{v}'"));
+    }
+    if let Some(v) = expires_at.filter(|v| *v < 0) {
+        return Err(format!(
+            "--expires-at must be a non-negative unix timestamp, got '{v}'"
+        ));
+    }
+    Ok(Action::Keys(KeysAction::Create {
+        config,
+        name,
+        budget_max,
+        rpm_limit,
+        tpm_limit,
+        expires_at,
+    }))
+}
+
 /// `--check-config`: validate `config_path` and print a clear success or
 /// failure message. Exits 0 when the config is valid, non-zero otherwise.
 /// Delegates to [`lumen_server::check_config`], which stays local-only (no
@@ -167,6 +372,115 @@ fn run_check_config(config_path: &Path) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// `keys create` / `keys list` (issue #68): manage virtual keys **offline**,
+/// straight against the SQLite file at `auth.db_path` - the bootstrap path
+/// for a fresh deployment, where no usable client key exists yet.
+///
+/// Gate parity with the server: `[auth] enabled = true` is required and
+/// `LUMEN_MASTER_KEY` must be present and well-formed, exactly like
+/// [`boot_auth_stack`] and the `/admin/*` API (key records store only
+/// hashes, but the CLI must not be a way around the admin gate).
+///
+/// Running this against a live server's database is fine for *reads*
+/// (`keys list`); a *created* key, however, only joins the live in-memory
+/// key table at the next restart or config reload, so prefer
+/// `POST /admin/keys` while the server is up.
+///
+/// The one-time plaintext goes to **stdout only**, inside the JSON response
+/// (the same `CreatedKey` shape as `POST /admin/keys`). No logging is
+/// initialised on this path and errors go to stderr, so the plaintext can
+/// never leak through tracing.
+fn run_keys(action: KeysAction) -> ExitCode {
+    match run_keys_inner(action) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("error: {err:#}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// The fallible body of [`run_keys`]: load the config, enforce the auth
+/// gate, open the store and execute the subcommand on a local runtime.
+fn run_keys_inner(action: KeysAction) -> anyhow::Result<()> {
+    use zeroize::Zeroize;
+
+    let config_path = match &action {
+        KeysAction::Create { config, .. } | KeysAction::List { config } => config.clone(),
+    };
+    let config = match Config::load(&config_path) {
+        Ok(cfg) => cfg,
+        Err(err) => anyhow::bail!("configuration error: {err}"),
+    };
+    anyhow::ensure!(
+        config.auth.enabled,
+        "auth is disabled in '{}': set `[auth] enabled = true` (and `db_path`) \
+         before managing virtual keys",
+        config_path.display()
+    );
+
+    // Same gate as boot_auth_stack: the master key must be present and valid.
+    // It is only validated here (key records store hashes, nothing sealed),
+    // then wiped - it is never logged and never printed.
+    let mut master_value = std::env::var(MASTER_KEY_ENV).with_context(|| {
+        format!("`keys` requires the {MASTER_KEY_ENV} env var (64 hex chars), the same gate as the /admin API")
+    })?;
+    let master_check = MasterKey::from_env_value(&master_value);
+    master_value.zeroize();
+    master_check.with_context(|| format!("invalid {MASTER_KEY_ENV}"))?;
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("failed to build tokio runtime")?;
+    runtime.block_on(async move {
+        let store = KeyStore::connect(&config.auth.db_url())
+            .await
+            .with_context(|| format!("failed to open auth database '{}'", config.auth.db_path))?;
+        match action {
+            KeysAction::Create {
+                name,
+                budget_max,
+                rpm_limit,
+                tpm_limit,
+                expires_at,
+                ..
+            } => {
+                let (plaintext, record) = store
+                    .create_key(lumen_auth::store::NewKey {
+                        name,
+                        budget_max,
+                        rpm_limit,
+                        tpm_limit,
+                        expires_at,
+                    })
+                    .await
+                    .context("failed to create key")?;
+                let created = lumen_server::admin::CreatedKey {
+                    key: plaintext.reveal().to_owned(),
+                    record,
+                };
+                // stdout is the command's output and the ONLY place the
+                // plaintext ever appears - store it now.
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&created)
+                        .context("failed to serialize created key")?
+                );
+            }
+            KeysAction::List { .. } => {
+                let records = store.list_keys().await.context("failed to list keys")?;
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&records)
+                        .context("failed to serialize key records")?
+                );
+            }
+        }
+        Ok(())
+    })
 }
 
 /// Build the app and serve until shutdown. Uses its own multi-thread runtime.
@@ -247,14 +561,7 @@ fn run(config: Config, config_path: PathBuf) -> anyhow::Result<()> {
                     Some(boot.auth_knobs),
                 )
             } else {
-                (
-                    None,
-                    None,
-                    None,
-                    std::collections::HashMap::new(),
-                    None,
-                    None,
-                )
+                (None, None, None, HashMap::new(), None, None)
             };
 
         // The shared client sets the default (process-wide) connect timeout and
@@ -288,6 +595,7 @@ fn run(config: Config, config_path: PathBuf) -> anyhow::Result<()> {
             key_backfill: Arc::new(ArcSwap::from_pointee(boot_backfill)),
             key_source,
             auth_knobs,
+            auth_runtime: auth_runtime.clone(),
         };
         let reload_armed = arm_config_reload(config_path, reload_targets, &reload_trigger);
 
@@ -426,7 +734,7 @@ struct AuthBoot {
     /// The usage writer task (drained on shutdown).
     usage_writer: tokio::task::JoinHandle<()>,
     /// Boot-time DB provider-key snapshot (seeds the hot-reload backfill cell).
-    key_backfill: std::collections::HashMap<String, String>,
+    key_backfill: HashMap<String, String>,
     /// DB key source the reloader re-reads on every reload (rotation support).
     key_source: Arc<ProviderKeySource>,
     /// Live auth knobs the flush/purge tasks read and a reload retunes.
@@ -458,7 +766,7 @@ async fn boot_auth_stack(
     // env var is unset (env vars stay the primary source). The snapshot is
     // handed to the hot-reload path so a reload re-applies these keys instead
     // of stripping them (they are absent from the env-only spec rebuild).
-    let mut key_backfill = std::collections::HashMap::new();
+    let mut key_backfill = HashMap::new();
     for spec in provider_specs.iter_mut() {
         if spec.api_key.is_none() {
             if let Some(key) = store
@@ -626,5 +934,192 @@ mod tests {
     fn help_flag_wins_and_returns_help() {
         let action = parse_args_from(args(&["--check-config", "-h"])).expect("-h should parse");
         assert_eq!(action, Action::Help);
+    }
+
+    // ---- `keys` subcommand (issue #68) --------------------------------------
+
+    #[test]
+    fn keys_create_parses_every_flag() {
+        let action = parse_args_from(args(&[
+            "keys",
+            "create",
+            "--config",
+            "prod.toml",
+            "--name",
+            "team-search",
+            "--budget-max",
+            "50.5",
+            "--rpm-limit",
+            "60",
+            "--tpm-limit",
+            "100000",
+            "--expires-at",
+            "1752537600",
+        ]))
+        .expect("keys create with all flags should parse");
+        assert_eq!(
+            action,
+            Action::Keys(KeysAction::Create {
+                config: PathBuf::from("prod.toml"),
+                name: "team-search".to_owned(),
+                budget_max: Some(50.5),
+                rpm_limit: Some(60),
+                tpm_limit: Some(100_000),
+                expires_at: Some(1_752_537_600),
+            })
+        );
+    }
+
+    #[test]
+    fn keys_create_defaults_config_and_leaves_limits_unset() {
+        let action = parse_args_from(args(&["keys", "create", "--name", "bootstrap"]))
+            .expect("minimal keys create should parse");
+        assert_eq!(
+            action,
+            Action::Keys(KeysAction::Create {
+                config: PathBuf::from("config.toml"),
+                name: "bootstrap".to_owned(),
+                budget_max: None,
+                rpm_limit: None,
+                tpm_limit: None,
+                expires_at: None,
+            })
+        );
+    }
+
+    #[test]
+    fn keys_create_requires_a_name() {
+        let err = parse_args_from(args(&["keys", "create"]))
+            .expect_err("keys create without --name must error");
+        assert!(err.contains("--name"), "error was: {err}");
+    }
+
+    #[test]
+    fn keys_create_rejects_a_blank_name() {
+        let err = parse_args_from(args(&["keys", "create", "--name", "  "]))
+            .expect_err("a whitespace-only name must error");
+        assert!(err.contains("--name"), "error was: {err}");
+    }
+
+    #[test]
+    fn keys_create_rejects_a_non_numeric_budget() {
+        let err = parse_args_from(args(&[
+            "keys",
+            "create",
+            "--name",
+            "x",
+            "--budget-max",
+            "cheap",
+        ]))
+        .expect_err("a non-numeric budget must error");
+        assert!(err.contains("--budget-max"), "error was: {err}");
+        assert!(err.contains("cheap"), "error was: {err}");
+    }
+
+    #[test]
+    fn keys_list_parses_with_an_explicit_config() {
+        let action = parse_args_from(args(&["keys", "list", "-c", "prod.toml"]))
+            .expect("keys list should parse");
+        assert_eq!(
+            action,
+            Action::Keys(KeysAction::List {
+                config: PathBuf::from("prod.toml"),
+            })
+        );
+    }
+
+    #[test]
+    fn keys_without_a_subcommand_is_an_error() {
+        let err = parse_args_from(args(&["keys"])).expect_err("bare `keys` must error");
+        assert!(err.contains("create"), "error was: {err}");
+        assert!(err.contains("list"), "error was: {err}");
+    }
+
+    #[test]
+    fn keys_with_an_unknown_subcommand_is_an_error() {
+        let err = parse_args_from(args(&["keys", "rotate"]))
+            .expect_err("unknown keys subcommand must error");
+        assert!(err.contains("rotate"), "error was: {err}");
+    }
+
+    #[test]
+    fn keys_with_an_unknown_flag_is_an_error() {
+        let err = parse_args_from(args(&["keys", "create", "--name", "x", "--bogus"]))
+            .expect_err("unknown keys flag must error");
+        assert!(err.contains("--bogus"), "error was: {err}");
+    }
+
+    #[test]
+    fn keys_help_returns_help() {
+        let action = parse_args_from(args(&["keys", "--help"])).expect("keys --help should parse");
+        assert_eq!(action, Action::Help);
+    }
+
+    #[test]
+    fn keys_create_rejects_a_non_finite_budget() {
+        // NaN and infinity parse as f64 but would silently become an
+        // UNLIMITED budget: they must be refused, not accepted.
+        for bad in ["NaN", "nan", "inf", "-inf", "infinity"] {
+            let err = parse_args_from(args(&[
+                "keys",
+                "create",
+                "--name",
+                "x",
+                "--budget-max",
+                bad,
+            ]))
+            .expect_err("a non-finite budget must error");
+            assert!(err.contains("--budget-max"), "error for '{bad}' was: {err}");
+        }
+    }
+
+    #[test]
+    fn keys_create_rejects_negative_values() {
+        let cases = [
+            ("--budget-max", "-5"),
+            ("--rpm-limit", "-1"),
+            ("--tpm-limit", "-100"),
+            ("--expires-at", "-1"),
+        ];
+        for (flag, value) in cases {
+            let err = parse_args_from(args(&["keys", "create", "--name", "x", flag, value]))
+                .expect_err("a negative value must error");
+            assert!(err.contains(flag), "error for '{flag} {value}' was: {err}");
+        }
+    }
+
+    #[test]
+    fn keys_flags_accept_the_equals_form() {
+        let action = parse_args_from(args(&[
+            "keys",
+            "create",
+            "--config=prod.toml",
+            "--name=team-search",
+            "--budget-max=50.5",
+            "--rpm-limit=60",
+            "--tpm-limit=100000",
+            "--expires-at=1752537600",
+        ]))
+        .expect("keys create with --flag=value should parse");
+        assert_eq!(
+            action,
+            Action::Keys(KeysAction::Create {
+                config: PathBuf::from("prod.toml"),
+                name: "team-search".to_owned(),
+                budget_max: Some(50.5),
+                rpm_limit: Some(60),
+                tpm_limit: Some(100_000),
+                expires_at: Some(1_752_537_600),
+            })
+        );
+
+        let action = parse_args_from(args(&["keys", "list", "--config=prod.toml"]))
+            .expect("keys list with --config= should parse");
+        assert_eq!(
+            action,
+            Action::Keys(KeysAction::List {
+                config: PathBuf::from("prod.toml"),
+            })
+        );
     }
 }
