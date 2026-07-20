@@ -8,6 +8,8 @@
 //! provider body: unknown fields stop at the gateway (see the field docs on
 //! [`EmbedRequest::extra`]).
 
+use std::borrow::Cow;
+
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
 
@@ -15,6 +17,20 @@ use crate::chat::ContentPart;
 
 /// Input to an embedding request: a single string, a text batch, a pre-tokenized
 /// input (token ids), or a multimodal batch of content-parts items.
+///
+/// ## The item is the unit of embedding
+///
+/// Every provider produces exactly ONE embedding per input item, and the
+/// gateway's automatic batching (`crates/providers/src/batch.rs`) splits by
+/// item count, so [`len`](EmbedInput::len) is the authoritative count of
+/// inner requests / embeddings a request yields. A [`Multi`](EmbedInput::Multi)
+/// item that is a [`Parts`](EmbedItem::Parts) array is a SINGLE item: its text
+/// parts are joined into one string (see [`item_texts`](EmbedInput::item_texts))
+/// and image parts fuse into the same one embedding, exactly as the item-level
+/// providers (jina, voyage, cohere) already treat them. Text-only providers
+/// therefore issue one inner request per item (never one per text fragment),
+/// which keeps the inner-request count at or below the provider's
+/// `max_batch_size` after splitting (issue #90).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum EmbedInput {
@@ -50,8 +66,12 @@ pub enum EmbedItem {
 }
 
 impl EmbedInput {
-    /// Number of individual items in this input. A single token array counts as
-    /// one item (one embedding); a token batch counts each inner array.
+    /// Number of individual items in this input, which equals the number of
+    /// embeddings a provider returns and the number of inner requests it issues
+    /// (one per item; see the type-level note). A single token array counts as
+    /// one item (one embedding); a token batch counts each inner array; a
+    /// [`Multi`](EmbedInput::Multi) `Parts` item counts as one regardless of how
+    /// many parts it carries.
     #[must_use]
     pub fn len(&self) -> usize {
         match self {
@@ -131,6 +151,69 @@ impl EmbedInput {
                 .collect(),
         };
         fragments.into_iter()
+    }
+
+    /// The text of each item, ONE string per item, in order: the input a
+    /// text-only provider (google, vertex, tei) sends as one inner request per
+    /// item so the inner-request count equals [`len`](EmbedInput::len).
+    ///
+    /// A [`Multi`](EmbedInput::Multi) `Parts` item's text fragments are joined
+    /// into a single string (image parts contribute nothing here; a text-only
+    /// provider rejects image input before it reaches this method). The common
+    /// single-fragment case borrows; only a genuine multi-fragment item
+    /// allocates. Pre-tokenized inputs carry no text and yield nothing (those
+    /// providers reject token-id input up front).
+    #[must_use]
+    pub fn item_texts(&self) -> Vec<Cow<'_, str>> {
+        match self {
+            EmbedInput::Single(s) => vec![Cow::Borrowed(s.as_str())],
+            EmbedInput::Batch(v) => v.iter().map(|s| Cow::Borrowed(s.as_str())).collect(),
+            EmbedInput::Tokens(_) | EmbedInput::TokenBatch(_) => Vec::new(),
+            EmbedInput::Multi(items) => items.iter().map(EmbedItem::joined_text).collect(),
+        }
+    }
+}
+
+impl EmbedItem {
+    /// This item's text as a single string (one embedding per item). A `Parts`
+    /// item joins its text fragments; a single text fragment borrows, more than
+    /// one allocates, and an item with no text fragment yields an empty string.
+    ///
+    /// Fragments are joined with a single newline, NOT concatenated directly:
+    /// distinct text chunks are separate pieces of content, and an empty
+    /// separator would fuse the trailing and leading tokens across a boundary
+    /// (`"brown" + "fox"` becoming `"brownfox"`), degrading the embedding. A
+    /// newline is the conventional separator for distinct text chunks and
+    /// cannot merge adjacent tokens.
+    ///
+    /// Public so every text-only provider (google, vertex, tei, jina) shares
+    /// one join, rather than each re-deriving it (and risking the empty-concat
+    /// bug independently).
+    #[must_use]
+    pub fn joined_text(&self) -> Cow<'_, str> {
+        match self {
+            EmbedItem::Text(s) => Cow::Borrowed(s.as_str()),
+            EmbedItem::Parts(parts) => {
+                let mut texts = parts.iter().filter_map(ContentPart::text_str);
+                match (texts.next(), texts.next()) {
+                    (None, _) => Cow::Borrowed(""),
+                    (Some(first), None) => Cow::Borrowed(first),
+                    (Some(first), Some(second)) => {
+                        // +2 for the newline separators between the first three
+                        // fragments; further fragments grow it as needed.
+                        let mut joined = String::with_capacity(first.len() + second.len() + 2);
+                        joined.push_str(first);
+                        joined.push('\n');
+                        joined.push_str(second);
+                        for rest in texts {
+                            joined.push('\n');
+                            joined.push_str(rest);
+                        }
+                        Cow::Owned(joined)
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -329,6 +412,86 @@ mod tests {
         let empty: EmbedInput = serde_json::from_str("[]").expect("valid empty batch");
         assert!(matches!(empty, EmbedInput::Batch(_)));
         assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn multi_parts_item_is_one_unit_and_joins_its_text() {
+        // Two items: a bare string, and a Parts item carrying two text
+        // fragments. The item is the unit of embedding, so `len` is 2 and
+        // `item_texts` yields two strings (the Parts fragments joined), NOT
+        // three fragment-level entries (issue #90).
+        let input = EmbedInput::Multi(vec![
+            EmbedItem::Text("solo".to_owned()),
+            EmbedItem::Parts(vec![
+                ContentPart {
+                    kind: "text".to_owned(),
+                    text: Some("foo".to_owned()),
+                    image_url: None,
+                    extra: Map::new(),
+                },
+                ContentPart {
+                    kind: "text".to_owned(),
+                    text: Some("bar".to_owned()),
+                    image_url: None,
+                    extra: Map::new(),
+                },
+            ]),
+        ]);
+
+        assert_eq!(input.len(), 2);
+        // Fragment-level iteration still sees all three fragments (token
+        // estimation relies on it), but the per-item view collapses to one
+        // string per item.
+        assert_eq!(input.text_iter().count(), 3);
+
+        let item_texts = input.item_texts();
+        assert_eq!(item_texts.len(), 2);
+        assert_eq!(item_texts[0], "solo");
+        // Fragments join with a newline, never an empty separator (which would
+        // fuse tokens across the boundary).
+        assert_eq!(item_texts[1], "foo\nbar");
+    }
+
+    #[test]
+    fn multi_text_parts_join_with_newline_not_empty_separator() {
+        // Two distinct text chunks must not fuse at their boundary
+        // ("brown" + "fox" -> "brownfox"); a newline keeps them apart.
+        let joined = EmbedInput::Multi(vec![EmbedItem::Parts(vec![
+            ContentPart {
+                kind: "text".to_owned(),
+                text: Some("The quick brown".to_owned()),
+                image_url: None,
+                extra: Map::new(),
+            },
+            ContentPart {
+                kind: "text".to_owned(),
+                text: Some("fox jumps".to_owned()),
+                image_url: None,
+                extra: Map::new(),
+            },
+        ])]);
+        let texts = joined.item_texts();
+        assert_eq!(texts.len(), 1);
+        assert_eq!(texts[0], "The quick brown\nfox jumps");
+
+        // A single text part is unchanged (a genuine borrow, no separator).
+        let single = EmbedInput::Multi(vec![EmbedItem::Parts(vec![ContentPart {
+            kind: "text".to_owned(),
+            text: Some("The quick brown".to_owned()),
+            image_url: None,
+            extra: Map::new(),
+        }])]);
+        assert_eq!(single.item_texts()[0], "The quick brown");
+    }
+
+    #[test]
+    fn item_texts_matches_len_across_shapes() {
+        // The invariant the batch path relies on: one text per item.
+        let single = EmbedInput::Single("x".to_owned());
+        assert_eq!(single.item_texts().len(), single.len());
+
+        let batch = EmbedInput::Batch(vec!["a".to_owned(), "b".to_owned()]);
+        assert_eq!(batch.item_texts().len(), batch.len());
     }
 
     #[test]

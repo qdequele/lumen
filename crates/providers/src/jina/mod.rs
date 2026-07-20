@@ -121,19 +121,20 @@ impl EmbeddingProvider for JinaProvider {
 /// `{"image":...}` and any accompanying caption text is not sent; a text-only
 /// item is sent as `{"text":...}`. This preserves the one-item→one-embedding
 /// contract.
+///
+/// Text-only items reuse [`EmbedItem::joined_text`] so jina joins multi-part
+/// text identically to the other text-only providers (newline-separated, never
+/// an empty concat that fuses tokens across fragment boundaries).
 fn jina_multimodal_input(items: &[EmbedItem]) -> Vec<Value> {
     items
         .iter()
-        .map(|item| match item {
-            EmbedItem::Text(s) => json!({ "text": s }),
-            EmbedItem::Parts(parts) => {
+        .map(|item| {
+            if let EmbedItem::Parts(parts) = item {
                 if let Some(image) = parts.iter().find_map(lumen_core::ContentPart::image) {
-                    json!({ "image": image.url })
-                } else {
-                    let text: String = parts.iter().filter_map(|p| p.text_str()).collect();
-                    json!({ "text": text })
+                    return json!({ "image": image.url });
                 }
             }
+            json!({ "text": item.joined_text() })
         })
         .collect()
 }

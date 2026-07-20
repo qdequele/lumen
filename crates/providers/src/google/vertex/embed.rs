@@ -52,7 +52,7 @@ struct VertexPredictRequest<'a> {
 
 #[derive(Serialize)]
 struct VertexInstance<'a> {
-    content: &'a str,
+    content: std::borrow::Cow<'a, str>,
 }
 
 #[derive(Serialize)]
@@ -87,13 +87,17 @@ struct VertexStatistics {
     token_count: u32,
 }
 
-/// Build the `:predict` body: one instance per text input, `dimensions`
-/// mapped to `parameters.outputDimensionality`.
+/// Build the `:predict` body: one instance per input ITEM (a `Multi` `Parts`
+/// item joins its text fragments), `dimensions` mapped to
+/// `parameters.outputDimensionality`. One instance per item keeps a
+/// single-instance model (`gemini-embedding-001`, `max_batch_size` = 1) to one
+/// instance per call even for multi-part items (issue #90).
 fn translate_request(req: &EmbedRequest) -> VertexPredictRequest<'_> {
     VertexPredictRequest {
         instances: req
             .input
-            .iter()
+            .item_texts()
+            .into_iter()
             .map(|content| VertexInstance { content })
             .collect(),
         parameters: req.dimensions.map(|d| VertexParameters {
@@ -205,6 +209,35 @@ mod tests {
                 "parameters": { "outputDimensionality": 128 }
             })
         );
+    }
+
+    #[test]
+    fn multi_part_item_yields_one_instance_per_item() {
+        // gemini-embedding-001 accepts a single instance per :predict call
+        // (max_batch_size == 1). A multi-part item must still be ONE instance,
+        // or a single-item batch would carry more than one instance and violate
+        // the documented limit (issue #90).
+        use lumen_core::{ContentPart, EmbedItem};
+        let input = EmbedInput::Multi(vec![EmbedItem::Parts(vec![
+            ContentPart {
+                kind: "text".to_owned(),
+                text: Some("foo".to_owned()),
+                image_url: None,
+                extra: serde_json::Map::new(),
+            },
+            ContentPart {
+                kind: "text".to_owned(),
+                text: Some("bar".to_owned()),
+                image_url: None,
+                extra: serde_json::Map::new(),
+            },
+        ])]);
+        let req = request(input, None);
+        let built = translate_request(&req);
+        assert_eq!(built.instances.len(), 1);
+        let body = serde_json::to_value(built).unwrap();
+        // Two text fragments join with a newline (never fused into "foobar").
+        assert_eq!(body["instances"][0]["content"], "foo\nbar");
     }
 
     #[test]

@@ -270,3 +270,54 @@ async fn jina_multimodal_uses_input_object_array() {
     assert_eq!(body["input"][0]["text"], "a caption");
     assert_eq!(body["input"][1]["image"], DATA_URI);
 }
+
+/// Issue #90 review: jina joins a multi-text-part item's fragments through the
+/// shared `EmbedItem::joined_text` (newline-separated), NOT its own empty
+/// concat that would fuse tokens across the boundary.
+#[tokio::test]
+async fn jina_multi_text_part_item_joins_fragments_with_newline() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/embeddings"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "object": "list",
+            "data": [{ "object": "embedding", "index": 0, "embedding": [0.1] }],
+            "model": "jina-clip-v2",
+            "usage": { "prompt_tokens": 4, "total_tokens": 4 }
+        })))
+        .mount(&upstream)
+        .await;
+
+    let provider: Arc<dyn EmbeddingProvider> = Arc::new(JinaProvider::new(
+        http::build_client(),
+        "jina-test",
+        Some(upstream.uri()),
+        Some("sk-x".to_owned()),
+    ));
+
+    let req = EmbedRequest {
+        model: "jina-clip-v2".to_owned(),
+        input: EmbedInput::Multi(vec![EmbedItem::Parts(vec![
+            ContentPart {
+                kind: "text".to_owned(),
+                text: Some("The quick brown".to_owned()),
+                image_url: None,
+                extra: serde_json::Map::new(),
+            },
+            ContentPart {
+                kind: "text".to_owned(),
+                text: Some("fox jumps".to_owned()),
+                image_url: None,
+                extra: serde_json::Map::new(),
+            },
+        ])]),
+        encoding_format: None,
+        dimensions: None,
+        user: None,
+        extra: serde_json::Map::new(),
+    };
+    provider.embed(req, CancellationToken::new()).await.unwrap();
+
+    let body = sent_body(&upstream).await;
+    assert_eq!(body["input"][0]["text"], "The quick brown\nfox jumps");
+}

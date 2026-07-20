@@ -26,7 +26,10 @@ pub async fn embed_batched(
 
     // Fast path: within a single upstream call, keep the original input shape.
     if req.input.len() <= max_batch {
-        return provider.embed(req, cancel.clone()).await;
+        let expected = req.input.len();
+        let resp = provider.embed(req, cancel.clone()).await?;
+        check_embedding_count(resp.data.len(), expected)?;
+        return Ok(resp);
     }
 
     // Consume the request, MOVING the input items into sub-batches rather
@@ -76,13 +79,37 @@ pub async fn embed_batched(
 
     // `buffered` preserves stream order; `try_collect` short-circuits on the
     // first error, dropping (cancelling) the remaining in-flight sub-batches.
+    // Each sub-batch verifies its own returned vector count against the count
+    // it asked for, so a short upstream response is rejected (never silently
+    // padded with an index gap) before reassembly (issue #89).
     let responses: Vec<EmbedResponse> = stream::iter(sub_requests)
-        .map(|sub| provider.embed(sub, cancel.clone()))
+        .map(|sub| {
+            let expected = sub.input.len();
+            let cancel = cancel.clone();
+            async move {
+                let resp = provider.embed(sub, cancel).await?;
+                check_embedding_count(resp.data.len(), expected)?;
+                Ok::<EmbedResponse, ProviderError>(resp)
+            }
+        })
         .buffered(concurrency)
         .try_collect()
         .await?;
 
     Ok(reassemble(responses, total_inputs, &model))
+}
+
+/// Reject a response whose embedding count does not match the number of inputs
+/// it was asked to embed. A short (or long) response is the upstream's fault,
+/// so it maps to a 502-class [`ProviderError::Translation`] (LM-3002), never a
+/// silent short result (issue #89).
+fn check_embedding_count(returned: usize, expected: usize) -> Result<(), ProviderError> {
+    if returned != expected {
+        return Err(ProviderError::Translation(format!(
+            "embedding count {returned} != input count {expected}"
+        )));
+    }
+    Ok(())
 }
 
 /// Split a vector into consecutive chunks of at most `size` items, moving the
@@ -96,6 +123,13 @@ fn chunk_vec<T>(items: Vec<T>, size: usize) -> impl Iterator<Item = Vec<T>> {
 }
 
 /// Concatenate sub-responses in order, re-index globally, and sum usage.
+///
+/// Usage is summed ONLY when every sub-batch reported upstream usage. If any
+/// sub-batch reported none (`prompt_tokens == 0`, e.g. Gemini's optional
+/// `usageMetadata` absent on one chunk), the summed total would be a silent
+/// undercount that the server then treats as exact. Instead the whole sum is
+/// zeroed, so the server falls back to the flagged local estimate for the full
+/// input, per ADR 003 (issue #89).
 fn reassemble(
     responses: Vec<EmbedResponse>,
     total_inputs: usize,
@@ -105,6 +139,9 @@ fn reassemble(
     let mut usage = EmbedUsage::default();
     let mut model = String::new();
     let mut next_index: u32 = 0;
+
+    // Every sub-batch must have reported usage for the sum to be exact.
+    let all_reported = responses.iter().all(|r| r.usage.prompt_tokens > 0);
 
     for resp in responses {
         if model.is_empty() {
@@ -119,6 +156,13 @@ fn reassemble(
         }
     }
 
+    if !all_reported {
+        // Partial or absent upstream usage: drop it so the server's
+        // `prompt_tokens > 0` check fails and the flagged estimate wins.
+        usage.prompt_tokens = 0;
+        usage.total_tokens = 0;
+    }
+
     if model.is_empty() {
         requested_model.clone_into(&mut model);
     }
@@ -128,5 +172,146 @@ fn reassemble(
         data,
         model,
         usage,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use lumen_core::{EmbedData, EmbeddingEncoding};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A configurable embedding provider that never touches the network.
+    struct MockProvider {
+        max_batch: usize,
+        /// Return one FEWER vector than asked (a short upstream response).
+        short: bool,
+        /// `usage.prompt_tokens` to report per call, in call order; `0` means
+        /// "reported no usage". Missing entries default to `0`.
+        usage: Vec<u32>,
+        calls: AtomicUsize,
+    }
+
+    impl MockProvider {
+        fn new(max_batch: usize, short: bool, usage: Vec<u32>) -> Self {
+            Self {
+                max_batch,
+                short,
+                usage,
+                calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl EmbeddingProvider for MockProvider {
+        async fn embed(
+            &self,
+            req: EmbedRequest,
+            _cancel: CancellationToken,
+        ) -> Result<EmbedResponse, ProviderError> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            let asked = req.input.len();
+            let n = if self.short {
+                asked.saturating_sub(1)
+            } else {
+                asked
+            };
+            let data = (0..n)
+                .map(|i| EmbedData {
+                    object: "embedding".to_owned(),
+                    index: u32::try_from(i).unwrap_or(u32::MAX),
+                    embedding: vec![0.0_f32],
+                    encoding: EmbeddingEncoding::default(),
+                })
+                .collect();
+            let prompt = self.usage.get(call).copied().unwrap_or(0);
+            Ok(EmbedResponse {
+                object: "list".to_owned(),
+                data,
+                model: req.model,
+                usage: EmbedUsage {
+                    prompt_tokens: prompt,
+                    total_tokens: prompt,
+                    estimated: None,
+                },
+            })
+        }
+
+        fn max_batch_size(&self) -> usize {
+            self.max_batch
+        }
+    }
+
+    fn batch_of(n: usize) -> EmbedRequest {
+        EmbedRequest {
+            model: "m".to_owned(),
+            input: EmbedInput::Batch((0..n).map(|i| i.to_string()).collect()),
+            encoding_format: None,
+            dimensions: None,
+            user: None,
+            extra: serde_json::Map::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn single_call_length_mismatch_is_a_translation_error() {
+        // 3 inputs <= max_batch 10: the fast path. A short response must not be
+        // accepted silently (issue #89).
+        let provider = MockProvider::new(10, true, vec![1]);
+        let err = embed_batched(&provider, batch_of(3), &CancellationToken::new(), 4)
+            .await
+            .unwrap_err();
+        match err {
+            ProviderError::Translation(msg) => {
+                assert!(
+                    msg.contains("embedding count 2 != input count 3"),
+                    "got: {msg}"
+                );
+            }
+            other => panic!("expected Translation, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn reassembled_length_mismatch_is_a_translation_error() {
+        // 5 inputs, max_batch 2 => 3 sub-batches; a short sub-batch fails the
+        // whole request rather than reassembling with an index gap (issue #89).
+        let provider = MockProvider::new(2, true, vec![1, 1, 1]);
+        let err = embed_batched(&provider, batch_of(5), &CancellationToken::new(), 4)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ProviderError::Translation(_)),
+            "expected Translation, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mixed_usage_zeroes_the_sum_for_the_estimate_fallback() {
+        // 3 inputs, max_batch 1 => 3 sub-batches; the middle reports no usage.
+        // The partial sum must be dropped so the server falls back to the
+        // flagged local estimate (issue #89 / ADR 003).
+        let provider = MockProvider::new(1, false, vec![5, 0, 7]);
+        let resp = embed_batched(&provider, batch_of(3), &CancellationToken::new(), 4)
+            .await
+            .unwrap();
+        assert_eq!(resp.data.len(), 3);
+        assert_eq!(resp.usage.prompt_tokens, 0);
+        assert_eq!(resp.usage.total_tokens, 0);
+        // reassemble never flags the estimate itself; the server does.
+        assert_eq!(resp.usage.estimated, None);
+    }
+
+    #[tokio::test]
+    async fn full_usage_is_summed_when_every_sub_batch_reports() {
+        let provider = MockProvider::new(1, false, vec![1, 2, 3]);
+        let resp = embed_batched(&provider, batch_of(3), &CancellationToken::new(), 4)
+            .await
+            .unwrap();
+        assert_eq!(resp.data.len(), 3);
+        assert_eq!(resp.usage.prompt_tokens, 6);
+        assert_eq!(resp.usage.total_tokens, 6);
     }
 }
