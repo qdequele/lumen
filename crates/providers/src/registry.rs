@@ -916,7 +916,10 @@ fn build_providers(
                     name: spec.name.clone(),
                 }
             })?;
-            let chat: Arc<dyn ChatProvider> = Arc::new(
+            // One signed instance serves both traits: chat via Converse and
+            // embeddings via per-model InvokeModel (Titan / Cohere on Bedrock,
+            // issue #95). SigV4 signing and region resolution are shared.
+            let provider = Arc::new(
                 BedrockProvider::new_with_env_credentials(
                     client.clone(),
                     spec.name.clone(),
@@ -926,9 +929,11 @@ fn build_providers(
                 )
                 .with_strict(spec.strict),
             );
+            let chat: Arc<dyn ChatProvider> = provider.clone();
+            let embed: Arc<dyn EmbeddingProvider> = provider;
             Ok(BuiltProviders {
                 chat: Some(chat),
-                embed: None,
+                embed: Some(embed),
                 rerank: None,
             })
         }
