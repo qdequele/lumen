@@ -42,6 +42,24 @@ All notable changes to LUMEN are documented here. The format is based on
   the edge). Pre-tokenized and image inputs are rejected before any upstream
   call. The `bedrock` fixtures join the shared embed conformance suite
   (nominal, batching, 429/5xx, malformed body, cancellation).
+- **Cached and reasoning token breakdown** (issue #99). The core `Usage`
+  struct now carries optional OpenAI-compatible `prompt_tokens_details`
+  (`cached_tokens`, plus a Lumen `cache_creation_tokens` extension) and
+  `completion_tokens_details` (`reasoning_tokens`), so upstream-reported
+  breakdowns are no longer silently dropped during translation. The OpenAI
+  translator passes the nested details through verbatim; the Anthropic
+  translator maps `cache_read_input_tokens` to `cached_tokens` (same read/hit
+  semantics) and keeps `cache_creation_input_tokens` in the distinct
+  cache-write slot (a write, with no OpenAI equivalent), on both the
+  non-streaming and streaming paths. The breakdown surfaces consistently on
+  all three ADR 003 sinks: the response body (OpenAI-compatible nested shape),
+  a new low-cardinality `lumen_token_breakdown_total{capability, model,
+  provider, kind}` Prometheus counter (a subset of `lumen_tokens_total`), and
+  three nullable `usage_log` columns (`cached_tokens`, `reasoning_tokens`,
+  `cache_write_tokens`, migration `0006_token_breakdown.sql`). Following the
+  "never zero, never invented" rule, an absent breakdown stays `None`/omitted
+  everywhere rather than a fabricated 0, and a locally estimated count carries
+  no breakdown at all.
 - **Virtual key deletion and rotation** (issue #66). `DELETE /admin/keys/{id}`
   soft-deletes a key: the row is tombstoned (`deleted_at` column, migration
   `0005_key_deleted_at.sql`) rather than removed, so `usage_log.key_id`

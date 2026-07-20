@@ -33,6 +33,29 @@ the count is always honest about whether it was measured or estimated.
    cost and the `estimated` flag, alongside status and metadata for later
    slicing. See [Usage log & multi-tenant metadata](usage-log.md).
 
+## Cached and reasoning token breakdown
+
+When an upstream reports a token breakdown, the gateway surfaces it instead of
+discarding it (issue #99), on the same three sinks and under the same "never
+zero, never invented" rule:
+
+- **Response body** - an OpenAI-compatible `usage.prompt_tokens_details`
+  (`cached_tokens`) and `usage.completion_tokens_details` (`reasoning_tokens`).
+  For Anthropic prompt caching, `cache_read_input_tokens` maps to
+  `cached_tokens` (a cache read/hit, same as OpenAI) and
+  `cache_creation_input_tokens` rides a distinct `cache_creation_tokens` field
+  in `prompt_tokens_details` (a cache write, which has no OpenAI equivalent).
+- **Prometheus** - `lumen_token_breakdown_total{capability, model, provider,
+  kind}` with `kind` one of `cached`, `reasoning`, `cache_write`. It is a
+  subset of `lumen_tokens_total`, split out so cache and reasoning usage can be
+  summed on their own.
+- **`usage_log`** - the nullable `cached_tokens`, `reasoning_tokens` and
+  `cache_write_tokens` columns.
+
+A breakdown is only ever an upstream fact: when the upstream reports none, all
+three surfaces omit it (`None`/NULL/no series), and a locally estimated count
+carries no breakdown at all.
+
 ## How estimation works
 
 Source priority, in order:
