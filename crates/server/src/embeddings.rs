@@ -15,7 +15,7 @@ use lumen_core::{tokens, GatewayError};
 use lumen_providers::batch;
 use tokio_util::sync::CancellationToken;
 
-use crate::accounting::{Accounting, Outcome, Target};
+use crate::accounting::{Accounting, Outcome, Target, TokenBreakdown};
 use crate::auth::AuthedKey;
 use crate::error::ApiError;
 use crate::resilience::model_used_headers;
@@ -221,6 +221,7 @@ fn finish_embed(
                 tokens_out: 0,
                 estimated: true,
                 search_units: None,
+                breakdown: TokenBreakdown::default(),
                 media,
                 cost,
                 status: 200,
@@ -233,6 +234,7 @@ fn finish_embed(
             tokens_out: 0,
             estimated,
             search_units: None,
+            breakdown: TokenBreakdown::default(),
             media,
             cost,
             status: 200,

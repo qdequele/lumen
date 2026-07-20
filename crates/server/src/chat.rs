@@ -42,7 +42,7 @@ use futures::stream::{BoxStream, StreamExt};
 use lumen_core::{tokens, ChatRequest, GatewayError, ProviderError, Usage};
 use tokio_util::sync::{CancellationToken, DropGuard};
 
-use crate::accounting::{Accounting, Outcome, StreamAccounting, Target};
+use crate::accounting::{Accounting, Outcome, StreamAccounting, Target, TokenBreakdown};
 use crate::auth::AuthedKey;
 use crate::error::ApiError;
 use crate::pricing::DEFAULT_RESERVED_OUTPUT_TOKENS;
@@ -342,6 +342,10 @@ fn settle_non_streaming(
             u64::from(usage.prompt_tokens),
             u64::from(usage.completion_tokens),
         );
+        // Issue #99: carry the upstream-reported breakdown through to
+        // Prometheus and usage_log. The response envelope already holds it
+        // (deserialized straight into `response.usage`).
+        let breakdown = TokenBreakdown::from_usage(&usage);
         let cost = accounting
             .pricing()
             .token_cost(client_model, tokens_in, tokens_out);
@@ -350,6 +354,7 @@ fn settle_non_streaming(
             tokens_out,
             estimated: false,
             search_units: None,
+            breakdown,
             media: lumen_core::MediaUsage::default(),
             cost,
             status: 200,
@@ -374,6 +379,10 @@ fn settle_non_streaming(
         completion_tokens: u32::try_from(tokens_out).unwrap_or(u32::MAX),
         total_tokens: u32::try_from(tokens_in + tokens_out).unwrap_or(u32::MAX),
         estimated: Some(true),
+        // A locally estimated count carries no cached/reasoning breakdown: a
+        // breakdown is an upstream fact, never derived (ADR 003, issue #99).
+        prompt_tokens_details: None,
+        completion_tokens_details: None,
     });
 
     if ctx.state.token_counter.refines(client_model) {
@@ -395,6 +404,7 @@ fn settle_non_streaming(
         tokens_out,
         estimated: true,
         search_units: None,
+        breakdown: TokenBreakdown::default(),
         media: lumen_core::MediaUsage::default(),
         cost,
         status: 200,
@@ -447,6 +457,7 @@ fn defer_chat_refinement(
             tokens_out: refined_out,
             estimated: true,
             search_units: None,
+            breakdown: TokenBreakdown::default(),
             media: lumen_core::MediaUsage::default(),
             cost,
             status: 200,

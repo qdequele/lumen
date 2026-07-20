@@ -492,6 +492,67 @@ async fn non_streaming_happy_path_resolves_alias_and_returns_openai_shape() {
     assert_eq!(sent["stream"], false);
 }
 
+/// Issue #99: when OpenAI reports a cached/reasoning breakdown, the gateway
+/// passes it through verbatim in the OpenAI-compatible nested shape.
+#[tokio::test]
+async fn openai_cached_and_reasoning_breakdown_pass_through() {
+    let upstream = MockServer::start().await;
+    let mut body = openai_chat_body("gpt-4o-2024-08-06");
+    body["usage"] = json!({
+        "prompt_tokens": 100, "completion_tokens": 40, "total_tokens": 140,
+        "prompt_tokens_details": { "cached_tokens": 64 },
+        "completion_tokens_details": { "reasoning_tokens": 30 }
+    });
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(body))
+        .mount(&upstream)
+        .await;
+
+    let base = common::spawn_with(openai_registry(&upstream.uri()), LIMIT).await;
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&json!({ "model": "gpt", "messages": [{ "role": "user", "content": "hi" }] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let out: Value = resp.json().await.unwrap();
+    assert_eq!(out["usage"]["prompt_tokens_details"]["cached_tokens"], 64);
+    assert_eq!(
+        out["usage"]["completion_tokens_details"]["reasoning_tokens"],
+        30
+    );
+    // The three-field usage is untouched.
+    assert_eq!(out["usage"]["total_tokens"], 140);
+}
+
+/// No regression when the upstream omits the breakdown: the `*_details`
+/// objects never appear (ADR 003: absent, never a fabricated zero).
+#[tokio::test]
+async fn openai_without_breakdown_omits_detail_objects() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(openai_chat_body("gpt-4o-2024-08-06")),
+        )
+        .mount(&upstream)
+        .await;
+
+    let base = common::spawn_with(openai_registry(&upstream.uri()), LIMIT).await;
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&json!({ "model": "gpt", "messages": [{ "role": "user", "content": "hi" }] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let out: Value = resp.json().await.unwrap();
+    assert!(out["usage"].get("prompt_tokens_details").is_none());
+    assert!(out["usage"].get("completion_tokens_details").is_none());
+}
+
 #[tokio::test]
 async fn unknown_model_is_404_fg2001() {
     let upstream = MockServer::start().await;
