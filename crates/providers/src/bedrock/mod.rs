@@ -36,6 +36,7 @@
 //! session tokens are supported, and an expired session token keeps failing
 //! (403) until the environment provides a fresh one.
 
+mod embed;
 mod eventstream;
 mod sigv4;
 mod stream;

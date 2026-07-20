@@ -29,6 +29,19 @@ All notable changes to LUMEN are documented here. The format is based on
   (`LM-1001`) before any upstream call and lenient mode drops them with a
   `debug` trace, consistent with the `response_format` / `seed` handling.
   Provider matrix in `docs/providers.md` updated.
+- **AWS Bedrock embeddings** (issue #95). The `bedrock` provider is no longer
+  chat-only: a model declaring `capabilities = ["embed"]` now builds and serves
+  `POST /v1/embeddings` for two families via per-model `InvokeModel`, reusing
+  the existing SigV4 signing and region resolution from the chat path. Amazon
+  Titan (`amazon.titan-embed-text-v2:0` and predecessors) embeds one text per
+  call (the gateway loops and reassembles in order; Titan v2 honors
+  `dimensions`), and Cohere Embed on Bedrock (`cohere.embed-english-v3`,
+  `cohere.embed-multilingual-v3`) embeds a batch with a defaulted/overridable
+  `input_type`. Token usage follows ADR 003 (Titan's `inputTextTokenCount`,
+  Cohere's `x-amzn-bedrock-input-token-count` header, else a local estimate at
+  the edge). Pre-tokenized and image inputs are rejected before any upstream
+  call. The `bedrock` fixtures join the shared embed conformance suite
+  (nominal, batching, 429/5xx, malformed body, cancellation).
 - **Virtual key deletion and rotation** (issue #66). `DELETE /admin/keys/{id}`
   soft-deletes a key: the row is tombstoned (`deleted_at` column, migration
   `0005_key_deleted_at.sql`) rather than removed, so `usage_log.key_id`

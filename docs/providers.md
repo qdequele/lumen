@@ -54,7 +54,7 @@ Rules that apply to every provider:
 | `anthropic` |  ✅  |       |        | required      | optional       | -                 |
 | `google`    |  ✅  |  ✅   |        | required      | optional       | 100               |
 | `vertex_ai` |  ✅  |  ✅   |        | required (SA JSON) | **required** (GCP region) | 1 |
-| `bedrock`   |  ✅  |       |        | AWS SigV4     | optional       | -                 |
+| `bedrock`   |  ✅  |  ✅   |        | AWS SigV4     | optional       | 1                 |
 | `cohere`    |  ✅  |  ✅   |   ✅   | required      | optional       | 96                |
 | `jina`      |      |  ✅   |   ✅   | required      | optional       | 2048              |
 | `voyage`    |      |  ✅   |   ✅   | required      | optional       | 128               |
@@ -272,7 +272,7 @@ capabilities = ["embed"]
 
 ## bedrock
 
-- **kind**: `bedrock` · **capabilities**: chat only.
+- **kind**: `bedrock` · **capabilities**: chat, embed.
 - **Auth**: AWS Signature Version 4 (SigV4), not a bearer key. Credentials are
   read from the standard AWS environment variables (`AWS_ACCESS_KEY_ID`,
   `AWS_SECRET_ACCESS_KEY`, and optionally `AWS_SESSION_TOKEN` for temporary
@@ -284,11 +284,33 @@ capabilities = ["embed"]
   There is no AWS credential-provider chain (no IMDS/instance roles, SSO,
   profiles or `credential_process`); an expired session token keeps failing
   with 403 until the environment supplies a fresh one.
-- **API**: the Bedrock **Converse** API (`POST /model/{modelId}/converse` and
-  `/converse-stream`), which gives one uniform schema across the Anthropic,
+- **API (chat)**: the Bedrock **Converse** API (`POST /model/{modelId}/converse`
+  and `/converse-stream`), which gives one uniform schema across the Anthropic,
   Meta Llama, Amazon Titan/Nova, Mistral and Cohere model families. The legacy
-  per-model `InvokeModel` schemas are intentionally not implemented (Converse
-  covers the same models).
+  per-model `InvokeModel` chat schemas are intentionally not implemented
+  (Converse covers the same chat models).
+- **API (embeddings)**: Bedrock has no Converse equivalent for embeddings, so
+  the embed path uses per-model `InvokeModel` (`POST /model/{modelId}/invoke`),
+  routed by model id (issue #95):
+  - **Amazon Titan** (`amazon.titan-embed-text-v2:0` and predecessors): embeds
+    ONE text per call (`{ "inputText": ... }`); the gateway loops one signed
+    request per input and reassembles the batch in order. Titan v2 honors
+    `dimensions` (mapped to Titan's `dimensions`/`normalize`); older Titan
+    models do not, so `dimensions` is dropped (or rejected under `strict`).
+  - **Cohere Embed on Bedrock** (`cohere.embed-english-v3`,
+    `cohere.embed-multilingual-v3`): embeds a batch in one call
+    (`{ "texts": [...], "input_type": ... }`); `input_type` defaults to
+    `search_document` and honors an override. Cohere does not accept
+    `dimensions`.
+  - **Batch limit**: reported as `1` (the conservative floor across the two
+    families, whose real per-call limits are 1 for Titan and 96 for Cohere),
+    so the router splits every batch into single-input sub-batches it runs
+    concurrently. Pre-tokenized (token-id) and image inputs are rejected with
+    an honest 400 before any upstream call (both families are text-only).
+  - **Usage (ADR 003)**: Titan's `inputTextTokenCount` and Cohere's
+    `x-amzn-bedrock-input-token-count` response header are reported as upstream
+    usage; when absent the request edge derives the local estimate (never a
+    silent zero).
 - **Region / base_url**: set `base_url` to the runtime endpoint for your region,
   `https://bedrock-runtime.{region}.amazonaws.com`; the region is parsed back out
   of it for the SigV4 signing scope. VPC/PrivateLink endpoint hosts
@@ -320,6 +342,16 @@ id = "bedrock-claude-3-5-sonnet"
 upstream_id = "anthropic.claude-3-5-sonnet-20241022-v2:0"
 capabilities = ["chat"]
 modalities = ["text", "image"]
+
+[[providers.models]]
+id = "bedrock-titan-embed"
+upstream_id = "amazon.titan-embed-text-v2:0"
+capabilities = ["embed"]
+
+[[providers.models]]
+id = "bedrock-cohere-embed"
+upstream_id = "cohere.embed-english-v3"
+capabilities = ["embed"]
 ```
 
 ## cohere

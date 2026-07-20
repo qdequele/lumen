@@ -19,13 +19,14 @@ use async_trait::async_trait;
 use lumen_core::{
     ContentPart, EmbedInput, EmbedItem, EmbedRequest, EmbeddingProvider, ImageUrl, ProviderError,
 };
+use lumen_providers::bedrock::{BedrockProvider, Credentials};
 use lumen_providers::{
     batch, CohereProvider, GoogleProvider, JinaProvider, MistralProvider, OllamaProvider,
     OpenAiProvider, TeiProvider, VertexProvider, VoyageProvider,
 };
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 // --------------------------------------------------------------------------
@@ -50,6 +51,14 @@ trait EmbedFixture: Send + Sync {
     /// (summing absent usage correctly yields zero).
     fn reports_usage(&self) -> bool {
         true
+    }
+
+    /// The model id the shared scenarios put on the request. Defaults to a
+    /// generic name (every fixture that ignores the model keeps working); the
+    /// Bedrock fixtures override it so the provider can route by model family
+    /// (Titan vs Cohere on Bedrock share one provider but differ on the wire).
+    fn model(&self) -> String {
+        "test-model".to_owned()
     }
 }
 
@@ -631,6 +640,135 @@ impl EmbedFixture for VertexEmbedFixture {
 }
 
 // --------------------------------------------------------------------------
+// Bedrock fixtures - `InvokeModel` (`POST /model/{modelId}/invoke`), SigV4.
+// Two families share one provider, routed by model id:
+//   - Titan: request `{ inputText }` (ONE text per call), response
+//     `{ embedding, inputTextTokenCount }`.
+//   - Cohere on Bedrock: request `{ texts, input_type }`, response
+//     `{ embeddings: [[...]] }` with the input token count in the
+//     `x-amzn-bedrock-input-token-count` response header.
+// Dummy AWS example credentials sign the requests; the mock never verifies
+// the signature.
+// --------------------------------------------------------------------------
+
+fn bedrock_creds() -> Credentials {
+    Credentials::new(
+        "AKIDEXAMPLE",
+        "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+        None,
+    )
+}
+
+struct BedrockTitanFixture;
+
+struct BedrockTitanEcho;
+impl Respond for BedrockTitanEcho {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
+        let text = body["inputText"].as_str().unwrap_or("");
+        let val: f32 = text.parse().unwrap_or(f32::NAN);
+        ResponseTemplate::new(200).set_body_json(json!({
+            "embedding": [val],
+            "inputTextTokenCount": 1
+        }))
+    }
+}
+
+#[async_trait]
+impl EmbedFixture for BedrockTitanFixture {
+    fn build(&self, base_url: String) -> Arc<dyn EmbeddingProvider> {
+        Arc::new(BedrockProvider::new(
+            reqwest::Client::new(),
+            "bedrock-titan-test",
+            "us-east-1",
+            Some(base_url),
+            Some(bedrock_creds()),
+        ))
+    }
+
+    fn model(&self) -> String {
+        "amazon.titan-embed-text-v2:0".to_owned()
+    }
+
+    async fn mount_echo(&self, mock: &MockServer) {
+        Mock::given(method("POST"))
+            .respond_with(BedrockTitanEcho)
+            .mount(mock)
+            .await;
+    }
+
+    async fn mount_delayed(&self, mock: &MockServer, delay: Duration) {
+        let body = json!({ "embedding": [0.0], "inputTextTokenCount": 1 });
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(body)
+                    .set_delay(delay),
+            )
+            .mount(mock)
+            .await;
+    }
+}
+
+struct BedrockCohereFixture;
+
+struct BedrockCohereEcho;
+impl Respond for BedrockCohereEcho {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
+        let inputs = extract_inputs(&body["texts"]);
+        let embeddings: Vec<Value> = inputs
+            .iter()
+            .map(|s| json!([s.parse::<f32>().unwrap_or(f32::NAN)]))
+            .collect();
+        let n = inputs.len();
+        ResponseTemplate::new(200)
+            .insert_header("x-amzn-bedrock-input-token-count", n.to_string().as_str())
+            .set_body_json(json!({
+                "embeddings": embeddings,
+                "response_type": "embeddings_floats"
+            }))
+    }
+}
+
+#[async_trait]
+impl EmbedFixture for BedrockCohereFixture {
+    fn build(&self, base_url: String) -> Arc<dyn EmbeddingProvider> {
+        Arc::new(BedrockProvider::new(
+            reqwest::Client::new(),
+            "bedrock-cohere-test",
+            "us-east-1",
+            Some(base_url),
+            Some(bedrock_creds()),
+        ))
+    }
+
+    fn model(&self) -> String {
+        "cohere.embed-english-v3".to_owned()
+    }
+
+    async fn mount_echo(&self, mock: &MockServer) {
+        Mock::given(method("POST"))
+            .respond_with(BedrockCohereEcho)
+            .mount(mock)
+            .await;
+    }
+
+    async fn mount_delayed(&self, mock: &MockServer, delay: Duration) {
+        let body = json!({ "embeddings": [[0.0]], "response_type": "embeddings_floats" });
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("x-amzn-bedrock-input-token-count", "1")
+                    .set_body_json(body)
+                    .set_delay(delay),
+            )
+            .mount(mock)
+            .await;
+    }
+}
+
+// --------------------------------------------------------------------------
 // Shared error mounts (schema-agnostic)
 // --------------------------------------------------------------------------
 
@@ -663,6 +801,14 @@ fn batch_request(texts: Vec<String>) -> EmbedRequest {
     }
 }
 
+/// A batch request carrying the fixture's model id, so a provider that routes
+/// by model family (Bedrock: Titan vs Cohere) resolves the right wire schema.
+fn req_for(fx: &dyn EmbedFixture, texts: Vec<String>) -> EmbedRequest {
+    let mut req = batch_request(texts);
+    req.model = fx.model();
+    req
+}
+
 // --------------------------------------------------------------------------
 // Scenarios (provider-agnostic)
 // --------------------------------------------------------------------------
@@ -672,7 +818,7 @@ async fn scenario_nominal(fx: &dyn EmbedFixture) {
     fx.mount_echo(&mock).await;
     let provider = fx.build(mock.uri());
 
-    let req = batch_request(vec!["0".into(), "1".into(), "2".into()]);
+    let req = req_for(fx, vec!["0".into(), "1".into(), "2".into()]);
     let resp = provider.embed(req, CancellationToken::new()).await.unwrap();
 
     assert_eq!(resp.data.len(), 3);
@@ -692,7 +838,7 @@ async fn scenario_batching_in_order(fx: &dyn EmbedFixture) {
     let max = provider.max_batch_size();
     let n = max * 2 + 1;
     let texts: Vec<String> = (0..n).map(|i| i.to_string()).collect();
-    let req = batch_request(texts);
+    let req = req_for(fx, texts);
 
     let resp = batch::embed_batched(&*provider, req, &CancellationToken::new(), 4)
         .await
@@ -720,7 +866,7 @@ async fn scenario_rate_limited(fx: &dyn EmbedFixture) {
     let provider = fx.build(mock.uri());
 
     let err = provider
-        .embed(batch_request(vec!["x".into()]), CancellationToken::new())
+        .embed(req_for(fx, vec!["x".into()]), CancellationToken::new())
         .await
         .unwrap_err();
     match err {
@@ -737,7 +883,7 @@ async fn scenario_upstream_5xx(fx: &dyn EmbedFixture) {
     let provider = fx.build(mock.uri());
 
     let err = provider
-        .embed(batch_request(vec!["x".into()]), CancellationToken::new())
+        .embed(req_for(fx, vec!["x".into()]), CancellationToken::new())
         .await
         .unwrap_err();
     match err {
@@ -757,7 +903,7 @@ async fn scenario_malformed_response(fx: &dyn EmbedFixture) {
     let provider = fx.build(mock.uri());
 
     let err = provider
-        .embed(batch_request(vec!["x".into()]), CancellationToken::new())
+        .embed(req_for(fx, vec!["x".into()]), CancellationToken::new())
         .await
         .unwrap_err();
     assert!(
@@ -780,15 +926,12 @@ async fn scenario_cancellation_aborts_upstream(fx: &dyn EmbedFixture) {
     // realistic scheduler jitter.
     fx.mount_delayed(&mock, Duration::from_secs(3)).await;
     let provider = fx.build(mock.uri());
+    let req = req_for(fx, vec!["x".into()]);
 
     let cancel = CancellationToken::new();
     let cancel_child = cancel.clone();
     let started = Instant::now();
-    let handle = tokio::spawn(async move {
-        provider
-            .embed(batch_request(vec!["x".into()]), cancel_child)
-            .await
-    });
+    let handle = tokio::spawn(async move { provider.embed(req, cancel_child).await });
 
     // Give the request time to reach the upstream, then cancel.
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -869,6 +1012,122 @@ async fn google_passes_embed_conformance_suite() {
 async fn vertex_passes_embed_conformance_suite() {
     let fx = VertexEmbedFixture::new().await;
     run_conformance(&fx).await;
+}
+
+#[tokio::test]
+async fn bedrock_titan_passes_embed_conformance_suite() {
+    run_conformance(&BedrockTitanFixture).await;
+}
+
+#[tokio::test]
+async fn bedrock_cohere_passes_embed_conformance_suite() {
+    run_conformance(&BedrockCohereFixture).await;
+}
+
+#[tokio::test]
+async fn bedrock_titan_rejects_token_input_before_any_call() {
+    assert_rejects_token_input(&BedrockTitanFixture, "bedrock-titan").await;
+}
+
+#[tokio::test]
+async fn bedrock_cohere_rejects_token_input_before_any_call() {
+    assert_rejects_token_input(&BedrockCohereFixture, "bedrock-cohere").await;
+}
+
+#[tokio::test]
+async fn bedrock_titan_rejects_image_input_before_any_call() {
+    assert_rejects_image_input(&BedrockTitanFixture, "bedrock-titan").await;
+}
+
+/// Titan `InvokeModel` embeds ONE text per call: the gateway loops one signed
+/// request per input, sends `{ inputText }`, maps `dimensions` to Titan v2's
+/// own `dimensions`/`normalize` fields, and sums `inputTextTokenCount` as
+/// upstream usage (ADR 003, never a silent zero).
+#[tokio::test]
+async fn bedrock_titan_invokes_once_per_input_with_expected_body_and_usage() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path_regex(
+            r"^/model/amazon\.titan-embed-text-v2%3A0/invoke$",
+        ))
+        .respond_with(BedrockTitanEcho)
+        .expect(2)
+        .mount(&mock)
+        .await;
+    let provider = BedrockTitanFixture.build(mock.uri());
+
+    let mut req = req_for(&BedrockTitanFixture, vec!["3".into(), "4".into()]);
+    req.dimensions = Some(256);
+    let resp = provider.embed(req, CancellationToken::new()).await.unwrap();
+
+    assert_eq!(resp.data.len(), 2);
+    assert_eq!(resp.data[0].embedding, vec![3.0]);
+    assert_eq!(resp.data[1].embedding, vec![4.0]);
+    // One token reported per single-input call, summed across the two calls.
+    assert_eq!(resp.usage.prompt_tokens, 2);
+    assert_eq!(resp.usage.total_tokens, 2);
+    assert_eq!(resp.usage.estimated, None);
+
+    let requests = mock.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    let first: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(
+        first,
+        json!({ "inputText": "3", "dimensions": 256, "normalize": true })
+    );
+}
+
+/// Cohere on Bedrock embeds a batch in one call: the body carries `texts` and
+/// an `input_type` (defaulting to `search_document`, honoring an override), and
+/// the input token count comes from the `x-amzn-bedrock-input-token-count`
+/// response header (ADR 003 upstream usage).
+#[tokio::test]
+async fn bedrock_cohere_invokes_batch_with_input_type_and_header_usage() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path_regex(r"^/model/cohere\.embed-english-v3/invoke$"))
+        .respond_with(BedrockCohereEcho)
+        .expect(1)
+        .mount(&mock)
+        .await;
+    let provider = BedrockCohereFixture.build(mock.uri());
+
+    let req = req_for(&BedrockCohereFixture, vec!["5".into(), "6".into()]);
+    let resp = provider.embed(req, CancellationToken::new()).await.unwrap();
+
+    assert_eq!(resp.data.len(), 2);
+    assert_eq!(resp.data[0].embedding, vec![5.0]);
+    assert_eq!(resp.data[1].embedding, vec![6.0]);
+    // Header-reported input token count (two texts) surfaces as upstream usage.
+    assert_eq!(resp.usage.prompt_tokens, 2);
+    assert_eq!(resp.usage.total_tokens, 2);
+    assert_eq!(resp.usage.estimated, None);
+
+    let requests = mock.received_requests().await.unwrap();
+    let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(
+        body,
+        json!({
+            "texts": ["5", "6"],
+            "input_type": "search_document"
+        })
+    );
+}
+
+#[tokio::test]
+async fn bedrock_cohere_honors_input_type_override() {
+    let mock = MockServer::start().await;
+    BedrockCohereFixture.mount_echo(&mock).await;
+    let provider = BedrockCohereFixture.build(mock.uri());
+
+    let mut req = req_for(&BedrockCohereFixture, vec!["0".into()]);
+    req.extra
+        .insert("input_type".to_owned(), json!("search_query"));
+    provider.embed(req, CancellationToken::new()).await.unwrap();
+
+    let requests = mock.received_requests().await.unwrap();
+    let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(body["input_type"], "search_query");
 }
 
 /// M2 acceptance criterion 1, verbatim: 5000 inputs, max_batch 2048 → exactly
