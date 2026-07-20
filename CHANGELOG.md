@@ -8,6 +8,16 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ### Added
 
+- **Route-not-found error envelope** (issue #88). Requests matching no route
+  (trailing-slash, extra-segment and other near-miss paths) used to return a
+  bare, empty-body 404 outside the LM envelope, and bypassed the virtual-key
+  auth layer. A `Router::fallback` now answers every such miss with the new
+  stable `LM-1003` route-not-found code (404, `type: invalid_request`),
+  documented in `docs/errors.md`. The fallback sits outside the auth layer on
+  purpose: an unmatched path answers 404 even when auth is enabled, which
+  leaks no more than the bare 404 it replaces (it names no path and discloses
+  no route), while a matched `/v1` route without a key still returns 401
+  `LM-4004`. `/health` latency isolation and `/metrics` are unchanged.
 - **Virtual key deletion and rotation** (issue #66). `DELETE /admin/keys/{id}`
   soft-deletes a key: the row is tombstoned (`deleted_at` column, migration
   `0005_key_deleted_at.sql`) rather than removed, so `usage_log.key_id`

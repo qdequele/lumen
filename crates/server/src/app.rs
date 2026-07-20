@@ -111,7 +111,25 @@ pub fn build_app(state: AppState) -> Router {
         app = app.merge(admin_routes);
     }
 
-    app.with_state(state).layer(middleware_stack)
+    // Every request that matches no route above lands here (trailing-slash,
+    // extra-segment and other near-miss paths) instead of returning a bare,
+    // empty-body 404. The fallback sits OUTSIDE the `/v1` virtual-key auth
+    // layer on purpose: `route_layer` only runs for routes that matched, and
+    // an unmatched path is answered before any auth check (issue #88). A
+    // `LM-1003` route-not-found envelope leaks no more than the bare 404 it
+    // replaces: it names no path and discloses no route. A MATCHED `/v1` route
+    // without a key still returns 401 `LM-4004`, since that route's existence
+    // is not the secret - only its auth state is.
+    app.fallback(route_not_found)
+        .with_state(state)
+        .layer(middleware_stack)
+}
+
+/// Router fallback for any request matching no route: the standard `LM-1003`
+/// route-not-found envelope (issue #88), never a bare 404. It runs outside the
+/// virtual-key auth layer, so it needs no state and touches no I/O.
+async fn route_not_found() -> Response {
+    ApiError::from(GatewayError::RouteNotFound).into_response()
 }
 
 /// Rewrite a bare `413` from [`RequestBodyLimitLayer`] into the `LM-1002`
