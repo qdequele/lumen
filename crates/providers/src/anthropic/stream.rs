@@ -40,6 +40,11 @@ pub(super) struct AnthropicTranslator {
     model: String,
     /// `input_tokens` captured at `message_start`, reported in the final usage.
     input_tokens: u32,
+    /// Cache read/write breakdown captured at `message_start` (issue #99).
+    /// `None` unless the request used prompt caching, so the streamed final
+    /// usage only carries a breakdown the upstream actually reported.
+    cache_read_input_tokens: Option<u32>,
+    cache_creation_input_tokens: Option<u32>,
     /// Anthropic content-block index → OpenAI tool-call index.
     tool_indices: HashMap<u64, u64>,
     /// Next OpenAI tool-call index to allocate.
@@ -54,10 +59,24 @@ impl AnthropicTranslator {
             id: String::new(),
             model: requested_model.to_owned(),
             input_tokens: 0,
+            cache_read_input_tokens: None,
+            cache_creation_input_tokens: None,
             tool_indices: HashMap::new(),
             next_tool_index: 0,
             finished: false,
         }
+    }
+
+    /// The OpenAI-compatible prompt-token breakdown captured at
+    /// `message_start`, or `None` when the stream reported no cache counts.
+    fn prompt_details(&self) -> Option<lumen_core::PromptTokensDetails> {
+        if self.cache_read_input_tokens.is_none() && self.cache_creation_input_tokens.is_none() {
+            return None;
+        }
+        Some(lumen_core::PromptTokensDetails {
+            cached_tokens: self.cache_read_input_tokens,
+            cache_creation_tokens: self.cache_creation_input_tokens,
+        })
     }
 
     /// Build a chunk from the captured id/model plus the given parts.
@@ -111,6 +130,8 @@ impl SseTranslator for AnthropicTranslator {
                     self.model = message.model;
                 }
                 self.input_tokens = message.usage.input_tokens;
+                self.cache_read_input_tokens = message.usage.cache_read_input_tokens;
+                self.cache_creation_input_tokens = message.usage.cache_creation_input_tokens;
                 Ok(vec![StreamItem::Chunk(self.chunk(
                     ChatDelta {
                         role: Some("assistant".to_owned()),
@@ -173,6 +194,10 @@ impl SseTranslator for AnthropicTranslator {
                     completion_tokens: completion,
                     total_tokens: self.input_tokens.saturating_add(completion),
                     estimated: None,
+                    // Cache breakdown captured at message_start rides the final
+                    // usage chunk (issue #99); Anthropic has no reasoning split.
+                    prompt_tokens_details: self.prompt_details(),
+                    completion_tokens_details: None,
                 };
                 Ok(vec![StreamItem::Chunk(self.chunk(
                     ChatDelta::default(),
@@ -233,10 +258,18 @@ struct MessageStart {
     usage: StartUsage,
 }
 
+// Field names mirror Anthropic's `message_start` usage JSON keys.
+#[allow(clippy::struct_field_names)]
 #[derive(Default, Deserialize)]
 struct StartUsage {
     #[serde(default)]
     input_tokens: u32,
+    /// Cache read/write counts, present only when the request used prompt
+    /// caching. `None` -> no breakdown surfaced (issue #99).
+    #[serde(default)]
+    cache_read_input_tokens: Option<u32>,
+    #[serde(default)]
+    cache_creation_input_tokens: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -301,6 +334,78 @@ mod tests {
             .iter()
             .flat_map(|e| translator.translate(e).expect("translates"))
             .collect()
+    }
+
+    /// Issue #99: cache read/write counts reported in `message_start` ride the
+    /// final usage chunk as an OpenAI-compatible `prompt_tokens_details`.
+    #[test]
+    fn streamed_final_usage_carries_cache_breakdown() {
+        let mut t = AnthropicTranslator::new("claude-req");
+        let items = feed(
+            &mut t,
+            &[
+                event(
+                    "message_start",
+                    serde_json::json!({
+                        "type": "message_start",
+                        "message": {
+                            "id": "msg_c", "model": "claude-3-5-sonnet",
+                            "usage": {
+                                "input_tokens": 10,
+                                "cache_read_input_tokens": 90,
+                                "cache_creation_input_tokens": 40
+                            }
+                        }
+                    }),
+                ),
+                event(
+                    "message_delta",
+                    serde_json::json!({
+                        "type": "message_delta",
+                        "delta": { "stop_reason": "end_turn" },
+                        "usage": { "output_tokens": 7 }
+                    }),
+                ),
+            ],
+        );
+        let StreamItem::Chunk(finish) = &items[1] else {
+            panic!("expected finish chunk")
+        };
+        let usage = finish.usage.expect("usage on final chunk");
+        assert_eq!(usage.prompt_tokens, 10);
+        assert_eq!(usage.cached_tokens(), Some(90));
+        assert_eq!(usage.cache_write_tokens(), Some(40));
+    }
+
+    /// Without cache counts, the streamed usage carries no breakdown.
+    #[test]
+    fn streamed_usage_without_cache_has_no_breakdown() {
+        let mut t = AnthropicTranslator::new("m");
+        let items = feed(
+            &mut t,
+            &[
+                event(
+                    "message_start",
+                    serde_json::json!({
+                        "type": "message_start",
+                        "message": { "id": "m", "model": "m", "usage": { "input_tokens": 4 } }
+                    }),
+                ),
+                event(
+                    "message_delta",
+                    serde_json::json!({
+                        "type": "message_delta",
+                        "delta": { "stop_reason": "end_turn" },
+                        "usage": { "output_tokens": 2 }
+                    }),
+                ),
+            ],
+        );
+        let StreamItem::Chunk(finish) = &items[1] else {
+            panic!("expected finish chunk")
+        };
+        let usage = finish.usage.expect("usage on final chunk");
+        assert!(usage.prompt_tokens_details.is_none());
     }
 
     /// Anthropic streams carry no creation time; each translated chunk must

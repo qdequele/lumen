@@ -805,6 +805,9 @@ fn translate_response(resp: GeminiResponse, requested_model: &str) -> ChatRespon
         completion_tokens: resp.usage_metadata.candidates,
         total_tokens: resp.usage_metadata.total,
         estimated: None,
+        // Gemini cached-content tokens are not surfaced yet (issue #99 scope).
+        prompt_tokens_details: None,
+        completion_tokens_details: None,
     };
 
     ChatResponse {

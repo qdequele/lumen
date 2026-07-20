@@ -373,6 +373,9 @@ pub(super) fn usage_from_cohere(usage: CohereUsage) -> Usage {
         completion_tokens: counts.output_tokens,
         total_tokens: counts.input_tokens.saturating_add(counts.output_tokens),
         estimated: None,
+        // Cohere does not report a cached/reasoning breakdown (issue #99).
+        prompt_tokens_details: None,
+        completion_tokens_details: None,
     }
 }
 

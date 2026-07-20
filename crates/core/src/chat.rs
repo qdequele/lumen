@@ -221,6 +221,34 @@ pub struct ChatRequest {
     pub extra: Map<String, Value>,
 }
 
+/// Prompt-side token breakdown, an OpenAI-compatible `prompt_tokens_details`
+/// object (issue #99). Every field is optional so an absent count is `None`
+/// (omitted from the wire), never a fabricated zero (ADR 003).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct PromptTokensDetails {
+    /// Prompt tokens served from the provider's prompt cache (a cache *read*).
+    /// OpenAI reports this directly; Anthropic's `cache_read_input_tokens`
+    /// maps here (same read/hit semantics).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_tokens: Option<u32>,
+    /// Prompt tokens written to the provider's prompt cache on this request (a
+    /// cache *write*). A Lumen extension carrying Anthropic's
+    /// `cache_creation_input_tokens`, which has no OpenAI equivalent; kept
+    /// distinct from `cached_tokens` so a write is never reported as a read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_tokens: Option<u32>,
+}
+
+/// Completion-side token breakdown, an OpenAI-compatible
+/// `completion_tokens_details` object (issue #99).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct CompletionTokensDetails {
+    /// Reasoning tokens billed within the completion (OpenAI o-series and
+    /// compatible models).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u32>,
+}
+
 /// Token accounting returned by upstream providers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Usage {
@@ -234,6 +262,35 @@ pub struct Usage {
     /// upstream reported none (ADR 003); omitted for upstream-reported usage.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub estimated: Option<bool>,
+    /// Prompt-side breakdown (cached / cache-creation tokens). `None` when the
+    /// upstream reported no breakdown; never fabricated (ADR 003, issue #99).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens_details: Option<PromptTokensDetails>,
+    /// Completion-side breakdown (reasoning tokens). `None` when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_tokens_details: Option<CompletionTokensDetails>,
+}
+
+impl Usage {
+    /// Cached (cache-read) prompt tokens, if the upstream reported them.
+    #[must_use]
+    pub fn cached_tokens(&self) -> Option<u32> {
+        self.prompt_tokens_details.and_then(|d| d.cached_tokens)
+    }
+
+    /// Cache-creation (cache-write) prompt tokens, if reported (Anthropic).
+    #[must_use]
+    pub fn cache_write_tokens(&self) -> Option<u32> {
+        self.prompt_tokens_details
+            .and_then(|d| d.cache_creation_tokens)
+    }
+
+    /// Reasoning tokens billed within the completion, if reported.
+    #[must_use]
+    pub fn reasoning_tokens(&self) -> Option<u32> {
+        self.completion_tokens_details
+            .and_then(|d| d.reasoning_tokens)
+    }
 }
 
 /// One completion choice in a non-streaming response.
@@ -391,6 +448,64 @@ mod tests {
             detail: None,
         };
         assert!(data.anthropic_file_id().is_none());
+    }
+
+    #[test]
+    fn usage_without_breakdown_omits_detail_objects() {
+        // Three-field usage (the common case) is unchanged: no `*_details`
+        // keys leak into the serialized body, and the accessors report None.
+        let json = r#"{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}"#;
+        let usage: Usage = serde_json::from_str(json).unwrap();
+        assert_eq!(usage.prompt_tokens, 10);
+        assert_eq!(usage.cached_tokens(), None);
+        assert_eq!(usage.reasoning_tokens(), None);
+        assert_eq!(usage.cache_write_tokens(), None);
+        let out = serde_json::to_value(usage).unwrap();
+        assert!(out.get("prompt_tokens_details").is_none());
+        assert!(out.get("completion_tokens_details").is_none());
+    }
+
+    #[test]
+    fn usage_deserializes_openai_shaped_breakdown_and_round_trips() {
+        // OpenAI reports the breakdown nested inside `prompt_tokens_details`
+        // and `completion_tokens_details`; both must survive deserialization
+        // and re-serialize in the same OpenAI-compatible shape.
+        let json = r#"{
+            "prompt_tokens":100,"completion_tokens":40,"total_tokens":140,
+            "prompt_tokens_details":{"cached_tokens":64},
+            "completion_tokens_details":{"reasoning_tokens":30}
+        }"#;
+        let usage: Usage = serde_json::from_str(json).unwrap();
+        assert_eq!(usage.cached_tokens(), Some(64));
+        assert_eq!(usage.reasoning_tokens(), Some(30));
+        assert_eq!(usage.cache_write_tokens(), None);
+        let out = serde_json::to_value(usage).unwrap();
+        assert_eq!(out["prompt_tokens_details"]["cached_tokens"], 64);
+        assert_eq!(out["completion_tokens_details"]["reasoning_tokens"], 30);
+    }
+
+    #[test]
+    fn usage_cache_write_tokens_serialize_inside_prompt_details() {
+        // Anthropic's cache-creation (write) count has no OpenAI slot; it
+        // rides alongside `cached_tokens` in `prompt_tokens_details` and is
+        // omitted when absent.
+        let usage = Usage {
+            prompt_tokens: 8,
+            completion_tokens: 2,
+            total_tokens: 10,
+            estimated: None,
+            prompt_tokens_details: Some(PromptTokensDetails {
+                cached_tokens: Some(5),
+                cache_creation_tokens: Some(3),
+            }),
+            completion_tokens_details: None,
+        };
+        assert_eq!(usage.cached_tokens(), Some(5));
+        assert_eq!(usage.cache_write_tokens(), Some(3));
+        let out = serde_json::to_value(usage).unwrap();
+        assert_eq!(out["prompt_tokens_details"]["cached_tokens"], 5);
+        assert_eq!(out["prompt_tokens_details"]["cache_creation_tokens"], 3);
+        assert!(out.get("completion_tokens_details").is_none());
     }
 
     #[test]

@@ -87,6 +87,8 @@ fn sample_response() -> ChatResponse {
             completion_tokens: 30,
             total_tokens: 50,
             estimated: None,
+            prompt_tokens_details: None,
+            completion_tokens_details: None,
         }),
         extra: serde_json::Map::new(),
     }

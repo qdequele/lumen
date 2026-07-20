@@ -181,6 +181,8 @@ mod tests {
                 completion_tokens: 1,
                 total_tokens: 4,
                 estimated: None,
+                prompt_tokens_details: None,
+                completion_tokens_details: None,
             }),
             extra: serde_json::Map::new(),
         }

@@ -203,6 +203,8 @@ impl BedrockStreamTranslator {
                         .total_tokens
                         .unwrap_or_else(|| u.input_tokens.saturating_add(u.output_tokens)),
                     estimated: None,
+                    prompt_tokens_details: None,
+                    completion_tokens_details: None,
                 });
                 self.finished = true;
                 Ok(vec![

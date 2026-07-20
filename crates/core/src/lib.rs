@@ -28,7 +28,8 @@ pub mod tokens;
 pub use capability::Capability;
 pub use chat::{
     ChatChoice, ChatChunk, ChatChunkChoice, ChatDelta, ChatMessage, ChatRequest, ChatResponse,
-    ContentPart, DataUri, ImageUrl, MessageContent, Usage,
+    CompletionTokensDetails, ContentPart, DataUri, ImageUrl, MessageContent, PromptTokensDetails,
+    Usage,
 };
 pub use embed::{
     encode_embedding_base64, EmbedData, EmbedInput, EmbedItem, EmbedRequest, EmbedResponse,

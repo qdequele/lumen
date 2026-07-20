@@ -17,7 +17,9 @@ use lumen_auth::state::{usd_to_micro, Reservation};
 use lumen_auth::store::UsageRecord;
 use lumen_auth::usage::UsageLogger;
 use lumen_core::GatewayError;
-use lumen_telemetry::tokens::{Direction, TokenMetrics, TokenSample};
+use lumen_telemetry::tokens::{
+    BreakdownKind, BreakdownSample, Direction, TokenMetrics, TokenSample,
+};
 use lumen_telemetry::LatencyMetrics;
 use serde_json::Value;
 use std::sync::Arc;
@@ -34,6 +36,10 @@ pub struct Outcome {
     pub estimated: bool,
     /// Rerank search units, when applicable.
     pub search_units: Option<u64>,
+    /// Upstream-reported token breakdown (cached / reasoning / cache-write),
+    /// when present (issue #99). Every field is `None` when the upstream
+    /// reported no breakdown; never fabricated (ADR 003).
+    pub breakdown: TokenBreakdown,
     /// Media accounting (count + decoded bytes, by type) - M9. Empty for
     /// text-only requests.
     pub media: lumen_core::MediaUsage,
@@ -41,6 +47,40 @@ pub struct Outcome {
     pub cost: f64,
     /// HTTP status returned to the client.
     pub status: u16,
+}
+
+/// Upstream-reported token breakdown for one request (issue #99). Each field
+/// is `Some` only when the upstream actually reported that count; an absent
+/// breakdown stays `None` on every surface (response body, Prometheus,
+/// `usage_log`), never a fabricated zero (ADR 003).
+// The shared `_tokens` postfix mirrors the OpenAI/usage_log column names.
+#[allow(clippy::struct_field_names)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TokenBreakdown {
+    /// Prompt tokens served from cache (cache read).
+    pub cached_tokens: Option<u64>,
+    /// Reasoning tokens billed within the completion.
+    pub reasoning_tokens: Option<u64>,
+    /// Prompt tokens written to cache (Anthropic cache-creation).
+    pub cache_write_tokens: Option<u64>,
+}
+
+impl TokenBreakdown {
+    /// Extract the breakdown from an upstream-reported [`Usage`]. Only the
+    /// counts the upstream actually reported become `Some`.
+    #[must_use]
+    pub fn from_usage(usage: &lumen_core::Usage) -> Self {
+        Self {
+            cached_tokens: usage.cached_tokens().map(u64::from),
+            reasoning_tokens: usage.reasoning_tokens().map(u64::from),
+            cache_write_tokens: usage.cache_write_tokens().map(u64::from),
+        }
+    }
+
+    /// The breakdown as `usage_log` column values (`i64`, saturating).
+    fn to_i64(value: Option<u64>) -> Option<i64> {
+        value.map(|v| i64::try_from(v).unwrap_or(i64::MAX))
+    }
 }
 
 /// What is being called: capability, client-facing model id, provider name.
@@ -173,6 +213,10 @@ impl Accounting {
             tokens_in: 0,
             tokens_out: 0,
             search_units: None,
+            // Nothing was served, so there is no breakdown to record.
+            cached_tokens: None,
+            reasoning_tokens: None,
+            cache_write_tokens: None,
             media_count: 0,
             media_bytes: 0,
             estimated: false,
@@ -214,6 +258,31 @@ impl Accounting {
     #[must_use]
     pub fn model_used(&self) -> &str {
         &self.model_used
+    }
+
+    /// Emit the upstream-reported token breakdown to Prometheus, one sample per
+    /// reported kind (issue #99). A `None` (absent) kind adds nothing and a
+    /// zero count is a no-op inside `add_token_breakdown` - never a fabricated
+    /// series (ADR 003).
+    fn record_token_breakdown(&self, breakdown: &TokenBreakdown, values: &[&str]) {
+        for (kind, count) in [
+            (BreakdownKind::Cached, breakdown.cached_tokens),
+            (BreakdownKind::Reasoning, breakdown.reasoning_tokens),
+            (BreakdownKind::CacheWrite, breakdown.cache_write_tokens),
+        ] {
+            if let Some(count) = count {
+                self.tokens.add_token_breakdown(
+                    &BreakdownSample {
+                        capability: self.capability,
+                        model: &self.model_used,
+                        provider: &self.provider,
+                        kind,
+                    },
+                    values,
+                    count,
+                );
+            }
+        }
     }
 
     /// Close the record: settle the budget reservation at the real cost,
@@ -306,6 +375,7 @@ impl Accounting {
             self.tokens
                 .add_search_units(&self.model_used, &self.provider, &values, units);
         }
+        self.record_token_breakdown(&outcome.breakdown, &values);
         // M9: media count + decoded bytes, one Prometheus sample per top-level
         // media type, attributed to the served model/provider.
         for ty in &outcome.media.by_type {
@@ -347,6 +417,9 @@ impl Accounting {
             search_units: outcome
                 .search_units
                 .map(|u| i64::try_from(u).unwrap_or(i64::MAX)),
+            cached_tokens: TokenBreakdown::to_i64(outcome.breakdown.cached_tokens),
+            reasoning_tokens: TokenBreakdown::to_i64(outcome.breakdown.reasoning_tokens),
+            cache_write_tokens: TokenBreakdown::to_i64(outcome.breakdown.cache_write_tokens),
             media_count: i64::try_from(outcome.media.count).unwrap_or(i64::MAX),
             media_bytes: i64::try_from(outcome.media.bytes).unwrap_or(i64::MAX),
             estimated: outcome.estimated,
@@ -399,6 +472,7 @@ impl StreamAccounting {
             return;
         };
         let (tokens_in, tokens_out, estimated) = self.sniffer.result(self.estimated_input);
+        let breakdown = self.sniffer.breakdown();
         // Bill at the model that actually served the stream (a fallback may
         // differ from the requested model) - consistent with the non-streaming,
         // embed and rerank paths.
@@ -410,6 +484,7 @@ impl StreamAccounting {
             tokens_out,
             estimated,
             search_units: None,
+            breakdown,
             media: lumen_core::MediaUsage::default(),
             cost,
             status,
@@ -443,6 +518,9 @@ struct UsageSniffer {
     /// `(prompt_tokens, completion_tokens)` from the last frame carrying a
     /// genuine top-level `usage` object.
     upstream_usage: Option<(u64, u64)>,
+    /// The token breakdown (cached / reasoning / cache-write) from that same
+    /// frame (issue #99). Absent until a usage chunk carries it.
+    upstream_breakdown: TokenBreakdown,
     data_frames: u64,
 }
 
@@ -492,7 +570,8 @@ impl UsageSniffer {
                 // "usage" fails the parse and cannot shadow the real chunk.
                 if contains(payload, b"\"usage\"") {
                     if let Some(parsed) = parse_usage(payload) {
-                        self.upstream_usage = Some(parsed);
+                        self.upstream_usage = Some((parsed.prompt, parsed.completion));
+                        self.upstream_breakdown = parsed.breakdown;
                     }
                 }
             }
@@ -510,11 +589,33 @@ impl UsageSniffer {
             None => (estimated_input, self.data_frames, true),
         }
     }
+
+    /// The upstream-reported token breakdown from the last usage chunk (issue
+    /// #99). Empty (all `None`) when no chunk carried one, or when usage was
+    /// estimated (no upstream chunk seen) - a breakdown is only ever an
+    /// upstream fact, never derived.
+    fn breakdown(&self) -> TokenBreakdown {
+        if self.upstream_usage.is_some() {
+            self.upstream_breakdown
+        } else {
+            TokenBreakdown::default()
+        }
+    }
 }
 
-/// Extract `(prompt_tokens, completion_tokens)` from one SSE payload iff it
-/// carries a genuine top-level `usage` object with at least one count.
-fn parse_usage(payload: &[u8]) -> Option<(u64, u64)> {
+/// A top-level `usage` object parsed from one SSE payload (issue #99).
+struct ParsedUsage {
+    prompt: u64,
+    completion: u64,
+    breakdown: TokenBreakdown,
+}
+
+/// Extract prompt/completion counts and the OpenAI-shaped token breakdown from
+/// one SSE payload iff it carries a genuine top-level `usage` object with at
+/// least one count. The breakdown reads the nested `prompt_tokens_details`
+/// (`cached_tokens`, `cache_creation_tokens`) and `completion_tokens_details`
+/// (`reasoning_tokens`); absent keys stay `None`, never a fabricated zero.
+fn parse_usage(payload: &[u8]) -> Option<ParsedUsage> {
     let value = serde_json::from_slice::<Value>(payload).ok()?;
     let usage = value.get("usage").filter(|u| u.is_object())?;
     let prompt = usage.get("prompt_tokens").and_then(Value::as_u64);
@@ -522,7 +623,20 @@ fn parse_usage(payload: &[u8]) -> Option<(u64, u64)> {
     if prompt.is_none() && completion.is_none() {
         return None;
     }
-    Some((prompt.unwrap_or(0), completion.unwrap_or(0)))
+    let prompt_details = usage.get("prompt_tokens_details");
+    let completion_details = usage.get("completion_tokens_details");
+    let nested =
+        |parent: Option<&Value>, key: &str| parent.and_then(|d| d.get(key)).and_then(Value::as_u64);
+    let breakdown = TokenBreakdown {
+        cached_tokens: nested(prompt_details, "cached_tokens"),
+        cache_write_tokens: nested(prompt_details, "cache_creation_tokens"),
+        reasoning_tokens: nested(completion_details, "reasoning_tokens"),
+    };
+    Some(ParsedUsage {
+        prompt: prompt.unwrap_or(0),
+        completion: completion.unwrap_or(0),
+        breakdown,
+    })
 }
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
@@ -601,6 +715,63 @@ mod tests {
         );
         s.scan(b"data: [DONE]\n\n");
         assert_eq!(s.result(99), (12, 34, false));
+        // No breakdown reported: it stays absent (issue #99).
+        let b = s.breakdown();
+        assert_eq!(b.cached_tokens, None);
+        assert_eq!(b.reasoning_tokens, None);
+        assert_eq!(b.cache_write_tokens, None);
+    }
+
+    #[test]
+    fn sniffer_extracts_the_token_breakdown_from_the_final_chunk() {
+        let mut s = UsageSniffer::default();
+        s.scan(
+            b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":40,\
+              \"prompt_tokens_details\":{\"cached_tokens\":64,\"cache_creation_tokens\":8},\
+              \"completion_tokens_details\":{\"reasoning_tokens\":30}}}\n\n",
+        );
+        s.scan(b"data: [DONE]\n\n");
+        assert_eq!(s.result(99), (100, 40, false));
+        let b = s.breakdown();
+        assert_eq!(b.cached_tokens, Some(64));
+        assert_eq!(b.cache_write_tokens, Some(8));
+        assert_eq!(b.reasoning_tokens, Some(30));
+    }
+
+    #[test]
+    fn estimated_stream_reports_no_breakdown() {
+        // No upstream usage chunk: usage is estimated, and a breakdown (an
+        // upstream fact) is never derived.
+        let mut s = UsageSniffer::default();
+        s.scan(b"data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n");
+        assert_eq!(s.result(10), (10, 1, true));
+        assert_eq!(s.breakdown().cached_tokens, None);
+    }
+
+    #[test]
+    fn finishing_with_a_breakdown_emits_prometheus_kind_series() {
+        let metrics = Metrics::new();
+        let accounting = open_accounting(&metrics);
+        accounting.finish(&Outcome {
+            tokens_in: 100,
+            tokens_out: 40,
+            estimated: false,
+            search_units: None,
+            breakdown: TokenBreakdown {
+                cached_tokens: Some(64),
+                reasoning_tokens: Some(30),
+                cache_write_tokens: None,
+            },
+            media: lumen_core::MediaUsage::default(),
+            cost: 0.0,
+            status: 200,
+        });
+        let out = metrics.encode_text();
+        assert!(out.contains("lumen_token_breakdown_total"), "{out}");
+        assert!(out.contains(r#"kind="cached""#), "{out}");
+        assert!(out.contains(r#"kind="reasoning""#), "{out}");
+        // An absent kind never creates a series (ADR 003).
+        assert!(!out.contains(r#"kind="cache_write""#), "{out}");
     }
 
     #[test]

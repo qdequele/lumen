@@ -15,7 +15,7 @@ use lumen_core::{tokens, GatewayError};
 use lumen_providers::rerank;
 use tokio_util::sync::CancellationToken;
 
-use crate::accounting::{Accounting, Outcome, Target};
+use crate::accounting::{Accounting, Outcome, Target, TokenBreakdown};
 use crate::auth::AuthedKey;
 use crate::error::ApiError;
 use crate::resilience::model_used_headers;
@@ -142,6 +142,7 @@ pub async fn rerank_handler(
                 tokens_out: 0,
                 estimated: true,
                 search_units: Some(search_units),
+                breakdown: TokenBreakdown::default(),
                 media: lumen_core::MediaUsage::default(),
                 cost,
                 status: 200,
@@ -153,6 +154,7 @@ pub async fn rerank_handler(
             tokens_out: 0,
             estimated: tokens_in_estimated,
             search_units: Some(search_units),
+            breakdown: TokenBreakdown::default(),
             media: lumen_core::MediaUsage::default(),
             cost,
             status: 200,

@@ -848,6 +848,9 @@ fn translate_response(resp: ConverseResponse, requested_model: &str) -> ChatResp
         completion_tokens: resp.usage.output_tokens,
         total_tokens: total,
         estimated: None,
+        // Bedrock cache-read/write tokens are not surfaced yet (issue #99 scope).
+        prompt_tokens_details: None,
+        completion_tokens_details: None,
     };
 
     ChatResponse {

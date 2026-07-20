@@ -31,6 +31,9 @@ fn usage(key_id: &str, ts: i64) -> UsageRecord {
         tokens_in: 12,
         tokens_out: 34,
         search_units: None,
+        cached_tokens: None,
+        reasoning_tokens: None,
+        cache_write_tokens: None,
         media_count: 0,
         media_bytes: 0,
         estimated: false,
@@ -40,6 +43,34 @@ fn usage(key_id: &str, ts: i64) -> UsageRecord {
         metadata: None,
         ts,
     }
+}
+
+/// Issue #99: the token-breakdown columns persist and read back, and an
+/// absent breakdown stays NULL (never a fabricated 0) - ADR 003.
+#[tokio::test]
+async fn usage_log_persists_token_breakdown_and_keeps_absent_null() {
+    let store = KeyStore::in_memory().await.expect("open store");
+    let mut with_breakdown = usage("key-a", 100);
+    with_breakdown.cached_tokens = Some(64);
+    with_breakdown.reasoning_tokens = Some(30);
+    with_breakdown.cache_write_tokens = Some(8);
+    let without = usage("key-b", 200); // all breakdown fields None
+    store
+        .insert_usage(&[with_breakdown, without])
+        .await
+        .expect("insert");
+
+    let dump = store.debug_dump().await.expect("dump");
+    // The reported breakdown round-trips as concrete integers.
+    assert!(
+        dump.contains("|64|30|8|"),
+        "breakdown values missing:\n{dump}"
+    );
+    // The absent row keeps NULLs, not zeros.
+    assert!(
+        dump.contains("|NULL|NULL|NULL|"),
+        "absent breakdown should be NULL:\n{dump}"
+    );
 }
 
 #[tokio::test]

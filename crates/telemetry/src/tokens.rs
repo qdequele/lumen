@@ -15,6 +15,8 @@ const TOKEN_LABELS: [&str; 5] = ["capability", "model", "provider", "direction",
 const SEARCH_UNIT_LABELS: [&str; 2] = ["model", "provider"];
 /// Base label names of the media counters (M9).
 const MEDIA_LABELS: [&str; 4] = ["capability", "model", "provider", "media_type"];
+/// Base label names of `lumen_token_breakdown_total` (issue #99).
+const BREAKDOWN_LABELS: [&str; 4] = ["capability", "model", "provider", "kind"];
 
 /// All M5 token/usage counters, registered against one [`Metrics`] registry.
 #[derive(Debug, Clone)]
@@ -23,6 +25,10 @@ pub struct TokenMetrics {
     rerank_search_units_total: IntCounterVec,
     media_total: IntCounterVec,
     media_bytes_total: IntCounterVec,
+    /// Cached / reasoning / cache-write token breakdown (issue #99). A subset
+    /// of `tokens_total`, split out by `kind` so it can be summed independently
+    /// without inflating the primary token counter.
+    token_breakdown_total: IntCounterVec,
     tokens_estimated_total: IntCounter,
     usage_log_dropped_total: IntCounter,
     metadata_rejected_total: IntCounter,
@@ -58,6 +64,11 @@ impl TokenMetrics {
             .copied()
             .chain(metadata_labels.iter().map(String::as_str))
             .collect();
+        let breakdown_label_names: Vec<&str> = BREAKDOWN_LABELS
+            .iter()
+            .copied()
+            .chain(metadata_labels.iter().map(String::as_str))
+            .collect();
 
         let tokens_total = IntCounterVec::new(
             Opts::new(
@@ -87,6 +98,13 @@ impl TokenMetrics {
             ),
             &media_label_names,
         )?;
+        let token_breakdown_total = IntCounterVec::new(
+            Opts::new(
+                "lumen_token_breakdown_total",
+                "Upstream-reported token breakdown by kind (cached / reasoning / cache_write), a subset of lumen_tokens_total (issue #99).",
+            ),
+            &breakdown_label_names,
+        )?;
         let tokens_estimated_total = IntCounter::new(
             "lumen_tokens_estimated_total",
             "Tokens that were locally estimated rather than upstream-reported.",
@@ -105,6 +123,7 @@ impl TokenMetrics {
         registry.register(Box::new(rerank_search_units_total.clone()))?;
         registry.register(Box::new(media_total.clone()))?;
         registry.register(Box::new(media_bytes_total.clone()))?;
+        registry.register(Box::new(token_breakdown_total.clone()))?;
         registry.register(Box::new(tokens_estimated_total.clone()))?;
         registry.register(Box::new(usage_log_dropped_total.clone()))?;
         registry.register(Box::new(metadata_rejected_total.clone()))?;
@@ -114,6 +133,7 @@ impl TokenMetrics {
             rerank_search_units_total,
             media_total,
             media_bytes_total,
+            token_breakdown_total,
             tokens_estimated_total,
             usage_log_dropped_total,
             metadata_rejected_total,
@@ -194,6 +214,30 @@ impl TokenMetrics {
             .inc_by(bytes);
     }
 
+    /// Count `count` tokens of one breakdown `kind` (issue #99). A zero count
+    /// is a no-op (no series created), mirroring the other token counters, so
+    /// an absent upstream breakdown never fabricates a `0` series (ADR 003).
+    pub fn add_token_breakdown(
+        &self,
+        sample: &BreakdownSample<'_>,
+        metadata_values: &[&str],
+        count: u64,
+    ) {
+        if count == 0 {
+            return;
+        }
+        let mut values: Vec<&str> = vec![
+            sample.capability,
+            sample.model,
+            sample.provider,
+            sample.kind.as_str(),
+        ];
+        self.extend_metadata(&mut values, metadata_values);
+        self.token_breakdown_total
+            .with_label_values(&values)
+            .inc_by(count);
+    }
+
     /// One usage-log entry was dropped because the channel was full.
     pub fn inc_usage_dropped(&self) {
         self.usage_log_dropped_total.inc();
@@ -241,6 +285,42 @@ pub struct MediaSample<'a> {
     pub provider: &'a str,
     /// Top-level media type (`"image"`, `"audio"`, …).
     pub media_type: &'a str,
+}
+
+/// One token-breakdown observation's label set (issue #99).
+#[derive(Debug, Clone, Copy)]
+pub struct BreakdownSample<'a> {
+    /// `chat` | `embed` | `rerank`.
+    pub capability: &'a str,
+    /// Client-facing model id.
+    pub model: &'a str,
+    /// Provider instance name.
+    pub provider: &'a str,
+    /// Which breakdown this count belongs to.
+    pub kind: BreakdownKind,
+}
+
+/// The `kind` label of `lumen_token_breakdown_total`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BreakdownKind {
+    /// Prompt tokens served from cache (cache read / hit).
+    Cached,
+    /// Reasoning tokens billed within the completion.
+    Reasoning,
+    /// Prompt tokens written to cache (cache write, Anthropic cache-creation).
+    CacheWrite,
+}
+
+impl BreakdownKind {
+    /// The Prometheus label value.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            BreakdownKind::Cached => "cached",
+            BreakdownKind::Reasoning => "reasoning",
+            BreakdownKind::CacheWrite => "cache_write",
+        }
+    }
 }
 
 /// Token direction label.
@@ -384,6 +464,44 @@ mod tests {
             0,
         );
         assert!(!metrics.encode_text().contains("lumen_media_total{"));
+    }
+
+    #[test]
+    fn breakdown_counter_records_kind_and_base_labels() {
+        let (metrics, tokens) = setup(&[]);
+        tokens.add_token_breakdown(
+            &BreakdownSample {
+                capability: "chat",
+                model: "gpt-5",
+                provider: "openai",
+                kind: BreakdownKind::Cached,
+            },
+            &[],
+            64,
+        );
+        let out = metrics.encode_text();
+        assert!(out.contains("lumen_token_breakdown_total"));
+        assert!(out.contains(r#"kind="cached""#));
+        assert!(out.contains(r#"model="gpt-5""#));
+        assert!(out.contains("64"));
+    }
+
+    #[test]
+    fn zero_breakdown_count_creates_no_series() {
+        let (metrics, tokens) = setup(&[]);
+        tokens.add_token_breakdown(
+            &BreakdownSample {
+                capability: "chat",
+                model: "m",
+                provider: "p",
+                kind: BreakdownKind::Reasoning,
+            },
+            &[],
+            0,
+        );
+        assert!(!metrics
+            .encode_text()
+            .contains("lumen_token_breakdown_total{"));
     }
 
     #[test]
