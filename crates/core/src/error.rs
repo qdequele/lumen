@@ -228,6 +228,15 @@ pub enum GatewayError {
     #[error("payload too large (limit {limit} bytes)")]
     PayloadTooLarge { limit: usize },
 
+    /// No route matched the request method and path (issue #88). Returned by
+    /// the router fallback for trailing-slash, extra-segment and other
+    /// near-miss paths, so an unmatched request carries the same LM envelope as
+    /// every other rejection instead of a bare, empty-body 404. The message is
+    /// deliberately static: it names no path, so it neither echoes client input
+    /// nor discloses which routes exist.
+    #[error("no route matches the request method and path")]
+    RouteNotFound,
+
     // ---- Routing errors (LM-2xxx) -------------------------------------------
     /// No model matched the requested id.
     #[error("model '{0}' not found")]
@@ -381,6 +390,7 @@ impl GatewayError {
         match self {
             GatewayError::InvalidRequest(_) => "LM-1001",
             GatewayError::PayloadTooLarge { .. } => "LM-1002",
+            GatewayError::RouteNotFound => "LM-1003",
             GatewayError::ModelNotFound(_) => "LM-2001",
             GatewayError::UnsupportedCapability { .. } => "LM-2002",
             GatewayError::ImageInputNotSupported { .. } => "LM-2003",
@@ -429,7 +439,7 @@ impl GatewayError {
             | GatewayError::ImageUrlRejected => 400,
             GatewayError::Unauthorized => 401,
             GatewayError::BudgetExceeded => 402,
-            GatewayError::ModelNotFound(_) => 404,
+            GatewayError::ModelNotFound(_) | GatewayError::RouteNotFound => 404,
             GatewayError::PayloadTooLarge { .. } => 413,
             GatewayError::QuotaExceeded { .. } | GatewayError::UpstreamRateLimited { .. } => 429,
             // Nonstandard, but the conventional "client closed request" status
@@ -455,6 +465,7 @@ impl GatewayError {
     pub const fn error_type(&self) -> ErrorType {
         match self {
             GatewayError::InvalidRequest(_)
+            | GatewayError::RouteNotFound
             | GatewayError::ModelNotFound(_)
             | GatewayError::UnsupportedCapability { .. }
             | GatewayError::ImageInputNotSupported { .. }
@@ -642,6 +653,7 @@ mod tests {
     fn error_codes_are_stable() {
         assert_eq!(GatewayError::InvalidRequest("x".into()).code(), "LM-1001");
         assert_eq!(GatewayError::PayloadTooLarge { limit: 1 }.code(), "LM-1002");
+        assert_eq!(GatewayError::RouteNotFound.code(), "LM-1003");
         // Routing errors (pinned by the M2 spec).
         assert_eq!(GatewayError::ModelNotFound("x".into()).code(), "LM-2001");
         assert_eq!(
@@ -897,6 +909,17 @@ mod tests {
         assert!(
             matches!(err, GatewayError::InvalidRequest(ref m) if m.contains("pre-tokenized") && m.contains("cohere"))
         );
+    }
+
+    #[test]
+    fn route_not_found_is_a_404_invalid_request() {
+        let err = GatewayError::RouteNotFound;
+        assert_eq!(err.code(), "LM-1003");
+        assert_eq!(err.http_status(), 404);
+        assert_eq!(err.error_type(), ErrorType::InvalidRequest);
+        // A route miss carries no `Retry-After` and is not a server error.
+        assert_eq!(err.retry_after(), None);
+        assert!(!(500..600).contains(&err.http_status()));
     }
 
     #[test]

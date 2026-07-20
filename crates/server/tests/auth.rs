@@ -402,6 +402,42 @@ async fn model_retrieve_sits_behind_virtual_key_auth() {
     assert_eq!(body["object"], "model");
 }
 
+#[tokio::test]
+async fn unmatched_route_falls_back_outside_auth_with_lm_1003() {
+    // Issue #88: the route-miss fallback sits OUTSIDE the virtual-key auth
+    // layer. An unmatched path answers with the LM-1003 route-not-found
+    // envelope even when auth is enabled and no key is presented - a 404
+    // envelope leaks no more than the bare 404 it replaces. This is distinct
+    // from a MATCHED /v1 route without a key, which is 401 LM-4004 (that path
+    // exists, so its existence is not the secret; its auth state is).
+    let upstream = MockServer::start().await;
+    let h = spawn_auth(full_registry(&upstream.uri()), &[]).await;
+
+    // A wholly unknown path under /v1, no Authorization header.
+    let resp = h
+        .client
+        .get(format!("{}/v1/does/not/exist", h.base))
+        .send()
+        .await
+        .expect("send");
+    assert_eq!(resp.status(), 404);
+    let body: Value = resp.json().await.expect("json");
+    assert_eq!(body["error"]["code"], "LM-1003");
+    assert_eq!(body["error"]["type"], "invalid_request");
+
+    // A trailing-slash near-miss of an operational route, likewise 404, never
+    // 401.
+    let resp = h
+        .client
+        .get(format!("{}/health/", h.base))
+        .send()
+        .await
+        .expect("send");
+    assert_eq!(resp.status(), 404);
+    let body: Value = resp.json().await.expect("json");
+    assert_eq!(body["error"]["code"], "LM-1003");
+}
+
 // ---- Hard budgets (criteria 1 & 2) -----------------------------------------
 
 #[tokio::test]
