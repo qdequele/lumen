@@ -97,6 +97,15 @@ pub struct UsageRecord {
     pub tokens_out: i64,
     /// Rerank search units, when the provider bills in them.
     pub search_units: Option<i64>,
+    /// Prompt tokens served from cache (cache read), when the upstream reported
+    /// the breakdown (issue #99). `None`, never 0, when absent (ADR 003).
+    pub cached_tokens: Option<i64>,
+    /// Reasoning tokens billed within the completion, when reported. `None`
+    /// when absent.
+    pub reasoning_tokens: Option<i64>,
+    /// Prompt tokens written to cache (Anthropic cache-creation), when
+    /// reported. `None` when absent.
+    pub cache_write_tokens: Option<i64>,
     /// Number of media items (images, …) in the request (M9). 0 for text-only.
     pub media_count: i64,
     /// Total decoded media bytes in the request (M9). 0 for text-only.
@@ -501,8 +510,8 @@ impl KeyStore {
         for rec in batch {
             sqlx::query(
                 "INSERT INTO usage_log \
-                 (key_id, model, model_used, provider, capability, tokens_in, tokens_out, search_units, media_count, media_bytes, estimated, cost, latency_ms, status, metadata, ts) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 (key_id, model, model_used, provider, capability, tokens_in, tokens_out, search_units, cached_tokens, reasoning_tokens, cache_write_tokens, media_count, media_bytes, estimated, cost, latency_ms, status, metadata, ts) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(&rec.key_id)
             .bind(&rec.model)
@@ -512,6 +521,9 @@ impl KeyStore {
             .bind(rec.tokens_in)
             .bind(rec.tokens_out)
             .bind(rec.search_units)
+            .bind(rec.cached_tokens)
+            .bind(rec.reasoning_tokens)
+            .bind(rec.cache_write_tokens)
             .bind(rec.media_count)
             .bind(rec.media_bytes)
             .bind(rec.estimated)
@@ -687,7 +699,7 @@ impl KeyStore {
                     "SELECT quote(id)||'|'||quote(key_hash)||'|'||quote(name)||'|'||quote(budget_max)||'|'||quote(budget_spent)||'|'||quote(rpm_limit)||'|'||quote(tpm_limit)||'|'||quote(expires_at)||'|'||quote(disabled)||'|'||quote(created_at)||'|'||quote(deleted_at) AS r FROM virtual_keys"
                 }
                 _ => {
-                    "SELECT quote(id)||'|'||quote(key_id)||'|'||quote(model)||'|'||quote(model_used)||'|'||quote(capability)||'|'||quote(tokens_in)||'|'||quote(tokens_out)||'|'||quote(search_units)||'|'||quote(estimated)||'|'||quote(cost)||'|'||quote(latency_ms)||'|'||quote(status)||'|'||coalesce(metadata,'')||'|'||quote(ts) AS r FROM usage_log"
+                    "SELECT quote(id)||'|'||quote(key_id)||'|'||quote(model)||'|'||quote(model_used)||'|'||quote(capability)||'|'||quote(tokens_in)||'|'||quote(tokens_out)||'|'||quote(search_units)||'|'||quote(cached_tokens)||'|'||quote(reasoning_tokens)||'|'||quote(cache_write_tokens)||'|'||quote(estimated)||'|'||quote(cost)||'|'||quote(latency_ms)||'|'||quote(status)||'|'||coalesce(metadata,'')||'|'||quote(ts) AS r FROM usage_log"
                 }
             };
             for row in sqlx::query(sql).fetch_all(&self.pool).await? {
