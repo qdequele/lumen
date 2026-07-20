@@ -178,7 +178,19 @@ impl EmbedItem {
     /// This item's text as a single string (one embedding per item). A `Parts`
     /// item joins its text fragments; a single text fragment borrows, more than
     /// one allocates, and an item with no text fragment yields an empty string.
-    fn joined_text(&self) -> Cow<'_, str> {
+    ///
+    /// Fragments are joined with a single newline, NOT concatenated directly:
+    /// distinct text chunks are separate pieces of content, and an empty
+    /// separator would fuse the trailing and leading tokens across a boundary
+    /// (`"brown" + "fox"` becoming `"brownfox"`), degrading the embedding. A
+    /// newline is the conventional separator for distinct text chunks and
+    /// cannot merge adjacent tokens.
+    ///
+    /// Public so every text-only provider (google, vertex, tei, jina) shares
+    /// one join, rather than each re-deriving it (and risking the empty-concat
+    /// bug independently).
+    #[must_use]
+    pub fn joined_text(&self) -> Cow<'_, str> {
         match self {
             EmbedItem::Text(s) => Cow::Borrowed(s.as_str()),
             EmbedItem::Parts(parts) => {
@@ -187,10 +199,14 @@ impl EmbedItem {
                     (None, _) => Cow::Borrowed(""),
                     (Some(first), None) => Cow::Borrowed(first),
                     (Some(first), Some(second)) => {
-                        let mut joined = String::with_capacity(first.len() + second.len());
+                        // +2 for the newline separators between the first three
+                        // fragments; further fragments grow it as needed.
+                        let mut joined = String::with_capacity(first.len() + second.len() + 2);
                         joined.push_str(first);
+                        joined.push('\n');
                         joined.push_str(second);
                         for rest in texts {
+                            joined.push('\n');
                             joined.push_str(rest);
                         }
                         Cow::Owned(joined)
@@ -431,7 +447,41 @@ mod tests {
         let item_texts = input.item_texts();
         assert_eq!(item_texts.len(), 2);
         assert_eq!(item_texts[0], "solo");
-        assert_eq!(item_texts[1], "foobar");
+        // Fragments join with a newline, never an empty separator (which would
+        // fuse tokens across the boundary).
+        assert_eq!(item_texts[1], "foo\nbar");
+    }
+
+    #[test]
+    fn multi_text_parts_join_with_newline_not_empty_separator() {
+        // Two distinct text chunks must not fuse at their boundary
+        // ("brown" + "fox" -> "brownfox"); a newline keeps them apart.
+        let joined = EmbedInput::Multi(vec![EmbedItem::Parts(vec![
+            ContentPart {
+                kind: "text".to_owned(),
+                text: Some("The quick brown".to_owned()),
+                image_url: None,
+                extra: Map::new(),
+            },
+            ContentPart {
+                kind: "text".to_owned(),
+                text: Some("fox jumps".to_owned()),
+                image_url: None,
+                extra: Map::new(),
+            },
+        ])]);
+        let texts = joined.item_texts();
+        assert_eq!(texts.len(), 1);
+        assert_eq!(texts[0], "The quick brown\nfox jumps");
+
+        // A single text part is unchanged (a genuine borrow, no separator).
+        let single = EmbedInput::Multi(vec![EmbedItem::Parts(vec![ContentPart {
+            kind: "text".to_owned(),
+            text: Some("The quick brown".to_owned()),
+            image_url: None,
+            extra: Map::new(),
+        }])]);
+        assert_eq!(single.item_texts()[0], "The quick brown");
     }
 
     #[test]

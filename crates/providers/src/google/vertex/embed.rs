@@ -236,7 +236,8 @@ mod tests {
         let built = translate_request(&req);
         assert_eq!(built.instances.len(), 1);
         let body = serde_json::to_value(built).unwrap();
-        assert_eq!(body["instances"][0]["content"], "foobar");
+        // Two text fragments join with a newline (never fused into "foobar").
+        assert_eq!(body["instances"][0]["content"], "foo\nbar");
     }
 
     #[test]

@@ -149,8 +149,10 @@ All notable changes to LUMEN are documented here. The format is based on
 - **Embed `Multi` items over-fanned into inner requests (issue #90).** A
   `Multi` content-parts item is now the unit of embedding everywhere: one item
   produces exactly one embedding / inner request. `EmbedInput::item_texts()`
-  yields one string per item (a `Parts` item's text fragments joined), and the
-  text-only providers (google, vertex, tei) build one inner request per item
+  yields one string per item (a `Parts` item's text fragments joined with a
+  newline, never an empty concat that would fuse tokens across a boundary; jina
+  shares the same `EmbedItem::joined_text` join), and the text-only providers
+  (google, vertex, tei, jina) build one inner request per item
   instead of one per text fragment. A multi-part batch therefore never exceeds
   a provider's `max_batch_size` in inner requests (previously a 100-item batch
   of two-part items sent 200 inner requests to Gemini's 100-per-call ceiling,

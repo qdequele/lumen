@@ -1351,27 +1351,39 @@ async fn google_embed_hits_batch_embed_contents_with_expected_body() {
 /// 100 fragments in a single call).
 #[tokio::test]
 async fn google_multipart_batch_never_exceeds_max_batch_in_inner_requests() {
+    // A count-only responder: one embedding per `requests[]` entry, so the
+    // per-sub-batch length check passes regardless of the (newline-joined,
+    // non-numeric) text content.
+    struct GoogleCount;
+    impl Respond for GoogleCount {
+        fn respond(&self, request: &Request) -> ResponseTemplate {
+            let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
+            let n = body["requests"].as_array().map_or(0, Vec::len);
+            let embeddings: Vec<Value> = (0..n).map(|_| json!({ "values": [0.0] })).collect();
+            ResponseTemplate::new(200).set_body_json(json!({ "embeddings": embeddings }))
+        }
+    }
     let mock = MockServer::start().await;
-    GoogleEmbedFixture.mount_echo(&mock).await;
+    Mock::given(method("POST"))
+        .respond_with(GoogleCount)
+        .mount(&mock)
+        .await;
     let provider = GoogleEmbedFixture.build(mock.uri());
     assert_eq!(provider.max_batch_size(), 100);
 
-    // 150 items, each carrying two text parts.
+    // 150 items, each carrying two distinct text fragments.
     let items: Vec<EmbedItem> = (0..150)
         .map(|i| {
             EmbedItem::Parts(vec![
                 ContentPart {
                     kind: "text".to_owned(),
-                    text: Some(i.to_string()),
+                    text: Some(format!("item {i} part one")),
                     image_url: None,
                     extra: serde_json::Map::new(),
                 },
-                // A second numeric text part so the join stays parseable by the
-                // echo responder (`"{i}" + "0"`); the point is that a two-PART
-                // item is still ONE inner request.
                 ContentPart {
                     kind: "text".to_owned(),
-                    text: Some("0".to_owned()),
+                    text: Some("part two".to_owned()),
                     image_url: None,
                     extra: serde_json::Map::new(),
                 },
