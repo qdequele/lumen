@@ -159,8 +159,9 @@ capabilities = ["chat"]
 - **Translation**: OpenAI ⇄ Anthropic is bidirectional, including tools and
   streaming events, so clients keep using the OpenAI wire format.
   `parallel_tool_calls: false` maps to `tool_choice.disable_parallel_tool_use`;
-  `response_format`, `seed` and `logprobs` have no Messages API equivalent -
-  see [chat extras](#openai-chat-extras-on-translated-providers) and the
+  `response_format`, `seed`, `logprobs`, `frequency_penalty` and
+  `presence_penalty` have no Messages API equivalent - see
+  [chat extras](#openai-chat-extras-on-translated-providers) and the
   `strict` flag.
 - **base_url**: optional override.
 
@@ -183,8 +184,9 @@ capabilities = ["chat"]
   `x-goog-api-key` header, never the URL.
 - **Translation**: OpenAI ⇄ Gemini, including streaming (`streamGenerateContent`).
   `response_format` JSON mode maps to `generationConfig.responseMimeType` /
-  `responseSchema` and `seed` to `generationConfig.seed`; `logprobs` and
-  `parallel_tool_calls` have no mapping - see
+  `responseSchema`, `seed` to `generationConfig.seed`, and `frequency_penalty`
+  / `presence_penalty` to `generationConfig.frequencyPenalty` /
+  `presencePenalty`; `logprobs` and `parallel_tool_calls` have no mapping - see
   [chat extras](#openai-chat-extras-on-translated-providers).
 - **Embeddings**: served through `models/{model}:batchEmbedContents`
   (`gemini-embedding-001`, `text-embedding-004`, ...). One inner request per
@@ -299,9 +301,9 @@ capabilities = ["embed"]
   streaming. Streaming arrives as AWS event-stream binary frames, decoded and
   translated to OpenAI chunks. Usage (`inputTokens` / `outputTokens`) is mapped
   per ADR 003. Converse has no equivalent for `response_format`, `seed`,
-  `logprobs` or `parallel_tool_calls` - see
-  [chat extras](#openai-chat-extras-on-translated-providers) and the `strict`
-  flag.
+  `logprobs`, `parallel_tool_calls`, `frequency_penalty` or `presence_penalty`
+  - see [chat extras](#openai-chat-extras-on-translated-providers) and the
+  `strict` flag.
 - **Images**: only inline `data:` URIs are supported (Converse takes raw image
   bytes); a remote image URL is rejected (`LM-2004`) since Bedrock cannot fetch
   one.
@@ -330,8 +332,9 @@ modalities = ["text", "image"]
   `system` hoist like Anthropic; `tool_calls` are already OpenAI-shaped), so
   translation is closer to identity than Anthropic's. `tool_choice` collapses
   to Cohere's `REQUIRED`/`NONE` (forcing one specific named tool has no v2
-  equivalent and falls back to `auto`). `response_format` and `seed` map onto
-  Cohere's native fields; `logprobs` and `parallel_tool_calls` do not - see
+  equivalent and falls back to `auto`). `response_format`, `seed`,
+  `frequency_penalty` and `presence_penalty` map onto Cohere's native fields;
+  `logprobs` and `parallel_tool_calls` do not - see
   [chat extras](#openai-chat-extras-on-translated-providers). Usage prefers
   `usage.tokens` (actual counts) over `usage.billed_units` (what's charged); a
   response reporting neither leaves the gateway's local estimator to fill in
@@ -721,11 +724,11 @@ capabilities = ["chat", "embed"]
 ## OpenAI chat extras on translated providers
 
 OpenAI-compatible kinds forward every unmodeled request field verbatim, so
-`response_format`, `seed`, `logprobs`, `top_logprobs`, `logit_bias` and
-`parallel_tool_calls` simply work there. The translated chat kinds rebuild
-the upstream request field by field, so each of these is either **mapped**
-onto a native equivalent or explicitly **unsupported** (issue #72) - never
-silently lost:
+`response_format`, `seed`, `logprobs`, `top_logprobs`, `logit_bias`,
+`parallel_tool_calls`, `frequency_penalty` and `presence_penalty` simply work
+there. The translated chat kinds rebuild the upstream request field by field,
+so each of these is either **mapped** onto a native equivalent or explicitly
+**unsupported** (issues #72, #91) - never silently lost:
 
 | Field | `anthropic` | `google` / `vertex_ai` | `bedrock` | `cohere` |
 |-----------------------|-------------|------------------------|-----------|----------|
@@ -735,6 +738,8 @@ silently lost:
 | `top_logprobs` | unsupported | unsupported | unsupported | unsupported³ |
 | `logit_bias` | unsupported | unsupported | unsupported | unsupported |
 | `parallel_tool_calls` | mapped⁴ | unsupported | unsupported | unsupported |
+| `frequency_penalty` | unsupported | mapped (`generationConfig.frequencyPenalty`) | unsupported | mapped |
+| `presence_penalty` | unsupported | mapped (`generationConfig.presencePenalty`) | unsupported | mapped |
 
 ¹ `{"type": "json_object"}` becomes `generationConfig.responseMimeType:
 "application/json"`; `{"type": "json_schema"}` additionally carries

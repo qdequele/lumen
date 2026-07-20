@@ -36,9 +36,11 @@
 //!
 //! `response_format` and `seed` map natively (issue #72): Cohere v2 supports
 //! JSON mode (`{"type": "json_object", "json_schema"?: <schema>}` - OpenAI's
-//! `json_schema` type collapses onto it) and a sampling seed. `logprobs` and
-//! `parallel_tool_calls` have no translated equivalent and are handled by the
-//! strict/lenient pre-flight in the provider (`super`).
+//! `json_schema` type collapses onto it) and a sampling seed.
+//! `frequency_penalty` and `presence_penalty` pass through to Cohere v2's own
+//! fields (issue #91). `logprobs` and `parallel_tool_calls` have no translated
+//! equivalent and are handled by the strict/lenient pre-flight in the provider
+//! (`super`).
 
 use lumen_core::{ChatChoice, ChatMessage, ChatRequest, ChatResponse, MessageContent, Usage};
 use serde::{Deserialize, Serialize};
@@ -71,6 +73,12 @@ pub(super) struct CohereChatRequest {
     /// integer passes through verbatim.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) seed: Option<Value>,
+    /// Cohere v2 accepts `frequency_penalty` / `presence_penalty` natively
+    /// (issue #91); a numeric client value passes through verbatim.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) frequency_penalty: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) presence_penalty: Option<Value>,
     /// Only serialized on the streaming path.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub(super) stream: bool,
@@ -293,6 +301,17 @@ pub(super) fn translate_request(req: &ChatRequest, stream: bool) -> CohereChatRe
         // guessed (a float would forward here while Gemini drops it, and a
         // negative i64 would pass `is_i64()` but Cohere would reject it).
         seed: req.extra.get("seed").filter(|v| v.is_u64()).cloned(),
+        // A non-numeric penalty is invalid OpenAI input; dropped, not guessed.
+        frequency_penalty: req
+            .extra
+            .get("frequency_penalty")
+            .filter(|v| v.is_number())
+            .cloned(),
+        presence_penalty: req
+            .extra
+            .get("presence_penalty")
+            .filter(|v| v.is_number())
+            .cloned(),
         stream,
     }
 }
@@ -826,6 +845,26 @@ mod tests {
         req.extra.insert("seed".to_owned(), json!(-1));
         let out = serde_json::to_value(translate_request(&req, false)).unwrap();
         assert!(out.get("seed").is_none());
+    }
+
+    /// Issue #91: `frequency_penalty` / `presence_penalty` pass through to
+    /// Cohere v2's own fields; a non-numeric value is dropped, not guessed.
+    #[test]
+    fn frequency_and_presence_penalty_pass_through_natively() {
+        let mut req = base_request(vec![msg("user", "hi")]);
+        req.extra.insert("frequency_penalty".to_owned(), json!(0.5));
+        req.extra.insert("presence_penalty".to_owned(), json!(0.25));
+        let out = serde_json::to_value(translate_request(&req, false)).unwrap();
+        assert_eq!(out["frequency_penalty"], 0.5);
+        assert_eq!(out["presence_penalty"], 0.25);
+
+        // A non-numeric penalty is invalid OpenAI input: dropped, not guessed.
+        req.extra
+            .insert("frequency_penalty".to_owned(), json!("nope"));
+        req.extra.remove("presence_penalty");
+        let out = serde_json::to_value(translate_request(&req, false)).unwrap();
+        assert!(out.get("frequency_penalty").is_none());
+        assert!(out.get("presence_penalty").is_none());
     }
 
     #[test]

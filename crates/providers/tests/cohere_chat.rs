@@ -205,6 +205,29 @@ async fn response_format_and_seed_reach_the_cohere_wire() {
     assert_eq!(sent["seed"], 42);
 }
 
+/// Issue #91: `frequency_penalty` / `presence_penalty` pass through to Cohere
+/// v2's own fields instead of being silently dropped - proven on the wire.
+#[tokio::test]
+async fn frequency_and_presence_penalty_reach_the_cohere_wire() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v2/chat"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(nominal_body()))
+        .mount(&mock)
+        .await;
+
+    let p = provider(mock.uri());
+    let mut req = request("command-r-plus", "hello", false);
+    req.extra.insert("frequency_penalty".to_owned(), json!(0.5));
+    req.extra.insert("presence_penalty".to_owned(), json!(0.25));
+    p.chat(req, CancellationToken::new()).await.unwrap();
+
+    let sent: Value =
+        serde_json::from_slice(&mock.received_requests().await.unwrap()[0].body).unwrap();
+    assert_eq!(sent["frequency_penalty"], 0.5);
+    assert_eq!(sent["presence_penalty"], 0.25);
+}
+
 /// Issue #72: strict mode turns fields the v2 translation cannot honor into
 /// an honest pre-flight rejection - the mock records ZERO upstream requests.
 #[tokio::test]

@@ -50,8 +50,8 @@ const MAX_BATCH_SIZE: usize = 96;
 /// to OpenAI's (`top_logprobs` rides the same response shape), and
 /// `logit_bias` / `parallel_tool_calls` have no v2 equivalent. Rejected
 /// (strict) or dropped with a trace (lenient) before any upstream call.
-/// `response_format` and `seed` are NOT here: they map natively in
-/// [`chat::translate_request`](self::chat).
+/// `response_format`, `seed`, `frequency_penalty` and `presence_penalty` are
+/// NOT here: they map natively in [`chat::translate_request`](self::chat).
 const UNSUPPORTED_CHAT_FIELDS: &[&str] = &[
     "logprobs",
     "top_logprobs",
