@@ -165,6 +165,8 @@ impl SseTranslator for GoogleTranslator {
                 completion_tokens: u.candidates,
                 total_tokens: u.total,
                 estimated: None,
+                prompt_tokens_details: None,
+                completion_tokens_details: None,
             });
             items.push(StreamItem::Chunk(self.chunk(
                 ChatDelta::default(),

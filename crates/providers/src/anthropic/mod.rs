@@ -179,12 +179,38 @@ struct AnthropicContentBlock {
     input: Option<serde_json::Value>,
 }
 
+// Field names mirror Anthropic's `usage` JSON keys (serde-bound), so the
+// shared `_tokens` postfix is intentional, not a naming smell.
+#[allow(clippy::struct_field_names)]
 #[derive(Default, Deserialize)]
 struct AnthropicUsage {
     #[serde(default)]
     input_tokens: u32,
     #[serde(default)]
     output_tokens: u32,
+    /// Prompt tokens written to the cache on this request (cache *write*).
+    /// Absent unless the request used prompt caching; `None`, never zero, so
+    /// the breakdown is only surfaced when the upstream reported it (issue #99).
+    #[serde(default)]
+    cache_creation_input_tokens: Option<u32>,
+    /// Prompt tokens served from the cache (cache *read*).
+    #[serde(default)]
+    cache_read_input_tokens: Option<u32>,
+}
+
+/// Build the OpenAI-compatible prompt-token breakdown from Anthropic's cache
+/// counts, mapping `cache_read_input_tokens` to `cached_tokens` (same read/hit
+/// semantics) and keeping `cache_creation_input_tokens` in the distinct
+/// `cache_creation_tokens` slot (a write, with no OpenAI equivalent). Returns
+/// `None` when neither is reported, so absence stays `None` (ADR 003).
+fn anthropic_prompt_details(usage: &AnthropicUsage) -> Option<lumen_core::PromptTokensDetails> {
+    if usage.cache_read_input_tokens.is_none() && usage.cache_creation_input_tokens.is_none() {
+        return None;
+    }
+    Some(lumen_core::PromptTokensDetails {
+        cached_tokens: usage.cache_read_input_tokens,
+        cache_creation_tokens: usage.cache_creation_input_tokens,
+    })
 }
 
 /// Translate an Anthropic `stop_reason` to an OpenAI `finish_reason`.
@@ -480,6 +506,9 @@ fn translate_response(resp: AnthropicResponse, requested_model: &str) -> ChatRes
             .input_tokens
             .saturating_add(resp.usage.output_tokens),
         estimated: None,
+        prompt_tokens_details: anthropic_prompt_details(&resp.usage),
+        // Anthropic does not report a reasoning-token split.
+        completion_tokens_details: None,
     };
 
     ChatResponse {
@@ -695,6 +724,7 @@ mod tests {
             usage: AnthropicUsage {
                 input_tokens: 10,
                 output_tokens: 5,
+                ..Default::default()
             },
         };
         let out = translate_response(resp, "claude-x");
@@ -712,6 +742,64 @@ mod tests {
         assert_eq!(usage.prompt_tokens, 10);
         assert_eq!(usage.completion_tokens, 5);
         assert_eq!(usage.total_tokens, 15);
+        // No cache fields upstream: the breakdown stays absent (issue #99).
+        assert!(usage.prompt_tokens_details.is_none());
+        assert_eq!(usage.cached_tokens(), None);
+        assert_eq!(usage.cache_write_tokens(), None);
+    }
+
+    /// Issue #99: Anthropic's `cache_read_input_tokens` maps to the
+    /// OpenAI-compatible `cached_tokens`, and `cache_creation_input_tokens`
+    /// stays in the distinct `cache_creation_tokens` (write) slot.
+    #[test]
+    fn response_surfaces_anthropic_cache_token_breakdown() {
+        let resp = AnthropicResponse {
+            id: "msg_c".to_owned(),
+            content: vec![text_block("hi")],
+            model: "claude-x".to_owned(),
+            stop_reason: Some("end_turn".to_owned()),
+            usage: AnthropicUsage {
+                input_tokens: 12,
+                output_tokens: 3,
+                cache_creation_input_tokens: Some(20),
+                cache_read_input_tokens: Some(80),
+            },
+        };
+        let out = translate_response(resp, "claude-x");
+        let usage = out.usage.unwrap();
+        assert_eq!(usage.cached_tokens(), Some(80));
+        assert_eq!(usage.cache_write_tokens(), Some(20));
+        // Serializes in the OpenAI-compatible nested shape.
+        let body = serde_json::to_value(usage).unwrap();
+        assert_eq!(body["prompt_tokens_details"]["cached_tokens"], 80);
+        assert_eq!(body["prompt_tokens_details"]["cache_creation_tokens"], 20);
+    }
+
+    /// A response reporting only a cache *read* (no write) surfaces just
+    /// `cached_tokens`, leaving the write slot absent.
+    #[test]
+    fn response_with_only_cache_read_omits_the_write_slot() {
+        let resp = AnthropicResponse {
+            id: "msg_r".to_owned(),
+            content: vec![text_block("hi")],
+            model: "claude-x".to_owned(),
+            stop_reason: Some("end_turn".to_owned()),
+            usage: AnthropicUsage {
+                input_tokens: 5,
+                output_tokens: 1,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: Some(64),
+            },
+        };
+        let out = translate_response(resp, "claude-x");
+        let usage = out.usage.unwrap();
+        assert_eq!(usage.cached_tokens(), Some(64));
+        assert_eq!(usage.cache_write_tokens(), None);
+        let body = serde_json::to_value(usage).unwrap();
+        assert_eq!(body["prompt_tokens_details"]["cached_tokens"], 64);
+        assert!(body["prompt_tokens_details"]
+            .get("cache_creation_tokens")
+            .is_none());
     }
 
     /// Anthropic responses carry no creation time; the gateway must stamp a
@@ -726,6 +814,7 @@ mod tests {
             usage: AnthropicUsage {
                 input_tokens: 1,
                 output_tokens: 1,
+                ..Default::default()
             },
         };
         let out = translate_response(resp, "claude-x");
@@ -904,6 +993,7 @@ mod tests {
             usage: AnthropicUsage {
                 input_tokens: 4,
                 output_tokens: 2,
+                ..Default::default()
             },
         };
         let out = translate_response(resp, "claude-x");
