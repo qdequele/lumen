@@ -135,6 +135,27 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ### Fixed
 
+- **Embed batch path: short upstream responses and partial usage (issue #89).**
+  The shared batching path (`crates/providers/src/batch.rs`) now verifies that
+  the upstream vector count matches the input count on BOTH the single-call fast
+  path and each reassembled sub-batch: a short (or long) response fails with a
+  502-class `ProviderError::Translation` (LM-3002, "embedding count N != input
+  count M") instead of returning fewer, correctly-indexed embeddings while
+  usage settles for the full input. Reassembly also sums upstream usage ONLY
+  when every sub-batch reported it; if any chunk reported none (reachable via
+  Gemini's optional `usageMetadata`), the whole sum is dropped so the server
+  falls back to the flagged local estimate rather than treating a partial sum
+  as exact (ADR 003).
+- **Embed `Multi` items over-fanned into inner requests (issue #90).** A
+  `Multi` content-parts item is now the unit of embedding everywhere: one item
+  produces exactly one embedding / inner request. `EmbedInput::item_texts()`
+  yields one string per item (a `Parts` item's text fragments joined), and the
+  text-only providers (google, vertex, tei) build one inner request per item
+  instead of one per text fragment. A multi-part batch therefore never exceeds
+  a provider's `max_batch_size` in inner requests (previously a 100-item batch
+  of two-part items sent 200 inner requests to Gemini's 100-per-call ceiling,
+  and a single multi-part item sent more than one instance to Vertex's
+  single-instance `gemini-embedding-001`).
 - **Cohere chat silently dropped image parts (issue #73).** The v2 chat
   translator flattened every message to plain text via `MessageContent::text()`,
   so a correctly-declared Command-A-Vision model (`modalities = ["text",

@@ -1344,6 +1344,64 @@ async fn google_embed_hits_batch_embed_contents_with_expected_body() {
     assert!(!requests[0].url.as_str().contains("goog-test-key"));
 }
 
+/// Issue #90: a batch of MULTI-PART items must issue one inner request per
+/// ITEM, never one per text fragment, so no `batchEmbedContents` call ever
+/// exceeds Gemini's 100-inner-request ceiling. 150 two-part items = 300 text
+/// fragments but only 150 items, so the split is 100 + 50 items (never 200 +
+/// 100 fragments in a single call).
+#[tokio::test]
+async fn google_multipart_batch_never_exceeds_max_batch_in_inner_requests() {
+    let mock = MockServer::start().await;
+    GoogleEmbedFixture.mount_echo(&mock).await;
+    let provider = GoogleEmbedFixture.build(mock.uri());
+    assert_eq!(provider.max_batch_size(), 100);
+
+    // 150 items, each carrying two text parts.
+    let items: Vec<EmbedItem> = (0..150)
+        .map(|i| {
+            EmbedItem::Parts(vec![
+                ContentPart {
+                    kind: "text".to_owned(),
+                    text: Some(i.to_string()),
+                    image_url: None,
+                    extra: serde_json::Map::new(),
+                },
+                // A second numeric text part so the join stays parseable by the
+                // echo responder (`"{i}" + "0"`); the point is that a two-PART
+                // item is still ONE inner request.
+                ContentPart {
+                    kind: "text".to_owned(),
+                    text: Some("0".to_owned()),
+                    image_url: None,
+                    extra: serde_json::Map::new(),
+                },
+            ])
+        })
+        .collect();
+    let mut req = batch_request(Vec::new());
+    req.model = "gemini-embedding-001".to_owned();
+    req.input = EmbedInput::Multi(items);
+
+    let resp = batch::embed_batched(&*provider, req, &CancellationToken::new(), 4)
+        .await
+        .unwrap();
+
+    // One embedding per item (150), never per fragment (would be 300).
+    assert_eq!(resp.data.len(), 150);
+
+    // Every upstream call carried at most 100 inner requests.
+    let received = mock.received_requests().await.unwrap();
+    assert_eq!(received.len(), 2, "expected 100 + 50 split");
+    for r in &received {
+        let body: Value = serde_json::from_slice(&r.body).unwrap();
+        let inner = body["requests"].as_array().map_or(0, Vec::len);
+        assert!(
+            inner <= 100,
+            "a batchEmbedContents call carried {inner} inner requests (> 100)"
+        );
+    }
+}
+
 /// The vertex_ai kind must call the regional, project-scoped `:predict`
 /// endpoint (Vertex does not expose `batchEmbedContents`) with Bearer auth,
 /// `instances[].content` per input, `parameters.outputDimensionality` mapped

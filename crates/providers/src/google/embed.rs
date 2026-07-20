@@ -72,7 +72,7 @@ struct GeminiEmbedContent<'a> {
 
 #[derive(Serialize)]
 struct GeminiEmbedTextPart<'a> {
-    text: &'a str,
+    text: std::borrow::Cow<'a, str>,
 }
 
 #[derive(Deserialize)]
@@ -97,13 +97,17 @@ struct GeminiEmbedUsage {
     prompt_token_count: u32,
 }
 
-/// Build the `batchEmbedContents` body: one inner request per text input.
+/// Build the `batchEmbedContents` body: one inner request per input ITEM (a
+/// `Multi` `Parts` item joins its text fragments), so the inner-request count
+/// equals `input.len()` and stays within Gemini's 100-per-call ceiling after
+/// the gateway's split (issue #90).
 fn translate_request(req: &EmbedRequest) -> GeminiBatchEmbedRequest<'_> {
     let model = format!("models/{}", req.model);
     GeminiBatchEmbedRequest {
         requests: req
             .input
-            .iter()
+            .item_texts()
+            .into_iter()
             .map(|text| GeminiEmbedContentRequest {
                 model: model.clone(),
                 content: GeminiEmbedContent {
@@ -221,6 +225,38 @@ mod tests {
                 ]
             })
         );
+    }
+
+    #[test]
+    fn multi_part_item_yields_one_inner_request_per_item() {
+        // A Multi with a two-text-part item plus a bare-text item: two ITEMS,
+        // so two inner requests (NOT three fragment-level requests). Keeps the
+        // inner-request count at input.len(), within the 100-per-call ceiling
+        // after splitting (issue #90).
+        use lumen_core::{ContentPart, EmbedItem};
+        let input = EmbedInput::Multi(vec![
+            EmbedItem::Parts(vec![
+                ContentPart {
+                    kind: "text".to_owned(),
+                    text: Some("foo".to_owned()),
+                    image_url: None,
+                    extra: serde_json::Map::new(),
+                },
+                ContentPart {
+                    kind: "text".to_owned(),
+                    text: Some("bar".to_owned()),
+                    image_url: None,
+                    extra: serde_json::Map::new(),
+                },
+            ]),
+            EmbedItem::Text("baz".to_owned()),
+        ]);
+        let req = request(input, None);
+        let built = translate_request(&req);
+        assert_eq!(built.requests.len(), 2);
+        let body = serde_json::to_value(built).unwrap();
+        assert_eq!(body["requests"][0]["content"]["parts"][0]["text"], "foobar");
+        assert_eq!(body["requests"][1]["content"]["parts"][0]["text"], "baz");
     }
 
     #[test]

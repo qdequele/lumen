@@ -66,7 +66,7 @@ impl fmt::Debug for TeiProvider {
 
 #[derive(Serialize)]
 struct TeiEmbedRequest<'a> {
-    inputs: Vec<&'a str>,
+    inputs: Vec<std::borrow::Cow<'a, str>>,
 }
 
 #[async_trait]
@@ -80,8 +80,11 @@ impl EmbeddingProvider for TeiProvider {
         // EMPTY inputs array. Honest 400 before any upstream call (issue #25).
         crate::mapping::reject_pretokenized_input(&self.provider_name, &req.input)?;
         let url = format!("{}/embed", self.base_url);
+        // One entry per item (a `Multi` `Parts` item joins its text fragments),
+        // so the inner-request count equals `input.len()` and never exceeds
+        // `max_batch_size` after the gateway's split (issue #90).
         let body = TeiEmbedRequest {
-            inputs: req.input.iter().collect(),
+            inputs: req.input.item_texts(),
         };
 
         let bytes = post_json(

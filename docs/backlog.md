@@ -110,6 +110,15 @@ milestone.
 - The four hosted rerank providers default `max_batch_size` conservatively
   (Cohere 96, Jina/Voyage/OpenAI-style large, TEI 32). Revisit against real
   provider limits; embeddings batching already exercises these.
+- **Per-model embedding `max_batch_size` override (surfaced by issue #90).**
+  Vertex embeddings hardcode `max_batch_size() = 1` because
+  `gemini-embedding-001` accepts a single instance per `:predict` call, but the
+  other `text-embedding-*` models take up to 250. A single conservative value
+  means a 1000-input request is ~250 sequential rounds at concurrency 4. A
+  config override (or a larger known-safe default for the text-embedding
+  models, keyed by model) would soften this bottleneck. Deferred: it needs
+  per-model config plumbing that the current `EmbeddingProvider::max_batch_size`
+  (provider-wide, model-agnostic) does not carry.
 
 ## Noted while building M4 (slice 1 - non-streaming chat)
 
