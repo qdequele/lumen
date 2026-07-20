@@ -57,8 +57,9 @@ const DEFAULT_BASE_URL: &str = "https://generativelanguage.googleapis.com";
 /// no OpenAI-shaped logprobs (nor `top_logprobs`), no logit biasing, no
 /// parallel-tool-call control. Rejected (strict) or dropped with a trace
 /// (lenient) before any upstream call, by both the Gemini Developer API
-/// provider and Vertex AI. `response_format` and `seed` are NOT here: they
-/// map natively onto `generationConfig` in [`translate_request`].
+/// provider and Vertex AI. `response_format`, `seed`, `frequency_penalty` and
+/// `presence_penalty` are NOT here: they map natively onto `generationConfig`
+/// in [`translate_request`].
 pub(crate) const UNSUPPORTED_CHAT_FIELDS: &[&str] = &[
     "logprobs",
     "top_logprobs",
@@ -312,6 +313,12 @@ struct GeminiGenerationConfig {
     /// OpenAI `seed` passes through natively (issue #72).
     #[serde(skip_serializing_if = "Option::is_none")]
     seed: Option<i64>,
+    /// OpenAI `frequency_penalty` -> Gemini's native field (issue #91).
+    #[serde(rename = "frequencyPenalty", skip_serializing_if = "Option::is_none")]
+    frequency_penalty: Option<f64>,
+    /// OpenAI `presence_penalty` -> Gemini's native field (issue #91).
+    #[serde(rename = "presencePenalty", skip_serializing_if = "Option::is_none")]
+    presence_penalty: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -451,6 +458,15 @@ fn translate_request(
         response_schema,
         // A non-integer seed is invalid OpenAI input anyway; dropped, not guessed.
         seed: req.extra.get("seed").and_then(serde_json::Value::as_i64),
+        // A non-numeric penalty is invalid OpenAI input; dropped, not guessed.
+        frequency_penalty: req
+            .extra
+            .get("frequency_penalty")
+            .and_then(serde_json::Value::as_f64),
+        presence_penalty: req
+            .extra
+            .get("presence_penalty")
+            .and_then(serde_json::Value::as_f64),
     };
 
     Ok(GeminiRequest {
@@ -1461,6 +1477,28 @@ mod tests {
             .insert("response_format".to_owned(), json!({ "type": "surprise" }));
         let body = serde_json::to_value(translate_request(&req, "google").unwrap()).unwrap();
         assert!(body["generationConfig"].get("responseMimeType").is_none());
+    }
+
+    /// Issue #91: `frequency_penalty` / `presence_penalty` map to Gemini's
+    /// native `generationConfig.frequencyPenalty` / `presencePenalty` instead
+    /// of being silently dropped; a non-numeric value is dropped, not guessed.
+    #[test]
+    fn frequency_and_presence_penalty_map_to_generation_config() {
+        let mut req = request(vec![msg("user", "hi")]);
+        req.extra.insert("frequency_penalty".to_owned(), json!(0.5));
+        req.extra
+            .insert("presence_penalty".to_owned(), json!(-0.25));
+        let body = serde_json::to_value(translate_request(&req, "google").unwrap()).unwrap();
+        assert_eq!(body["generationConfig"]["frequencyPenalty"], 0.5);
+        assert_eq!(body["generationConfig"]["presencePenalty"], -0.25);
+
+        // A non-numeric penalty is invalid OpenAI input: dropped, not guessed.
+        let mut req = request(vec![msg("user", "hi")]);
+        req.extra
+            .insert("frequency_penalty".to_owned(), json!("nope"));
+        let body = serde_json::to_value(translate_request(&req, "google").unwrap()).unwrap();
+        assert!(body["generationConfig"].get("frequencyPenalty").is_none());
+        assert!(body["generationConfig"].get("presencePenalty").is_none());
     }
 
     /// Issue #72: strict mode rejects fields Gemini cannot honor with an

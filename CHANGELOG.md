@@ -18,6 +18,17 @@ All notable changes to LUMEN are documented here. The format is based on
   leaks no more than the bare 404 it replaces (it names no path and discloses
   no route), while a matched `/v1` route without a key still returns 401
   `LM-4004`. `/health` latency isolation and `/metrics` are unchanged.
+- **`frequency_penalty` / `presence_penalty` on translated chat providers**
+  (issue #91). Both fields rode `ChatRequest.extra` and were silently dropped
+  (even in strict mode) on the translated kinds. They now map natively onto
+  `generationConfig.frequencyPenalty` / `presencePenalty` for `google` and
+  `vertex_ai`, and pass through to Cohere v2's own `frequency_penalty` /
+  `presence_penalty` fields; a non-numeric value is dropped, not guessed. On
+  `anthropic` and `bedrock` (no Converse/Messages equivalent) they join the
+  unsupported-field lists, so strict mode rejects them with an honest 400
+  (`LM-1001`) before any upstream call and lenient mode drops them with a
+  `debug` trace, consistent with the `response_format` / `seed` handling.
+  Provider matrix in `docs/providers.md` updated.
 - **Virtual key deletion and rotation** (issue #66). `DELETE /admin/keys/{id}`
   soft-deletes a key: the row is tombstoned (`deleted_at` column, migration
   `0005_key_deleted_at.sql`) rather than removed, so `usage_log.key_id`

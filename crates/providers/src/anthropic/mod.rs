@@ -38,18 +38,20 @@ const ANTHROPIC_VERSION: &str = "2023-06-01";
 /// Anthropic requires `max_tokens`; used when the client omits it.
 const DEFAULT_MAX_TOKENS: u32 = 4096;
 
-/// OpenAI chat fields the Messages API has no equivalent for (issue #72):
-/// no JSON mode / structured output, no sampling seed, no logprobs (nor
-/// `top_logprobs`), no logit biasing. Rejected (strict) or dropped with a
-/// trace (lenient) before any upstream call. `parallel_tool_calls` is NOT
-/// here: it maps to `tool_choice.disable_parallel_tool_use` in
-/// [`translate_request`].
+/// OpenAI chat fields the Messages API has no equivalent for (issues #72,
+/// #91): no JSON mode / structured output, no sampling seed, no logprobs (nor
+/// `top_logprobs`), no logit biasing, no frequency/presence penalties.
+/// Rejected (strict) or dropped with a trace (lenient) before any upstream
+/// call. `parallel_tool_calls` is NOT here: it maps to
+/// `tool_choice.disable_parallel_tool_use` in [`translate_request`].
 const UNSUPPORTED_CHAT_FIELDS: &[&str] = &[
     "response_format",
     "seed",
     "logprobs",
     "top_logprobs",
     "logit_bias",
+    "frequency_penalty",
+    "presence_penalty",
 ];
 
 /// An Anthropic chat provider.
@@ -1137,6 +1139,8 @@ mod tests {
             ("logprobs", json!(true)),
             ("top_logprobs", json!(5)),
             ("logit_bias", json!({ "50256": -100 })),
+            ("frequency_penalty", json!(0.5)),
+            ("presence_penalty", json!(0.25)),
         ] {
             let mut extra = serde_json::Map::new();
             extra.insert(field.to_owned(), value);
