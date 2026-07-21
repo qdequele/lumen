@@ -10,12 +10,14 @@ code rules - they are the contract, not suggestions.
 
 ## Ground rules
 
-The four pillars, in priority order, decide every trade-off:
+The five pillars, in priority order, decide every trade-off:
 
 1. **Performance** - < 1 ms added latency p99, zero-copy streaming, ~15 MB RAM idle.
 2. **Sovereignty** - zero telemetry, prompts never logged by default, single binary.
 3. **Robustness** - propagated cancellation, backpressure, DB off the request path.
 4. **Multi-capability** - chat + embeddings + rerank are first-class citizens.
+5. **Token observability** - every request of every capability produces a token
+   count, never a silent zero (ADR 003).
 
 Hard code rules (full list in [`CLAUDE.md`](CLAUDE.md#strict-code-rules)):
 

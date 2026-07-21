@@ -9,7 +9,9 @@ milestone.
 
 - Web admin UI
 - Semantic cache
-- Multimodal (images / audio) support
+- Audio (input/output) support. Image input already shipped in v1:
+  [chat vision](chat/vision.md) (M8) and
+  [multimodal embeddings](embeddings/multimodal.md) (M9).
 - Guardrails / moderation
 - Distributed rate limiting (Redis)
 - OTLP tracing export

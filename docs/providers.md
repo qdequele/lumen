@@ -172,8 +172,8 @@ kind = "anthropic"
 api_key_env = "ANTHROPIC_API_KEY"
 
 [[providers.models]]
-id = "claude-3-5-sonnet"
-upstream_id = "claude-3-5-sonnet-20241022"
+id = "claude-sonnet-4-5"
+upstream_id = "claude-sonnet-4-5-20250929"
 capabilities = ["chat"]
 ```
 
@@ -338,8 +338,8 @@ base_url = "https://bedrock-runtime.us-east-1.amazonaws.com"
 # api_key_env = "AWS_SECRET_ACCESS_KEY"   # optional secret override
 
 [[providers.models]]
-id = "bedrock-claude-3-5-sonnet"
-upstream_id = "anthropic.claude-3-5-sonnet-20241022-v2:0"
+id = "bedrock-claude-sonnet-4-5"
+upstream_id = "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
 capabilities = ["chat"]
 modalities = ["text", "image"]
 
@@ -932,7 +932,7 @@ survive a single-vendor outage by spanning providers:
 [[providers.models]]
 id = "gpt-4o"
 capabilities = ["chat"]
-fallbacks = ["claude-3-5-sonnet"]     # different vendor, same capability
+fallbacks = ["claude-sonnet-4-5"]     # different vendor, same capability
 ```
 
 See [`docs/adr/005-resilience-execution.md`](adr/005-resilience-execution.md)

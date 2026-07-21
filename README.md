@@ -165,19 +165,23 @@ non-empty (an empty list is rejected with `LM-2010`).
 
 ## Providers × capabilities
 
-Twenty provider kinds: nine **native** integrations plus eleven
+Twenty-six provider kinds: fifteen **native** integrations plus eleven
 **OpenAI-compatible** hosts. The `kind` string is what you put in a
 `[[providers]]` block. **Self-hosted** kinds are keyless and require a
 `base_url`; hosted kinds read their API key from the env var named by
-`api_key_env`.
+`api_key_env` (`bedrock` uses AWS env credentials; for `vertex_ai` the
+`api_key_env` var holds a GCP service-account JSON).
 
 | `kind`      | Chat | Embed | Rerank | Auth                  | Notes                          |
 |-------------|:----:|:-----:|:------:|-----------------------|--------------------------------|
 | `openai`    |  ✅  |  ✅   |        | `api_key_env`         |                                |
-| `mistral`   |  ✅  |  ✅   |        | `api_key_env`         | OpenAI-compatible              |
+| `mistral`   |  ✅  |  ✅   |        | `api_key_env`         | OpenAI-style API, native module |
 | `anthropic` |  ✅  |       |        | `api_key_env`         | bidirectional translation      |
-| `google`    |  ✅  |       |        | `api_key_env`         | Gemini                         |
-| `cohere`    |      |  ✅   |   ✅   | `api_key_env`         | one model can do embed+rerank  |
+| `google`    |  ✅  |  ✅   |        | `api_key_env`         | Gemini Developer API           |
+| `vertex_ai` |  ✅  |  ✅   |        | GCP service account   | Gemini on GCP; `base_url` = region |
+| `bedrock`   |  ✅  |  ✅   |        | AWS SigV4 (env creds) | Converse API                   |
+| `azure`     |  ✅  |  ✅   |        | `api_key_env`, **`base_url`** | deployment-routed URLs |
+| `cohere`    |  ✅  |  ✅   |   ✅   | `api_key_env`         | one model can serve all three  |
 | `jina`      |      |  ✅   |   ✅   | `api_key_env`         |                                |
 | `voyage`    |      |  ✅   |   ✅   | `api_key_env`         |                                |
 | `mixedbread`|      |      |   ✅   | `api_key_env`         | `mxbai-rerank-*`               |
@@ -195,12 +199,10 @@ else that speaks the OpenAI format works via `kind = "openai"` + a `base_url`.
 Note that `groq`, `deepseek`, `openrouter`, `perplexity` and `xai` serve chat
 only (no upstream embeddings API): declaring `embed` on them is rejected at
 config load, unless a custom `base_url` fronts the host with an
-embedding-capable proxy. See the capability table in
-[`docs/providers.md`](docs/providers.md).
-`cloudflare` additionally serves **rerank** (BAAI `bge-reranker-*`) through
-Workers AI's native `/ai/run/{model}` endpoint rather than the OpenAI path -
-see [`docs/providers.md`](docs/providers.md). The `together` kind additionally
-serves **rerank** (LlamaRank) natively.
+embedding-capable proxy. Two of the OpenAI-compatible hosts additionally serve
+**rerank** natively: `together` (LlamaRank) and `cloudflare` (BAAI `bge-reranker-*`,
+through Workers AI's native `/ai/run/{model}` endpoint rather than the OpenAI
+path). Full capability table in [`docs/providers.md`](docs/providers.md).
 
 Per-provider setup (env var, `base_url`, defaults, batch limits) is in
 [`docs/providers.md`](docs/providers.md).
@@ -288,11 +290,16 @@ Reproduce the in-process numbers:
 cargo bench -p server --bench gateway_overhead
 ```
 
-The full loaded head-to-head against LiteLLM (added latency p50/p99, RAM, req/s)
-is a one-command Docker + k6 harness - see [`bench/README.md`](bench/README.md).
-That comparison is not executed in the recording environment; the microsecond
-off-network overhead above is what is asserted, and the harness lets anyone
-produce the loaded numbers on their own hardware.
+The full loaded head-to-head against LiteLLM (added latency p50/p99, RAM,
+req/s) is a one-command Docker + k6 harness - see
+[`bench/README.md`](bench/README.md). A recorded baseline is committed under
+[`bench/results/`](bench/results): in that run LUMEN added **~2.5 ms at p50**
+over the direct-to-mock baseline, while LiteLLM's p50 reached **~324 ms** at
+roughly **140x the RAM**, and LUMEN sustained about **25x** LiteLLM's
+throughput. The absolute numbers come from a noisy shared host - treat the
+relative comparison as the meaningful part, and re-run `bench/run.sh` on your
+own hardware before making capacity decisions. Method and caveats:
+[`docs/perf-baseline.md`](docs/perf-baseline.md).
 
 ## Security
 

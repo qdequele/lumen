@@ -1,7 +1,7 @@
 # multi-provider-fallback
 
 Cross-vendor chat fallback: `gpt-4o` (OpenAI) is primary, with
-`claude-3-5-sonnet` (Anthropic) declared as its `fallbacks`. Needs
+`claude-sonnet-4-5` (Anthropic) declared as its `fallbacks`. Needs
 `OPENAI_API_KEY` and `ANTHROPIC_API_KEY`; the Anthropic key is only used if
 the fallback actually fires.
 
@@ -37,5 +37,5 @@ With both keys valid and OpenAI healthy, `x-lumen-model-used` reads
    failures, so after the 5th failing call to OpenAI the breaker trips open
    for that provider.
 3. Once the breaker is open, `x-lumen-model-used` flips from `gpt-4o` to
-   `claude-3-5-sonnet` on subsequent calls: the router stops even trying the
+   `claude-sonnet-4-5` on subsequent calls: the router stops even trying the
    broken primary and goes straight to the fallback.

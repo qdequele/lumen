@@ -63,7 +63,7 @@ cargo run -p server -- --config examples/self-hosted/config.toml
 ## multi-provider-fallback
 
 Cross-vendor chat fallback: `gpt-4o` (OpenAI) is primary, with
-`claude-3-5-sonnet` (Anthropic) declared as its `fallbacks`.
+`claude-sonnet-4-5` (Anthropic) declared as its `fallbacks`.
 
 **Demonstrates**: the `x-lumen-model-used` response header reporting
 whether the primary or the fallback served a request, and how the circuit

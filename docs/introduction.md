@@ -31,7 +31,7 @@ default**.
 - **[Architecture decisions](adr/001-crate-and-lib-naming.md)** - the ADRs that pin the design.
 - **Project** - [backlog](backlog.md) and [contributing](contributing.md).
 
-## The four pillars
+## The five pillars
 
 Every trade-off is decided in this order:
 
@@ -39,6 +39,10 @@ Every trade-off is decided in this order:
 2. **Sovereignty** - zero telemetry, prompts never logged by default, single binary.
 3. **Robustness** - propagated cancellation, backpressure, DB off the request path.
 4. **Multi-capability** - chat + embeddings + rerank are first-class citizens.
+5. **Token observability** - every request of every capability produces a token
+   count: upstream usage when reported, otherwise a local estimate flagged
+   `estimated`. Never a silent zero. See
+   [token accounting & cost](operations/token-accounting.md).
 
 Want to contribute? Start with the
 [contribution guide](https://github.com/qdequele/lumen/blob/main/CONTRIBUTING.md).
