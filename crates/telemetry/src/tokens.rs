@@ -254,7 +254,7 @@ impl TokenMetrics {
         } else {
             // Defensive: a caller bug must corrupt one metric sample at
             // worst, never panic the request path.
-            values.extend(std::iter::repeat("").take(self.metadata_labels.len()));
+            values.extend(std::iter::repeat_n("", self.metadata_labels.len()));
         }
     }
 }

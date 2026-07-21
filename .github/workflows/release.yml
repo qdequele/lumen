@@ -2,6 +2,10 @@ name: Release
 
 # Cut a release on a semver tag: static musl binaries (x86_64 + aarch64) attached
 # to the GitHub Release, and a multi-arch distroless image pushed to GHCR (M7 §7.2).
+#
+# Order of operations: the full test gate must pass on the tagged commit first;
+# then the GitHub Release is created with notes extracted from CHANGELOG.md;
+# only then are binaries (with .sha256 checksums) attached and the image pushed.
 on:
   push:
     tags:
@@ -13,11 +17,66 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
 
 jobs:
+  # Tagging a commit must not ship it untested: the same gate as ci.yml runs
+  # on the tagged commit before anything is built or published.
+  gate:
+    name: test gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format check
+        run: cargo fmt --all --check
+
+      - name: Clippy (pedantic, deny warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo test --workspace
+
+  # Create the release up front with its notes, so the binaries jobs attach to
+  # a release that already has a curated body instead of an empty one.
+  release-notes:
+    name: create release with CHANGELOG notes
+    runs-on: ubuntu-latest
+    needs: gate
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract this version's CHANGELOG section
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v ver="$version" '
+            index($0, "## [" ver "]") == 1 { found = 1; next }
+            /^## \[/ { found = 0 }
+            found { print }
+          ' CHANGELOG.md > RELEASE_NOTES.md
+          if ! [ -s RELEASE_NOTES.md ]; then
+            echo "::error::CHANGELOG.md has no \"## [$version]\" section; refusing to cut a release with empty notes." >&2
+            exit 1
+          fi
+          echo "extracted $(wc -l < RELEASE_NOTES.md) lines of release notes"
+
+      - name: Create the release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: RELEASE_NOTES.md
+
   binaries:
     name: static binary (${{ matrix.target }})
     runs-on: ubuntu-latest
+    needs: release-notes
     strategy:
       fail-fast: false
       matrix:
@@ -39,7 +98,7 @@ jobs:
       - name: Build release binary
         run: cross build --release --bin lumen --target ${{ matrix.target }}
 
-      - name: Package
+      - name: Package and checksum
         run: |
           bin="target/${{ matrix.target }}/release/lumen"
           size=$(stat -c%s "$bin")
@@ -47,15 +106,19 @@ jobs:
           # Fail the release if the stripped binary blows past the 25 MB budget.
           test "$size" -lt 26214400 || { echo "binary exceeds 25 MB"; exit 1; }
           tar -czf "lumen-${{ matrix.target }}.tar.gz" -C "target/${{ matrix.target }}/release" lumen
+          sha256sum "lumen-${{ matrix.target }}.tar.gz" > "lumen-${{ matrix.target }}.tar.gz.sha256"
 
       - name: Attach to release
         uses: softprops/action-gh-release@v2
         with:
-          files: lumen-${{ matrix.target }}.tar.gz
+          files: |
+            lumen-${{ matrix.target }}.tar.gz
+            lumen-${{ matrix.target }}.tar.gz.sha256
 
   image:
     name: multi-arch image → GHCR
     runs-on: ubuntu-latest
+    needs: release-notes
     steps:
       - uses: actions/checkout@v4
 

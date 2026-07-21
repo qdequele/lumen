@@ -20,11 +20,17 @@ and `linux/arm64`.
 
 Static musl binaries for `x86_64-unknown-linux-musl` and
 `aarch64-unknown-linux-musl` are attached to every GitHub release cut from a
-`v*` tag.
+`v*` tag, each with a `.sha256` checksum file alongside it. Verify a download
+before unpacking:
+
+```bash
+shasum -a 256 -c lumen-x86_64-unknown-linux-musl.tar.gz.sha256
+```
 
 ## From source
 
-Needs a recent stable Rust toolchain (MSRV 1.80, per `Cargo.toml`):
+Needs a recent stable Rust toolchain (MSRV 1.88, per `Cargo.toml` and checked
+in CI against the committed `Cargo.lock`):
 
 ```bash
 cargo build --release -p server --bin lumen
