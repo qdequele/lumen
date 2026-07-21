@@ -65,18 +65,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Reject the U+2014 em-dash in tracked text. House style: use hyphens,
-      # commas, colons, parentheses, or restructure. Cargo.lock and LICENSE
-      # are excluded (generated / legal text we do not edit).
+      # Reject the U+2014 em-dash in EVERY tracked text file (git grep -I
+      # skips binaries), not an extension allowlist - the old list missed
+      # .sql, which is how migration 0001 shipped with one. House style: use
+      # hyphens, commas, colons, parentheses, or restructure. Exclusions:
+      # Cargo.lock and LICENSE (generated / legal text we do not edit) and
+      # bench/results (verbatim third-party benchmark output).
       - name: Reject em-dashes
         run: |
-          hits=$(git ls-files -- '*.md' '*.rs' '*.toml' '*.yml' '*.yaml' '*.txt' \
-            ':!Cargo.lock' ':!LICENSE' \
-            | xargs -r perl -CSD -ne 'print "$ARGV:$.: $_" if /\x{2014}/; close ARGV if eof;')
-          if [ -n "$hits" ]; then
+          emdash=$(printf '\342\200\224')
+          set +e
+          hits=$(git grep -I -n -e "$emdash" -- . ':!Cargo.lock' ':!LICENSE' ':!bench/results')
+          rc=$?
+          set -e
+          if [ "$rc" -eq 0 ]; then
             echo "::error::Em-dashes (U+2014) are not allowed. Use hyphens, commas, colons, or restructure." >&2
             printf '%s\n' "$hits" >&2
             exit 1
+          elif [ "$rc" -ne 1 ]; then
+            echo "::error::git grep failed with status $rc" >&2
+            exit "$rc"
           fi
           echo "No em-dashes found."
 

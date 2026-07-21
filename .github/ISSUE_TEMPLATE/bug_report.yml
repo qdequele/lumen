@@ -1,0 +1,69 @@
+name: Bug report
+description: Something LUMEN does is wrong, crashes, or contradicts the docs.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. Two rules before anything else:
+
+        - **Never paste API keys or provider secrets.** LUMEN configs reference keys by env-var name (`api_key_env`), so a config snippet is safe to share as-is.
+        - **Security vulnerabilities** go through [private reporting](https://github.com/qdequele/lumen/security/advisories/new), never a public issue (see [SECURITY.md](https://github.com/qdequele/lumen/blob/main/SECURITY.md)).
+  - type: input
+    id: version
+    attributes:
+      label: LUMEN version
+      description: Release tag, Docker image tag, or commit sha.
+      placeholder: v0.2.0
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      description: Which subsystem does this touch? Maintainers turn this into the `area:` label.
+      options:
+        - providers
+        - streaming
+        - tokenizer
+        - observability
+        - config
+        - resilience
+        - testing
+        - vision
+        - not sure
+    validations:
+      required: true
+  - type: dropdown
+    id: scope
+    attributes:
+      label: Capability
+      description: Which capability is affected? Becomes the `scope:` label; pick "cross-cutting" when it is not tied to one.
+      multiple: true
+      options:
+        - chat
+        - embedding
+        - reranking
+        - cross-cutting
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: Include the `LM-xxxx` error code and HTTP status if the gateway returned one (every code is documented in [docs/errors.md](https://github.com/qdequele/lumen/blob/main/docs/errors.md)).
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction
+      description: Minimal config (`[[providers]]` + model block) and the request that triggers it. For config problems, `lumen --check-config --config <file>` output is ideal.
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Relevant gateway log lines. Prompts and secrets are never logged by default, so these are normally safe to paste; skim them anyway.
+      render: text

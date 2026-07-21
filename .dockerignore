@@ -1,11 +1,24 @@
+# Build context for Dockerfile: the workspace source only. Everything else
+# stays out - especially local secrets (.env files, config overrides) that
+# must never reach an image layer or the builder cache, per the sovereignty
+# pillar.
 target/
 .git/
 .github/
+.claude/
 bench/
 docs/
 tests/
+examples/
+monitoring/
+fuzz/
+book/
+.tmp-mdbook/
 **/*.md
-*.db
-*.db-*
-.claude/
-config.toml
+**/*.db
+**/*.db-*
+**/*.sqlite*
+**/config.toml
+**/config.local.toml
+**/.env
+**/.env.*
