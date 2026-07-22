@@ -6,6 +6,58 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **README provider matrix matches the shipped code.** The front-page table
+  claimed twenty kinds (nine native) and omitted `azure`, `vertex_ai` and
+  `bedrock` entirely, while denying `cohere` chat and `google` embeddings -
+  all of which are implemented. Regenerated from `docs/providers.md`:
+  twenty-six kinds, fifteen native plus eleven OpenAI-compatible, with the two
+  native-rerank notes (`together`, `cloudflare`) merged into one sentence.
+- **README Benchmarks section no longer denies the recorded head-to-head.**
+  It said the LiteLLM comparison "is not executed" although a recorded run is
+  committed under `bench/results/` and published in `docs/perf-baseline.md`.
+  It now cites that baseline (~2.5 ms added p50 vs LiteLLM's ~324 ms at
+  roughly 140x the RAM and 1/25th the throughput) with the shared-host caveat.
+- **Retired Claude model replaced in every user-facing config.**
+  `claude-3-5-sonnet-20241022` was retired upstream on 2025-10-28, so the
+  flagship `examples/multi-provider-fallback` demo (and `config.example.toml`,
+  `docs/providers.md`, `docs/examples.md`) failed at request time. They now
+  use `claude-sonnet-4-5` / `claude-sonnet-4-5-20250929`; the Bedrock entry
+  uses the region-prefixed inference profile id
+  `us.anthropic.claude-sonnet-4-5-20250929-v1:0` that current Claude models
+  require on Bedrock. Wiremock test fixtures keep the old string (they never
+  reach a real upstream).
+- **Real Cloudflare account id scrubbed from `monitoring/lumen.toml`.** The
+  monitoring docs promise a `YOUR_CLOUDFLARE_ACCOUNT_ID` placeholder, but the
+  committed file carried a real account id, which also disarmed `smoke.py`'s
+  skip guard (a user's `CLOUDFLARE_API_TOKEN` would have been sent against
+  that account's URL). Placeholder restored; the exposed id remains in git
+  history and should be treated as burned.
+- **SECURITY.md points at a working disclosure channel.** The "email the
+  maintainers at the address in the repository metadata" path was a dead end
+  (no address exists in the repo). GitHub private vulnerability reporting is
+  now the single documented channel, linked directly, and enabled on the
+  repository.
+- **Docs front page and CONTRIBUTING list all five pillars.**
+  `docs/introduction.md` and `CONTRIBUTING.md` both said "the four pillars",
+  omitting token observability (pillar 5 and a headline differentiator, per
+  ADR 003).
+- **Backlog no longer defers shipped work.** `docs/backlog.md` listed
+  "Multimodal (images / audio) support" as a v2 idea although image input
+  shipped in v1 (chat vision in M8, multimodal embeddings in M9); the entry
+  now defers only audio.
+- **Em-dash removed from `crates/auth/migrations/0001_init.sql`.** The repo
+  bans em-dashes, but migration 0001's first comment line carried one that the
+  `no-em-dashes` CI job cannot see (its extension allowlist skips `.sql`; a
+  follow-up will invert the check to cover all tracked files). **Upgrade
+  note**: sqlx validates checksums of applied migrations, so an auth database
+  created before this change fails at the next boot with "migration 1 was
+  previously applied but has been modified". Repair the recorded checksum
+  in place:
+  `sqlite3 lumen.db "UPDATE _sqlx_migrations SET checksum = x'1515FFCF83419118A06CACFB964CADC873574B41B912B40A97AF397BC6D799459835F61AD5260B832CB74EB302330AEB' WHERE version = 1;"`
+  New databases are unaffected.
+
 ### Added
 
 - **Route-not-found error envelope** (issue #88). Requests matching no route

@@ -4,13 +4,13 @@
 
 Please report security issues **privately**, not via public GitHub issues.
 
-- Use GitHub's **[Report a vulnerability](https://docs.github.com/en/code-security/security-advisories/guidance-on-reporting-and-writing-information-about-vulnerabilities/privately-reporting-a-security-vulnerability)**
-  (Security → Advisories → *Report a vulnerability*) on this repository, or
-- email the maintainers at the address in the repository metadata.
+Use GitHub's private vulnerability reporting on this repository:
+**<https://github.com/qdequele/lumen/security/advisories/new>**
+(Security → Advisories → *Report a vulnerability*).
 
 Include a description, affected version/commit, and a reproduction if possible.
-We aim to acknowledge within 3 business days and to ship a fix or mitigation
-before any public disclosure. Please give us a reasonable window to remediate.
+Reports are acknowledged within 3 business days, and a fix or mitigation ships
+before any public disclosure. Please allow a reasonable window to remediate.
 
 ## Supported versions
 

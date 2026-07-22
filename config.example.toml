@@ -199,7 +199,7 @@ cost_per_1m_output = 10.0
 # declared above (here "chat"), which is validated at boot. Whichever model
 # actually serves the request is reported in the x-lumen-model-used
 # response header and the usage_log.model_used column.
-fallbacks = ["claude-3-5-sonnet"]
+fallbacks = ["claude-sonnet-4-5"]
 
 [[providers.models]]
 id = "text-embedding-3-small"
@@ -214,8 +214,8 @@ kind = "anthropic"
 api_key_env = "ANTHROPIC_API_KEY"
 
 [[providers.models]]
-id = "claude-3-5-sonnet"
-upstream_id = "claude-3-5-sonnet-20241022"
+id = "claude-sonnet-4-5"
+upstream_id = "claude-sonnet-4-5-20250929"
 capabilities = ["chat"]
 cost_per_1m_input = 3.0
 cost_per_1m_output = 15.0
@@ -273,7 +273,9 @@ cost_per_1m_output = 15.0
 # is parsed back out of it for the signing scope (standard and VPC endpoint
 # hosts). For any other custom endpoint export AWS_REGION - a provider whose
 # region cannot be determined fails at startup. `upstream_id` is the Bedrock
-# model id and may include a version suffix with a colon.
+# model id and may include a version suffix with a colon; current Claude
+# models are invoked through a region-prefixed inference profile id
+# (`us.` / `eu.` / `apac.` + model id).
 [[providers]]
 name = "bedrock"
 kind = "bedrock"
@@ -281,8 +283,8 @@ base_url = "https://bedrock-runtime.us-east-1.amazonaws.com"
 # api_key_env = "AWS_SECRET_ACCESS_KEY"   # optional: overrides the env secret
 
 [[providers.models]]
-id = "bedrock-claude-3-5-sonnet"
-upstream_id = "anthropic.claude-3-5-sonnet-20241022-v2:0"
+id = "bedrock-claude-sonnet-4-5"
+upstream_id = "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
 capabilities = ["chat"]
 modalities = ["text", "image"]
 

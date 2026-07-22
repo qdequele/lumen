@@ -9,7 +9,7 @@ api_key_env = "OPENAI_API_KEY"
 id = "gpt-4o"
 upstream_id = "gpt-4o-2024-08-06"
 capabilities = ["chat"]
-fallbacks = ["claude-3-5-sonnet"]
+fallbacks = ["claude-sonnet-4-5"]
 
 [[providers]]
 name = "anthropic"
@@ -17,6 +17,6 @@ kind = "anthropic"
 api_key_env = "ANTHROPIC_API_KEY"
 
 [[providers.models]]
-id = "claude-3-5-sonnet"
-upstream_id = "claude-3-5-sonnet-20241022"
+id = "claude-sonnet-4-5"
+upstream_id = "claude-sonnet-4-5-20250929"
 capabilities = ["chat"]
