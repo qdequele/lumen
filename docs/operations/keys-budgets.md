@@ -30,6 +30,11 @@ With auth on, every `/v1/*` request is checked against a **virtual key**:
   from memory to SQLite on `flush_interval_ms` (default 10000). A crash
   loses at most that much *accounting*; it never allows a budget overrun,
   since enforcement itself lives in memory.
+- That database is the **only copy** of the key hashes, stored provider
+  keys, budget state and usage ledger: see
+  [Backups](deployment.md#backups) for how not to lose it, and
+  [Scaling and high availability](deployment.md#scaling-and-high-availability)
+  for why in-memory enforcement means one instance in v1.
 
 ## Refusals
 

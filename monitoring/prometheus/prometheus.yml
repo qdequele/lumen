@@ -4,6 +4,12 @@ global:
   scrape_interval: 5s
   evaluation_interval: 5s
 
+# Starter rules for the silent failure modes (usage-log drops, rejected
+# reloads, open breakers, probe-down providers, 5xx ratio). Visible at
+# http://localhost:9090/alerts once the stack is up.
+rule_files:
+  - /etc/prometheus/alerts.yml
+
 scrape_configs:
   - job_name: lumen
     static_configs:

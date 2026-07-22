@@ -33,6 +33,26 @@ Per-request **cost** is not a Prometheus series: it is a `usage_log`-only
 figure, computed from the `cost_per_1m_*` / `cost_per_1k_searches` prices in
 config. See [Token accounting & cost](token-accounting.md).
 
+## What to alert on
+
+Several failure modes are **deliberately silent on the request path**: the
+gateway sheds work instead of failing requests, and the only trace is a
+counter. "The drop is visible in your dashboards" is only true if
+something watches these:
+
+| Alert condition | Meaning |
+|---|---|
+| `increase(lumen_usage_log_dropped_total[5m]) > 0` | Usage-log rows are being shed under pressure: token accounting is incomplete for those requests. Raise `usage_channel_capacity` or investigate DB write latency. |
+| `increase(lumen_config_reload_failures_total[15m]) > 0` | A config reload was rejected; the **old** config keeps serving. The deploy that "went out" did not. |
+| `lumen_circuit_state == 1` for 2m | A provider/model circuit is open: calls are short-circuited to fallbacks (or failing). |
+| `lumen_provider_up == 0` for 5m | A background health probe cannot reach a provider (only exported for probed providers). |
+| 5xx share of `lumen_request_duration_seconds_count` > 5% | Upstream or gateway failures; `499` (client cancelled) is deliberately outside the 5xx class and does not count. |
+
+The monitoring rig ships these as ready-made Prometheus rules in
+[`monitoring/prometheus/alerts.yml`](https://github.com/qdequele/lumen/blob/main/monitoring/prometheus/alerts.yml) -
+copy them into your own Prometheus and tune the windows. Routing them to a
+pager needs an Alertmanager, which the rig intentionally leaves out.
+
 ## See it live: the monitoring rig
 
 `monitoring/` is a one-command Docker Compose stack that runs the gateway

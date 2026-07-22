@@ -21,10 +21,12 @@ default**.
 - **Reranking** - [reranking](reranking/reranking.md).
 - **Operations** - [token accounting & cost](operations/token-accounting.md),
   [metrics & dashboards](operations/metrics.md),
+  [logging](operations/logging.md),
   [usage log & multi-tenant metadata](operations/usage-log.md),
   [keys, quotas & budgets](operations/keys-budgets.md),
-  [resilience tuning](operations/resilience.md) and
-  [deployment](operations/deployment.md).
+  [resilience tuning](operations/resilience.md),
+  [deployment](operations/deployment.md) and
+  [upgrades](operations/upgrades.md).
 - **[Examples](examples.md)** - ready-made scenario configs.
 - **Reference** - [providers](providers.md), [error codes](errors.md) and the
   [performance baseline](perf-baseline.md).
