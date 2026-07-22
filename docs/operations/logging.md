@@ -17,8 +17,12 @@ Prompts, responses and provider secrets are treated as radioactive:
   tests enforce it.
 
 What is logged is metadata: request ids, models, providers, HTTP status,
-latency, and operational events (boot, config reloads, circuit-breaker
-transitions, flush failures).
+latency, operational events (boot, config reloads, circuit-breaker
+transitions, flush failures), and the client-supplied `x-lumen-metadata`
+header when present (a bounded JSON object of up to 16 keys, whole header
+capped at 4 KiB). **Operators must not include secrets or prompt content in
+the metadata header**, as it is logged in full and stored in the `usage_log`
+table.
 
 ## Format
 

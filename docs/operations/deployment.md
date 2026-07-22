@@ -188,15 +188,18 @@ anyway rather than hanging.
 
 Accounting across a stop, when auth is enabled:
 
-- **Clean shutdown loses zero accounting.** After the listener drains, the
-  gateway performs a final budget flush and a bounded wait (up to 5 s) for
-  the usage-log writer, so everything spent is persisted before exit -
-  barring a database write failure at that moment, which is logged as a
-  warning rather than blocking exit.
+- **Clean shutdown attempts a final accounting flush with a bounded wait.**
+  After the listener drains, the gateway performs a final budget flush and
+  waits up to 5 seconds for the usage-log writer to drain its channel.
+  Usage rows still in the channel when the wait expires are lost, as are
+  rows from database write failures (both logged as warnings rather than
+  blocking exit). In the common case, a clean shutdown loses no accounting.
 - **A crash loses at most `flush_interval_ms`** (default 10 s) of budget
   *accounting* and whatever usage-log rows were still in the bounded
-  channel. It can never allow a budget overrun: enforcement lives in
-  memory, ahead of the flush.
+  channel. Budget enforcement itself lives in memory ahead of the flush, so
+  a running process never allows overruns. After a restart, however,
+  budgets reload from the last persisted state: unflushed usage lost in a
+  crash can permit spend beyond the intended budget until the gap closes.
 
 Rolling restarts through the reverse proxy work as expected: mark the
 instance down (or just send `SIGTERM`), let the 30 s drain finish the
@@ -221,9 +224,11 @@ nothing to back up.
 
   A live backup can trail reality by up to `flush_interval_ms` (default
   10 s) of budget accounting - the in-memory spend not yet flushed.
-- **Cold backup** (exact): stop the gateway first (a clean `SIGTERM` flushes
-  everything, see above), then copy `lumen.db` together with its `-wal` and
-  `-shm` sidecar files if present.
+- **Cold backup** (consistent snapshot): stop the gateway first (a clean
+  `SIGTERM` attempts a final flush, see above), then copy `lumen.db`
+  together with its `-wal` and `-shm` sidecar files if present. The backup
+  reflects the state at shutdown, though in-flight or unflushed usage rows
+  from the bounded channel may not be included.
 - **Restore needs the matching `LUMEN_MASTER_KEY`.** Stored provider keys
   are encrypted under it; a restored database without the same master key
   serves virtual keys and history fine, but every stored provider key is

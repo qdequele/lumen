@@ -40,9 +40,9 @@ no separate migrate command and nothing to run by hand.
 
 `SIGTERM` the old process (or let your supervisor do it), start the new
 one. In-flight requests get up to 30 seconds to finish and a clean
-shutdown flushes all accounting - the mechanics and the supervisor
-timeouts to pair with them are in
-[Shutdown and restarts](deployment.md#shutdown-and-restarts). With auth
+shutdown attempts a final accounting flush with a bounded wait (up to 5
+seconds) - the mechanics and the supervisor timeouts to pair with them are
+in [Shutdown and restarts](deployment.md#shutdown-and-restarts). With auth
 enabled, prefer stop-then-start over running old and new side by side; two
 live instances double-enforce budgets and quotas for as long as they
 overlap (see
