@@ -8,6 +8,32 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ### Added
 
+- **Operator docs for the questions an SRE asks first.** `deployment.md`
+  gains four sections: *Scaling and high availability* (the honest v1
+  constraint: with auth enabled, budgets and RPM/TPM quotas are enforced in
+  per-process memory over a per-node SQLite file, so N replicas silently
+  multiply every limit by N - one active instance is the supported shape,
+  Postgres backend is the v2 lift; with auth off the gateway is a stateless
+  proxy and scales freely), *Shutdown and restarts* (SIGTERM/SIGINT drain
+  in-flight requests up to 30 s; a clean shutdown flushes accounting with
+  zero loss, a crash loses at most `flush_interval_ms`; systemd
+  `TimeoutStopSec` / Kubernetes `terminationGracePeriodSeconds` guidance),
+  *Backups* (WAL-safe `sqlite3 .backup` live, cold copy with sidecars, the
+  `LUMEN_MASTER_KEY` pairing, what is unrecoverable), plus a hardened
+  systemd unit and reverse-proxy snippets (Caddy; nginx with
+  `proxy_buffering off` so SSE streams token by token). Two new book
+  pages: [Logging](docs/operations/logging.md) (`RUST_LOG` filtering,
+  `log_format = "pretty" | "json"`, what is never logged) and
+  [Upgrades](docs/operations/upgrades.md) (auto-run forward-only
+  migrations, back up before upgrading, what SemVer promises pre-1.0 per
+  surface: API, `LM-xxxx` codes, config keys, metric names).
+- **Starter Prometheus alert rules in the monitoring rig**
+  (`monitoring/prometheus/alerts.yml`, loaded via `rule_files`): the
+  failure modes the gateway keeps deliberately silent on the request path
+  now have alerts - usage-log rows shed under pressure, rejected config
+  reloads, circuit breakers open 2m+, probe-down providers, and a 5%
+  upstream 5xx ratio. `metrics.md` documents the same list as "what to
+  alert on".
 - **Contributor surface under `.github/`.** Issue forms for bug reports,
   feature requests and questions (their dropdowns mirror the `area:` /
   `scope:` label taxonomy from CONTRIBUTING.md, and blank issues are

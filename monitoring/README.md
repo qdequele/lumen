@@ -5,6 +5,10 @@ Anthropic, Mistral, Google Gemini, Cohere, Jina, Voyage, Cloudflare Workers AI)
 with Prometheus scraping it and a pre-provisioned Grafana dashboard showing the
 consumption: token rates per provider/model/capability/direction, rerank search
 units, media accounting, circuit-breaker state, and gateway internals.
+Prometheus also loads the starter alert rules from
+[`prometheus/alerts.yml`](prometheus/alerts.yml) (usage-log drops, rejected
+reloads, open breakers, probe-down providers, 5xx ratio); watch them fire at
+<http://localhost:9090/alerts>.
 
 ## 1. Put your keys in `.env`
 

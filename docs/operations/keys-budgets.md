@@ -27,9 +27,17 @@ With auth on, every `/v1/*` request is checked against a **virtual key**:
   (`rpm_limit`, `tpm_limit`) are enforced **in memory, before any upstream
   call** - a rejected request never spends and never reaches a provider.
 - The database is **never on the request path**. Budget spend is flushed
-  from memory to SQLite on `flush_interval_ms` (default 10000). A crash
-  loses at most that much *accounting*; it never allows a budget overrun,
-  since enforcement itself lives in memory.
+  from memory to SQLite on `flush_interval_ms` (default 10000). While the
+  process is running, enforcement itself lives in memory ahead of the
+  flush, so budget overruns cannot occur. A crash loses at most that much
+  *accounting*; after a restart, budgets reload from the last persisted
+  state, so unflushed usage lost in a crash can permit spend beyond the
+  intended budget until the gap closes.
+- That database is the **only copy** of the key hashes, stored provider
+  keys, budget state and usage ledger: see
+  [Backups](deployment.md#backups) for how not to lose it, and
+  [Scaling and high availability](deployment.md#scaling-and-high-availability)
+  for why in-memory enforcement means one instance in v1.
 
 ## Refusals
 

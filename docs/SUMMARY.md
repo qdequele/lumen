@@ -29,10 +29,12 @@
 
 - [Token accounting & cost](operations/token-accounting.md)
 - [Metrics & dashboards](operations/metrics.md)
+- [Logging](operations/logging.md)
 - [Usage log & multi-tenant metadata](operations/usage-log.md)
 - [Keys, quotas & budgets](operations/keys-budgets.md)
 - [Resilience tuning](operations/resilience.md)
 - [Deployment](operations/deployment.md)
+- [Upgrades](operations/upgrades.md)
 
 # Examples
 

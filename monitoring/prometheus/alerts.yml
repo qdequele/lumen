@@ -1,0 +1,68 @@
+# Starter alert rules for the failure modes LUMEN keeps deliberately
+# silent on the request path. Rules evaluate inside Prometheus and show at
+# http://localhost:9090/alerts; routing them to a pager additionally needs
+# an Alertmanager, which this rig does not include.
+#
+# Thresholds are starting points: tune `for:` windows and the error-ratio
+# cutoff to your traffic. Metric semantics: docs/operations/metrics.md.
+groups:
+  - name: lumen
+    rules:
+      # The usage-log channel sheds rows instead of blocking the request
+      # path. That protects latency, but every dropped row is token
+      # accounting lost - the never-zero pillar degrades silently unless
+      # this fires. Raise [auth].usage_channel_capacity or investigate DB
+      # write latency.
+      - alert: LumenUsageLogRowsDropped
+        expr: increase(lumen_usage_log_dropped_total[5m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "usage-log rows are being dropped"
+          description: "{{ $value }} usage_log rows were shed in the last 5m; token accounting is incomplete for those requests."
+
+      # A rejected reload means the config on disk is invalid and the
+      # gateway is serving the OLD config. Deploys look done but are not.
+      - alert: LumenConfigReloadFailing
+        expr: increase(lumen_config_reload_failures_total[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "a config reload was rejected"
+          description: "The config on disk failed validation; the previous config keeps serving. Fix the file or expect the next restart to fail."
+
+      # 0 = closed, 1 = open (short-circuiting), 2 = half-open (probing).
+      - alert: LumenCircuitOpen
+        expr: lumen_circuit_state == 1
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "circuit breaker open for {{ $labels.provider }}/{{ $labels.model }}"
+          description: "Calls to this provider/model have been short-circuited for 2m+; traffic is failing over or failing."
+
+      # Only exists for providers with an explicit base_url when
+      # [resilience].health_check_enabled = true.
+      - alert: LumenProviderProbeDown
+        expr: lumen_provider_up == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "health probe failing for provider {{ $labels.provider }}"
+          description: "Background health checks have not seen this provider healthy for 5m."
+
+      # Upstream/gateway failures as a share of accounted requests. 499
+      # (client cancelled) is deliberately outside the 5xx class and does
+      # not count.
+      - alert: LumenErrorRatioHigh
+        expr: |
+          sum(rate(lumen_request_duration_seconds_count{status=~"5.."}[5m]))
+            /
+          sum(rate(lumen_request_duration_seconds_count[5m])) > 0.05
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "more than 5% of requests are failing"
+          description: "5xx responses exceed 5% of accounted requests over the last 5m."
