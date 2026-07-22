@@ -80,7 +80,7 @@ zeroize = "1"
 
 # SigV4 request signing (AWS Bedrock). Pure-Rust, rustls-compatible, no OpenSSL.
 sha2 = "0.10"
-hmac = "0.12"
+hmac = "0.13"
 hex = "0.4"
 
 # Testing
