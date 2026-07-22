@@ -102,6 +102,14 @@ pub fn build_app(state: AppState) -> Router {
                 patch(admin::patch_key).delete(admin::delete_key),
             )
             .route("/admin/keys/{id}/rotate", post(admin::rotate_key))
+            .route(
+                "/admin/groups",
+                post(admin::create_group).get(admin::list_groups),
+            )
+            .route(
+                "/admin/groups/{id}",
+                patch(admin::patch_group).delete(admin::delete_group),
+            )
             .route("/admin/provider-keys/{name}", put(admin::put_provider_key))
             .route("/admin/usage", get(admin::usage_report))
             .route_layer(middleware::from_fn_with_state(

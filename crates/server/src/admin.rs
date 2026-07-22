@@ -12,6 +12,13 @@
 //! * `POST /admin/keys/{id}/rotate` - mint a new secret for an existing key;
 //!   same one-time-plaintext contract as creation, identity and budget state
 //!   preserved.
+//! * `POST /admin/groups` / `GET /admin/groups` - create and list budget
+//!   groups (ADR 009): shared pools that member keys draw from in addition
+//!   to their own budgets.
+//! * `PATCH /admin/groups/{id}` - adjust a group's shared budget; binds
+//!   every member on their next request.
+//! * `DELETE /admin/groups/{id}` - soft-delete a group; refused while it
+//!   still has active member keys.
 //! * `PUT /admin/provider-keys/{name}` - store a provider API key encrypted
 //!   at rest (AES-256-GCM under the master key) and apply it without a restart
 //!   by requesting a hot reload; used for providers whose `api_key_env` is
@@ -31,7 +38,8 @@ use axum::Json;
 use lumen_auth::key::hash_key;
 use lumen_auth::state::micro_to_usd;
 use lumen_auth::store::{
-    KeyPatch, NewKey, UsageAggregate, UsageFilter, UsageGroupBy, VirtualKeyRecord,
+    DeleteGroupOutcome, GroupPatch, GroupRecord, KeyPatch, NewGroup, NewKey, UsageAggregate,
+    UsageFilter, UsageGroupBy, VirtualKeyRecord,
 };
 use lumen_core::GatewayError;
 use serde::{Deserialize, Serialize};
@@ -64,6 +72,18 @@ fn internal(error: &lumen_auth::AuthError) -> ApiError {
     GatewayError::Internal(error.to_string()).into()
 }
 
+/// Map a store failure from a key/group write: a caller-named unknown group
+/// is their error (400 `LM-1001` - naming it back leaks nothing, they sent
+/// it), everything else stays an opaque 500.
+fn store_error(error: lumen_auth::AuthError) -> ApiError {
+    match error {
+        lumen_auth::AuthError::UnknownGroup(id) => {
+            GatewayError::InvalidRequest(format!("unknown budget group '{id}'")).into()
+        }
+        other => internal(&other),
+    }
+}
+
 fn runtime(state: &AppState) -> Result<&crate::auth::AuthRuntime, ApiError> {
     state
         .auth
@@ -81,11 +101,7 @@ pub async fn create_key(
         return Err(GatewayError::InvalidRequest("`name` must not be empty".to_owned()).into());
     }
     let auth = runtime(&state)?;
-    let (plaintext, record) = auth
-        .store
-        .create_key(params)
-        .await
-        .map_err(|e| internal(&e))?;
+    let (plaintext, record) = auth.store.create_key(params).await.map_err(store_error)?;
     // Make the key usable immediately, without waiting for a reboot.
     auth.keys.upsert(hash_key(plaintext.reveal()), &record);
     Ok((
@@ -137,7 +153,7 @@ pub async fn patch_key(
         .store
         .update_key(&id, patch)
         .await
-        .map_err(|e| internal(&e))?
+        .map_err(store_error)?
         .ok_or_else(|| GatewayError::InvalidRequest(format!("unknown key id '{id}'")))?;
     // Reflect the change in the live table (spend is preserved).
     auth.keys.apply(&updated);
@@ -214,6 +230,117 @@ pub async fn rotate_key(
     }))
 }
 
+// ---- Budget groups (ADR 009) ------------------------------------------------
+
+/// Create a budget group. No secret exists for a group, so the response is
+/// just the record - nothing one-time about it.
+pub async fn create_group(
+    State(state): State<AppState>,
+    payload: Result<Json<NewGroup>, JsonRejection>,
+) -> Result<(StatusCode, Json<GroupRecord>), ApiError> {
+    let Json(params) = payload.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
+    if params.name.trim().is_empty() {
+        return Err(GatewayError::InvalidRequest("`name` must not be empty".to_owned()).into());
+    }
+    let auth = runtime(&state)?;
+    let record = auth
+        .store
+        .create_group(params)
+        .await
+        .map_err(|e| internal(&e))?;
+    // Make the group joinable and enforced immediately, no restart.
+    auth.keys.upsert_group(&record);
+    Ok((StatusCode::CREATED, Json(record)))
+}
+
+/// `GET /admin/groups` query parameters.
+#[derive(Debug, Default, Deserialize)]
+pub struct ListGroupsParams {
+    /// Also list soft-deleted tombstones (default: active groups only).
+    #[serde(default)]
+    pub include_deleted: bool,
+}
+
+/// List every active budget group; `?include_deleted=true` adds tombstones.
+pub async fn list_groups(
+    State(state): State<AppState>,
+    params: Result<Query<ListGroupsParams>, QueryRejection>,
+) -> Result<Json<Vec<GroupRecord>>, ApiError> {
+    let Query(params) = params.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
+    let auth = runtime(&state)?;
+    let groups = auth
+        .store
+        .list_groups(params.include_deleted)
+        .await
+        .map_err(|e| internal(&e))?;
+    Ok(Json(groups))
+}
+
+/// Patch a group: adjust the shared budget or the label. Pool spend is
+/// preserved, and the new cap binds every member key on its very next
+/// request. An unknown or deleted id is a 400 `LM-1001`, like `patch_key`.
+pub async fn patch_group(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    payload: Result<Json<GroupPatch>, JsonRejection>,
+) -> Result<Json<GroupRecord>, ApiError> {
+    let Json(patch) = payload.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
+    let auth = runtime(&state)?;
+    let updated = auth
+        .store
+        .update_group(&id, patch)
+        .await
+        .map_err(|e| internal(&e))?
+        .ok_or_else(|| GatewayError::InvalidRequest(format!("unknown group id '{id}'")))?;
+    auth.keys.apply_group(&updated);
+    Ok(Json(updated))
+}
+
+/// Delete a group - a **soft delete** like keys (the tombstone keeps
+/// `usage_log.group_id` attribution), refused while the group still has
+/// active member keys: silently dropping members out of pool enforcement
+/// would be worse than this 400. Move or delete the member keys first.
+pub async fn delete_group(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let auth = runtime(&state)?;
+    let outcome = auth
+        .store
+        .delete_group(&id)
+        .await
+        .map_err(|e| internal(&e))?;
+    match outcome {
+        DeleteGroupOutcome::Deleted(_) => {
+            // Evict from the live table and flush the final pool spend now:
+            // once the entry is gone the periodic flusher never sees this id
+            // again (mirrors `delete_key`).
+            if let Some(entry) = auth.keys.remove_group(&id) {
+                let spent = micro_to_usd(entry.spent_micro());
+                if let Err(error) = auth
+                    .store
+                    .persist_group_budgets(&[(id.clone(), spent)])
+                    .await
+                {
+                    tracing::warn!(
+                        group_id = %id,
+                        %error,
+                        "failed to persist final pool spend while deleting a group"
+                    );
+                }
+            }
+            Ok(StatusCode::NO_CONTENT)
+        }
+        DeleteGroupOutcome::HasMembers(count) => Err(GatewayError::InvalidRequest(format!(
+            "group '{id}' still has {count} active member key(s); move or delete them first"
+        ))
+        .into()),
+        DeleteGroupOutcome::NotFound => {
+            Err(GatewayError::InvalidRequest(format!("unknown group id '{id}'")).into())
+        }
+    }
+}
+
 /// `PUT /admin/provider-keys/{name}` body.
 #[derive(Debug, Deserialize)]
 pub struct ProviderKeyBody {
@@ -277,6 +404,8 @@ const MAX_GROUP_LIMIT: u32 = 1_000;
 pub struct UsageParams {
     /// Only rows for this virtual key id.
     pub key_id: Option<String>,
+    /// Only rows attributed to this budget group id (ADR 009).
+    pub group_id: Option<String>,
     /// Only rows for this client-facing model id.
     pub model: Option<String>,
     /// Only rows served by this provider instance.
@@ -289,7 +418,7 @@ pub struct UsageParams {
     /// Window end (inclusive): unix seconds or RFC3339. Default: now.
     pub until: Option<String>,
     /// Grouping dimension: `model` (default) | `model_used` | `provider` |
-    /// `capability` | `key_id` | `status` | `total`.
+    /// `capability` | `key_id` | `group_id` | `status` | `total`.
     pub group_by: Option<String>,
     /// Maximum number of groups returned (1..=1000, default 100).
     pub limit: Option<u32>,
@@ -335,7 +464,7 @@ pub async fn usage_report(
         Some(value) => UsageGroupBy::parse(value).ok_or_else(|| {
             GatewayError::InvalidRequest(format!(
                 "invalid `group_by` '{value}': expected one of model, model_used, \
-                 provider, capability, key_id, status, total"
+                 provider, capability, key_id, group_id, status, total"
             ))
         })?,
     };
@@ -371,6 +500,7 @@ pub async fn usage_report(
 
     let filter = UsageFilter {
         key_id: params.key_id,
+        group_id: params.group_id,
         model: params.model,
         provider: params.provider,
         capability: params.capability,
@@ -522,6 +652,7 @@ mod tests {
             record: VirtualKeyRecord {
                 id: "id-1".to_owned(),
                 name: "debug-test".to_owned(),
+                group_id: None,
                 budget_max: None,
                 budget_spent: 0.0,
                 rpm_limit: None,

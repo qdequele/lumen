@@ -7,6 +7,7 @@ use std::time::Duration;
 fn record(model: &str) -> UsageRecord {
     UsageRecord {
         key_id: None,
+        group_id: None,
         model: model.to_owned(),
         model_used: model.to_owned(),
         provider: "openai".to_owned(),

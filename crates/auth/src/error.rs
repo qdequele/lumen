@@ -23,4 +23,11 @@ pub enum AuthError {
     /// Carries no detail by design - there is nothing safe to say.
     #[error("provider key decryption failed")]
     Decrypt,
+
+    /// A key create/patch referenced a budget group that does not exist or
+    /// was soft-deleted (ADR 009). Unlike the other variants this one maps
+    /// to a client error (400 `LM-1001`), not an opaque 500: the caller
+    /// named the group, so naming it back leaks nothing.
+    #[error("unknown budget group '{0}'")]
+    UnknownGroup(String),
 }

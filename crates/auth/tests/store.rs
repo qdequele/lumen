@@ -14,6 +14,7 @@ use lumen_auth::store::{KeyPatch, KeyStore, NewKey, UsageFilter, UsageGroupBy, U
 fn new_key(name: &str) -> NewKey {
     NewKey {
         name: name.to_owned(),
+        group_id: None,
         budget_max: Some(10.0),
         rpm_limit: Some(60),
         tpm_limit: Some(100_000),
@@ -24,6 +25,7 @@ fn new_key(name: &str) -> NewKey {
 fn usage(key_id: &str, ts: i64) -> UsageRecord {
     UsageRecord {
         key_id: Some(key_id.to_owned()),
+        group_id: None,
         model: "gpt-test".to_owned(),
         model_used: "gpt-test".to_owned(),
         provider: "openai".to_owned(),

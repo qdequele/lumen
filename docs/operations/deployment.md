@@ -128,11 +128,15 @@ PromQL - the counters sum correctly).
 **With `[auth].enabled = true`, v1 is single-instance by design.** Hard
 budgets and RPM/TPM quotas are enforced **in per-process memory** (that is
 what keeps the database off the request path), and spend is flushed to a
-**per-node SQLite file**. Behind a load balancer, N replicas each enforce
-the full budget and quota independently: a `$100` hard budget becomes an
-effective `$100 x N`, an `rpm_limit` of 60 becomes `60 x N`, and the usage
-ledger splits into N disjoint database files. Nothing crashes - the
-guarantees silently stop meaning what they say, which is worse.
+**per-node SQLite file**. Budget-group pools
+([ADR 009](../adr/009-shared-parent-budgets.md)) are enforced the same
+way, in the same per-instance memory, so the single-instance constraint
+applies to a shared pool identically. Behind a load balancer, N replicas
+each enforce the full budget and quota independently: a `$100` hard
+budget becomes an effective `$100 x N`, an `rpm_limit` of 60 becomes
+`60 x N`, and the usage ledger splits into N disjoint database files.
+Nothing crashes - the guarantees silently stop meaning what they say,
+which is worse.
 
 Until then, the supported shapes with auth enabled are:
 

@@ -83,6 +83,9 @@ USAGE:
 OPTIONS:
     -c, --config <PATH>      Path to the TOML config file [default: config.toml]
     --name <NAME>            Human-readable key label (create: required)
+    --group-id <ID>          Budget group to join (ADR 009). The group must
+                              already exist (created via POST /admin/groups);
+                              an unknown id is refused.
     --budget-max <USD>       Hard budget in USD [default: unlimited]
     --rpm-limit <N>          Requests-per-minute cap [default: unlimited]
     --tpm-limit <N>          Tokens-per-minute cap [default: unlimited]
@@ -162,6 +165,8 @@ enum KeysAction {
         config: PathBuf,
         /// Human-readable label (required, non-blank).
         name: String,
+        /// Budget group to join (ADR 009); must name an existing group.
+        group_id: Option<String>,
         /// Hard budget in USD; `None` = unlimited.
         budget_max: Option<f64>,
         /// Requests-per-minute cap; `None` = unlimited.
@@ -248,6 +253,15 @@ fn number_of<T: std::str::FromStr>(flag: &str, value: &str) -> Result<T, String>
         .map_err(|_| format!("{flag} expects a number, got '{value}'"))
 }
 
+/// Refuse a negative value for `flag` (a negative cap would mint a key that
+/// is dead on arrival, silently defeating the contract).
+fn ensure_non_negative(flag: &str, value: Option<i64>) -> Result<(), String> {
+    match value.filter(|v| *v < 0) {
+        Some(v) => Err(format!("{flag} must not be negative, got '{v}'")),
+        None => Ok(()),
+    }
+}
+
 /// Parse everything after `lumen keys`: the `create`/`list` subcommand and
 /// its flags. Every value flag accepts both `--flag value` and `--flag=value`.
 fn parse_keys_args(mut args: impl Iterator<Item = String>) -> Result<Action, String> {
@@ -265,6 +279,7 @@ fn parse_keys_args(mut args: impl Iterator<Item = String>) -> Result<Action, Str
 
     let mut config = PathBuf::from("config.toml");
     let mut name: Option<String> = None;
+    let mut group_id: Option<String> = None;
     let mut budget_max: Option<f64> = None;
     let mut rpm_limit: Option<i64> = None;
     let mut tpm_limit: Option<i64> = None;
@@ -285,6 +300,9 @@ fn parse_keys_args(mut args: impl Iterator<Item = String>) -> Result<Action, Str
                 config = PathBuf::from(flag_value("--config", inline, &mut args)?);
             }
             "--name" if create => name = Some(flag_value("--name", inline, &mut args)?),
+            "--group-id" if create => {
+                group_id = Some(flag_value("--group-id", inline, &mut args)?);
+            }
             "--budget-max" if create => {
                 budget_max = Some(number_of(
                     "--budget-max",
@@ -330,20 +348,22 @@ fn parse_keys_args(mut args: impl Iterator<Item = String>) -> Result<Action, Str
             ));
         }
     }
-    if let Some(v) = rpm_limit.filter(|v| *v < 0) {
-        return Err(format!("--rpm-limit must not be negative, got '{v}'"));
-    }
-    if let Some(v) = tpm_limit.filter(|v| *v < 0) {
-        return Err(format!("--tpm-limit must not be negative, got '{v}'"));
-    }
+    ensure_non_negative("--rpm-limit", rpm_limit)?;
+    ensure_non_negative("--tpm-limit", tpm_limit)?;
     if let Some(v) = expires_at.filter(|v| *v < 0) {
         return Err(format!(
             "--expires-at must be a non-negative unix timestamp, got '{v}'"
         ));
     }
+    if let Some(v) = &group_id {
+        if v.trim().is_empty() {
+            return Err("--group-id must not be blank".to_owned());
+        }
+    }
     Ok(Action::Keys(KeysAction::Create {
         config,
         name,
+        group_id,
         budget_max,
         rpm_limit,
         tpm_limit,
@@ -442,6 +462,7 @@ fn run_keys_inner(action: KeysAction) -> anyhow::Result<()> {
         match action {
             KeysAction::Create {
                 name,
+                group_id,
                 budget_max,
                 rpm_limit,
                 tpm_limit,
@@ -451,6 +472,7 @@ fn run_keys_inner(action: KeysAction) -> anyhow::Result<()> {
                 let (plaintext, record) = store
                     .create_key(lumen_auth::store::NewKey {
                         name,
+                        group_id,
                         budget_max,
                         rpm_limit,
                         tpm_limit,
@@ -654,6 +676,12 @@ async fn drain_on_shutdown(
                 tracing::warn!(%error, "final budget flush failed");
             }
         }
+        let dirty_groups = runtime.keys.drain_dirty_groups();
+        if !dirty_groups.is_empty() {
+            if let Err(error) = runtime.store.persist_group_budgets(&dirty_groups).await {
+                tracing::warn!(%error, "final group budget flush failed");
+            }
+        }
     }
     if let Some(writer) = usage_writer {
         if tokio::time::timeout(Duration::from_secs(5), writer)
@@ -744,6 +772,36 @@ struct AuthBoot {
     auth_knobs: Arc<AuthKnobs>,
 }
 
+/// Periodic budget flush: memory → DB, keys then group pools (ADR 009) on
+/// the same cadence. A crash loses at most one interval of *accounting*;
+/// enforcement lives in memory and is reloaded from the last flush at boot.
+/// The cadence is read live from `knobs` so a hot reload retunes it without
+/// a restart (a sleep loop, since a live period change can't be pushed into
+/// a fixed `tokio::time::Interval`).
+fn spawn_budget_flush_task(runtime: Arc<AuthRuntime>, knobs: Arc<AuthKnobs>) {
+    tokio::spawn(async move {
+        loop {
+            // `.max(1)` guards a reload that disabled auth (knob validated to be
+            // non-zero while auth is enabled, but a disabling reload sets 0).
+            let interval = Duration::from_millis(knobs.flush_interval_ms().max(1));
+            tokio::time::sleep(interval).await;
+            let dirty = runtime.keys.drain_dirty();
+            if !dirty.is_empty() {
+                if let Err(error) = runtime.store.persist_budgets(&dirty).await {
+                    tracing::warn!(%error, "budget flush failed; will retry next interval");
+                }
+            }
+            let dirty_groups = runtime.keys.drain_dirty_groups();
+            if dirty_groups.is_empty() {
+                continue;
+            }
+            if let Err(error) = runtime.store.persist_group_budgets(&dirty_groups).await {
+                tracing::warn!(%error, "group budget flush failed; will retry next interval");
+            }
+        }
+    });
+}
+
 /// Boot the M5 auth stack: master key, SQLite store, provider-key back-fill,
 /// in-memory key table, usage writer, periodic budget flush and retention
 /// purge. The flush and purge tasks read their cadence/window from the shared
@@ -783,12 +841,17 @@ async fn boot_auth_stack(
         }
     }
 
+    let groups = store
+        .load_groups()
+        .await
+        .context("failed to load budget groups")?;
+    let group_count = groups.len();
     let entries = store
         .load_auth_entries()
         .await
         .context("failed to load virtual keys")?;
-    let keys = AuthState::load(entries);
-    tracing::info!(key_count = keys.len(), "virtual keys loaded");
+    let keys = AuthState::load(groups, entries);
+    tracing::info!(key_count = keys.len(), group_count, "virtual keys loaded");
 
     let (logger, writer) = spawn_usage_writer(
         store.clone(),
@@ -821,28 +884,7 @@ async fn boot_auth_stack(
     // (zeroized on drop) and the one-way admin hash; wipe the clear copy.
     master_value.zeroize();
 
-    // Periodic budget flush: memory → DB. A crash loses at most one interval
-    // of *accounting*; enforcement lives in memory and is reloaded from the
-    // last flush at boot. The cadence is read live from `auth_knobs` so a hot
-    // reload retunes it without a restart (a sleep loop, since a live period
-    // change can't be pushed into a fixed `tokio::time::Interval`).
-    let flush_runtime = Arc::clone(&runtime);
-    let flush_knobs = Arc::clone(&auth_knobs);
-    tokio::spawn(async move {
-        loop {
-            // `.max(1)` guards a reload that disabled auth (knob validated to be
-            // non-zero while auth is enabled, but a disabling reload sets 0).
-            let interval = Duration::from_millis(flush_knobs.flush_interval_ms().max(1));
-            tokio::time::sleep(interval).await;
-            let dirty = flush_runtime.keys.drain_dirty();
-            if dirty.is_empty() {
-                continue;
-            }
-            if let Err(error) = flush_runtime.store.persist_budgets(&dirty).await {
-                tracing::warn!(%error, "budget flush failed; will retry next interval");
-            }
-        }
-    });
+    spawn_budget_flush_task(Arc::clone(&runtime), Arc::clone(&auth_knobs));
 
     // Retention purge: drop usage_log rows older than the window. The window is
     // read live from `auth_knobs` each tick so a reload retunes it in place.
@@ -965,12 +1007,45 @@ mod tests {
             Action::Keys(KeysAction::Create {
                 config: PathBuf::from("prod.toml"),
                 name: "team-search".to_owned(),
+                group_id: None,
                 budget_max: Some(50.5),
                 rpm_limit: Some(60),
                 tpm_limit: Some(100_000),
                 expires_at: Some(1_752_537_600),
             })
         );
+    }
+
+    #[test]
+    fn keys_create_parses_a_group_id() {
+        let action = parse_args_from(args(&[
+            "keys",
+            "create",
+            "--name",
+            "proj-a",
+            "--group-id",
+            "grp-1",
+        ]))
+        .expect("keys create with --group-id should parse");
+        assert_eq!(
+            action,
+            Action::Keys(KeysAction::Create {
+                config: PathBuf::from("config.toml"),
+                name: "proj-a".to_owned(),
+                group_id: Some("grp-1".to_owned()),
+                budget_max: None,
+                rpm_limit: None,
+                tpm_limit: None,
+                expires_at: None,
+            })
+        );
+    }
+
+    #[test]
+    fn keys_create_rejects_a_blank_group_id() {
+        let err = parse_args_from(args(&["keys", "create", "--name", "x", "--group-id", " "]))
+            .expect_err("a whitespace-only group id must error");
+        assert!(err.contains("--group-id"), "error was: {err}");
     }
 
     #[test]
@@ -982,6 +1057,7 @@ mod tests {
             Action::Keys(KeysAction::Create {
                 config: PathBuf::from("config.toml"),
                 name: "bootstrap".to_owned(),
+                group_id: None,
                 budget_max: None,
                 rpm_limit: None,
                 tpm_limit: None,
@@ -1098,6 +1174,7 @@ mod tests {
             "create",
             "--config=prod.toml",
             "--name=team-search",
+            "--group-id=grp-1",
             "--budget-max=50.5",
             "--rpm-limit=60",
             "--tpm-limit=100000",
@@ -1109,6 +1186,7 @@ mod tests {
             Action::Keys(KeysAction::Create {
                 config: PathBuf::from("prod.toml"),
                 name: "team-search".to_owned(),
+                group_id: Some("grp-1".to_owned()),
                 budget_max: Some(50.5),
                 rpm_limit: Some(60),
                 tpm_limit: Some(100_000),

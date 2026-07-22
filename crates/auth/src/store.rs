@@ -22,6 +22,8 @@ pub struct VirtualKeyRecord {
     pub id: String,
     /// Human-readable label.
     pub name: String,
+    /// The budget group this key draws from (ADR 009); `None` = no group.
+    pub group_id: Option<String>,
     /// Hard budget in USD; `None` = unlimited.
     pub budget_max: Option<f64>,
     /// Spend accumulated so far (flushed periodically from memory).
@@ -42,11 +44,65 @@ pub struct VirtualKeyRecord {
     pub deleted_at: Option<i64>,
 }
 
+/// One budget-group row (ADR 009): a shared budget pool any number of
+/// virtual keys can belong to. Groups have no secret - there is no hash and
+/// no plaintext, only the record.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, sqlx::FromRow)]
+pub struct GroupRecord {
+    /// Opaque identifier (primary key, safe to expose in the admin API).
+    pub id: String,
+    /// Human-readable label.
+    pub name: String,
+    /// Shared hard budget in USD; `None` = unlimited (pure attribution).
+    pub budget_max: Option<f64>,
+    /// Pool spend accumulated so far (flushed periodically from memory).
+    pub budget_spent: f64,
+    /// Creation time, unix seconds.
+    pub created_at: i64,
+    /// Soft-delete tombstone (unix seconds); `None` = active. A deleted
+    /// group stops enforcing and cannot gain members, but its row stays so
+    /// `usage_log.group_id` attribution survives.
+    pub deleted_at: Option<i64>,
+}
+
+/// Parameters for creating a budget group.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct NewGroup {
+    /// Human-readable label.
+    pub name: String,
+    /// Shared hard budget in USD; `None` = unlimited.
+    pub budget_max: Option<f64>,
+}
+
+/// A partial group update: `None` fields are left unchanged.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct GroupPatch {
+    /// New label.
+    pub name: Option<String>,
+    /// New shared hard budget in USD.
+    pub budget_max: Option<f64>,
+}
+
+/// The outcome of a [`KeyStore::delete_group`] call. A group with live
+/// member keys refuses deletion - silently orphaning members into
+/// unlimited spend would be worse than an error.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DeleteGroupOutcome {
+    /// The group was tombstoned; the final record is returned.
+    Deleted(GroupRecord),
+    /// The group still has this many active member keys; nothing changed.
+    HasMembers(i64),
+    /// No active group with that id exists (unknown or already deleted).
+    NotFound,
+}
+
 /// Parameters for creating a key.
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 pub struct NewKey {
     /// Human-readable label.
     pub name: String,
+    /// Budget group to join (ADR 009); must name an active group.
+    pub group_id: Option<String>,
     /// Hard budget in USD; `None` = unlimited.
     pub budget_max: Option<f64>,
     /// Requests-per-minute cap.
@@ -59,10 +115,22 @@ pub struct NewKey {
 
 /// A partial update: `None` fields are left unchanged (fields cannot be
 /// cleared back to NULL through a patch - create a new key instead).
+///
+/// `group_id` is the one deliberate exception (ADR 009): leaving a group
+/// must not require re-minting the key, so it is tri-state - absent leaves
+/// membership unchanged, JSON `null` leaves the group, a string joins one.
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 pub struct KeyPatch {
     /// New label.
     pub name: Option<String>,
+    /// Group membership change: `None` = unchanged, `Some(None)` = leave,
+    /// `Some(Some(id))` = join (the group must be active).
+    // The nesting IS the wire contract (absent vs null vs value), so the
+    // clippy::option_option lint's "use an enum" advice would only rename
+    // the same three states.
+    #[allow(clippy::option_option)]
+    #[serde(default, deserialize_with = "double_option")]
+    pub group_id: Option<Option<String>>,
     /// New hard budget in USD.
     pub budget_max: Option<f64>,
     /// New RPM cap.
@@ -75,12 +143,27 @@ pub struct KeyPatch {
     pub disabled: Option<bool>,
 }
 
+/// Deserialize a field so that *absent* and *null* are distinguishable:
+/// absent stays `None` (via `#[serde(default)]`), an explicit JSON `null`
+/// becomes `Some(None)`, and a value becomes `Some(Some(value))`.
+// See the allow on `KeyPatch::group_id`: the nesting is the wire contract.
+#[allow(clippy::option_option)]
+fn double_option<'de, D>(deserializer: D) -> Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    serde::Deserialize::deserialize(deserializer).map(Some)
+}
+
 /// One usage-log entry (M5 §5.3 / ADR 003). No prompt or response content -
 /// counts, cost and labels only.
 #[derive(Debug, Clone)]
 pub struct UsageRecord {
     /// The virtual key that made the call; `None` when auth is disabled.
     pub key_id: Option<String>,
+    /// The key's budget group at accounting begin (ADR 009); `None` when the
+    /// key had none or auth is disabled. Stamped on refusal rows too.
+    pub group_id: Option<String>,
     /// Client-facing model id the client requested.
     pub model: String,
     /// Model that actually served the request - the same as `model` unless a
@@ -130,6 +213,8 @@ pub struct UsageRecord {
 pub struct UsageFilter {
     /// Only rows for this virtual key id.
     pub key_id: Option<String>,
+    /// Only rows attributed to this budget group id (ADR 009).
+    pub group_id: Option<String>,
     /// Only rows for this client-facing model id.
     pub model: Option<String>,
     /// Only rows served by this provider instance.
@@ -159,6 +244,8 @@ pub enum UsageGroupBy {
     Capability,
     /// Group by virtual key id (rows without a key group under `""`).
     KeyId,
+    /// Group by budget group id (ADR 009; rows without one group under `""`).
+    GroupId,
     /// Group by the HTTP status returned to the client.
     Status,
     /// No grouping: one aggregate row over every matching request.
@@ -176,6 +263,7 @@ impl UsageGroupBy {
             "provider" => Some(Self::Provider),
             "capability" => Some(Self::Capability),
             "key_id" => Some(Self::KeyId),
+            "group_id" => Some(Self::GroupId),
             "status" => Some(Self::Status),
             "total" => Some(Self::Total),
             _ => None,
@@ -191,6 +279,7 @@ impl UsageGroupBy {
             Self::Provider => "provider",
             Self::Capability => "capability",
             Self::KeyId => "key_id",
+            Self::GroupId => "group_id",
             Self::Status => "status",
             Self::Total => "total",
         }
@@ -205,6 +294,7 @@ impl UsageGroupBy {
             Self::Provider => "provider",
             Self::Capability => "capability",
             Self::KeyId => "COALESCE(key_id, '')",
+            Self::GroupId => "COALESCE(group_id, '')",
             Self::Status => "CAST(status AS TEXT)",
             Self::Total => "'total'",
         }
@@ -299,10 +389,14 @@ impl KeyStore {
         &self,
         params: NewKey,
     ) -> Result<(PlaintextKey, VirtualKeyRecord), AuthError> {
+        if let Some(group_id) = &params.group_id {
+            self.require_active_group(group_id).await?;
+        }
         let plaintext = generate();
         let record = VirtualKeyRecord {
             id: random_id(),
             name: params.name,
+            group_id: params.group_id,
             budget_max: params.budget_max,
             budget_spent: 0.0,
             rpm_limit: params.rpm_limit,
@@ -314,12 +408,13 @@ impl KeyStore {
         };
         sqlx::query(
             "INSERT INTO virtual_keys \
-             (id, key_hash, name, budget_max, budget_spent, rpm_limit, tpm_limit, expires_at, disabled, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             (id, key_hash, name, group_id, budget_max, budget_spent, rpm_limit, tpm_limit, expires_at, disabled, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&record.id)
         .bind(hash_key(plaintext.reveal()))
         .bind(&record.name)
+        .bind(&record.group_id)
         .bind(record.budget_max)
         .bind(record.budget_spent)
         .bind(record.rpm_limit)
@@ -332,11 +427,26 @@ impl KeyStore {
         Ok((plaintext, record))
     }
 
+    /// Fail with [`AuthError::UnknownGroup`] unless `group_id` names an
+    /// active (non-deleted) budget group.
+    async fn require_active_group(&self, group_id: &str) -> Result<(), AuthError> {
+        let exists = sqlx::query("SELECT 1 FROM budget_groups WHERE id = ? AND deleted_at IS NULL")
+            .bind(group_id)
+            .fetch_optional(&self.pool)
+            .await?
+            .is_some();
+        if exists {
+            Ok(())
+        } else {
+            Err(AuthError::UnknownGroup(group_id.to_owned()))
+        }
+    }
+
     /// Look a key up by the BLAKE3 hash of its plaintext. Deleted keys are
     /// invisible here: a tombstoned hash must never authenticate.
     pub async fn find_by_hash(&self, hash: &str) -> Result<Option<VirtualKeyRecord>, AuthError> {
         let record = sqlx::query_as::<_, VirtualKeyRecord>(
-            "SELECT id, name, budget_max, budget_spent, rpm_limit, tpm_limit, expires_at, disabled, created_at, deleted_at \
+            "SELECT id, name, group_id, budget_max, budget_spent, rpm_limit, tpm_limit, expires_at, disabled, created_at, deleted_at \
              FROM virtual_keys WHERE key_hash = ? AND deleted_at IS NULL",
         )
         .bind(hash)
@@ -350,7 +460,7 @@ impl KeyStore {
     /// never leaves the auth layer; deleted keys never load.
     pub async fn load_auth_entries(&self) -> Result<Vec<(String, VirtualKeyRecord)>, AuthError> {
         let rows = sqlx::query(
-            "SELECT id, key_hash, name, budget_max, budget_spent, rpm_limit, tpm_limit, expires_at, disabled, created_at, deleted_at \
+            "SELECT id, key_hash, name, group_id, budget_max, budget_spent, rpm_limit, tpm_limit, expires_at, disabled, created_at, deleted_at \
              FROM virtual_keys WHERE deleted_at IS NULL",
         )
         .fetch_all(&self.pool)
@@ -361,6 +471,7 @@ impl KeyStore {
             let record = VirtualKeyRecord {
                 id: row.try_get("id")?,
                 name: row.try_get("name")?,
+                group_id: row.try_get("group_id")?,
                 budget_max: row.try_get("budget_max")?,
                 budget_spent: row.try_get("budget_spent")?,
                 rpm_limit: row.try_get("rpm_limit")?,
@@ -387,7 +498,7 @@ impl KeyStore {
             "WHERE deleted_at IS NULL "
         };
         let records = sqlx::query_as::<_, VirtualKeyRecord>(&format!(
-            "SELECT id, name, budget_max, budget_spent, rpm_limit, tpm_limit, expires_at, disabled, created_at, deleted_at \
+            "SELECT id, name, group_id, budget_max, budget_spent, rpm_limit, tpm_limit, expires_at, disabled, created_at, deleted_at \
              FROM virtual_keys {filter}ORDER BY created_at, id",
         ))
         .fetch_all(&self.pool)
@@ -402,6 +513,16 @@ impl KeyStore {
         id: &str,
         patch: KeyPatch,
     ) -> Result<Option<VirtualKeyRecord>, AuthError> {
+        // Validate a join BEFORE any write, so an unknown group rejects the
+        // whole patch instead of half-applying it.
+        if let Some(Some(group_id)) = &patch.group_id {
+            self.require_active_group(group_id).await?;
+        }
+        // `group_id` is tri-state (ADR 009): COALESCE cannot express
+        // clear-to-NULL, so a flag bind selects between "keep" and "set"
+        // (where the set value may itself be NULL) in the same statement.
+        let group_change = patch.group_id.is_some();
+        let group_value = patch.group_id.flatten();
         let changed = sqlx::query(
             "UPDATE virtual_keys SET \
                name = COALESCE(?, name), \
@@ -409,7 +530,8 @@ impl KeyStore {
                rpm_limit = COALESCE(?, rpm_limit), \
                tpm_limit = COALESCE(?, tpm_limit), \
                expires_at = COALESCE(?, expires_at), \
-               disabled = COALESCE(?, disabled) \
+               disabled = COALESCE(?, disabled), \
+               group_id = CASE WHEN ? THEN ? ELSE group_id END \
              WHERE id = ? AND deleted_at IS NULL",
         )
         .bind(patch.name)
@@ -418,6 +540,8 @@ impl KeyStore {
         .bind(patch.tpm_limit)
         .bind(patch.expires_at)
         .bind(patch.disabled)
+        .bind(group_change)
+        .bind(group_value)
         .bind(id)
         .execute(&self.pool)
         .await?
@@ -477,7 +601,7 @@ impl KeyStore {
     /// successful write - the caller already checked the row exists).
     async fn fetch_key(&self, id: &str) -> Result<Option<VirtualKeyRecord>, AuthError> {
         let record = sqlx::query_as::<_, VirtualKeyRecord>(
-            "SELECT id, name, budget_max, budget_spent, rpm_limit, tpm_limit, expires_at, disabled, created_at, deleted_at \
+            "SELECT id, name, group_id, budget_max, budget_spent, rpm_limit, tpm_limit, expires_at, disabled, created_at, deleted_at \
              FROM virtual_keys WHERE id = ?",
         )
         .bind(id)
@@ -501,6 +625,152 @@ impl KeyStore {
         Ok(())
     }
 
+    // ---- Budget groups (ADR 009) --------------------------------------------
+
+    /// Create a budget group. Groups have no secret: the record is the whole
+    /// story.
+    pub async fn create_group(&self, params: NewGroup) -> Result<GroupRecord, AuthError> {
+        let record = GroupRecord {
+            id: random_id(),
+            name: params.name,
+            budget_max: params.budget_max,
+            budget_spent: 0.0,
+            created_at: now_unix(),
+            deleted_at: None,
+        };
+        sqlx::query(
+            "INSERT INTO budget_groups (id, name, budget_max, budget_spent, created_at) \
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(&record.id)
+        .bind(&record.name)
+        .bind(record.budget_max)
+        .bind(record.budget_spent)
+        .bind(record.created_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(record)
+    }
+
+    /// Every active group - for the admin API. Pass `include_deleted = true`
+    /// to also see tombstones (audit view).
+    pub async fn list_groups(&self, include_deleted: bool) -> Result<Vec<GroupRecord>, AuthError> {
+        let filter = if include_deleted {
+            ""
+        } else {
+            "WHERE deleted_at IS NULL "
+        };
+        let records = sqlx::query_as::<_, GroupRecord>(&format!(
+            "SELECT id, name, budget_max, budget_spent, created_at, deleted_at \
+             FROM budget_groups {filter}ORDER BY created_at, id",
+        ))
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(records)
+    }
+
+    /// Every **active** group - exclusively for building the in-memory
+    /// [`AuthState`](crate::state::AuthState) at boot and on reload.
+    pub async fn load_groups(&self) -> Result<Vec<GroupRecord>, AuthError> {
+        self.list_groups(false).await
+    }
+
+    /// Apply a partial update; returns the updated record, or `None` when
+    /// the id does not exist (or was deleted - tombstones reject updates).
+    pub async fn update_group(
+        &self,
+        id: &str,
+        patch: GroupPatch,
+    ) -> Result<Option<GroupRecord>, AuthError> {
+        let changed = sqlx::query(
+            "UPDATE budget_groups SET \
+               name = COALESCE(?, name), \
+               budget_max = COALESCE(?, budget_max) \
+             WHERE id = ? AND deleted_at IS NULL",
+        )
+        .bind(patch.name)
+        .bind(patch.budget_max)
+        .bind(id)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        if changed == 0 {
+            return Ok(None);
+        }
+        self.fetch_group(id).await
+    }
+
+    /// Soft-delete a group, refusing while it still has active member keys
+    /// (they would silently fall out of pool enforcement otherwise). The
+    /// tombstone keeps `usage_log.group_id` attribution, mirroring key
+    /// deletion.
+    pub async fn delete_group(&self, id: &str) -> Result<DeleteGroupOutcome, AuthError> {
+        let members: i64 = sqlx::query(
+            "SELECT COUNT(*) AS n FROM virtual_keys \
+             WHERE group_id = ? AND deleted_at IS NULL",
+        )
+        .bind(id)
+        .fetch_one(&self.pool)
+        .await?
+        .try_get("n")?;
+        if members > 0 {
+            // Only report members for a group that actually exists (and is
+            // not already tombstoned) - otherwise fall through to NotFound.
+            let active =
+                sqlx::query("SELECT 1 FROM budget_groups WHERE id = ? AND deleted_at IS NULL")
+                    .bind(id)
+                    .fetch_optional(&self.pool)
+                    .await?
+                    .is_some();
+            if active {
+                return Ok(DeleteGroupOutcome::HasMembers(members));
+            }
+        }
+        let changed = sqlx::query(
+            "UPDATE budget_groups SET deleted_at = ? WHERE id = ? AND deleted_at IS NULL",
+        )
+        .bind(now_unix())
+        .bind(id)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        if changed == 0 {
+            return Ok(DeleteGroupOutcome::NotFound);
+        }
+        match self.fetch_group(id).await? {
+            Some(record) => Ok(DeleteGroupOutcome::Deleted(record)),
+            None => Ok(DeleteGroupOutcome::NotFound),
+        }
+    }
+
+    /// Fetch one group by id, tombstoned or not (internal re-read after a
+    /// successful write).
+    async fn fetch_group(&self, id: &str) -> Result<Option<GroupRecord>, AuthError> {
+        let record = sqlx::query_as::<_, GroupRecord>(
+            "SELECT id, name, budget_max, budget_spent, created_at, deleted_at \
+             FROM budget_groups WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(record)
+    }
+
+    /// Persist absolute pool spend `(group id, spent USD)` - the group half
+    /// of the periodic budget flush. One transaction for the whole batch.
+    pub async fn persist_group_budgets(&self, spent: &[(String, f64)]) -> Result<(), AuthError> {
+        let mut tx = self.pool.begin().await?;
+        for (id, amount) in spent {
+            sqlx::query("UPDATE budget_groups SET budget_spent = ? WHERE id = ?")
+                .bind(amount)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     // ---- Usage log ----------------------------------------------------------
 
     /// Insert a batch of usage records in one transaction (the async writer's
@@ -510,10 +780,11 @@ impl KeyStore {
         for rec in batch {
             sqlx::query(
                 "INSERT INTO usage_log \
-                 (key_id, model, model_used, provider, capability, tokens_in, tokens_out, search_units, cached_tokens, reasoning_tokens, cache_write_tokens, media_count, media_bytes, estimated, cost, latency_ms, status, metadata, ts) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 (key_id, group_id, model, model_used, provider, capability, tokens_in, tokens_out, search_units, cached_tokens, reasoning_tokens, cache_write_tokens, media_count, media_bytes, estimated, cost, latency_ms, status, metadata, ts) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(&rec.key_id)
+            .bind(&rec.group_id)
             .bind(&rec.model)
             .bind(&rec.model_used)
             .bind(&rec.provider)
@@ -584,6 +855,7 @@ impl KeyStore {
         );
         for (present, clause) in [
             (filter.key_id.is_some(), " AND key_id = ?"),
+            (filter.group_id.is_some(), " AND group_id = ?"),
             (filter.model.is_some(), " AND model = ?"),
             (filter.provider.is_some(), " AND provider = ?"),
             (filter.capability.is_some(), " AND capability = ?"),
@@ -597,6 +869,7 @@ impl KeyStore {
         let mut query = sqlx::query(&sql).bind(filter.since).bind(filter.until);
         for value in [
             &filter.key_id,
+            &filter.group_id,
             &filter.model,
             &filter.provider,
             &filter.capability,
@@ -691,15 +964,18 @@ impl KeyStore {
     /// request path.
     pub async fn debug_dump(&self) -> Result<String, AuthError> {
         let mut dump = String::new();
-        for table in ["virtual_keys", "usage_log"] {
+        for table in ["virtual_keys", "budget_groups", "usage_log"] {
             // `quote()` renders any SQLite value as a literal; the column list
             // is fixed per table so this stays injection-free.
             let sql = match table {
                 "virtual_keys" => {
-                    "SELECT quote(id)||'|'||quote(key_hash)||'|'||quote(name)||'|'||quote(budget_max)||'|'||quote(budget_spent)||'|'||quote(rpm_limit)||'|'||quote(tpm_limit)||'|'||quote(expires_at)||'|'||quote(disabled)||'|'||quote(created_at)||'|'||quote(deleted_at) AS r FROM virtual_keys"
+                    "SELECT quote(id)||'|'||quote(key_hash)||'|'||quote(name)||'|'||quote(group_id)||'|'||quote(budget_max)||'|'||quote(budget_spent)||'|'||quote(rpm_limit)||'|'||quote(tpm_limit)||'|'||quote(expires_at)||'|'||quote(disabled)||'|'||quote(created_at)||'|'||quote(deleted_at) AS r FROM virtual_keys"
+                }
+                "budget_groups" => {
+                    "SELECT quote(id)||'|'||quote(name)||'|'||quote(budget_max)||'|'||quote(budget_spent)||'|'||quote(created_at)||'|'||quote(deleted_at) AS r FROM budget_groups"
                 }
                 _ => {
-                    "SELECT quote(id)||'|'||quote(key_id)||'|'||quote(model)||'|'||quote(model_used)||'|'||quote(capability)||'|'||quote(tokens_in)||'|'||quote(tokens_out)||'|'||quote(search_units)||'|'||quote(cached_tokens)||'|'||quote(reasoning_tokens)||'|'||quote(cache_write_tokens)||'|'||quote(estimated)||'|'||quote(cost)||'|'||quote(latency_ms)||'|'||quote(status)||'|'||coalesce(metadata,'')||'|'||quote(ts) AS r FROM usage_log"
+                    "SELECT quote(id)||'|'||quote(key_id)||'|'||quote(group_id)||'|'||quote(model)||'|'||quote(model_used)||'|'||quote(capability)||'|'||quote(tokens_in)||'|'||quote(tokens_out)||'|'||quote(search_units)||'|'||quote(cached_tokens)||'|'||quote(reasoning_tokens)||'|'||quote(cache_write_tokens)||'|'||quote(estimated)||'|'||quote(cost)||'|'||quote(latency_ms)||'|'||quote(status)||'|'||coalesce(metadata,'')||'|'||quote(ts) AS r FROM usage_log"
                 }
             };
             for row in sqlx::query(sql).fetch_all(&self.pool).await? {

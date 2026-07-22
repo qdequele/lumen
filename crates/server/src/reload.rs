@@ -351,12 +351,25 @@ pub async fn reload_once(path: &Path, targets: &Arc<ReloadTargets>) {
             ),
         }
     }
-    // Virtual keys created offline (e.g. `lumen keys create` straight against
-    // the DB) become live here: re-read the table and upsert into the
-    // in-memory state. New hashes are inserted; existing entries only have
-    // their limits re-applied and keep their in-memory spend. A DB error
-    // keeps the current table (a sick DB never locks anyone out).
+    // Virtual keys and budget groups created offline (e.g. `lumen keys
+    // create` straight against the DB) become live here: re-read the tables
+    // and upsert into the in-memory state. Groups refresh FIRST so the key
+    // pass can resolve its group pointers (ADR 009). New entries are
+    // inserted; existing ones only have their limits re-applied and keep
+    // their in-memory spend. A DB error keeps the current tables (a sick DB
+    // never locks anyone out).
     if let Some(runtime) = &targets.auth_runtime {
+        match runtime.store.load_groups().await {
+            Ok(groups) => {
+                for record in &groups {
+                    runtime.keys.upsert_group(record);
+                }
+            }
+            Err(error) => tracing::warn!(
+                %error,
+                "budget-group refresh failed; keeping the current in-memory group table"
+            ),
+        }
         match runtime.store.load_auth_entries().await {
             Ok(entries) => {
                 for (hash, record) in entries {
@@ -687,7 +700,7 @@ mod tests {
         // before the offline key existed.
         let store = KeyStore::in_memory().await.expect("store");
         let runtime = Arc::new(AuthRuntime {
-            keys: AuthState::load(Vec::new()),
+            keys: AuthState::load(Vec::new(), Vec::new()),
             store: store.clone(),
             admin_token_hash: hash_key("admin"),
             master: None,

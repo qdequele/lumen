@@ -54,6 +54,9 @@
 - [004 - Streaming passthrough](adr/004-streaming-passthrough.md)
 - [005 - Resilience execution](adr/005-resilience-execution.md)
 - [006 - Client cancellation error code](adr/006-client-cancellation-error-code.md)
+- [007 - Accounting refinements](adr/007-accounting-refinements.md)
+- [008 - Hot reload auth & DB key rotation](adr/008-hot-reload-auth-and-db-key-rotation.md)
+- [009 - Shared parent budgets](adr/009-shared-parent-budgets.md)
 
 # Project
 

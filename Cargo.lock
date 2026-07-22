@@ -141,6 +141,7 @@ name = "auth"
 version = "0.2.0"
 dependencies = [
  "aes-gcm",
+ "arc-swap",
  "blake3",
  "core",
  "dashmap",

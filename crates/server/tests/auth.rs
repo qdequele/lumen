@@ -151,6 +151,7 @@ impl Harness {
             .store
             .create_key(NewKey {
                 name: "test-key".to_owned(),
+                group_id: None,
                 budget_max: budget,
                 rpm_limit: rpm,
                 tpm_limit: tpm,
@@ -202,8 +203,9 @@ async fn spawn_auth_with_store(
     metadata_labels: &[&str],
     store: KeyStore,
 ) -> Harness {
+    let groups = store.load_groups().await.expect("load groups");
     let entries = store.load_auth_entries().await.expect("load entries");
-    let keys = AuthState::load(entries);
+    let keys = AuthState::load(groups, entries);
     let runtime = Arc::new(AuthRuntime {
         keys,
         store: store.clone(),
@@ -1426,6 +1428,7 @@ async fn admin_delete_retry_evicts_a_zombie_key_from_memory() {
     let zombie = VirtualKeyRecord {
         id: id.clone(),
         name: "zombie".to_owned(),
+        group_id: None,
         budget_max: None,
         budget_spent: 0.0,
         rpm_limit: None,
