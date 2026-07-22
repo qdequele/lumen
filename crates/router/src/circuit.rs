@@ -161,8 +161,7 @@ impl CircuitBreaker {
                 // presumed lost (no on_success/on_failure ever ran) and a fresh
                 // probe is admitted so the breaker cannot wedge shut.
                 let expires_at = inner.probe_admitted_at.map(|t| t + self.config.cooldown);
-                // MSRV 1.80: `Option::is_none_or` is 1.82, so use `map_or`.
-                let stale = expires_at.map_or(true, |deadline| now >= deadline);
+                let stale = expires_at.is_none_or(|deadline| now >= deadline);
                 if inner.probe_in_flight && !stale {
                     Admission::Rejected {
                         retry_after: expires_at

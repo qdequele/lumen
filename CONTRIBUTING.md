@@ -33,7 +33,9 @@ Hard code rules (full list in [`CLAUDE.md`](CLAUDE.md#strict-code-rules)):
 ## Development setup
 
 ```bash
-# Toolchain is pinned via rust-toolchain.toml; rustup will honor it.
+# rust-toolchain.toml selects the floating `stable` channel (rustup honors
+# it); the supported floor is MSRV 1.88, declared in Cargo.toml and checked
+# in CI.
 rustup update
 
 cargo build --workspace

@@ -35,6 +35,28 @@ jobs:
       - name: Tests
         run: cargo test --workspace
 
+  # The MSRV is a support statement, so it must compile: check the workspace
+  # against the committed Cargo.lock on the declared minimum (Cargo.toml
+  # `rust-version`). Keep the toolchain version here in sync with it.
+  msrv:
+    name: MSRV (1.88)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install MSRV toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88"
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check workspace on MSRV (locked)
+        run: cargo check --workspace --locked
+
   no-em-dashes:
     name: no em-dashes
     runs-on: ubuntu-latest

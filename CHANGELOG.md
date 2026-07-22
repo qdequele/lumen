@@ -6,60 +6,22 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ## [Unreleased]
 
-### Fixed
-
-- **README provider matrix matches the shipped code.** The front-page table
-  claimed twenty kinds (nine native) and omitted `azure`, `vertex_ai` and
-  `bedrock` entirely, while denying `cohere` chat and `google` embeddings -
-  all of which are implemented. Regenerated from `docs/providers.md`:
-  twenty-six kinds, fifteen native plus eleven OpenAI-compatible, with the two
-  native-rerank notes (`together`, `cloudflare`) merged into one sentence.
-- **README Benchmarks section no longer denies the recorded head-to-head.**
-  It said the LiteLLM comparison "is not executed" although a recorded run is
-  committed under `bench/results/` and published in `docs/perf-baseline.md`.
-  It now cites that baseline (~2.5 ms added p50 vs LiteLLM's ~324 ms at
-  roughly 140x the RAM and 1/25th the throughput) with the shared-host caveat.
-- **Retired Claude model replaced in every user-facing config.**
-  `claude-3-5-sonnet-20241022` was retired upstream on 2025-10-28, so the
-  flagship `examples/multi-provider-fallback` demo (and `config.example.toml`,
-  `docs/providers.md`, `docs/examples.md`) failed at request time. They now
-  use `claude-sonnet-4-5` / `claude-sonnet-4-5-20250929`; the Bedrock entry
-  uses the region-prefixed inference profile id
-  `us.anthropic.claude-sonnet-4-5-20250929-v1:0` that current Claude models
-  require on Bedrock. Wiremock test fixtures keep the old string (they never
-  reach a real upstream).
-- **Real Cloudflare account id scrubbed from `monitoring/lumen.toml`.** The
-  monitoring docs promise a `YOUR_CLOUDFLARE_ACCOUNT_ID` placeholder, but the
-  committed file carried a real account id, which also disarmed `smoke.py`'s
-  skip guard (a user's `CLOUDFLARE_API_TOKEN` would have been sent against
-  that account's URL). Placeholder restored; the exposed id remains in git
-  history and should be treated as burned.
-- **SECURITY.md points at a working disclosure channel.** The "email the
-  maintainers at the address in the repository metadata" path was a dead end
-  (no address exists in the repo). GitHub private vulnerability reporting is
-  now the single documented channel, linked directly, and enabled on the
-  repository.
-- **Docs front page and CONTRIBUTING list all five pillars.**
-  `docs/introduction.md` and `CONTRIBUTING.md` both said "the four pillars",
-  omitting token observability (pillar 5 and a headline differentiator, per
-  ADR 003).
-- **Backlog no longer defers shipped work.** `docs/backlog.md` listed
-  "Multimodal (images / audio) support" as a v2 idea although image input
-  shipped in v1 (chat vision in M8, multimodal embeddings in M9); the entry
-  now defers only audio.
-- **Em-dash removed from `crates/auth/migrations/0001_init.sql`.** The repo
-  bans em-dashes, but migration 0001's first comment line carried one that the
-  `no-em-dashes` CI job cannot see (its extension allowlist skips `.sql`; a
-  follow-up will invert the check to cover all tracked files). **Upgrade
-  note**: sqlx validates checksums of applied migrations, so an auth database
-  created before this change fails at the next boot with "migration 1 was
-  previously applied but has been modified". Repair the recorded checksum
-  in place:
-  `sqlite3 lumen.db "UPDATE _sqlx_migrations SET checksum = x'1515FFCF83419118A06CACFB964CADC873574B41B912B40A97AF397BC6D799459835F61AD5260B832CB74EB302330AEB' WHERE version = 1;"`
-  New databases are unaffected.
+## [0.2.0] - 2026-07-21
 
 ### Added
 
+- **Release pipeline hardening.** `release.yml` no longer ships untested
+  code: a full gate job (fmt, clippy pedantic, workspace tests) must pass on
+  the tagged commit before binaries build or the image pushes. Every release
+  tarball now gets a `.sha256` checksum file attached alongside it
+  (verification documented in the installation guide), and the GitHub Release
+  body is generated from this changelog's section for the tag; the job fails
+  if the section is missing, so a release can never again ship with empty
+  notes.
+- **MSRV check in CI.** A new `msrv` job runs
+  `cargo check --workspace --locked` on Rust 1.88 for every push and pull
+  request, so the published MSRV can no longer drift from what the committed
+  `Cargo.lock` actually needs.
 - **Route-not-found error envelope** (issue #88). Requests matching no route
   (trailing-slash, extra-segment and other near-miss paths) used to return a
   bare, empty-body 404 outside the LM envelope, and bypassed the virtual-key
@@ -185,7 +147,595 @@ All notable changes to LUMEN are documented here. The format is based on
   default. Setting `api_version` on any other kind is a boot-time config
   validation error.
 
+#### Test & benchmark debt (issue #27)
+
+- **Direct fuzzing of the Anthropic/Google translation paths.** Each provider
+  module gets a `#[cfg(fuzzing)] pub mod fuzzing` shim (compiled only under
+  `cargo fuzz`, which sets `--cfg fuzzing` across the dependency graph, so
+  normal builds are unaffected) exposing `translate_request`/
+  `translate_response`. Four new `fuzz/fuzz_targets/` binaries
+  (`anthropic_translate_request`, `anthropic_translate_response`,
+  `google_translate_request`, `google_translate_response`), wired into the
+  weekly fuzz CI matrix; each ran 10 000 libFuzzer iterations locally with no
+  crashes. See `fuzz/README.md`.
+- **Reproducible, committed LUMEN-vs-LiteLLM benchmark baseline.** `bench/run.sh`
+  drives the full head-to-head (build/start the pinned stack, run k6 against
+  direct/lumen/litellm, sample RAM under load, tear down) in one command and
+  writes a timestamped report to `bench/results/`. `bench/compose.yaml` now
+  pins LiteLLM and mockserver by tag *and* digest. A recorded baseline run is
+  committed and linked from `docs/perf-baseline.md`, with an honest caveat
+  about the recording host's noise.
+- **Real-signal SIGTERM/SIGINT integration test.** `crates/server/tests/signal_shutdown.rs`
+  (`#[cfg(unix)]`) spawns the actual `lumen` binary and sends it a genuine
+  `SIGTERM`/`SIGINT` via `libc::kill`, asserting an in-flight request still
+  completes and the process exits 0 - the real `tokio::signal` path, not just
+  the injected-oneshot `serve()` tests.
+
+#### Opt-in accurate per-model tokenizer (ADR 003)
+
+- New `[tokenizer]` config section with `mode = "heuristic"` (default) or
+  `"accurate"`. The default is unchanged: the cheap byte heuristic, zero added
+  latency, allocation-light, hot-path-safe. `"accurate"` opts into exact
+  per-model BPE counting (`tiktoken-rs`) for the local estimation fallback.
+- Accurate mode selects the tiktoken vocabulary by model prefix: `cl100k_base`
+  for `gpt-4` / `gpt-3.5` / `text-embedding-3`, `o200k_base` for `gpt-4o` /
+  `o1` / `o3` / `gpt-4.1` / `gpt-5`. Non-OpenAI models (Claude, Mistral,
+  Llama, ...) keep the byte heuristic, as does any tokenizer failure -
+  counting never fails or rejects a request.
+- The request path is never delayed: the response envelope always carries the
+  inline heuristic estimate (flagged `estimated`), and the accurate BPE count
+  is computed AFTER the response is handed off, by a spawned background
+  accounting task running the BPE pass on the blocking pool via
+  `tokio::task::spawn_blocking` (repo rule 2). The accurate number lands in
+  Prometheus (`lumen_tokens_total`) and `usage_log` - the accounting surfaces.
+  Latency histograms and `usage_log.latency_ms` are frozen at response time,
+  so the deferral never inflates them. Refinement fires only when an upstream
+  reported no usage (chat non-streaming, embeddings, rerank). Encoders are
+  built once at startup, never on the request path. Local counts stay flagged
+  `estimated = true`; upstream-reported usage always wins. Streaming input
+  counts remain heuristic (the stream is not buffered).
+- New dependency `tiktoken-rs` (pure Rust, MIT; pulls no OpenSSL, honoring the
+  rustls-only mandate).
+
+#### Per-provider connect timeout (issue #24)
+
+- A provider block may now set `connect_timeout_ms`, joining the existing
+  per-provider `first_token_timeout_ms` and `total_timeout_ms` overrides. When
+  set, that provider is given its own `reqwest::Client` (built once at registry
+  construction) with the override as its connect timeout and the same overall
+  backstop as the shared client. Providers that do not override keep sharing the
+  one pooled client, so cross-provider connection pooling is preserved for the
+  common case. Trade-off: an overriding provider no longer shares the pool (its
+  connections pool only within its own client). Config validation rejects a
+  `connect_timeout_ms` of `0`. The override is picked up on hot reload like the
+  other two, because the registry rebuilds its clients from the new specs.
+  Supersedes the ADR 005 deferral of per-provider connect timeouts (amended
+  2026-07-15).
+
+#### Hot reload extended to auth knobs + DB provider-key rotation
+
+- **Hot reload now retunes the safe `[auth]` knobs without a restart.** A
+  `SIGHUP`, config-file change, or admin trigger swaps the budget-flush cadence
+  (`auth.flush_interval_ms`) and the usage-log retention window
+  (`auth.retention_days`) into a shared cell the flush/purge background tasks
+  read live on their next tick. The bounded usage-log channel knobs
+  (`usage_channel_capacity`, `usage_batch_max`, `usage_flush_ms`),
+  `auth.db_path`, `auth.enabled` and the server bind address stay boot-time
+  (rebinding a live listener is out of scope); this is documented in the
+  `reload` module and `docs/backlog.md`.
+- **Rotating a DB-stored provider key takes effect without a restart.**
+  `PUT /admin/provider-keys/{name}` now pings the hot-reload trigger after
+  sealing the key; the reloader re-reads provider keys from the encrypted store
+  (off the request path, in the reload task), rebuilds the provider registry and
+  swaps it atomically. Every reload (SIGHUP / file change / trigger) re-reads the
+  DB keys, so a rotation is picked up even without the admin trigger. A DB read
+  error keeps the previous snapshot, so a reload never strips a working key.
+  Environment-sourced keys keep precedence (rotation only affects env-keyless
+  providers). Closes the M5/M7 backlog debt "DB-stored provider keys are
+  boot-time only" and "auth knobs still boot-time".
+
+#### Richer per-kind health probes (#23)
+
+- The background health-check task (`resilience.health_check_enabled`) now
+  uses a real liveness endpoint for every self-hosted, keyless provider kind,
+  not just TEI: **vLLM** (server-root `GET /health`; a trailing `/v1` in the
+  configured `base_url` is stripped, since the documented convention is
+  `base_url = "http://host:8000/v1"`) and **Ollama**
+  (`GET {base_url}/api/version`), both built for this exact use. A non-2xx
+  response on these now correctly marks the provider `down`, same as TEI.
+- Keyed vendor kinds (OpenAI, Anthropic, the OpenAI-compatible hosts, ...)
+  keep the bare `base_url` reachability probe (any HTTP response counts as
+  `up`) - an unauthenticated call to a real endpoint like `/models` would 401
+  a healthy server, which is a worse signal, and the probe task does not carry
+  provider API keys. This is the explicit default match arm in
+  `ProbeTarget::probe_url`/`is_liveness_endpoint`, so any new `ProviderKind`
+  (several are landing in parallel PRs) automatically inherits bare
+  reachability until it earns a real probe.
+
+#### AWS Bedrock provider (SigV4, Converse API)
+
+- **New `bedrock` provider kind: chat via the AWS Bedrock Converse API.** One
+  uniform schema (`POST /model/{modelId}/converse` and `/converse-stream`)
+  covers the Anthropic, Meta Llama, Amazon Titan/Nova, Mistral and Cohere model
+  families, so the legacy per-model `InvokeModel` schemas are intentionally not
+  implemented. Bidirectional OpenAI ⇄ Converse translation including system
+  prompts, `inferenceConfig`, tools, images (inline `data:` URIs) and usage
+  (`inputTokens`/`outputTokens`, mapped per ADR 003).
+- **AWS Signature Version 4 request signing**, hand-rolled over `hmac` + `sha2`
+  (pure-Rust, rustls-compatible, no OpenSSL and no AWS SDK runtime) to keep the
+  dependency and RAM footprint aligned with the project pillars. The canonical
+  request path is double-encoded per the non-S3 SigV4 rule (wire `%3A`, signed
+  `%253A`), so versioned model ids containing `:` sign correctly; verified by
+  known-answer tests against AWS's published `aws-sig-v4-test-suite` vectors
+  (`get-vanilla`, `post-vanilla`) plus a double-encoding KAT. Credentials are
+  re-read from the standard AWS environment variables (`AWS_ACCESS_KEY_ID`,
+  `AWS_SECRET_ACCESS_KEY`, optional `AWS_SESSION_TOKEN`) on every request, so
+  rotated values apply without a restart; only static keys and pre-issued STS
+  tokens are supported (no IMDS/SSO chain). The secret and session token are
+  never logged and never appear in `Debug`. The signing region is resolved from
+  the `bedrock-runtime.{region}` endpoint host (standard and VPC/PrivateLink
+  shapes) or from `AWS_REGION` / `AWS_DEFAULT_REGION`; an undeterminable region
+  is a startup error, never a silent default.
+- **Streaming** parses the AWS event-stream binary framing
+  (`vnd.amazon.eventstream`: prelude, headers, payload, CRCs) into OpenAI chunks;
+  CRC validation is skipped (TLS assures integrity) but frame lengths are checked
+  exactly. Cancellation aborts the in-flight upstream request like every other
+  provider. Wiremock tests cover signed-header well-formedness, the Converse
+  round-trip, event-stream frame parsing from byte fixtures, streaming
+  translation, partial-stream (no fabricated `[DONE]`), cancellation, and
+  secret hygiene.
+
+#### Additional rerank providers (Mixedbread, Pinecone, NVIDIA NIM, Together)
+
+- Four new rerank kinds broaden first-class rerank coverage (issue #19):
+  - **`mixedbread`** (`mxbai-rerank-*`, hosted): bearer auth,
+    `POST /v1/reranking` (note the path: `reranking`, not `rerank`) with the
+    renamed request fields `input`/`top_k` and a `data`-nested response
+    (`results`/`relevance_score` also accepted). Token-billed, so the gateway
+    reports an ADR-003 `estimated` token count.
+  - **`pinecone`** (hosted inference): authenticates with the `Api-Key` header
+    (not a bearer token) plus a pinned `X-Pinecone-API-Version`, sends
+    documents as `{ "text": ... }` objects, and carries the upstream
+    `usage.rerank_units` through as `search_units` (not estimated).
+  - **`nvidia`** (NIM ranking): `base_url` required (the NIM root), key
+    optional (self-hosted NIMs are keyless). Posts to `{base}/v1/ranking` with
+    `query: { text }` / `passages: [{ text }]`; NIM returns a raw **logit**,
+    passed through unchanged as `relevance_score` (unbounded, comparable only
+    within one response, no sigmoid applied). No `top_n` on the wire, so the
+    gateway truncates afterwards (as for TEI).
+  - **`together`**: the existing OpenAI-compatible `together` kind now also
+    serves **rerank** (LlamaRank) natively via its Cohere-shaped `/rerank`
+    endpoint, mirroring how `cloudflare` adds native rerank; one provider entry
+    serves chat, embed and rerank against the same `base_url` and key.
+- All four honour `CancellationToken` (a client disconnect aborts the upstream
+  call), map upstream status codes to `ProviderError` with a retry hint, and
+  keep the API key out of `Debug`/logs. Covered by the shared rerank
+  conformance suite plus dedicated request-shape/auth-header tests.
+
+#### Cohere chat (Command R / R+)
+
+- The `cohere` provider kind now implements `ChatProvider` alongside its
+  existing embed and rerank capabilities: `POST /v2/chat`, non-streaming and
+  streaming (SSE). Cohere's v2 wire shape is OpenAI-adjacent (roles live
+  directly in `messages`, unlike Anthropic's top-level `system` hoist; an
+  assistant's `tool_calls` are already OpenAI-shaped), so translation is
+  mostly a matter of field renames (`top_p` -> `p`, `stop` -> `stop_sequences`)
+  and `tool_choice` collapsing to Cohere's `REQUIRED`/`NONE` strings (forcing
+  one named tool has no v2 equivalent and falls back to `auto`, dropped with a
+  `debug` trace). `n` (multiple completions) has no v2 equivalent and is
+  likewise dropped with a `debug` trace rather than silently ignored.
+- Streaming translates Cohere's typed SSE events (`message-start`,
+  `content-delta`, `tool-call-start/-delta`, `message-end`) to OpenAI chunks
+  event by event, bounded state only (mirrors the Anthropic/Google streaming
+  translators) - `message-end` is Cohere's sole terminal event and carries
+  both the finish reason and full usage, so it emits the final chunk followed
+  immediately by the stream terminator.
+- Token usage (ADR 003): `usage.tokens` (actual pre-billing counts) is
+  preferred over `usage.billed_units` (what's charged, which can differ e.g.
+  under caching discounts); a response reporting neither leaves `usage: None`
+  so the gateway's local estimator fills in an honestly-flagged count.
+- Every trait method honours `CancellationToken`, including aborting the
+  upstream connection on stream drop (client disconnect), matching every
+  other provider.
+
+#### Google Vertex AI provider
+
+- New provider `kind = "vertex_ai"`: Gemini models on Google Cloud Vertex AI
+  (chat, streaming and non-streaming). Distinct from `kind = "google"` (the
+  public Gemini Developer API): requests go to the regional endpoint
+  `https://{region}-aiplatform.googleapis.com/v1/projects/{project}/locations/{region}/publishers/google/models/{model}:generateContent`
+  (`:streamGenerateContent?alt=sse` when streaming), reusing the existing
+  Gemini wire translation.
+- GCP service-account OAuth: LUMEN signs an RS256 JWT assertion with the
+  account's private key and exchanges it for a short-lived `Bearer` access
+  token (scope `cloud-platform`). Tokens are cached in memory and refreshed
+  60 s before expiry, keeping the exchange off the per-request hot path;
+  concurrent refreshes coalesce onto one fetch. A token-exchange failure is a
+  provider-named upstream error (LM-3003 family), never a misleading client
+  401. The private key is redacted from all `Debug` output, logs and errors.
+- Config: `api_key_env` names an env var holding the full service-account key
+  JSON; `base_url` carries the GCP region (e.g. `us-central1`); the project id
+  comes from the credentials. An unset credentials env var still boots (parity
+  with other providers) and fails per request; garbage credentials JSON is a
+  startup error naming the provider.
+- New workspace dependency `jsonwebtoken` (RS256 signing; `ring`-backed, no
+  OpenSSL, consistent with the rustls-only policy).
+
+#### Azure OpenAI provider (deployment routing + api-version)
+
+- New `azure` provider kind (chat + embeddings): reuses the OpenAI JSON
+  wire schema verbatim (near-passthrough, like `mistral`), with the three
+  Azure-specific deltas bridged in `crates/providers/src/azure`:
+  - URL construction is deployment-routed:
+    `{endpoint}/openai/deployments/{deployment}/{chat/completions|embeddings}?api-version=...`,
+    not the generic OpenAI-compatible `base_url`-swap path.
+  - Auth is the `api-key` header, never a bearer token.
+  - Deployment routing reuses the existing `upstream_id` aliasing mechanism -
+    set a model's `upstream_id` to the Azure deployment name, no new config
+    field needed (the router already rewrites `req.model` to `upstream_id`
+    before calling the provider).
+  - `api-version` is selected via a `?api-version=YYYY-MM-DD` query string on
+    `base_url`, defaulting to a pinned recent version when omitted. There is
+    no dedicated `api_version` config field yet - see the module doc comment
+    and `docs/providers.md#azure` for the known gap and workaround.
+- `base_url` is required for `azure` (every Azure resource endpoint is
+  operator-specific; there is no shared public default).
+- `config.example.toml` and `docs/providers.md` updated with a worked example.
+
+#### Provider-native file/GCS image URI sources (issue #12)
+
+- Chat vision content parts now accept two provider-native image references
+  alongside inline `data:` URIs and remote `http(s)` URLs: an Anthropic Files
+  API reference, spelled `anthropic-file:<file_id>` in the `url` field, and a
+  Gemini-native file/GCS reference (`gs://bucket/object`, or a Gemini Files
+  API URI under `https://generativelanguage.googleapis.com/`).
+- Anthropic translates `anthropic-file:<file_id>` to a `source: {type: "file",
+  file_id}` content block instead of `base64`/`url`.
+- Gemini translates a `gs://`/Files API URI to a `fileData.fileUri` part
+  instead of `inlineData`; the mime type is included only when it can be
+  confidently inferred from the URI's extension, otherwise omitted so Gemini
+  falls back to the mime type it recorded at upload time. Caveat: the Gemini
+  Developer API (the `google` kind's default endpoint) only resolves its own
+  Files API URIs; `gs://` is a Vertex AI capability, forwarded verbatim and
+  rejected by the default upstream (documented in `docs/providers.md`).
+- A Gemini Files API URI is also an `https://` URL; it is exempt from the
+  `LM-2004` remote-URL pre-flight so it reaches Gemini as `fileData.fileUri`
+  instead of being wrongly rejected.
+- Sending a provider-native reference to a provider that cannot resolve it
+  (e.g. an Anthropic `file_id` routed to Gemini) is now rejected before any
+  upstream call with a new `LM-2008` (400) client error, instead of surfacing
+  as a translation failure (502) from the mismatched provider.
+
+#### Per-image vision token heuristic for the estimation fallback
+
+- The local prompt-token estimation fallback (`estimate_chat_prompt`, ADR 003)
+  no longer counts an image content part as `0` tokens. Each image part now
+  contributes a flat per-image estimate: `85` tokens for `"detail": "low"`
+  (OpenAI's exact, resolution-independent low-detail cost) or `765` tokens for
+  `"detail": "high"`/`"auto"`/unset (an approximation of OpenAI's tile formula
+  for a typical ~1024x1024 image, since the gateway does not decode image
+  bytes on the request path to learn the real dimensions - see the ADR 003
+  vision addendum). This only affects requests where the upstream reports no
+  `usage` at all; upstream-reported usage was already accurate and is
+  untouched. Fixes #9.
+
+#### Gemini tool calling
+
+- **The Google (Gemini) provider now supports tool calling** instead of
+  silently dropping it (issue #4). Request translation maps OpenAI `tools` to
+  Gemini `tools[].functionDeclarations` and `tool_choice` to
+  `toolConfig.functionCallingConfig` (`auto`/`required`/`none`/specific
+  function). Assistant `tool_calls` become `functionCall` parts (role `model`)
+  and role `tool` messages become `functionResponse` parts (role `user`,
+  consecutive results merged). Both the non-streaming and streaming response
+  translators surface Gemini `functionCall` parts as OpenAI `tool_calls` and
+  map the trailing `STOP` to `finish_reason: "tool_calls"`. A synthetic call
+  id (`call_<n>`) is minted since Gemini does not return one.
+
+#### `--check-config` validation mode
+
+- New `lumen --check-config [--config <PATH>]` mode for CI / deploy pipelines
+  (issue #21): loads and fully validates the config the same way the server
+  does at boot, including semantic validation and provider registry
+  construction (which catches reference errors such as a missing `base_url`
+  for a self-hosted provider). Prints a clear success or failure message and
+  exits 0 when the config is valid, non-zero otherwise. Binds no listener,
+  opens no database, and contacts no provider, so it is safe to run ahead of
+  a real boot.
+- New `lumen_server::check_config` library function backs the flag, kept
+  separate from `main` so the validation logic stays unit-testable.
+
+#### Embeddings/rerank input format gaps (issue #25)
+
+- **Token-array embedding inputs.** `POST /v1/embeddings` now accepts
+  pre-tokenized `input`: a single token-id array (`[1,2,3]`, one item) or a batch
+  of them (`[[1,2],[3,4]]`). They pass through natively on OpenAI-compatible
+  providers and count one token per id in the estimation fallback. String and
+  string-batch inputs are unchanged (untagged order tries them first).
+  Providers whose APIs only take text (Cohere, TEI, Ollama, Jina, Voyage,
+  Mistral) reject token-array input with an honest 400 (`LM-1001`,
+  `ProviderError::UnsupportedInput`) BEFORE any upstream call, instead of
+  sending an empty or garbled body upstream (rule 8).
+- **base64 embedding output.** When a client sets `encoding_format: "base64"`,
+  each vector is re-encoded as OpenAI-style base64 (little-endian `f32` bytes) at
+  the response edge. Because the gateway always holds vectors as `Vec<f32>`
+  internally, this works for every provider, including Ollama and TEI that have
+  no upstream `encoding_format`. Any other value serializes as a float array.
+- **Rerank object documents with `rank_fields`.** `RerankDocument` object
+  documents now keep all their fields, and the request accepts an optional
+  Cohere-style `rank_fields` selector. Each object document is reduced to a
+  single ranking text at the gateway edge (selected fields joined with newlines,
+  or the `text` field when no selector), so providers still only ever see plain
+  text. Note: with `return_documents: true`, an object document's echoed
+  `document.text` is that reduced ranking text, not the original JSON object.
+- **Ollama strict mode.** A new per-provider `strict = true` (config
+  `[[providers]] strict`) makes Ollama reject a request that sets `dimensions`
+  (which it cannot honor) with a 400 (`LM-1001`) naming the field, instead of
+  silently returning full-width vectors. The default stays lenient (drops the
+  field with a debug log). Backed by a new `ProviderError::UnsupportedField`
+  that maps to a client 400 and is never retried or failed over.
+
+#### Cohere embed `input_type` override (#22)
+
+- `POST /v1/embeddings` now accepts an `input_type` extra field so a caller
+  can override Cohere's query-vs-document intent (`search_query`,
+  `search_document`, `classification`, `clustering`) instead of always
+  getting the `search_document` default - materially affects retrieval
+  quality for query-time embeddings. `EmbedRequest` gained an `extra` map
+  (the `serde(flatten)` idiom `ChatRequest` already uses) that captures
+  unknown request fields for provider translation code and survives automatic
+  batching intact. Unlike the chat path, `extra` is never re-serialized into
+  an outgoing provider body: only the Cohere translation consumes
+  `input_type`, and unknown fields stop at the gateway rather than being
+  forwarded to OpenAI-compatible upstreams (which may be strict). An
+  unrecognized `input_type` is rejected with `LM-1001` before any upstream
+  call. See `docs/providers.md` § cohere.
+
+#### Token-based rerank usage for Jina/Voyage (issue #10)
+
+- `RerankUsage` gains `total_tokens` and `tokens_estimated`, additive to the
+  existing `search_units`/`estimated` pair. Jina and Voyage bill rerank in
+  tokens rather than search units and report `usage.total_tokens`; the
+  gateway now surfaces that upstream count unflagged (`tokens_estimated`
+  omitted), instead of always synthesising a local estimate.
+- Every rerank response now carries a `total_tokens` count for uniform
+  observability (ADR 003): when the upstream does not report one (Cohere,
+  TEI, or Jina/Voyage without `usage`), the gateway falls back to the
+  existing `query + documents` heuristic and flags it
+  `"tokens_estimated": true`.
+- `POST /v1/rerank` accounting (`lumen_tokens_total{...,estimated}` and
+  `usage_log.estimated`) now reflects whether the *token* count was
+  upstream-reported or gateway-derived, rather than always `true`.
+
+#### Cloudflare Workers AI rerank (native endpoint)
+
+- The `cloudflare` kind now serves **rerank** in addition to chat/embed.
+  Workers AI's `bge-reranker-*` models are not part of the OpenAI-compatible
+  surface, so reranking is translated against Cloudflare's native
+  `POST /ai/run/{model}` endpoint (`{ query, contexts, top_k }` in,
+  `{ result: { response: [{ id, score }] }, success, errors }` out) rather
+  than the OpenAI-compatible path used for chat/embed. One `[[providers]]`
+  entry with `kind = "cloudflare"` now serves all three capabilities against
+  the same account-scoped `base_url`; the native endpoint's URL is derived by
+  stripping a trailing `/ai/v1` (or `/v1`) suffix to reach the account root.
+  Cloudflare reports no token usage for this model, so `usage` follows the
+  same ADR 003 fallback as TEI (a gateway-derived estimate, marked
+  `estimated`).
+
+#### Endpoint latency observability
+
+- **Every endpoint now measures and publishes its latency.** A new middleware
+  times each HTTP request (including `/health`, `/health/providers`,
+  `/metrics`, `/v1/models` and `/admin/*`) and exports
+  `lumen_http_request_duration_seconds{method,path,status}` - `path` is the
+  matched route template (or `"unmatched"`), never the raw URI, so cardinality
+  stays bounded and user data never reaches a label. Each request also emits a
+  `lumen::http` "request completed" log event carrying `latency_ms` inside the
+  request span. For streaming responses this layer measures
+  time-to-response-headers.
+- New `lumen_request_duration_seconds{capability,model,provider,status}`
+  histogram: end-to-end latency of accounted API calls (chat/embed/rerank),
+  attributed to the model/provider that actually served the request (fallbacks
+  included). Recorded when accounting closes, so streaming chat covers the
+  full stream - the Prometheus counterpart of `usage_log.latency_ms`.
+- The `lumen::usage` structured log event now includes `latency_ms`, from the
+  same clock read as the usage-log row and the histogram sample.
+
+#### Multimodal embeddings + guarded image fetch (M9)
+
+- `POST /v1/embeddings` now accepts image inputs via OpenAI-style content parts:
+  `input` may be an array whose items are strings or arrays of typed parts
+  (`{"type":"text",...}` / `{"type":"image_url",...}`), mixable per item. The
+  part `type` defaults to `"text"`, and text-vs-image is decided by which field
+  is present, not by `type`. Text-only `input` (string or string array) is
+  unchanged. Reuses the shared `ContentPart`/`ImageUrl` types from
+  `crates/core/src/chat.rs` (introduced by M8 chat vision).
+- Per-model `modalities` config (default `["text"]`), surfaced in
+  `GET /v1/models`. Image input to a model without `"image"` fails fast with
+  `LM-2003` (400) before any upstream call.
+- Multimodal translation for Cohere (embed-v4 `inputs`/`content`), Voyage
+  (`/multimodalembeddings`), and Jina (object `input` array). Non-image-capable
+  providers are gated by the `modalities` check.
+- **Opt-in, guarded server-side image fetch** (`[image_fetch]`, default off):
+  a remote `http(s)` image URL is fetched, base64-encoded, and inlined as a
+  `data:` URI before provider translation. Guards: scheme/host/prefix
+  allowlists, a non-configurable private/loopback/link-local IP block with the
+  connection pinned to the vetted resolved address (DNS-rebinding safe), a
+  streamed size cap, a per-fetch timeout, an `image/*` MIME allowlist, and
+  redirect re-validation. Cancellation-aware. New error codes `LM-2005`
+  (fetch disabled), `LM-2006` (rejected by a guard), `LM-2007` (fetch failed).
+  A remote URL never leaks internal network detail in the client error.
+- Token accounting (ADR 003) for multimodal: upstream `usage` is trusted; the
+  local fallback estimates text parts only (images contribute 0, flagged
+  `estimated`).
+- **Media accounting** as a billing dimension alongside tokens: each request's
+  media item count and total **decoded** bytes are measured (per top-level type)
+  and exported as Prometheus counters `lumen_media_total` and
+  `lumen_media_bytes_total` (labels `capability`/`model`/`provider`/`media_type`
+  + the metadata allowlist), added to the `lumen::usage` structured log, and
+  persisted to new `usage_log` columns `media_count` / `media_bytes` (migration
+  `0003`). Measured uniformly whether the image was a client `data:` URI or
+  gateway-fetched.
+
+#### Vision (image input to chat)
+
+- `POST /v1/chat/completions` accepts OpenAI's content-parts message shape
+  (`content` as a string *or* an array of `{"type":"text"|"image_url",...}`
+  parts); unknown future part types (e.g. `input_audio`) survive round-trip
+  verbatim rather than erroring. `MessageContent`/`ContentPart`/`ImageUrl` land
+  in `crates/core/src/chat.rs`.
+- Per-model opt-in: `modalities = ["text", "image"]` in `[[providers.models]]`
+  (default `["text"]`), surfaced in `GET /v1/models`. An image part sent to a
+  model that hasn't opted in is rejected with the new `LM-2003` (400) before
+  any upstream call.
+- **Provider translation:** OpenAI-family kinds (+ `vllm`) forward image parts
+  verbatim; **Anthropic** translates `image_url` to `image` source blocks
+  (base64 or `url`, both directions); **Gemini** translates to `inline_data`
+  (base64 only) - a remote image URL routed to Gemini is rejected with the new
+  `LM-2004` (400) rather than the gateway fetching it itself. LUMEN never
+  dereferences a user-supplied image URL (SSRF-safety + the latency pillar);
+  only providers that fetch remote URLs themselves (OpenAI, Anthropic) may
+  receive one.
+- **Accounting** (ADR 003 addendum): upstream-reported `usage` already folds in
+  image tokens and is trusted as-is; the local estimation fallback counts text
+  only (`MessageContent::text()`), so an image part contributes `0` to an
+  estimate - the response is still honestly flagged `"estimated": true`, never
+  a silent zero. A per-image token heuristic is deferred (`docs/backlog.md`).
+- `LM-1002` request-body-size envelope (previously a raw 413) now wraps every
+  route, including chat - base64-inlined images can be large.
+- Docs: `docs/errors.md` (`LM-2003`/`LM-2004`), a new "Vision (image input)"
+  section in `docs/providers.md`, README capability note, and a commented
+  `modalities` example in `config.example.toml`.
+
+#### OpenAI-compatible provider kinds
+
+- Eleven new `kind`s served by the OpenAI provider with a per-kind base URL:
+  `groq`, `together`, `fireworks`, `deepseek`, `openrouter`, `perplexity`,
+  `xai`, `deepinfra`, `huggingface` (the HF Inference router), `cloudflare`
+  (Workers AI - `base_url` carries the account id, so it is required), and
+  `vllm` (any self-hosted OpenAI-compatible server; `base_url` required, API key
+  optional). All serve chat + embeddings. `ProviderKind` gains
+  `default_base_url()` and `is_openai_compatible()`; a missing URL for the two
+  URL-required kinds is a boot error rather than a silent fall-through to
+  api.openai.com. Docs (`docs/providers.md`, README matrix) and registry +
+  server wiring tests included.
+
+### Changed
+
+- **MSRV corrected to 1.88.** The declared `rust-version = "1.80"` could not
+  build the committed `Cargo.lock` (`home`, `time`, `time-core` and
+  `time-macros` all declare `rust-version = 1.88`). `Cargo.toml`, the
+  installation guide and CONTRIBUTING now state 1.88; CONTRIBUTING no longer
+  calls the floating `stable` channel "pinned"; and the `circuit.rs` `map_or`
+  workaround for pre-1.82 `Option::is_none_or` is replaced by the real
+  method. The version bump also forces a full re-lint, surfacing the
+  warn-by-default `manual_repeat_n` clippy lint in `telemetry` that cached
+  lint results had masked (fixed with `repeat_n`).
+- **Refreshed the LUMEN-vs-LiteLLM baseline** (`bench/run.sh` at commit
+  `51fc809`): new committed run `bench/results/20260715T231135Z/` and updated
+  numbers in `docs/perf-baseline.md`. Same relative story as the previous
+  baseline: ~2.5 ms added p50 over direct-to-mock for LUMEN vs ~317 ms for
+  LiteLLM, ~25x LiteLLM's throughput at ~7.6 MB vs ~1.03 GB RAM under load.
+- Documentation restructured around capabilities: the mdBook at
+  https://qdequele.github.io/lumen/ is now the canonical documentation home
+  (getting started, chat / embeddings / reranking guides, operations incl.
+  analytics and budgets, examples); the README slimmed down accordingly.
+  Added runnable `examples/` scenarios validated in CI by `--check-config`.
+
+#### First-frame-peek streaming retry (issue #7)
+
+- **Streaming commitment now happens at the first content frame, not at the
+  open.** After the upstream stream opens (2xx + headers), the gateway peeks the
+  first frame before committing the response. An upstream that opens `200` then
+  errors, or closes, before delivering any content frame is now a *pre-commit*
+  failure: it retries and falls over per the existing resilience policy (and
+  penalises the provider's circuit breaker) instead of sending the client a
+  terminal SSE error frame. Once the first content frame arrives the request is
+  committed and the M4 frame guards own the rest, unchanged (a mid-stream error
+  is still a terminal error frame, never retried).
+- The peek buffers at most one frame (zero-copy, ADR 004), is bounded by the
+  per-attempt `first_token` timeout (a silent upstream fails over), and aborts
+  the upstream on a client disconnect during the peek window (no fallback).
+- New `ProviderError::EmptyStream` (retryable, provider-fault) models an upstream
+  that opened but sent no content frame; it maps to the existing `LM-3010` when
+  every link in the chain empty-streams. See ADR 005, 2026-07-15 amendment.
+
+#### Rate-limit and usage-log accounting refinements (issue #26, ADR 007)
+
+- **TPM is now settled to real usage, like the budget.** A successful request
+  debits the pre-call token estimate to the per-minute window and then adjusts
+  it to the real token count when accounting closes. A large `max_tokens`
+  reservation no longer starves a key for a full minute after a short reply.
+  A dropped (failed/cancelled) reservation deliberately keeps the TPM debit -
+  a request that hit the gateway still counts against the rate limit - while
+  the budget reservation is refunded (no money was spent).
+- **A request refused inside admission no longer burns quota.** When TPM
+  refuses after RPM was counted, or the budget refuses after RPM and TPM were
+  counted, the earlier bumps are rolled back, so a rejected request consumes no
+  RPM/TPM.
+- **Rejected requests now produce a usage-log row.** An admission refusal
+  (402/429) writes a status-only `usage_log` entry (zero tokens, zero cost, the
+  `status` column carrying the rejection) via the same bounded, non-blocking
+  channel as successful requests - never a synchronous DB write on the request
+  path. Enables per-key rejection analytics. (401 stays unlogged: it is refused
+  in the auth middleware before accounting opens.)
+- **`usage_log.metadata` keeps JSON value types.** Metadata values are stored
+  as typed JSON (`{"batch":42,"canary":true}`) instead of stringified
+  (`{"batch":"42"}`), so numeric/boolean filtering via SQLite `json_extract`
+  works. Prometheus labels still stringify (labels are always strings). The
+  column stays TEXT - no migration.
+
 ### Fixed
+
+- **README provider matrix matches the shipped code.** The front-page table
+  claimed twenty kinds (nine native) and omitted `azure`, `vertex_ai` and
+  `bedrock` entirely, while denying `cohere` chat and `google` embeddings -
+  all of which are implemented. Regenerated from `docs/providers.md`:
+  twenty-six kinds, fifteen native plus eleven OpenAI-compatible, with the two
+  native-rerank notes (`together`, `cloudflare`) merged into one sentence.
+- **README Benchmarks section no longer denies the recorded head-to-head.**
+  It said the LiteLLM comparison "is not executed" although a recorded run is
+  committed under `bench/results/` and published in `docs/perf-baseline.md`.
+  It now cites that baseline (~2.5 ms added p50 vs LiteLLM's ~324 ms at
+  roughly 140x the RAM and 1/25th the throughput) with the shared-host caveat.
+- **Retired Claude model replaced in every user-facing config.**
+  `claude-3-5-sonnet-20241022` was retired upstream on 2025-10-28, so the
+  flagship `examples/multi-provider-fallback` demo (and `config.example.toml`,
+  `docs/providers.md`, `docs/examples.md`) failed at request time. They now
+  use `claude-sonnet-4-5` / `claude-sonnet-4-5-20250929`; the Bedrock entry
+  uses the region-prefixed inference profile id
+  `us.anthropic.claude-sonnet-4-5-20250929-v1:0` that current Claude models
+  require on Bedrock. Wiremock test fixtures keep the old string (they never
+  reach a real upstream).
+- **Real Cloudflare account id scrubbed from `monitoring/lumen.toml`.** The
+  monitoring docs promise a `YOUR_CLOUDFLARE_ACCOUNT_ID` placeholder, but the
+  committed file carried a real account id, which also disarmed `smoke.py`'s
+  skip guard (a user's `CLOUDFLARE_API_TOKEN` would have been sent against
+  that account's URL). Placeholder restored; the exposed id remains in git
+  history and should be treated as burned.
+- **SECURITY.md points at a working disclosure channel.** The "email the
+  maintainers at the address in the repository metadata" path was a dead end
+  (no address exists in the repo). GitHub private vulnerability reporting is
+  now the single documented channel, linked directly, and enabled on the
+  repository.
+- **Docs front page and CONTRIBUTING list all five pillars.**
+  `docs/introduction.md` and `CONTRIBUTING.md` both said "the four pillars",
+  omitting token observability (pillar 5 and a headline differentiator, per
+  ADR 003).
+- **Backlog no longer defers shipped work.** `docs/backlog.md` listed
+  "Multimodal (images / audio) support" as a v2 idea although image input
+  shipped in v1 (chat vision in M8, multimodal embeddings in M9); the entry
+  now defers only audio.
+- **Em-dash removed from `crates/auth/migrations/0001_init.sql`.** The repo
+  bans em-dashes, but migration 0001's first comment line carried one that the
+  `no-em-dashes` CI job cannot see (its extension allowlist skips `.sql`; a
+  follow-up will invert the check to cover all tracked files). **Upgrade
+  note**: sqlx validates checksums of applied migrations, so an auth database
+  created before this change fails at the next boot with "migration 1 was
+  previously applied but has been modified". Repair the recorded checksum
+  in place:
+  `sqlite3 lumen.db "UPDATE _sqlx_migrations SET checksum = x'1515FFCF83419118A06CACFB964CADC873574B41B912B40A97AF397BC6D799459835F61AD5260B832CB74EB302330AEB' WHERE version = 1;"`
+  New databases are unaffected.
 
 - **Embed batch path: short upstream responses and partial usage (issue #89).**
   The shared batching path (`crates/providers/src/batch.rs`) now verifies that
@@ -253,16 +803,6 @@ All notable changes to LUMEN are documented here. The format is based on
   otherwise the gateway's local estimate (marked `estimated`) applies. Both
   kinds pass the shared embed conformance suite, including cancellation.
 
-### Changed
-
-- **Refreshed the LUMEN-vs-LiteLLM baseline** (`bench/run.sh` at commit
-  `51fc809`): new committed run `bench/results/20260715T231135Z/` and updated
-  numbers in `docs/perf-baseline.md`. Same relative story as the previous
-  baseline: ~2.5 ms added p50 over direct-to-mock for LUMEN vs ~317 ms for
-  LiteLLM, ~25x LiteLLM's throughput at ~7.6 MB vs ~1.03 GB RAM under load.
-
-### Fixed
-
 - **`response_format`, `seed`, `logprobs` and `parallel_tool_calls` were
   silently dropped by the translated chat providers** (issue #72). These
   fields pass through verbatim on OpenAI-compatible kinds but the translated
@@ -295,468 +835,6 @@ All notable changes to LUMEN are documented here. The format is based on
   `Config::load` now excludes `master_key` from the `LUMEN_*` env merge
   (`Env::prefixed("LUMEN_").ignore(&["master_key"])`); the secret is still
   read normally by `boot_auth_stack` via `std::env::var`.
-
-### Added - Test & benchmark debt (issue #27)
-
-- **Direct fuzzing of the Anthropic/Google translation paths.** Each provider
-  module gets a `#[cfg(fuzzing)] pub mod fuzzing` shim (compiled only under
-  `cargo fuzz`, which sets `--cfg fuzzing` across the dependency graph, so
-  normal builds are unaffected) exposing `translate_request`/
-  `translate_response`. Four new `fuzz/fuzz_targets/` binaries
-  (`anthropic_translate_request`, `anthropic_translate_response`,
-  `google_translate_request`, `google_translate_response`), wired into the
-  weekly fuzz CI matrix; each ran 10 000 libFuzzer iterations locally with no
-  crashes. See `fuzz/README.md`.
-- **Reproducible, committed LUMEN-vs-LiteLLM benchmark baseline.** `bench/run.sh`
-  drives the full head-to-head (build/start the pinned stack, run k6 against
-  direct/lumen/litellm, sample RAM under load, tear down) in one command and
-  writes a timestamped report to `bench/results/`. `bench/compose.yaml` now
-  pins LiteLLM and mockserver by tag *and* digest. A recorded baseline run is
-  committed and linked from `docs/perf-baseline.md`, with an honest caveat
-  about the recording host's noise.
-- **Real-signal SIGTERM/SIGINT integration test.** `crates/server/tests/signal_shutdown.rs`
-  (`#[cfg(unix)]`) spawns the actual `lumen` binary and sends it a genuine
-  `SIGTERM`/`SIGINT` via `libc::kill`, asserting an in-flight request still
-  completes and the process exits 0 - the real `tokio::signal` path, not just
-  the injected-oneshot `serve()` tests.
-
-### Fixed - Test determinism
-
-- `monitoring/smoke.py` now exercises the Gemini tool-calling roundtrip
-  (`check_chat_tools` added to the `google (gemini)` provider block, skipped
-  like the others when `GEMINI_API_KEY` is absent) and its module docstring
-  and `monitoring/README.md` no longer claim Gemini tool calls are
-  unexercised, now that Gemini tool calling has shipped (issue #4).
-- `resilience.rs::health_stays_fast_under_upstream_429_storm` no longer panics
-  on a client-side TCP connect reset/broken-pipe under its 500-concurrent-request
-  storm (a saturated OS accept backlog on some hosts, not gateway behaviour):
-  the shared `post_chat` test helper now retries pre-response transport errors
-  with backoff. Storm size is also overridable via
-  `LUMEN_RESILIENCE_STORM_SIZE` (default unchanged: 500).
-- `providers::embeddings::mistral_passes_embed_conformance_suite`'s
-  cancellation scenario widened its mocked-delay/elapsed-bound margin (2s/1s →
-  3s/2s) for headroom under full workspace-test parallelism, without weakening
-  what it proves.
-
-### Changed - First-frame-peek streaming retry (issue #7)
-
-- **Streaming commitment now happens at the first content frame, not at the
-  open.** After the upstream stream opens (2xx + headers), the gateway peeks the
-  first frame before committing the response. An upstream that opens `200` then
-  errors, or closes, before delivering any content frame is now a *pre-commit*
-  failure: it retries and falls over per the existing resilience policy (and
-  penalises the provider's circuit breaker) instead of sending the client a
-  terminal SSE error frame. Once the first content frame arrives the request is
-  committed and the M4 frame guards own the rest, unchanged (a mid-stream error
-  is still a terminal error frame, never retried).
-- The peek buffers at most one frame (zero-copy, ADR 004), is bounded by the
-  per-attempt `first_token` timeout (a silent upstream fails over), and aborts
-  the upstream on a client disconnect during the peek window (no fallback).
-- New `ProviderError::EmptyStream` (retryable, provider-fault) models an upstream
-  that opened but sent no content frame; it maps to the existing `LM-3010` when
-  every link in the chain empty-streams. See ADR 005, 2026-07-15 amendment.
-
-### Added - Opt-in accurate per-model tokenizer (ADR 003)
-
-- New `[tokenizer]` config section with `mode = "heuristic"` (default) or
-  `"accurate"`. The default is unchanged: the cheap byte heuristic, zero added
-  latency, allocation-light, hot-path-safe. `"accurate"` opts into exact
-  per-model BPE counting (`tiktoken-rs`) for the local estimation fallback.
-- Accurate mode selects the tiktoken vocabulary by model prefix: `cl100k_base`
-  for `gpt-4` / `gpt-3.5` / `text-embedding-3`, `o200k_base` for `gpt-4o` /
-  `o1` / `o3` / `gpt-4.1` / `gpt-5`. Non-OpenAI models (Claude, Mistral,
-  Llama, ...) keep the byte heuristic, as does any tokenizer failure -
-  counting never fails or rejects a request.
-- The request path is never delayed: the response envelope always carries the
-  inline heuristic estimate (flagged `estimated`), and the accurate BPE count
-  is computed AFTER the response is handed off, by a spawned background
-  accounting task running the BPE pass on the blocking pool via
-  `tokio::task::spawn_blocking` (repo rule 2). The accurate number lands in
-  Prometheus (`lumen_tokens_total`) and `usage_log` - the accounting surfaces.
-  Latency histograms and `usage_log.latency_ms` are frozen at response time,
-  so the deferral never inflates them. Refinement fires only when an upstream
-  reported no usage (chat non-streaming, embeddings, rerank). Encoders are
-  built once at startup, never on the request path. Local counts stay flagged
-  `estimated = true`; upstream-reported usage always wins. Streaming input
-  counts remain heuristic (the stream is not buffered).
-- New dependency `tiktoken-rs` (pure Rust, MIT; pulls no OpenSSL, honoring the
-  rustls-only mandate).
-
-### Added - Per-provider connect timeout (issue #24)
-
-- A provider block may now set `connect_timeout_ms`, joining the existing
-  per-provider `first_token_timeout_ms` and `total_timeout_ms` overrides. When
-  set, that provider is given its own `reqwest::Client` (built once at registry
-  construction) with the override as its connect timeout and the same overall
-  backstop as the shared client. Providers that do not override keep sharing the
-  one pooled client, so cross-provider connection pooling is preserved for the
-  common case. Trade-off: an overriding provider no longer shares the pool (its
-  connections pool only within its own client). Config validation rejects a
-  `connect_timeout_ms` of `0`. The override is picked up on hot reload like the
-  other two, because the registry rebuilds its clients from the new specs.
-  Supersedes the ADR 005 deferral of per-provider connect timeouts (amended
-  2026-07-15).
-
-### Added - Hot reload extended to auth knobs + DB provider-key rotation
-
-- **Hot reload now retunes the safe `[auth]` knobs without a restart.** A
-  `SIGHUP`, config-file change, or admin trigger swaps the budget-flush cadence
-  (`auth.flush_interval_ms`) and the usage-log retention window
-  (`auth.retention_days`) into a shared cell the flush/purge background tasks
-  read live on their next tick. The bounded usage-log channel knobs
-  (`usage_channel_capacity`, `usage_batch_max`, `usage_flush_ms`),
-  `auth.db_path`, `auth.enabled` and the server bind address stay boot-time
-  (rebinding a live listener is out of scope); this is documented in the
-  `reload` module and `docs/backlog.md`.
-- **Rotating a DB-stored provider key takes effect without a restart.**
-  `PUT /admin/provider-keys/{name}` now pings the hot-reload trigger after
-  sealing the key; the reloader re-reads provider keys from the encrypted store
-  (off the request path, in the reload task), rebuilds the provider registry and
-  swaps it atomically. Every reload (SIGHUP / file change / trigger) re-reads the
-  DB keys, so a rotation is picked up even without the admin trigger. A DB read
-  error keeps the previous snapshot, so a reload never strips a working key.
-  Environment-sourced keys keep precedence (rotation only affects env-keyless
-  providers). Closes the M5/M7 backlog debt "DB-stored provider keys are
-  boot-time only" and "auth knobs still boot-time".
-
-### Changed - Rate-limit and usage-log accounting refinements (issue #26, ADR 007)
-
-- **TPM is now settled to real usage, like the budget.** A successful request
-  debits the pre-call token estimate to the per-minute window and then adjusts
-  it to the real token count when accounting closes. A large `max_tokens`
-  reservation no longer starves a key for a full minute after a short reply.
-  A dropped (failed/cancelled) reservation deliberately keeps the TPM debit -
-  a request that hit the gateway still counts against the rate limit - while
-  the budget reservation is refunded (no money was spent).
-- **A request refused inside admission no longer burns quota.** When TPM
-  refuses after RPM was counted, or the budget refuses after RPM and TPM were
-  counted, the earlier bumps are rolled back, so a rejected request consumes no
-  RPM/TPM.
-- **Rejected requests now produce a usage-log row.** An admission refusal
-  (402/429) writes a status-only `usage_log` entry (zero tokens, zero cost, the
-  `status` column carrying the rejection) via the same bounded, non-blocking
-  channel as successful requests - never a synchronous DB write on the request
-  path. Enables per-key rejection analytics. (401 stays unlogged: it is refused
-  in the auth middleware before accounting opens.)
-- **`usage_log.metadata` keeps JSON value types.** Metadata values are stored
-  as typed JSON (`{"batch":42,"canary":true}`) instead of stringified
-  (`{"batch":"42"}`), so numeric/boolean filtering via SQLite `json_extract`
-  works. Prometheus labels still stringify (labels are always strings). The
-  column stays TEXT - no migration.
-
-### Added - Richer per-kind health probes (#23)
-
-- The background health-check task (`resilience.health_check_enabled`) now
-  uses a real liveness endpoint for every self-hosted, keyless provider kind,
-  not just TEI: **vLLM** (server-root `GET /health`; a trailing `/v1` in the
-  configured `base_url` is stripped, since the documented convention is
-  `base_url = "http://host:8000/v1"`) and **Ollama**
-  (`GET {base_url}/api/version`), both built for this exact use. A non-2xx
-  response on these now correctly marks the provider `down`, same as TEI.
-- Keyed vendor kinds (OpenAI, Anthropic, the OpenAI-compatible hosts, ...)
-  keep the bare `base_url` reachability probe (any HTTP response counts as
-  `up`) - an unauthenticated call to a real endpoint like `/models` would 401
-  a healthy server, which is a worse signal, and the probe task does not carry
-  provider API keys. This is the explicit default match arm in
-  `ProbeTarget::probe_url`/`is_liveness_endpoint`, so any new `ProviderKind`
-  (several are landing in parallel PRs) automatically inherits bare
-  reachability until it earns a real probe.
-
-### Added - AWS Bedrock provider (SigV4, Converse API)
-
-- **New `bedrock` provider kind: chat via the AWS Bedrock Converse API.** One
-  uniform schema (`POST /model/{modelId}/converse` and `/converse-stream`)
-  covers the Anthropic, Meta Llama, Amazon Titan/Nova, Mistral and Cohere model
-  families, so the legacy per-model `InvokeModel` schemas are intentionally not
-  implemented. Bidirectional OpenAI ⇄ Converse translation including system
-  prompts, `inferenceConfig`, tools, images (inline `data:` URIs) and usage
-  (`inputTokens`/`outputTokens`, mapped per ADR 003).
-- **AWS Signature Version 4 request signing**, hand-rolled over `hmac` + `sha2`
-  (pure-Rust, rustls-compatible, no OpenSSL and no AWS SDK runtime) to keep the
-  dependency and RAM footprint aligned with the project pillars. The canonical
-  request path is double-encoded per the non-S3 SigV4 rule (wire `%3A`, signed
-  `%253A`), so versioned model ids containing `:` sign correctly; verified by
-  known-answer tests against AWS's published `aws-sig-v4-test-suite` vectors
-  (`get-vanilla`, `post-vanilla`) plus a double-encoding KAT. Credentials are
-  re-read from the standard AWS environment variables (`AWS_ACCESS_KEY_ID`,
-  `AWS_SECRET_ACCESS_KEY`, optional `AWS_SESSION_TOKEN`) on every request, so
-  rotated values apply without a restart; only static keys and pre-issued STS
-  tokens are supported (no IMDS/SSO chain). The secret and session token are
-  never logged and never appear in `Debug`. The signing region is resolved from
-  the `bedrock-runtime.{region}` endpoint host (standard and VPC/PrivateLink
-  shapes) or from `AWS_REGION` / `AWS_DEFAULT_REGION`; an undeterminable region
-  is a startup error, never a silent default.
-- **Streaming** parses the AWS event-stream binary framing
-  (`vnd.amazon.eventstream`: prelude, headers, payload, CRCs) into OpenAI chunks;
-  CRC validation is skipped (TLS assures integrity) but frame lengths are checked
-  exactly. Cancellation aborts the in-flight upstream request like every other
-  provider. Wiremock tests cover signed-header well-formedness, the Converse
-  round-trip, event-stream frame parsing from byte fixtures, streaming
-  translation, partial-stream (no fabricated `[DONE]`), cancellation, and
-  secret hygiene.
-
-### Added - Additional rerank providers (Mixedbread, Pinecone, NVIDIA NIM, Together)
-
-- Four new rerank kinds broaden first-class rerank coverage (issue #19):
-  - **`mixedbread`** (`mxbai-rerank-*`, hosted): bearer auth,
-    `POST /v1/reranking` (note the path: `reranking`, not `rerank`) with the
-    renamed request fields `input`/`top_k` and a `data`-nested response
-    (`results`/`relevance_score` also accepted). Token-billed, so the gateway
-    reports an ADR-003 `estimated` token count.
-  - **`pinecone`** (hosted inference): authenticates with the `Api-Key` header
-    (not a bearer token) plus a pinned `X-Pinecone-API-Version`, sends
-    documents as `{ "text": ... }` objects, and carries the upstream
-    `usage.rerank_units` through as `search_units` (not estimated).
-  - **`nvidia`** (NIM ranking): `base_url` required (the NIM root), key
-    optional (self-hosted NIMs are keyless). Posts to `{base}/v1/ranking` with
-    `query: { text }` / `passages: [{ text }]`; NIM returns a raw **logit**,
-    passed through unchanged as `relevance_score` (unbounded, comparable only
-    within one response, no sigmoid applied). No `top_n` on the wire, so the
-    gateway truncates afterwards (as for TEI).
-  - **`together`**: the existing OpenAI-compatible `together` kind now also
-    serves **rerank** (LlamaRank) natively via its Cohere-shaped `/rerank`
-    endpoint, mirroring how `cloudflare` adds native rerank; one provider entry
-    serves chat, embed and rerank against the same `base_url` and key.
-- All four honour `CancellationToken` (a client disconnect aborts the upstream
-  call), map upstream status codes to `ProviderError` with a retry hint, and
-  keep the API key out of `Debug`/logs. Covered by the shared rerank
-  conformance suite plus dedicated request-shape/auth-header tests.
-
-### Added - Cohere chat (Command R / R+)
-
-- The `cohere` provider kind now implements `ChatProvider` alongside its
-  existing embed and rerank capabilities: `POST /v2/chat`, non-streaming and
-  streaming (SSE). Cohere's v2 wire shape is OpenAI-adjacent (roles live
-  directly in `messages`, unlike Anthropic's top-level `system` hoist; an
-  assistant's `tool_calls` are already OpenAI-shaped), so translation is
-  mostly a matter of field renames (`top_p` -> `p`, `stop` -> `stop_sequences`)
-  and `tool_choice` collapsing to Cohere's `REQUIRED`/`NONE` strings (forcing
-  one named tool has no v2 equivalent and falls back to `auto`, dropped with a
-  `debug` trace). `n` (multiple completions) has no v2 equivalent and is
-  likewise dropped with a `debug` trace rather than silently ignored.
-- Streaming translates Cohere's typed SSE events (`message-start`,
-  `content-delta`, `tool-call-start/-delta`, `message-end`) to OpenAI chunks
-  event by event, bounded state only (mirrors the Anthropic/Google streaming
-  translators) - `message-end` is Cohere's sole terminal event and carries
-  both the finish reason and full usage, so it emits the final chunk followed
-  immediately by the stream terminator.
-- Token usage (ADR 003): `usage.tokens` (actual pre-billing counts) is
-  preferred over `usage.billed_units` (what's charged, which can differ e.g.
-  under caching discounts); a response reporting neither leaves `usage: None`
-  so the gateway's local estimator fills in an honestly-flagged count.
-- Every trait method honours `CancellationToken`, including aborting the
-  upstream connection on stream drop (client disconnect), matching every
-  other provider.
-
-### Fixed - Deterministic 429-storm resilience test
-
-- `health_stays_fast_under_upstream_429_storm` no longer flakes on macOS. The
-  kernel clamps every listen backlog to `kern.ipc.somaxconn` (128 by default)
-  and answers accept-queue overflow with RST, so the test's 500 simultaneous
-  loopback connects were reset by the OS before the gateway ever saw them
-  (surfacing as connect `ECONNRESET` or first-write `EPIPE` panics). The storm
-  now retries kernel-level connection failures with a bounded budget (matching
-  Linux SYN-retransmit semantics), shares one pooled client with a timeout so a
-  wedged gateway fails loudly instead of hanging, pre-warms the health probe's
-  keep-alive connection so the latency bound measures the handler path rather
-  than the kernel's accept queue, and raises the process soft fd limit (the
-  storm holds ~2000 sockets across four hops in one process, above launchd's
-  256 default). What the test asserts is unchanged: /health stays under the
-  same bound during the storm and all 500 requests complete with 429/503.
-
-### Added - Google Vertex AI provider
-
-- New provider `kind = "vertex_ai"`: Gemini models on Google Cloud Vertex AI
-  (chat, streaming and non-streaming). Distinct from `kind = "google"` (the
-  public Gemini Developer API): requests go to the regional endpoint
-  `https://{region}-aiplatform.googleapis.com/v1/projects/{project}/locations/{region}/publishers/google/models/{model}:generateContent`
-  (`:streamGenerateContent?alt=sse` when streaming), reusing the existing
-  Gemini wire translation.
-- GCP service-account OAuth: LUMEN signs an RS256 JWT assertion with the
-  account's private key and exchanges it for a short-lived `Bearer` access
-  token (scope `cloud-platform`). Tokens are cached in memory and refreshed
-  60 s before expiry, keeping the exchange off the per-request hot path;
-  concurrent refreshes coalesce onto one fetch. A token-exchange failure is a
-  provider-named upstream error (LM-3003 family), never a misleading client
-  401. The private key is redacted from all `Debug` output, logs and errors.
-- Config: `api_key_env` names an env var holding the full service-account key
-  JSON; `base_url` carries the GCP region (e.g. `us-central1`); the project id
-  comes from the credentials. An unset credentials env var still boots (parity
-  with other providers) and fails per request; garbage credentials JSON is a
-  startup error naming the provider.
-- New workspace dependency `jsonwebtoken` (RS256 signing; `ring`-backed, no
-  OpenSSL, consistent with the rustls-only policy).
-
-### Added - Azure OpenAI provider (deployment routing + api-version)
-
-- New `azure` provider kind (chat + embeddings): reuses the OpenAI JSON
-  wire schema verbatim (near-passthrough, like `mistral`), with the three
-  Azure-specific deltas bridged in `crates/providers/src/azure`:
-  - URL construction is deployment-routed:
-    `{endpoint}/openai/deployments/{deployment}/{chat/completions|embeddings}?api-version=...`,
-    not the generic OpenAI-compatible `base_url`-swap path.
-  - Auth is the `api-key` header, never a bearer token.
-  - Deployment routing reuses the existing `upstream_id` aliasing mechanism -
-    set a model's `upstream_id` to the Azure deployment name, no new config
-    field needed (the router already rewrites `req.model` to `upstream_id`
-    before calling the provider).
-  - `api-version` is selected via a `?api-version=YYYY-MM-DD` query string on
-    `base_url`, defaulting to a pinned recent version when omitted. There is
-    no dedicated `api_version` config field yet - see the module doc comment
-    and `docs/providers.md#azure` for the known gap and workaround.
-- `base_url` is required for `azure` (every Azure resource endpoint is
-  operator-specific; there is no shared public default).
-- `config.example.toml` and `docs/providers.md` updated with a worked example.
-### Changed
-
-- Documentation restructured around capabilities: the mdBook at
-  https://qdequele.github.io/lumen/ is now the canonical documentation home
-  (getting started, chat / embeddings / reranking guides, operations incl.
-  analytics and budgets, examples); the README slimmed down accordingly.
-  Added runnable `examples/` scenarios validated in CI by `--check-config`.
-
-### Added - Provider-native file/GCS image URI sources (issue #12)
-
-- Chat vision content parts now accept two provider-native image references
-  alongside inline `data:` URIs and remote `http(s)` URLs: an Anthropic Files
-  API reference, spelled `anthropic-file:<file_id>` in the `url` field, and a
-  Gemini-native file/GCS reference (`gs://bucket/object`, or a Gemini Files
-  API URI under `https://generativelanguage.googleapis.com/`).
-- Anthropic translates `anthropic-file:<file_id>` to a `source: {type: "file",
-  file_id}` content block instead of `base64`/`url`.
-- Gemini translates a `gs://`/Files API URI to a `fileData.fileUri` part
-  instead of `inlineData`; the mime type is included only when it can be
-  confidently inferred from the URI's extension, otherwise omitted so Gemini
-  falls back to the mime type it recorded at upload time. Caveat: the Gemini
-  Developer API (the `google` kind's default endpoint) only resolves its own
-  Files API URIs; `gs://` is a Vertex AI capability, forwarded verbatim and
-  rejected by the default upstream (documented in `docs/providers.md`).
-- A Gemini Files API URI is also an `https://` URL; it is exempt from the
-  `LM-2004` remote-URL pre-flight so it reaches Gemini as `fileData.fileUri`
-  instead of being wrongly rejected.
-- Sending a provider-native reference to a provider that cannot resolve it
-  (e.g. an Anthropic `file_id` routed to Gemini) is now rejected before any
-  upstream call with a new `LM-2008` (400) client error, instead of surfacing
-  as a translation failure (502) from the mismatched provider.
-
-### Added - Per-image vision token heuristic for the estimation fallback
-
-- The local prompt-token estimation fallback (`estimate_chat_prompt`, ADR 003)
-  no longer counts an image content part as `0` tokens. Each image part now
-  contributes a flat per-image estimate: `85` tokens for `"detail": "low"`
-  (OpenAI's exact, resolution-independent low-detail cost) or `765` tokens for
-  `"detail": "high"`/`"auto"`/unset (an approximation of OpenAI's tile formula
-  for a typical ~1024x1024 image, since the gateway does not decode image
-  bytes on the request path to learn the real dimensions - see the ADR 003
-  vision addendum). This only affects requests where the upstream reports no
-  `usage` at all; upstream-reported usage was already accurate and is
-  untouched. Fixes #9.
-
-### Added - Gemini tool calling
-
-- **The Google (Gemini) provider now supports tool calling** instead of
-  silently dropping it (issue #4). Request translation maps OpenAI `tools` to
-  Gemini `tools[].functionDeclarations` and `tool_choice` to
-  `toolConfig.functionCallingConfig` (`auto`/`required`/`none`/specific
-  function). Assistant `tool_calls` become `functionCall` parts (role `model`)
-  and role `tool` messages become `functionResponse` parts (role `user`,
-  consecutive results merged). Both the non-streaming and streaming response
-  translators surface Gemini `functionCall` parts as OpenAI `tool_calls` and
-  map the trailing `STOP` to `finish_reason: "tool_calls"`. A synthetic call
-  id (`call_<n>`) is minted since Gemini does not return one.
-
-### Added - `--check-config` validation mode
-
-- New `lumen --check-config [--config <PATH>]` mode for CI / deploy pipelines
-  (issue #21): loads and fully validates the config the same way the server
-  does at boot, including semantic validation and provider registry
-  construction (which catches reference errors such as a missing `base_url`
-  for a self-hosted provider). Prints a clear success or failure message and
-  exits 0 when the config is valid, non-zero otherwise. Binds no listener,
-  opens no database, and contacts no provider, so it is safe to run ahead of
-  a real boot.
-- New `lumen_server::check_config` library function backs the flag, kept
-  separate from `main` so the validation logic stays unit-testable.
-
-### Added - Embeddings/rerank input format gaps (issue #25)
-
-- **Token-array embedding inputs.** `POST /v1/embeddings` now accepts
-  pre-tokenized `input`: a single token-id array (`[1,2,3]`, one item) or a batch
-  of them (`[[1,2],[3,4]]`). They pass through natively on OpenAI-compatible
-  providers and count one token per id in the estimation fallback. String and
-  string-batch inputs are unchanged (untagged order tries them first).
-  Providers whose APIs only take text (Cohere, TEI, Ollama, Jina, Voyage,
-  Mistral) reject token-array input with an honest 400 (`LM-1001`,
-  `ProviderError::UnsupportedInput`) BEFORE any upstream call, instead of
-  sending an empty or garbled body upstream (rule 8).
-- **base64 embedding output.** When a client sets `encoding_format: "base64"`,
-  each vector is re-encoded as OpenAI-style base64 (little-endian `f32` bytes) at
-  the response edge. Because the gateway always holds vectors as `Vec<f32>`
-  internally, this works for every provider, including Ollama and TEI that have
-  no upstream `encoding_format`. Any other value serializes as a float array.
-- **Rerank object documents with `rank_fields`.** `RerankDocument` object
-  documents now keep all their fields, and the request accepts an optional
-  Cohere-style `rank_fields` selector. Each object document is reduced to a
-  single ranking text at the gateway edge (selected fields joined with newlines,
-  or the `text` field when no selector), so providers still only ever see plain
-  text. Note: with `return_documents: true`, an object document's echoed
-  `document.text` is that reduced ranking text, not the original JSON object.
-- **Ollama strict mode.** A new per-provider `strict = true` (config
-  `[[providers]] strict`) makes Ollama reject a request that sets `dimensions`
-  (which it cannot honor) with a 400 (`LM-1001`) naming the field, instead of
-  silently returning full-width vectors. The default stays lenient (drops the
-  field with a debug log). Backed by a new `ProviderError::UnsupportedField`
-  that maps to a client 400 and is never retried or failed over.
-
-### Added - Cohere embed `input_type` override (#22)
-
-- `POST /v1/embeddings` now accepts an `input_type` extra field so a caller
-  can override Cohere's query-vs-document intent (`search_query`,
-  `search_document`, `classification`, `clustering`) instead of always
-  getting the `search_document` default - materially affects retrieval
-  quality for query-time embeddings. `EmbedRequest` gained an `extra` map
-  (the `serde(flatten)` idiom `ChatRequest` already uses) that captures
-  unknown request fields for provider translation code and survives automatic
-  batching intact. Unlike the chat path, `extra` is never re-serialized into
-  an outgoing provider body: only the Cohere translation consumes
-  `input_type`, and unknown fields stop at the gateway rather than being
-  forwarded to OpenAI-compatible upstreams (which may be strict). An
-  unrecognized `input_type` is rejected with `LM-1001` before any upstream
-  call. See `docs/providers.md` § cohere.
-
-### Added - Token-based rerank usage for Jina/Voyage (issue #10)
-
-- `RerankUsage` gains `total_tokens` and `tokens_estimated`, additive to the
-  existing `search_units`/`estimated` pair. Jina and Voyage bill rerank in
-  tokens rather than search units and report `usage.total_tokens`; the
-  gateway now surfaces that upstream count unflagged (`tokens_estimated`
-  omitted), instead of always synthesising a local estimate.
-- Every rerank response now carries a `total_tokens` count for uniform
-  observability (ADR 003): when the upstream does not report one (Cohere,
-  TEI, or Jina/Voyage without `usage`), the gateway falls back to the
-  existing `query + documents` heuristic and flags it
-  `"tokens_estimated": true`.
-- `POST /v1/rerank` accounting (`lumen_tokens_total{...,estimated}` and
-  `usage_log.estimated`) now reflects whether the *token* count was
-  upstream-reported or gateway-derived, rather than always `true`.
-
-### Added - Cloudflare Workers AI rerank (native endpoint)
-
-- The `cloudflare` kind now serves **rerank** in addition to chat/embed.
-  Workers AI's `bge-reranker-*` models are not part of the OpenAI-compatible
-  surface, so reranking is translated against Cloudflare's native
-  `POST /ai/run/{model}` endpoint (`{ query, contexts, top_k }` in,
-  `{ result: { response: [{ id, score }] }, success, errors }` out) rather
-  than the OpenAI-compatible path used for chat/embed. One `[[providers]]`
-  entry with `kind = "cloudflare"` now serves all three capabilities against
-  the same account-scoped `base_url`; the native endpoint's URL is derived by
-  stripping a trailing `/ai/v1` (or `/v1`) suffix to reach the account root.
-  Cloudflare reports no token usage for this model, so `usage` follows the
-  same ADR 003 fallback as TEI (a gateway-derived estimate, marked
-  `estimated`).
-
-### Fixed
-
 - **Dedicated client-cancel error code (issue #11).** A client-initiated
   cancel (`ProviderError::Cancelled`, typically a disconnect mid-request) no
   longer maps to `GatewayError::Internal` (`LM-5001`, 500). It now has its own
@@ -790,103 +868,39 @@ All notable changes to LUMEN are documented here. The format is based on
   (clamped to `0` on a pre-epoch clock, no panics) backs both the
   non-streaming and streaming translation paths.
 
-### Added - Endpoint latency observability
+#### Test determinism
 
-- **Every endpoint now measures and publishes its latency.** A new middleware
-  times each HTTP request (including `/health`, `/health/providers`,
-  `/metrics`, `/v1/models` and `/admin/*`) and exports
-  `lumen_http_request_duration_seconds{method,path,status}` - `path` is the
-  matched route template (or `"unmatched"`), never the raw URI, so cardinality
-  stays bounded and user data never reaches a label. Each request also emits a
-  `lumen::http` "request completed" log event carrying `latency_ms` inside the
-  request span. For streaming responses this layer measures
-  time-to-response-headers.
-- New `lumen_request_duration_seconds{capability,model,provider,status}`
-  histogram: end-to-end latency of accounted API calls (chat/embed/rerank),
-  attributed to the model/provider that actually served the request (fallbacks
-  included). Recorded when accounting closes, so streaming chat covers the
-  full stream - the Prometheus counterpart of `usage_log.latency_ms`.
-- The `lumen::usage` structured log event now includes `latency_ms`, from the
-  same clock read as the usage-log row and the histogram sample.
+- `monitoring/smoke.py` now exercises the Gemini tool-calling roundtrip
+  (`check_chat_tools` added to the `google (gemini)` provider block, skipped
+  like the others when `GEMINI_API_KEY` is absent) and its module docstring
+  and `monitoring/README.md` no longer claim Gemini tool calls are
+  unexercised, now that Gemini tool calling has shipped (issue #4).
+- `resilience.rs::health_stays_fast_under_upstream_429_storm` no longer panics
+  on a client-side TCP connect reset/broken-pipe under its 500-concurrent-request
+  storm (a saturated OS accept backlog on some hosts, not gateway behaviour):
+  the shared `post_chat` test helper now retries pre-response transport errors
+  with backoff. Storm size is also overridable via
+  `LUMEN_RESILIENCE_STORM_SIZE` (default unchanged: 500).
+- `providers::embeddings::mistral_passes_embed_conformance_suite`'s
+  cancellation scenario widened its mocked-delay/elapsed-bound margin (2s/1s →
+  3s/2s) for headroom under full workspace-test parallelism, without weakening
+  what it proves.
 
-### Added - Multimodal embeddings + guarded image fetch (M9)
+#### Deterministic 429-storm resilience test
 
-- `POST /v1/embeddings` now accepts image inputs via OpenAI-style content parts:
-  `input` may be an array whose items are strings or arrays of typed parts
-  (`{"type":"text",...}` / `{"type":"image_url",...}`), mixable per item. The
-  part `type` defaults to `"text"`, and text-vs-image is decided by which field
-  is present, not by `type`. Text-only `input` (string or string array) is
-  unchanged. Reuses the shared `ContentPart`/`ImageUrl` types from
-  `crates/core/src/chat.rs` (introduced by M8 chat vision).
-- Per-model `modalities` config (default `["text"]`), surfaced in
-  `GET /v1/models`. Image input to a model without `"image"` fails fast with
-  `LM-2003` (400) before any upstream call.
-- Multimodal translation for Cohere (embed-v4 `inputs`/`content`), Voyage
-  (`/multimodalembeddings`), and Jina (object `input` array). Non-image-capable
-  providers are gated by the `modalities` check.
-- **Opt-in, guarded server-side image fetch** (`[image_fetch]`, default off):
-  a remote `http(s)` image URL is fetched, base64-encoded, and inlined as a
-  `data:` URI before provider translation. Guards: scheme/host/prefix
-  allowlists, a non-configurable private/loopback/link-local IP block with the
-  connection pinned to the vetted resolved address (DNS-rebinding safe), a
-  streamed size cap, a per-fetch timeout, an `image/*` MIME allowlist, and
-  redirect re-validation. Cancellation-aware. New error codes `LM-2005`
-  (fetch disabled), `LM-2006` (rejected by a guard), `LM-2007` (fetch failed).
-  A remote URL never leaks internal network detail in the client error.
-- Token accounting (ADR 003) for multimodal: upstream `usage` is trusted; the
-  local fallback estimates text parts only (images contribute 0, flagged
-  `estimated`).
-- **Media accounting** as a billing dimension alongside tokens: each request's
-  media item count and total **decoded** bytes are measured (per top-level type)
-  and exported as Prometheus counters `lumen_media_total` and
-  `lumen_media_bytes_total` (labels `capability`/`model`/`provider`/`media_type`
-  + the metadata allowlist), added to the `lumen::usage` structured log, and
-  persisted to new `usage_log` columns `media_count` / `media_bytes` (migration
-  `0003`). Measured uniformly whether the image was a client `data:` URI or
-  gateway-fetched.
-
-### Added - Vision (image input to chat)
-
-- `POST /v1/chat/completions` accepts OpenAI's content-parts message shape
-  (`content` as a string *or* an array of `{"type":"text"|"image_url",...}`
-  parts); unknown future part types (e.g. `input_audio`) survive round-trip
-  verbatim rather than erroring. `MessageContent`/`ContentPart`/`ImageUrl` land
-  in `crates/core/src/chat.rs`.
-- Per-model opt-in: `modalities = ["text", "image"]` in `[[providers.models]]`
-  (default `["text"]`), surfaced in `GET /v1/models`. An image part sent to a
-  model that hasn't opted in is rejected with the new `LM-2003` (400) before
-  any upstream call.
-- **Provider translation:** OpenAI-family kinds (+ `vllm`) forward image parts
-  verbatim; **Anthropic** translates `image_url` to `image` source blocks
-  (base64 or `url`, both directions); **Gemini** translates to `inline_data`
-  (base64 only) - a remote image URL routed to Gemini is rejected with the new
-  `LM-2004` (400) rather than the gateway fetching it itself. LUMEN never
-  dereferences a user-supplied image URL (SSRF-safety + the latency pillar);
-  only providers that fetch remote URLs themselves (OpenAI, Anthropic) may
-  receive one.
-- **Accounting** (ADR 003 addendum): upstream-reported `usage` already folds in
-  image tokens and is trusted as-is; the local estimation fallback counts text
-  only (`MessageContent::text()`), so an image part contributes `0` to an
-  estimate - the response is still honestly flagged `"estimated": true`, never
-  a silent zero. A per-image token heuristic is deferred (`docs/backlog.md`).
-- `LM-1002` request-body-size envelope (previously a raw 413) now wraps every
-  route, including chat - base64-inlined images can be large.
-- Docs: `docs/errors.md` (`LM-2003`/`LM-2004`), a new "Vision (image input)"
-  section in `docs/providers.md`, README capability note, and a commented
-  `modalities` example in `config.example.toml`.
-
-### Added - OpenAI-compatible provider kinds
-
-- Eleven new `kind`s served by the OpenAI provider with a per-kind base URL:
-  `groq`, `together`, `fireworks`, `deepseek`, `openrouter`, `perplexity`,
-  `xai`, `deepinfra`, `huggingface` (the HF Inference router), `cloudflare`
-  (Workers AI - `base_url` carries the account id, so it is required), and
-  `vllm` (any self-hosted OpenAI-compatible server; `base_url` required, API key
-  optional). All serve chat + embeddings. `ProviderKind` gains
-  `default_base_url()` and `is_openai_compatible()`; a missing URL for the two
-  URL-required kinds is a boot error rather than a silent fall-through to
-  api.openai.com. Docs (`docs/providers.md`, README matrix) and registry +
-  server wiring tests included.
+- `health_stays_fast_under_upstream_429_storm` no longer flakes on macOS. The
+  kernel clamps every listen backlog to `kern.ipc.somaxconn` (128 by default)
+  and answers accept-queue overflow with RST, so the test's 500 simultaneous
+  loopback connects were reset by the OS before the gateway ever saw them
+  (surfacing as connect `ECONNRESET` or first-write `EPIPE` panics). The storm
+  now retries kernel-level connection failures with a bounded budget (matching
+  Linux SYN-retransmit semantics), shares one pooled client with a timeout so a
+  wedged gateway fails loudly instead of hanging, pre-warms the health probe's
+  keep-alive connection so the latency bound measures the handler path rather
+  than the kernel's accept queue, and raises the process soft fd limit (the
+  storm holds ~2000 sockets across four hops in one process, above launchd's
+  256 default). What the test asserts is unchanged: /health stays under the
+  same bound during the storm and all 500 requests complete with 429/503.
 
 ## [0.1.0] - 2026-07-13
 
@@ -1220,4 +1234,6 @@ This closes every remaining streaming criterion:
 - Docs: error-code reference (`docs/errors.md`), ADR 001 (crate/lib naming),
   and this changelog.
 
+[Unreleased]: https://github.com/qdequele/lumen/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/qdequele/lumen/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/qdequele/lumen/releases/tag/v0.1.0
