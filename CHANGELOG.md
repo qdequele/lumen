@@ -6,6 +6,32 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **Contributor surface under `.github/`.** Issue forms for bug reports,
+  feature requests and questions (their dropdowns mirror the `area:` /
+  `scope:` label taxonomy from CONTRIBUTING.md, and blank issues are
+  disabled in favor of the forms plus direct links to the docs site and
+  private vulnerability reporting), a pull-request template that is the
+  Definition-of-Done checklist, weekly Dependabot updates for cargo (root
+  and fuzz workspaces, minor/patch bumps grouped) and GitHub Actions, and a
+  CODEOWNERS file routing review to the maintainer.
+
+### Fixed
+
+- **`.dockerignore` keeps local secrets and non-build content out of the
+  image build context.** `.env` files, `config.local.toml`, SQLite
+  artifacts, `fuzz/`, mdBook output, `examples/` and `monitoring/` are now
+  excluded from `COPY . .`; none of them are needed to build the binary,
+  and env files must never reach an image layer or the builder cache.
+- **The `no-em-dashes` CI job now scans every tracked text file.** The old
+  extension allowlist (md/rs/toml/yml/yaml/txt) structurally missed `.sql`,
+  `.json`, `.sh` and `.py`, which is how migration 0001 shipped with an
+  em-dash on its first line (fixed in 0.2.0). The check is inverted to
+  `git grep` over all tracked files (binaries skipped) minus explicit
+  exclusions: `Cargo.lock`, `LICENSE`, and the verbatim third-party output
+  under `bench/results/`.
+
 ## [0.2.0] - 2026-07-21
 
 ### Added

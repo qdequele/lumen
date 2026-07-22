@@ -1,0 +1,15 @@
+name: Question
+description: Ask about behavior, configuration, or usage.
+labels: ["question"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The [documentation](https://qdequele.github.io/lumen/) covers installation, per-capability guides, operations (keys, budgets, metrics, resilience, deployment) and every `LM-xxxx` error code. If it did not answer you, ask away; unanswered questions are how the docs find their gaps.
+  - type: textarea
+    id: question
+    attributes:
+      label: Your question
+      description: Include the config shape you are running (never paste real keys; `api_key_env` names are safe) and what you already tried or read.
+    validations:
+      required: true

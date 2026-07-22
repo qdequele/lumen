@@ -1,0 +1,23 @@
+# Weekly dependency PRs. Complements (not replaces) the session ritual in
+# CLAUDE.md (`cargo outdated` + manual bump): Dependabot catches security
+# releases between sessions and keeps the Actions pins fresh.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directories:
+      - "/"
+      - "/fuzz"
+    schedule:
+      interval: weekly
+    # One grouped PR for routine bumps; security updates still arrive
+    # individually and immediately.
+    groups:
+      minor-and-patch:
+        update-types:
+          - "minor"
+          - "patch"
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly

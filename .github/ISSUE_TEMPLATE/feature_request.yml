@@ -1,0 +1,53 @@
+name: Feature request
+description: Propose an enhancement to the gateway.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before proposing: [docs/backlog.md](https://github.com/qdequele/lumen/blob/main/docs/backlog.md) lists ideas that are already parked, and v1 deliberately excludes a web UI, billing, semantic cache, guardrails/moderation, audio support and a plugin system. A request for one of those is welcome, but it lands in the backlog rather than the near-term plan.
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      description: Which subsystem would this touch? Maintainers turn this into the `area:` label.
+      options:
+        - providers
+        - streaming
+        - tokenizer
+        - observability
+        - config
+        - resilience
+        - testing
+        - vision
+        - not sure
+    validations:
+      required: true
+  - type: dropdown
+    id: scope
+    attributes:
+      label: Capability
+      description: Which capability does this concern? Becomes the `scope:` label; pick "cross-cutting" when it is not tied to one.
+      multiple: true
+      options:
+        - chat
+        - embedding
+        - reranking
+        - cross-cutting
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What can you not do (or not do well) today? Concrete scenario beats abstract capability.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: What should LUMEN do instead? Include the config or API surface you would expect, if you have one in mind.
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives and workarounds
+      description: What you do today instead, and why it is not good enough.
