@@ -1,6 +1,13 @@
 // k6 load script: fixed chat request against $TARGET, reporting p50/p95/p99.
 // Compare a gateway target's percentiles against the direct mock baseline; the
 // difference is the gateway's added latency.
+//
+// Besides total request time (http_req_duration), the report also reads time
+// to first byte out of k6's built-in http_req_waiting metric (request fully
+// written -> first response byte); both land in the --summary-export JSON with
+// the trend stats configured below. Streaming time-to-first-chunk cannot be
+// measured with stock k6 (it buffers response bodies); that variant lives in
+// `cargo bench -p server --bench stream_ttfb`.
 import http from "k6/http";
 import { check } from "k6";
 

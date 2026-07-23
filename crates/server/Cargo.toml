@@ -70,5 +70,9 @@ libc = { workspace = true }
 name = "gateway_overhead"
 harness = false
 
+[[bench]]
+name = "stream_ttfb"
+harness = false
+
 [lints]
 workspace = true
