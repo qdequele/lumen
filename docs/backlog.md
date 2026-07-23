@@ -5,6 +5,26 @@ Ideas surfaced during development that are intentionally out of scope for v1
 Recorded here so they are not lost, and so we don't gold-plate the current
 milestone.
 
+## Noted while building ADR 009 (shared parent budgets)
+
+- **Groups carry budget only.** Group-level RPM/TPM, a group `disabled`
+  flag (pause a whole customer), group expiry, and nested groups are all
+  deliberate non-goals of the first slice; each is a natural follow-up on
+  the same `GroupEntry` shape.
+- **No `lumen groups` offline subcommand.** Groups are created via
+  `POST /admin/groups` (master-key gated, no virtual key needed), so there
+  is no bootstrap chicken-and-egg; `lumen keys create --group-id` covers
+  the offline key path. Add the subcommand only if a real workflow needs
+  fully offline group provisioning.
+- **No `lumen_group_budget_remaining` gauge.** Pool spend is visible via
+  `GET /admin/keys`-style reads (`GET /admin/groups`) and the usage log;
+  a Prometheus gauge per group would be cheap but adds a per-group metric
+  series - decide when a dashboard actually wants it.
+- **Atomic budget top-up.** `PATCH` on a key or group budget is a
+  read-modify-write for the caller; a `POST .../grant {"amount"}` increment
+  route would remove the need to serialize concurrent top-ups in the
+  control plane.
+
 ## Deferred to v2 (from the vision)
 
 - Web admin UI

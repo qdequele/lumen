@@ -23,6 +23,7 @@ aes-gcm = { workspace = true }
 rand = { workspace = true }
 zeroize = { workspace = true }
 dashmap = { workspace = true }
+arc-swap = { workspace = true }
 tokio = { workspace = true }
 
 [dev-dependencies]

@@ -200,6 +200,29 @@ impl std::fmt::Display for QuotaKind {
     }
 }
 
+/// Which hard budget refused the request (ADR 009): the virtual key's own
+/// `budget_max`, or the shared pool of the budget group the key belongs to.
+/// Both carry the same stable code (`LM-4001`, 402) - the semantic is
+/// unchanged, "a hard budget you are subject to is exhausted" - and only the
+/// message text discloses the scope; a caller can only ever observe budgets
+/// it is billed against, so there is no probing concern.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BudgetScope {
+    /// The virtual key's own hard budget.
+    Key,
+    /// The budget group (shared parent pool) the key belongs to.
+    Group,
+}
+
+impl std::fmt::Display for BudgetScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            BudgetScope::Key => "key",
+            BudgetScope::Group => "key's group",
+        })
+    }
+}
+
 /// Coarse client-facing error category. Serialized as the `type` field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -351,10 +374,14 @@ pub enum GatewayError {
     },
 
     // ---- Auth / budget errors (LM-4xxx, codes pinned by the M5 spec) --------
-    /// The virtual key's hard budget is exhausted. Enforced *before* any
-    /// upstream call, so a rejected request never leaks spend.
-    #[error("budget exceeded for this key")]
-    BudgetExceeded,
+    /// A hard budget the key is subject to is exhausted: its own
+    /// `budget_max`, or its budget group's shared pool (ADR 009). Enforced
+    /// *before* any upstream call, so a rejected request never leaks spend.
+    #[error("budget exceeded for this {scope}")]
+    BudgetExceeded {
+        /// Which budget refused: the key's own, or its group's.
+        scope: BudgetScope,
+    },
 
     /// A gateway-side per-key quota (RPM or TPM) was exceeded.
     #[error("{quota} quota exceeded for this key")]
@@ -410,7 +437,7 @@ impl GatewayError {
             GatewayError::UpstreamConnectTimeout { .. } => "LM-3012",
             GatewayError::UpstreamTotalTimeout { .. } => "LM-3013",
             GatewayError::CircuitOpen { .. } => "LM-3020",
-            GatewayError::BudgetExceeded => "LM-4001",
+            GatewayError::BudgetExceeded { .. } => "LM-4001",
             GatewayError::QuotaExceeded {
                 quota: QuotaKind::Rpm,
                 ..
@@ -438,7 +465,7 @@ impl GatewayError {
             | GatewayError::ImageFetchDisabled
             | GatewayError::ImageUrlRejected => 400,
             GatewayError::Unauthorized => 401,
-            GatewayError::BudgetExceeded => 402,
+            GatewayError::BudgetExceeded { .. } => 402,
             GatewayError::ModelNotFound(_) | GatewayError::RouteNotFound => 404,
             GatewayError::PayloadTooLarge { .. } => 413,
             GatewayError::QuotaExceeded { .. } | GatewayError::UpstreamRateLimited { .. } => 429,
@@ -476,7 +503,7 @@ impl GatewayError {
             | GatewayError::EmptyDocuments
             | GatewayError::PayloadTooLarge { .. }
             | GatewayError::Unauthorized
-            | GatewayError::BudgetExceeded
+            | GatewayError::BudgetExceeded { .. }
             | GatewayError::QuotaExceeded { .. } => ErrorType::InvalidRequest,
             GatewayError::Upstream { .. }
             | GatewayError::ImageFetchFailed
@@ -733,8 +760,36 @@ mod tests {
             .code(),
             "LM-3011"
         );
-        // Auth / budget codes (pinned by the M5 spec).
-        assert_eq!(GatewayError::BudgetExceeded.code(), "LM-4001");
+        // Auth / budget codes (pinned by the M5 spec). Both budget scopes
+        // share LM-4001 (ADR 009); only the message text differs.
+        assert_eq!(
+            GatewayError::BudgetExceeded {
+                scope: BudgetScope::Key
+            }
+            .code(),
+            "LM-4001"
+        );
+        assert_eq!(
+            GatewayError::BudgetExceeded {
+                scope: BudgetScope::Group
+            }
+            .code(),
+            "LM-4001"
+        );
+        assert_eq!(
+            GatewayError::BudgetExceeded {
+                scope: BudgetScope::Key
+            }
+            .to_string(),
+            "budget exceeded for this key"
+        );
+        assert_eq!(
+            GatewayError::BudgetExceeded {
+                scope: BudgetScope::Group
+            }
+            .to_string(),
+            "budget exceeded for this key's group"
+        );
         assert_eq!(
             GatewayError::QuotaExceeded {
                 quota: QuotaKind::Rpm,

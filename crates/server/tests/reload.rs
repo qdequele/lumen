@@ -181,3 +181,81 @@ fn single(k: &str, v: &str) -> HashMap<String, String> {
     m.insert(k.to_owned(), v.to_owned());
     m
 }
+
+#[tokio::test]
+async fn reload_makes_an_offline_group_and_member_key_live_and_group_enforced() {
+    // ADR 009 §4: a hot reload re-reads groups from the DB BEFORE keys, so a
+    // group and its member key provisioned straight against the DB (offline,
+    // as `lumen keys create` does) become live - and group-ENFORCED - after
+    // one reload, no restart. Mirrors the offline-key reload test.
+    use lumen_auth::key::hash_key;
+    use lumen_auth::state::{usd_to_micro, AuthState};
+    use lumen_auth::store::{NewGroup, NewKey};
+    use lumen_core::{BudgetScope, GatewayError};
+    use lumen_server::auth::AuthRuntime;
+
+    let upstream = MockServer::start().await;
+    let dir = tempdir();
+    let path = write_config(&dir, &upstream.uri());
+
+    // A live auth runtime whose in-memory tables were loaded at "boot",
+    // before the offline group and key existed.
+    let store = KeyStore::in_memory().await.expect("store");
+    let runtime = Arc::new(AuthRuntime {
+        keys: AuthState::load(Vec::new(), Vec::new()),
+        store: store.clone(),
+        admin_token_hash: hash_key("admin"),
+        master: None,
+    });
+
+    // Offline provisioning straight against the DB: a $5 pool and one
+    // member key, neither of which the live tables have ever seen.
+    let group = store
+        .create_group(NewGroup {
+            name: "offline-pool".to_owned(),
+            budget_max: Some(5.0),
+        })
+        .await
+        .expect("create group offline");
+    let (plaintext, _record) = store
+        .create_key(NewKey {
+            name: "offline-member".to_owned(),
+            group_id: Some(group.id.clone()),
+            ..NewKey::default()
+        })
+        .await
+        .expect("create key offline");
+    assert!(
+        runtime.keys.authenticate(plaintext.reveal(), 0).is_none(),
+        "the offline-created key must not be live before the reload"
+    );
+
+    let targets = Arc::new(ReloadTargets {
+        registry: registry_with_key(&path, "irrelevant-key"),
+        pricing: Arc::new(ArcSwap::from_pointee(CostTable::default())),
+        resilience: Arc::new(ResilienceRuntime::defaults()),
+        metrics: ReloadMetrics::register(&Metrics::new()).expect("reload metrics"),
+        key_backfill: Arc::new(ArcSwap::from_pointee(HashMap::new())),
+        key_source: None,
+        auth_knobs: None,
+        auth_runtime: Some(Arc::clone(&runtime)),
+    });
+    reload_once(&path, &targets).await;
+
+    // Live now...
+    let entry = runtime
+        .keys
+        .authenticate(plaintext.reveal(), 0)
+        .expect("the offline-created key is live after the reload");
+    // ...and enforced against its (also freshly loaded) group: a $10
+    // estimate blows the $5 pool - group-scoped, since the key itself has
+    // no budget of its own.
+    assert!(matches!(
+        entry.admit(0, 1, usd_to_micro(10.0)),
+        Err(GatewayError::BudgetExceeded {
+            scope: BudgetScope::Group
+        })
+    ));
+    // A $3 estimate under the pool is admitted: the key is usable.
+    assert!(entry.admit(0, 1, usd_to_micro(3.0)).is_ok());
+}

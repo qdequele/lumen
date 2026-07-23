@@ -8,6 +8,23 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ### Added
 
+- **Shared parent budgets (budget groups)** - ADR 009. A budget group is a
+  named pool any number of virtual keys can belong to; admission now checks
+  the key's own budget AND the group's shared pool, both in per-process
+  memory before any upstream call, with the same reserve/settle/refund
+  semantics (and ADR 007 rollback guarantees) as per-key budgets. Both
+  refusals stay 402 `LM-4001`; the message text discloses which scope
+  refused (`GatewayError::BudgetExceeded` gained a `scope` field -
+  key-scope message unchanged). New admin surface: `POST`/`GET
+  /admin/groups`, `PATCH`/`DELETE /admin/groups/{id}` (soft delete, refused
+  while active member keys exist), `group_id` on key create, tri-state
+  `group_id` on key patch (absent = unchanged, `null` = leave, string =
+  join), `lumen keys create --group-id`. Usage rows (refusals included)
+  carry `group_id`; `GET /admin/usage` gains `group_by=group_id` and a
+  `group_id` filter. Groups flush, reload and survive crashes exactly like
+  key budgets (migration `0007_budget_groups.sql`). Motivating pattern:
+  prepaid credits per customer with one key per project - one group per
+  customer, top up the group, no chunk allocation.
 - **Operator docs for the questions an SRE asks first.** `deployment.md`
   gains four sections: *Scaling and high availability* (the honest v1
   constraint: with auth enabled, budgets and RPM/TPM quotas are enforced in

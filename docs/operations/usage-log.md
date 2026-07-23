@@ -21,8 +21,10 @@ than that many days.
 ## Querying it over HTTP
 
 `GET /admin/usage` (master-key gated, like every `/admin/*` route) returns
-aggregates over these rows - filtered by key, model, provider, capability
-and time window, grouped by the dimension you choose. Because rows arrive
+aggregates over these rows - filtered by key, budget group (ADR 009),
+model, provider, capability and time window, grouped by the dimension you
+choose. Every row carries the key's `group_id` at admission (refusal rows
+included), so per-pool reporting covers refused traffic too. Because rows arrive
 through the bounded channel above, requests from the last flush interval
 may not be visible yet. See
 [Keys, quotas & budgets](keys-budgets.md#usage--spend-reporting-get-adminusage).

@@ -51,6 +51,7 @@ impl Harness {
             .store
             .create_key(NewKey {
                 name: "test-key".to_owned(),
+                group_id: None,
                 budget_max: None,
                 rpm_limit: None,
                 tpm_limit: None,
@@ -82,8 +83,9 @@ impl Harness {
 /// Spawn an auth-enabled gateway around `registry`.
 async fn spawn_admin(registry: Arc<Registry>) -> Harness {
     let store = KeyStore::in_memory().await.expect("open store");
+    let groups = store.load_groups().await.expect("load groups");
     let entries = store.load_auth_entries().await.expect("load entries");
-    let keys = AuthState::load(entries);
+    let keys = AuthState::load(groups, entries);
     let runtime = Arc::new(AuthRuntime {
         keys,
         store: store.clone(),
@@ -119,6 +121,7 @@ async fn spawn_admin(registry: Arc<Registry>) -> Harness {
 fn row(ts: i64) -> UsageRecord {
     UsageRecord {
         key_id: Some("key-a".to_owned()),
+        group_id: None,
         model: "gpt".to_owned(),
         model_used: "gpt".to_owned(),
         provider: "openai".to_owned(),
@@ -532,4 +535,225 @@ async fn gateway_requests_show_up_with_their_provider() {
     // Upstream reported the usage: nothing was estimated.
     assert_eq!(openai["estimated_requests"], 0);
     assert_eq!(openai["upstream_requests"], 1);
+}
+
+// ---- Group attribution (ADR 009 §5) --------------------------------------------
+//
+// Every usage row - successes AND admission refusals - is stamped with the
+// key's group id, so per-pool reporting works even for refused traffic.
+// `GET /admin/usage` gains `group_by=group_id` and a `group_id` filter.
+
+use figment::providers::{Format, Toml};
+use figment::Figment;
+use lumen_auth::store::NewGroup;
+use lumen_server::config::Config;
+use lumen_server::pricing::CostTable;
+
+/// $1 per embed token (mirrors tests/auth.rs): "abcd" estimates to exactly
+/// $1, so a $2 group pool admits two calls and refuses the third.
+fn dollar_embed_pricing() -> CostTable {
+    let toml = r#"
+        [[providers]]
+        name = "openai"
+        kind = "openai"
+        [[providers.models]]
+        id = "embed-small"
+        capabilities = ["embed"]
+        cost_per_1m_input = 1000000.0
+    "#;
+    let config: Config = Figment::new()
+        .merge(Toml::string(toml))
+        .extract()
+        .expect("valid pricing config");
+    CostTable::from_config(&config)
+}
+
+/// An OpenAI embeddings registry over `upstream`.
+fn embed_registry(upstream: &str) -> Arc<Registry> {
+    Arc::new(
+        Registry::build(
+            vec![ProviderSpec {
+                name: "openai".to_owned(),
+                kind: ProviderKind::Openai,
+                api_key: Some("sk-test-xxx".to_owned()),
+                base_url: Some(upstream.to_owned()),
+                api_version: None,
+                strict: false,
+                connect_timeout_ms: None,
+                models: vec![ModelSpec {
+                    id: "embed-small".to_owned(),
+                    upstream_id: "text-embedding-3-small".to_owned(),
+                    capabilities: vec![Capability::Embed],
+                    modalities: vec!["text".to_owned()],
+                }],
+            }],
+            http::build_client(),
+            Duration::from_secs(300),
+        )
+        .expect("registry builds"),
+    )
+}
+
+async fn mount_embeddings(upstream: &MockServer) {
+    Mock::given(method("POST"))
+        .and(path("/embeddings"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "object": "list",
+            "data": [{ "object": "embedding", "index": 0, "embedding": [0.1, 0.2] }],
+            "model": "text-embedding-3-small",
+            "usage": { "prompt_tokens": 1, "total_tokens": 1 }
+        })))
+        .mount(upstream)
+        .await;
+}
+
+/// Like `spawn_admin`, with the dollar price table attached (so budget
+/// admission can refuse) and groups loaded BEFORE keys, as boot does
+/// (ADR 009 §4).
+async fn spawn_admin_priced(registry: Arc<Registry>) -> Harness {
+    let store = KeyStore::in_memory().await.expect("open store");
+    let groups = store.load_groups().await.expect("load groups");
+    let entries = store.load_auth_entries().await.expect("load entries");
+    let keys = AuthState::load(groups, entries);
+    let runtime = Arc::new(AuthRuntime {
+        keys,
+        store: store.clone(),
+        admin_token_hash: hash_key(&master()),
+        master: Some(MasterKey::from_env_value(&master()).expect("master key")),
+    });
+    let (logger, _writer) = spawn_usage_writer(
+        store.clone(),
+        UsageWriterConfig {
+            capacity: 64,
+            batch_max: 500,
+            flush_interval: Duration::from_millis(25),
+        },
+    );
+
+    let metrics = Metrics::new();
+    let tokens = TokenMetrics::register(&metrics, &[]).expect("register token metrics");
+    let latency = LatencyMetrics::register(&metrics).expect("register latency metrics");
+    let state = AppState::new(metrics, registry, tokens, latency)
+        .with_pricing(dollar_embed_pricing())
+        .with_auth(Arc::clone(&runtime))
+        .with_usage(logger);
+    let base = common::spawn_state(state, LIMIT).await;
+
+    Harness {
+        base,
+        store,
+        runtime,
+        client: reqwest::Client::new(),
+    }
+}
+
+/// Create a group in the DB AND the live state; returns its id.
+async fn create_live_group(h: &Harness, budget_max: Option<f64>) -> String {
+    let record = h
+        .store
+        .create_group(NewGroup {
+            name: "pool".to_owned(),
+            budget_max,
+        })
+        .await
+        .expect("create group");
+    h.runtime.keys.upsert_group(&record);
+    record.id
+}
+
+/// Create a (possibly grouped) key in the DB AND the live state; returns its
+/// plaintext.
+async fn create_live_key(h: &Harness, group_id: Option<&str>) -> String {
+    let (plaintext, record) = h
+        .store
+        .create_key(NewKey {
+            name: "member".to_owned(),
+            group_id: group_id.map(str::to_owned),
+            ..NewKey::default()
+        })
+        .await
+        .expect("create key");
+    h.runtime.keys.upsert(hash_key(plaintext.reveal()), &record);
+    plaintext.reveal().to_owned()
+}
+
+/// One embeddings call ("abcd", a $1 estimate); returns the HTTP status.
+async fn embed(h: &Harness, key: &str) -> u16 {
+    h.client
+        .post(format!("{}/v1/embeddings", h.base))
+        .bearer_auth(key)
+        .json(&json!({ "model": "embed-small", "input": "abcd" }))
+        .send()
+        .await
+        .expect("send")
+        .status()
+        .as_u16()
+}
+
+#[tokio::test]
+async fn usage_rows_carry_the_group_and_group_by_group_id_aggregates_the_pool() {
+    // Successes from BOTH member keys and the group-refused 402 all land
+    // under the pool's id; the ungrouped key's row stays outside it.
+    let upstream = MockServer::start().await;
+    mount_embeddings(&upstream).await;
+    let h = spawn_admin_priced(embed_registry(&upstream.uri())).await;
+
+    let gid = create_live_group(&h, Some(2.0)).await;
+    let member_a = create_live_key(&h, Some(&gid)).await;
+    let member_b = create_live_key(&h, Some(&gid)).await;
+    let loner = create_live_key(&h, None).await;
+
+    assert_eq!(embed(&h, &member_a).await, 200);
+    assert_eq!(embed(&h, &member_b).await, 200);
+    // The $2 pool is drained: the third member call is refused at admission.
+    assert_eq!(embed(&h, &member_a).await, 402);
+    assert_eq!(embed(&h, &loner).await, 200);
+    h.wait_usage_rows(4).await;
+
+    let body: Value = h
+        .usage("?group_by=group_id")
+        .await
+        .json()
+        .await
+        .expect("json");
+    assert_eq!(body["group_by"], "group_id");
+    // Two aggregates: the pool, and the ungrouped remainder.
+    assert_eq!(body["groups"].as_array().expect("groups").len(), 2);
+
+    let pool = group(&body, &gid);
+    assert_eq!(pool["requests"], 3, "both members' rows AND the refusal");
+    assert_eq!(pool["requests_ok"], 2);
+    assert_eq!(
+        pool["requests_client_error"], 1,
+        "the 402 admission refusal is attributed to the pool"
+    );
+    assert_eq!(pool["cost"], 2.0);
+}
+
+#[tokio::test]
+async fn group_id_filter_narrows_the_usage_report_to_the_pool() {
+    let upstream = MockServer::start().await;
+    mount_embeddings(&upstream).await;
+    let h = spawn_admin_priced(embed_registry(&upstream.uri())).await;
+
+    let gid = create_live_group(&h, Some(100.0)).await;
+    let member = create_live_key(&h, Some(&gid)).await;
+    let loner = create_live_key(&h, None).await;
+
+    assert_eq!(embed(&h, &member).await, 200);
+    assert_eq!(embed(&h, &loner).await, 200);
+    h.wait_usage_rows(2).await;
+
+    // Unfiltered: both rows.
+    let all: Value = h.usage("?group_by=total").await.json().await.expect("json");
+    assert_eq!(group(&all, "total")["requests"], 2);
+
+    // Filtered to the pool: the ungrouped row disappears.
+    let narrowed: Value = h
+        .usage(&format!("?group_id={gid}&group_by=total"))
+        .await
+        .json()
+        .await
+        .expect("json");
+    assert_eq!(group(&narrowed, "total")["requests"], 1);
 }

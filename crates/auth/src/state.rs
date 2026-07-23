@@ -18,9 +18,10 @@
 //! DB speaks USD floats at the edges ([`usd_to_micro`] / [`micro_to_usd`]).
 
 use crate::key::hash_key;
-use crate::store::VirtualKeyRecord;
+use crate::store::{GroupRecord, VirtualKeyRecord};
+use arc_swap::ArcSwapOption;
 use dashmap::DashMap;
-use lumen_core::{GatewayError, QuotaKind};
+use lumen_core::{BudgetScope, GatewayError, QuotaKind};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -49,10 +50,89 @@ pub fn micro_to_usd(micro: i64) -> f64 {
     micro as f64 / 1_000_000.0
 }
 
+/// Atomically reserve `reserve` micro-USD against `spent`, bounded by
+/// `max_bound` ([`UNLIMITED`] = no bound). Check-and-reserve is one atomic
+/// step (a CAS loop), so two requests can never both fit into the same
+/// remaining budget. Returns `false`, without reserving, when the addition
+/// would exceed the bound. Shared by the key budget and the group pool
+/// (ADR 009).
+fn reserve_micro(spent: &AtomicI64, max_bound: i64, reserve: i64) -> bool {
+    if max_bound == UNLIMITED {
+        spent.fetch_add(reserve, Ordering::SeqCst);
+        return true;
+    }
+    let mut current = spent.load(Ordering::SeqCst);
+    loop {
+        if current.saturating_add(reserve) > max_bound {
+            return false;
+        }
+        match spent.compare_exchange_weak(
+            current,
+            current + reserve,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Ok(_) => return true,
+            Err(actual) => current = actual,
+        }
+    }
+}
+
+/// The live, request-path view of one budget group (ADR 009): the budget
+/// half of a [`KeyEntry`], shared by every member key through an `Arc`.
+#[derive(Debug)]
+pub struct GroupEntry {
+    id: String,
+    /// Shared hard budget in micro-USD; [`UNLIMITED`] = none.
+    budget_max_micro: AtomicI64,
+    /// Committed + currently-reserved pool spend in micro-USD.
+    spent_micro: AtomicI64,
+    /// Pool spend changed since the last flush.
+    dirty: AtomicBool,
+}
+
+impl GroupEntry {
+    fn from_record(record: &GroupRecord) -> Self {
+        Self {
+            id: record.id.clone(),
+            budget_max_micro: AtomicI64::new(record.budget_max.map_or(UNLIMITED, usd_to_micro)),
+            spent_micro: AtomicI64::new(usd_to_micro(record.budget_spent)),
+            dirty: AtomicBool::new(false),
+        }
+    }
+
+    /// Overwrite the adjustable fields from an (admin-updated) record. The
+    /// accrued pool spend is deliberately NOT overwritten - memory is the
+    /// source of truth for spend after boot, exactly like keys.
+    fn apply_limits(&self, record: &GroupRecord) {
+        self.budget_max_micro.store(
+            record.budget_max.map_or(UNLIMITED, usd_to_micro),
+            Ordering::SeqCst,
+        );
+    }
+
+    /// The group's opaque id (the `budget_groups.id` column).
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Current pool spend (committed + reserved) in micro-USD.
+    #[must_use]
+    pub fn spent_micro(&self) -> i64 {
+        self.spent_micro.load(Ordering::SeqCst)
+    }
+}
+
 /// The live, request-path view of one virtual key.
 #[derive(Debug)]
 pub struct KeyEntry {
     id: String,
+    /// The budget group this key draws from (ADR 009); lock-free load on
+    /// the hot path, swapped by admin membership changes. The `Arc` is
+    /// shared with [`AuthState::groups`], so a group budget patch is
+    /// visible to every member instantly.
+    group: ArcSwapOption<GroupEntry>,
     /// Hard budget in micro-USD; [`UNLIMITED`] = none.
     budget_max_micro: AtomicI64,
     /// Committed + currently-reserved spend in micro-USD.
@@ -75,6 +155,7 @@ impl KeyEntry {
     fn from_record(record: &VirtualKeyRecord) -> Self {
         let entry = Self {
             id: record.id.clone(),
+            group: ArcSwapOption::empty(),
             budget_max_micro: AtomicI64::new(UNLIMITED),
             spent_micro: AtomicI64::new(usd_to_micro(record.budget_spent)),
             rpm_limit: AtomicI64::new(UNLIMITED),
@@ -87,6 +168,20 @@ impl KeyEntry {
         };
         entry.apply_limits(record);
         entry
+    }
+
+    /// Swap the live group this key draws from (admin membership change /
+    /// boot resolve). The pointer is resolved by [`AuthState`], never here:
+    /// the entry knows only the group it enforces against.
+    fn set_group(&self, group: Option<Arc<GroupEntry>>) {
+        self.group.store(group);
+    }
+
+    /// The id of the budget group this key currently draws from, if any -
+    /// a snapshot for usage attribution at accounting begin.
+    #[must_use]
+    pub fn group_id(&self) -> Option<String> {
+        self.group.load().as_ref().map(|g| g.id.clone())
     }
 
     /// Overwrite the adjustable fields from an (admin-updated) record. The
@@ -123,10 +218,12 @@ impl KeyEntry {
     }
 
     /// Admit one request: bump the RPM and TPM windows, then atomically
-    /// reserve the estimated cost against the hard budget. When a later
-    /// admission step refuses (TPM after RPM, or the budget after both), the
-    /// earlier bumps are rolled back so a rejected request consumes no quota
-    /// and never reserves budget.
+    /// reserve the estimated cost against the key's hard budget and, when
+    /// the key belongs to a budget group (ADR 009), against the group's
+    /// shared pool. When a later admission step refuses (TPM after RPM, the
+    /// key budget after both, or the group pool after all three), the
+    /// earlier bumps and reservations are rolled back so a rejected request
+    /// consumes no quota and never reserves budget.
     ///
     /// The TPM window is debited with the pre-call **estimate**;
     /// [`Reservation::settle`] later adjusts it to the real token count, and
@@ -172,40 +269,51 @@ impl KeyEntry {
         }
 
         let reserve = estimated_cost_micro.max(0);
-        let max = self.budget_max_micro.load(Ordering::SeqCst);
-        if max == UNLIMITED {
-            self.spent_micro.fetch_add(reserve, Ordering::SeqCst);
-        } else {
-            // CAS loop: check-and-reserve is one atomic step, so two requests
-            // can never both fit into the same remaining budget.
-            let mut current = self.spent_micro.load(Ordering::SeqCst);
-            loop {
-                if current.saturating_add(reserve) > max {
-                    // Refused after the quota bumps: unwind them so the budget
-                    // rejection does not also consume the caller's quota.
-                    if rpm_tracked {
-                        adjust_window(&self.rpm_window, minute, -1);
-                    }
-                    if tpm_tracked {
-                        adjust_window(&self.tpm_window, minute, -tpm_debit);
-                    }
-                    return Err(GatewayError::BudgetExceeded);
-                }
-                match self.spent_micro.compare_exchange_weak(
-                    current,
-                    current + reserve,
-                    Ordering::SeqCst,
-                    Ordering::SeqCst,
-                ) {
-                    Ok(_) => break,
-                    Err(actual) => current = actual,
-                }
+        let unwind_windows = |entry: &Self| {
+            // Refused after the quota bumps: unwind them so a budget
+            // rejection does not also consume the caller's quota (ADR 007).
+            if rpm_tracked {
+                adjust_window(&entry.rpm_window, minute, -1);
             }
+            if tpm_tracked {
+                adjust_window(&entry.tpm_window, minute, -tpm_debit);
+            }
+        };
+        let key_max = self.budget_max_micro.load(Ordering::SeqCst);
+        if !reserve_micro(&self.spent_micro, key_max, reserve) {
+            unwind_windows(self);
+            return Err(GatewayError::BudgetExceeded {
+                scope: BudgetScope::Key,
+            });
+        }
+
+        // Group pool last (ADR 009): a refusal here unwinds everything the
+        // earlier steps took, key-budget reservation included. Between that
+        // reservation and this unwind a concurrent request may observe the
+        // key's spend transiently inflated and get refused - conservative,
+        // never an overrun.
+        let group = self.group.load_full();
+        if let Some(group) = &group {
+            let group_max = group.budget_max_micro.load(Ordering::SeqCst);
+            if !reserve_micro(&group.spent_micro, group_max, reserve) {
+                self.spent_micro.fetch_sub(reserve, Ordering::SeqCst);
+                // The refund is a spend change too: a flush may have drained
+                // the transiently inflated value between the reserve and this
+                // unwind, so leave the entry dirty for the next flush to
+                // correct (mirrors `Reservation::drop`).
+                self.dirty.store(true, Ordering::SeqCst);
+                unwind_windows(self);
+                return Err(GatewayError::BudgetExceeded {
+                    scope: BudgetScope::Group,
+                });
+            }
+            group.dirty.store(true, Ordering::SeqCst);
         }
         self.dirty.store(true, Ordering::SeqCst);
 
         Ok(Reservation {
             entry: Arc::clone(self),
+            group,
             reserved_micro: reserve,
             tpm_debit: tpm_tracked.then_some(tpm_debit),
             minute,
@@ -226,6 +334,10 @@ impl KeyEntry {
 #[derive(Debug)]
 pub struct Reservation {
     entry: Arc<KeyEntry>,
+    /// The group pool the reservation was ALSO made against, captured at
+    /// admission (ADR 009): a key moved to another group mid-flight still
+    /// settles against the pool that admitted it.
+    group: Option<Arc<GroupEntry>>,
     reserved_micro: i64,
     /// Tokens debited to the TPM window at admit, to settle/refund against the
     /// real usage; `None` when TPM is untracked (no debit was made).
@@ -238,6 +350,15 @@ pub struct Reservation {
 }
 
 impl Reservation {
+    /// The id of the group pool this reservation was charged against, if
+    /// any - the authoritative attribution for the request's usage row: a
+    /// concurrent admin membership swap cannot make the row disagree with
+    /// the pool that actually admitted it (ADR 009).
+    #[must_use]
+    pub fn group_id(&self) -> Option<String> {
+        self.group.as_ref().map(|g| g.id.clone())
+    }
+
     /// Commit the real cost and token count of the call. The budget releases
     /// any over-reservation (or charges the shortfall), and the TPM window is
     /// adjusted from the pre-call estimate to the real token count. In both
@@ -246,6 +367,11 @@ impl Reservation {
     pub fn settle(mut self, actual_cost_micro: i64, actual_tokens: i64) {
         let delta = actual_cost_micro.max(0) - self.reserved_micro;
         self.entry.spent_micro.fetch_add(delta, Ordering::SeqCst);
+        if let Some(group) = &self.group {
+            // The pool sees the same real cost as the key (ADR 009).
+            group.spent_micro.fetch_add(delta, Ordering::SeqCst);
+            group.dirty.store(true, Ordering::SeqCst);
+        }
         if let Some(debited) = self.tpm_debit {
             let token_delta = actual_tokens.max(0) - debited;
             adjust_window(&self.entry.tpm_window, self.minute, token_delta);
@@ -258,34 +384,64 @@ impl Reservation {
 impl Drop for Reservation {
     fn drop(&mut self) {
         if !self.settled {
-            // Refund the budget only: no money was spent. The TPM debit is
+            // Refund the budgets only: no money was spent. The TPM debit is
             // kept on purpose (see the struct doc) - a request that hit the
             // gateway counts against the rate limit even when it failed.
             self.entry
                 .spent_micro
                 .fetch_sub(self.reserved_micro, Ordering::SeqCst);
             self.entry.dirty.store(true, Ordering::SeqCst);
+            if let Some(group) = &self.group {
+                group
+                    .spent_micro
+                    .fetch_sub(self.reserved_micro, Ordering::SeqCst);
+                group.dirty.store(true, Ordering::SeqCst);
+            }
         }
     }
 }
 
 /// The full in-memory key table: hash → entry for authentication, id → the
-/// same entries for admin updates and flushing.
+/// same entries for admin updates and flushing, plus the budget groups the
+/// keys draw from (ADR 009).
 #[derive(Debug, Default)]
 pub struct AuthState {
     by_hash: DashMap<String, Arc<KeyEntry>>,
     by_id: DashMap<String, Arc<KeyEntry>>,
+    groups: DashMap<String, Arc<GroupEntry>>,
 }
 
 impl AuthState {
-    /// Build the state from `(key hash, record)` pairs loaded at boot.
+    /// Build the state from the group records and `(key hash, record)` pairs
+    /// loaded at boot. Groups load first: keys resolve their group pointer
+    /// against them.
     #[must_use]
-    pub fn load(entries: Vec<(String, VirtualKeyRecord)>) -> Self {
+    pub fn load(groups: Vec<GroupRecord>, entries: Vec<(String, VirtualKeyRecord)>) -> Self {
         let state = Self::default();
+        for record in groups {
+            state.upsert_group(&record);
+        }
         for (hash, record) in entries {
             state.upsert(hash, &record);
         }
         state
+    }
+
+    /// Resolve a record's `group_id` to the live group entry. A dangling id
+    /// (only reachable through out-of-band DB edits - the store validates
+    /// membership writes) leaves the key without live pool enforcement,
+    /// with a warning, rather than refusing all its traffic.
+    fn resolve_group(&self, record: &VirtualKeyRecord) -> Option<Arc<GroupEntry>> {
+        let group_id = record.group_id.as_deref()?;
+        let resolved = self.groups.get(group_id).map(|g| Arc::clone(&g));
+        if resolved.is_none() {
+            tracing::warn!(
+                key_id = %record.id,
+                group_id = %group_id,
+                "key references an unknown budget group; pool enforcement disabled for it"
+            );
+        }
+        resolved
     }
 
     /// Number of keys loaded.
@@ -310,12 +466,18 @@ impl AuthState {
 
     /// Insert a brand-new key (admin create / boot load). Holding the
     /// `by_id` entry across the decision keeps two concurrent upserts of the
-    /// same id from installing divergent entries in the two maps.
+    /// same id from installing divergent entries in the two maps. Either
+    /// way the key's group pointer is re-resolved from the record.
     pub fn upsert(&self, hash: String, record: &VirtualKeyRecord) {
+        let group = self.resolve_group(record);
         match self.by_id.entry(record.id.clone()) {
-            dashmap::Entry::Occupied(existing) => existing.get().apply_limits(record),
+            dashmap::Entry::Occupied(existing) => {
+                existing.get().apply_limits(record);
+                existing.get().set_group(group);
+            }
             dashmap::Entry::Vacant(slot) => {
                 let entry = Arc::new(KeyEntry::from_record(record));
+                entry.set_group(group);
                 self.by_hash.insert(hash, Arc::clone(&entry));
                 slot.insert(entry);
             }
@@ -323,10 +485,12 @@ impl AuthState {
     }
 
     /// Apply an admin update to an existing key (by id). Spend is preserved;
-    /// limits, expiry and the disabled flag take effect immediately.
+    /// limits, expiry, the disabled flag and group membership take effect
+    /// immediately.
     pub fn apply(&self, record: &VirtualKeyRecord) {
         if let Some(entry) = self.by_id.get(&record.id) {
             entry.apply_limits(record);
+            entry.set_group(self.resolve_group(record));
         }
     }
 
@@ -360,7 +524,42 @@ impl AuthState {
         // evict the old alias is fine, and keeps hashes out of `KeyEntry`.
         self.by_hash.retain(|_, e| !Arc::ptr_eq(e, &entry));
         entry.apply_limits(record);
+        entry.set_group(self.resolve_group(record));
         self.by_hash.insert(new_hash, entry);
+    }
+
+    /// Insert or refresh a budget group (admin create / boot load / reload).
+    /// An existing entry only has its limits re-applied and keeps its
+    /// in-memory pool spend, mirroring key upserts.
+    pub fn upsert_group(&self, record: &GroupRecord) {
+        match self.groups.entry(record.id.clone()) {
+            dashmap::Entry::Occupied(existing) => existing.get().apply_limits(record),
+            dashmap::Entry::Vacant(slot) => {
+                slot.insert(Arc::new(GroupEntry::from_record(record)));
+            }
+        }
+    }
+
+    /// Apply an admin update to an existing group (by id). Pool spend is
+    /// preserved; the budget takes effect for every member on their very
+    /// next request (the members share the entry through an `Arc`).
+    pub fn apply_group(&self, record: &GroupRecord) {
+        if let Some(entry) = self.groups.get(&record.id) {
+            entry.apply_limits(record);
+        }
+    }
+
+    /// Remove a group from the live table (admin delete). The store refuses
+    /// deletion while active member keys exist, so by the time this runs no
+    /// live key should still point at the entry; any straggler holding the
+    /// `Arc` keeps enforcing against the detached pool until its own next
+    /// membership update - never a panic, never unlimited spend.
+    ///
+    /// Returns the evicted entry so the caller can flush its final accrued
+    /// pool spend (the periodic flusher will never see this id again);
+    /// `None` when the id was not live.
+    pub fn remove_group(&self, id: &str) -> Option<Arc<GroupEntry>> {
+        self.groups.remove(id).map(|(_, entry)| entry)
     }
 
     /// Collect `(key id, spent USD)` for every key whose spend changed since
@@ -370,6 +569,24 @@ impl AuthState {
     pub fn drain_dirty(&self) -> Vec<(String, f64)> {
         let mut out = Vec::new();
         for entry in &self.by_id {
+            if entry.dirty.swap(false, Ordering::SeqCst) {
+                out.push((
+                    entry.id.clone(),
+                    micro_to_usd(entry.spent_micro.load(Ordering::SeqCst)),
+                ));
+            }
+        }
+        out
+    }
+
+    /// Collect `(group id, pool spend USD)` for every group whose spend
+    /// changed since the last call, marking them clean - the group half of
+    /// [`drain_dirty`](Self::drain_dirty), with the same re-dirtying
+    /// guarantee for spend that lands mid-drain.
+    #[must_use]
+    pub fn drain_dirty_groups(&self) -> Vec<(String, f64)> {
+        let mut out = Vec::new();
+        for entry in &self.groups {
             if entry.dirty.swap(false, Ordering::SeqCst) {
                 out.push((
                     entry.id.clone(),

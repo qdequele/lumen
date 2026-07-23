@@ -15,6 +15,7 @@ fn record(id: &str) -> VirtualKeyRecord {
     VirtualKeyRecord {
         id: id.to_owned(),
         name: id.to_owned(),
+        group_id: None,
         budget_max: None,
         budget_spent: 0.0,
         rpm_limit: None,
@@ -27,7 +28,7 @@ fn record(id: &str) -> VirtualKeyRecord {
 }
 
 fn state_with(plaintext: &str, rec: VirtualKeyRecord) -> AuthState {
-    AuthState::load(vec![(hash_key(plaintext), rec)])
+    AuthState::load(Vec::new(), vec![(hash_key(plaintext), rec)])
 }
 
 #[test]
@@ -76,7 +77,7 @@ fn race_50_concurrent_requests_on_budget_for_10_exactly_10_pass() {
     // And the 51st request is refused with the budget error.
     assert!(matches!(
         entry.admit(NOW, 100, usd_to_micro(1.0)),
-        Err(GatewayError::BudgetExceeded)
+        Err(GatewayError::BudgetExceeded { .. })
     ));
 }
 
@@ -215,10 +216,12 @@ fn budget_rejection_unwinds_the_rpm_and_tpm_bumps() {
     );
     let entry = state.authenticate("fg-unwind", NOW).expect("key valid");
 
-    // $2 estimate against a $1 budget: refused at the budget step.
+    // $2 estimate against a $1 budget: refused at the key-budget step.
     assert!(matches!(
         entry.admit(NOW, 10, usd_to_micro(2.0)),
-        Err(GatewayError::BudgetExceeded)
+        Err(GatewayError::BudgetExceeded {
+            scope: BudgetScope::Key
+        })
     ));
 
     // The failed attempt consumed neither RPM nor TPM: 5 real requests fit.
@@ -388,10 +391,13 @@ fn authenticate_rejects_unknown_disabled_and_expired_keys() {
         expires_at: Some(NOW - 1),
         ..record("expired")
     };
-    let state = AuthState::load(vec![
-        (hash_key("fg-disabled"), disabled),
-        (hash_key("fg-expired"), expired),
-    ]);
+    let state = AuthState::load(
+        Vec::new(),
+        vec![
+            (hash_key("fg-disabled"), disabled),
+            (hash_key("fg-expired"), expired),
+        ],
+    );
 
     assert!(state.authenticate("fg-unknown", NOW).is_none());
     assert!(state.authenticate("fg-disabled", NOW).is_none());
@@ -416,7 +422,9 @@ fn boot_load_restores_spent_budget_an_exhausted_key_stays_exhausted() {
     let entry = state.authenticate("fg-restart", NOW).expect("key valid");
     assert!(matches!(
         entry.admit(NOW, 1, usd_to_micro(0.01)),
-        Err(GatewayError::BudgetExceeded)
+        Err(GatewayError::BudgetExceeded {
+            scope: BudgetScope::Key
+        })
     ));
 }
 
@@ -549,10 +557,466 @@ fn rotate_swaps_the_hash_and_keeps_the_accrued_spend() {
         .settle(usd_to_micro(1.0), 1);
     assert!(matches!(
         rotated.admit(NOW, 1, usd_to_micro(1.0)),
-        Err(GatewayError::BudgetExceeded)
+        Err(GatewayError::BudgetExceeded {
+            scope: BudgetScope::Key
+        })
     ));
 
     // Rotating an id the table has never seen inserts it fresh (defensive).
     state.rotate(hash_key("fg-ghost"), &record("ghost"));
     assert!(state.authenticate("fg-ghost", NOW).is_some());
+}
+
+// ---- Shared parent budgets (ADR 009) ----------------------------------------
+//
+// A budget group is a shared pool any number of keys draw from. Admission
+// reserves against the key budget AND the group pool; a refusal at any step
+// consumes nothing (the ADR 007 rule), settle debits both sides, and dropping
+// an unsettled reservation refunds both (the TPM debit stays, per ADR 007).
+
+use lumen_auth::store::GroupRecord;
+use lumen_core::BudgetScope;
+
+fn group(id: &str, budget_max: Option<f64>) -> GroupRecord {
+    GroupRecord {
+        id: id.to_owned(),
+        name: id.to_owned(),
+        budget_max,
+        budget_spent: 0.0,
+        created_at: 0,
+        deleted_at: None,
+    }
+}
+
+fn member(id: &str, group_id: &str) -> VirtualKeyRecord {
+    VirtualKeyRecord {
+        group_id: Some(group_id.to_owned()),
+        ..record(id)
+    }
+}
+
+#[test]
+fn two_keys_drain_the_shared_pool_and_the_refusal_is_group_scoped() {
+    // ADR 009 acceptance: the pool is the boundary, not the keys. Both keys
+    // keep ample personal headroom; only the shared $10 pool runs dry.
+    let state = AuthState::load(
+        vec![group("pool", Some(10.0))],
+        vec![
+            (
+                hash_key("fg-share-a"),
+                VirtualKeyRecord {
+                    budget_max: Some(100.0),
+                    ..member("share-a", "pool")
+                },
+            ),
+            (
+                hash_key("fg-share-b"),
+                VirtualKeyRecord {
+                    budget_max: Some(100.0),
+                    ..member("share-b", "pool")
+                },
+            ),
+        ],
+    );
+    let a = state.authenticate("fg-share-a", NOW).expect("key a valid");
+    let b = state.authenticate("fg-share-b", NOW).expect("key b valid");
+
+    a.admit(NOW, 1, usd_to_micro(6.0))
+        .expect("a fits the pool")
+        .settle(usd_to_micro(6.0), 1);
+    b.admit(NOW, 1, usd_to_micro(4.0))
+        .expect("b fits the pool")
+        .settle(usd_to_micro(4.0), 1);
+
+    // The pool is dry: EITHER key is refused, with the group scope...
+    assert!(matches!(
+        a.admit(NOW, 1, usd_to_micro(1.0)),
+        Err(GatewayError::BudgetExceeded {
+            scope: BudgetScope::Group
+        })
+    ));
+    assert!(matches!(
+        b.admit(NOW, 1, usd_to_micro(1.0)),
+        Err(GatewayError::BudgetExceeded {
+            scope: BudgetScope::Group
+        })
+    ));
+    // ...while each key's own $100 budget still has plenty of headroom.
+    assert_eq!(a.spent_micro(), usd_to_micro(6.0));
+    assert_eq!(b.spent_micro(), usd_to_micro(4.0));
+}
+
+#[test]
+fn a_grouped_keys_own_budget_refusal_stays_key_scoped() {
+    // The key budget is checked before the pool, and its refusal keeps the
+    // key scope - the message stays byte-identical to the ungrouped one
+    // (ADR 009 §2).
+    let state = AuthState::load(
+        vec![group("wide", Some(100.0))],
+        vec![(
+            hash_key("fg-tight-key"),
+            VirtualKeyRecord {
+                budget_max: Some(1.0),
+                ..member("tight-key", "wide")
+            },
+        )],
+    );
+    let entry = state.authenticate("fg-tight-key", NOW).expect("key valid");
+    assert!(matches!(
+        entry.admit(NOW, 1, usd_to_micro(2.0)),
+        Err(GatewayError::BudgetExceeded {
+            scope: BudgetScope::Key
+        })
+    ));
+}
+
+#[test]
+fn group_refusal_unwinds_the_rpm_and_tpm_bumps() {
+    // The ADR 007 rule extended to the group step: a request the POOL
+    // refuses consumes neither RPM nor TPM (mirror of
+    // `budget_rejection_unwinds_the_rpm_and_tpm_bumps`).
+    let state = AuthState::load(
+        vec![group("tight-pool", Some(1.0))],
+        vec![(
+            hash_key("fg-unwind-group"),
+            VirtualKeyRecord {
+                budget_max: Some(50.0),
+                rpm_limit: Some(5),
+                tpm_limit: Some(50),
+                ..member("unwind-group", "tight-pool")
+            },
+        )],
+    );
+    let entry = state
+        .authenticate("fg-unwind-group", NOW)
+        .expect("key valid");
+
+    // $2 estimate against the $1 pool: refused at the group step, after the
+    // RPM, TPM and key-budget steps had all already bumped.
+    assert!(matches!(
+        entry.admit(NOW, 10, usd_to_micro(2.0)),
+        Err(GatewayError::BudgetExceeded {
+            scope: BudgetScope::Group
+        })
+    ));
+
+    // The refused attempt burned nothing: 5 requests of 10 tokens each fill
+    // the RPM (5) and TPM (50) windows EXACTLY - only possible if the
+    // refused request's bumps were rolled back.
+    for _ in 0..5 {
+        entry.admit(NOW, 10, 0).expect("admitted").settle(0, 10);
+    }
+    assert!(matches!(
+        entry.admit(NOW, 1, 0),
+        Err(GatewayError::QuotaExceeded {
+            quota: QuotaKind::Rpm,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn group_refusal_unwinds_the_key_budget_reservation() {
+    let state = AuthState::load(
+        vec![group("small-pool", Some(1.0))],
+        vec![(
+            hash_key("fg-key-unwind"),
+            VirtualKeyRecord {
+                budget_max: Some(50.0),
+                ..member("key-unwind", "small-pool")
+            },
+        )],
+    );
+    let entry = state.authenticate("fg-key-unwind", NOW).expect("key valid");
+
+    assert!(matches!(
+        entry.admit(NOW, 1, usd_to_micro(2.0)),
+        Err(GatewayError::BudgetExceeded {
+            scope: BudgetScope::Group
+        })
+    ));
+    // The key-budget reservation made before the group step was unwound...
+    assert_eq!(entry.spent_micro(), 0);
+    // ...and a fresh estimate that fits the pool is admitted: the refused
+    // request left no residue on the pool either.
+    assert!(entry.admit(NOW, 1, usd_to_micro(1.0)).is_ok());
+}
+
+#[test]
+fn settle_debits_the_key_and_the_group_by_the_same_delta() {
+    let state = AuthState::load(
+        vec![group("settle-pool", Some(100.0))],
+        vec![(
+            hash_key("fg-settle-both"),
+            VirtualKeyRecord {
+                budget_max: Some(100.0),
+                ..member("settle-both", "settle-pool")
+            },
+        )],
+    );
+    let entry = state
+        .authenticate("fg-settle-both", NOW)
+        .expect("key valid");
+
+    // Reserve $5, settle at the real $2: both sides land on exactly $2.
+    entry
+        .admit(NOW, 1, usd_to_micro(5.0))
+        .expect("admitted")
+        .settle(usd_to_micro(2.0), 1);
+    assert_eq!(entry.spent_micro(), usd_to_micro(2.0));
+
+    let dirty = state.drain_dirty_groups();
+    assert_eq!(dirty.len(), 1);
+    assert_eq!(dirty[0].0, "settle-pool");
+    assert!(
+        (dirty[0].1 - 2.0).abs() < 1e-9,
+        "the pool settled to the same $2, got {}",
+        dirty[0].1
+    );
+}
+
+#[test]
+fn dropping_an_unsettled_reservation_refunds_the_key_and_the_group() {
+    let state = AuthState::load(
+        vec![group("refund-pool", Some(10.0))],
+        vec![(
+            hash_key("fg-refund-both"),
+            VirtualKeyRecord {
+                budget_max: Some(10.0),
+                ..member("refund-both", "refund-pool")
+            },
+        )],
+    );
+    let entry = state
+        .authenticate("fg-refund-both", NOW)
+        .expect("key valid");
+
+    let reservation = entry.admit(NOW, 1, usd_to_micro(10.0)).expect("admitted");
+    drop(reservation); // upstream failed / was cancelled - no money moved
+
+    // The key was refunded...
+    assert_eq!(entry.spent_micro(), 0);
+    // ...and so was the pool: the FULL pool fits again.
+    assert!(entry.admit(NOW, 1, usd_to_micro(10.0)).is_ok());
+
+    // Read the pool counter directly: back to zero after both refunds (the
+    // second reservation above was dropped unsettled too).
+    let evicted = state.remove_group("refund-pool").expect("group was live");
+    assert_eq!(evicted.id(), "refund-pool");
+    assert_eq!(evicted.spent_micro(), 0);
+}
+
+#[test]
+fn an_unlimited_key_in_a_limited_group_is_still_group_capped() {
+    let state = AuthState::load(
+        vec![group("cap-pool", Some(2.0))],
+        // No budget_max on the key itself: only the pool can refuse.
+        vec![(hash_key("fg-freewheel"), member("freewheel", "cap-pool"))],
+    );
+    let entry = state.authenticate("fg-freewheel", NOW).expect("key valid");
+
+    entry
+        .admit(NOW, 1, usd_to_micro(2.0))
+        .expect("the pool covers it")
+        .settle(usd_to_micro(2.0), 1);
+    assert!(matches!(
+        entry.admit(NOW, 1, usd_to_micro(0.01)),
+        Err(GatewayError::BudgetExceeded {
+            scope: BudgetScope::Group
+        })
+    ));
+}
+
+#[test]
+fn drain_dirty_groups_reports_group_spend_once_until_it_changes_again() {
+    let state = AuthState::load(
+        vec![group("flush-pool", Some(100.0))],
+        vec![(
+            hash_key("fg-group-flush"),
+            member("group-flush", "flush-pool"),
+        )],
+    );
+    let entry = state
+        .authenticate("fg-group-flush", NOW)
+        .expect("key valid");
+
+    // Nothing spent yet -> nothing to flush.
+    assert!(state.drain_dirty_groups().is_empty());
+
+    entry
+        .admit(NOW, 1, usd_to_micro(3.0))
+        .expect("admitted")
+        .settle(usd_to_micro(3.0), 1);
+    let first = state.drain_dirty_groups();
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].0, "flush-pool");
+    assert!((first[0].1 - 3.0).abs() < 1e-9);
+
+    // Unchanged since the flush -> clean.
+    assert!(state.drain_dirty_groups().is_empty());
+
+    // New spend re-arms the dirty flag.
+    entry
+        .admit(NOW, 1, usd_to_micro(1.0))
+        .expect("admitted")
+        .settle(usd_to_micro(1.0), 1);
+    let second = state.drain_dirty_groups();
+    assert_eq!(second.len(), 1);
+    assert!((second[0].1 - 4.0).abs() < 1e-9);
+}
+
+#[test]
+fn apply_group_raises_the_pool_without_resetting_in_memory_spend() {
+    let state = AuthState::load(
+        vec![group("grow-pool", Some(1.0))],
+        vec![(hash_key("fg-grower"), member("grower", "grow-pool"))],
+    );
+    let entry = state.authenticate("fg-grower", NOW).expect("key valid");
+    entry
+        .admit(NOW, 1, usd_to_micro(1.0))
+        .expect("admitted")
+        .settle(usd_to_micro(1.0), 1);
+    assert!(matches!(
+        entry.admit(NOW, 1, usd_to_micro(1.0)),
+        Err(GatewayError::BudgetExceeded {
+            scope: BudgetScope::Group
+        })
+    ));
+
+    // Admin raises the pool. The record's budget_spent (0.0) must NOT
+    // overwrite the $1 already accrued in memory (limits only, ADR 008).
+    state.apply_group(&group("grow-pool", Some(5.0)));
+
+    // $4 fits ($1 accrued + $4 = the new $5 cap held exactly)...
+    let reservation = entry
+        .admit(NOW, 1, usd_to_micro(4.0))
+        .expect("headroom after the raise");
+    // ...and one more cent does not: the in-memory spend survived the apply.
+    assert!(matches!(
+        entry.admit(NOW, 1, usd_to_micro(0.01)),
+        Err(GatewayError::BudgetExceeded {
+            scope: BudgetScope::Group
+        })
+    ));
+    drop(reservation);
+}
+
+#[test]
+fn a_key_patched_out_of_its_group_stops_debiting_the_pool() {
+    let state = AuthState::load(
+        vec![group("leave-pool", Some(5.0))],
+        vec![(hash_key("fg-leaver"), member("leaver", "leave-pool"))],
+    );
+    let entry = state.authenticate("fg-leaver", NOW).expect("key valid");
+    assert_eq!(entry.group_id().as_deref(), Some("leave-pool"));
+    entry
+        .admit(NOW, 1, usd_to_micro(1.0))
+        .expect("admitted")
+        .settle(usd_to_micro(1.0), 1);
+
+    // Admin patches the key out of the group: upsert with group_id = None.
+    state.upsert(hash_key("fg-leaver"), &record("leaver"));
+    assert_eq!(entry.group_id(), None, "the live group pointer is cleared");
+
+    // $10 dwarfs the $5 pool, but the key no longer belongs to it.
+    entry
+        .admit(NOW, 1, usd_to_micro(10.0))
+        .expect("no group cap any more")
+        .settle(usd_to_micro(10.0), 1);
+
+    // The pool kept only the pre-departure dollar.
+    let evicted = state.remove_group("leave-pool").expect("group was live");
+    assert_eq!(evicted.spent_micro(), usd_to_micro(1.0));
+}
+
+#[test]
+fn group_refusal_re_dirties_the_key_so_a_mid_admit_flush_is_corrected() {
+    // Review finding on ADR 009: `reserve_micro` transiently inflates the
+    // key's spend before the group step. If a flush drains exactly then, the
+    // DB holds the inflated value; the group-refusal unwind must therefore
+    // leave the key DIRTY again so the next flush rewrites the corrected
+    // spend (mirroring `Reservation::drop`).
+    let state = AuthState::load(
+        vec![group("tight-pool", Some(1.0))],
+        vec![(hash_key("fg-redirty"), member("redirty", "tight-pool"))],
+    );
+    let entry = state.authenticate("fg-redirty", NOW).expect("key valid");
+
+    entry
+        .admit(NOW, 1, usd_to_micro(1.0))
+        .expect("first dollar fills the pool")
+        .settle(usd_to_micro(1.0), 1);
+    // Simulate the periodic flush right before the refused attempt: the key
+    // is reported once and marked clean.
+    assert_eq!(state.drain_dirty(), vec![("redirty".to_owned(), 1.0)]);
+    assert!(
+        state.drain_dirty().is_empty(),
+        "key is clean after the drain"
+    );
+
+    // Group refusal: the key reservation is unwound...
+    assert!(matches!(
+        entry.admit(NOW, 1, usd_to_micro(1.0)),
+        Err(GatewayError::BudgetExceeded {
+            scope: BudgetScope::Group
+        })
+    ));
+    // ...and the unwind itself re-dirties the key with the corrected value,
+    // so a flush that raced the transient inflation gets overwritten.
+    assert_eq!(state.drain_dirty(), vec![("redirty".to_owned(), 1.0)]);
+}
+
+#[test]
+fn race_two_keys_on_a_shared_pool_for_10_exactly_10_pass_with_no_residue() {
+    // ADR 009 acceptance criterion: the pool can never be overrun by
+    // concurrency, even across DIFFERENT member keys, and a refused thread
+    // leaves zero residue on its key (the unwind holds under contention).
+    let state = AuthState::load(
+        vec![group("race-pool", Some(10.0))],
+        vec![
+            (hash_key("fg-race-a"), member("race-a", "race-pool")),
+            (hash_key("fg-race-b"), member("race-b", "race-pool")),
+        ],
+    );
+    let a = state.authenticate("fg-race-a", NOW).expect("key a valid");
+    let b = state.authenticate("fg-race-b", NOW).expect("key b valid");
+
+    let barrier = Arc::new(Barrier::new(50));
+    let handles: Vec<_> = (0..50)
+        .map(|i| {
+            let entry = if i % 2 == 0 {
+                Arc::clone(&a)
+            } else {
+                Arc::clone(&b)
+            };
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                match entry.admit(NOW, 1, usd_to_micro(1.0)) {
+                    Ok(reservation) => {
+                        reservation.settle(usd_to_micro(1.0), 1);
+                        true
+                    }
+                    Err(_) => false,
+                }
+            })
+        })
+        .collect();
+    let admitted = handles
+        .into_iter()
+        .filter_map(|h| h.join().ok())
+        .filter(|passed| *passed)
+        .count();
+
+    // Exactly the pool-covered requests passed, whichever keys carried them.
+    assert_eq!(admitted, 10, "the $10 pool admits exactly 10 x $1");
+    // The pool landed exactly at its cap, and the keys' combined spend
+    // equals the pool's: refused threads left zero residue anywhere.
+    let pool = state.remove_group("race-pool").expect("group is live");
+    assert_eq!(pool.spent_micro(), usd_to_micro(10.0));
+    assert_eq!(
+        a.spent_micro() + b.spent_micro(),
+        usd_to_micro(10.0),
+        "no key residue from refused threads"
+    );
 }

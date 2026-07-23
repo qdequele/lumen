@@ -105,6 +105,8 @@ pub struct Accounting {
     model_used: String,
     provider: String,
     key_id: Option<String>,
+    /// The key's budget group at admission (ADR 009), for usage attribution.
+    group_id: Option<String>,
     reservation: Option<Reservation>,
     metadata: Option<RequestMetadata>,
     tokens: TokenMetrics,
@@ -147,30 +149,42 @@ impl Accounting {
             }
         };
 
-        let (key_id, reservation) = match key {
-            Some(AuthedKey(entry)) => match entry.admit(
-                now_unix(),
-                i64::try_from(estimated_tokens).unwrap_or(i64::MAX),
-                usd_to_micro(estimated_cost),
-            ) {
-                Ok(reservation) => (Some(entry.id().to_owned()), Some(reservation)),
-                Err(error) => {
-                    // The request is refused (402/429) before any upstream
-                    // call. Still record a status-only usage-log row so
-                    // per-key rejection analytics work, via the same
-                    // non-blocking channel as successful requests (never a
-                    // synchronous DB write on the request path).
-                    Self::log_rejection(
-                        state,
-                        target,
-                        entry.id(),
-                        metadata.as_ref(),
-                        error.http_status(),
-                    );
-                    return Err(error);
+        let (key_id, group_id, reservation) = match key {
+            Some(AuthedKey(entry)) => {
+                // Snapshot the group BEFORE admission for the refusal row
+                // (no reservation exists to ask on that path); a successful
+                // admission re-derives it from the reservation itself, the
+                // pool that actually admitted the request (ADR 009).
+                let group_id = entry.group_id();
+                match entry.admit(
+                    now_unix(),
+                    i64::try_from(estimated_tokens).unwrap_or(i64::MAX),
+                    usd_to_micro(estimated_cost),
+                ) {
+                    Ok(reservation) => (
+                        Some(entry.id().to_owned()),
+                        reservation.group_id(),
+                        Some(reservation),
+                    ),
+                    Err(error) => {
+                        // The request is refused (402/429) before any upstream
+                        // call. Still record a status-only usage-log row so
+                        // per-key rejection analytics work, via the same
+                        // non-blocking channel as successful requests (never a
+                        // synchronous DB write on the request path).
+                        Self::log_rejection(
+                            state,
+                            target,
+                            entry.id(),
+                            group_id,
+                            metadata.as_ref(),
+                            error.http_status(),
+                        );
+                        return Err(error);
+                    }
                 }
-            },
-            None => (None, None),
+            }
+            None => (None, None, None),
         };
 
         Ok(Self {
@@ -179,6 +193,7 @@ impl Accounting {
             model_used: target.model.to_owned(),
             provider: target.provider.to_owned(),
             key_id,
+            group_id,
             reservation,
             metadata,
             tokens: state.tokens.clone(),
@@ -198,6 +213,7 @@ impl Accounting {
         state: &AppState,
         target: Target<'_>,
         key_id: &str,
+        group_id: Option<String>,
         metadata: Option<&RequestMetadata>,
         status: u16,
     ) {
@@ -206,6 +222,7 @@ impl Accounting {
         };
         let record = UsageRecord {
             key_id: Some(key_id.to_owned()),
+            group_id,
             model: target.model.to_owned(),
             model_used: target.model.to_owned(),
             provider: target.provider.to_owned(),
@@ -408,6 +425,7 @@ impl Accounting {
         };
         let record = UsageRecord {
             key_id: self.key_id.clone(),
+            group_id: self.group_id.clone(),
             model: self.model.clone(),
             model_used: self.model_used.clone(),
             provider: self.provider.clone(),
@@ -659,6 +677,7 @@ mod tests {
             model_used: "gpt".to_owned(),
             provider: "openai".to_owned(),
             key_id: None,
+            group_id: None,
             reservation: None,
             metadata: None,
             tokens,

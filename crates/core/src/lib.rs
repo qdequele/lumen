@@ -35,7 +35,9 @@ pub use embed::{
     encode_embedding_base64, EmbedData, EmbedInput, EmbedItem, EmbedRequest, EmbedResponse,
     EmbedUsage, EmbeddingEncoding,
 };
-pub use error::{ErrorBody, ErrorEnvelope, ErrorType, GatewayError, ProviderError, QuotaKind};
+pub use error::{
+    BudgetScope, ErrorBody, ErrorEnvelope, ErrorType, GatewayError, ProviderError, QuotaKind,
+};
 pub use media::{measure_media, MediaTypeUsage, MediaUsage};
 pub use provider::{ChatProvider, EmbeddingProvider, RerankProvider};
 pub use rerank::{

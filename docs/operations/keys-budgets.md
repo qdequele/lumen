@@ -43,7 +43,7 @@ With auth on, every `/v1/*` request is checked against a **virtual key**:
 
 | Code | HTTP | Cause |
 |---|---|---|
-| `LM-4001` | 402 | Hard budget exhausted. |
+| `LM-4001` | 402 | Hard budget exhausted - the key's own budget or its [budget group](#budget-groups)'s shared pool. Same code for both; the message text says which scope refused. |
 | `LM-4002` | 429 | Requests-per-minute quota exceeded. |
 | `LM-4003` | 429 | Tokens-per-minute quota exceeded. |
 | `LM-4004` | 401 | Missing or invalid virtual key - deliberately unspecific: unknown, disabled and expired keys are indistinguishable, so a caller cannot probe key state. |
@@ -87,8 +87,115 @@ together, so they take effect immediately with no restart.
 | `PATCH` | `/admin/keys/{id}` | Adjust budget/limits, or enable/disable a key. |
 | `DELETE` | `/admin/keys/{id}` | Soft-delete a key (tombstone; stops authenticating immediately). |
 | `POST` | `/admin/keys/{id}/rotate` | Mint a new secret for an existing key (one-time plaintext, identity and spend preserved). |
+| `POST` | `/admin/groups` | Create a budget group - a shared pool member keys draw from. |
+| `GET` | `/admin/groups` | List active groups. `?include_deleted=true` adds tombstones. |
+| `PATCH` | `/admin/groups/{id}` | Adjust a group's name or shared budget (pool spend preserved). |
+| `DELETE` | `/admin/groups/{id}` | Soft-delete a group. Refused while it still has active member keys. |
 | `PUT` | `/admin/provider-keys/{name}` | Store a provider API key encrypted at rest. |
 | `GET` | `/admin/usage` | Aggregated usage and spend from the usage log. |
+
+### Budget groups
+
+A **budget group** is a shared pool that several keys draw from
+([ADR 009](../adr/009-shared-parent-budgets.md)). The pattern it exists
+for: prepaid credits per customer, one key per project of that customer.
+Without groups you would chunk the customer's credit across the project
+keys and rebalance from outside - racy, and credit strands on idle keys.
+With groups: one group per customer, its keys join it, and a top-up is a
+single `PATCH`.
+
+Create the pool first:
+
+```bash
+curl -s http://localhost:8080/admin/groups \
+  -H "Authorization: Bearer $LUMEN_MASTER_KEY" \
+  -H 'content-type: application/json' \
+  -d '{"name": "acme-corp", "budget_max": 500.0}'
+```
+
+`name` is required; `budget_max` (USD) is optional - omit it for an
+unlimited pool that only attributes usage. A group has no plaintext and no
+hash, so unlike key creation there is **no one-time secret**: the `201`
+response is just the record, and `GET /admin/groups` lists the same shape.
+
+```json
+{
+  "id": "...",
+  "name": "acme-corp",
+  "budget_max": 500.0,
+  "budget_spent": 0.0,
+  "created_at": 1752537600,
+  "deleted_at": null
+}
+```
+
+A group carries **budget only**: no group-level RPM/TPM, no `disabled`
+flag, no expiry (each member key's own limits still apply; group-level
+limits are backlog).
+
+**Membership.** A key belongs to **at most one group**, via `group_id` on
+`POST /admin/keys` or `PATCH /admin/keys/{id}`:
+
+```bash
+curl -s http://localhost:8080/admin/keys \
+  -H "Authorization: Bearer $LUMEN_MASTER_KEY" \
+  -H 'content-type: application/json' \
+  -d '{"name": "acme-project-search", "group_id": "<group id>", "budget_max": 100.0}'
+```
+
+On the patch, `group_id` is **tri-state**: leave the field out and
+membership is unchanged, send JSON `null` and the key leaves its group,
+send a string and it joins that group. This is the one deliberate
+exception to "patch fields cannot clear to NULL" - leaving a group must
+not require re-minting the key. A `group_id` naming an unknown or deleted
+group is refused with 400 `LM-1001` before anything is written. Key
+records expose `group_id` wherever records appear. `lumen keys create`
+takes `--group-id <ID>` too, but the group must already exist: there is no
+offline `lumen groups` subcommand - create groups through the admin API,
+which needs only the master key.
+
+**Enforcement** works exactly like a key budget, one level up:
+
+- **Admission checks both.** The key's own `budget_max` (when set) AND the
+  group pool, in memory, before any upstream call. Either refusal is a
+  402 `LM-4001`; the message says which scope refused ("budget exceeded
+  for this key" vs "budget exceeded for this key's group").
+- **Refunds mirror per-key budgets**
+  ([ADR 007](../adr/007-accounting-refinements.md)): a request refused at
+  admission consumes nothing from either pool, and actual cost settles
+  against both on completion.
+- **Flush and crash semantics are identical** to key budgets: pool spend
+  flushes to SQLite on `flush_interval_ms`, enforcement lives in memory
+  ahead of the flush, and a crash loses at most one flush interval of pool
+  *accounting*.
+
+Pool spend is the group's own accumulator, never recomputed from its
+members: spend a key accrued before joining (or after leaving) is not
+moved retroactively.
+
+To top up a customer, raise the cap - pool spend is preserved, and the new
+cap binds every member key on its next request, no restart (`name` can be
+patched the same way; an unknown or deleted id returns 400 `LM-1001`):
+
+```bash
+curl -s -X PATCH http://localhost:8080/admin/groups/<id> \
+  -H "Authorization: Bearer $LUMEN_MASTER_KEY" \
+  -H 'content-type: application/json' \
+  -d '{"budget_max": 1000.0}'
+```
+
+`DELETE /admin/groups/{id}` is a **soft delete**, like keys, and it is
+refused (400) while the group still has active member keys: move them out
+(`PATCH` with `"group_id": null` or another group) or delete them first.
+Silently dropping members out of pool enforcement would be worse than the
+error. The tombstone keeps `usage_log` attribution, and its final pool
+spend is flushed on removal.
+
+**Attribution.** Every `usage_log` row - successes and 402/429 refusal
+rows alike - carries the key's group id (when it has one), so per-customer
+reporting includes the traffic the pool refused. `GET /admin/usage`
+(below) takes a `group_id` filter and `group_by=group_id`; under that
+grouping, rows from ungrouped keys aggregate under an empty group name.
 
 ### Create a key
 
@@ -113,6 +220,7 @@ response is the **only place the plaintext key ever appears**:
   "key": "sk-lumen-...",
   "id": "...",
   "name": "team-search",
+  "group_id": null,
   "budget_max": 50.0,
   "budget_spent": 0.0,
   "rpm_limit": 60,
@@ -192,9 +300,9 @@ restart. Environment-sourced keys keep precedence over a stored key. See
 
 ### Usage & spend reporting (`GET /admin/usage`)
 
-Aggregates the [usage log](usage-log.md) per key, model, provider or
-capability - the HTTP query surface over the same rows the batched writer
-persists:
+Aggregates the [usage log](usage-log.md) per key, budget group, model,
+provider or capability - the HTTP query surface over the same rows the
+batched writer persists:
 
 ```bash
 curl -s "http://localhost:8080/admin/usage?group_by=provider&since=2026-07-15T00:00:00Z" \
@@ -206,12 +314,13 @@ Query parameters (all optional):
 | Parameter | Meaning | Default |
 |---|---|---|
 | `key_id` | Only rows for this virtual key id. | all keys |
+| `group_id` | Only rows attributed to this [budget group](#budget-groups) id. | all rows |
 | `model` | Only rows for this client-facing model id. | all models |
 | `provider` | Only rows attributed to this provider instance. | all providers |
 | `capability` | `chat`, `embed` or `rerank`. | all capabilities |
 | `since` | Window start (inclusive): unix seconds or RFC3339. | `until` - 24 h |
 | `until` | Window end (inclusive): unix seconds or RFC3339. | now |
-| `group_by` | `model`, `model_used`, `provider`, `capability`, `key_id`, `status` or `total`. | `model` |
+| `group_by` | `model`, `model_used`, `provider`, `capability`, `key_id`, `group_id`, `status` or `total`. | `model` |
 | `limit` | Maximum groups returned, 1 to 1000. | 100 |
 
 The response echoes the effective window and grouping, then one aggregate
