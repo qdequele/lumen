@@ -52,7 +52,7 @@ anyhow = "1"
 
 # GCP service-account OAuth (Vertex AI): RS256-signed JWT assertion. Pure-Rust
 # crypto backend (ring), never OpenSSL - compatible with the rustls-only policy.
-jsonwebtoken = { version = "9", default-features = false, features = ["use_pem"] }
+jsonwebtoken = { version = "10", default-features = false, features = ["use_pem"] }
 
 # Logging / metrics
 tracing = "0.1"
