@@ -155,3 +155,33 @@ on the next request, no restart - the ADR 008 contract.
 - Not in this slice (recorded in `docs/backlog.md`): group RPM/TPM, a group
   `disabled` flag, group expiry, nested groups, a
   `lumen_group_budget_remaining` gauge, and a `lumen groups` CLI.
+
+## Amendment (2026-07-22): atomic grant routes
+
+A prepaid-credits control plane tops up budgets concurrently; a
+read-modify-write `PATCH budget_max` can lose one of two racing top-ups.
+`POST /admin/keys/{id}/grant` and `POST /admin/groups/{id}/grant` take
+`{"amount": <USD>}` and raise the cap as an atomic increment on BOTH sides:
+`budget_max = budget_max + ?` inside SQLite, and a `fetch_add` on the live
+entry - neither side ever re-reads-then-writes, so concurrent grants all
+land. Spend and quota windows are untouched; the effect is immediate, no
+reload. Guardrails, all 400 `LM-1001`: the amount must be positive, finite
+and at most 1e12 USD (serde_json already rejects overflowing literals like
+`1e999` at parse time; the finite check is belt-and-braces, and the upper
+bound keeps repeated grants from summing the DB float toward `+Inf`, which
+would reload as an unlimited cap), an unknown or deleted id is refused,
+and granting to a capless (`budget_max` NULL) key or group is refused
+rather than silently meaning nothing - set a cap with a PATCH first. In
+memory the `UNLIMITED` sentinel is protected in both directions: a capless
+entry stays capless, and a capped entry saturates below the sentinel so a
+grant can never accidentally mint an unlimited budget.
+
+Consistency contract: the database is authoritative. The grant is two
+independent atomic increments (DB, then memory), so three interleavings
+can leave the live cap diverging from the DB by at most one grant amount
+until the next reload or restart heals it: a hot reload or a `PATCH`
+(both store caps absolutely) racing the two steps in either direction,
+and a client disconnect between the DB write and the memory increment.
+Grants are also not idempotent: a timed-out grant may have landed - verify
+with a `GET` before retrying (an `Idempotency-Key` header is in the
+backlog).

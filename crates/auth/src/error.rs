@@ -30,4 +30,11 @@ pub enum AuthError {
     /// named the group, so naming it back leaks nothing.
     #[error("unknown budget group '{0}'")]
     UnknownGroup(String),
+
+    /// A grant targeted an active key or group whose `budget_max` is NULL
+    /// (unlimited). There is no cap to raise; the caller must set one with
+    /// a PATCH first. Client error (400 `LM-1001`) like [`Self::UnknownGroup`]:
+    /// the caller named the id, so naming it back leaks nothing.
+    #[error("'{0}' has no budget cap to grant to (budget_max is unlimited)")]
+    NoBudgetCap(String),
 }

@@ -1020,3 +1020,292 @@ fn race_two_keys_on_a_shared_pool_for_10_exactly_10_pass_with_no_residue() {
         "no key residue from refused threads"
     );
 }
+
+// ---- Atomic budget grants (prepaid top-ups) ----------------------------------
+//
+// The grant routes top a budget up while traffic flows: the state half is an
+// atomic add on the live entry's cap, so an exhausted key or pool reopens on
+// the very next admit - no reload, no restart, no lost concurrent increment.
+// An UNLIMITED cap is a sentinel, not a number: granting onto it must stay a
+// no-op (a naive fetch_add would wrap it negative and refuse everything).
+
+#[test]
+fn grant_key_reopens_an_exhausted_key_for_the_very_next_admit() {
+    let state = state_with(
+        "fg-grant-key",
+        VirtualKeyRecord {
+            budget_max: Some(10.0),
+            budget_spent: 10.0,
+            ..record("grant-key")
+        },
+    );
+    let entry = state.authenticate("fg-grant-key", NOW).expect("key valid");
+    // Cap = spent: the key is exhausted, with the key-scoped refusal.
+    assert!(matches!(
+        entry.admit(NOW, 1, usd_to_micro(1.0)),
+        Err(GatewayError::BudgetExceeded {
+            scope: BudgetScope::Key
+        })
+    ));
+
+    assert!(
+        state.grant_key("grant-key", usd_to_micro(5.0)),
+        "a live id reports true"
+    );
+
+    // The raise landed IN PLACE: the same entry admits on the very next
+    // request, and the accrued spend was not touched by the grant.
+    assert_eq!(entry.spent_micro(), usd_to_micro(10.0));
+    entry
+        .admit(NOW, 1, usd_to_micro(5.0))
+        .expect("granted headroom admits")
+        .settle(usd_to_micro(5.0), 1);
+    // The grant added exactly $5: one more cent is refused.
+    assert!(matches!(
+        entry.admit(NOW, 1, usd_to_micro(0.01)),
+        Err(GatewayError::BudgetExceeded {
+            scope: BudgetScope::Key
+        })
+    ));
+}
+
+#[test]
+fn grant_group_reopens_a_drained_pool_for_both_member_keys() {
+    let state = AuthState::load(
+        vec![group("topup-pool", Some(10.0))],
+        vec![
+            (hash_key("fg-topup-a"), member("topup-a", "topup-pool")),
+            (hash_key("fg-topup-b"), member("topup-b", "topup-pool")),
+        ],
+    );
+    let a = state.authenticate("fg-topup-a", NOW).expect("key a valid");
+    let b = state.authenticate("fg-topup-b", NOW).expect("key b valid");
+
+    a.admit(NOW, 1, usd_to_micro(6.0))
+        .expect("a fits the pool")
+        .settle(usd_to_micro(6.0), 1);
+    b.admit(NOW, 1, usd_to_micro(4.0))
+        .expect("b fits the pool")
+        .settle(usd_to_micro(4.0), 1);
+    // The pool is dry: either key gets the group-scoped refusal.
+    for entry in [&a, &b] {
+        assert!(matches!(
+            entry.admit(NOW, 1, usd_to_micro(1.0)),
+            Err(GatewayError::BudgetExceeded {
+                scope: BudgetScope::Group
+            })
+        ));
+    }
+
+    assert!(
+        state.grant_group("topup-pool", usd_to_micro(4.0)),
+        "a live id reports true"
+    );
+
+    // BOTH members see the top-up on their very next admit (they share the
+    // pool entry through an Arc)...
+    a.admit(NOW, 1, usd_to_micro(2.0))
+        .expect("a reopened")
+        .settle(usd_to_micro(2.0), 1);
+    b.admit(NOW, 1, usd_to_micro(2.0))
+        .expect("b reopened")
+        .settle(usd_to_micro(2.0), 1);
+    // ...and the top-up was exactly $4: the pool is dry again.
+    assert!(matches!(
+        a.admit(NOW, 1, usd_to_micro(0.01)),
+        Err(GatewayError::BudgetExceeded {
+            scope: BudgetScope::Group
+        })
+    ));
+}
+
+#[test]
+fn grant_key_on_an_unlimited_cap_keeps_it_unlimited() {
+    // budget_max None loads as the UNLIMITED sentinel. A grant onto it is a
+    // deliberate no-op that still reports the id as live - it must NOT
+    // fetch_add onto i64::MAX (wrapping negative) and must NOT turn the
+    // sentinel into a finite $5 cap.
+    let state = state_with("fg-grant-unlim", record("grant-unlim"));
+    let entry = state
+        .authenticate("fg-grant-unlim", NOW)
+        .expect("key valid");
+
+    assert!(
+        state.grant_key("grant-unlim", usd_to_micro(5.0)),
+        "a live id reports true even when the grant is a no-op"
+    );
+
+    // Still unlimited: costs far beyond the granted $5 keep passing.
+    for _ in 0..2 {
+        entry
+            .admit(NOW, 1, usd_to_micro(1_000_000.0))
+            .expect("an unlimited key admits any cost")
+            .settle(usd_to_micro(1_000_000.0), 1);
+    }
+    assert_eq!(
+        entry.spent_micro(),
+        usd_to_micro(2_000_000.0),
+        "spend is still tracked"
+    );
+}
+
+#[test]
+fn grant_group_on_an_unlimited_pool_keeps_it_unlimited() {
+    // The group half of the sentinel rule: an uncapped pool stays uncapped.
+    let state = AuthState::load(
+        vec![group("free-pool", None)],
+        vec![(hash_key("fg-free-rider"), member("free-rider", "free-pool"))],
+    );
+    let entry = state.authenticate("fg-free-rider", NOW).expect("key valid");
+
+    assert!(
+        state.grant_group("free-pool", usd_to_micro(5.0)),
+        "a live id reports true even when the grant is a no-op"
+    );
+
+    entry
+        .admit(NOW, 1, usd_to_micro(1_000_000.0))
+        .expect("an unlimited pool admits any cost")
+        .settle(usd_to_micro(1_000_000.0), 1);
+    let pool = state.remove_group("free-pool").expect("group is live");
+    assert_eq!(
+        pool.spent_micro(),
+        usd_to_micro(1_000_000.0),
+        "pool spend is still tracked"
+    );
+}
+
+#[test]
+fn grants_return_false_for_ids_that_are_not_live() {
+    let state = AuthState::load(
+        vec![group("gone-pool", Some(10.0))],
+        vec![(
+            hash_key("fg-goner"),
+            VirtualKeyRecord {
+                budget_max: Some(10.0),
+                ..record("goner")
+            },
+        )],
+    );
+
+    // Unknown ids are not live.
+    assert!(!state.grant_key("never-seen", usd_to_micro(1.0)));
+    assert!(!state.grant_group("never-seen", usd_to_micro(1.0)));
+
+    // Evicted entries are not live either.
+    state.remove("goner").expect("key was live");
+    state.remove_group("gone-pool").expect("group was live");
+    assert!(!state.grant_key("goner", usd_to_micro(1.0)));
+    assert!(!state.grant_group("gone-pool", usd_to_micro(1.0)));
+}
+
+#[test]
+fn race_concurrent_grants_all_land_alongside_concurrent_admits() {
+    // The route's whole reason to exist: grants are atomic increments, so
+    // N racing top-ups ALL land - none is lost to a read-modify-write -
+    // even while admissions hammer the same key and pool. 20 granters add
+    // $1 each to a $5 cap and pool; 20 admitters try $1 each. Whatever
+    // interleaving happens, cap and pool both end at exactly $25, and the
+    // spend equals the number of admitted requests.
+    let state = AuthState::load(
+        vec![group("grant-pool", Some(5.0))],
+        vec![(
+            hash_key("fg-grant-race"),
+            VirtualKeyRecord {
+                budget_max: Some(5.0),
+                ..member("grant-race", "grant-pool")
+            },
+        )],
+    );
+    let entry = state.authenticate("fg-grant-race", NOW).expect("key valid");
+
+    let barrier = Arc::new(Barrier::new(40));
+    let mut admitted = 0_usize;
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..40)
+            .map(|i| {
+                let entry = Arc::clone(&entry);
+                let state = &state;
+                let barrier = Arc::clone(&barrier);
+                scope.spawn(move || {
+                    barrier.wait();
+                    if i % 2 == 0 {
+                        assert!(state.grant_key("grant-race", usd_to_micro(1.0)));
+                        assert!(state.grant_group("grant-pool", usd_to_micro(1.0)));
+                        false
+                    } else {
+                        match entry.admit(NOW, 1, usd_to_micro(1.0)) {
+                            Ok(reservation) => {
+                                reservation.settle(usd_to_micro(1.0), 1);
+                                true
+                            }
+                            Err(_) => false,
+                        }
+                    }
+                })
+            })
+            .collect();
+        admitted = handles
+            .into_iter()
+            .filter_map(|h| h.join().ok())
+            .filter(|passed| *passed)
+            .count();
+    });
+
+    // Every grant landed: $5 initial + 20 x $1 on both the key cap and the
+    // pool cap. Provable through admission headroom: total capacity is $25
+    // on each side, `admitted` requests consumed that much already, and the
+    // remainder admits to the dollar - then one more cent is refused.
+    let spent = usd_to_micro(1.0) * i64::try_from(admitted).expect("fits");
+    assert_eq!(entry.spent_micro(), spent, "spend equals admitted requests");
+    let headroom = usd_to_micro(25.0) - spent;
+    let remaining = headroom / usd_to_micro(1.0);
+    for _ in 0..remaining {
+        entry
+            .admit(NOW, 1, usd_to_micro(1.0))
+            .expect("headroom to the granted caps")
+            .settle(usd_to_micro(1.0), 1);
+    }
+    assert!(
+        matches!(
+            entry.admit(NOW, 1, usd_to_micro(0.01)),
+            Err(GatewayError::BudgetExceeded { .. })
+        ),
+        "both caps land at exactly $25: the next cent is refused"
+    );
+}
+
+#[test]
+fn a_huge_grant_saturates_below_the_unlimited_sentinel() {
+    // grant_cap saturates at UNLIMITED - 1: even a grant whose micro-USD
+    // amount clamps to i64::MAX must leave the key CAPPED. A finite cap
+    // refuses an i64::MAX-cost admission; the sentinel would admit it.
+    let state = AuthState::load(
+        Vec::new(),
+        vec![(
+            hash_key("fg-saturate"),
+            VirtualKeyRecord {
+                budget_max: Some(1.0),
+                ..record("saturate")
+            },
+        )],
+    );
+    let entry = state.authenticate("fg-saturate", NOW).expect("key valid");
+
+    // usd_to_micro(9.3e12) clamps to i64::MAX (the sentinel value itself).
+    assert!(state.grant_key("saturate", usd_to_micro(9.3e12)));
+    assert!(
+        matches!(
+            entry.admit(NOW, 1, i64::MAX),
+            Err(GatewayError::BudgetExceeded {
+                scope: BudgetScope::Key
+            })
+        ),
+        "the cap saturated below UNLIMITED and still refuses"
+    );
+    // A normal admission still fits: saturation kept the cap huge, not zero.
+    entry
+        .admit(NOW, 1, usd_to_micro(1.0))
+        .expect("a sane cost admits against the saturated cap")
+        .settle(usd_to_micro(1.0), 1);
+}

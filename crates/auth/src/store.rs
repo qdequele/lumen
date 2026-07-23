@@ -756,6 +756,69 @@ impl KeyStore {
         Ok(record)
     }
 
+    /// Atomically raise a key's budget cap by `amount` USD (admin grant).
+    /// The increment happens inside SQLite (`budget_max = budget_max + ?`),
+    /// never as a read-modify-write, so two concurrent grants both land.
+    /// Spend is untouched. `Ok(None)` when the id is unknown or the key is
+    /// soft-deleted; [`AuthError::NoBudgetCap`] when the key is active but
+    /// capless (`budget_max` NULL) - there is no cap to raise, the caller
+    /// must set one with a patch first. Amount-sign validation is the HTTP
+    /// handler's job, not the store's.
+    pub async fn grant_key_budget(
+        &self,
+        id: &str,
+        amount: f64,
+    ) -> Result<Option<VirtualKeyRecord>, AuthError> {
+        let changed = sqlx::query(
+            "UPDATE virtual_keys SET budget_max = budget_max + ? \
+             WHERE id = ? AND deleted_at IS NULL AND budget_max IS NOT NULL",
+        )
+        .bind(amount)
+        .bind(id)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        if changed == 0 {
+            // Nothing matched: unknown, tombstoned, or active-but-capless.
+            return match self.fetch_key(id).await? {
+                Some(record) if record.deleted_at.is_none() => {
+                    Err(AuthError::NoBudgetCap(id.to_owned()))
+                }
+                _ => Ok(None),
+            };
+        }
+        self.fetch_key(id).await
+    }
+
+    /// The group half of [`grant_key_budget`](Self::grant_key_budget):
+    /// atomically raise a pool's cap by `amount` USD. Same contract -
+    /// `Ok(None)` for unknown/deleted, [`AuthError::NoBudgetCap`] for an
+    /// active capless pool, spend untouched.
+    pub async fn grant_group_budget(
+        &self,
+        id: &str,
+        amount: f64,
+    ) -> Result<Option<GroupRecord>, AuthError> {
+        let changed = sqlx::query(
+            "UPDATE budget_groups SET budget_max = budget_max + ? \
+             WHERE id = ? AND deleted_at IS NULL AND budget_max IS NOT NULL",
+        )
+        .bind(amount)
+        .bind(id)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        if changed == 0 {
+            return match self.fetch_group(id).await? {
+                Some(record) if record.deleted_at.is_none() => {
+                    Err(AuthError::NoBudgetCap(id.to_owned()))
+                }
+                _ => Ok(None),
+            };
+        }
+        self.fetch_group(id).await
+    }
+
     /// Persist absolute pool spend `(group id, spent USD)` - the group half
     /// of the periodic budget flush. One transaction for the whole batch.
     pub async fn persist_group_budgets(&self, spent: &[(String, f64)]) -> Result<(), AuthError> {

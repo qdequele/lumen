@@ -8,6 +8,18 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ### Added
 
+- **Atomic budget grant routes** - ADR 009 amendment. `POST
+  /admin/keys/{id}/grant` and `POST /admin/groups/{id}/grant` take
+  `{"amount": <USD>}` and raise `budget_max` as an atomic increment on both
+  the database (`budget_max = budget_max + ?`) and the live in-memory entry
+  (`fetch_add`), so concurrent top-ups from a billing control plane never
+  lose an update the way read-modify-write PATCHes can. Immediate effect,
+  no reload; spend and quotas untouched. Refused with 400 `LM-1001` for a
+  non-positive, non-finite or oversized amount (single grants cap at 1e12
+  USD so the stored f64 can never sum toward an accidental *unlimited*),
+  an unknown or deleted id, or a capless (`budget_max` NULL) target - set
+  a cap with a PATCH first. Grants are not idempotent: a timed-out call
+  may have landed, verify with a GET before retrying.
 - **Shared parent budgets (budget groups)** - ADR 009. A budget group is a
   named pool any number of virtual keys can belong to; admission now checks
   the key's own budget AND the group's shared pool, both in per-process

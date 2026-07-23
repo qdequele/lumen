@@ -7,6 +7,12 @@ milestone.
 
 ## Noted while building ADR 009 (shared parent budgets)
 
+- **Grant routes are not idempotent** (ADR 009 amendment). A timed-out
+  `POST /admin/{keys,groups}/{id}/grant` may have landed; the docs tell
+  billing automation to verify with a GET before retrying. A client-supplied
+  `Idempotency-Key` header (dedup table keyed on it, replay the recorded
+  response) would make retries safe; add it when a real billing integration
+  asks.
 - **Groups carry budget only.** Group-level RPM/TPM, a group `disabled`
   flag (pause a whole customer), group expiry, and nested groups are all
   deliberate non-goals of the first slice; each is a natural follow-up on

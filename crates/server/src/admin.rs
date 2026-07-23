@@ -19,6 +19,11 @@
 //!   every member on their next request.
 //! * `DELETE /admin/groups/{id}` - soft-delete a group; refused while it
 //!   still has active member keys.
+//! * `POST /admin/keys/{id}/grant` / `POST /admin/groups/{id}/grant` -
+//!   atomically raise a budget cap by `amount` USD (ADR 009 amendment): an
+//!   in-database and in-memory `fetch_add`, so concurrent top-ups from a
+//!   billing control plane never lose an update the way read-modify-write
+//!   PATCHes can.
 //! * `PUT /admin/provider-keys/{name}` - store a provider API key encrypted
 //!   at rest (AES-256-GCM under the master key) and apply it without a restart
 //!   by requesting a hot reload; used for providers whose `api_key_env` is
@@ -73,13 +78,18 @@ fn internal(error: &lumen_auth::AuthError) -> ApiError {
 }
 
 /// Map a store failure from a key/group write: a caller-named unknown group
-/// is their error (400 `LM-1001` - naming it back leaks nothing, they sent
-/// it), everything else stays an opaque 500.
+/// or capless grant target is their error (400 `LM-1001` - naming the id
+/// back leaks nothing, they sent it), everything else stays an opaque 500.
 fn store_error(error: lumen_auth::AuthError) -> ApiError {
     match error {
         lumen_auth::AuthError::UnknownGroup(id) => {
             GatewayError::InvalidRequest(format!("unknown budget group '{id}'")).into()
         }
+        lumen_auth::AuthError::NoBudgetCap(id) => GatewayError::InvalidRequest(format!(
+            "'{id}' has no budget cap to grant to (budget_max is unlimited); \
+             set one with a PATCH first"
+        ))
+        .into(),
         other => internal(&other),
     }
 }
@@ -339,6 +349,95 @@ pub async fn delete_group(
             Err(GatewayError::InvalidRequest(format!("unknown group id '{id}'")).into())
         }
     }
+}
+
+/// `POST /admin/keys/{id}/grant` and `/admin/groups/{id}/grant` body.
+#[derive(Debug, Deserialize)]
+pub struct GrantBody {
+    /// USD to add to the budget cap. Must be a positive finite number.
+    pub amount: f64,
+}
+
+/// Hard upper bound on a single grant, in USD. Keeps the DB cap far away
+/// from both f64 infinity (repeated huge grants would sum to `+Inf`, which
+/// serializes as `null` and reloads as *unlimited*) and the in-memory
+/// micro-USD clamp at ~9.2e12 - either would silently mint the unlimited
+/// sentinel the grant path promises never to produce.
+const MAX_GRANT_USD: f64 = 1e12;
+
+/// Validate a grant amount: positive, finite and at most [`MAX_GRANT_USD`],
+/// or 400 `LM-1001`. serde_json rejects overflowing literals like `1e999`
+/// at parse time (and JSON has no NaN literal), so the finite check is
+/// belt-and-braces in case a future serde version saturates to `inf`
+/// instead of erroring.
+fn validated_grant_amount(
+    payload: Result<Json<GrantBody>, JsonRejection>,
+) -> Result<f64, ApiError> {
+    let Json(body) = payload.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
+    if body.amount.is_finite() && body.amount > 0.0 && body.amount <= MAX_GRANT_USD {
+        Ok(body.amount)
+    } else {
+        Err(GatewayError::InvalidRequest(format!(
+            "grant `amount` must be a positive finite number of at most {MAX_GRANT_USD:e} USD, \
+             got '{}'",
+            body.amount
+        ))
+        .into())
+    }
+}
+
+/// Grant budget to a key: atomically raise `budget_max` by `amount` USD
+/// (ADR 009 amendment). DB first (the durable atomic add), then the live
+/// entry (its own `fetch_add`) - two concurrent grants both land on both
+/// sides, which is the whole point over a read-modify-write PATCH. Takes
+/// effect on the very next request, no restart. An unknown or deleted id is
+/// a 400 `LM-1001`; so is a capless key (there is no cap to raise).
+pub async fn grant_key(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    payload: Result<Json<GrantBody>, JsonRejection>,
+) -> Result<Json<VirtualKeyRecord>, ApiError> {
+    let amount = validated_grant_amount(payload)?;
+    let auth = runtime(&state)?;
+    let record = auth
+        .store
+        .grant_key_budget(&id, amount)
+        .await
+        .map_err(store_error)?
+        .ok_or_else(|| GatewayError::InvalidRequest(format!("unknown key id '{id}'")))?;
+    // The live entry increments independently (never re-read from the DB
+    // record, which could interleave with a concurrent grant's re-read).
+    // A dead id here means a racing delete: the tombstoned row never
+    // reloads, and a deleted key needs no live cap - nothing to repair.
+    //
+    // Honest divergence windows (DB is authoritative; memory drift is
+    // bounded by one grant amount and healed by the next reload/boot):
+    // a hot reload or a PATCH stores caps ABSOLUTELY and can interleave
+    // with the two-step grant in either direction, and a client disconnect
+    // between the DB write and this line credits the DB but not memory.
+    auth.keys
+        .grant_key(&id, lumen_auth::state::usd_to_micro(amount));
+    Ok(Json(record))
+}
+
+/// The group half of [`grant_key`]: atomically raise a pool's cap. Every
+/// member key sees the new headroom on its next admission.
+pub async fn grant_group(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    payload: Result<Json<GrantBody>, JsonRejection>,
+) -> Result<Json<GroupRecord>, ApiError> {
+    let amount = validated_grant_amount(payload)?;
+    let auth = runtime(&state)?;
+    let record = auth
+        .store
+        .grant_group_budget(&id, amount)
+        .await
+        .map_err(store_error)?
+        .ok_or_else(|| GatewayError::InvalidRequest(format!("unknown group id '{id}'")))?;
+    auth.keys
+        .grant_group(&id, lumen_auth::state::usd_to_micro(amount));
+    Ok(Json(record))
 }
 
 /// `PUT /admin/provider-keys/{name}` body.

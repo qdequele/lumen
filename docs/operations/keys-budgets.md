@@ -87,10 +87,12 @@ together, so they take effect immediately with no restart.
 | `PATCH` | `/admin/keys/{id}` | Adjust budget/limits, or enable/disable a key. |
 | `DELETE` | `/admin/keys/{id}` | Soft-delete a key (tombstone; stops authenticating immediately). |
 | `POST` | `/admin/keys/{id}/rotate` | Mint a new secret for an existing key (one-time plaintext, identity and spend preserved). |
+| `POST` | `/admin/keys/{id}/grant` | Atomically add to a key's budget cap (concurrency-safe top-up). |
 | `POST` | `/admin/groups` | Create a budget group - a shared pool member keys draw from. |
 | `GET` | `/admin/groups` | List active groups. `?include_deleted=true` adds tombstones. |
 | `PATCH` | `/admin/groups/{id}` | Adjust a group's name or shared budget (pool spend preserved). |
 | `DELETE` | `/admin/groups/{id}` | Soft-delete a group. Refused while it still has active member keys. |
+| `POST` | `/admin/groups/{id}/grant` | Atomically add to a group's shared budget cap (concurrency-safe top-up). |
 | `PUT` | `/admin/provider-keys/{name}` | Store a provider API key encrypted at rest. |
 | `GET` | `/admin/usage` | Aggregated usage and spend from the usage log. |
 
@@ -102,7 +104,7 @@ for: prepaid credits per customer, one key per project of that customer.
 Without groups you would chunk the customer's credit across the project
 keys and rebalance from outside - racy, and credit strands on idle keys.
 With groups: one group per customer, its keys join it, and a top-up is a
-single `PATCH`.
+single [grant](#granting-budget-top-ups).
 
 Create the pool first:
 
@@ -184,6 +186,11 @@ curl -s -X PATCH http://localhost:8080/admin/groups/<id> \
   -d '{"budget_max": 1000.0}'
 ```
 
+A `PATCH` sends an **absolute** cap, so top-ups that can race (an
+automated billing flow) should use
+[grant](#granting-budget-top-ups) instead - it adds atomically and never
+loses a concurrent update.
+
 `DELETE /admin/groups/{id}` is a **soft delete**, like keys, and it is
 refused (400) while the group still has active member keys: move them out
 (`PATCH` with `"group_id": null` or another group) or delete them first.
@@ -196,6 +203,50 @@ rows alike - carries the key's group id (when it has one), so per-customer
 reporting includes the traffic the pool refused. `GET /admin/usage`
 (below) takes a `group_id` filter and `group_by=group_id`; under that
 grouping, rows from ungrouped keys aggregate under an empty group name.
+
+### Granting budget (top-ups)
+
+`POST /admin/groups/{id}/grant` adds to a pool's cap **atomically**. It
+exists for the prepaid-credits flow above: a customer buys credits, and
+the billing control plane grants their pool.
+
+```bash
+curl -s -X POST http://localhost:8080/admin/groups/<id>/grant \
+  -H "Authorization: Bearer $LUMEN_MASTER_KEY" \
+  -H 'content-type: application/json' \
+  -d '{"amount": 25.0}'
+```
+
+The body is `{"amount": <USD>}`, the amount to **add** to `budget_max`;
+spend and quota windows are untouched. The `200` response is the updated
+group record, the same shape as `GET /admin/groups`. The key half is
+`POST /admin/keys/{id}/grant`: same body, same rules, and the `200`
+response is the updated key record (the record only - no plaintext,
+nothing was minted).
+
+Why not a `PATCH`? A patch sends an **absolute** cap, so two racing
+top-ups can lose one: both workers read 500, both add 25, both write 525,
+and one customer payment vanishes. A grant is an atomic increment on
+**both** sides - `budget_max = budget_max + ?` inside SQLite, a
+`fetch_add` on the live in-memory entry - so concurrent grants all land.
+Like every admin change it takes effect on the very next request, no
+restart.
+
+Three refusals, all `400` `LM-1001`:
+
+- **A non-positive, non-finite or oversized `amount`.** Zero and negatives
+  are rejected; overflowing literals like `1e999` never even parse; and a
+  single grant is capped at `1e12` USD so repeated grants can never sum
+  the stored cap toward infinity (which would read back as *unlimited*).
+- **Unknown or deleted id**, like every other admin write.
+- **A capless target** (`budget_max` null): there is no cap to raise, and
+  silently doing nothing would be worse than the error. Set a cap first
+  (`PATCH {"budget_max": ...}`), then grant.
+
+One retry caveat for billing automation: a grant is **not idempotent**. A
+call that timed out or disconnected may still have landed in the
+database, and blindly retrying would credit the cap twice - verify with
+`GET /admin/groups` (or `/admin/keys`) before retrying.
 
 ### Create a key
 
