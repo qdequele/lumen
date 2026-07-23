@@ -1421,6 +1421,103 @@ async fn streaming_client_disconnect_aborts_upstream_connection() {
     );
 }
 
+/// A raw TCP "upstream" that writes its first SSE frame immediately, then
+/// holds the rest of the stream (tail frames + `[DONE]` + EOF) until the test
+/// releases it through the returned sender. Lets a test prove the first bit
+/// reached the client while the upstream was verifiably still mid-stream,
+/// with no sleeps or timing races: the tail is only ever written after the
+/// client has already observed the first chunk.
+async fn spawn_gated_sse_upstream() -> (String, tokio::sync::oneshot::Sender<()>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+
+    tokio::spawn(async move {
+        let Ok((mut socket, _)) = listener.accept().await else {
+            return;
+        };
+        // Drain the request (small, one read on loopback) before responding.
+        let mut req = [0u8; 4096];
+        let _ = socket.read(&mut req).await;
+        let head =
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n";
+        let first = "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"first\"}}]}\n\n";
+        if socket.write_all(head.as_bytes()).await.is_err()
+            || socket.write_all(first.as_bytes()).await.is_err()
+        {
+            return;
+        }
+        let _ = socket.flush().await;
+        // Gate: hold the tail until the client side has seen the first chunk.
+        if rx.await.is_err() {
+            return;
+        }
+        let tail = "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"rest\"}}]}\n\ndata: [DONE]\n\n";
+        let _ = socket.write_all(tail.as_bytes()).await;
+        let _ = socket.flush().await;
+        // `connection: close` + no content-length: EOF ends the body.
+        let _ = socket.shutdown().await;
+    });
+
+    (format!("http://{addr}"), tx)
+}
+
+/// The property `benches/stream_ttfb.rs` measures the magnitude of: the
+/// gateway forwards the first upstream SSE frame to the client while the
+/// upstream is still mid-stream, rather than buffering the response until
+/// `[DONE]`/EOF (ADR 004 passthrough). Deterministic by construction: the
+/// upstream's tail is gated on this test observing the first chunk, so a
+/// buffering gateway would hit the bounded timeout below, never a flake.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn first_stream_chunk_reaches_the_client_before_the_upstream_finishes() {
+    let (upstream_url, release_tail) = spawn_gated_sse_upstream().await;
+    let base = common::spawn_with(openai_registry(&upstream_url), LIMIT).await;
+
+    let client = reqwest::Client::new();
+    let mut resp = client
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&json!({
+            "model": "gpt",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // The first chunk must arrive while the tail is still held back (it is
+    // only released after this read). Bound the wait so a buffering gateway
+    // fails loudly instead of hanging the suite.
+    let first = tokio::time::timeout(Duration::from_secs(5), resp.chunk())
+        .await
+        .expect("first bit was not forwarded while the upstream was mid-stream")
+        .unwrap()
+        .expect("stream ended before the first frame");
+    let mut body = String::from_utf8(first.to_vec()).unwrap();
+    assert!(
+        body.starts_with("data: "),
+        "unexpected first chunk: {body:?}"
+    );
+
+    // Release the tail and drain to a normal completion - bounded too, so a
+    // gateway that swallowed the tail fails loudly instead of hanging.
+    release_tail
+        .send(())
+        .expect("gated upstream is still waiting");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(chunk) = resp.chunk().await.unwrap() {
+            body.push_str(std::str::from_utf8(&chunk).unwrap());
+        }
+    })
+    .await
+    .expect("released tail was not forwarded");
+    assert!(body.ends_with("data: [DONE]\n\n"), "tail missing: {body:?}");
+}
+
 // ---- M4 finish: streaming translation + stream guards ----------------------
 
 /// Anthropic SSE event fixture (text + tool_use), in upstream wire format.

@@ -13,7 +13,8 @@ See `docs/perf-baseline.md` for methodology and the recorded in-process numbers.
   `/v1/chat/completions` (what the direct-baseline k6 run calls on the mock
   itself).
 - `lumen-bench.toml` / `litellm-bench.yaml` - matching single-model configs.
-- `k6-added-latency.js` - 50-VU, 30 s constant load reporting p50/p95/p99.
+- `k6-added-latency.js` - 50-VU, 30 s constant load reporting p50/p95/p99 for
+  both total request time and time to first byte.
 - `run.sh` - drives the whole harness end to end (build, wait for readiness,
   run k6 against all three targets, sample RAM under load, write a report)
   and writes a timestamped, self-contained result under `results/`.
@@ -57,9 +58,26 @@ docker compose -f bench/compose.yaml down -v
 - **Added latency** = gateway `http_req_duration` percentile − direct percentile,
   at p50 and p99. The direct baseline captures the localhost hop + mock time so
   the subtraction isolates the gateway.
+- **Time to first byte (TTFB)** = gateway `http_req_waiting` percentile −
+  direct percentile. k6 defines `http_req_waiting` as the gap between the
+  request being fully written and the first byte of the response arriving,
+  so this is how much longer a client waits for the *start* of the answer
+  because the gateway sits in the middle. The scenario is non-streaming and
+  the mock body is tiny, so TTFB tracks total duration closely here; it
+  diverges (and matters) on targets that do real work before their first
+  byte. Every `*.summary.json` ever recorded contains this metric, so the
+  table can be derived retroactively for old runs too.
 - **RAM** = the `MEM USAGE` column from `docker stats` for `lumen` vs
   `litellm` under the same load.
 - **Throughput** = k6's `http_reqs` rate (req/s) for each target.
+
+Streaming time-to-first-chunk is deliberately *not* measured here: stock k6
+buffers response bodies, so it cannot timestamp the first SSE chunk of a
+stream (a body-aware client such as the xk6-sse extension would be needed;
+noted in `docs/backlog.md`). The streaming first-bit measurement lives in
+`cargo bench -p server --bench stream_ttfb`, which times request dispatch to
+first SSE body bytes through the full LUMEN stack against the same request
+issued directly to the upstream.
 
 The mock returns instantly, so absolute latencies are tiny and dominated by
 transport - which is exactly the point: it exposes the proxy's own overhead

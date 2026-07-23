@@ -158,6 +158,23 @@ REPORT="$RUN_DIR/report.md"
   echo
   echo "Added latency = gateway percentile - direct percentile."
   echo
+  echo "### Time to first byte"
+  echo
+  echo "k6's \`http_req_waiting\`: the gap between the request being fully"
+  echo "written and the first byte of the response arriving, i.e. how long the"
+  echo "target sat on the request before starting to answer. Added TTFB ="
+  echo "gateway percentile - direct percentile."
+  echo
+  echo "| Target | p50 (ms) | p95 (ms) | p99 (ms) |"
+  echo "|---|---|---|---|"
+  for name in direct lumen litellm; do
+    f="$RUN_DIR/$name.summary.json"
+    p50=$(pct "$f" http_req_waiting med)
+    p95=$(pct "$f" http_req_waiting "p(95)")
+    p99=$(pct "$f" http_req_waiting "p(99)")
+    echo "| $name | $p50 | $p95 | $p99 |"
+  done
+  echo
   echo "## RAM under load (\`docker stats --no-stream\`, sampled ~10s into each run)"
   echo
   echo '```'

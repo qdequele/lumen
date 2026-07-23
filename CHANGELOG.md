@@ -60,6 +60,22 @@ All notable changes to LUMEN are documented here. The format is based on
   rejected apply never touches the live file; `If-Match` guards against two
   operators losing an edit, and the previous document is kept as `.bak`
   (ADR 010).
+- **Time to first bit, measured on the bench.** Two additions, one per
+  bench layer. (1) The k6 head-to-head report (`bench/run.sh`) now surfaces a
+  time-to-first-byte table per target (k6's built-in `http_req_waiting`:
+  request fully written to first response byte; added TTFB = gateway − direct).
+  The metric was always recorded in every `*.summary.json`, so the table is
+  derivable retroactively for committed runs - `docs/perf-baseline.md` now
+  shows it for the recorded baseline. (2) A new `stream_ttfb` criterion bench
+  (`cargo bench -p server --bench stream_ttfb`) measures what stock k6 cannot:
+  streaming time-to-first-chunk over real sockets, the same `stream: true`
+  request timed direct-to-upstream vs through the full LUMEN stack, the
+  difference being the gateway's added first-bit latency on the streaming
+  path. A companion integration test pins the property the bench quantifies
+  (first upstream SSE frame reaches the client while the upstream tail is
+  verifiably still held back - gated, not sleep-based). k6-side streaming
+  TTFT under load needs a body-aware client (xk6-sse); noted in
+  `docs/backlog.md`.
 - **Atomic budget grant routes** - ADR 009 amendment. `POST
   /admin/keys/{id}/grant` and `POST /admin/groups/{id}/grant` take
   `{"amount": <USD>}` and raise `budget_max` as an atomic increment on both
