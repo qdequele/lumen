@@ -415,3 +415,224 @@ async fn persist_group_budgets_survives_reload() {
     let listed = store.list_groups(false).await.expect("list");
     assert_eq!(listed[0].budget_spent, 12.5);
 }
+
+// ---- Atomic budget grants (prepaid top-ups) ---------------------------------
+//
+// A prepaid-credits control plane tops budgets up while traffic flows; a
+// read-modify-write PATCH would race concurrent top-ups, so a grant is one
+// atomic SQL increment (budget_max = budget_max + amount) on the active row.
+
+#[tokio::test]
+async fn grant_key_budget_adds_to_the_cap_and_leaves_spend_untouched() {
+    let store = KeyStore::in_memory().await.expect("open store");
+    let (plaintext, record) = store
+        .create_key(NewKey {
+            name: "topped-up".to_owned(),
+            budget_max: Some(10.0),
+            ..NewKey::default()
+        })
+        .await
+        .expect("create key");
+    // Accrue some spend first, so "spend untouched" is a real assertion.
+    store
+        .persist_budgets(&[(record.id.clone(), 2.0)])
+        .await
+        .expect("flush spend");
+
+    let granted = store
+        .grant_key_budget(&record.id, 5.0)
+        .await
+        .expect("grant")
+        .expect("key exists");
+    assert_eq!(granted.budget_max, Some(15.0), "10 + 5 = 15");
+    assert_eq!(granted.budget_spent, 2.0, "a grant never touches spend");
+
+    // Memory-independent read-back: the increment landed in SQLite, not in
+    // some copy the grant call returned.
+    let fetched = store
+        .find_by_hash(&hash_key(plaintext.reveal()))
+        .await
+        .expect("lookup")
+        .expect("key exists");
+    assert_eq!(fetched.budget_max, Some(15.0));
+    assert_eq!(fetched.budget_spent, 2.0);
+}
+
+#[tokio::test]
+async fn grant_group_budget_adds_to_the_cap_and_leaves_spend_untouched() {
+    let store = KeyStore::in_memory().await.expect("open store");
+    let record = store
+        .create_group(new_group("prepaid"))
+        .await
+        .expect("create group");
+    // new_group carries a $25 cap; accrue $2.50 of pool spend first.
+    store
+        .persist_group_budgets(&[(record.id.clone(), 2.5)])
+        .await
+        .expect("flush spend");
+
+    let granted = store
+        .grant_group_budget(&record.id, 5.0)
+        .await
+        .expect("grant")
+        .expect("group exists");
+    assert_eq!(granted.budget_max, Some(30.0), "25 + 5 = 30");
+    assert_eq!(granted.budget_spent, 2.5, "a grant never touches spend");
+
+    // Memory-independent read-back: what a restarted gateway would load.
+    let reloaded = store.load_groups().await.expect("load");
+    assert_eq!(reloaded[0].budget_max, Some(30.0));
+    assert_eq!(reloaded[0].budget_spent, 2.5);
+}
+
+#[tokio::test]
+async fn sequential_grants_accumulate_on_the_same_row() {
+    // Grants are increments, not sets: two top-ups sum on the stored cap.
+    let store = KeyStore::in_memory().await.expect("open store");
+
+    let (_, key) = store
+        .create_key(NewKey {
+            name: "accumulator".to_owned(),
+            budget_max: Some(10.0),
+            ..NewKey::default()
+        })
+        .await
+        .expect("create key");
+    store
+        .grant_key_budget(&key.id, 5.0)
+        .await
+        .expect("grant")
+        .expect("key exists");
+    let key_after = store
+        .grant_key_budget(&key.id, 2.5)
+        .await
+        .expect("grant")
+        .expect("key exists");
+    assert_eq!(key_after.budget_max, Some(17.5), "10 + 5 + 2.5 = 17.5");
+
+    let group = store
+        .create_group(NewGroup {
+            name: "pool-accumulator".to_owned(),
+            budget_max: Some(10.0),
+        })
+        .await
+        .expect("create group");
+    store
+        .grant_group_budget(&group.id, 5.0)
+        .await
+        .expect("grant")
+        .expect("group exists");
+    let group_after = store
+        .grant_group_budget(&group.id, 2.5)
+        .await
+        .expect("grant")
+        .expect("group exists");
+    assert_eq!(group_after.budget_max, Some(17.5), "10 + 5 + 2.5 = 17.5");
+}
+
+#[tokio::test]
+async fn grant_key_budget_of_unknown_or_deleted_id_returns_none() {
+    let store = KeyStore::in_memory().await.expect("open store");
+    assert!(store
+        .grant_key_budget("nope", 5.0)
+        .await
+        .expect("grant")
+        .is_none());
+
+    let (_, key) = store
+        .create_key(NewKey {
+            name: "dead".to_owned(),
+            budget_max: Some(10.0),
+            ..NewKey::default()
+        })
+        .await
+        .expect("create key");
+    store
+        .delete_key(&key.id)
+        .await
+        .expect("delete")
+        .expect("key exists");
+    // A tombstone behaves like an unknown id...
+    assert!(store
+        .grant_key_budget(&key.id, 5.0)
+        .await
+        .expect("grant")
+        .is_none());
+    // ...and its row is untouched: no increment landed on the tombstone.
+    let all = store.list_keys(true).await.expect("list all");
+    assert_eq!(all[0].budget_max, Some(10.0));
+}
+
+#[tokio::test]
+async fn grant_group_budget_of_unknown_or_deleted_id_returns_none() {
+    let store = KeyStore::in_memory().await.expect("open store");
+    assert!(store
+        .grant_group_budget("nope", 5.0)
+        .await
+        .expect("grant")
+        .is_none());
+
+    let group = store.create_group(new_group("dead")).await.expect("create");
+    assert!(matches!(
+        store.delete_group(&group.id).await.expect("delete"),
+        DeleteGroupOutcome::Deleted(_)
+    ));
+    // A tombstone behaves like an unknown id...
+    assert!(store
+        .grant_group_budget(&group.id, 5.0)
+        .await
+        .expect("grant")
+        .is_none());
+    // ...and its row is untouched: no increment landed on the tombstone.
+    let all = store.list_groups(true).await.expect("list all");
+    assert_eq!(all[0].budget_max, Some(25.0));
+}
+
+#[tokio::test]
+async fn grant_key_budget_to_an_uncapped_key_is_refused_and_writes_nothing() {
+    // budget_max NULL means unlimited: adding credits to infinity is
+    // meaningless, so the store refuses instead of silently no-opping - the
+    // caller must PATCH a cap on first.
+    let store = KeyStore::in_memory().await.expect("open store");
+    let (_, key) = store
+        .create_key(NewKey {
+            name: "uncapped".to_owned(),
+            ..NewKey::default()
+        })
+        .await
+        .expect("create key");
+
+    let err = store
+        .grant_key_budget(&key.id, 5.0)
+        .await
+        .expect_err("an uncapped key must refuse the grant");
+    assert!(matches!(err, AuthError::NoBudgetCap(id) if id == key.id));
+
+    // The refusal wrote nothing: the row still has no cap and no spend.
+    let rows = store.list_keys(false).await.expect("list");
+    assert_eq!(rows[0].budget_max, None);
+    assert_eq!(rows[0].budget_spent, 0.0);
+}
+
+#[tokio::test]
+async fn grant_group_budget_to_an_uncapped_group_is_refused_and_writes_nothing() {
+    let store = KeyStore::in_memory().await.expect("open store");
+    let group = store
+        .create_group(NewGroup {
+            name: "tracking-only".to_owned(),
+            budget_max: None,
+        })
+        .await
+        .expect("create group");
+
+    let err = store
+        .grant_group_budget(&group.id, 5.0)
+        .await
+        .expect_err("an uncapped group must refuse the grant");
+    assert!(matches!(err, AuthError::NoBudgetCap(id) if id == group.id));
+
+    // The refusal wrote nothing: the row still has no cap and no spend.
+    let rows = store.list_groups(false).await.expect("list");
+    assert_eq!(rows[0].budget_max, None);
+    assert_eq!(rows[0].budget_spent, 0.0);
+}

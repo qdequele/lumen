@@ -111,6 +111,12 @@ impl GroupEntry {
         );
     }
 
+    /// Atomically raise the pool's cap by `amount_micro` (admin grant). A
+    /// capless (unlimited) pool stays unlimited - see [`grant_cap`].
+    fn grant(&self, amount_micro: i64) {
+        grant_cap(&self.budget_max_micro, amount_micro);
+    }
+
     /// The group's opaque id (the `budget_groups.id` column).
     #[must_use]
     pub fn id(&self) -> &str {
@@ -211,6 +217,12 @@ impl KeyEntry {
     #[must_use]
     pub fn spent_micro(&self) -> i64 {
         self.spent_micro.load(Ordering::SeqCst)
+    }
+
+    /// Atomically raise the key's cap by `amount_micro` (admin grant). A
+    /// capless (unlimited) key stays capless - see [`grant_cap`].
+    fn grant(&self, amount_micro: i64) {
+        grant_cap(&self.budget_max_micro, amount_micro);
     }
 
     fn usable(&self, now: i64) -> bool {
@@ -562,6 +574,34 @@ impl AuthState {
         self.groups.remove(id).map(|(_, entry)| entry)
     }
 
+    /// Atomically raise a live key's budget cap by `amount_micro` (admin
+    /// grant): a `fetch_add`, never a read-modify-write, so two concurrent
+    /// grants both land. Spend and quota windows are untouched; a capless
+    /// key stays capless (see [`grant_cap`]). `false` when the id is not
+    /// live (unknown or deleted) - the caller decides what that means.
+    pub fn grant_key(&self, id: &str, amount_micro: i64) -> bool {
+        match self.by_id.get(id) {
+            Some(entry) => {
+                entry.grant(amount_micro);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The group half of [`grant_key`](Self::grant_key): atomically raise a
+    /// live pool's cap. Every member key sees the new headroom on its next
+    /// admission (the entry is shared via `Arc`).
+    pub fn grant_group(&self, id: &str, amount_micro: i64) -> bool {
+        match self.groups.get(id) {
+            Some(entry) => {
+                entry.grant(amount_micro);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Collect `(key id, spent USD)` for every key whose spend changed since
     /// the last call, marking them clean. Any spend that lands between the
     /// clean-marking and the read re-dirties the entry, so nothing is lost.
@@ -596,6 +636,22 @@ impl AuthState {
         }
         out
     }
+}
+
+/// Atomically raise a budget cap by `amount_micro` (admin grant). Two rules,
+/// both to protect the [`UNLIMITED`] sentinel:
+///
+/// * a capless entry stays capless - adding to the sentinel would corrupt it
+///   into a huge-but-finite cap, so the update is a no-op;
+/// * a capped entry saturates at `UNLIMITED - 1` - a grant must never
+///   *accidentally* mint an unlimited budget by overflowing into the
+///   sentinel value.
+fn grant_cap(cap: &AtomicI64, amount_micro: i64) {
+    // fetch_update never panics: the closure returning `None` (unlimited
+    // case) simply leaves the value untouched.
+    let _ = cap.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |max| {
+        (max != UNLIMITED).then(|| max.saturating_add(amount_micro).min(UNLIMITED - 1))
+    });
 }
 
 /// Seconds until the current per-minute quota window rolls over.
