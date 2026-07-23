@@ -324,6 +324,17 @@ milestone.
   shared dev host, not dedicated hardware, so the *relative* LUMEN-vs-LiteLLM
   comparison is solid but the absolute figures are illustrative. Re-run
   `bench/run.sh` on real hardware for numbers to make capacity decisions on.
+- **Streaming time-to-first-token in the k6 harness.** The head-to-head now
+  reports non-streaming time to first byte (k6's built-in `http_req_waiting`),
+  but a *streaming* TTFT column (first SSE chunk of a `stream: true` response,
+  per target, under load) is not measurable with stock k6: it buffers response
+  bodies, so the first body chunk cannot be timestamped. Doing it in the
+  harness needs a body-aware load client - the `xk6-sse` extension (custom k6
+  build via xk6) or a small purpose-built Rust/Go client - plus a mock
+  upstream that actually paces its SSE frames (mockserver writes the whole
+  body at once). Until then the streaming first-bit number lives off-harness
+  in `cargo bench -p server --bench stream_ttfb` (single-request latency,
+  direct vs via-gateway, no concurrent load).
 
 ## Backlog debt paid down (post-v0.1.0)
 
