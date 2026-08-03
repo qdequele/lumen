@@ -72,7 +72,7 @@ dashmap = "6"
 tiktoken-rs = "0.12"
 
 # Storage & crypto (M5: virtual keys, budgets, usage log)
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros", "derive"] }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros", "derive"] }
 blake3 = "1"
 aes-gcm = "0.10"
 rand = "0.9"
