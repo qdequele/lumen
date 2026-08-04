@@ -492,17 +492,16 @@ impl KeyStore {
         &self,
         include_deleted: bool,
     ) -> Result<Vec<VirtualKeyRecord>, AuthError> {
-        let filter = if include_deleted {
-            ""
-        } else {
-            "WHERE deleted_at IS NULL "
-        };
-        let records = sqlx::query_as::<_, VirtualKeyRecord>(&format!(
+        let sql = if include_deleted {
             "SELECT id, name, group_id, budget_max, budget_spent, rpm_limit, tpm_limit, expires_at, disabled, created_at, deleted_at \
-             FROM virtual_keys {filter}ORDER BY created_at, id",
-        ))
-        .fetch_all(&self.pool)
-        .await?;
+             FROM virtual_keys ORDER BY created_at, id"
+        } else {
+            "SELECT id, name, group_id, budget_max, budget_spent, rpm_limit, tpm_limit, expires_at, disabled, created_at, deleted_at \
+             FROM virtual_keys WHERE deleted_at IS NULL ORDER BY created_at, id"
+        };
+        let records = sqlx::query_as::<_, VirtualKeyRecord>(sql)
+            .fetch_all(&self.pool)
+            .await?;
         Ok(records)
     }
 
@@ -655,17 +654,16 @@ impl KeyStore {
     /// Every active group - for the admin API. Pass `include_deleted = true`
     /// to also see tombstones (audit view).
     pub async fn list_groups(&self, include_deleted: bool) -> Result<Vec<GroupRecord>, AuthError> {
-        let filter = if include_deleted {
-            ""
-        } else {
-            "WHERE deleted_at IS NULL "
-        };
-        let records = sqlx::query_as::<_, GroupRecord>(&format!(
+        let sql = if include_deleted {
             "SELECT id, name, budget_max, budget_spent, created_at, deleted_at \
-             FROM budget_groups {filter}ORDER BY created_at, id",
-        ))
-        .fetch_all(&self.pool)
-        .await?;
+             FROM budget_groups ORDER BY created_at, id"
+        } else {
+            "SELECT id, name, budget_max, budget_spent, created_at, deleted_at \
+             FROM budget_groups WHERE deleted_at IS NULL ORDER BY created_at, id"
+        };
+        let records = sqlx::query_as::<_, GroupRecord>(sql)
+            .fetch_all(&self.pool)
+            .await?;
         Ok(records)
     }
 
@@ -929,7 +927,10 @@ impl KeyStore {
         }
         sql.push_str(" GROUP BY grp ORDER BY cost DESC, grp ASC LIMIT ?");
 
-        let mut query = sqlx::query(&sql).bind(filter.since).bind(filter.until);
+        // AssertSqlSafe: audited above - only fixed fragments and binds.
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(filter.since)
+            .bind(filter.until);
         for value in [
             &filter.key_id,
             &filter.group_id,

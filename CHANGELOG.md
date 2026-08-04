@@ -6,6 +6,18 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed
+
+- **Dependency major bumps: sqlx 0.9, jsonwebtoken 10, hmac 0.13, sha2 0.11**
+  (supersedes dependabot PRs #115-#120). sqlx 0.9 rejects dynamic SQL strings
+  at compile time: the two admin list queries now select between two static
+  statements, and the audited `usage_summary` builder (fixed fragments only,
+  every caller value a bind) opts in via `AssertSqlSafe`. jsonwebtoken 10
+  requires an explicit crypto backend: `rust_crypto` (pure Rust, keeps the
+  rustls-only, no-OpenSSL policy). hmac 0.13 / sha2 0.11 (digest 0.11) moved
+  HMAC construction from `Mac::new_from_slice` to `KeyInit::new_from_slice`
+  in the SigV4 signer. No behavior change; all suites pass unchanged.
+
 ### Added
 
 - **Atomic budget grant routes** - ADR 009 amendment. `POST
