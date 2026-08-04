@@ -20,7 +20,7 @@
 //! never placed in any error; only the derived, opaque `Authorization` value is
 //! returned to the caller.
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
 
 type HmacSha256 = Hmac<Sha256>;
@@ -236,7 +236,7 @@ fn derive_signing_key(
 /// so construction never fails.
 fn hmac(key: &[u8], data: &[u8]) -> Vec<u8> {
     let mut mac =
-        <HmacSha256 as Mac>::new_from_slice(key).expect("HMAC accepts a key of any length");
+        <HmacSha256 as KeyInit>::new_from_slice(key).expect("HMAC accepts a key of any length");
     mac.update(data);
     mac.finalize().into_bytes().to_vec()
 }
