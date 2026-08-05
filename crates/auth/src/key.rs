@@ -6,7 +6,7 @@
 //! (argon2) exists for *low-entropy* secrets and would burn ~100 ms of CPU on
 //! every authenticated request for nothing (pillar 1).
 
-use rand::RngCore;
+use rand::Rng;
 use std::fmt;
 
 /// A freshly generated virtual key in the clear.

@@ -16,7 +16,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install stable toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -44,7 +44,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install MSRV toolchain
         uses: dtolnay/rust-toolchain@master
@@ -63,7 +63,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Reject the U+2014 em-dash in EVERY tracked text file (git grep -I
       # skips binaries), not an extension allowlist - the old list missed
@@ -98,7 +98,7 @@ jobs:
       contents: read
       checks: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Advisory database check (RUSTSEC) - fails on known vulnerabilities.
       # Ignored advisories are transitive and not exploitable here; the
@@ -121,7 +121,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install stable toolchain
         uses: dtolnay/rust-toolchain@stable
