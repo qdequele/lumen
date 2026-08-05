@@ -8,6 +8,32 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ### Changed
 
+- **Dependency major bumps: rand 0.10, aes-gcm 0.11, jsonwebtoken 11, notify 8,
+  base64 0.23, prometheus 0.14, criterion 0.8** (supersedes dependabot PRs
+  #126-#137). rand 0.10 moved `RngCore` out of the crate root and `fill_bytes`
+  onto the `Rng` trait. aes-gcm 0.11 deprecated `Array::from_slice`: key and
+  nonce construction now use the infallible `From<[u8; N]>` conversions, and
+  `MasterKey::open` converts the split-off nonce with `TryFrom` instead of
+  risking a panic. jsonwebtoken 11, notify 8, base64 0.23, prometheus 0.14 and
+  criterion 0.8 needed no source changes. Note base64 0.23 adds `simd-unsafe`
+  to its default features, so the default build now carries its SIMD fast
+  paths. Also refreshes the GitHub Actions pins (actions/checkout 7,
+  docker/login-action 4, docker/setup-qemu-action 4, actions/deploy-pages 5,
+  actions/upload-pages-artifact 5). reqwest 0.13 is deliberately held back:
+  its `rustls` feature pulls aws-lc-sys (vendored C crypto, needs cmake) and
+  swaps the bundled webpki-roots for the OS trust store, which conflicts with
+  the pure-Rust rustls-only mandate and risks the aarch64-musl cross-builds.
+- **MSRV raised to 1.94, and the MSRV job now actually tests it.** The declared
+  floor had drifted: sqlx 0.9 requires rustc 1.94, so `rust-version = "1.88"`
+  was already unbuildable. CI missed it because `rust-toolchain.toml` pins the
+  floating `stable` channel, and a toolchain file outranks the default that
+  installing 1.88 set, so the job silently checked stable. The step now sets
+  `RUSTUP_TOOLCHAIN` explicitly, which outranks the toolchain file. The bump
+  also ungated `clippy::duration_suboptimal_units` (1.94 stabilized
+  `Duration::from_mins`), which fired on ~45 timeout and backoff sites; it is
+  allowed at the workspace level alongside the other pedantic exemptions,
+  because those durations mirror a config surface expressed in seconds and
+  milliseconds.
 - **Dependency major bumps: sqlx 0.9, jsonwebtoken 10, hmac 0.13, sha2 0.11**
   (supersedes dependabot PRs #115-#120). sqlx 0.9 rejects dynamic SQL strings
   at compile time: the two admin list queries now select between two static

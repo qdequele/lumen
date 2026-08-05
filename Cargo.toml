@@ -12,7 +12,7 @@ members = [
 [workspace.package]
 version = "0.2.0"
 edition = "2021"
-rust-version = "1.88"
+rust-version = "1.94"
 license = "Apache-2.0"
 repository = "https://github.com/qdequele/lumen"
 authors = ["LUMEN contributors"]
@@ -109,6 +109,13 @@ missing_errors_doc = "allow"
 missing_panics_doc = "allow"
 must_use_candidate = "allow"
 doc_markdown = "allow"
+# Fires only since the MSRV moved to 1.94, which stabilized `Duration::from_mins`
+# and so ungated this lint. It wants `from_mins(5)` where we write
+# `from_secs(300)`, across ~45 timeout, retry-backoff and token-skew sites.
+# Those durations mirror the config surface, which expresses every knob in
+# seconds or milliseconds, so keeping the code in the same unit as the TOML it
+# comes from reads better here than converting at the call site.
+duration_suboptimal_units = "allow"
 
 [profile.release]
 lto = "thin"
