@@ -76,7 +76,7 @@ tiktoken-rs = "0.12"
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros", "derive"] }
 blake3 = "1"
 aes-gcm = "0.10"
-rand = "0.9"
+rand = "0.10"
 zeroize = "1"
 
 # SigV4 request signing (AWS Bedrock). Pure-Rust, rustls-compatible, no OpenSSL.
