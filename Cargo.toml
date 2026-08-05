@@ -44,7 +44,7 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-base64 = "0.22"
+base64 = "0.23"
 
 # Errors
 thiserror = "2"
@@ -58,7 +58,7 @@ jsonwebtoken = { version = "11", default-features = false, features = ["use_pem"
 # Logging / metrics
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
-prometheus = { version = "0.13", default-features = false }
+prometheus = { version = "0.14", default-features = false }
 
 # Config
 figment = { version = "0.10", features = ["toml", "env"] }
@@ -86,7 +86,7 @@ hex = "0.4"
 
 # Testing
 wiremock = "0.6"
-criterion = { version = "0.5", features = ["async_tokio"] }
+criterion = { version = "0.8", features = ["async_tokio"] }
 tempfile = "3"
 # Real-signal integration tests only (crates/server/tests): sending an actual
 # SIGTERM/SIGINT to a spawned child process, cfg(unix)-gated.
