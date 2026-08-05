@@ -26,7 +26,7 @@ jobs:
     name: test gate
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install stable toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -52,7 +52,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: gate
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Extract this version's CHANGELOG section
         run: |
@@ -84,7 +84,7 @@ jobs:
           - x86_64-unknown-linux-musl
           - aarch64-unknown-linux-musl
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install stable toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -120,7 +120,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: release-notes
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up QEMU (for arm64 emulation)
         uses: docker/setup-qemu-action@v3
