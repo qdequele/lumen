@@ -16,7 +16,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install stable toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -39,22 +39,29 @@ jobs:
   # against the committed Cargo.lock on the declared minimum (Cargo.toml
   # `rust-version`). Keep the toolchain version here in sync with it.
   msrv:
-    name: MSRV (1.88)
+    name: MSRV (1.94)
     runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install MSRV toolchain
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.88"
+          toolchain: "1.94"
 
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
 
+      # RUSTUP_TOOLCHAIN is required, not belt-and-braces: rust-toolchain.toml
+      # pins the floating `stable` channel, and a toolchain file outranks the
+      # default that installing 1.94 above sets. Without this the job resolved
+      # to stable and silently tested something other than the MSRV, which is
+      # how the declared floor drifted from the dependency graph unnoticed.
       - name: Check workspace on MSRV (locked)
+        env:
+          RUSTUP_TOOLCHAIN: "1.94"
         run: cargo check --workspace --locked
 
   no-em-dashes:
@@ -63,7 +70,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Reject the U+2014 em-dash in EVERY tracked text file (git grep -I
       # skips binaries), not an extension allowlist - the old list missed
@@ -98,7 +105,7 @@ jobs:
       contents: read
       checks: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Advisory database check (RUSTSEC) - fails on known vulnerabilities.
       # Ignored advisories are transitive and not exploitable here; the
@@ -121,7 +128,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install stable toolchain
         uses: dtolnay/rust-toolchain@stable

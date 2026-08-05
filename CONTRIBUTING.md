@@ -34,7 +34,7 @@ Hard code rules (full list in [`CLAUDE.md`](CLAUDE.md#strict-code-rules)):
 
 ```bash
 # rust-toolchain.toml selects the floating `stable` channel (rustup honors
-# it); the supported floor is MSRV 1.88, declared in Cargo.toml and checked
+# it); the supported floor is MSRV 1.94, declared in Cargo.toml and checked
 # in CI.
 rustup update
 

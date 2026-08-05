@@ -23,7 +23,7 @@ jobs:
             google_translate_response,
           ]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install nightly toolchain
         uses: dtolnay/rust-toolchain@nightly

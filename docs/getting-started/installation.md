@@ -29,7 +29,7 @@ shasum -a 256 -c lumen-x86_64-unknown-linux-musl.tar.gz.sha256
 
 ## From source
 
-Needs a recent stable Rust toolchain (MSRV 1.88, per `Cargo.toml` and checked
+Needs a recent stable Rust toolchain (MSRV 1.94, per `Cargo.toml` and checked
 in CI against the committed `Cargo.lock`):
 
 ```bash

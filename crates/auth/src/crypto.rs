@@ -8,7 +8,7 @@
 use crate::AuthError;
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
-use rand::RngCore;
+use rand::Rng;
 use std::fmt;
 
 /// AES-GCM nonce length in bytes.
@@ -64,12 +64,12 @@ impl MasterKey {
     /// Encrypt `plaintext`; returns `nonce || ciphertext` (nonce is 12 random
     /// bytes, fresh per call).
     pub fn seal(&self, plaintext: &[u8]) -> Result<Vec<u8>, AuthError> {
-        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&self.0));
+        let cipher = Aes256Gcm::new(&Key::<Aes256Gcm>::from(self.0));
         let mut nonce_bytes = [0_u8; NONCE_LEN];
         rand::rng().fill_bytes(&mut nonce_bytes);
-        let nonce = Nonce::from_slice(&nonce_bytes);
+        let nonce = Nonce::from(nonce_bytes);
         let ciphertext = cipher
-            .encrypt(nonce, plaintext)
+            .encrypt(&nonce, plaintext)
             .map_err(|_| AuthError::Decrypt)?;
         let mut sealed = Vec::with_capacity(NONCE_LEN + ciphertext.len());
         sealed.extend_from_slice(&nonce_bytes);
@@ -88,9 +88,12 @@ impl MasterKey {
             return Err(AuthError::Decrypt);
         }
         let (nonce_bytes, ciphertext) = sealed.split_at(NONCE_LEN);
-        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&self.0));
+        // `split_at(NONCE_LEN)` guarantees the length, but convert fallibly
+        // rather than panicking on a slice-to-array mismatch (rule 1).
+        let nonce = Nonce::try_from(nonce_bytes).map_err(|_| AuthError::Decrypt)?;
+        let cipher = Aes256Gcm::new(&Key::<Aes256Gcm>::from(self.0));
         cipher
-            .decrypt(Nonce::from_slice(nonce_bytes), ciphertext)
+            .decrypt(&nonce, ciphertext)
             .map_err(|_| AuthError::Decrypt)
     }
 }

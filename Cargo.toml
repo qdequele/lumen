@@ -12,7 +12,7 @@ members = [
 [workspace.package]
 version = "0.2.0"
 edition = "2021"
-rust-version = "1.88"
+rust-version = "1.94"
 license = "Apache-2.0"
 repository = "https://github.com/qdequele/lumen"
 authors = ["LUMEN contributors"]
@@ -44,7 +44,7 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-base64 = "0.22"
+base64 = "0.23"
 
 # Errors
 thiserror = "2"
@@ -53,16 +53,16 @@ anyhow = "1"
 # GCP service-account OAuth (Vertex AI): RS256-signed JWT assertion. Pure-Rust
 # crypto backend (RustCrypto), never OpenSSL - compatible with the rustls-only
 # policy. jsonwebtoken 10 requires picking a backend feature explicitly.
-jsonwebtoken = { version = "10", default-features = false, features = ["use_pem", "rust_crypto"] }
+jsonwebtoken = { version = "11", default-features = false, features = ["use_pem", "rust_crypto"] }
 
 # Logging / metrics
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
-prometheus = { version = "0.13", default-features = false }
+prometheus = { version = "0.14", default-features = false }
 
 # Config
 figment = { version = "0.10", features = ["toml", "env"] }
-notify = "7"
+notify = "8"
 
 # Concurrency / data structures
 arc-swap = "1"
@@ -75,8 +75,8 @@ tiktoken-rs = "0.12"
 # Storage & crypto (M5: virtual keys, budgets, usage log)
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros", "derive"] }
 blake3 = "1"
-aes-gcm = "0.10"
-rand = "0.9"
+aes-gcm = "0.11"
+rand = "0.10"
 zeroize = "1"
 
 # SigV4 request signing (AWS Bedrock). Pure-Rust, rustls-compatible, no OpenSSL.
@@ -86,7 +86,7 @@ hex = "0.4"
 
 # Testing
 wiremock = "0.6"
-criterion = { version = "0.5", features = ["async_tokio"] }
+criterion = { version = "0.8", features = ["async_tokio"] }
 tempfile = "3"
 # Real-signal integration tests only (crates/server/tests): sending an actual
 # SIGTERM/SIGINT to a spawned child process, cfg(unix)-gated.
@@ -109,6 +109,13 @@ missing_errors_doc = "allow"
 missing_panics_doc = "allow"
 must_use_candidate = "allow"
 doc_markdown = "allow"
+# Fires only since the MSRV moved to 1.94, which stabilized `Duration::from_mins`
+# and so ungated this lint. It wants `from_mins(5)` where we write
+# `from_secs(300)`, across ~45 timeout, retry-backoff and token-skew sites.
+# Those durations mirror the config surface, which expresses every knob in
+# seconds or milliseconds, so keeping the code in the same unit as the TOML it
+# comes from reads better here than converting at the call site.
+duration_suboptimal_units = "allow"
 
 [profile.release]
 lto = "thin"
