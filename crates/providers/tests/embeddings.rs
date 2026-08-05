@@ -914,40 +914,58 @@ async fn scenario_malformed_response(fx: &dyn EmbedFixture) {
 
 async fn scenario_cancellation_aborts_upstream(fx: &dyn EmbedFixture) {
     let mock = MockServer::start().await;
-    // Upstream would take 3s; we cancel almost immediately. The delay (and
-    // the elapsed bound below) has headroom beyond the bare minimum needed
-    // on a quiet host: this suite runs across every provider fixture, and
-    // under full workspace-test parallelism (many `#[tokio::test]`s
-    // contending for the same CPUs) real-time sleeps and task wakeups can
-    // slip by hundreds of ms - this test flaked once under exactly that
-    // load. A wider margin keeps the assertion just as meaningful (still
-    // asserting the call returns in a small fraction of the mocked delay,
-    // proving upstream was never awaited to completion) while tolerating
-    // realistic scheduler jitter.
+    // Upstream would take 3s; we cancel as soon as the request has provably
+    // reached it. Waiting for that arrival instead of sleeping a fixed budget
+    // is what makes this deterministic: this suite runs across every provider
+    // fixture, and the Vertex one mints an RS256 JWT (pure-Rust RSA, slow in
+    // an unoptimized build) and exchanges it for an OAuth token before the
+    // embed call is issued. Under full workspace-test parallelism, or on a
+    // 2-core CI runner, that preamble outlasts any fixed pre-cancel sleep, so
+    // the cancel landed before the request went out and the received-requests
+    // assertion below saw 0. Both bounds now measure what they claim to.
     fx.mount_delayed(&mock, Duration::from_secs(3)).await;
     let provider = fx.build(mock.uri());
     let req = req_for(fx, vec!["x".into()]);
 
     let cancel = CancellationToken::new();
     let cancel_child = cancel.clone();
-    let started = Instant::now();
     let handle = tokio::spawn(async move { provider.embed(req, cancel_child).await });
 
-    // Give the request time to reach the upstream, then cancel.
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // wiremock records a request on receipt, not after its delayed response is
+    // sent, so this observes the provider edge without waiting out the 3s.
+    let arrived = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if mock
+                .received_requests()
+                .await
+                .is_some_and(|reqs| !reqs.is_empty())
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(
+        arrived.is_ok(),
+        "upstream never received the request, so there was nothing to cancel"
+    );
+
+    let cancelled_at = Instant::now();
     cancel.cancel();
 
     let result = handle.await.unwrap();
-    let elapsed = started.elapsed();
+    let cancel_latency = cancelled_at.elapsed();
 
     assert!(
         matches!(result, Err(ProviderError::Cancelled)),
         "expected Cancelled, got {result:?}"
     );
-    // Returned well before the 3s upstream delay → the call was aborted.
+    // Returned promptly after the cancel rather than waiting out the 3s
+    // upstream delay → the call was aborted.
     assert!(
-        elapsed < Duration::from_secs(2),
-        "cancellation should abort promptly, took {elapsed:?}"
+        cancel_latency < Duration::from_secs(2),
+        "cancellation should abort promptly, took {cancel_latency:?}"
     );
     // The upstream did receive the request (it reached the provider edge).
     let calls = mock.received_requests().await.unwrap().len();
