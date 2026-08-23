@@ -97,7 +97,12 @@ What happens on a successful apply:
    merged with `LUMEN_*` env vars, and used to build a candidate provider
    registry. A parse failure or a registry-build failure (e.g. a provider
    missing a required `base_url`) is rejected with `400` (`LM-1001`); the
-   staging file is removed and the real config file is never touched.
+   staging file is removed and the real config file is never touched. The
+   error message names the offending field or setting (e.g.
+   `"server.first_token_timeout_ms must not be 0"`) but never the staging
+   file's own filesystem path - that path is an implementation detail of
+   this route, not something the operator wrote or needs to see, and it is
+   logged server-side instead.
 3. Only once validation succeeds is the *current* file copied to a `.bak`
    sibling (e.g. `lumen.toml.bak`) - one generation of history, enough to
    revert a bad apply by hand - and the staged file renamed into place.
@@ -105,7 +110,11 @@ What happens on a successful apply:
    restart (see [Hot reload](#hot-reload)).
 
 A rejected apply (`400` or `412`) is guaranteed to leave the config file
-byte-for-byte unchanged and to leave no temporary file behind.
+byte-for-byte unchanged and to leave no temporary file behind. Concurrent
+`PUT`s are serialised gateway-side, so two operators racing the same
+pre-apply hash can never both land: exactly one wins, and the other sees a
+`412` for a hash that moved out from under it, never a silently corrupted
+mix of the two documents.
 
 ## Validate before you boot
 

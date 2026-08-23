@@ -356,3 +356,99 @@ async fn put_config_leaves_no_temporary_file_behind() {
         "a rejected apply must clean up its staging file"
     );
 }
+
+/// Regression coverage for a check-then-rename race: an unsynchronised
+/// handler could let two concurrent `PUT`s both pass the `If-Match` check
+/// against the same pre-apply hash and then clobber each other's staged
+/// bytes before either validated, so a caller could receive `204` while a
+/// DIFFERENT document is what actually went live. `If-Match`'s whole reason
+/// to exist is that two operators editing at once cannot silently lose one
+/// edit, so this must hold under real concurrency, not just sequentially.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn put_config_serializes_concurrent_applies_no_lost_update() {
+    let h = spawn_admin(registry()).await;
+    let before = h.valid_config();
+    let hash = h.current_hash().await;
+
+    let doc_a = format!("{before}\n# applied by operator A\n");
+    let doc_b = format!("{before}\n# applied by operator B\n");
+
+    let (resp_a, resp_b) = tokio::join!(h.put_config(&doc_a, &hash), h.put_config(&doc_b, &hash));
+    let status_a = resp_a.status();
+    let status_b = resp_b.status();
+
+    // Exactly one racing apply wins (204); the other must observe that the
+    // hash already moved and be refused as stale (412) - never both
+    // succeeding (a lost update) and never both failing (a live apply
+    // starved out by its own race).
+    let successes = [status_a, status_b]
+        .into_iter()
+        .filter(|s| *s == 204)
+        .count();
+    let stale = [status_a, status_b]
+        .into_iter()
+        .filter(|s| *s == 412)
+        .count();
+    assert_eq!(
+        (successes, stale),
+        (1, 1),
+        "expected exactly one winner and one stale rejection, got {status_a} and {status_b}"
+    );
+
+    let landed = std::fs::read_to_string(&h.config_path).expect("read config");
+    let winner = if status_a == 204 { &doc_a } else { &doc_b };
+    assert_eq!(
+        &landed, winner,
+        "the live file must exactly equal the document reported as applied, \
+         never a mix of the two racing writes"
+    );
+}
+
+#[tokio::test]
+async fn put_config_rejection_names_the_field_but_not_the_staging_path() {
+    // A semantic validation failure (never a TOML parse error, so the
+    // message comes from `Config::validate`, which is exactly where a
+    // `ConfigError::Validation { path, message }` used to leak `path` -
+    // the staged `.tmp` file's full filesystem path - into the client
+    // response.
+    let h = spawn_admin(registry()).await;
+    let hash = h.current_hash().await;
+
+    // A duplicate provider name (not under `[server]`, so it cannot be
+    // masked by the harness's `LUMEN_SERVER__PORT` env override the way
+    // `server.port = 0` would be).
+    let bad = r#"
+[[providers]]
+name = "dup"
+kind = "openai"
+[[providers.models]]
+id = "a"
+capabilities = ["chat"]
+
+[[providers]]
+name = "dup"
+kind = "openai"
+[[providers.models]]
+id = "b"
+capabilities = ["chat"]
+"#;
+    let response = h.put_config(bad, &hash).await;
+    assert_eq!(response.status(), 400);
+    let body: Value = response.json().await.expect("json");
+    let message = body["error"]["message"].as_str().expect("message");
+
+    assert!(
+        message.contains("dup"),
+        "the operator must still learn which field was rejected: {message}"
+    );
+    let config_dir = h
+        .config_path
+        .parent()
+        .expect("a parent directory")
+        .to_string_lossy()
+        .into_owned();
+    assert!(
+        !message.contains(&config_dir) && !message.contains(".tmp"),
+        "the response must not leak the staging file's filesystem path: {message}"
+    );
+}

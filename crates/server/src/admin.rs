@@ -921,8 +921,9 @@ pub async fn put_config(
     let if_match = if_match.trim_matches('"').to_owned();
 
     let path_for_blocking = path.clone();
+    let lock = Arc::clone(&state.config_apply_lock);
     let outcome = tokio::task::spawn_blocking(move || {
-        apply_config_document(&path_for_blocking, &body, &if_match)
+        apply_config_document(&path_for_blocking, &body, &if_match, &lock)
     })
     .await
     .map_err(|e| GatewayError::Internal(format!("config apply task failed: {e}")))?;
@@ -941,11 +942,28 @@ pub async fn put_config(
 
 /// The blocking half of [`put_config`]: hash check, staged write, validation,
 /// backup and atomic rename. Runs on a blocking thread; never on the runtime.
+///
+/// The whole sequence runs under `lock` (see [`AppState::config_apply_lock`]):
+/// two concurrent `PUT`s must never interleave, or the second could clobber
+/// the first's staged bytes before validation runs, defeating the very
+/// lost-update guarantee `If-Match` exists to provide. A poisoned lock is
+/// surfaced as an internal error rather than silently recovered into: it can
+/// only mean an earlier apply panicked mid-sequence (which the workspace's
+/// no-`unwrap`/`expect`/`panic!` rule should make unreachable in practice),
+/// and building on top of whatever state that left behind is not a risk
+/// worth taking.
 fn apply_config_document(
     path: &std::path::Path,
     body: &str,
     if_match: &str,
+    lock: &std::sync::Mutex<()>,
 ) -> Result<(), ApiError> {
+    let _guard = lock.lock().map_err(|_| {
+        ApiError::from(GatewayError::Internal(
+            "config apply lock poisoned by an earlier failed apply".to_owned(),
+        ))
+    })?;
+
     let current = std::fs::read(path)
         .map_err(|e| ApiError::from(GatewayError::Internal(format!("reading config: {e}"))))?;
     if config_hash(&current) != if_match {
@@ -955,14 +973,24 @@ fn apply_config_document(
         .into());
     }
 
-    let staged = path.with_extension("toml.tmp");
+    // Unique per call (process id + a monotonic counter), even though `lock`
+    // already serialises every apply within this process: a process that was
+    // killed or crashed mid-apply can leave a stale `.tmp` behind, and a
+    // fixed name would let a later request mistake it for its own staging
+    // file. Same directory as `path` throughout - a rename is only atomic
+    // within one filesystem.
+    let staged = path.with_extension(format!("toml.{}.tmp", unique_suffix()));
     std::fs::write(&staged, body.as_bytes())
         .map_err(|e| ApiError::from(GatewayError::Internal(format!("staging config: {e}"))))?;
+    // From here on, ANY early return (via `?` or otherwise) must not leave
+    // the staged file behind. A guard makes that structural instead of
+    // relying on every future `return Err(..)` to remember its own cleanup:
+    // `commit()` is the only way to suppress the removal, and it is called
+    // exactly once, after the rename that consumes the file.
+    let staging = StagingGuard::new(&staged);
 
     if let Err(error) = crate::reload::validate_candidate(&staged) {
-        // Clean up before reporting: a rejected apply must leave no trace.
-        let _ = std::fs::remove_file(&staged);
-        return Err(GatewayError::InvalidRequest(format!("config rejected: {error}")).into());
+        return Err(describe_rejection(&error));
     }
 
     let backup = path.with_extension("toml.bak");
@@ -970,7 +998,83 @@ fn apply_config_document(
         .map_err(|e| ApiError::from(GatewayError::Internal(format!("backing up config: {e}"))))?;
     std::fs::rename(&staged, path)
         .map_err(|e| ApiError::from(GatewayError::Internal(format!("applying config: {e}"))))?;
+    staging.commit();
     Ok(())
+}
+
+/// A process id + monotonic counter suffix, unique within this process's
+/// lifetime. Not a security token - only meant to keep a crash-orphaned
+/// staging file from colliding with a live one; the ordinary case is
+/// serialised entirely by `config_apply_lock`.
+fn unique_suffix() -> String {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{}-{n}", std::process::id())
+}
+
+/// Removes the staged config file on drop, unless [`commit`](Self::commit)
+/// was called first. Exists so every failure path out of
+/// [`apply_config_document`] - validation, backup, or the final rename -
+/// cleans up the staging file without each call site having to remember to.
+struct StagingGuard<'a> {
+    path: &'a std::path::Path,
+    committed: bool,
+}
+
+impl<'a> StagingGuard<'a> {
+    /// Guard `path`, a staging file that already exists on disk.
+    fn new(path: &'a std::path::Path) -> Self {
+        Self {
+            path,
+            committed: false,
+        }
+    }
+
+    /// Declare the staged file consumed (renamed into place): `Drop` must
+    /// not attempt to remove a path that no longer names the staging file.
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for StagingGuard<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            // Best-effort: the file may already be gone (e.g. a concurrent
+            // cleanup), and there is no client left to report a failure to.
+            let _ = std::fs::remove_file(self.path);
+        }
+    }
+}
+
+/// Turn a `validate_candidate` failure into the client-facing rejection,
+/// without the staged file's filesystem path: `ConfigError::Parse` and
+/// `ConfigError::Validation` both embed that path in their `Display` text,
+/// and `GatewayError::InvalidRequest`'s message reaches the client verbatim
+/// (only `Internal` is scrubbed - see `GatewayError::public_message`), so
+/// formatting the error directly would leak a `.tmp` path the operator never
+/// created. `RegistryError`'s variants never embed a path, so those pass
+/// through unchanged. The full detail (path included) still reaches the
+/// server log: `ApiError`'s `IntoResponse` logs `%err` regardless of what is
+/// returned to the client.
+fn describe_rejection(error: &crate::reload::ReloadError) -> ApiError {
+    let message = match error {
+        crate::reload::ReloadError::Config(config_error) => match config_error {
+            crate::config::ConfigError::Parse { message, .. }
+            | crate::config::ConfigError::Validation { message, .. } => message.clone(),
+            // The staged file was just written by this handler; it going
+            // missing before validation runs is not a client mistake to
+            // explain away as a bad document.
+            crate::config::ConfigError::NotFound { .. } => {
+                return GatewayError::Internal(
+                    "staged config file disappeared before it could be validated".to_owned(),
+                )
+                .into();
+            }
+        },
+        crate::reload::ReloadError::Registry(registry_error) => registry_error.to_string(),
+    };
+    GatewayError::InvalidRequest(format!("config rejected: {message}")).into()
 }
 
 /// The config file path this process booted from.

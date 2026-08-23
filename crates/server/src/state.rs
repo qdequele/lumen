@@ -81,6 +81,15 @@ pub struct AppState {
     /// rewrite this exact file: the file stays the source of truth, so a
     /// gateway restarted without a control plane comes up identically.
     pub config_path: Option<Arc<std::path::PathBuf>>,
+    /// Serialises the whole `PUT /admin/config` sequence (hash check, stage,
+    /// validate, back up, rename) across concurrent requests. Without it two
+    /// racing applies (two operators, or a client retry racing its own
+    /// original) could both pass the `If-Match` check against the same
+    /// pre-apply hash and then interleave their writes, defeating the very
+    /// lost-update guarantee `If-Match` exists to provide. Always present
+    /// (not gated behind a builder) so no construction site needs editing;
+    /// the data behind it is `()` - only the mutual exclusion matters.
+    pub config_apply_lock: Arc<std::sync::Mutex<()>>,
     /// Local token-estimation strategy (ADR 003). Default: the byte heuristic;
     /// `accurate` mode holds pre-built BPE encoders. Shared, never rebuilt on
     /// the request path.
@@ -116,6 +125,7 @@ impl AppState {
             image_fetch: Arc::new(ImageFetchPolicy::default()),
             reload_trigger: None,
             config_path: None,
+            config_apply_lock: Arc::new(std::sync::Mutex::new(())),
             token_counter: Arc::new(TokenCounter::Heuristic),
         }
     }
