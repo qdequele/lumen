@@ -536,3 +536,91 @@ async fn expired_and_disabled_flags_load_correctly() {
     assert_eq!(all[0].expires_at, Some(123));
     assert!(all[0].disabled);
 }
+
+#[tokio::test]
+async fn usage_export_pages_by_cursor_without_gaps_or_repeats() {
+    let store = KeyStore::in_memory().await.expect("open store");
+    let (_plaintext, record) = store
+        .create_key(new_key("exporter"))
+        .await
+        .expect("create key");
+    let id = record.id;
+    let batch: Vec<_> = (0..5).map(|i| usage(&id, 1_000 + i)).collect();
+    store.insert_usage(&batch).await.expect("seed usage");
+
+    let first = store
+        .usage_export(0, i64::MAX, None, 2)
+        .await
+        .expect("first page");
+    assert_eq!(first.len(), 2);
+
+    let cursor = first.last().map(|row| row.id).expect("a last row");
+    let second = store
+        .usage_export(0, i64::MAX, Some(cursor), 2)
+        .await
+        .expect("second page");
+    assert_eq!(second.len(), 2);
+
+    // No repeats across the boundary, and ids strictly ascend.
+    assert!(second[0].id > cursor);
+    assert!(first[0].id < first[1].id);
+
+    let third = store
+        .usage_export(0, i64::MAX, second.last().map(|r| r.id), 2)
+        .await
+        .expect("third page");
+    assert_eq!(third.len(), 1, "five rows over pages of two");
+
+    let all: Vec<i64> = first
+        .iter()
+        .chain(second.iter())
+        .chain(third.iter())
+        .map(|row| row.id)
+        .collect();
+    let mut sorted = all.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(all, sorted, "pages cover every row exactly once, in order");
+}
+
+#[tokio::test]
+async fn usage_export_honours_the_time_window() {
+    let store = KeyStore::in_memory().await.expect("open store");
+    let (_plaintext, record) = store
+        .create_key(new_key("windowed"))
+        .await
+        .expect("create key");
+    let id = record.id;
+    store
+        .insert_usage(&[usage(&id, 100), usage(&id, 200), usage(&id, 300)])
+        .await
+        .expect("seed usage");
+
+    let rows = store
+        .usage_export(150, 250, None, 100)
+        .await
+        .expect("windowed export");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].ts, 200);
+}
+
+#[tokio::test]
+async fn usage_export_carries_the_attribution_columns() {
+    let store = KeyStore::in_memory().await.expect("open store");
+    let (_plaintext, record) = store
+        .create_key(new_key("attributed"))
+        .await
+        .expect("create key");
+    let id = record.id;
+    store.insert_usage(&[usage(&id, 42)]).await.expect("seed");
+
+    let rows = store
+        .usage_export(0, i64::MAX, None, 10)
+        .await
+        .expect("export");
+    let row = rows.first().expect("one row");
+    assert_eq!(row.key_id.as_deref(), Some(id.as_str()));
+    assert_eq!(row.provider, "openai");
+    assert_eq!(row.capability, "chat");
+    assert_eq!(row.model_used, "gpt-test");
+}
