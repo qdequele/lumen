@@ -63,6 +63,7 @@ use lumen_auth::store::{
 };
 use lumen_core::GatewayError;
 use serde::{Deserialize, Serialize};
+use std::io::Write as _;
 use std::sync::Arc;
 
 /// `POST /admin/keys` response: the record plus the one-time plaintext key.
@@ -980,8 +981,26 @@ fn apply_config_document(
     // file. Same directory as `path` throughout - a rename is only atomic
     // within one filesystem.
     let staged = path.with_extension(format!("toml.{}.tmp", unique_suffix()));
-    std::fs::write(&staged, body.as_bytes())
-        .map_err(|e| ApiError::from(GatewayError::Internal(format!("staging config: {e}"))))?;
+    {
+        // `File::create` + `write_all` + `sync_all`, not `std::fs::write`:
+        // `sync_all` is the step that actually matters here. `rename` only
+        // makes the NAME change atomic; it says nothing about whether the
+        // bytes behind the old name ever reached disk. On ext4 with delayed
+        // allocation in particular, the rename's metadata can be durable
+        // while the data blocks are not, so a crash shortly after an apply
+        // can leave `path` pointing at a zero-length file - `.bak` still
+        // holds the previous good document, but nothing tells the operator
+        // to reach for it, and `Config::load` refuses to boot on the
+        // corrupt result. Flushing the data before the rename closes that
+        // window. Scoped so the file handle (and its fsync) completes
+        // before `StagingGuard` or `validate_candidate` touch the path.
+        let mut file = std::fs::File::create(&staged)
+            .map_err(|e| ApiError::from(GatewayError::Internal(format!("staging config: {e}"))))?;
+        file.write_all(body.as_bytes())
+            .map_err(|e| ApiError::from(GatewayError::Internal(format!("staging config: {e}"))))?;
+        file.sync_all()
+            .map_err(|e| ApiError::from(GatewayError::Internal(format!("staging config: {e}"))))?;
+    }
     // From here on, ANY early return (via `?` or otherwise) must not leave
     // the staged file behind. A guard makes that structural instead of
     // relying on every future `return Err(..)` to remember its own cleanup:
@@ -999,7 +1018,40 @@ fn apply_config_document(
     std::fs::rename(&staged, path)
         .map_err(|e| ApiError::from(GatewayError::Internal(format!("applying config: {e}"))))?;
     staging.commit();
+
+    // Fsync the containing directory too: a data-only fsync guarantees the
+    // staged bytes are durable, but says nothing about whether the RENAME
+    // itself (the directory-entry update that gives `path` its new
+    // contents) survived a crash. Best-effort and non-fatal on purpose:
+    // directory fsync is a documented no-op or an outright error on some
+    // platforms (Windows in particular), and the apply has already
+    // succeeded on disk by this point - failing the request over a
+    // durability nicety it cannot control would be worse than logging and
+    // moving on.
+    sync_parent_dir(path);
     Ok(())
+}
+
+/// Best-effort fsync of `path`'s containing directory, so a rename into
+/// `path` is durable across a crash, not just present in the page cache.
+/// Never returns an error: see the call site in [`apply_config_document`]
+/// for why a failure here must not fail an apply that already landed.
+fn sync_parent_dir(path: &std::path::Path) {
+    let parent = match path.parent() {
+        // A bare filename (e.g. "lumen.toml", no directory component) has
+        // an empty parent; its containing directory is the CWD.
+        Some(p) if p.as_os_str().is_empty() => std::path::Path::new("."),
+        Some(p) => p,
+        None => return,
+    };
+    if let Err(error) = std::fs::File::open(parent).and_then(|dir| dir.sync_all()) {
+        tracing::warn!(
+            %error,
+            path = %parent.display(),
+            "failed to fsync the config directory after applying a new config; \
+             the rename may not survive a crash even though the apply itself succeeded"
+        );
+    }
 }
 
 /// A process id + monotonic counter suffix, unique within this process's
