@@ -53,6 +53,23 @@ table, resilience policy and the runtime-safe `[auth]` knobs are atomically
 swapped (the bind address and a few other knobs still need a restart).
 Details in [Deployment](../operations/deployment.md#hot-reload).
 
+## Viewing the live config over the admin API
+
+`GET /admin/config` (master key required) returns the config file the
+gateway booted from, verbatim:
+
+```json
+{ "config": "<raw toml, byte for byte>", "hash": "<64 hex chars, BLAKE3>" }
+```
+
+`config` is the file's exact bytes, never a re-serialisation of the merged
+in-memory config: `Config::load` overlays `LUMEN_*` environment variables on
+top of the file, and showing that merged view would make environment
+overrides look like file content, and a later write would bake them in
+permanently. `hash` is a BLAKE3 content hash of those same bytes, meant to be
+echoed as `If-Match` on the `PUT /admin/config` that applies a new one (ADR
+010), so two operators editing at once cannot silently clobber each other.
+
 ## Validate before you boot
 
 Run `lumen --check-config --config config.toml` to validate a config file

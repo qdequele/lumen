@@ -52,6 +52,9 @@ All notable changes to LUMEN are documented here. The format is based on
 - `GET /admin/usage/export`: cursor-paginated raw usage rows, so a control
   plane can build its own multi-dimensional view instead of making one
   aggregate call per dimension (ADR 010).
+- `GET /admin/config`: returns the config file verbatim with a BLAKE3 content
+  hash. The file, never a re-serialisation of the merged in-memory config, so
+  environment overrides are never written back into it (ADR 010).
 - **Atomic budget grant routes** - ADR 009 amendment. `POST
   /admin/keys/{id}/grant` and `POST /admin/groups/{id}/grant` take
   `{"amount": <USD>}` and raise `budget_max` as an atomic increment on both

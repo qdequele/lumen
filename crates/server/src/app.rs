@@ -115,6 +115,7 @@ pub fn build_app(state: AppState) -> Router {
             .route("/admin/provider-keys/{name}", put(admin::put_provider_key))
             .route("/admin/usage", get(admin::usage_report))
             .route("/admin/usage/export", get(admin::usage_export))
+            .route("/admin/config", get(admin::get_config))
             .route_layer(middleware::from_fn_with_state(
                 state.clone(),
                 auth::require_master_key,

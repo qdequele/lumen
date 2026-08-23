@@ -32,6 +32,10 @@
 //!   `usage_log` table (issue #64).
 //! * `GET /admin/usage/export` - cursor-paginated raw `usage_log` rows, for a
 //!   control plane building its own multi-dimensional view (ADR 010).
+//! * `GET /admin/config` - the config file verbatim, plus a BLAKE3 content
+//!   hash to be echoed as `If-Match` on the `PUT` that applies a new one
+//!   (ADR 010). Never a serialisation of the merged in-memory `Config`: that
+//!   would render environment overrides as if they were file content.
 //!
 //! Every change is applied to the database AND the in-memory state, so it
 //! takes effect immediately without a restart.
@@ -50,6 +54,7 @@ use lumen_auth::store::{
 };
 use lumen_core::GatewayError;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 /// `POST /admin/keys` response: the record plus the one-time plaintext key.
 #[derive(Serialize)]
@@ -828,6 +833,57 @@ const fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
     let day_of_year = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1;
     let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
     era * 146_097 + day_of_era - 719_468
+}
+
+// ---- Config read and apply (ADR 010) ----------------------------------------
+
+/// Content hash of a config document: BLAKE3, lowercase hex.
+///
+/// Used as the concurrency token for `PUT /admin/config`. It is a change
+/// detector, not a security boundary.
+#[must_use]
+pub fn config_hash(bytes: &[u8]) -> String {
+    blake3::hash(bytes).to_hex().to_string()
+}
+
+/// `GET /admin/config` response.
+#[derive(Debug, Serialize)]
+pub struct ConfigDocument {
+    /// The config file's contents, byte for byte.
+    pub config: String,
+    /// BLAKE3 hash of those bytes, to be echoed as `If-Match` on a PUT.
+    pub hash: String,
+}
+
+/// Return the config file verbatim.
+///
+/// Deliberately NOT a serialisation of the in-memory `Config`: `Config::load`
+/// merges the TOML file with `LUMEN_`-prefixed environment variables, so
+/// rendering the merged struct would show environment overrides as if they
+/// were file content, and a subsequent PUT would write them permanently into
+/// the file. The operator must see and edit exactly what is on disk.
+pub async fn get_config(State(state): State<AppState>) -> Result<Json<ConfigDocument>, ApiError> {
+    let path = config_path(&state)?;
+    let bytes = tokio::fs::read(path.as_ref())
+        .await
+        .map_err(|e| GatewayError::Internal(format!("reading config: {e}")))?;
+    let config = String::from_utf8(bytes)
+        .map_err(|_| GatewayError::Internal("config file is not valid UTF-8".to_owned()))?;
+    let hash = config_hash(config.as_bytes());
+    Ok(Json(ConfigDocument { config, hash }))
+}
+
+/// The config file path this process booted from.
+///
+/// `None` only in tests: `main.rs` always sets it. A 500 is therefore the
+/// honest answer, not a client error, because nothing the caller sent caused
+/// it. `GatewayError` has no `NotFound(String)` variant, and inventing one
+/// for a condition that cannot occur in production would be noise.
+fn config_path(state: &AppState) -> Result<Arc<std::path::PathBuf>, ApiError> {
+    state
+        .config_path
+        .clone()
+        .ok_or_else(|| GatewayError::Internal("no config file backs this server".to_owned()).into())
 }
 
 #[cfg(test)]

@@ -2558,6 +2558,7 @@ dependencies = [
  "async-trait",
  "auth",
  "axum",
+ "blake3",
  "bytes",
  "core",
  "criterion",
