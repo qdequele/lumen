@@ -34,10 +34,33 @@ const PROVIDER_KEY_ENV: &str = "LUMEN_TEST_PROVIDER_KEY";
 /// the rendered config: only the env var *name* is file content.
 const PROVIDER_KEY_VALUE: &str = "sentinel-provider-secret";
 
-/// Config file content the harness boots with: a provider that resolves its
-/// key from `PROVIDER_KEY_ENV`, so the "never expose a resolved value" test
-/// has something to resolve.
+/// `LUMEN_`-prefixed env var that `Config::load`'s figment merge genuinely
+/// folds into a `Config` field: `Env::prefixed("LUMEN_").split("__")` maps
+/// `LUMEN_SERVER__PORT` onto `server.port` (config.rs, `Config::load`), and
+/// `config.rs`'s own `env_var_overrides_file_value` test proves this - it
+/// sets exactly this var and asserts `cfg.server.port` changes to match.
+/// Used here, set to a value the config file never mentions, to prove the
+/// handler returns the raw file rather than a `Config` merged with env
+/// overrides: a handler that round-tripped through `Config::load` and
+/// re-serialized the result would leak this value into the response.
+const ENV_OVERRIDE_PORT: &str = "LUMEN_SERVER__PORT";
+/// The env override value for `ENV_OVERRIDE_PORT`. Distinct from `FILE_PORT`
+/// and from `Config`'s own default port (8080), so its presence in the
+/// response can only be explained by a merge that must not happen.
+const ENV_OVERRIDE_PORT_VALUE: &str = "40404";
+/// The port the harness config file specifies directly, distinct from
+/// `ENV_OVERRIDE_PORT_VALUE` and from the default, so the response containing
+/// it can only be explained by reading the file.
+const FILE_PORT: &str = "7777";
+
+/// Config file content the harness boots with: an explicit `server.port`
+/// (see `FILE_PORT`) distinct from what the env override would set, and a
+/// provider that resolves its key from `PROVIDER_KEY_ENV`, so the
+/// "never expose a resolved value" test has something to resolve.
 const CONFIG_TOML: &str = r#"
+[server]
+port = 7777
+
 [[providers]]
 name = "test-provider"
 kind = "openai"
@@ -81,6 +104,10 @@ async fn spawn_admin(registry: Arc<Registry>) -> Harness {
     // Distinctive var name (see `PROVIDER_KEY_ENV` doc comment) so setting it
     // process-wide cannot race any other test in the workspace.
     std::env::set_var(PROVIDER_KEY_ENV, PROVIDER_KEY_VALUE);
+    // Genuinely merges into `Config.server.port` via figment (see
+    // `ENV_OVERRIDE_PORT` doc comment); every test in this file sets it to
+    // the same value, so no race with itself either.
+    std::env::set_var(ENV_OVERRIDE_PORT, ENV_OVERRIDE_PORT_VALUE);
 
     let dir = TempDir::new().expect("create temp dir");
     let config_path = dir.path().join("lumen.toml");
@@ -160,4 +187,28 @@ async fn get_config_never_exposes_a_resolved_provider_key() {
         "the config exposes the env var NAME, never its resolved value"
     );
     assert!(rendered.contains(PROVIDER_KEY_ENV));
+}
+
+#[tokio::test]
+async fn get_config_never_exposes_a_merged_env_override() {
+    // `ENV_OVERRIDE_PORT` (`LUMEN_SERVER__PORT`) genuinely merges into
+    // `Config.server.port` via figment (see its doc comment and
+    // `config.rs`'s `env_var_overrides_file_value` test) - unlike the
+    // provider-key case above, there is a real code path (`Config::load`
+    // followed by re-serializing the merged struct) that WOULD leak this
+    // value into the response. The file itself says `port = 7777`
+    // (`FILE_PORT`), never `ENV_OVERRIDE_PORT_VALUE`, so this test can only
+    // pass if the handler returns the file's own bytes.
+    let h = spawn_admin(registry()).await;
+    let body: Value = h.get("/admin/config").await.json().await.expect("json");
+    let rendered = body["config"].as_str().expect("config string");
+    assert!(
+        !rendered.contains(ENV_OVERRIDE_PORT_VALUE),
+        "an env override merged into `Config` must never leak into the file \
+         contents returned to the operator"
+    );
+    assert!(
+        rendered.contains(FILE_PORT),
+        "the file's own value must still be present"
+    );
 }
