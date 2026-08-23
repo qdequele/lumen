@@ -36,6 +36,15 @@
 //!   hash to be echoed as `If-Match` on the `PUT` that applies a new one
 //!   (ADR 010). Never a serialisation of the merged in-memory `Config`: that
 //!   would render environment overrides as if they were file content.
+//! * `PUT /admin/config` - apply a new config document (ADR 010). The
+//!   submitted bytes are staged in a temp file next to the real one,
+//!   validated there (parse + registry build), then the current file is
+//!   backed up to `.bak` and the staged file is renamed into place. Requires
+//!   an `If-Match` header carrying the current hash from `GET /admin/config`;
+//!   a stale hash is a 412 (`LM-1004`), a missing header or an invalid
+//!   document is a 400 (`LM-1001`). This is the highest-privilege route in
+//!   the gateway: it can repoint a provider's `base_url` and thereby redirect
+//!   customer traffic.
 //!
 //! Every change is applied to the database AND the in-memory state, so it
 //! takes effect immediately without a restart.
@@ -871,6 +880,97 @@ pub async fn get_config(State(state): State<AppState>) -> Result<Json<ConfigDocu
         .map_err(|_| GatewayError::Internal("config file is not valid UTF-8".to_owned()))?;
     let hash = config_hash(config.as_bytes());
     Ok(Json(ConfigDocument { config, hash }))
+}
+
+/// Apply a new config document.
+///
+/// The file stays the source of truth. The sequence is deliberate:
+///
+/// 1. Compare `If-Match` against the current file's hash, so two operators
+///    editing at once cannot silently lose one edit.
+/// 2. Stage the submitted bytes in a temporary file in the SAME directory
+///    (a rename is only atomic within a filesystem).
+/// 3. Validate the staged file. Writing first and validating after would
+///    leave an invalid document on disk that breaks the next SIGHUP or
+///    restart with no visible cause.
+/// 4. Back up the current file, then rename the staged file into place.
+/// 5. Ping the hot-reload trigger.
+///
+/// This route can repoint a provider's `base_url` and thereby redirect
+/// customer traffic. It is the highest-privilege operation in the gateway,
+/// which is why the apply is logged.
+///
+/// # Errors
+///
+/// A 400 (`LM-1001`) when `If-Match` is missing or the document is invalid
+/// TOML or fails registry construction; a 412 (`LM-1004`) when `If-Match`
+/// does not match the current file's hash.
+pub async fn put_config(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    body: String,
+) -> Result<StatusCode, ApiError> {
+    let path = config_path(&state)?;
+
+    let Some(if_match) = headers.get("if-match").and_then(|v| v.to_str().ok()) else {
+        return Err(GatewayError::InvalidRequest(
+            "`If-Match` is required: GET /admin/config first and echo its hash".to_owned(),
+        )
+        .into());
+    };
+    let if_match = if_match.trim_matches('"').to_owned();
+
+    let path_for_blocking = path.clone();
+    let outcome = tokio::task::spawn_blocking(move || {
+        apply_config_document(&path_for_blocking, &body, &if_match)
+    })
+    .await
+    .map_err(|e| GatewayError::Internal(format!("config apply task failed: {e}")))?;
+    outcome?;
+
+    if let Some(trigger) = &state.reload_trigger {
+        trigger.notify_one();
+        tracing::info!("config applied through the admin API; hot reload requested");
+    } else {
+        tracing::info!(
+            "config applied through the admin API; no reloader armed, applies at restart"
+        );
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// The blocking half of [`put_config`]: hash check, staged write, validation,
+/// backup and atomic rename. Runs on a blocking thread; never on the runtime.
+fn apply_config_document(
+    path: &std::path::Path,
+    body: &str,
+    if_match: &str,
+) -> Result<(), ApiError> {
+    let current = std::fs::read(path)
+        .map_err(|e| ApiError::from(GatewayError::Internal(format!("reading config: {e}"))))?;
+    if config_hash(&current) != if_match {
+        return Err(GatewayError::ConfigStale(
+            "config changed since it was read; GET /admin/config and re-apply".to_owned(),
+        )
+        .into());
+    }
+
+    let staged = path.with_extension("toml.tmp");
+    std::fs::write(&staged, body.as_bytes())
+        .map_err(|e| ApiError::from(GatewayError::Internal(format!("staging config: {e}"))))?;
+
+    if let Err(error) = crate::reload::validate_candidate(&staged) {
+        // Clean up before reporting: a rejected apply must leave no trace.
+        let _ = std::fs::remove_file(&staged);
+        return Err(GatewayError::InvalidRequest(format!("config rejected: {error}")).into());
+    }
+
+    let backup = path.with_extension("toml.bak");
+    std::fs::copy(path, &backup)
+        .map_err(|e| ApiError::from(GatewayError::Internal(format!("backing up config: {e}"))))?;
+    std::fs::rename(&staged, path)
+        .map_err(|e| ApiError::from(GatewayError::Internal(format!("applying config: {e}"))))?;
+    Ok(())
 }
 
 /// The config file path this process booted from.

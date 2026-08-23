@@ -247,6 +247,11 @@ pub enum GatewayError {
     #[error("invalid request: {0}")]
     InvalidRequest(String),
 
+    /// A conditional write lost a race: the resource changed since the caller
+    /// read it. Carries a safe, caller-facing hint about what to do next.
+    #[error("{0}")]
+    ConfigStale(String),
+
     /// The request body exceeded the configured size limit.
     #[error("payload too large (limit {limit} bytes)")]
     PayloadTooLarge { limit: usize },
@@ -416,6 +421,7 @@ impl GatewayError {
     pub const fn code(&self) -> &'static str {
         match self {
             GatewayError::InvalidRequest(_) => "LM-1001",
+            GatewayError::ConfigStale(_) => "LM-1004",
             GatewayError::PayloadTooLarge { .. } => "LM-1002",
             GatewayError::RouteNotFound => "LM-1003",
             GatewayError::ModelNotFound(_) => "LM-2001",
@@ -468,6 +474,7 @@ impl GatewayError {
             GatewayError::BudgetExceeded { .. } => 402,
             GatewayError::ModelNotFound(_) | GatewayError::RouteNotFound => 404,
             GatewayError::PayloadTooLarge { .. } => 413,
+            GatewayError::ConfigStale(_) => 412,
             GatewayError::QuotaExceeded { .. } | GatewayError::UpstreamRateLimited { .. } => 429,
             // Nonstandard, but the conventional "client closed request" status
             // (nginx 499): the client is normally already gone, so this status
@@ -492,6 +499,7 @@ impl GatewayError {
     pub const fn error_type(&self) -> ErrorType {
         match self {
             GatewayError::InvalidRequest(_)
+            | GatewayError::ConfigStale(_)
             | GatewayError::RouteNotFound
             | GatewayError::ModelNotFound(_)
             | GatewayError::UnsupportedCapability { .. }

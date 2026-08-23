@@ -55,6 +55,11 @@ All notable changes to LUMEN are documented here. The format is based on
 - `GET /admin/config`: returns the config file verbatim with a BLAKE3 content
   hash. The file, never a re-serialisation of the merged in-memory config, so
   environment overrides are never written back into it (ADR 010).
+- `PUT /admin/config`: apply a config document remotely. The submitted
+  document is validated in a staging file before an atomic rename, so a
+  rejected apply never touches the live file; `If-Match` guards against two
+  operators losing an edit, and the previous document is kept as `.bak`
+  (ADR 010).
 - **Atomic budget grant routes** - ADR 009 amendment. `POST
   /admin/keys/{id}/grant` and `POST /admin/groups/{id}/grant` take
   `{"amount": <USD>}` and raise `budget_max` as an atomic increment on both

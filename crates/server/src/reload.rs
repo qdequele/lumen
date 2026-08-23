@@ -167,6 +167,33 @@ pub struct ReloadTargets {
     pub auth_runtime: Option<Arc<crate::auth::AuthRuntime>>,
 }
 
+/// Validate a config document at `path` without swapping anything.
+///
+/// Runs the two checks a reload runs, in the same order: `Config::load`
+/// (parse, merge with `LUMEN_` env vars, validate) and a candidate registry
+/// build. The second is not redundant: a keyless provider missing a
+/// `base_url` passes validation and only fails when the registry is built,
+/// which is why `apply_reload` puts the registry rebuild first.
+///
+/// Used by `PUT /admin/config` to reject a bad document BEFORE it reaches
+/// the real config path, so an invalid apply cannot leave a file behind that
+/// would break the next restart.
+///
+/// # Errors
+///
+/// [`ReloadError::Config`] if the document does not parse or validate;
+/// [`ReloadError::Registry`] if a registry cannot be built from it.
+pub fn validate_candidate(path: &Path) -> Result<(), ReloadError> {
+    let config = Config::load(path)?;
+    // A throwaway client: this runs on an admin route, never the hot path.
+    Registry::build(
+        config.provider_specs(),
+        lumen_providers::http::build_client(),
+        Duration::from_secs(300),
+    )?;
+    Ok(())
+}
+
 /// Re-load `path`, validate it, and (only on success) atomically swap the
 /// routing table, price table, resilience policy and auth knobs. Increments the
 /// success/failure counters. On any error every target is left exactly as it

@@ -70,6 +70,43 @@ permanently. `hash` is a BLAKE3 content hash of those same bytes, meant to be
 echoed as `If-Match` on the `PUT /admin/config` that applies a new one (ADR
 010), so two operators editing at once cannot silently clobber each other.
 
+## Applying a new config over the admin API
+
+**`PUT /admin/config` is the highest-privilege route in the gateway: it can
+repoint any provider's `base_url` (or add a new provider entirely) and
+thereby redirect customer traffic to a different upstream.** Master key
+required, same as every other `/admin/*` route.
+
+The `If-Match` contract:
+
+- Send the submitted document as the raw request body (`Content-Type` is
+  irrelevant; the body is treated as the TOML file's new contents).
+- Send the `hash` from a prior `GET /admin/config` as the `If-Match` header.
+  A missing `If-Match` header is rejected with `400` (`LM-1001`) - the
+  request is malformed like any other missing-required-input case.
+- If `If-Match` does not equal the config file's *current* hash (someone
+  else applied a change since you last read it), the request is rejected
+  with `412` (`LM-1004`) and the file is left untouched. `GET /admin/config`
+  again to see what changed, then re-apply against the fresh hash.
+
+What happens on a successful apply:
+
+1. The submitted bytes are staged in a temporary file next to the real one
+   (same directory, so the final rename is atomic).
+2. The staged file is validated exactly like a hot reload would: parsed,
+   merged with `LUMEN_*` env vars, and used to build a candidate provider
+   registry. A parse failure or a registry-build failure (e.g. a provider
+   missing a required `base_url`) is rejected with `400` (`LM-1001`); the
+   staging file is removed and the real config file is never touched.
+3. Only once validation succeeds is the *current* file copied to a `.bak`
+   sibling (e.g. `lumen.toml.bak`) - one generation of history, enough to
+   revert a bad apply by hand - and the staged file renamed into place.
+4. The hot-reload trigger fires, so the new config takes effect without a
+   restart (see [Hot reload](#hot-reload)).
+
+A rejected apply (`400` or `412`) is guaranteed to leave the config file
+byte-for-byte unchanged and to leave no temporary file behind.
+
 ## Validate before you boot
 
 Run `lumen --check-config --config config.toml` to validate a config file

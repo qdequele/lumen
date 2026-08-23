@@ -28,8 +28,14 @@ fn master() -> String {
 }
 
 /// Name of the env var the harness config references via `api_key_env`.
-/// Distinctive so it cannot race any other test in this workspace.
-const PROVIDER_KEY_ENV: &str = "LUMEN_TEST_PROVIDER_KEY";
+/// Distinctive so it cannot race any other test in this workspace, and
+/// deliberately NOT `LUMEN_`-prefixed: `Config::load` merges every
+/// `LUMEN_`-prefixed env var as a config override via figment, and `Config`
+/// denies unknown fields, so a `LUMEN_`-prefixed provider-key var here would
+/// make every `Config::load` call in this file fail with "unknown field"
+/// (only surfaces once a test exercises a real load, i.e. `PUT`'s
+/// `validate_candidate` - `GET` never calls `Config::load`).
+const PROVIDER_KEY_ENV: &str = "TEST_PROVIDER_API_KEY";
 /// The sentinel value exported under `PROVIDER_KEY_ENV`. Must never appear in
 /// the rendered config: only the env var *name* is file content.
 const PROVIDER_KEY_VALUE: &str = "sentinel-provider-secret";
@@ -64,7 +70,7 @@ port = 7777
 [[providers]]
 name = "test-provider"
 kind = "openai"
-api_key_env = "LUMEN_TEST_PROVIDER_KEY"
+api_key_env = "TEST_PROVIDER_API_KEY"
 
 [[providers.models]]
 id = "gpt-4o"
@@ -90,6 +96,29 @@ impl Harness {
             .send()
             .await
             .expect("send")
+    }
+
+    /// The current config hash, via GET.
+    async fn current_hash(&self) -> String {
+        let body: Value = self.get("/admin/config").await.json().await.expect("json");
+        body["hash"].as_str().expect("hash").to_owned()
+    }
+
+    /// PUT a config document with an `If-Match` header.
+    async fn put_config(&self, body: &str, if_match: &str) -> reqwest::Response {
+        self.client
+            .put(format!("{}/admin/config", self.base))
+            .bearer_auth(master())
+            .header("If-Match", if_match)
+            .body(body.to_owned())
+            .send()
+            .await
+            .expect("request sent")
+    }
+
+    /// The config document the harness booted from.
+    fn valid_config(&self) -> String {
+        std::fs::read_to_string(&self.config_path).expect("read config")
     }
 }
 
@@ -177,7 +206,7 @@ async fn get_config_returns_the_file_bytes_verbatim() {
 
 #[tokio::test]
 async fn get_config_never_exposes_a_resolved_provider_key() {
-    // The harness config sets api_key_env = "LUMEN_TEST_PROVIDER_KEY" and the
+    // The harness config sets api_key_env = "TEST_PROVIDER_API_KEY" and the
     // harness exports that variable with a sentinel value.
     let h = spawn_admin(registry()).await;
     let body: Value = h.get("/admin/config").await.json().await.expect("json");
@@ -210,5 +239,120 @@ async fn get_config_never_exposes_a_merged_env_override() {
     assert!(
         rendered.contains(FILE_PORT),
         "the file's own value must still be present"
+    );
+}
+
+#[tokio::test]
+async fn put_config_rejects_invalid_toml_and_leaves_the_file_untouched() {
+    let h = spawn_admin(registry()).await;
+    let before = std::fs::read(&h.config_path).expect("read config");
+    let hash = h.current_hash().await;
+
+    let response = h.put_config("this is not valid toml {{{", &hash).await;
+    assert_eq!(response.status(), 400);
+
+    let after = std::fs::read(&h.config_path).expect("read config");
+    assert_eq!(before, after, "a rejected apply must not touch the file");
+}
+
+#[tokio::test]
+async fn put_config_rejects_a_config_the_registry_cannot_build() {
+    let h = spawn_admin(registry()).await;
+    let before = std::fs::read(&h.config_path).expect("read config");
+    let hash = h.current_hash().await;
+
+    // A keyless provider with no base_url passes Config::validate and is only
+    // caught when the registry is built. `kind = "vllm"` has no built-in
+    // default base URL (unlike `"openai"`, which falls back to
+    // api.openai.com and would pass registry construction too), so this is
+    // the shape that actually exercises `RegistryError::MissingBaseUrl`.
+    let bad = r#"
+[[providers]]
+name = "nowhere"
+kind = "vllm"
+[[providers.models]]
+id = "m"
+capabilities = ["chat"]
+"#;
+    let response = h.put_config(bad, &hash).await;
+    assert_eq!(response.status(), 400);
+    assert_eq!(
+        std::fs::read(&h.config_path).expect("read config"),
+        before,
+        "registry rejection must also leave the file untouched"
+    );
+}
+
+#[tokio::test]
+async fn put_config_rejects_a_stale_if_match() {
+    let h = spawn_admin(registry()).await;
+    let before = std::fs::read(&h.config_path).expect("read config");
+
+    let response = h
+        .put_config(&h.valid_config(), "0".repeat(64).as_str())
+        .await;
+    assert_eq!(response.status(), 412);
+    assert_eq!(
+        std::fs::read(&h.config_path).expect("read config"),
+        before,
+        "a lost-update guard must not apply the write it refused"
+    );
+}
+
+#[tokio::test]
+async fn put_config_requires_an_if_match_header() {
+    // 400, not 428: a missing header is a malformed request like any other,
+    // and the console always sends one. 412 is reserved for a STALE hash,
+    // which the console must distinguish because it retries after re-reading.
+    let h = spawn_admin(registry()).await;
+    let response = h
+        .client
+        .put(format!("{}/admin/config", h.base))
+        .bearer_auth(master())
+        .body(h.valid_config())
+        .send()
+        .await
+        .expect("request sent");
+    assert_eq!(response.status(), 400);
+}
+
+#[tokio::test]
+async fn put_config_applies_a_valid_document_and_keeps_a_backup() {
+    let h = spawn_admin(registry()).await;
+    let before = std::fs::read_to_string(&h.config_path).expect("read config");
+    let hash = h.current_hash().await;
+
+    let updated = format!("{before}\n# applied by the console\n");
+    let response = h.put_config(&updated, &hash).await;
+    assert_eq!(response.status(), 204);
+
+    assert_eq!(
+        std::fs::read_to_string(&h.config_path).expect("read config"),
+        updated
+    );
+
+    let backup = h.config_path.with_extension("toml.bak");
+    assert_eq!(
+        std::fs::read_to_string(&backup).expect("read backup"),
+        before,
+        "the previous document is kept so the console can offer a revert"
+    );
+}
+
+#[tokio::test]
+async fn put_config_leaves_no_temporary_file_behind() {
+    let h = spawn_admin(registry()).await;
+    let hash = h.current_hash().await;
+    let _ = h.put_config("not toml at all {{{", &hash).await;
+
+    let dir = h.config_path.parent().expect("a parent directory");
+    let strays: Vec<_> = std::fs::read_dir(dir)
+        .expect("read dir")
+        .filter_map(Result::ok)
+        .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
+        .collect();
+    assert!(
+        strays.is_empty(),
+        "a rejected apply must clean up its staging file"
     );
 }
