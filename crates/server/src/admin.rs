@@ -30,6 +30,8 @@
 //!   unset or empty (env keeps precedence when set).
 //! * `GET /admin/usage` - aggregated usage and spend reporting over the
 //!   `usage_log` table (issue #64).
+//! * `GET /admin/usage/export` - cursor-paginated raw `usage_log` rows, for a
+//!   control plane building its own multi-dimensional view (ADR 010).
 //!
 //! Every change is applied to the database AND the in-memory state, so it
 //! takes effect immediately without a restart.
@@ -625,6 +627,94 @@ pub async fn usage_report(
         truncated,
         groups,
     }))
+}
+
+/// Default page size for `GET /admin/usage/export`.
+const DEFAULT_EXPORT_LIMIT: u32 = 1_000;
+/// Hard cap on a single export page. A caller asking for more is rejected
+/// rather than silently clamped: a silent clamp reads as "that was the whole
+/// window" and would make a console under-report without any signal.
+const MAX_EXPORT_LIMIT: u32 = 10_000;
+
+/// `GET /admin/usage/export` query parameters. Unknown parameters are
+/// rejected (400 `LM-1001`), so a typo never silently widens an export.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UsageExportParams {
+    /// Window start (inclusive): unix seconds or RFC3339. Default: 24 hours
+    /// before `until`.
+    pub since: Option<String>,
+    /// Window end (inclusive): unix seconds or RFC3339. Default: now.
+    pub until: Option<String>,
+    /// Return rows with an id strictly greater than this. Absent starts at
+    /// the beginning of the window.
+    pub cursor: Option<i64>,
+    /// Page size. Default 1000, hard cap 10000.
+    pub limit: Option<u32>,
+}
+
+/// `GET /admin/usage/export` response.
+#[derive(Debug, Serialize)]
+pub struct UsageExportPage {
+    /// The rows of this page, ordered by `id`.
+    pub rows: Vec<lumen_auth::store::UsageRow>,
+    /// Cursor to pass as `cursor` for the next page, or `null` when the
+    /// window is exhausted.
+    pub next_cursor: Option<i64>,
+}
+
+/// Export raw usage rows for a window, paginated by primary key.
+///
+/// Complements `GET /admin/usage`, which aggregates over one dimension at a
+/// time: a control plane building a multi-dimensional view needs the rows
+/// themselves (ADR 010). The rows carry no prompt or response content.
+pub async fn usage_export(
+    State(state): State<AppState>,
+    params: Result<Query<UsageExportParams>, QueryRejection>,
+) -> Result<Json<UsageExportPage>, ApiError> {
+    let Query(params) = params.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
+
+    let limit = params.limit.unwrap_or(DEFAULT_EXPORT_LIMIT);
+    if limit == 0 || limit > MAX_EXPORT_LIMIT {
+        return Err(GatewayError::InvalidRequest(format!(
+            "`limit` must be between 1 and {MAX_EXPORT_LIMIT}"
+        ))
+        .into());
+    }
+
+    // Same helpers `usage_report` uses, so both routes accept identical
+    // time formats: a digit string is unix seconds, anything else RFC3339.
+    let until = match params.until.as_deref() {
+        None => crate::auth::now_unix(),
+        Some(value) => parse_time_param(value).ok_or_else(|| invalid_time("until", value))?,
+    };
+    let since = match params.since.as_deref() {
+        None => until.saturating_sub(DEFAULT_WINDOW_SECS),
+        Some(value) => parse_time_param(value).ok_or_else(|| invalid_time("since", value))?,
+    };
+    if since > until {
+        return Err(
+            GatewayError::InvalidRequest("`since` must not be after `until`".to_owned()).into(),
+        );
+    }
+
+    let auth = runtime(&state)?;
+    let rows = auth
+        .store
+        .usage_export(since, until, params.cursor, i64::from(limit))
+        .await
+        .map_err(|e| internal(&e))?;
+
+    // A short page means the window is exhausted. A full page might be the
+    // last one, in which case the caller gets one empty page: cheap, and far
+    // safer than guessing and truncating an export.
+    let next_cursor = if rows.len() == limit as usize {
+        rows.last().map(|row| row.id)
+    } else {
+        None
+    };
+
+    Ok(Json(UsageExportPage { rows, next_cursor }))
 }
 
 fn invalid_time(name: &str, value: &str) -> GatewayError {

@@ -49,6 +49,9 @@ All notable changes to LUMEN are documented here. The format is based on
 - `KeyStore::usage_export`: cursor-paginated raw `usage_log` read, ordered by
   primary key so pages cannot skip or repeat rows while new requests land
   (ADR 010).
+- `GET /admin/usage/export`: cursor-paginated raw usage rows, so a control
+  plane can build its own multi-dimensional view instead of making one
+  aggregate call per dimension (ADR 010).
 - **Atomic budget grant routes** - ADR 009 amendment. `POST
   /admin/keys/{id}/grant` and `POST /admin/groups/{id}/grant` take
   `{"amount": <USD>}` and raise `budget_max` as an atomic increment on both

@@ -29,6 +29,55 @@ through the bounded channel above, requests from the last flush interval
 may not be visible yet. See
 [Keys, quotas & budgets](keys-budgets.md#usage--spend-reporting-get-adminusage).
 
+## Exporting raw rows: `GET /admin/usage/export`
+
+`GET /admin/usage` aggregates over one dimension at a time. A control plane
+building its own multi-dimensional view (per-tenant AND per-model AND
+per-day, say) needs the underlying rows instead of a fixed aggregate shape
+(ADR 010). `GET /admin/usage/export` returns them directly, cursor-paginated,
+master-key gated like every other `/admin/*` route.
+
+Query parameters (all optional, unknown parameters are rejected with 400
+`LM-1001`):
+
+| Parameter | Meaning | Default |
+|-----------|---------|---------|
+| `since` | Window start (inclusive): unix seconds or RFC3339. | 24 hours before `until` |
+| `until` | Window end (inclusive): unix seconds or RFC3339. | now |
+| `cursor` | Return rows with `id` strictly greater than this. | start of the window |
+| `limit` | Page size, 1 to 10000. | 1000 |
+
+The response shape:
+
+```json
+{
+  "rows": [ { "id": 1042, "key_id": "...", "model": "...", "...": "..." } ],
+  "next_cursor": 1043
+}
+```
+
+Each row has the same columns as the `usage_log` table (id, key_id,
+group_id, model, model_used, provider, capability, token/media/cache
+counters, cost, latency, status, metadata, ts). As with every other usage
+surface, rows never carry prompt or response content, only accounting
+fields.
+
+Pagination is by primary key, not offset, so an export cannot skip or repeat
+a row when new requests land mid-export: keep requesting with `cursor` set
+to the previous page's `next_cursor` until `next_cursor` comes back `null`,
+which signals the window is exhausted. A full page is not by itself proof
+that more data exists; the exhausted signal is always a `null` cursor, even
+if that means one extra call returning zero rows at the very end.
+
+`limit` is capped at 10000 per page; a request above the cap is rejected
+(400) rather than silently clamped, so a caller always knows the page it got
+back was the size it asked for.
+
+```bash
+curl -s -H "Authorization: Bearer $LUMEN_MASTER_KEY" \
+  "http://localhost:8080/admin/usage/export?since=2026-08-01T00:00:00Z&limit=500"
+```
+
 ## `x-lumen-metadata`
 
 Clients may attach a per-request metadata header, canonically
