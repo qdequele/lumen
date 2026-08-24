@@ -126,6 +126,16 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ### Fixed
 
+- **h2 bumped to 0.4.18 for RUSTSEC-2026-0258**: h2 accepted and queued empty
+  DATA frames without limit, so a stream that was never drained could grow
+  memory without bound or panic on length overflow. h2 is a transitive
+  dependency through hyper; the advisory is patched in 0.4.16.
+- `PUT /admin/config` no longer leaves a partially written staging file behind
+  when the write or its fsync fails (a full disk is the realistic trigger). The
+  cleanup guard is now armed before the file is created rather than after the
+  write completes, so the failure window it was meant to cover is actually
+  covered.
+
 - **`PUT /admin/config` no longer leaks the staged file's path on a TOML
   parse rejection.** `ConfigError::Parse`'s message was `figment::Error`'s
   own `Display` verbatim, which appends `" in {source} {name}"` naming the

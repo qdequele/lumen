@@ -1008,6 +1008,17 @@ fn apply_config_document(
     // file. Same directory as `path` throughout - a rename is only atomic
     // within one filesystem.
     let staged = path.with_extension(format!("toml.{}.tmp", unique_suffix()));
+    // Armed BEFORE the file is created, not after the write block: a failing
+    // `write_all` or `sync_all` (a full disk is the realistic trigger) returns
+    // through `?` with the file already created, and a guard armed after the
+    // block would never see it. From here on ANY early return must not leave
+    // the staged file behind, and the guard makes that structural instead of
+    // relying on every future `return Err(..)` to remember its own cleanup:
+    // `commit()` is the only way to suppress the removal, and it is called
+    // exactly once, after the rename that consumes the file. Arming it before
+    // `File::create` costs nothing when creation itself fails, since removing
+    // a path that was never created is ignored.
+    let staging = StagingGuard::new(&staged);
     {
         // `File::create` + `write_all` + `sync_all`, not `std::fs::write`:
         // `sync_all` is the step that actually matters here. `rename` only
@@ -1020,7 +1031,7 @@ fn apply_config_document(
         // to reach for it, and `Config::load` refuses to boot on the
         // corrupt result. Flushing the data before the rename closes that
         // window. Scoped so the file handle (and its fsync) completes
-        // before `StagingGuard` or `validate_candidate` touch the path.
+        // before `validate_candidate` touches the path.
         let mut file = std::fs::File::create(&staged)
             .map_err(|e| ApiError::from(GatewayError::Internal(format!("staging config: {e}"))))?;
         file.write_all(body.as_bytes())
@@ -1028,12 +1039,6 @@ fn apply_config_document(
         file.sync_all()
             .map_err(|e| ApiError::from(GatewayError::Internal(format!("staging config: {e}"))))?;
     }
-    // From here on, ANY early return (via `?` or otherwise) must not leave
-    // the staged file behind. A guard makes that structural instead of
-    // relying on every future `return Err(..)` to remember its own cleanup:
-    // `commit()` is the only way to suppress the removal, and it is called
-    // exactly once, after the rename that consumes the file.
-    let staging = StagingGuard::new(&staged);
 
     // `File::create` above always creates with mode `0o666 & !umask` -
     // typically `0644` - regardless of what `path` was actually set to, and
@@ -1179,7 +1184,9 @@ struct StagingGuard<'a> {
 }
 
 impl<'a> StagingGuard<'a> {
-    /// Guard `path`, a staging file that already exists on disk.
+    /// Guard `path`, the staging file, which need NOT exist yet: the guard is
+    /// armed before creation so a failed write or fsync cannot leak a
+    /// partially written file, and `Drop` ignores a path that is not there.
     fn new(path: &'a std::path::Path) -> Self {
         Self {
             path,
