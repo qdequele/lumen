@@ -986,6 +986,20 @@ mod tests {
     }
 
     #[test]
+    fn config_stale_is_a_412_invalid_request() {
+        // `PUT /admin/config`'s lost-update guard (ADR 010, docs/errors.md
+        // LM-1004): a stale `If-Match` must be a 412, distinct from a
+        // missing/malformed header (plain `LM-1001` 400), so the console can
+        // tell "re-read and retry" apart from "fix your request" - see
+        // `GatewayError::ConfigStale`'s own doc comment.
+        let err = GatewayError::ConfigStale("config changed since it was read".to_owned());
+        assert_eq!(err.code(), "LM-1004");
+        assert_eq!(err.http_status(), 412);
+        assert_eq!(err.error_type(), ErrorType::InvalidRequest);
+        assert!(!(500..600).contains(&err.http_status()));
+    }
+
+    #[test]
     fn provider_rate_limit_retry_after_is_exposed() {
         let err = ProviderError::RateLimited {
             provider: "p".into(),

@@ -255,6 +255,72 @@ async fn put_config_rejects_invalid_toml_and_leaves_the_file_untouched() {
     assert_eq!(before, after, "a rejected apply must not touch the file");
 }
 
+/// Regression coverage for a leak `put_config_rejection_names_the_field_but_not_the_staging_path`
+/// (below) does not exercise: that test's payload fails `Config::validate`
+/// (a hand-written, path-free message), never `figment`'s own TOML parser.
+/// A genuine TOML syntax error goes through `ConfigError::Parse`, whose
+/// `message` used to be `figment::Error::to_string()` verbatim - and
+/// figment's own `Display` appends `" in {source} {name}"`, where `source`
+/// is the path it actually read, i.e. the staged `.tmp` file here, never
+/// anything the operator wrote. The offending line/column must still come
+/// through: the fix is to stop leaking the path, not to blank the message.
+#[tokio::test]
+async fn put_config_rejects_invalid_toml_without_leaking_the_staging_path() {
+    let h = spawn_admin(registry()).await;
+    let hash = h.current_hash().await;
+
+    let response = h.put_config("this is not valid toml {{{", &hash).await;
+    assert_eq!(response.status(), 400);
+    let body: Value = response.json().await.expect("json");
+    let message = body["error"]["message"].as_str().expect("message");
+
+    let config_dir = h
+        .config_path
+        .parent()
+        .expect("a parent directory")
+        .to_string_lossy()
+        .into_owned();
+    assert!(
+        !message.contains(&config_dir) && !message.contains(".tmp"),
+        "the response must not leak the staging file's filesystem path: {message}"
+    );
+    assert!(
+        message.to_lowercase().contains("line"),
+        "the operator must still learn where the document is malformed: {message}"
+    );
+}
+
+/// Finding 3: `PUT /admin/config` must not widen the live file's Unix
+/// permissions. `std::fs::File::create` (used to stage the submitted bytes)
+/// always creates with mode `0o666 & !umask`, and the rename makes the live
+/// file inherit whatever mode the STAGED file has, not the original's - so
+/// an operator-hardened `0600` config would otherwise become `0644` (or
+/// looser) on the very first successful apply through this route.
+#[cfg(unix)]
+#[tokio::test]
+async fn put_config_preserves_unix_permissions_across_a_successful_apply() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let h = spawn_admin(registry()).await;
+    std::fs::set_permissions(&h.config_path, std::fs::Permissions::from_mode(0o600))
+        .expect("chmod 0600");
+    let hash = h.current_hash().await;
+
+    let updated = format!("{}\n# applied by the console\n", h.valid_config());
+    let response = h.put_config(&updated, &hash).await;
+    assert_eq!(response.status(), 204);
+
+    let mode = std::fs::metadata(&h.config_path)
+        .expect("stat config")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(
+        mode, 0o600,
+        "an apply must not widen the config file's permissions"
+    );
+}
+
 #[tokio::test]
 async fn put_config_rejects_a_config_the_registry_cannot_build() {
     let h = spawn_admin(registry()).await;
@@ -292,6 +358,12 @@ async fn put_config_rejects_a_stale_if_match() {
         .put_config(&h.valid_config(), "0".repeat(64).as_str())
         .await;
     assert_eq!(response.status(), 412);
+    let body: Value = response.json().await.expect("json");
+    assert_eq!(
+        body["error"]["code"].as_str().expect("code"),
+        "LM-1004",
+        "a stale If-Match must be distinguishable from a plain LM-1001 400"
+    );
     assert_eq!(
         std::fs::read(&h.config_path).expect("read config"),
         before,

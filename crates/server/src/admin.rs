@@ -671,6 +671,17 @@ pub struct UsageExportParams {
 /// `GET /admin/usage/export` response.
 #[derive(Debug, Serialize)]
 pub struct UsageExportPage {
+    /// Effective window start, unix seconds (inclusive): either the caller's
+    /// own `since`, or the resolved default. Echoed (like `usage_report`'s
+    /// `since`/`until`) so a caller paginating without explicit bounds can
+    /// pin the window to what the FIRST page actually resolved, by passing
+    /// these two values back on every later page - otherwise `since`/`until`
+    /// default to "24 hours before now" recomputed on every single call, so
+    /// a multi-page export with no explicit window is filtering each page
+    /// against a window that moved forward while it paginated.
+    pub since: i64,
+    /// Effective window end, unix seconds (inclusive). See `since`.
+    pub until: i64,
     /// The rows of this page, ordered by `id`.
     pub rows: Vec<lumen_auth::store::UsageRow>,
     /// Cursor to pass as `cursor` for the next page, or `null` when the
@@ -729,7 +740,12 @@ pub async fn usage_export(
         None
     };
 
-    Ok(Json(UsageExportPage { rows, next_cursor }))
+    Ok(Json(UsageExportPage {
+        since,
+        until,
+        rows,
+        next_cursor,
+    }))
 }
 
 fn invalid_time(name: &str, value: &str) -> GatewayError {
@@ -852,7 +868,7 @@ const fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
 /// Used as the concurrency token for `PUT /admin/config`. It is a change
 /// detector, not a security boundary.
 #[must_use]
-pub fn config_hash(bytes: &[u8]) -> String {
+fn config_hash(bytes: &[u8]) -> String {
     blake3::hash(bytes).to_hex().to_string()
 }
 
@@ -967,7 +983,18 @@ fn apply_config_document(
 
     let current = std::fs::read(path)
         .map_err(|e| ApiError::from(GatewayError::Internal(format!("reading config: {e}"))))?;
-    if config_hash(&current) != if_match {
+    let old_hash = config_hash(&current);
+    if old_hash != if_match {
+        // See `describe_rejection`'s doc comment: `ApiError`'s `IntoResponse`
+        // only logs `code`/`status` for a non-5xx response, so without this a
+        // rejected apply (stale `If-Match` included) would leave no trace in
+        // the gateway's own logs at all.
+        tracing::warn!(
+            config_path = %path.display(),
+            current_hash = %old_hash,
+            provided_if_match = %if_match,
+            "config apply rejected: If-Match does not match the current file hash"
+        );
         return Err(GatewayError::ConfigStale(
             "config changed since it was read; GET /admin/config and re-apply".to_owned(),
         )
@@ -1008,8 +1035,23 @@ fn apply_config_document(
     // exactly once, after the rename that consumes the file.
     let staging = StagingGuard::new(&staged);
 
+    // `File::create` above always creates with mode `0o666 & !umask` -
+    // typically `0644` - regardless of what `path` was actually set to, and
+    // the live file adopts the STAGED file's mode on rename, not the
+    // original's (`std::fs::copy`, used for the `.bak` sibling below, DOES
+    // preserve mode - only this staged-then-renamed file does not). Without
+    // this, a config file an operator hardened to e.g. `0600` would silently
+    // widen to whatever the process umask allows on the very first apply
+    // through this route, exposing base URLs, model topology, `db_path` and
+    // `api_key_env` names to any other local account on a shared host.
+    if let Err(error) = preserve_permissions(path, &staged) {
+        return Err(ApiError::from(GatewayError::Internal(format!(
+            "preserving config file permissions: {error}"
+        ))));
+    }
+
     if let Err(error) = crate::reload::validate_candidate(&staged) {
-        return Err(describe_rejection(&error));
+        return Err(describe_rejection(path, &error));
     }
 
     let backup = path.with_extension("toml.bak");
@@ -1029,6 +1071,50 @@ fn apply_config_document(
     // durability nicety it cannot control would be worse than logging and
     // moving on.
     sync_parent_dir(path);
+
+    // ADR 010 names this the highest-privilege route in the gateway (it can
+    // repoint a provider's `base_url` and thereby redirect customer
+    // traffic), but the gateway itself has no acting identity to log: ADR
+    // 010 decision 4 delegates human identity to the reverse proxy in front
+    // of the console, which keeps its own audit log of who applied what.
+    // What the gateway CAN and does record is the content-level fact of the
+    // change: an incident responder reading gateway logs alone can see that
+    // a config was applied through this API, and, by comparing hashes
+    // against `GET /admin/config` history or backups, tell exactly what
+    // changed. Hashes only, never content - this must never become a vector
+    // for logging secrets or provider topology.
+    tracing::info!(
+        config_path = %path.display(),
+        old_hash = %old_hash,
+        new_hash = %config_hash(body.as_bytes()),
+        "config applied through the admin API"
+    );
+    Ok(())
+}
+
+/// Preserve `source`'s Unix file mode on `target`.
+///
+/// `std::fs::File::create` always creates a new file with mode
+/// `0o666 & !umask`, never the mode of any existing file at a neighbouring
+/// path, so staging a config document in a fresh file and renaming it into
+/// place would otherwise silently change the live file's permissions on
+/// every apply. A no-op on non-Unix targets: there is no equivalent
+/// permission-bit model to copy there, and this route already only fsyncs a
+/// parent directory (see [`sync_parent_dir`]) on a best-effort basis
+/// elsewhere on non-Unix platforms.
+#[cfg(unix)]
+fn preserve_permissions(source: &std::path::Path, target: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(source)?.permissions().mode();
+    std::fs::set_permissions(target, std::fs::Permissions::from_mode(mode))
+}
+
+/// Non-Unix targets have no permission bits to copy.
+#[cfg(not(unix))]
+fn preserve_permissions(
+    _source: &std::path::Path,
+    _target: &std::path::Path,
+) -> std::io::Result<()> {
     Ok(())
 }
 
@@ -1100,16 +1186,32 @@ impl Drop for StagingGuard<'_> {
 }
 
 /// Turn a `validate_candidate` failure into the client-facing rejection,
-/// without the staged file's filesystem path: `ConfigError::Parse` and
-/// `ConfigError::Validation` both embed that path in their `Display` text,
-/// and `GatewayError::InvalidRequest`'s message reaches the client verbatim
-/// (only `Internal` is scrubbed - see `GatewayError::public_message`), so
-/// formatting the error directly would leak a `.tmp` path the operator never
-/// created. `RegistryError`'s variants never embed a path, so those pass
-/// through unchanged. The full detail (path included) still reaches the
-/// server log: `ApiError`'s `IntoResponse` logs `%err` regardless of what is
-/// returned to the client.
-fn describe_rejection(error: &crate::reload::ReloadError) -> ApiError {
+/// without leaking the staged file's filesystem path.
+///
+/// `ConfigError::Parse` and `ConfigError::Validation` both have a `path`
+/// field carrying that path, and their own `Display` (used by `{error}`
+/// below, never by this function) names it - correctly, since that `Display`
+/// is what reaches the log line just below, not the client. This function
+/// instead takes each variant's `message` field alone: `Validation`'s is
+/// hand-written by `Config::validate` and never contained a path to begin
+/// with, and `Parse`'s no longer does either (`describe_figment_error` in
+/// `config.rs` strips figment's own trailing `" in {source} {name}"`, which
+/// is the fragment that used to carry it). `RegistryError`'s variants never
+/// embed a path, so those pass through unchanged.
+///
+/// The full detail - path included - still needs to reach a human somewhere,
+/// since a rejected apply is exactly the kind of thing an operator wants a
+/// record of. It does NOT reach it via `ApiError`'s `IntoResponse`
+/// (`crate::error`): that only logs `code` and `status` for a non-5xx
+/// response, at `debug`, never the message or this error's `Display`. So
+/// this function logs it directly, at `warn`, before scrubbing the message
+/// down to what the client is allowed to see.
+fn describe_rejection(path: &std::path::Path, error: &crate::reload::ReloadError) -> ApiError {
+    tracing::warn!(
+        config_path = %path.display(),
+        error = %error,
+        "config apply rejected"
+    );
     let message = match error {
         crate::reload::ReloadError::Config(config_error) => match config_error {
             crate::config::ConfigError::Parse { message, .. }

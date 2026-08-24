@@ -188,6 +188,49 @@ async fn export_pages_and_reports_the_next_cursor() {
     assert!(rows2[0]["id"].as_i64().expect("id") > cursor);
 }
 
+/// Finding 6: a console paginating without an explicit `since`/`until`
+/// would otherwise filter every page against a window recomputed relative
+/// to "now" at call time, i.e. no single nameable window - `usage_report`
+/// already echoes its effective window for exactly this reason, and export
+/// must match. Explicit bounds here so the echoed values are trivially
+/// checkable against what was sent, and identical across both pages of the
+/// same logical export.
+#[tokio::test]
+async fn export_echoes_the_effective_window_stably_across_pages() {
+    let h = spawn_admin(registry()).await;
+    h.seed_usage(4).await;
+
+    let since = 0;
+    let until = now_unix();
+
+    let body: Value = h
+        .get(&format!(
+            "/admin/usage/export?since={since}&until={until}&limit=2"
+        ))
+        .await
+        .json()
+        .await
+        .expect("json body");
+    assert_eq!(body["since"].as_i64().expect("since"), since);
+    assert_eq!(body["until"].as_i64().expect("until"), until);
+    let cursor = body["next_cursor"].as_i64().expect("a cursor");
+
+    let body2: Value = h
+        .get(&format!(
+            "/admin/usage/export?since={since}&until={until}&limit=2&cursor={cursor}"
+        ))
+        .await
+        .json()
+        .await
+        .expect("json body");
+    assert_eq!(
+        body2["since"].as_i64().expect("since"),
+        since,
+        "the echoed window must be stable across pages of the same export"
+    );
+    assert_eq!(body2["until"].as_i64().expect("until"), until);
+}
+
 #[tokio::test]
 async fn export_reports_a_null_cursor_on_the_last_page() {
     let h = spawn_admin(registry()).await;
@@ -214,7 +257,7 @@ async fn export_rejects_an_unknown_query_parameter() {
 }
 
 #[tokio::test]
-async fn export_caps_an_oversized_limit() {
+async fn export_rejects_an_oversized_limit() {
     let h = spawn_admin(registry()).await;
     h.seed_usage(3).await;
     let response = h.get("/admin/usage/export?limit=999999").await;
