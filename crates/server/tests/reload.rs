@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use lumen_auth::crypto::MasterKey;
@@ -17,10 +18,11 @@ use lumen_auth::store::KeyStore;
 use lumen_providers::{http, Registry};
 use lumen_server::config::Config;
 use lumen_server::pricing::CostTable;
-use lumen_server::reload::{reload_once, ProviderKeySource, ReloadTargets};
+use lumen_server::reload::{reload_once, spawn_config_reloader, ProviderKeySource, ReloadTargets};
 use lumen_server::resilience::ResilienceRuntime;
 use lumen_telemetry::{Metrics, ReloadMetrics};
 use serde_json::json;
+use tokio::sync::Notify;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -258,4 +260,140 @@ async fn reload_makes_an_offline_group_and_member_key_live_and_group_enforced() 
     ));
     // A $3 estimate under the pool is admitted: the key is usable.
     assert!(entry.admit(0, 1, usd_to_micro(3.0)).is_ok());
+}
+
+const ONE_MODEL_CHAT: &str = r#"
+    [[providers]]
+    name = "openai"
+    kind = "openai"
+    [[providers.models]]
+    id = "gpt"
+    capabilities = ["chat"]
+"#;
+
+const TWO_MODELS_CHAT_EMBED: &str = r#"
+    [[providers]]
+    name = "openai"
+    kind = "openai"
+    [[providers.models]]
+    id = "gpt"
+    capabilities = ["chat"]
+    [[providers.models]]
+    id = "embed"
+    capabilities = ["embed"]
+"#;
+
+fn registry_from_chat_config(path: &Path) -> Arc<Registry> {
+    let config = Config::load(path).expect("initial config valid");
+    Arc::new(
+        Registry::build(
+            config.provider_specs(),
+            http::build_client(),
+            Duration::from_secs(300),
+        )
+        .expect("registry"),
+    )
+}
+
+/// Reload targets sharing `registry`/`metrics`, with default pricing and
+/// resilience, no key backfill and no auth knobs.
+fn bare_filename_reload_targets(registry: Arc<Registry>, metrics: ReloadMetrics) -> ReloadTargets {
+    ReloadTargets {
+        registry,
+        pricing: Arc::new(ArcSwap::from_pointee(CostTable::default())),
+        resilience: Arc::new(ResilienceRuntime::defaults()),
+        metrics,
+        key_backfill: Arc::new(ArcSwap::from_pointee(HashMap::new())),
+        key_source: None,
+        auth_knobs: None,
+        auth_runtime: None,
+    }
+}
+
+/// Regression test: a config path with NO directory component used to make
+/// `spawn_config_reloader` watch the FILE's own inode rather than its
+/// containing directory. Replacing the file via rename - exactly what
+/// `PUT /admin/config` and any GitOps sync do - unlinks that inode, silently
+/// ending the watch with no error anywhere; only a directory watch (filtered
+/// to the config's own file name) survives a rename.
+///
+/// This lives in its own process (an integration test under
+/// `crates/server/tests/`), not in the `lumen_server` lib's unit test
+/// binary, specifically BECAUSE it calls `std::env::set_current_dir` and
+/// holds a foreign working directory for the better part of a second: two
+/// unit tests in `crates/server/src/config.rs`
+/// (`env_var_overrides_file_value`,
+/// `master_key_env_var_is_never_folded_into_the_config`) call
+/// `Config::load(Path::new("config.toml"))` inside a `figment::Jail`, and
+/// `Jail` chdirs into its own temp directory internally while serialising
+/// only against OTHER jails via its own private static lock - it has no way
+/// to know about a chdir happening outside of it. Sharing a test binary (and
+/// therefore a process and a CWD) with those tests would make this test's
+/// chdir liable to land in the middle of a jail test's relative-path load,
+/// and would make this test's CWD-restoring guard liable to capture a
+/// jail's temp directory as "the original CWD" and later restore the
+/// process into a directory that has since been deleted. Running as a
+/// separate binary (Cargo gives every file under `tests/` its own process)
+/// makes that interference structurally impossible instead of relying on a
+/// lock everyone remembers to take.
+///
+/// Note: this cannot discriminate old from new code on macOS, because
+/// FSEvents does not reproduce the inode-unlink-on-rename behaviour that
+/// inotify does; it is a real regression guard only under inotify (Linux).
+/// That platform gap is known and accepted, not something to fix here.
+#[tokio::test]
+async fn spawn_config_reloader_survives_a_rename_replace_of_a_bare_filename_config() {
+    // Restores the original CWD on drop (including on panic/early return),
+    // so this test cannot leave the process's working directory changed for
+    // whatever runs after it in this binary.
+    struct RestoreCwd(PathBuf);
+    impl Drop for RestoreCwd {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.0);
+        }
+    }
+
+    let dir = tempdir();
+    let config_path = dir.join("lumen.toml");
+    std::fs::write(&config_path, ONE_MODEL_CHAT).expect("write config");
+    let registry = registry_from_chat_config(&config_path);
+
+    // A BARE filename (no directory component) is passed to
+    // `spawn_config_reloader` below - the exact shape that triggered the bug
+    // - and it, like the reload path in general, re-resolves that relative
+    // path against the process CWD on every single reload, not just once at
+    // startup. The CWD must therefore stay pointed at `dir` for this whole
+    // test, not just while arming the watcher; a real gateway process never
+    // changes its CWD after boot, so this is a property of the test rig,
+    // not of the code under test.
+    let _restore = RestoreCwd(std::env::current_dir().expect("read cwd"));
+    std::env::set_current_dir(&dir).expect("chdir into tempdir");
+
+    let metrics = ReloadMetrics::register(&Metrics::new()).expect("reload metrics");
+    let t = bare_filename_reload_targets(Arc::clone(&registry), metrics);
+    let trigger = Arc::new(Notify::new());
+    let handle =
+        spawn_config_reloader(PathBuf::from("lumen.toml"), t, trigger).expect("spawn reloader");
+
+    // Give the watcher a moment to be fully armed before the replace.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Replace the file via RENAME, not an in-place write: the operation
+    // that unlinks a file-level watch.
+    let staged = dir.join("lumen.toml.staged");
+    std::fs::write(&staged, TWO_MODELS_CHAT_EMBED).expect("write staged");
+    std::fs::rename(&staged, &config_path).expect("rename into place");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if registry.embedding_route("embed").is_some() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "hot reload did not fire after a rename-replace of a bare-filename config"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    handle.abort();
 }

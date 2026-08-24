@@ -940,72 +940,25 @@ mod tests {
         );
     }
 
-    /// Regression test: a config path with NO directory component used to
-    /// make `spawn_config_reloader` watch the FILE's own inode rather than
-    /// its containing directory. Replacing the file via rename - exactly
-    /// what `PUT /admin/config` and any GitOps sync do - unlinks that inode,
-    /// silently ending the watch with no error anywhere; only a directory
-    /// watch (filtered to the config's own file name) survives a rename.
-    /// This also exercises that the existing file-name filter still scopes
-    /// correctly once the watch target is a directory instead of the file
-    /// itself - it was already written generically, but this is the first
-    /// test to actually feed it directory-level events for a bare filename.
-    #[tokio::test]
-    async fn spawn_config_reloader_survives_a_rename_replace_of_a_bare_filename_config() {
-        // Restores the original CWD on drop (including on panic/early
-        // return), so this test cannot leave the process's working
-        // directory changed for whatever runs after it.
-        struct RestoreCwd(PathBuf);
-        impl Drop for RestoreCwd {
-            fn drop(&mut self) {
-                let _ = std::env::set_current_dir(&self.0);
-            }
-        }
-
-        let dir = tempdir();
-        let config_path = dir.join("lumen.toml");
-        std::fs::write(&config_path, ONE_MODEL).expect("write config");
-        let registry = registry_from(&config_path);
-
-        // A BARE filename (no directory component) is passed to
-        // `spawn_config_reloader` below - the exact shape that triggered the
-        // bug - and it, like the reload path in general, re-resolves that
-        // relative path against the process CWD on every single reload, not
-        // just once at startup. The CWD must therefore stay pointed at
-        // `dir` for this whole test, not just while arming the watcher; a
-        // real gateway process never changes its CWD after boot, so this is
-        // a property of the test rig, not of the code under test.
-        let _restore = RestoreCwd(std::env::current_dir().expect("read cwd"));
-        std::env::set_current_dir(&dir).expect("chdir into tempdir");
-
-        let metrics = ReloadMetrics::register(&Metrics::new()).unwrap();
-        let t = targets(Arc::clone(&registry), metrics);
-        let trigger = Arc::new(Notify::new());
-        let handle =
-            spawn_config_reloader(PathBuf::from("lumen.toml"), t, trigger).expect("spawn reloader");
-
-        // Give the watcher a moment to be fully armed before the replace.
-        tokio::time::sleep(Duration::from_millis(200)).await;
-
-        // Replace the file via RENAME, not an in-place write: the operation
-        // that unlinks a file-level watch.
-        let staged = dir.join("lumen.toml.staged");
-        std::fs::write(&staged, TWO_MODELS).expect("write staged");
-        std::fs::rename(&staged, &config_path).expect("rename into place");
-
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        loop {
-            if registry.embedding_route("embed").is_some() {
-                break;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "hot reload did not fire after a rename-replace of a bare-filename config"
-            );
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        handle.abort();
-    }
+    // The regression test for a bare-filename config path surviving a
+    // rename-replace (`spawn_config_reloader_survives_a_rename_replace_of_a_bare_filename_config`)
+    // used to live here, but it calls `std::env::set_current_dir` and holds
+    // a foreign working directory for the better part of a second. Two
+    // tests in `crates/server/src/config.rs` (`env_var_overrides_file_value`,
+    // `master_key_env_var_is_never_folded_into_the_config`) use
+    // `figment::Jail`, which chdirs internally and serialises only against
+    // OTHER jails via its own private static lock - it has no way to know
+    // about a chdir happening outside of it. Sharing this lib's unit test
+    // binary (and therefore a process and a CWD) with those tests made the
+    // chdir here liable to land in the middle of a jail test's relative-path
+    // `Config::load`, and made this test's CWD-restoring guard liable to
+    // capture a jail's temp directory as "the original CWD" and later
+    // restore the process into a directory that had since been deleted:
+    // a real, if intermittent, source of CI flakiness. It now lives in
+    // `crates/server/tests/reload.rs`, which Cargo builds and runs as its
+    // own process, making that interference structurally impossible instead
+    // of relying on a lock every CWD-touching test would have to remember
+    // to take.
 
     /// A unique temp dir under the OS temp root (no external crate).
     fn tempdir() -> PathBuf {
