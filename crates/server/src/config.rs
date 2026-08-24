@@ -643,6 +643,41 @@ pub enum ConfigError {
     },
 }
 
+/// Render a `figment` extraction error without the trailing `" in {source}
+/// {name}"` fragment its own `Display` appends (e.g. `" in /srv/lumen/lumen
+/// .toml.4127-0.tmp TOML file"`): `source` is the path figment actually read,
+/// which is the real config path on a normal boot but the staged `.tmp` file
+/// during `PUT /admin/config` validation (`crate::reload::validate_candidate`
+/// runs `Config::load` against the staging copy). `ConfigError::Parse`
+/// already carries the correct path in its own `path` field, so repeating
+/// figment's copy is redundant on a normal load and a filesystem-path leak on
+/// a `PUT` rejection.
+///
+/// Reconstructed structurally from `figment::Error`'s public fields (`kind`,
+/// `path`, `profile`, `metadata`), not by trimming the formatted string: this
+/// stays correct if figment ever reorders or restyles its own `Display`,
+/// where a suffix-trim would silently stop matching.
+fn describe_figment_error(error: &figment::Error) -> String {
+    use std::fmt::Write as _;
+
+    error
+        .clone()
+        .into_iter()
+        .map(|level| {
+            let mut message = level.kind.to_string();
+            if let (Some(profile), Some(metadata)) = (&level.profile, &level.metadata) {
+                if !level.path.is_empty() {
+                    let key = metadata.interpolate(profile, &level.path);
+                    // `write!` into a `String` is infallible.
+                    let _ = write!(message, " for key {key:?}");
+                }
+            }
+            message
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 impl Config {
     /// Load and validate configuration from `path`, overlaid with `LUMEN_*`
     /// environment variables.
@@ -673,7 +708,7 @@ impl Config {
     fn from_figment(figment: &Figment, path_label: &str) -> Result<Self, ConfigError> {
         let config: Config = figment.extract().map_err(|e| ConfigError::Parse {
             path: path_label.to_owned(),
-            message: e.to_string(),
+            message: describe_figment_error(&e),
         })?;
         config.validate(path_label)?;
         Ok(config)
@@ -963,6 +998,49 @@ mod tests {
             msg.contains("portt"),
             "message should name the field: {msg}"
         );
+    }
+
+    /// Regression test: `figment::Error`'s own `Display` appends
+    /// `" in {source} {name}"` (e.g. `" in /tmp/x/bad.toml TOML file"`) to a
+    /// parse failure. `ConfigError::Parse.message` used to be that full
+    /// string verbatim, so a caller who only has `message` (not `path`) -
+    /// exactly the situation `admin::describe_rejection` is in when scrubbing
+    /// a `PUT /admin/config` rejection - saw figment's own copy of the path,
+    /// which is the STAGED `.tmp` file during a `PUT`, not anything the
+    /// operator wrote. `Config::load` on a real file (not `Toml::string`, so
+    /// figment's `source` is a genuine path) exercises this directly.
+    #[test]
+    fn parse_error_message_has_no_redundant_path_but_keeps_the_position() {
+        let dir = std::env::temp_dir().join(format!(
+            "lumen-config-parse-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("bad.toml");
+        std::fs::write(&path, "this is not valid toml {{{").expect("write bad config");
+
+        let err = Config::load(&path).expect_err("malformed TOML must be rejected");
+        let ConfigError::Parse { message, .. } = &err else {
+            panic!("expected a Parse error, got {err:?}");
+        };
+        assert!(
+            !message.contains(&path.display().to_string()),
+            "the message must not repeat figment's own copy of the file path: {message}"
+        );
+        assert!(
+            !message.contains("TOML file"),
+            "the message must not carry figment's source-kind tag: {message}"
+        );
+        assert!(
+            message.to_lowercase().contains("line"),
+            "the message must still name the offending line/column: {message}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
