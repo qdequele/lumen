@@ -91,8 +91,14 @@ a content hash returned by `GET`, so concurrent operators cannot silently
 lose an edit. The previous file is kept for revert.
 
 This endpoint can repoint a provider's `base_url` and thereby redirect
-customer traffic. It is the highest-privilege operation in the system and
-every call is audit-logged with the acting identity.
+customer traffic. It is the highest-privilege operation in the system.
+Consistent with decision 4, the gateway itself has no acting identity to
+log - that lives in the console's own `audit_log`, keyed to the signed
+identity the reverse proxy asserted. What the gateway records on its own
+side is content-level, not identity-level: a successful apply logs the old
+and new config content hashes at `info`, and a rejected apply (a stale
+`If-Match`, invalid TOML, or a config the registry cannot build) logs the
+full rejection detail at `warn`. Hashes only, never file content or secrets.
 
 **`GET /admin/usage/export`.** Cursor-paginated raw `usage_log` rows.
 `GET /admin/usage` aggregates over one dimension at a time, so building a

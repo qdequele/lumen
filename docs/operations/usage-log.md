@@ -51,16 +51,20 @@ The response shape:
 
 ```json
 {
+  "since": 1785600000,
+  "until": 1785686400,
   "rows": [ { "id": 1042, "key_id": "...", "model": "...", "...": "..." } ],
   "next_cursor": 1043
 }
 ```
 
-Each row has the same columns as the `usage_log` table (id, key_id,
-group_id, model, model_used, provider, capability, token/media/cache
-counters, cost, latency, status, metadata, ts). As with every other usage
-surface, rows never carry prompt or response content, only accounting
-fields.
+`since` and `until` are the EFFECTIVE window for this call: either what the
+caller passed, or the resolved default (24 hours before `until`, `until`
+itself defaulting to "now"). Each row has the same columns as the
+`usage_log` table (id, key_id, group_id, model, model_used, provider,
+capability, token/media/cache counters, cost, latency, status, metadata,
+ts). As with every other usage surface, rows never carry prompt or response
+content, only accounting fields.
 
 Pagination is by primary key, not offset, so an export cannot skip or repeat
 a row when new requests land mid-export: keep requesting with `cursor` set
@@ -68,6 +72,14 @@ to the previous page's `next_cursor` until `next_cursor` comes back `null`,
 which signals the window is exhausted. A full page is not by itself proof
 that more data exists; the exhausted signal is always a `null` cursor, even
 if that means one extra call returning zero rows at the very end.
+
+**Pin the window explicitly when paginating.** With no explicit `since`/
+`until`, both default relative to "now" and are recomputed independently on
+every call - so a multi-page export that never passes `since`/`until` is
+filtering each page against a window that keeps sliding forward while it
+pages through. Read `since` and `until` off the FIRST response and pass
+those same two values back on every subsequent page, instead of relying on
+the defaults again; this is exactly why the response echoes them.
 
 `limit` is capped at 10000 per page; a request above the cap is rejected
 (400) rather than silently clamped, so a caller always knows the page it got

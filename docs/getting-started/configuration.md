@@ -116,6 +116,35 @@ pre-apply hash can never both land: exactly one wins, and the other sees a
 `412` for a hash that moved out from under it, never a silently corrupted
 mix of the two documents.
 
+**Not every field actually takes effect without a restart.** A `204` means
+the write and the reload trigger both succeeded, not that every field you
+changed is now live: the restart-only settings named in [Hot
+reload](#hot-reload) - the bind address, `auth.enabled`, `auth.db_path`, and
+the bounded usage-log channel knobs (`usage_channel_capacity`,
+`usage_batch_max`, `usage_flush_ms`) - are silently unaffected by a `PUT`
+just as they are by `SIGHUP`, with no separate signal in the response. Check
+`reload.rs`'s module documentation (or this page's [Hot
+reload](#hot-reload) section) for the authoritative restart-only list before
+relying on a config change through this route.
+
+**Security note: the master key is equivalent to host filesystem access.**
+`api_key_env` accepts ANY environment variable name, not just ones a
+provider convention would suggest. Because `PUT /admin/config` lets a
+master-key holder add a provider with an attacker-controlled `base_url` and
+`api_key_env` pointed at any variable present in the gateway's own process
+environment - `LUMEN_MASTER_KEY` itself, or any cloud credential the process
+happens to carry - a single crafted config plus one request to that
+provider's model returns the named secret back to the caller as a Bearer
+token. Before remote config apply existed, reaching this required
+filesystem write access on the gateway host; with this route, the master
+key alone is enough. In practice: **holding the master key is now equivalent
+to filesystem write access on the gateway host, plus read access to its
+entire process environment.** Mitigate with a separate master key per
+gateway, exposing the admin surface on a private network only, and using the
+read-only config mount opt-out (see
+[Deployment](../operations/deployment.md#hot-reload)) on any gateway that
+does not need remote apply.
+
 ## Validate before you boot
 
 Run `lumen --check-config --config config.toml` to validate a config file
