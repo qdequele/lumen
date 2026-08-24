@@ -130,13 +130,22 @@ fn registry() -> Arc<Registry> {
 
 /// Spawn an auth-enabled gateway booted against a real config file on disk.
 async fn spawn_admin(registry: Arc<Registry>) -> Harness {
-    // Distinctive var name (see `PROVIDER_KEY_ENV` doc comment) so setting it
-    // process-wide cannot race any other test in the workspace.
-    std::env::set_var(PROVIDER_KEY_ENV, PROVIDER_KEY_VALUE);
-    // Genuinely merges into `Config.server.port` via figment (see
-    // `ENV_OVERRIDE_PORT` doc comment); every test in this file sets it to
-    // the same value, so no race with itself either.
-    std::env::set_var(ENV_OVERRIDE_PORT, ENV_OVERRIDE_PORT_VALUE);
+    // Written exactly once per process, before any server in this file can
+    // start. `set_var` is not merely "racy with other tests that also write":
+    // `PUT /admin/config` calls `Config::load` on a blocking worker, which
+    // READS the environment, so a concurrent test entering `spawn_admin` and
+    // writing it is the classic setenv/getenv data race. Setting the same
+    // value twice does not make that safe, because the race is write-vs-read,
+    // not write-vs-write. `Once` removes the writes after the first.
+    static ENV_ONCE: std::sync::Once = std::sync::Once::new();
+    ENV_ONCE.call_once(|| {
+        // Distinctive var name (see `PROVIDER_KEY_ENV` doc comment) so setting
+        // it process-wide cannot collide with any other test in the workspace.
+        std::env::set_var(PROVIDER_KEY_ENV, PROVIDER_KEY_VALUE);
+        // Genuinely merges into `Config.server.port` via figment (see
+        // `ENV_OVERRIDE_PORT` doc comment).
+        std::env::set_var(ENV_OVERRIDE_PORT, ENV_OVERRIDE_PORT_VALUE);
+    });
 
     let dir = TempDir::new().expect("create temp dir");
     let config_path = dir.path().join("lumen.toml");

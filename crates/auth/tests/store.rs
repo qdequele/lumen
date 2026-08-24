@@ -602,6 +602,19 @@ async fn usage_export_honours_the_time_window() {
         .expect("windowed export");
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].ts, 200);
+
+    // Both bounds are INCLUSIVE, which the store doc and the HTTP docs both
+    // promise. The interior window above holds whether the SQL uses `>=`/`<=`
+    // or `>`/`<`, so it cannot prove that on its own: this one puts a row
+    // exactly on each edge, where a half-open window would drop both.
+    let inclusive = store
+        .usage_export(100, 300, None, 100)
+        .await
+        .expect("inclusive export");
+    assert_eq!(
+        inclusive.iter().map(|row| row.ts).collect::<Vec<_>>(),
+        vec![100, 200, 300]
+    );
 }
 
 #[tokio::test]
