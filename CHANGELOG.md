@@ -193,6 +193,17 @@ All notable changes to LUMEN are documented here. The format is based on
   `git grep` over all tracked files (binaries skipped) minus explicit
   exclusions: `Cargo.lock`, `LICENSE`, and the verbatim third-party output
   under `bench/results/`.
+- **`PUT /admin/config` no longer fails an otherwise-valid apply just
+  because the config file lives on a filesystem with no Unix permission
+  model** (CIFS/FAT-style mounts, some FUSE layers). Preserving the live
+  file's permissions across the staged-file rename is now best-effort,
+  matching how the same route already treats the parent-directory fsync: a
+  `chmod` failure is logged at `warn` and the apply proceeds, rather than
+  being turned into a 500. On a filesystem with no permission bits, there
+  was never a permission to widen, so there is nothing to protect by
+  refusing the apply. The Unix happy path (an operator-hardened `0600`
+  config surviving an apply) is unchanged and stays covered by its own
+  test.
 
 ## [0.2.0] - 2026-07-21
 

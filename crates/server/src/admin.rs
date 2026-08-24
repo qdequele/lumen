@@ -1044,10 +1044,21 @@ fn apply_config_document(
     // widen to whatever the process umask allows on the very first apply
     // through this route, exposing base URLs, model topology, `db_path` and
     // `api_key_env` names to any other local account on a shared host.
+    // Best-effort, like `sync_parent_dir` below: on a filesystem with no
+    // Unix permission model to speak of (CIFS/FAT-style mounts, some FUSE
+    // layers), `chmod` fails not because a real permission would be widened,
+    // but because there was never a permission bit to preserve in the first
+    // place. Refusing the apply over that would turn a config change that
+    // would previously have succeeded into a hard failure for a reason the
+    // operator cannot fix from this side of the API.
     if let Err(error) = preserve_permissions(path, &staged) {
-        return Err(ApiError::from(GatewayError::Internal(format!(
-            "preserving config file permissions: {error}"
-        ))));
+        tracing::warn!(
+            %error,
+            path = %path.display(),
+            "failed to preserve the config file's permissions across the apply; \
+             continuing, since a filesystem without a permission model has \
+             nothing to protect"
+        );
     }
 
     if let Err(error) = crate::reload::validate_candidate(&staged) {
@@ -1092,7 +1103,7 @@ fn apply_config_document(
     Ok(())
 }
 
-/// Preserve `source`'s Unix file mode on `target`.
+/// Preserve `source`'s Unix file mode on `target`, best-effort.
 ///
 /// `std::fs::File::create` always creates a new file with mode
 /// `0o666 & !umask`, never the mode of any existing file at a neighbouring
@@ -1102,6 +1113,14 @@ fn apply_config_document(
 /// permission-bit model to copy there, and this route already only fsyncs a
 /// parent directory (see [`sync_parent_dir`]) on a best-effort basis
 /// elsewhere on non-Unix platforms.
+///
+/// The caller treats a returned error as best-effort too (log and continue,
+/// exactly like [`sync_parent_dir`]): on a filesystem that implements no
+/// Unix permission model at all (CIFS/FAT-style mounts, some FUSE layers),
+/// `chmod` fails, but there was never a permission to widen, so there is
+/// nothing to protect by refusing the apply. Do not turn this back into a
+/// hard failure; that would reject an apply that would previously have
+/// succeeded, for a condition the operator has no way to fix from the API.
 #[cfg(unix)]
 fn preserve_permissions(source: &std::path::Path, target: &std::path::Path) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
