@@ -55,8 +55,11 @@ Details in [Deployment](../operations/deployment.md#hot-reload).
 
 ## Viewing the live config over the admin API
 
-`GET /admin/config` (master key required) returns the config file the
-gateway booted from, verbatim:
+`GET /admin/config` returns the config file the gateway booted from,
+verbatim. It requires the master key AND `auth.enabled = true`: the whole
+`/admin/*` router is only mounted when auth is on, so on a default
+deployment (where `[auth]` is disabled) this route does not exist at all and
+answers 404 rather than 401.
 
 ```json
 { "config": "<raw toml, byte for byte>", "hash": "<64 hex chars, BLAKE3>" }
@@ -75,7 +78,9 @@ echoed as `If-Match` on the `PUT /admin/config` that applies a new one (ADR
 **`PUT /admin/config` is the highest-privilege route in the gateway: it can
 repoint any provider's `base_url` (or add a new provider entirely) and
 thereby redirect customer traffic to a different upstream.** Master key
-required, same as every other `/admin/*` route.
+required, same as every other `/admin/*` route, and likewise only mounted
+when `auth.enabled = true`: with auth off the route is absent and returns
+404, not 401.
 
 The `If-Match` contract:
 
