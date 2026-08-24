@@ -173,6 +173,30 @@ knobs (`usage_channel_capacity`, `usage_batch_max`, `usage_flush_ms`) -
 rebinding a live listener or resizing a running channel is out of scope for
 a live swap.
 
+`PUT /admin/config` (ADR 010) applies a new config document remotely instead
+of an operator editing the file by hand: it stages the submitted bytes next
+to the real config file, validates the staged copy, then backs up the
+current file to `.bak` and renames the staged file into place before
+triggering the same reload path as above. This means **the gateway process
+needs write permission on the config file's directory**, not just the file
+itself (the staged file and the `.bak` sibling are both new files created
+next to it, and the final apply is a rename within that directory). A
+read-only config mount (a common hardening choice, e.g. a Kubernetes
+ConfigMap volume or an immutable container layer) disables this route: the
+staging write fails and the request is rejected with an internal error
+(`LM-5001`), which is the correct refusal - the alternative would be a
+silent apply that never actually took effect. `GET`/reading the config still
+works read-only; only the `PUT` needs the extra permission. Relatedly, if
+the config path is a symlink (a pattern some ConfigMap-mount setups and
+manual atomic-deploy scripts use), an apply's rename REPLACES the symlink
+itself with a regular file - the same rename that lands the new document in
+place cannot also preserve "the path is a symlink pointing elsewhere"; a
+setup that depends on the config path staying a symlink across reloads is
+not compatible with applying through this route. See
+[Applying a new config over the admin API](../getting-started/configuration.md#applying-a-new-config-over-the-admin-api)
+for the full request contract, and its security note on what holding the
+master key implies once this route exists.
+
 ## Shutdown and restarts
 
 What each signal does:

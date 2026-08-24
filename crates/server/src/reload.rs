@@ -167,6 +167,33 @@ pub struct ReloadTargets {
     pub auth_runtime: Option<Arc<crate::auth::AuthRuntime>>,
 }
 
+/// Validate a config document at `path` without swapping anything.
+///
+/// Runs the two checks a reload runs, in the same order: `Config::load`
+/// (parse, merge with `LUMEN_` env vars, validate) and a candidate registry
+/// build. The second is not redundant: a keyless provider missing a
+/// `base_url` passes validation and only fails when the registry is built,
+/// which is why `apply_reload` puts the registry rebuild first.
+///
+/// Used by `PUT /admin/config` to reject a bad document BEFORE it reaches
+/// the real config path, so an invalid apply cannot leave a file behind that
+/// would break the next restart.
+///
+/// # Errors
+///
+/// [`ReloadError::Config`] if the document does not parse or validate;
+/// [`ReloadError::Registry`] if a registry cannot be built from it.
+pub fn validate_candidate(path: &Path) -> Result<(), ReloadError> {
+    let config = Config::load(path)?;
+    // A throwaway client: this runs on an admin route, never the hot path.
+    Registry::build(
+        config.provider_specs(),
+        lumen_providers::http::build_client(),
+        Duration::from_secs(300),
+    )?;
+    Ok(())
+}
+
 /// Re-load `path`, validate it, and (only on success) atomically swap the
 /// routing table, price table, resilience policy and auth knobs. Increments the
 /// success/failure counters. On any error every target is left exactly as it
@@ -260,6 +287,23 @@ fn merge_key_backfill(
 /// a config in several syscalls) into one reload.
 const DEBOUNCE: Duration = Duration::from_millis(250);
 
+/// The directory `spawn_config_reloader` should watch for `path`: the parent
+/// directory when `path` has one, or the current working directory when it
+/// does not (e.g. `lumen --config lumen.toml`, the form used in the
+/// quickstart, has an empty parent). Mirrors `admin::sync_parent_dir`'s
+/// identical fallback for the identical empty-parent case.
+///
+/// Watching `path` itself instead of its directory (the bug this function
+/// fixes) works right up until something replaces the file via rename -
+/// which `PUT /admin/config` and any GitOps sync both do - at which point
+/// the watch dies silently with no error anywhere, because the rename
+/// unlinks the inode the watch was armed on.
+fn watch_target(path: &Path) -> &Path {
+    path.parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map_or_else(|| Path::new("."), |p| p)
+}
+
 /// Spawn the background reloader: reload on `SIGHUP`, on changes to the config
 /// file, and when `trigger` is notified (the admin API pings it after storing a
 /// provider key, so a rotation applies without a restart). The returned task
@@ -277,11 +321,15 @@ pub fn spawn_config_reloader(
 ) -> Result<tokio::task::JoinHandle<()>, notify::Error> {
     use notify::{RecursiveMode, Watcher};
 
-    // Watch the parent directory (editors replace the file via rename, which a
-    // watch on the file itself would miss), but only react to events that touch
-    // the config file - a neighbour file (e.g. the SQLite DB) must not trigger
-    // a reload. Matching by file name avoids canonicalize races when the file
-    // is briefly absent mid-rename.
+    // Watch the parent directory (editors, GitOps syncs and `PUT
+    // /admin/config` all replace the file via rename rather than an
+    // in-place write, which a watch on the file itself would miss - a
+    // rename unlinks the inode a file-level watch is armed on, most visibly
+    // with the inotify backend, silently ending the watch with no error
+    // anywhere), but only react to events that touch the config file - a
+    // neighbour file (e.g. the SQLite DB) must not trigger a reload.
+    // Matching by file name avoids canonicalize races when the file is
+    // briefly absent mid-rename.
     let config_name = path.file_name().map(std::ffi::OsStr::to_owned);
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
@@ -297,11 +345,7 @@ pub fn spawn_config_reloader(
             }
         }
     })?;
-    let watch_target = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .map_or(path.as_path(), |p| p);
-    watcher.watch(watch_target, RecursiveMode::NonRecursive)?;
+    watcher.watch(watch_target(&path), RecursiveMode::NonRecursive)?;
 
     let targets = Arc::new(targets);
     let handle = tokio::spawn(async move {
@@ -880,6 +924,41 @@ mod tests {
             "DB key re-applied so the reload doesn't strip it"
         );
     }
+
+    #[test]
+    fn watch_target_falls_back_to_the_cwd_for_a_bare_filename() {
+        // `lumen --config lumen.toml` (the quickstart form): no directory
+        // component at all.
+        assert_eq!(watch_target(Path::new("lumen.toml")), Path::new("."));
+    }
+
+    #[test]
+    fn watch_target_uses_the_parent_directory_when_present() {
+        assert_eq!(
+            watch_target(Path::new("/etc/lumen/lumen.toml")),
+            Path::new("/etc/lumen")
+        );
+    }
+
+    // The regression test for a bare-filename config path surviving a
+    // rename-replace (`spawn_config_reloader_survives_a_rename_replace_of_a_bare_filename_config`)
+    // used to live here, but it calls `std::env::set_current_dir` and holds
+    // a foreign working directory for the better part of a second. Two
+    // tests in `crates/server/src/config.rs` (`env_var_overrides_file_value`,
+    // `master_key_env_var_is_never_folded_into_the_config`) use
+    // `figment::Jail`, which chdirs internally and serialises only against
+    // OTHER jails via its own private static lock - it has no way to know
+    // about a chdir happening outside of it. Sharing this lib's unit test
+    // binary (and therefore a process and a CWD) with those tests made the
+    // chdir here liable to land in the middle of a jail test's relative-path
+    // `Config::load`, and made this test's CWD-restoring guard liable to
+    // capture a jail's temp directory as "the original CWD" and later
+    // restore the process into a directory that had since been deleted:
+    // a real, if intermittent, source of CI flakiness. It now lives in
+    // `crates/server/tests/reload.rs`, which Cargo builds and runs as its
+    // own process, making that interference structurally impossible instead
+    // of relying on a lock every CWD-touching test would have to remember
+    // to take.
 
     /// A unique temp dir under the OS temp root (no external crate).
     fn tempdir() -> PathBuf {

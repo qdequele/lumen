@@ -46,7 +46,11 @@ impl MasterKey {
             ));
         }
         let mut bytes = [0_u8; 32];
-        for (i, chunk) in trimmed.as_bytes().chunks_exact(2).enumerate() {
+        // `as_chunks::<2>().0` rather than `chunks_exact(2)`: the length check
+        // above already guarantees an even count, so the remainder is empty
+        // and the complete-chunks half is exhaustive. Clippy pedantic requires
+        // this form for a constant chunk size (`chunks_exact_to_as_chunks`).
+        for (i, chunk) in trimmed.as_bytes().as_chunks::<2>().0.iter().enumerate() {
             let hi = hex_val(chunk[0]);
             let lo = hex_val(chunk[1]);
             match (hi, lo) {

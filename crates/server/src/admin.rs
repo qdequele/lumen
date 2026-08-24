@@ -30,6 +30,21 @@
 //!   unset or empty (env keeps precedence when set).
 //! * `GET /admin/usage` - aggregated usage and spend reporting over the
 //!   `usage_log` table (issue #64).
+//! * `GET /admin/usage/export` - cursor-paginated raw `usage_log` rows, for a
+//!   control plane building its own multi-dimensional view (ADR 010).
+//! * `GET /admin/config` - the config file verbatim, plus a BLAKE3 content
+//!   hash to be echoed as `If-Match` on the `PUT` that applies a new one
+//!   (ADR 010). Never a serialisation of the merged in-memory `Config`: that
+//!   would render environment overrides as if they were file content.
+//! * `PUT /admin/config` - apply a new config document (ADR 010). The
+//!   submitted bytes are staged in a temp file next to the real one,
+//!   validated there (parse + registry build), then the current file is
+//!   backed up to `.bak` and the staged file is renamed into place. Requires
+//!   an `If-Match` header carrying the current hash from `GET /admin/config`;
+//!   a stale hash is a 412 (`LM-1004`), a missing header or an invalid
+//!   document is a 400 (`LM-1001`). This is the highest-privilege route in
+//!   the gateway: it can repoint a provider's `base_url` and thereby redirect
+//!   customer traffic.
 //!
 //! Every change is applied to the database AND the in-memory state, so it
 //! takes effect immediately without a restart.
@@ -48,6 +63,8 @@ use lumen_auth::store::{
 };
 use lumen_core::GatewayError;
 use serde::{Deserialize, Serialize};
+use std::io::Write as _;
+use std::sync::Arc;
 
 /// `POST /admin/keys` response: the record plus the one-time plaintext key.
 #[derive(Serialize)]
@@ -627,6 +644,110 @@ pub async fn usage_report(
     }))
 }
 
+/// Default page size for `GET /admin/usage/export`.
+const DEFAULT_EXPORT_LIMIT: u32 = 1_000;
+/// Hard cap on a single export page. A caller asking for more is rejected
+/// rather than silently clamped: a silent clamp reads as "that was the whole
+/// window" and would make a console under-report without any signal.
+const MAX_EXPORT_LIMIT: u32 = 10_000;
+
+/// `GET /admin/usage/export` query parameters. Unknown parameters are
+/// rejected (400 `LM-1001`), so a typo never silently widens an export.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UsageExportParams {
+    /// Window start (inclusive): unix seconds or RFC3339. Default: 24 hours
+    /// before `until`.
+    pub since: Option<String>,
+    /// Window end (inclusive): unix seconds or RFC3339. Default: now.
+    pub until: Option<String>,
+    /// Return rows with an id strictly greater than this. Absent starts at
+    /// the beginning of the window.
+    pub cursor: Option<i64>,
+    /// Page size. Default 1000, hard cap 10000.
+    pub limit: Option<u32>,
+}
+
+/// `GET /admin/usage/export` response.
+#[derive(Debug, Serialize)]
+pub struct UsageExportPage {
+    /// Effective window start, unix seconds (inclusive): either the caller's
+    /// own `since`, or the resolved default. Echoed (like `usage_report`'s
+    /// `since`/`until`) so a caller paginating without explicit bounds can
+    /// pin the window to what the FIRST page actually resolved, by passing
+    /// these two values back on every later page - otherwise `since`/`until`
+    /// default to "24 hours before now" recomputed on every single call, so
+    /// a multi-page export with no explicit window is filtering each page
+    /// against a window that moved forward while it paginated.
+    pub since: i64,
+    /// Effective window end, unix seconds (inclusive). See `since`.
+    pub until: i64,
+    /// The rows of this page, ordered by `id`.
+    pub rows: Vec<lumen_auth::store::UsageRow>,
+    /// Cursor to pass as `cursor` for the next page, or `null` when the
+    /// window is exhausted.
+    pub next_cursor: Option<i64>,
+}
+
+/// Export raw usage rows for a window, paginated by primary key.
+///
+/// Complements `GET /admin/usage`, which aggregates over one dimension at a
+/// time: a control plane building a multi-dimensional view needs the rows
+/// themselves (ADR 010). The rows carry no prompt or response content.
+pub async fn usage_export(
+    State(state): State<AppState>,
+    params: Result<Query<UsageExportParams>, QueryRejection>,
+) -> Result<Json<UsageExportPage>, ApiError> {
+    let Query(params) = params.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
+
+    let limit = params.limit.unwrap_or(DEFAULT_EXPORT_LIMIT);
+    if limit == 0 || limit > MAX_EXPORT_LIMIT {
+        return Err(GatewayError::InvalidRequest(format!(
+            "`limit` must be between 1 and {MAX_EXPORT_LIMIT}"
+        ))
+        .into());
+    }
+
+    // Same helpers `usage_report` uses, so both routes accept identical
+    // time formats: a digit string is unix seconds, anything else RFC3339.
+    let until = match params.until.as_deref() {
+        None => crate::auth::now_unix(),
+        Some(value) => parse_time_param(value).ok_or_else(|| invalid_time("until", value))?,
+    };
+    let since = match params.since.as_deref() {
+        None => until.saturating_sub(DEFAULT_WINDOW_SECS),
+        Some(value) => parse_time_param(value).ok_or_else(|| invalid_time("since", value))?,
+    };
+    if since > until {
+        return Err(
+            GatewayError::InvalidRequest("`since` must not be after `until`".to_owned()).into(),
+        );
+    }
+
+    let auth = runtime(&state)?;
+    let rows = auth
+        .store
+        .usage_export(since, until, params.cursor, i64::from(limit))
+        .await
+        .map_err(|e| internal(&e))?;
+
+    // A short page means the window is exhausted. A full page might be the
+    // last one, in which case the caller gets one empty page: cheap, and far
+    // safer than guessing and truncating an export.
+    let next_cursor = if rows.len() == limit as usize {
+        rows.last().map(|row| row.id)
+    } else {
+        None
+    };
+
+    Ok(Json(UsageExportPage {
+        since,
+        until,
+        rows,
+        next_cursor,
+    }))
+}
+
 fn invalid_time(name: &str, value: &str) -> GatewayError {
     GatewayError::InvalidRequest(format!(
         "invalid `{name}` '{value}': expected unix seconds or an RFC3339 timestamp"
@@ -738,6 +859,415 @@ const fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
     let day_of_year = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1;
     let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
     era * 146_097 + day_of_era - 719_468
+}
+
+// ---- Config read and apply (ADR 010) ----------------------------------------
+
+/// Content hash of a config document: BLAKE3, lowercase hex.
+///
+/// Used as the concurrency token for `PUT /admin/config`. It is a change
+/// detector, not a security boundary.
+#[must_use]
+fn config_hash(bytes: &[u8]) -> String {
+    blake3::hash(bytes).to_hex().to_string()
+}
+
+/// `GET /admin/config` response.
+#[derive(Debug, Serialize)]
+pub struct ConfigDocument {
+    /// The config file's contents, byte for byte.
+    pub config: String,
+    /// BLAKE3 hash of those bytes, to be echoed as `If-Match` on a PUT.
+    pub hash: String,
+}
+
+/// Return the config file verbatim.
+///
+/// Deliberately NOT a serialisation of the in-memory `Config`: `Config::load`
+/// merges the TOML file with `LUMEN_`-prefixed environment variables, so
+/// rendering the merged struct would show environment overrides as if they
+/// were file content, and a subsequent PUT would write them permanently into
+/// the file. The operator must see and edit exactly what is on disk.
+pub async fn get_config(State(state): State<AppState>) -> Result<Json<ConfigDocument>, ApiError> {
+    let path = config_path(&state)?;
+    let bytes = tokio::fs::read(path.as_ref())
+        .await
+        .map_err(|e| GatewayError::Internal(format!("reading config: {e}")))?;
+    let config = String::from_utf8(bytes)
+        .map_err(|_| GatewayError::Internal("config file is not valid UTF-8".to_owned()))?;
+    let hash = config_hash(config.as_bytes());
+    Ok(Json(ConfigDocument { config, hash }))
+}
+
+/// Apply a new config document.
+///
+/// The file stays the source of truth. The sequence is deliberate:
+///
+/// 1. Compare `If-Match` against the current file's hash, so two operators
+///    editing at once cannot silently lose one edit.
+/// 2. Stage the submitted bytes in a temporary file in the SAME directory
+///    (a rename is only atomic within a filesystem).
+/// 3. Validate the staged file. Writing first and validating after would
+///    leave an invalid document on disk that breaks the next SIGHUP or
+///    restart with no visible cause.
+/// 4. Back up the current file, then rename the staged file into place.
+/// 5. Ping the hot-reload trigger.
+///
+/// This route can repoint a provider's `base_url` and thereby redirect
+/// customer traffic. It is the highest-privilege operation in the gateway,
+/// which is why the apply is logged.
+///
+/// # Errors
+///
+/// A 400 (`LM-1001`) when `If-Match` is missing or the document is invalid
+/// TOML or fails registry construction; a 412 (`LM-1004`) when `If-Match`
+/// does not match the current file's hash.
+pub async fn put_config(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    body: String,
+) -> Result<StatusCode, ApiError> {
+    let path = config_path(&state)?;
+
+    let Some(if_match) = headers.get("if-match").and_then(|v| v.to_str().ok()) else {
+        return Err(GatewayError::InvalidRequest(
+            "`If-Match` is required: GET /admin/config first and echo its hash".to_owned(),
+        )
+        .into());
+    };
+    let if_match = if_match.trim_matches('"').to_owned();
+
+    let path_for_blocking = path.clone();
+    let lock = Arc::clone(&state.config_apply_lock);
+    let outcome = tokio::task::spawn_blocking(move || {
+        apply_config_document(&path_for_blocking, &body, &if_match, &lock)
+    })
+    .await
+    .map_err(|e| GatewayError::Internal(format!("config apply task failed: {e}")))?;
+    outcome?;
+
+    if let Some(trigger) = &state.reload_trigger {
+        trigger.notify_one();
+        tracing::info!("config applied through the admin API; hot reload requested");
+    } else {
+        tracing::info!(
+            "config applied through the admin API; no reloader armed, applies at restart"
+        );
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// The blocking half of [`put_config`]: hash check, staged write, validation,
+/// backup and atomic rename. Runs on a blocking thread; never on the runtime.
+///
+/// The whole sequence runs under `lock` (see [`AppState::config_apply_lock`]):
+/// two concurrent `PUT`s must never interleave, or the second could clobber
+/// the first's staged bytes before validation runs, defeating the very
+/// lost-update guarantee `If-Match` exists to provide. A poisoned lock is
+/// surfaced as an internal error rather than silently recovered into: it can
+/// only mean an earlier apply panicked mid-sequence (which the workspace's
+/// no-`unwrap`/`expect`/`panic!` rule should make unreachable in practice),
+/// and building on top of whatever state that left behind is not a risk
+/// worth taking.
+fn apply_config_document(
+    path: &std::path::Path,
+    body: &str,
+    if_match: &str,
+    lock: &std::sync::Mutex<()>,
+) -> Result<(), ApiError> {
+    let _guard = lock.lock().map_err(|_| {
+        ApiError::from(GatewayError::Internal(
+            "config apply lock poisoned by an earlier failed apply".to_owned(),
+        ))
+    })?;
+
+    let current = std::fs::read(path)
+        .map_err(|e| ApiError::from(GatewayError::Internal(format!("reading config: {e}"))))?;
+    let old_hash = config_hash(&current);
+    if old_hash != if_match {
+        // See `describe_rejection`'s doc comment: `ApiError`'s `IntoResponse`
+        // only logs `code`/`status` for a non-5xx response, so without this a
+        // rejected apply (stale `If-Match` included) would leave no trace in
+        // the gateway's own logs at all.
+        tracing::warn!(
+            config_path = %path.display(),
+            current_hash = %old_hash,
+            provided_if_match = %if_match,
+            "config apply rejected: If-Match does not match the current file hash"
+        );
+        return Err(GatewayError::ConfigStale(
+            "config changed since it was read; GET /admin/config and re-apply".to_owned(),
+        )
+        .into());
+    }
+
+    // Unique per call (process id + a monotonic counter), even though `lock`
+    // already serialises every apply within this process: a process that was
+    // killed or crashed mid-apply can leave a stale `.tmp` behind, and a
+    // fixed name would let a later request mistake it for its own staging
+    // file. Same directory as `path` throughout - a rename is only atomic
+    // within one filesystem.
+    let staged = path.with_extension(format!("toml.{}.tmp", unique_suffix()));
+    // Armed BEFORE the file is created, not after the write block: a failing
+    // `write_all` or `sync_all` (a full disk is the realistic trigger) returns
+    // through `?` with the file already created, and a guard armed after the
+    // block would never see it. From here on ANY early return must not leave
+    // the staged file behind, and the guard makes that structural instead of
+    // relying on every future `return Err(..)` to remember its own cleanup:
+    // `commit()` is the only way to suppress the removal, and it is called
+    // exactly once, after the rename that consumes the file. Arming it before
+    // `File::create` costs nothing when creation itself fails, since removing
+    // a path that was never created is ignored.
+    let staging = StagingGuard::new(&staged);
+    {
+        // `File::create` + `write_all` + `sync_all`, not `std::fs::write`:
+        // `sync_all` is the step that actually matters here. `rename` only
+        // makes the NAME change atomic; it says nothing about whether the
+        // bytes behind the old name ever reached disk. On ext4 with delayed
+        // allocation in particular, the rename's metadata can be durable
+        // while the data blocks are not, so a crash shortly after an apply
+        // can leave `path` pointing at a zero-length file - `.bak` still
+        // holds the previous good document, but nothing tells the operator
+        // to reach for it, and `Config::load` refuses to boot on the
+        // corrupt result. Flushing the data before the rename closes that
+        // window. Scoped so the file handle (and its fsync) completes
+        // before `validate_candidate` touches the path.
+        let mut file = std::fs::File::create(&staged)
+            .map_err(|e| ApiError::from(GatewayError::Internal(format!("staging config: {e}"))))?;
+        file.write_all(body.as_bytes())
+            .map_err(|e| ApiError::from(GatewayError::Internal(format!("staging config: {e}"))))?;
+        file.sync_all()
+            .map_err(|e| ApiError::from(GatewayError::Internal(format!("staging config: {e}"))))?;
+    }
+
+    // `File::create` above always creates with mode `0o666 & !umask` -
+    // typically `0644` - regardless of what `path` was actually set to, and
+    // the live file adopts the STAGED file's mode on rename, not the
+    // original's (`std::fs::copy`, used for the `.bak` sibling below, DOES
+    // preserve mode - only this staged-then-renamed file does not). Without
+    // this, a config file an operator hardened to e.g. `0600` would silently
+    // widen to whatever the process umask allows on the very first apply
+    // through this route, exposing base URLs, model topology, `db_path` and
+    // `api_key_env` names to any other local account on a shared host.
+    // Best-effort, like `sync_parent_dir` below: on a filesystem with no
+    // Unix permission model to speak of (CIFS/FAT-style mounts, some FUSE
+    // layers), `chmod` fails not because a real permission would be widened,
+    // but because there was never a permission bit to preserve in the first
+    // place. Refusing the apply over that would turn a config change that
+    // would previously have succeeded into a hard failure for a reason the
+    // operator cannot fix from this side of the API.
+    if let Err(error) = preserve_permissions(path, &staged) {
+        tracing::warn!(
+            %error,
+            path = %path.display(),
+            "failed to preserve the config file's permissions across the apply; \
+             continuing, since a filesystem without a permission model has \
+             nothing to protect"
+        );
+    }
+
+    if let Err(error) = crate::reload::validate_candidate(&staged) {
+        return Err(describe_rejection(path, &error));
+    }
+
+    let backup = path.with_extension("toml.bak");
+    std::fs::copy(path, &backup)
+        .map_err(|e| ApiError::from(GatewayError::Internal(format!("backing up config: {e}"))))?;
+    std::fs::rename(&staged, path)
+        .map_err(|e| ApiError::from(GatewayError::Internal(format!("applying config: {e}"))))?;
+    staging.commit();
+
+    // Fsync the containing directory too: a data-only fsync guarantees the
+    // staged bytes are durable, but says nothing about whether the RENAME
+    // itself (the directory-entry update that gives `path` its new
+    // contents) survived a crash. Best-effort and non-fatal on purpose:
+    // directory fsync is a documented no-op or an outright error on some
+    // platforms (Windows in particular), and the apply has already
+    // succeeded on disk by this point - failing the request over a
+    // durability nicety it cannot control would be worse than logging and
+    // moving on.
+    sync_parent_dir(path);
+
+    // ADR 010 names this the highest-privilege route in the gateway (it can
+    // repoint a provider's `base_url` and thereby redirect customer
+    // traffic), but the gateway itself has no acting identity to log: ADR
+    // 010 decision 4 delegates human identity to the reverse proxy in front
+    // of the console, which keeps its own audit log of who applied what.
+    // What the gateway CAN and does record is the content-level fact of the
+    // change: an incident responder reading gateway logs alone can see that
+    // a config was applied through this API, and, by comparing hashes
+    // against `GET /admin/config` history or backups, tell exactly what
+    // changed. Hashes only, never content - this must never become a vector
+    // for logging secrets or provider topology.
+    tracing::info!(
+        config_path = %path.display(),
+        old_hash = %old_hash,
+        new_hash = %config_hash(body.as_bytes()),
+        "config applied through the admin API"
+    );
+    Ok(())
+}
+
+/// Preserve `source`'s Unix file mode on `target`, best-effort.
+///
+/// `std::fs::File::create` always creates a new file with mode
+/// `0o666 & !umask`, never the mode of any existing file at a neighbouring
+/// path, so staging a config document in a fresh file and renaming it into
+/// place would otherwise silently change the live file's permissions on
+/// every apply. A no-op on non-Unix targets: there is no equivalent
+/// permission-bit model to copy there, and this route already only fsyncs a
+/// parent directory (see [`sync_parent_dir`]) on a best-effort basis
+/// elsewhere on non-Unix platforms.
+///
+/// The caller treats a returned error as best-effort too (log and continue,
+/// exactly like [`sync_parent_dir`]): on a filesystem that implements no
+/// Unix permission model at all (CIFS/FAT-style mounts, some FUSE layers),
+/// `chmod` fails, but there was never a permission to widen, so there is
+/// nothing to protect by refusing the apply. Do not turn this back into a
+/// hard failure; that would reject an apply that would previously have
+/// succeeded, for a condition the operator has no way to fix from the API.
+#[cfg(unix)]
+fn preserve_permissions(source: &std::path::Path, target: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(source)?.permissions().mode();
+    std::fs::set_permissions(target, std::fs::Permissions::from_mode(mode))
+}
+
+/// Non-Unix targets have no permission bits to copy.
+#[cfg(not(unix))]
+fn preserve_permissions(
+    _source: &std::path::Path,
+    _target: &std::path::Path,
+) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// Best-effort fsync of `path`'s containing directory, so a rename into
+/// `path` is durable across a crash, not just present in the page cache.
+/// Never returns an error: see the call site in [`apply_config_document`]
+/// for why a failure here must not fail an apply that already landed.
+fn sync_parent_dir(path: &std::path::Path) {
+    let parent = match path.parent() {
+        // A bare filename (e.g. "lumen.toml", no directory component) has
+        // an empty parent; its containing directory is the CWD.
+        Some(p) if p.as_os_str().is_empty() => std::path::Path::new("."),
+        Some(p) => p,
+        None => return,
+    };
+    if let Err(error) = std::fs::File::open(parent).and_then(|dir| dir.sync_all()) {
+        tracing::warn!(
+            %error,
+            path = %parent.display(),
+            "failed to fsync the config directory after applying a new config; \
+             the rename may not survive a crash even though the apply itself succeeded"
+        );
+    }
+}
+
+/// A process id + monotonic counter suffix, unique within this process's
+/// lifetime. Not a security token - only meant to keep a crash-orphaned
+/// staging file from colliding with a live one; the ordinary case is
+/// serialised entirely by `config_apply_lock`.
+fn unique_suffix() -> String {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{}-{n}", std::process::id())
+}
+
+/// Removes the staged config file on drop, unless [`commit`](Self::commit)
+/// was called first. Exists so every failure path out of
+/// [`apply_config_document`] - validation, backup, or the final rename -
+/// cleans up the staging file without each call site having to remember to.
+struct StagingGuard<'a> {
+    path: &'a std::path::Path,
+    committed: bool,
+}
+
+impl<'a> StagingGuard<'a> {
+    /// Guard `path`, the staging file, which need NOT exist yet: the guard is
+    /// armed before creation so a failed write or fsync cannot leak a
+    /// partially written file, and `Drop` ignores a path that is not there.
+    fn new(path: &'a std::path::Path) -> Self {
+        Self {
+            path,
+            committed: false,
+        }
+    }
+
+    /// Declare the staged file consumed (renamed into place): `Drop` must
+    /// not attempt to remove a path that no longer names the staging file.
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for StagingGuard<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            // Best-effort: the file may already be gone (e.g. a concurrent
+            // cleanup), and there is no client left to report a failure to.
+            let _ = std::fs::remove_file(self.path);
+        }
+    }
+}
+
+/// Turn a `validate_candidate` failure into the client-facing rejection,
+/// without leaking the staged file's filesystem path.
+///
+/// `ConfigError::Parse` and `ConfigError::Validation` both have a `path`
+/// field carrying that path, and their own `Display` (used by `{error}`
+/// below, never by this function) names it - correctly, since that `Display`
+/// is what reaches the log line just below, not the client. This function
+/// instead takes each variant's `message` field alone: `Validation`'s is
+/// hand-written by `Config::validate` and never contained a path to begin
+/// with, and `Parse`'s no longer does either (`describe_figment_error` in
+/// `config.rs` strips figment's own trailing `" in {source} {name}"`, which
+/// is the fragment that used to carry it). `RegistryError`'s variants never
+/// embed a path, so those pass through unchanged.
+///
+/// The full detail - path included - still needs to reach a human somewhere,
+/// since a rejected apply is exactly the kind of thing an operator wants a
+/// record of. It does NOT reach it via `ApiError`'s `IntoResponse`
+/// (`crate::error`): that only logs `code` and `status` for a non-5xx
+/// response, at `debug`, never the message or this error's `Display`. So
+/// this function logs it directly, at `warn`, before scrubbing the message
+/// down to what the client is allowed to see.
+fn describe_rejection(path: &std::path::Path, error: &crate::reload::ReloadError) -> ApiError {
+    tracing::warn!(
+        config_path = %path.display(),
+        error = %error,
+        "config apply rejected"
+    );
+    let message = match error {
+        crate::reload::ReloadError::Config(config_error) => match config_error {
+            crate::config::ConfigError::Parse { message, .. }
+            | crate::config::ConfigError::Validation { message, .. } => message.clone(),
+            // The staged file was just written by this handler; it going
+            // missing before validation runs is not a client mistake to
+            // explain away as a bad document.
+            crate::config::ConfigError::NotFound { .. } => {
+                return GatewayError::Internal(
+                    "staged config file disappeared before it could be validated".to_owned(),
+                )
+                .into();
+            }
+        },
+        crate::reload::ReloadError::Registry(registry_error) => registry_error.to_string(),
+    };
+    GatewayError::InvalidRequest(format!("config rejected: {message}")).into()
+}
+
+/// The config file path this process booted from.
+///
+/// `None` only in tests: `main.rs` always sets it. A 500 is therefore the
+/// honest answer, not a client error, because nothing the caller sent caused
+/// it. `GatewayError` has no `NotFound(String)` variant, and inventing one
+/// for a condition that cannot occur in production would be noise.
+fn config_path(state: &AppState) -> Result<Arc<std::path::PathBuf>, ApiError> {
+    state
+        .config_path
+        .clone()
+        .ok_or_else(|| GatewayError::Internal("no config file backs this server".to_owned()).into())
 }
 
 #[cfg(test)]

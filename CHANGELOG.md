@@ -46,6 +46,20 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ### Added
 
+- `KeyStore::usage_export`: cursor-paginated raw `usage_log` read, ordered by
+  primary key so pages cannot skip or repeat rows while new requests land
+  (ADR 010).
+- `GET /admin/usage/export`: cursor-paginated raw usage rows, so a control
+  plane can build its own multi-dimensional view instead of making one
+  aggregate call per dimension (ADR 010).
+- `GET /admin/config`: returns the config file verbatim with a BLAKE3 content
+  hash. The file, never a re-serialisation of the merged in-memory config, so
+  environment overrides are never written back into it (ADR 010).
+- `PUT /admin/config`: apply a config document remotely. The submitted
+  document is validated in a staging file before an atomic rename, so a
+  rejected apply never touches the live file; `If-Match` guards against two
+  operators losing an edit, and the previous document is kept as `.bak`
+  (ADR 010).
 - **Atomic budget grant routes** - ADR 009 amendment. `POST
   /admin/keys/{id}/grant` and `POST /admin/groups/{id}/grant` take
   `{"amount": <USD>}` and raise `budget_max` as an atomic increment on both
@@ -112,6 +126,71 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ### Fixed
 
+- **h2 bumped to 0.4.18 for RUSTSEC-2026-0258**: h2 accepted and queued empty
+  DATA frames without limit, so a stream that was never drained could grow
+  memory without bound or panic on length overflow. h2 is a transitive
+  dependency through hyper; the advisory is patched in 0.4.16.
+- `PUT /admin/config` no longer leaves a partially written staging file behind
+  when the write or its fsync fails (a full disk is the realistic trigger). The
+  cleanup guard is now armed before the file is created rather than after the
+  write completes, so the failure window it was meant to cover is actually
+  covered.
+
+- **`PUT /admin/config` no longer leaks the staged file's path on a TOML
+  parse rejection.** `ConfigError::Parse`'s message was `figment::Error`'s
+  own `Display` verbatim, which appends `" in {source} {name}"` naming the
+  file figment actually read - the staged `.tmp` file during a `PUT`, never
+  anything the operator wrote. `Config::load` now reconstructs the message
+  structurally from `figment::Error`'s public fields instead, dropping that
+  trailing fragment while keeping the offending line/column/field. A prior
+  fix scrubbed the (hand-written, path-free) validation-failure message but
+  missed this one, since the regression test that would have caught it
+  happened to exercise validation rather than a genuine parse error.
+- **A rejected `PUT /admin/config` apply now leaves a real trace in the
+  gateway's own logs.** A code comment claimed `ApiError`'s `IntoResponse`
+  "logs `%err` regardless of what is returned to the client"; it does not -
+  a non-5xx response only logs `code`/`status`, at `debug`. A rejection
+  (stale `If-Match`, invalid TOML, or a registry-build failure) now logs
+  the full detail, staged path included, at `warn`, from the config-apply
+  path only (no change to `ApiError`'s general 4xx logging).
+- **`PUT /admin/config` no longer widens the config file's Unix
+  permissions.** Staging always creates the temp file at `0o666 & !umask`,
+  and the live file inherited that mode on rename rather than the
+  original's - an operator-hardened `0600` config became `0644` (or looser)
+  on the first successful apply. The staged file's mode is now copied from
+  the live file before the rename (a no-op on non-Unix targets).
+- **Hot reload could die silently after the first `PUT /admin/config` when
+  the gateway was started with a bare config filename** (`lumen --config
+  lumen.toml`, no directory component - the quickstart's own form). The
+  file watcher fell back to watching the file itself in that case; a later
+  rename-replace (what `PUT /admin/config` and any GitOps sync both do)
+  unlinks the watched inode, most visibly under inotify, while the boot log
+  still claimed hot reload was armed. It now falls back to watching the
+  current directory instead, mirroring the identical fallback already used
+  for fsyncing the config directory after an apply.
+- **`GET /admin/usage/export` now echoes its effective `since`/`until`**,
+  matching `GET /admin/usage`. Without this, a console paginating a backlog
+  with no explicit window was filtering each page against a "24 hours
+  before now" window recomputed independently on every call - a window that
+  moves while it pages through, corresponding to no nameable range.
+- **ADR 010's audit-logging claim corrected to match what the gateway
+  actually records.** The ADR stated every `PUT /admin/config` call "is
+  audit-logged with the acting identity"; the gateway has no acting identity
+  to log (ADR decision 4 delegates that to the console, behind the reverse
+  proxy), and previously logged one identity-free line with no other detail.
+  A successful apply now logs the old and new content hashes at `info`
+  (hashes only, never content); rejections are covered by the warn-log fix
+  above. The ADR sentence now describes this instead of the identity claim.
+- **Documentation: `PUT /admin/config` operator guidance filled in.**
+  `configuration.md` now warns that a `204` does not mean every field took
+  effect without a restart (names the restart-only set), and adds a
+  security note that `api_key_env` accepting any environment variable name
+  means the master key is now equivalent to filesystem write access on the
+  gateway host plus read access to its entire process environment, once
+  remote config apply is enabled - mitigations: a separate master key per
+  gateway, a private-network-only admin surface, and the read-only config
+  mount opt-out. `deployment.md` cross-references it and notes that an
+  atomic apply replaces a symlinked config path with a regular file.
 - **`.dockerignore` keeps local secrets and non-build content out of the
   image build context.** `.env` files, `config.local.toml`, SQLite
   artifacts, `fuzz/`, mdBook output, `examples/` and `monitoring/` are now
@@ -124,6 +203,17 @@ All notable changes to LUMEN are documented here. The format is based on
   `git grep` over all tracked files (binaries skipped) minus explicit
   exclusions: `Cargo.lock`, `LICENSE`, and the verbatim third-party output
   under `bench/results/`.
+- **`PUT /admin/config` no longer fails an otherwise-valid apply just
+  because the config file lives on a filesystem with no Unix permission
+  model** (CIFS/FAT-style mounts, some FUSE layers). Preserving the live
+  file's permissions across the staged-file rename is now best-effort,
+  matching how the same route already treats the parent-directory fsync: a
+  `chmod` failure is logged at `warn` and the apply proceeds, rather than
+  being turned into a 500. On a filesystem with no permission bits, there
+  was never a permission to widen, so there is nothing to protect by
+  refusing the apply. The Unix happy path (an operator-hardened `0600`
+  config surviving an apply) is unchanged and stays covered by its own
+  test.
 
 ## [0.2.0] - 2026-07-21
 

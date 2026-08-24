@@ -622,6 +622,10 @@ fn run(config: Config, config_path: PathBuf) -> anyhow::Result<()> {
             auth_knobs,
             auth_runtime: auth_runtime.clone(),
         };
+        // Cloned before the move into `arm_config_reload`: the admin config
+        // routes need the same path the reloader watches, so a `PUT` rewrites
+        // exactly the file a SIGHUP or file-watch reload would re-read.
+        let config_path_for_state = config_path.clone();
         let reload_armed = arm_config_reload(config_path, reload_targets, &reload_trigger);
 
         let health = boot_health(&config, &client, &resilience_metrics);
@@ -637,7 +641,8 @@ fn run(config: Config, config_path: PathBuf) -> anyhow::Result<()> {
             .with_health(health)
             .with_body_limit(config.server.body_limit)
             .with_image_fetch(image_fetch)
-            .with_token_counter(token_counter);
+            .with_token_counter(token_counter)
+            .with_config_path(config_path_for_state);
         // Expose the reload trigger only when the reloader is actually armed.
         if reload_armed {
             state = state.with_reload_trigger(Arc::clone(&reload_trigger));

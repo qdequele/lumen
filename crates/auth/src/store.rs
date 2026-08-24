@@ -338,6 +338,58 @@ pub struct UsageAggregate {
     pub cost: f64,
 }
 
+/// One raw `usage_log` row, for cursor-paginated export (ADR 010).
+///
+/// Carries no prompt or response content: the table has no such columns by
+/// construction (sovereignty pillar). `metadata` is the flat JSON object the
+/// caller attached through the ADR 002 request-metadata header, and is the
+/// only caller-supplied field here.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, sqlx::FromRow)]
+pub struct UsageRow {
+    /// Primary key, and the pagination cursor: rows are only ever appended.
+    pub id: i64,
+    /// The virtual key that made the call; `None` when auth was disabled.
+    pub key_id: Option<String>,
+    /// The key's budget group at accounting begin (ADR 009).
+    pub group_id: Option<String>,
+    /// Client-facing model id the client requested.
+    pub model: String,
+    /// Model that actually served the request (differs when a fallback fired).
+    pub model_used: String,
+    /// Provider instance that served the request.
+    pub provider: String,
+    /// `chat` | `embed` | `rerank`.
+    pub capability: String,
+    /// Input/prompt tokens.
+    pub tokens_in: i64,
+    /// Output/completion tokens.
+    pub tokens_out: i64,
+    /// Prompt tokens served from cache, when the upstream reported it.
+    pub cached_tokens: Option<i64>,
+    /// Reasoning tokens billed within the completion, when reported.
+    pub reasoning_tokens: Option<i64>,
+    /// Prompt tokens written to cache, when reported.
+    pub cache_write_tokens: Option<i64>,
+    /// Rerank search units, where the provider bills in them.
+    pub search_units: Option<i64>,
+    /// Number of media items in the request.
+    pub media_count: i64,
+    /// Total decoded media bytes in the request.
+    pub media_bytes: i64,
+    /// Whether the token counts were locally estimated (ADR 003).
+    pub estimated: bool,
+    /// Cost in USD derived from the configured price table.
+    pub cost: f64,
+    /// End-to-end latency of the call in milliseconds.
+    pub latency_ms: i64,
+    /// HTTP status returned to the client.
+    pub status: i64,
+    /// ADR 002 metadata as a compact JSON object, when supplied.
+    pub metadata: Option<String>,
+    /// Unix seconds.
+    pub ts: i64,
+}
+
 /// Handle to the SQLite database (pooled; cheap to clone).
 #[derive(Debug, Clone)]
 pub struct KeyStore {
@@ -969,6 +1021,45 @@ impl KeyStore {
             });
         }
         Ok(groups)
+    }
+
+    /// Export raw usage rows in `[since, until]`, ordered by `id`, starting
+    /// strictly after `cursor` (`None` starts at the beginning of the window).
+    ///
+    /// Pagination is by primary key rather than `LIMIT`/`OFFSET` on purpose:
+    /// `usage_log` is append-only, so a cursor scan cannot skip or repeat a
+    /// row when new requests land mid-export, which an offset scan would.
+    ///
+    /// `limit` bounds the page; the caller is responsible for capping it.
+    ///
+    /// # Errors
+    ///
+    /// [`AuthError::Db`] if the query fails.
+    pub async fn usage_export(
+        &self,
+        since: i64,
+        until: i64,
+        cursor: Option<i64>,
+        limit: i64,
+    ) -> Result<Vec<UsageRow>, AuthError> {
+        let rows = sqlx::query_as::<_, UsageRow>(
+            "SELECT id, key_id, group_id, model, model_used, provider, capability, \
+             tokens_in, tokens_out, cached_tokens, reasoning_tokens, cache_write_tokens, \
+             search_units, media_count, media_bytes, estimated, cost, latency_ms, \
+             status, metadata, ts \
+             FROM usage_log \
+             WHERE ts >= ? AND ts <= ? AND id > ? \
+             ORDER BY id \
+             LIMIT ?",
+        )
+        .bind(since)
+        .bind(until)
+        // AUTOINCREMENT ids start at 1, so 0 is a safe "from the beginning".
+        .bind(cursor.unwrap_or(0))
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
     }
 
     /// Number of usage rows (tests and diagnostics).
