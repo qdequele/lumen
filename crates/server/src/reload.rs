@@ -287,6 +287,23 @@ fn merge_key_backfill(
 /// a config in several syscalls) into one reload.
 const DEBOUNCE: Duration = Duration::from_millis(250);
 
+/// The directory `spawn_config_reloader` should watch for `path`: the parent
+/// directory when `path` has one, or the current working directory when it
+/// does not (e.g. `lumen --config lumen.toml`, the form used in the
+/// quickstart, has an empty parent). Mirrors `admin::sync_parent_dir`'s
+/// identical fallback for the identical empty-parent case.
+///
+/// Watching `path` itself instead of its directory (the bug this function
+/// fixes) works right up until something replaces the file via rename -
+/// which `PUT /admin/config` and any GitOps sync both do - at which point
+/// the watch dies silently with no error anywhere, because the rename
+/// unlinks the inode the watch was armed on.
+fn watch_target(path: &Path) -> &Path {
+    path.parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map_or_else(|| Path::new("."), |p| p)
+}
+
 /// Spawn the background reloader: reload on `SIGHUP`, on changes to the config
 /// file, and when `trigger` is notified (the admin API pings it after storing a
 /// provider key, so a rotation applies without a restart). The returned task
@@ -304,11 +321,15 @@ pub fn spawn_config_reloader(
 ) -> Result<tokio::task::JoinHandle<()>, notify::Error> {
     use notify::{RecursiveMode, Watcher};
 
-    // Watch the parent directory (editors replace the file via rename, which a
-    // watch on the file itself would miss), but only react to events that touch
-    // the config file - a neighbour file (e.g. the SQLite DB) must not trigger
-    // a reload. Matching by file name avoids canonicalize races when the file
-    // is briefly absent mid-rename.
+    // Watch the parent directory (editors, GitOps syncs and `PUT
+    // /admin/config` all replace the file via rename rather than an
+    // in-place write, which a watch on the file itself would miss - a
+    // rename unlinks the inode a file-level watch is armed on, most visibly
+    // with the inotify backend, silently ending the watch with no error
+    // anywhere), but only react to events that touch the config file - a
+    // neighbour file (e.g. the SQLite DB) must not trigger a reload.
+    // Matching by file name avoids canonicalize races when the file is
+    // briefly absent mid-rename.
     let config_name = path.file_name().map(std::ffi::OsStr::to_owned);
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
@@ -324,11 +345,7 @@ pub fn spawn_config_reloader(
             }
         }
     })?;
-    let watch_target = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .map_or(path.as_path(), |p| p);
-    watcher.watch(watch_target, RecursiveMode::NonRecursive)?;
+    watcher.watch(watch_target(&path), RecursiveMode::NonRecursive)?;
 
     let targets = Arc::new(targets);
     let handle = tokio::spawn(async move {
@@ -906,6 +923,88 @@ mod tests {
             Some("db-key"),
             "DB key re-applied so the reload doesn't strip it"
         );
+    }
+
+    #[test]
+    fn watch_target_falls_back_to_the_cwd_for_a_bare_filename() {
+        // `lumen --config lumen.toml` (the quickstart form): no directory
+        // component at all.
+        assert_eq!(watch_target(Path::new("lumen.toml")), Path::new("."));
+    }
+
+    #[test]
+    fn watch_target_uses_the_parent_directory_when_present() {
+        assert_eq!(
+            watch_target(Path::new("/etc/lumen/lumen.toml")),
+            Path::new("/etc/lumen")
+        );
+    }
+
+    /// Regression test: a config path with NO directory component used to
+    /// make `spawn_config_reloader` watch the FILE's own inode rather than
+    /// its containing directory. Replacing the file via rename - exactly
+    /// what `PUT /admin/config` and any GitOps sync do - unlinks that inode,
+    /// silently ending the watch with no error anywhere; only a directory
+    /// watch (filtered to the config's own file name) survives a rename.
+    /// This also exercises that the existing file-name filter still scopes
+    /// correctly once the watch target is a directory instead of the file
+    /// itself - it was already written generically, but this is the first
+    /// test to actually feed it directory-level events for a bare filename.
+    #[tokio::test]
+    async fn spawn_config_reloader_survives_a_rename_replace_of_a_bare_filename_config() {
+        // Restores the original CWD on drop (including on panic/early
+        // return), so this test cannot leave the process's working
+        // directory changed for whatever runs after it.
+        struct RestoreCwd(PathBuf);
+        impl Drop for RestoreCwd {
+            fn drop(&mut self) {
+                let _ = std::env::set_current_dir(&self.0);
+            }
+        }
+
+        let dir = tempdir();
+        let config_path = dir.join("lumen.toml");
+        std::fs::write(&config_path, ONE_MODEL).expect("write config");
+        let registry = registry_from(&config_path);
+
+        // A BARE filename (no directory component) is passed to
+        // `spawn_config_reloader` below - the exact shape that triggered the
+        // bug - and it, like the reload path in general, re-resolves that
+        // relative path against the process CWD on every single reload, not
+        // just once at startup. The CWD must therefore stay pointed at
+        // `dir` for this whole test, not just while arming the watcher; a
+        // real gateway process never changes its CWD after boot, so this is
+        // a property of the test rig, not of the code under test.
+        let _restore = RestoreCwd(std::env::current_dir().expect("read cwd"));
+        std::env::set_current_dir(&dir).expect("chdir into tempdir");
+
+        let metrics = ReloadMetrics::register(&Metrics::new()).unwrap();
+        let t = targets(Arc::clone(&registry), metrics);
+        let trigger = Arc::new(Notify::new());
+        let handle =
+            spawn_config_reloader(PathBuf::from("lumen.toml"), t, trigger).expect("spawn reloader");
+
+        // Give the watcher a moment to be fully armed before the replace.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Replace the file via RENAME, not an in-place write: the operation
+        // that unlinks a file-level watch.
+        let staged = dir.join("lumen.toml.staged");
+        std::fs::write(&staged, TWO_MODELS).expect("write staged");
+        std::fs::rename(&staged, &config_path).expect("rename into place");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if registry.embedding_route("embed").is_some() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "hot reload did not fire after a rename-replace of a bare-filename config"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        handle.abort();
     }
 
     /// A unique temp dir under the OS temp root (no external crate).
