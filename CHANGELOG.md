@@ -6,6 +6,14 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-08-25
+
+v0.3.0 was published without binaries (see below) and, releases being
+immutable, could not be repaired: its release was deleted and GitHub retires
+the tag name of a deleted immutable release permanently. v0.3.1 is therefore
+the first installable 0.3 release; it contains everything in 0.3.0 plus the
+pipeline fix.
+
 ### Fixed
 
 - **Release pipeline: draft-first asset uploads.** GitHub's immutable releases
@@ -1472,7 +1480,8 @@ This closes every remaining streaming criterion:
 - Docs: error-code reference (`docs/errors.md`), ADR 001 (crate/lib naming),
   and this changelog.
 
-[Unreleased]: https://github.com/qdequele/lumen/compare/v0.3.0...HEAD
-[0.3.0]: https://github.com/qdequele/lumen/compare/v0.2.0...v0.3.0
+[Unreleased]: https://github.com/qdequele/lumen/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/qdequele/lumen/compare/v0.2.0...v0.3.1
+[0.3.0]: https://github.com/qdequele/lumen/compare/v0.2.0...e99e750
 [0.2.0]: https://github.com/qdequele/lumen/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/qdequele/lumen/releases/tag/v0.1.0
