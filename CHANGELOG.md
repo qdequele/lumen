@@ -6,6 +6,8 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-25
+
 ### Changed
 
 - **Dependency major bumps: rand 0.10, aes-gcm 0.11, jsonwebtoken 11, notify 8,
@@ -1459,6 +1461,7 @@ This closes every remaining streaming criterion:
 - Docs: error-code reference (`docs/errors.md`), ADR 001 (crate/lib naming),
   and this changelog.
 
-[Unreleased]: https://github.com/qdequele/lumen/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/qdequele/lumen/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/qdequele/lumen/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/qdequele/lumen/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/qdequele/lumen/releases/tag/v0.1.0
