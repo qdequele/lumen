@@ -21,7 +21,22 @@ Two layers, because "added latency" has two very different scales:
    LiteLLM both proxying the *same* zero-latency mock upstream, driven by k6.
    Added latency = gateway percentile − direct-to-mock percentile. This is the
    number a user feels; it includes one extra localhost hop. Provided as a
-   reproducible harness (see `bench/README.md`).
+   reproducible harness (see `bench/README.md`). Reported at two marks per
+   target: total request time (`http_req_duration`) and **time to first byte**
+   (`http_req_waiting`: request fully written → first response byte).
+
+3. **Streaming time to first bit (`cargo bench -p server --bench
+   stream_ttfb`)** - the one latency k6 cannot see: how much later a client
+   receives the *first SSE chunk* of a `stream: true` response because the
+   gateway sits in the middle. Real sockets, full LUMEN stack (axum → router →
+   OpenAI-kind provider), instant mock upstream; the same request is timed
+   direct-to-upstream and via-gateway, and the difference between the two
+   distributions is the gateway's added streaming TTFB. The companion
+   integration test
+   (`tests/chat.rs::first_stream_chunk_reaches_the_client_before_the_upstream_finishes`)
+   proves the first frame is forwarded while the upstream is verifiably still
+   mid-stream (gated tail, no timing races), so this bench measures eager
+   forwarding, not buffer-then-flush.
 
 ### Environment of the recorded run
 
@@ -46,6 +61,27 @@ serialize). Streaming passthrough adds even less per chunk: it forwards upstream
 `Bytes` verbatim with no per-chunk serde (ADR 004), so the per-chunk cost is a
 bounded copy plus the `[DONE]`/heartbeat scan, not a deserialize.
 
+### Streaming time to first bit (measured here)
+
+Recorded with `cargo bench -p server --bench stream_ttfb` in the same
+environment as above: the span from dispatching a `stream: true` chat request
+to reading the first bytes of the SSE body, over real loopback sockets,
+against an instant mock upstream.
+
+| Bench | Median | 95 % CI |
+|---|---|---|
+| `direct_to_upstream` (client → mock, no gateway) | **71.6 µs** | 70.6 – 71.9 µs |
+| `via_gateway` (client → full LUMEN stack → same mock) | **168.4 µs** | 158.0 – 175.9 µs |
+
+**Added streaming TTFB ≈ 97 µs median (~0.1 ms)**: the extra wait before a
+client sees the first streamed token because LUMEN sits in the middle. That
+buys one full extra HTTP hop (accept, parse, route, provider request build,
+upstream connect-pooled call, headers + first-frame forward), measured end to
+end, and still lands an order of magnitude inside the < 1 ms pillar. The
+companion integration test (methodology point 3 above) guarantees the number
+means what it says: the first frame is forwarded while the upstream is still
+mid-stream, never buffered until end-of-stream.
+
 ### Idle memory & binary size (measured here)
 
 | | |
@@ -69,6 +105,22 @@ committed at [`bench/results/20260715T231135Z/`](../bench/results/20260715T23113
 | direct (mock, no gateway) | 6.91 ms | 204.99 ms | 836.43 ms | 1191.7 |
 | lumen | 9.44 ms | 36.57 ms | 220.57 ms | 2733.5 |
 | litellm v1.92.0 | 323.75 ms | 656.67 ms | 6490.29 ms | 111.3 |
+
+Time to first byte for the same run (`http_req_waiting`; derived from the
+committed raw `*.summary.json` of that run - the metric was always recorded,
+its report table was added later, so the run's own `report.md` predates it):
+
+| Target | TTFB p50 | TTFB p95 | TTFB p99 |
+|---|---|---|---|
+| direct (mock, no gateway) | 6.81 ms | 204.91 ms | 836.42 ms |
+| lumen | 9.38 ms | 36.34 ms | 220.17 ms |
+| litellm v1.92.0 | 323.71 ms | 655.39 ms | 6490.04 ms |
+
+TTFB tracks total duration almost exactly in this scenario (non-streaming,
+tiny mock body: once the first byte is out, the rest follows within
+microseconds), so it carries the same caveat and the same conclusion: LUMEN
+delays the start of the response by ~2.6 ms at p50 on this noisy host,
+LiteLLM by ~317 ms.
 
 RAM under load (`docker stats`, sampled mid-run): **lumen ~7.6 MB**,
 **litellm ~1.03 GB**.
@@ -114,6 +166,9 @@ particular (noisy, shared) host's numbers, not a hardware-independent claim.
 ```bash
 # In-process overhead (no Docker needed):
 cargo bench -p server --bench gateway_overhead
+
+# Streaming time to first bit, direct vs via-gateway (no Docker needed):
+cargo bench -p server --bench stream_ttfb
 
 # Idle RAM + binary size:
 cargo build --release -p server --bin lumen
