@@ -434,6 +434,163 @@ One encoding note: an RFC3339 `+HH:MM` offset contains a `+`, which in a
 query string means a space - percent-encode it as `%2B`
 (`until=2026-07-15T03:00:00%2B02:00`), or use `Z`/unix seconds.
 
+## Outbound webhooks for budget events
+
+Everything above is *pull*: a control plane asks LUMEN what happened.
+Webhooks are the *push* half (ADR 011), and they exist for one problem in
+particular. A hard budget refuses with `402` `LM-4001` the instant the
+pool empties - so a prepaid-credits backend that only polls will always
+learn about the exhaustion *after* the customer has already been refused.
+A `budget.threshold` event at 80% is the trigger for an auto-recharge that
+lands as a `POST /admin/keys/{id}/grant` before that ever happens.
+
+**Absent by default.** With no `[webhooks]` block LUMEN makes no outbound
+call to anything but its configured providers. Enabling it is a deliberate
+choice, and it requires `auth.enabled = true` (every event describes a
+virtual key or a budget group); the gateway refuses to boot otherwise.
+
+```toml
+[webhooks]
+url = "https://backend.example.com/lumen/events"
+signing_key_env = "LUMEN_WEBHOOK_SECRET"
+events = ["budget.threshold", "budget.exhausted", "key.disabled"]
+thresholds = [50, 80, 95]
+channel_capacity = 1024
+timeout_ms = 5000
+max_attempts = 5
+retry_base_ms = 500
+```
+
+### The events
+
+| Event | Fires when | What a backend does with it |
+|---|---|---|
+| `budget.threshold` | `budget_spent / budget_max` crosses a configured percentage | Charge the customer, then `grant` |
+| `budget.exhausted` | The first `LM-4001` refusal since the subject last had headroom | Alert, upsell, or suspend cleanly |
+| `key.disabled` | A `PATCH` disabled a key that was enabled | Mark the key inactive in your registry |
+| `key.rotated` | `POST /admin/keys/{id}/rotate` succeeded | Invalidate any cached key material |
+| `key.deleted` | `DELETE /admin/keys/{id}` tombstoned the key | Drop the key from your registry |
+
+Both budget events fire for **keys and for budget groups**; the payload's
+`scope` says which, and `subject_id` is the id you would pass to the
+matching `grant` route.
+
+### Edge-triggering
+
+A threshold fires **once per budget epoch**, not once per request past it.
+Cross 80% on Tuesday and every request for the rest of the week is silent.
+A grant that buys headroom re-arms the thresholds it drops below: top a
+$100 key that has spent $85 up to $300, and 85/300 = 28% re-arms 50% and
+80% for the new epoch. A cap *reduction* does not un-fire what already
+fired.
+
+`budget.exhausted` works the same way: the first refusal signals, the next
+thousand do not, and a grant re-arms it.
+
+One consequence worth planning for: a restart re-arms from the **last
+flushed** spend, so an event can legitimately fire twice if the crash
+window (`auth.flush_interval_ms`, 10 s by default) swallowed the settle
+that first crossed it.
+
+### The payload
+
+```json
+{
+  "id": "evt_9f2c1b7ad04e4a1c8f3b6e2d5a90c714",
+  "event": "budget.threshold",
+  "scope": "key",
+  "subject_id": "3b14b24efc6dc198000cdf5506ddea6d",
+  "subject_name": "team-search",
+  "budget_max": 100.0,
+  "budget_spent": 82.0,
+  "threshold": 80,
+  "ts": 1787691194
+}
+```
+
+Accounting facts only. Never a plaintext key, never client metadata, never
+prompt or response content - the same no-content construction as
+`usage_log`. `budget_max` is omitted for an uncapped subject, and
+`threshold` only appears on `budget.threshold`.
+
+### Verifying a delivery
+
+Every POST carries four headers:
+
+| Header | Meaning |
+|---|---|
+| `x-lumen-signature` | Hex HMAC-SHA256 of the **exact** request body |
+| `x-lumen-event-id` | Unique per *event*, not per attempt |
+| `x-lumen-event` | The event kind, so you can route without parsing |
+| `x-lumen-timestamp` | The event's own `ts`, which is inside the signed body |
+
+Verify against the raw bytes you received, before any JSON round-trip:
+
+```python
+import hashlib, hmac
+
+def verify(raw_body: bytes, header: str, secret: str) -> bool:
+    expected = hmac.new(secret.encode(), raw_body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, header)
+```
+
+The secret comes from the environment (`signing_key_env` names the
+variable, never holds the value), exactly like a provider key. A named but
+unset variable is a **boot error**: a billing integration silently
+downgraded to unsigned deliveries is worse than a refused start. Omitting
+`signing_key_env` entirely is allowed - deliveries then carry no signature
+- and logs a startup warning.
+
+### Delivery guarantees, and what they are not
+
+**At-least-once while the process lives.** A retryable failure (5xx, 429,
+408, or a network error) backs off exponentially with jitter up to
+`max_attempts`, reusing the same `x-lumen-event-id` every time. Any other
+non-2xx is treated as permanent and not retried - the receiver has said
+this event will never be accepted. Nothing is persisted, so a restart
+forgets undelivered events.
+
+**Receivers must be idempotent on `x-lumen-event-id`.** Retries, and the
+post-restart re-fire described above, both re-send the same id.
+
+**Not an accounting system.** A full queue drops events rather than slow a
+request down, and a receiver that stays down past the retry budget loses
+them. `GET /admin/usage/export` remains the source of truth: reconcile
+against it on a schedule and treat webhooks purely as a latency
+optimisation over polling.
+
+**Never on the request path.** Detection is a compare on the atomic budget
+settle that already happens per request; delivery is a non-blocking
+`try_send` into a bounded queue drained by a background task. A dead
+receiver cannot add a millisecond to a customer's request.
+
+### Watching it work
+
+| Metric | Meaning |
+|---|---|
+| `lumen_webhook_queued_total` | Events accepted into the queue |
+| `lumen_webhook_sent_total` | Events the receiver acknowledged with a 2xx |
+| `lumen_webhook_dropped_total` | Events dropped by a full queue - raise `channel_capacity`, or fix the receiver |
+| `lumen_webhook_retries_total` | Failed attempts that were retried |
+| `lumen_webhook_dead_total` | Events abandoned (retries exhausted, or a permanent rejection) |
+| `lumen_webhook_delivery_seconds` | Wall time of a single delivery attempt |
+
+Sustained `dropped` or `dead` means your billing loop is running blind:
+fall back to the export route until the receiver is healthy again.
+
+### What a reload can change
+
+`url`, `events`, `thresholds`, `timeout_ms`, `max_attempts` and
+`retry_base_ms` are swapped by a hot reload, through the same queue and
+sender task - so a retarget never loses what is already queued. Removing
+the `[webhooks]` block stops emission entirely.
+
+Restart-only: `channel_capacity` (the bounded queue is built once),
+`signing_key_env` (a running process cannot observe a changed environment
+variable), and *adding* a `[webhooks]` block to a process that booted
+without one - there is no queue or sender task to attach to. LUMEN warns
+in all three cases rather than pretending the change took effect.
+
 ## Operator notes
 
 Per [`SECURITY.md`](https://github.com/qdequele/lumen/blob/main/SECURITY.md),

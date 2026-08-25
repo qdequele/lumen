@@ -56,6 +56,79 @@ usage_flush_ms = 2000             # …or at least this often
 retention_days = 30               # purge usage_log rows older than this
 
 # ---------------------------------------------------------------------------
+# Outbound budget webhooks (ADR 011) - ABSENT by default.
+#
+# This whole section is commented out on purpose. With no [webhooks] block the
+# gateway makes no outbound call to anything but its configured providers.
+# Uncommenting it makes LUMEN POST to the URL below: that is a deliberate
+# choice, not a default.
+#
+# What it is for: a billing control plane that sells prepaid credit needs to
+# hear that a budget is nearly gone BEFORE it hits zero, because a hard budget
+# refuses with 402 LM-4001 the moment the pool empties. A `budget.threshold`
+# event at 80% is the trigger for a Stripe-style auto-recharge, which lands as
+# a POST /admin/keys/{id}/grant before the customer ever sees a refusal.
+#
+# What it sends: accounting facts only - event id and kind, the key or group id
+# and name, budget_max, budget_spent, the crossed threshold, a timestamp. Never
+# a plaintext key, never client metadata, never prompt or response content.
+#
+# Requires auth.enabled = true (every event describes a virtual key or a budget
+# group); LUMEN refuses to boot otherwise.
+#
+# Detection costs nothing on the request path: it is a compare against the
+# armed thresholds on the atomic budget settle that already happens per
+# request. Delivery goes through a bounded queue drained by a background task -
+# a full queue DROPS events and counts them in lumen_webhook_dropped_total
+# rather than slowing a request down. Webhooks are a signal, not an accounting
+# system: GET /admin/usage/export stays the source of truth, and a receiver
+# must reconcile against it.
+#
+# Each POST carries:
+#   x-lumen-signature   hex HMAC-SHA256 of the exact request body
+#   x-lumen-event-id    unique per EVENT, not per attempt - dedupe on it
+#   x-lumen-event       the event kind, for routing without parsing
+#   x-lumen-timestamp   the event's own `ts` (also inside the signed body)
+#
+# Delivery is at-least-once while the process lives: retries reuse the same
+# event id, and a crash can re-fire an event after a restart (up to
+# auth.flush_interval_ms of accounting can be lost). Receivers MUST be
+# idempotent on x-lumen-event-id.
+#
+# Hot reload covers `url`, `events`, `thresholds`, `timeout_ms`,
+# `max_attempts` and `retry_base_ms`. Restart-only: `channel_capacity` (the
+# queue is built once), `signing_key_env` (a running process cannot observe a
+# changed env var), and adding the block to a process that booted without it.
+# ---------------------------------------------------------------------------
+# [webhooks]
+# url = "https://backend.example.com/lumen/events"
+#
+# # Name of the env var holding the HMAC-SHA256 signing secret - never the
+# # secret itself, exactly like api_key_env. Named but unset/empty is a boot
+# # error; omitted entirely means UNSIGNED deliveries (only defensible on a
+# # trusted network) and logs a startup warning.
+# signing_key_env = "LUMEN_WEBHOOK_SECRET"
+#
+# # Which events to deliver. Default: ["budget.threshold", "budget.exhausted"].
+# #   budget.threshold  - spend crossed a configured percentage of the cap
+# #   budget.exhausted  - the first LM-4001 refusal since the subject last had
+# #                       headroom
+# #   key.disabled      - a PATCH disabled a key (edge-triggered)
+# #   key.rotated       - a key's secret was rotated (id and budget preserved)
+# #   key.deleted       - a key was soft-deleted and stops authenticating
+# events = ["budget.threshold", "budget.exhausted", "key.disabled"]
+#
+# # Percent-of-budget thresholds, each fired ONCE per budget epoch - not once
+# # per request past it. A grant that buys headroom re-arms the thresholds it
+# # drops below, so the next epoch signals again.
+# thresholds = [50, 80, 95]
+#
+# channel_capacity = 1024   # bounded queue; full = drop + counter, never backpressure
+# timeout_ms = 5000         # per-attempt request timeout
+# max_attempts = 5          # total attempts per event, including the first
+# retry_base_ms = 500       # pre-jitter backoff after the first failure, doubling
+
+# ---------------------------------------------------------------------------
 # Telemetry (ADR 002).
 #
 # Clients may send an `x-lumen-metadata` header (alias: `cf-aig-metadata`)

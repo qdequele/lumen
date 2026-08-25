@@ -24,6 +24,7 @@ pub mod resilience;
 pub mod routes;
 pub mod state;
 pub mod tokenizer;
+pub mod webhooks;
 
 pub use app::build_app;
 pub use config::{Config, ConfigError};

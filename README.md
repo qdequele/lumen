@@ -219,6 +219,18 @@ chars), it adds **virtual keys**, **hard budgets** and **RPM/TPM quotas**, all
 enforced **in memory before any upstream call**, so a rejected request never
 spends. See [Keys, quotas & budgets](https://qdequele.github.io/lumen/operations/keys-budgets.html).
 
+### Budget webhooks (ADR 011)
+
+Absent by default - with no `[webhooks]` block the gateway calls nothing but its
+providers. Enable it and a billing backend gets pushed `budget.threshold`,
+`budget.exhausted` and key-lifecycle events, so it can auto-recharge through
+`POST /admin/keys/{id}/grant` **before** a customer hits a 402 instead of
+polling for it. Detection is a compare on the budget settle that already
+happens per request; delivery is a bounded queue and a background sender with
+HMAC-signed, idempotent, at-least-once semantics. Payloads carry accounting
+facts only - never a key, never prompt or response content. See
+[Outbound webhooks for budget events](https://qdequele.github.io/lumen/operations/keys-budgets.html#outbound-webhooks-for-budget-events).
+
 ### Resilience
 
 Survives flaky upstreams without becoming flaky itself: **retries** with
@@ -240,7 +252,8 @@ and [Metrics & dashboards](https://qdequele.github.io/lumen/operations/metrics.h
 
 `SIGHUP`, a file-watch, or an admin provider-key rotation triggers a reload: the
 new config is validated, then the provider registry, price table, resilience
-policy and the runtime-safe `[auth]` knobs are atomically swapped; in-flight
+policy, the runtime-safe `[auth]` knobs and the `[webhooks]` delivery policy
+are atomically swapped; in-flight
 requests are unaffected. An invalid config is **rejected** - the old config
 keeps serving. See
 [Deployment](https://qdequele.github.io/lumen/operations/deployment.html).

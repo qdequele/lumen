@@ -16,10 +16,16 @@
 //!
 //! Money is tracked in integer **micro-USD** so the atomics stay exact; the
 //! DB speaks USD floats at the edges ([`usd_to_micro`] / [`micro_to_usd`]).
+//!
+//! When outbound webhooks are configured (ADR 011) each entry also carries the
+//! edge-trigger state for its budget signals; detection is a compare on the
+//! settle that already happens per request, and delivery is decoupled through
+//! a bounded queue (see [`events`](crate::events)).
 
+use crate::events::{BudgetSignals, EventKind, EventScope, SignalCell, SignalState, Subject};
 use crate::key::hash_key;
 use crate::store::{GroupRecord, VirtualKeyRecord};
-use arc_swap::ArcSwapOption;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use dashmap::DashMap;
 use lumen_core::{BudgetScope, GatewayError, QuotaKind};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
@@ -83,21 +89,32 @@ fn reserve_micro(spent: &AtomicI64, max_bound: i64, reserve: i64) -> bool {
 #[derive(Debug)]
 pub struct GroupEntry {
     id: String,
+    /// Human-readable label, carried so a webhook payload can name the pool
+    /// without a database read. Swappable: an admin PATCH can rename it.
+    name: ArcSwap<String>,
     /// Shared hard budget in micro-USD; [`UNLIMITED`] = none.
     budget_max_micro: AtomicI64,
     /// Committed + currently-reserved pool spend in micro-USD.
     spent_micro: AtomicI64,
     /// Pool spend changed since the last flush.
     dirty: AtomicBool,
+    /// The live webhook signalling policy, shared with every other entry;
+    /// `None` (the default) means no `[webhooks]` block and no detection work.
+    signals: Arc<SignalCell>,
+    /// Edge-trigger state for this pool's budget signals (ADR 011).
+    signal_state: SignalState,
 }
 
 impl GroupEntry {
-    fn from_record(record: &GroupRecord) -> Self {
+    fn from_record(record: &GroupRecord, signals: Arc<SignalCell>) -> Self {
         Self {
             id: record.id.clone(),
+            name: ArcSwap::from_pointee(record.name.clone()),
             budget_max_micro: AtomicI64::new(record.budget_max.map_or(UNLIMITED, usd_to_micro)),
             spent_micro: AtomicI64::new(usd_to_micro(record.budget_spent)),
             dirty: AtomicBool::new(false),
+            signals,
+            signal_state: SignalState::default(),
         }
     }
 
@@ -105,16 +122,50 @@ impl GroupEntry {
     /// accrued pool spend is deliberately NOT overwritten - memory is the
     /// source of truth for spend after boot, exactly like keys.
     fn apply_limits(&self, record: &GroupRecord) {
+        self.name.store(Arc::new(record.name.clone()));
         self.budget_max_micro.store(
             record.budget_max.map_or(UNLIMITED, usd_to_micro),
             Ordering::SeqCst,
         );
+        // A changed cap starts a new budget epoch (ADR 011 §1).
+        self.rearm_signals();
     }
 
     /// Atomically raise the pool's cap by `amount_micro` (admin grant). A
     /// capless (unlimited) pool stays unlimited - see [`grant_cap`].
     fn grant(&self, amount_micro: i64) {
         grant_cap(&self.budget_max_micro, amount_micro);
+        self.rearm_signals();
+    }
+
+    /// Run `f` with this pool's live signalling policy and event subject, or
+    /// do nothing when webhooks are off. The name and budget numbers are read
+    /// under one snapshot so an event can never mix a stale name with fresh
+    /// figures.
+    fn with_signals(&self, f: impl FnOnce(&BudgetSignals, &SignalState, &Subject<'_>)) {
+        // Borrowed guard, not `load_full`: see `KeyEntry::with_signals`.
+        let guard = self.signals.load();
+        let Some(signals) = guard.as_ref() else {
+            return;
+        };
+        let name = self.name.load();
+        let max = self.budget_max_micro.load(Ordering::SeqCst);
+        let subject = Subject {
+            scope: EventScope::Group,
+            id: &self.id,
+            name: name.as_str(),
+            max_micro: (max != UNLIMITED).then_some(max),
+            spent_micro: self.spent_micro.load(Ordering::SeqCst),
+        };
+        f(signals, &self.signal_state, &subject);
+    }
+
+    /// Re-arm the pool's budget signals against the current cap (a cap change,
+    /// or a newly installed policy).
+    fn rearm_signals(&self) {
+        self.with_signals(|signals, state, subject| {
+            state.rearm(signals.thresholds(), subject);
+        });
     }
 
     /// The group's opaque id (the `budget_groups.id` column).
@@ -155,10 +206,18 @@ pub struct KeyEntry {
     tpm_window: AtomicU64,
     /// Spend changed since the last flush.
     dirty: AtomicBool,
+    /// Human-readable label, carried so a webhook payload can name the key
+    /// without a database read. Swappable: an admin PATCH can rename it.
+    name: ArcSwap<String>,
+    /// The live webhook signalling policy, shared with every other entry;
+    /// `None` (the default) means no `[webhooks]` block and no detection work.
+    signals: Arc<SignalCell>,
+    /// Edge-trigger state for this key's budget signals (ADR 011).
+    signal_state: SignalState,
 }
 
 impl KeyEntry {
-    fn from_record(record: &VirtualKeyRecord) -> Self {
+    fn from_record(record: &VirtualKeyRecord, signals: Arc<SignalCell>) -> Self {
         let entry = Self {
             id: record.id.clone(),
             group: ArcSwapOption::empty(),
@@ -171,6 +230,9 @@ impl KeyEntry {
             rpm_window: AtomicU64::new(0),
             tpm_window: AtomicU64::new(0),
             dirty: AtomicBool::new(false),
+            name: ArcSwap::from_pointee(record.name.clone()),
+            signals,
+            signal_state: SignalState::default(),
         };
         entry.apply_limits(record);
         entry
@@ -194,6 +256,7 @@ impl KeyEntry {
     /// accrued spend is deliberately NOT overwritten - memory is the source
     /// of truth for spend after boot.
     fn apply_limits(&self, record: &VirtualKeyRecord) {
+        self.name.store(Arc::new(record.name.clone()));
         self.budget_max_micro.store(
             record.budget_max.map_or(UNLIMITED, usd_to_micro),
             Ordering::SeqCst,
@@ -205,6 +268,8 @@ impl KeyEntry {
         self.expires_at
             .store(record.expires_at.unwrap_or(UNLIMITED), Ordering::SeqCst);
         self.disabled.store(record.disabled, Ordering::SeqCst);
+        // A changed cap starts a new budget epoch (ADR 011 §1).
+        self.rearm_signals();
     }
 
     /// The key's opaque id (the `virtual_keys.id` column).
@@ -219,10 +284,60 @@ impl KeyEntry {
         self.spent_micro.load(Ordering::SeqCst)
     }
 
+    /// Whether the key is currently disabled. Read by the admin API to
+    /// edge-trigger the `key.disabled` webhook: a PATCH that leaves an
+    /// already-disabled key disabled is not a state change and must not
+    /// re-notify the billing backend (ADR 011 §1).
+    #[must_use]
+    pub fn is_disabled(&self) -> bool {
+        self.disabled.load(Ordering::SeqCst)
+    }
+
     /// Atomically raise the key's cap by `amount_micro` (admin grant). A
     /// capless (unlimited) key stays capless - see [`grant_cap`].
     fn grant(&self, amount_micro: i64) {
         grant_cap(&self.budget_max_micro, amount_micro);
+        self.rearm_signals();
+    }
+
+    /// Run `f` with this key's live signalling policy and event subject, or do
+    /// nothing when webhooks are off (one pointer load on the settle path).
+    /// The name and budget numbers are read under one snapshot so an event can
+    /// never mix a stale name with fresh figures.
+    fn with_signals(&self, f: impl FnOnce(&BudgetSignals, &SignalState, &Subject<'_>)) {
+        // `load` (a borrowed guard), not `load_full`: the common case is that
+        // webhooks are off, and even when they are on there is no reason to
+        // bump a refcount for a value used entirely within this call.
+        let guard = self.signals.load();
+        let Some(signals) = guard.as_ref() else {
+            return;
+        };
+        let name = self.name.load();
+        let max = self.budget_max_micro.load(Ordering::SeqCst);
+        let subject = Subject {
+            scope: EventScope::Key,
+            id: &self.id,
+            name: name.as_str(),
+            max_micro: (max != UNLIMITED).then_some(max),
+            spent_micro: self.spent_micro.load(Ordering::SeqCst),
+        };
+        f(signals, &self.signal_state, &subject);
+    }
+
+    /// Re-arm the key's budget signals against the current cap (a cap change,
+    /// or a newly installed policy).
+    fn rearm_signals(&self) {
+        self.with_signals(|signals, state, subject| {
+            state.rearm(signals.thresholds(), subject);
+        });
+    }
+
+    /// Emit one administrative lifecycle event (`key.disabled` / `key.rotated`
+    /// / `key.deleted`) for this key. A no-op when webhooks are off or the
+    /// kind is not enabled; the caller decides when the state change happened,
+    /// since each admin action IS the edge (ADR 011 §1).
+    pub fn signal_lifecycle(&self, kind: EventKind) {
+        self.with_signals(|signals, _, subject| signals.emit(kind, subject));
     }
 
     fn usable(&self, now: i64) -> bool {
@@ -294,6 +409,10 @@ impl KeyEntry {
         let key_max = self.budget_max_micro.load(Ordering::SeqCst);
         if !reserve_micro(&self.spent_micro, key_max, reserve) {
             unwind_windows(self);
+            // First LM-4001 since this key last had headroom: signal the
+            // billing backend (ADR 011 §1). Edge-triggered, so a key that
+            // keeps being refused does not flood the queue.
+            self.with_signals(|signals, state, subject| state.on_refusal(signals, subject));
             return Err(GatewayError::BudgetExceeded {
                 scope: BudgetScope::Key,
             });
@@ -315,6 +434,7 @@ impl KeyEntry {
                 // correct (mirrors `Reservation::drop`).
                 self.dirty.store(true, Ordering::SeqCst);
                 unwind_windows(self);
+                group.with_signals(|signals, state, subject| state.on_refusal(signals, subject));
                 return Err(GatewayError::BudgetExceeded {
                     scope: BudgetScope::Group,
                 });
@@ -390,6 +510,17 @@ impl Reservation {
         }
         self.entry.dirty.store(true, Ordering::SeqCst);
         self.settled = true;
+
+        // Budget-threshold detection (ADR 011 §2), on the settle that has just
+        // moved the spend. Off entirely when no `[webhooks]` block is
+        // configured; when it is, a crossing is a compare plus a non-blocking
+        // `try_send` - never a network call and never a database write on the
+        // request path.
+        self.entry
+            .with_signals(|signals, state, subject| state.on_settle(signals, subject));
+        if let Some(group) = &self.group {
+            group.with_signals(|signals, state, subject| state.on_settle(signals, subject));
+        }
     }
 }
 
@@ -421,6 +552,10 @@ pub struct AuthState {
     by_hash: DashMap<String, Arc<KeyEntry>>,
     by_id: DashMap<String, Arc<KeyEntry>>,
     groups: DashMap<String, Arc<GroupEntry>>,
+    /// The one webhook signalling cell every entry shares (ADR 011). `None`
+    /// (the default) = no `[webhooks]` block: entries do no detection work at
+    /// all. Installed and swapped through [`set_signals`](Self::set_signals).
+    signals: Arc<SignalCell>,
 }
 
 impl AuthState {
@@ -437,6 +572,56 @@ impl AuthState {
             state.upsert(hash, &record);
         }
         state
+    }
+
+    /// Install (or clear, with `None`) the live webhook signalling policy and
+    /// re-arm every live entry against it.
+    ///
+    /// Re-arming matters twice. At boot it stops a key already past a
+    /// threshold from re-firing that threshold on its first settle - the
+    /// budget it was flushed with is the epoch it is already in. On a hot
+    /// reload that changes `thresholds`, it arms the new list against current
+    /// spend instead of replaying every threshold below it.
+    ///
+    /// The queue behind the policy is created once and reused, so the sender
+    /// task keeps the receiver it was spawned with.
+    pub fn set_signals(&self, signals: Option<Arc<BudgetSignals>>) {
+        self.signals.store(signals);
+        for group in &self.groups {
+            group.rearm_signals();
+        }
+        for entry in &self.by_id {
+            entry.rearm_signals();
+        }
+    }
+
+    /// The live signalling policy, for callers that emit events of their own
+    /// (the admin API's lifecycle events); `None` when webhooks are off.
+    #[must_use]
+    pub fn signals(&self) -> Option<Arc<BudgetSignals>> {
+        self.signals.load_full()
+    }
+
+    /// Whether a live key is currently disabled; `None` when the id is not
+    /// live. Read by the admin API to edge-trigger `key.disabled`.
+    #[must_use]
+    pub fn key_disabled(&self, id: &str) -> Option<bool> {
+        self.by_id.get(id).map(|entry| entry.is_disabled())
+    }
+
+    /// Emit one administrative lifecycle event for a live key (ADR 011 §1).
+    /// A no-op - returning `false` - when the id is not live, so an admin
+    /// action on a key this process never loaded cannot announce a state
+    /// change that did not happen here. Also a no-op when webhooks are off or
+    /// the kind is not enabled.
+    pub fn signal_key_lifecycle(&self, id: &str, kind: EventKind) -> bool {
+        match self.by_id.get(id) {
+            Some(entry) => {
+                entry.signal_lifecycle(kind);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Resolve a record's `group_id` to the live group entry. A dangling id
@@ -488,7 +673,7 @@ impl AuthState {
                 existing.get().set_group(group);
             }
             dashmap::Entry::Vacant(slot) => {
-                let entry = Arc::new(KeyEntry::from_record(record));
+                let entry = Arc::new(KeyEntry::from_record(record, Arc::clone(&self.signals)));
                 entry.set_group(group);
                 self.by_hash.insert(hash, Arc::clone(&entry));
                 slot.insert(entry);
@@ -547,7 +732,10 @@ impl AuthState {
         match self.groups.entry(record.id.clone()) {
             dashmap::Entry::Occupied(existing) => existing.get().apply_limits(record),
             dashmap::Entry::Vacant(slot) => {
-                slot.insert(Arc::new(GroupEntry::from_record(record)));
+                slot.insert(Arc::new(GroupEntry::from_record(
+                    record,
+                    Arc::clone(&self.signals),
+                )));
             }
         }
     }

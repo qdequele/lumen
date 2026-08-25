@@ -13,6 +13,7 @@ use figment::{
     providers::{Env, Format, Toml},
     Figment,
 };
+use lumen_auth::events::EventKind;
 use lumen_core::Capability;
 use lumen_providers::{ModelSpec, ProviderKind, ProviderSpec};
 use lumen_telemetry::logging::LogFormat;
@@ -48,6 +49,150 @@ pub struct Config {
     /// Local token-estimation strategy (ADR 003). Default: the byte heuristic.
     #[serde(default)]
     pub tokenizer: TokenizerConfig,
+    /// Outbound webhooks for budget events (ADR 011). Absent by default:
+    /// with no `[webhooks]` block the gateway makes no outbound call to
+    /// anything but the configured providers.
+    #[serde(default)]
+    pub webhooks: Option<WebhooksConfig>,
+}
+
+/// Outbound webhooks for key and group budget events (ADR 011).
+///
+/// Strictly opt-in: the whole section is absent by default, and absent means
+/// the gateway calls nothing but its providers (sovereignty pillar). When it
+/// is present the gateway POSTs accounting facts (ids, names, budget figures)
+/// to `url`; never a plaintext key, never request metadata, never prompt or
+/// response content.
+///
+/// `channel_capacity` is structural (the bounded queue is built once at boot)
+/// and so is the presence of the block itself; `url`, `events`, `thresholds`,
+/// `timeout_ms`, `max_attempts` and `retry_base_ms` are re-read on a hot
+/// reload. The signing secret comes from the process environment, which a
+/// running process cannot change, so it too is read once at boot.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebhooksConfig {
+    /// Receiver endpoint. One receiver in v1; a backend that needs fan-out
+    /// does it itself.
+    pub url: String,
+    /// Name of the environment variable holding the HMAC-SHA256 signing
+    /// secret - the same indirection provider keys use, so no secret is ever
+    /// written into a config file. Unset means unsigned deliveries, which is
+    /// only defensible on a trusted network; the boot log says so loudly.
+    #[serde(default)]
+    pub signing_key_env: Option<String>,
+    /// Which event kinds to deliver.
+    #[serde(default = "default_webhook_events")]
+    pub events: Vec<EventKind>,
+    /// Percent-of-budget thresholds for `budget.threshold`, each fired once
+    /// per budget epoch. Sorted and deduplicated when the policy is built.
+    #[serde(default = "default_webhook_thresholds")]
+    pub thresholds: Vec<u8>,
+    /// Bounded queue capacity. A full queue DROPS events and counts them
+    /// (`lumen_webhook_dropped_total`) rather than slowing a request down.
+    #[serde(default = "default_webhook_channel_capacity")]
+    pub channel_capacity: usize,
+    /// Per-attempt request timeout in ms.
+    #[serde(default = "default_webhook_timeout_ms")]
+    pub timeout_ms: u64,
+    /// Total delivery attempts per event, including the first (`1` = no
+    /// retries).
+    #[serde(default = "default_webhook_max_attempts")]
+    pub max_attempts: u32,
+    /// Base backoff delay in ms: the pre-jitter wait after the first failed
+    /// attempt, doubling per attempt.
+    #[serde(default = "default_webhook_retry_base_ms")]
+    pub retry_base_ms: u64,
+}
+
+impl Default for WebhooksConfig {
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            signing_key_env: None,
+            events: default_webhook_events(),
+            thresholds: default_webhook_thresholds(),
+            channel_capacity: default_webhook_channel_capacity(),
+            timeout_ms: default_webhook_timeout_ms(),
+            max_attempts: default_webhook_max_attempts(),
+            retry_base_ms: default_webhook_retry_base_ms(),
+        }
+    }
+}
+
+impl WebhooksConfig {
+    /// Validate the block. Called only when the block is present, so every
+    /// rule here is unconditional.
+    fn validate(&self, err: &impl Fn(String) -> ConfigError) -> Result<(), ConfigError> {
+        let url = self.url.trim();
+        if url.is_empty() {
+            return Err(err("webhooks.url must not be empty".to_owned()));
+        }
+        if url != self.url {
+            return Err(err(
+                "webhooks.url must not have leading or trailing whitespace".to_owned(),
+            ));
+        }
+        if !(url.starts_with("http://") || url.starts_with("https://")) {
+            return Err(err(
+                "webhooks.url must be an http:// or https:// URL".to_owned()
+            ));
+        }
+        if let Some(var) = &self.signing_key_env {
+            if var.trim().is_empty() || var.trim() != var {
+                return Err(err(
+                    "webhooks.signing_key_env must be a non-blank env var name with no \
+                     surrounding whitespace"
+                        .to_owned(),
+                ));
+            }
+            // A `LUMEN_`-prefixed name is folded into the config overlay
+            // unless it is excluded by name (see `secret_env_keys`), and a
+            // `__` in it would be read as a nested config key that no
+            // exclusion can match. Reject the shape instead of booting into a
+            // confusing "unknown field" error.
+            if var.starts_with("LUMEN_") && var.contains("__") {
+                return Err(err(format!(
+                    "webhooks.signing_key_env '{var}' must not contain '__': LUMEN_-prefixed \
+                     variables are parsed as nested config keys on '__'"
+                )));
+            }
+        }
+        if self.events.is_empty() {
+            return Err(err(
+                "webhooks.events must list at least one event kind (remove the [webhooks] \
+                 block to disable webhooks entirely)"
+                    .to_owned(),
+            ));
+        }
+        if self.events.contains(&EventKind::BudgetThreshold) {
+            if self.thresholds.is_empty() {
+                return Err(err(
+                    "webhooks.thresholds must not be empty when 'budget.threshold' is \
+                     enabled"
+                        .to_owned(),
+                ));
+            }
+            if let Some(bad) = self.thresholds.iter().find(|t| **t == 0 || **t > 100) {
+                return Err(err(format!(
+                    "webhooks.thresholds must be percentages in 1..=100 (found {bad})"
+                )));
+            }
+        }
+        if self.channel_capacity == 0 {
+            return Err(err("webhooks.channel_capacity must not be 0".to_owned()));
+        }
+        for (field, value) in [
+            ("webhooks.timeout_ms", self.timeout_ms),
+            ("webhooks.max_attempts", u64::from(self.max_attempts)),
+            ("webhooks.retry_base_ms", self.retry_base_ms),
+        ] {
+            if value == 0 {
+                return Err(err(format!("{field} must not be 0")));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Opt-in accurate tokenizer (ADR 003). The estimation fallback (used only when
@@ -568,6 +713,24 @@ const fn default_usage_flush_ms() -> u64 {
 const fn default_retention_days() -> u32 {
     30
 }
+fn default_webhook_events() -> Vec<EventKind> {
+    vec![EventKind::BudgetThreshold, EventKind::BudgetExhausted]
+}
+fn default_webhook_thresholds() -> Vec<u8> {
+    vec![50, 80, 95]
+}
+const fn default_webhook_channel_capacity() -> usize {
+    1_024
+}
+const fn default_webhook_timeout_ms() -> u64 {
+    5_000
+}
+const fn default_webhook_max_attempts() -> u32 {
+    5
+}
+const fn default_webhook_retry_base_ms() -> u64 {
+    500
+}
 const fn default_retry_max_attempts() -> u32 {
     3
 }
@@ -678,6 +841,48 @@ fn describe_figment_error(error: &figment::Error) -> String {
         .join("\n")
 }
 
+/// The `LUMEN_`-prefixed environment variables that are process **secrets**,
+/// not config fields, and so must be excluded from figment's env overlay.
+///
+/// `Config` denies unknown fields, so a `LUMEN_`-prefixed variable that does
+/// not name a config key makes every load fail - `--check-config` and real
+/// boots alike - with an "unknown field" parse error. Two such variables
+/// exist:
+///
+/// * `LUMEN_MASTER_KEY`, read by `boot_auth_stack`, whose name is fixed.
+/// * The webhook signing secret (ADR 011), whose name is **not** fixed: the
+///   operator chooses it in `webhooks.signing_key_env`, and the ADR's own
+///   example names it `LUMEN_WEBHOOK_SECRET`. It is discovered here by peeking
+///   at the TOML file alone: a permissive parse of that single key, with no
+///   env overlay and no validation, so a malformed file still produces the
+///   real error from the full load rather than one from this peek.
+///
+/// Only the exact variable named in config is excluded, so a typo elsewhere in
+/// the `LUMEN_*` namespace is still caught. A name containing `__` is not
+/// excluded (figment would read it as a nested key); config validation rejects
+/// that shape outright.
+fn secret_env_keys(path: &Path) -> Vec<String> {
+    /// Just enough of the config to find the signing variable's name.
+    #[derive(Deserialize)]
+    struct Peek {
+        webhooks: Option<PeekWebhooks>,
+    }
+    #[derive(Deserialize)]
+    struct PeekWebhooks {
+        signing_key_env: Option<String>,
+    }
+
+    let mut keys = vec!["master_key".to_owned()];
+    if let Ok(peek) = Figment::new().merge(Toml::file(path)).extract::<Peek>() {
+        if let Some(var) = peek.webhooks.and_then(|w| w.signing_key_env) {
+            if let Some(suffix) = var.strip_prefix("LUMEN_") {
+                keys.push(suffix.to_lowercase());
+            }
+        }
+    }
+    keys
+}
+
 impl Config {
     /// Load and validate configuration from `path`, overlaid with `LUMEN_*`
     /// environment variables.
@@ -689,18 +894,14 @@ impl Config {
         if !path.exists() {
             return Err(ConfigError::NotFound { path: label });
         }
-        let figment = Figment::new().merge(Toml::file(path)).merge(
-            Env::prefixed("LUMEN_")
-                // `LUMEN_MASTER_KEY` is a secret read directly from the
-                // process environment by `boot_auth_stack` (main.rs), never
-                // a config field. `Config` denies unknown fields, so without
-                // this exclusion setting the var (required whenever
-                // `auth.enabled = true`) makes every load - including
-                // `--check-config` and real boots - fail with an
-                // "unknown field: found `master_key`" parse error.
-                .ignore(&["master_key"])
-                .split("__"),
-        );
+        // Secrets that live in `LUMEN_`-prefixed variables are read directly
+        // from the process environment, never through the config, and must be
+        // kept out of the figment overlay - see [`secret_env_keys`].
+        let secrets = secret_env_keys(path);
+        let ignored: Vec<&str> = secrets.iter().map(String::as_str).collect();
+        let figment = Figment::new()
+            .merge(Toml::file(path))
+            .merge(Env::prefixed("LUMEN_").ignore(&ignored).split("__"));
         Self::from_figment(&figment, &label)
     }
 
@@ -750,6 +951,20 @@ impl Config {
             if self.auth.retention_days == 0 {
                 return Err(err("auth.retention_days must not be 0".to_owned()));
             }
+        }
+
+        if let Some(webhooks) = &self.webhooks {
+            // Every event kind is about a virtual key or a budget group, so
+            // the block is meaningless - and silently inert - without auth.
+            // Say so at boot rather than shipping a dead integration.
+            if !self.auth.enabled {
+                return Err(err(
+                    "[webhooks] requires auth.enabled = true: every budget event describes a \
+                     virtual key or a budget group"
+                        .to_owned(),
+                ));
+            }
+            webhooks.validate(&err)?;
         }
 
         self.telemetry.validate(path_label)?;
@@ -967,6 +1182,299 @@ mod tests {
     fn load_str(s: &str) -> Result<Config, ConfigError> {
         let figment = Figment::new().merge(Toml::string(s));
         Config::from_figment(&figment, "test.toml")
+    }
+
+    // ---- Outbound budget webhooks (ADR 011) --------------------------------
+
+    /// An `[auth]` section webhooks can legally hang off, plus one provider.
+    const AUTH_ON: &str = r#"
+        [auth]
+        enabled = true
+
+        [[providers]]
+        name = "openai-main"
+        kind = "openai"
+
+        [[providers.models]]
+        id = "gpt-4o"
+        capabilities = ["chat"]
+    "#;
+
+    fn with_webhooks(block: &str) -> Result<Config, ConfigError> {
+        load_str(&format!("{AUTH_ON}\n[webhooks]\n{block}"))
+    }
+
+    #[test]
+    fn a_lumen_prefixed_signing_env_var_is_never_folded_into_the_config() {
+        // ADR 011's own example names the secret LUMEN_WEBHOOK_SECRET, which
+        // sits inside figment's `LUMEN_` overlay namespace. Without excluding
+        // it by name, setting the very variable the config asks for made every
+        // load fail with "unknown field: found `webhook_secret`" - a gateway
+        // that refuses to boot the moment webhooks are actually configured.
+        #[allow(clippy::result_large_err)]
+        figment::Jail::expect_with(|jail| {
+            jail.create_file(
+                "config.toml",
+                &format!(
+                    "{AUTH_ON}\n[webhooks]\nurl = \"https://b.example/e\"\n\
+                     signing_key_env = \"LUMEN_WEBHOOK_SECRET\"\n"
+                ),
+            )?;
+            jail.set_env("LUMEN_WEBHOOK_SECRET", "whsec-do-not-fold-me");
+            jail.set_env("LUMEN_MASTER_KEY", "a".repeat(64));
+
+            let cfg = Config::load(Path::new("config.toml")).expect("must load");
+            let hooks = cfg.webhooks.as_ref().expect("block present");
+            // The NAME survives; the value never enters the config at all.
+            assert_eq!(
+                hooks.signing_key_env.as_deref(),
+                Some("LUMEN_WEBHOOK_SECRET")
+            );
+            let rendered = format!("{cfg:?}");
+            assert!(!rendered.contains("whsec-do-not-fold-me"), "{rendered}");
+            // Sanity: the rest of the env-override mechanism still works.
+            jail.set_env("LUMEN_SERVER__PORT", "9191");
+            let cfg = Config::load(Path::new("config.toml")).expect("must load");
+            assert_eq!(cfg.server.port, 9191);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn only_the_configured_signing_var_is_excluded_from_the_overlay() {
+        // The exclusion is by exact name, so an unrelated LUMEN_ typo is still
+        // caught rather than silently swallowed.
+        #[allow(clippy::result_large_err)]
+        figment::Jail::expect_with(|jail| {
+            jail.create_file(
+                "config.toml",
+                &format!(
+                    "{AUTH_ON}\n[webhooks]\nurl = \"https://b.example/e\"\n\
+                     signing_key_env = \"LUMEN_WEBHOOK_SECRET\"\n"
+                ),
+            )?;
+            jail.set_env("LUMEN_WEBHOOK_SECRET", "whsec-ok");
+            jail.set_env("LUMEN_SERVERR__PORT", "9191");
+            let err = Config::load(Path::new("config.toml")).unwrap_err();
+            assert!(matches!(err, ConfigError::Parse { .. }), "{err:?}");
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn a_lumen_prefixed_signing_var_containing_a_double_underscore_is_rejected() {
+        // figment splits LUMEN_ variables into nested keys on `__`, which no
+        // by-name exclusion can match - so the shape is refused at validation
+        // instead of producing a baffling "unknown field" at boot.
+        let err = with_webhooks(
+            "url = \"https://b.example/e\"\nsigning_key_env = \"LUMEN_WEBHOOK__SECRET\"",
+        )
+        .unwrap_err();
+        let ConfigError::Validation { message, .. } = err else {
+            panic!("expected a validation error");
+        };
+        assert!(message.contains("must not contain '__'"), "{message}");
+
+        // A non-LUMEN_ name may contain anything: it never enters the overlay.
+        assert!(with_webhooks(
+            "url = \"https://b.example/e\"\nsigning_key_env = \"MY_APP__SECRET\""
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn no_webhooks_block_means_no_webhooks() {
+        // The sovereignty default: absent, not merely disabled.
+        assert!(load_str(VALID).unwrap().webhooks.is_none());
+        assert!(load_str("").unwrap().webhooks.is_none());
+    }
+
+    #[test]
+    fn a_webhooks_block_parses_with_its_documented_defaults() {
+        let cfg = with_webhooks(r#"url = "https://backend.example.com/lumen/events""#).unwrap();
+        let hooks = cfg.webhooks.expect("block present");
+        assert_eq!(hooks.url, "https://backend.example.com/lumen/events");
+        assert_eq!(hooks.signing_key_env, None);
+        assert_eq!(
+            hooks.events,
+            [EventKind::BudgetThreshold, EventKind::BudgetExhausted]
+        );
+        assert_eq!(hooks.thresholds, [50, 80, 95]);
+        assert_eq!(hooks.channel_capacity, 1_024);
+        assert_eq!(hooks.timeout_ms, 5_000);
+        assert_eq!(hooks.max_attempts, 5);
+        assert_eq!(hooks.retry_base_ms, 500);
+    }
+
+    #[test]
+    fn every_event_kind_is_addressable_by_its_dotted_name() {
+        let cfg = with_webhooks(
+            r#"
+            url = "https://b.example/e"
+            events = ["budget.threshold", "budget.exhausted", "key.disabled", "key.rotated", "key.deleted"]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.webhooks.expect("block present").events, EventKind::ALL);
+    }
+
+    #[test]
+    fn an_unknown_event_kind_is_rejected() {
+        let err = with_webhooks(
+            r#"
+            url = "https://b.example/e"
+            events = ["budget.almost"]
+            "#,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ConfigError::Parse { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn webhooks_require_auth_to_be_enabled() {
+        // Every event describes a key or a group, so the block is inert
+        // without auth - say so at boot instead of shipping a dead hook.
+        let err = load_str("[webhooks]\nurl = \"https://b.example/e\"\n").unwrap_err();
+        let ConfigError::Validation { message, .. } = err else {
+            panic!("expected a validation error");
+        };
+        assert!(message.contains("auth.enabled"), "{message}");
+    }
+
+    #[test]
+    fn a_webhook_url_must_be_a_non_blank_http_url() {
+        for (block, expected) in [
+            ("url = \"\"", "must not be empty"),
+            ("url = \" https://b.example/e \"", "whitespace"),
+            ("url = \"ftp://b.example/e\"", "http:// or https://"),
+            ("url = \"b.example/e\"", "http:// or https://"),
+        ] {
+            let err = with_webhooks(block).unwrap_err();
+            let ConfigError::Validation { message, .. } = err else {
+                panic!("expected a validation error for {block}");
+            };
+            assert!(message.contains(expected), "{block}: {message}");
+        }
+    }
+
+    #[test]
+    fn an_empty_event_list_is_rejected_rather_than_treated_as_off() {
+        let err = with_webhooks(
+            r#"
+            url = "https://b.example/e"
+            events = []
+            "#,
+        )
+        .unwrap_err();
+        let ConfigError::Validation { message, .. } = err else {
+            panic!("expected a validation error");
+        };
+        assert!(message.contains("at least one event kind"), "{message}");
+    }
+
+    #[test]
+    fn thresholds_are_only_required_when_the_threshold_event_is_enabled() {
+        // Enabled and empty: an error, because nothing would ever fire.
+        let err = with_webhooks(
+            r#"
+            url = "https://b.example/e"
+            events = ["budget.threshold"]
+            thresholds = []
+            "#,
+        )
+        .unwrap_err();
+        let ConfigError::Validation { message, .. } = err else {
+            panic!("expected a validation error");
+        };
+        assert!(
+            message.contains("thresholds must not be empty"),
+            "{message}"
+        );
+
+        // Not enabled: an empty list is fine.
+        assert!(with_webhooks(
+            r#"
+            url = "https://b.example/e"
+            events = ["budget.exhausted"]
+            thresholds = []
+            "#,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn thresholds_must_be_percentages_in_1_to_100() {
+        for bad in ["0", "101"] {
+            let err = with_webhooks(&format!(
+                "url = \"https://b.example/e\"\nthresholds = [50, {bad}]"
+            ))
+            .unwrap_err();
+            let ConfigError::Validation { message, .. } = err else {
+                panic!("expected a validation error for {bad}");
+            };
+            assert!(message.contains("1..=100"), "{bad}: {message}");
+        }
+        // 100 % is legal: an operator may want a signal exactly at the cap.
+        assert!(with_webhooks("url = \"https://b.example/e\"\nthresholds = [100]").is_ok());
+    }
+
+    #[test]
+    fn zero_valued_webhook_knobs_are_rejected() {
+        for field in [
+            "channel_capacity",
+            "timeout_ms",
+            "max_attempts",
+            "retry_base_ms",
+        ] {
+            let err =
+                with_webhooks(&format!("url = \"https://b.example/e\"\n{field} = 0")).unwrap_err();
+            let ConfigError::Validation { message, .. } = err else {
+                panic!("expected a validation error for {field}");
+            };
+            assert!(message.contains(field), "{field}: {message}");
+        }
+    }
+
+    #[test]
+    fn a_blank_signing_key_env_name_is_rejected() {
+        for value in ["\"\"", "\"  \"", "\" LUMEN_WEBHOOK_SECRET \""] {
+            let err = with_webhooks(&format!(
+                "url = \"https://b.example/e\"\nsigning_key_env = {value}"
+            ))
+            .unwrap_err();
+            let ConfigError::Validation { message, .. } = err else {
+                panic!("expected a validation error for {value}");
+            };
+            assert!(message.contains("signing_key_env"), "{value}: {message}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_webhook_field_is_rejected_and_named() {
+        let err = with_webhooks("url = \"https://b.example/e\"\nurll = \"typo\"").unwrap_err();
+        let ConfigError::Parse { message, .. } = err else {
+            panic!("expected a parse error");
+        };
+        assert!(message.contains("urll"), "{message}");
+    }
+
+    #[test]
+    fn the_webhook_block_never_holds_a_secret_only_an_env_var_name() {
+        // Same contract as provider keys: a config file (and so a `GET
+        // /admin/config` response) can never contain the signing secret.
+        let cfg = with_webhooks(
+            r#"
+            url = "https://b.example/e"
+            signing_key_env = "LUMEN_WEBHOOK_SECRET"
+            "#,
+        )
+        .unwrap();
+        let rendered = format!("{:?}", cfg.webhooks.as_ref().expect("block present"));
+        assert!(rendered.contains("LUMEN_WEBHOOK_SECRET"), "{rendered}");
+        // Serialising the config (what a control plane would receive) carries
+        // the variable NAME and nothing more.
+        let serialized = serde_json::to_string(&cfg).expect("config serializes");
+        assert!(serialized.contains("LUMEN_WEBHOOK_SECRET"), "{serialized}");
     }
 
     #[test]

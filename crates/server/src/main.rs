@@ -26,12 +26,15 @@ use lumen_server::{
     resilience::ResilienceRuntime,
     state::AppState,
     tokenizer::TokenCounter,
+    webhooks::{load_signing_key, spawn_webhook_sender, WebhookRuntime},
 };
 use lumen_telemetry::{
     logging::init_logging, LatencyMetrics, Metrics, ReloadMetrics, ResilienceMetrics, TokenMetrics,
+    WebhookMetrics,
 };
 use std::sync::Arc;
 use tokio::net::TcpListener;
+use tokio_util::sync::CancellationToken;
 
 /// Env var holding the master key (64 hex chars): admin-API token and
 /// at-rest encryption key for stored provider keys. Required when
@@ -556,15 +559,13 @@ fn run(config: Config, config_path: PathBuf) -> anyhow::Result<()> {
             first_token_timeout: Duration::from_millis(config.server.first_token_timeout_ms),
             heartbeat_interval: Duration::from_millis(config.server.sse_heartbeat_ms),
         };
-        let metrics = Metrics::new();
-        let tokens = TokenMetrics::register(&metrics, &config.telemetry.metadata_labels)
-            .context("failed to register token metrics")?;
-        let latency =
-            LatencyMetrics::register(&metrics).context("failed to register latency metrics")?;
-        let resilience_metrics = ResilienceMetrics::register(&metrics)
-            .context("failed to register resilience metrics")?;
-        let reload_metrics =
-            ReloadMetrics::register(&metrics).context("failed to register reload metrics")?;
+        let RegisteredMetrics {
+            metrics,
+            tokens,
+            latency,
+            resilience: resilience_metrics,
+            reload: reload_metrics,
+        } = register_metrics(&config)?;
         let resilience = Arc::new(ResilienceRuntime::from_config(
             &config,
             Some(resilience_metrics.clone()),
@@ -589,24 +590,22 @@ fn run(config: Config, config_path: PathBuf) -> anyhow::Result<()> {
                 (None, None, None, HashMap::new(), None, None)
             };
 
-        // The shared client sets the default (process-wide) connect timeout and
-        // an overall cap that backstops the executor's total timeout (M6 §6.4).
-        // A provider that sets `connect_timeout_ms` gets its own client with the
-        // same overall backstop (ADR 005, 2026-07-15 amendment); every other
-        // provider keeps sharing this pooled client.
-        let overall_backstop =
-            Duration::from_millis(config.resilience.total_timeout_ms.saturating_add(30_000));
-        let client = lumen_providers::http::build_client_with(
-            Duration::from_millis(config.resilience.connect_timeout_ms),
-            overall_backstop,
-        );
-        let registry = Arc::new(
-            lumen_providers::Registry::build(provider_specs, client.clone(), overall_backstop)
-                .context("failed to build provider registry")?,
-        );
+        let (client, registry) = build_http_stack(&config, provider_specs)?;
 
         // Shared cell so the hot reloader swaps the very cell handlers read.
         let pricing = Arc::new(ArcSwap::from_pointee(CostTable::from_config(&config)));
+
+        // Outbound budget webhooks (ADR 011). Strictly opt-in: with no
+        // `[webhooks]` block nothing below runs, no counter is registered and
+        // the gateway makes no outbound call to anything but its providers.
+        let webhook_cancel = CancellationToken::new();
+        let webhooks = boot_webhooks(
+            &config,
+            &metrics,
+            &client,
+            auth_runtime.as_ref(),
+            &webhook_cancel,
+        )?;
 
         // Config hot reload (M7 §7.3): SIGHUP / file change / admin trigger swaps
         // routing, pricing, resilience and auth knobs and re-reads DB provider
@@ -620,6 +619,7 @@ fn run(config: Config, config_path: PathBuf) -> anyhow::Result<()> {
             key_backfill: Arc::new(ArcSwap::from_pointee(boot_backfill)),
             key_source,
             auth_knobs,
+            webhooks,
             auth_runtime: auth_runtime.clone(),
         };
         // Cloned before the move into `arm_config_reload`: the admin config
@@ -630,18 +630,14 @@ fn run(config: Config, config_path: PathBuf) -> anyhow::Result<()> {
 
         let health = boot_health(&config, &client, &resilience_metrics);
 
-        let image_fetch = build_image_fetch_policy(&config);
-
-        let token_counter = build_token_counter(&config);
-
         let mut state = AppState::new(metrics, registry, tokens, latency)
             .with_guards(guards)
             .with_pricing_cell(pricing)
             .with_resilience(resilience)
             .with_health(health)
             .with_body_limit(config.server.body_limit)
-            .with_image_fetch(image_fetch)
-            .with_token_counter(token_counter)
+            .with_image_fetch(build_image_fetch_policy(&config))
+            .with_token_counter(build_token_counter(&config))
             .with_config_path(config_path_for_state);
         // Expose the reload trigger only when the reloader is actually armed.
         if reload_armed {
@@ -658,6 +654,11 @@ fn run(config: Config, config_path: PathBuf) -> anyhow::Result<()> {
         lifecycle::serve(listener, app, DRAIN_TIMEOUT, lifecycle::shutdown_signal())
             .await
             .context("server error")?;
+
+        // Abandon anything still queued for delivery: webhooks are a
+        // convenience signal and the export route is the system of record, so
+        // shutdown must never wait on a sick receiver (ADR 011 §2).
+        webhook_cancel.cancel();
 
         drain_on_shutdown(auth_runtime, usage_writer).await;
 
@@ -759,6 +760,117 @@ fn boot_health(
         );
     }
     health
+}
+
+/// Build the shared HTTP client and the provider routing table over it.
+///
+/// The shared client sets the default (process-wide) connect timeout and an
+/// overall cap that backstops the executor's total timeout (M6 §6.4). A
+/// provider that sets `connect_timeout_ms` gets its own client with the same
+/// overall backstop (ADR 005, 2026-07-15 amendment); every other provider -
+/// and the webhook sender (ADR 011) - keeps sharing this pooled client.
+fn build_http_stack(
+    config: &Config,
+    provider_specs: Vec<lumen_providers::ProviderSpec>,
+) -> anyhow::Result<(reqwest::Client, Arc<lumen_providers::Registry>)> {
+    let overall_backstop =
+        Duration::from_millis(config.resilience.total_timeout_ms.saturating_add(30_000));
+    let client = lumen_providers::http::build_client_with(
+        Duration::from_millis(config.resilience.connect_timeout_ms),
+        overall_backstop,
+    );
+    let registry = Arc::new(
+        lumen_providers::Registry::build(provider_specs, client.clone(), overall_backstop)
+            .context("failed to build provider registry")?,
+    );
+    Ok((client, registry))
+}
+
+/// The always-on Prometheus collectors, registered against one registry.
+/// (The webhook collectors are registered separately, only when a
+/// `[webhooks]` block exists - see [`boot_webhooks`].)
+struct RegisteredMetrics {
+    metrics: Metrics,
+    tokens: TokenMetrics,
+    latency: LatencyMetrics,
+    resilience: ResilienceMetrics,
+    reload: ReloadMetrics,
+}
+
+/// Create the registry and register every always-on collector.
+fn register_metrics(config: &Config) -> anyhow::Result<RegisteredMetrics> {
+    let metrics = Metrics::new();
+    let tokens = TokenMetrics::register(&metrics, &config.telemetry.metadata_labels)
+        .context("failed to register token metrics")?;
+    let latency =
+        LatencyMetrics::register(&metrics).context("failed to register latency metrics")?;
+    let resilience =
+        ResilienceMetrics::register(&metrics).context("failed to register resilience metrics")?;
+    let reload = ReloadMetrics::register(&metrics).context("failed to register reload metrics")?;
+    Ok(RegisteredMetrics {
+        metrics,
+        tokens,
+        latency,
+        resilience,
+        reload,
+    })
+}
+
+/// Boot the outbound-webhook stack (ADR 011), or do nothing at all.
+///
+/// With no `[webhooks]` block this returns `None` without registering a single
+/// counter or spawning a single task: the gateway's only outbound calls stay
+/// the ones its providers need (sovereignty pillar). With a block, it
+/// registers the webhook metrics, creates the bounded queue, installs the
+/// signalling policy on the live key table and spawns the delivery task.
+///
+/// A named-but-unset `signing_key_env` is fatal here rather than a warning: a
+/// billing integration silently downgraded to unsigned deliveries is worse
+/// than a refused boot, and `--check-config` cannot catch it (it never reads
+/// the environment for secrets).
+fn boot_webhooks(
+    config: &Config,
+    metrics: &Metrics,
+    client: &reqwest::Client,
+    auth_runtime: Option<&Arc<AuthRuntime>>,
+    cancel: &CancellationToken,
+) -> anyhow::Result<Option<Arc<WebhookRuntime>>> {
+    let Some(block) = &config.webhooks else {
+        return Ok(None);
+    };
+    // `Config::validate` refuses `[webhooks]` unless auth is enabled, so this
+    // is defence in depth rather than a reachable path.
+    let Some(auth_runtime) = auth_runtime else {
+        anyhow::bail!("[webhooks] requires auth.enabled = true");
+    };
+
+    let webhook_metrics =
+        WebhookMetrics::register(metrics).context("failed to register webhook metrics")?;
+    let signing_key = load_signing_key(block).map_err(|message| anyhow::anyhow!(message))?;
+    let (runtime, receiver, signals) = WebhookRuntime::build(block, webhook_metrics.clone());
+    // Installing the policy also re-arms every loaded key and group against
+    // the configured thresholds, so a key already past one does not re-fire it
+    // on its first settle after a restart.
+    auth_runtime.keys.set_signals(Some(signals));
+    spawn_webhook_sender(
+        receiver,
+        client.clone(),
+        runtime.policy(),
+        signing_key,
+        webhook_metrics,
+        cancel.clone(),
+    );
+    let events: Vec<&str> = block.events.iter().map(|e| e.as_str()).collect();
+    // The URL is operator-configured and secret-free; the signing secret and
+    // even its resolved value never appear here.
+    tracing::info!(
+        url = %block.url,
+        ?events,
+        thresholds = ?block.thresholds,
+        signed = block.signing_key_env.is_some(),
+        "outbound budget webhooks enabled"
+    );
+    Ok(Some(runtime))
 }
 
 /// Everything [`boot_auth_stack`] hands back to [`run`].

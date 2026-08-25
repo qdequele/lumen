@@ -18,13 +18,21 @@
 //! - the **virtual-key table**, re-synced from the auth DB so keys created
 //!   offline (e.g. `lumen keys create`) become live without a restart;
 //!   existing entries keep their in-memory spend (memory stays the source of
-//!   truth for accrued spend after boot).
+//!   truth for accrued spend after boot);
+//! - the **webhook delivery policy and event set** (ADR 011): the receiver
+//!   URL, timeouts, retry budget, enabled events and thresholds. The bounded
+//!   queue and the sender task are kept, so a retarget never drops what is
+//!   already queued, and removing the `[webhooks]` block stops detection.
 //!
 //! Read once at boot and therefore **restart-only** (documented in
 //! `docs/backlog.md`): the server bind address (rebinding a live listener is
-//! high-risk and out of scope), `auth.enabled`, `auth.db_path`, and the bounded
+//! high-risk and out of scope), `auth.enabled`, `auth.db_path`, the bounded
 //! usage-log channel knobs (`usage_channel_capacity`, `usage_batch_max`,
-//! `usage_flush_ms`) whose capacity is structurally fixed at channel creation.
+//! `usage_flush_ms`) whose capacity is structurally fixed at channel creation,
+//! and the webhook queue's `channel_capacity` plus `signing_key_env` (the
+//! secret is read from the process environment, which a running process cannot
+//! see change). Adding a `[webhooks]` block to a process that booted without
+//! one also needs a restart: there is no queue or sender task to attach to.
 //!
 //! Provider API keys are re-resolved from the environment on every reload (env
 //! stays the primary source). For providers whose env var is unset, the key is
@@ -49,6 +57,7 @@ use tokio::sync::Notify;
 use crate::config::{Config, ConfigError};
 use crate::pricing::CostTable;
 use crate::resilience::ResilienceRuntime;
+use crate::webhooks::WebhookRuntime;
 
 /// Why a reload was rejected. The previous config is always kept on error.
 #[derive(Debug, thiserror::Error)]
@@ -159,6 +168,10 @@ pub struct ReloadTargets {
     /// Live auth knobs swapped from the reloaded config; `Some` only when auth
     /// is enabled.
     pub auth_knobs: Option<Arc<AuthKnobs>>,
+    /// The outbound-webhook runtime (bounded queue + delivery policy);
+    /// `Some` only when the process booted with a `[webhooks]` block
+    /// (ADR 011). A reload retunes the policy and the event set through it.
+    pub webhooks: Option<Arc<WebhookRuntime>>,
     /// The live auth runtime (in-memory key table + store); `Some` only when
     /// auth is enabled. On each reload the virtual-key table is re-read from
     /// the DB so keys created offline (e.g. `lumen keys create`) become live
@@ -238,6 +251,7 @@ pub fn apply_reload(path: &Path, targets: &ReloadTargets) -> Result<(), ReloadEr
     if let Some(knobs) = &targets.auth_knobs {
         knobs.store_from_config(&config);
     }
+    apply_webhook_reload(&config, targets);
     targets.metrics.inc_success();
     tracing::info!(
         model_count = config.loaded_models().len(),
@@ -245,6 +259,33 @@ pub fn apply_reload(path: &Path, targets: &ReloadTargets) -> Result<(), ReloadEr
         "configuration reloaded; routing table, pricing, resilience policy and auth knobs swapped"
     );
     Ok(())
+}
+
+/// Retune outbound webhooks from a reloaded config (ADR 011 §4).
+///
+/// The queue and the sender task survive the reload; only the delivery policy
+/// and the signalling policy (enabled events, thresholds) are swapped. Two
+/// cases are reported rather than applied, because neither can be honoured
+/// without a restart: a `[webhooks]` block added to a process that booted
+/// without one (there is no queue to attach to), and the structural knobs
+/// `apply_reload` warns about.
+fn apply_webhook_reload(config: &Config, targets: &ReloadTargets) {
+    let Some(webhooks) = &targets.webhooks else {
+        if config.webhooks.is_some() {
+            tracing::warn!(
+                "config declares [webhooks] but this process booted without it; outbound \
+                 budget events need a restart to start"
+            );
+        }
+        return;
+    };
+    let signals = webhooks.apply_reload(config.webhooks.as_ref());
+    // `Config::validate` refuses `[webhooks]` without `auth.enabled`, so an
+    // auth runtime is always present when a block is; clearing on removal is
+    // equally a no-op without one.
+    if let Some(auth_runtime) = &targets.auth_runtime {
+        auth_runtime.keys.set_signals(signals);
+    }
 }
 
 /// Re-read every configured provider's key from the encrypted DB store. A
@@ -528,6 +569,7 @@ mod tests {
             key_backfill: Arc::new(ArcSwap::from_pointee(HashMap::new())),
             key_source: None,
             auth_knobs: None,
+            webhooks: None,
             auth_runtime: None,
         }
     }
@@ -706,6 +748,7 @@ mod tests {
             key_backfill: Arc::new(ArcSwap::from_pointee(boot_backfill)),
             key_source: Some(source),
             auth_knobs: None,
+            webhooks: None,
             auth_runtime: None,
         });
 

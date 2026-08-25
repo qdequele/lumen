@@ -55,6 +55,7 @@ use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
+use lumen_auth::events::EventKind;
 use lumen_auth::key::hash_key;
 use lumen_auth::state::micro_to_usd;
 use lumen_auth::store::{
@@ -176,6 +177,11 @@ pub async fn patch_key(
 ) -> Result<Json<VirtualKeyRecord>, ApiError> {
     let Json(patch) = payload.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
     let auth = runtime(&state)?;
+    // Snapshot the live disabled flag BEFORE the patch so `key.disabled` can
+    // be edge-triggered: a PATCH that leaves an already-disabled key disabled
+    // is not a state change and must not re-notify the billing backend
+    // (ADR 011 §1).
+    let was_disabled = auth.keys.key_disabled(&id);
     let updated = auth
         .store
         .update_key(&id, patch)
@@ -184,6 +190,9 @@ pub async fn patch_key(
         .ok_or_else(|| GatewayError::InvalidRequest(format!("unknown key id '{id}'")))?;
     // Reflect the change in the live table (spend is preserved).
     auth.keys.apply(&updated);
+    if updated.disabled && was_disabled == Some(false) {
+        auth.keys.signal_key_lifecycle(&id, EventKind::KeyDisabled);
+    }
     Ok(Json(updated))
 }
 
@@ -210,6 +219,12 @@ pub async fn delete_key(
     // retry repairs a previously missed one, so the zombie window closes on
     // the very next delete attempt rather than lasting until a restart.
     if let Some(entry) = auth.keys.remove(&id) {
+        // Announce the removal only when THIS call's DB write is the one that
+        // tombstoned the row: a retry that only repaired a missed eviction
+        // (see above) must not fire a second `key.deleted` (ADR 011 §1).
+        if deleted.is_some() {
+            entry.signal_lifecycle(EventKind::KeyDeleted);
+        }
         // Flush the final accrued spend now: once the entry is dropped here
         // the periodic flusher (`drain_dirty`) will never see this id again,
         // so the tombstone's `budget_spent` would otherwise freeze at
@@ -251,6 +266,11 @@ pub async fn rotate_key(
     // Swap the live alias: the old plaintext dies and the new one works
     // right away, with spend and quota windows carried over.
     auth.keys.rotate(hash_key(plaintext.reveal()), &record);
+    // The rotation itself IS the edge, so this fires every time - a backend
+    // registry that caches key material needs every one of them. The payload
+    // never carries the new (or old) plaintext.
+    auth.keys
+        .signal_key_lifecycle(&record.id, EventKind::KeyRotated);
     Ok(Json(CreatedKey {
         key: plaintext.reveal().to_owned(),
         record,

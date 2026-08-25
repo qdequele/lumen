@@ -8,14 +8,43 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ### Added
 
-- **ADR 011: outbound webhooks for budget events** (design only, no
-  implementation yet; tracked in #146). Opt-in `[webhooks]` sender for
-  `budget.threshold` / `budget.exhausted` / key lifecycle events, so a
-  billing backend can top up a budget through the grant routes before the
-  customer hits 402, instead of polling. Detection rides the existing
-  in-memory settle; delivery is a bounded channel and an async sender with
-  HMAC-signed, idempotent, at-least-once semantics. No `[webhooks]` block
-  means no outbound calls and no behavior change.
+- **Outbound webhooks for budget events** (ADR 011, closes #146). A new
+  opt-in `[webhooks]` block makes LUMEN POST `budget.threshold`,
+  `budget.exhausted`, `key.disabled`, `key.rotated` and `key.deleted` events
+  to a billing backend, so a prepaid-credits control plane can auto-recharge
+  through `POST /admin/keys/{id}/grant` *before* a customer hits a 402
+  `LM-4001`, instead of polling for it. Both budget events cover keys and
+  budget groups (ADR 009).
+  - **Absent by default**: with no `[webhooks]` block the gateway makes no
+    outbound call to anything but its configured providers, and no webhook
+    metric is even registered. The block requires `auth.enabled = true`.
+  - **Never on the request path**: a crossing is detected by comparing the
+    armed thresholds on the atomic budget settle that already happens per
+    request, then queued with a non-blocking `try_send` into a bounded
+    channel drained by a background task. A full queue drops the event and
+    counts it (`lumen_webhook_dropped_total`) rather than slowing a request.
+  - **Edge-triggered**: a threshold fires once per budget epoch, not once
+    per request beyond it; a grant that buys headroom re-arms the thresholds
+    it drops below. `budget.exhausted` fires on the first refusal only.
+  - **Billing-grade delivery**: hex HMAC-SHA256 over the exact request body
+    in `x-lumen-signature` (secret from an env var named by
+    `signing_key_env`, never in the config file, redacted in `Debug` and
+    zeroized on drop), a per-event `x-lumen-event-id` stable across retries,
+    and at-least-once delivery with jittered exponential backoff. Payloads
+    carry accounting facts only: never a plaintext key, never client
+    metadata, never prompt or response content.
+  - New metrics: `lumen_webhook_queued_total`, `lumen_webhook_sent_total`,
+    `lumen_webhook_dropped_total`, `lumen_webhook_retries_total`,
+    `lumen_webhook_dead_total` and the `lumen_webhook_delivery_seconds`
+    histogram.
+  - Hot reload covers `url`, `events`, `thresholds`, `timeout_ms`,
+    `max_attempts` and `retry_base_ms` through the same queue and sender
+    task; `channel_capacity`, `signing_key_env` and adding the block to a
+    process that booted without one stay restart-only, with a warning rather
+    than a silent no-op. Shutdown cancels the sender without draining, so a
+    sick receiver can never delay shutdown.
+  - Documented in `docs/operations/keys-budgets.md` (payload shape,
+    signature verification, guarantees) and `config.example.toml`.
 
 ### Changed
 
