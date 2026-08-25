@@ -6,6 +6,17 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **ADR 011: outbound webhooks for budget events** (design only, no
+  implementation yet; tracked in #146). Opt-in `[webhooks]` sender for
+  `budget.threshold` / `budget.exhausted` / key lifecycle events, so a
+  billing backend can top up a budget through the grant routes before the
+  customer hits 402, instead of polling. Detection rides the existing
+  in-memory settle; delivery is a bounded channel and an async sender with
+  HMAC-signed, idempotent, at-least-once semantics. No `[webhooks]` block
+  means no outbound calls and no behavior change.
+
 ### Changed
 
 - **Docs: README admin row and a maintainer release guide.** The README API
