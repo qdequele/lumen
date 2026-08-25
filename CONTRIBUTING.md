@@ -141,6 +141,31 @@ that isn't tied to a single capability.
 | `scope: embedding` | Embeddings capability. |
 | `scope: reranking` | Reranking capability. |
 
+## Cutting a release (maintainers)
+
+1. **Release PR**: fold `[Unreleased]` in `CHANGELOG.md` into a new
+   `## [X.Y.Z] - YYYY-MM-DD` section (leave a fresh empty `[Unreleased]`,
+   update the compare-link footer), bump the workspace `version` in
+   `Cargo.toml`, and refresh `Cargo.lock` (`cargo update --workspace`).
+   Run the full validation gate, open the PR, merge on green.
+2. **Tag the merge commit** on `main` and push it:
+   `git tag -a vX.Y.Z -m "LUMEN vX.Y.Z: see CHANGELOG.md for the full list" && git push origin vX.Y.Z`.
+3. The tag push triggers `release.yml`: the full test gate runs on the tagged
+   commit, a **draft** release is created from the tag's CHANGELOG section
+   (the job fails if the section is missing), both musl tarballs and their
+   `.sha256` checksums attach to the draft, the multi-arch image goes to
+   GHCR, and a final `publish` job verifies all four assets before flipping
+   the draft public.
+
+**Releases are immutable.** Two consequences, both learned the hard way:
+
+- Once published, a release cannot be edited and no asset can be added or
+  replaced. That is why the pipeline is draft-first; keep it that way.
+- Deleting a published release **permanently retires its tag name**: GitHub
+  refuses to ever recreate that tag (v0.3.0 is burned this way). If a release
+  ships broken, do not delete it and re-tag; fix the cause and cut the next
+  patch version instead.
+
 ## Security
 
 Please do not open public issues for vulnerabilities - see [`SECURITY.md`](SECURITY.md)

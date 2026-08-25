@@ -6,6 +6,17 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed
+
+- **Docs: README admin row and a maintainer release guide.** The README API
+  table's `/admin/*` row now lists all five verbs and names what the surface
+  actually covers (keys, budgets, usage reporting and export, provider-key
+  rotation, config read/apply); it had not been updated since before ADR 010.
+  CONTRIBUTING.md gains a "Cutting a release" section documenting the
+  draft-first pipeline and the immutable-release rules (no post-publish asset
+  uploads; deleting a published release permanently retires its tag name, so
+  a broken release means cutting the next patch version, never re-tagging).
+
 ## [0.3.1] - 2026-08-25
 
 v0.3.0 was published without binaries (see below) and, releases being
