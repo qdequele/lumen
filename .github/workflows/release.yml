@@ -4,8 +4,11 @@ name: Release
 # to the GitHub Release, and a multi-arch distroless image pushed to GHCR (M7 §7.2).
 #
 # Order of operations: the full test gate must pass on the tagged commit first;
-# then the GitHub Release is created with notes extracted from CHANGELOG.md;
-# only then are binaries (with .sha256 checksums) attached and the image pushed.
+# then the GitHub Release is created as a DRAFT with notes extracted from
+# CHANGELOG.md; binaries (with .sha256 checksums) attach to the draft; the
+# release is published only once every asset is attached. Draft-first is
+# mandatory: with immutable releases, GitHub rejects any asset upload after
+# publication, so publish must be the last step, never the first.
 on:
   push:
     tags:
@@ -45,10 +48,12 @@ jobs:
       - name: Tests
         run: cargo test --workspace
 
-  # Create the release up front with its notes, so the binaries jobs attach to
-  # a release that already has a curated body instead of an empty one.
+  # Create the release as a DRAFT up front with its notes, so the binaries
+  # jobs attach to a release that already has a curated body instead of an
+  # empty one. It stays a draft (mutable, invisible to users) until the
+  # `publish` job flips it once every asset is attached.
   release-notes:
-    name: create release with CHANGELOG notes
+    name: create draft release with CHANGELOG notes
     runs-on: ubuntu-latest
     needs: gate
     steps:
@@ -68,10 +73,19 @@ jobs:
           fi
           echo "extracted $(wc -l < RELEASE_NOTES.md) lines of release notes"
 
-      - name: Create the release
-        uses: softprops/action-gh-release@v3
-        with:
-          body_path: RELEASE_NOTES.md
+      # Idempotent: a re-run must not fail on the already-created draft, and
+      # must never touch an already-published (immutable) release.
+      - name: Create the draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" --json isDraft --jq .isDraft 2>/dev/null | grep -q false; then
+            echo "::error::release $GITHUB_REF_NAME is already published (immutable); delete it before re-running." >&2
+            exit 1
+          fi
+          gh release create "$GITHUB_REF_NAME" --draft --verify-tag \
+            --title "$GITHUB_REF_NAME" --notes-file RELEASE_NOTES.md 2>/dev/null \
+            || gh release edit "$GITHUB_REF_NAME" --notes-file RELEASE_NOTES.md
 
   binaries:
     name: static binary (${{ matrix.target }})
@@ -108,12 +122,15 @@ jobs:
           tar -czf "lumen-${{ matrix.target }}.tar.gz" -C "target/${{ matrix.target }}/release" lumen
           sha256sum "lumen-${{ matrix.target }}.tar.gz" > "lumen-${{ matrix.target }}.tar.gz.sha256"
 
-      - name: Attach to release
-        uses: softprops/action-gh-release@v3
-        with:
-          files: |
-            lumen-${{ matrix.target }}.tar.gz
-            lumen-${{ matrix.target }}.tar.gz.sha256
+      # `gh release upload` resolves draft releases by tag; --clobber keeps
+      # re-runs idempotent while the release is still a draft.
+      - name: Attach to draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "$GITHUB_REF_NAME" --clobber \
+            "lumen-${{ matrix.target }}.tar.gz" \
+            "lumen-${{ matrix.target }}.tar.gz.sha256"
 
   image:
     name: multi-arch image → GHCR
@@ -144,3 +161,23 @@ jobs:
           tags: |
             ghcr.io/${{ github.repository }}:${{ github.ref_name }}
             ghcr.io/${{ github.repository }}:latest
+
+  # Publish LAST, once every binary is attached and the image is pushed. From
+  # this moment the release is immutable: no asset can be added or changed.
+  publish:
+    name: publish release
+    runs-on: ubuntu-latest
+    needs: [binaries, image]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Verify assets and publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          count=$(gh release view "$GITHUB_REF_NAME" --json assets --jq '.assets | length')
+          if [ "$count" -ne 4 ]; then
+            echo "::error::expected 4 assets (2 tarballs + 2 checksums), found $count; leaving the release as a draft." >&2
+            exit 1
+          fi
+          gh release edit "$GITHUB_REF_NAME" --draft=false --latest

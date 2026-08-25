@@ -6,6 +6,17 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **Release pipeline: draft-first asset uploads.** GitHub's immutable releases
+  reject any asset upload after publication, which left v0.3.0 published with
+  zero binaries: the workflow created the release first and attached tarballs
+  after. The release is now created as a draft, binaries and checksums attach
+  to the draft, and a final `publish` job flips it public only after verifying
+  all four assets are present. Re-runs are idempotent while the release is a
+  draft, and a re-run against an already-published tag fails fast with a clear
+  error instead of a confusing upload rejection.
+
 ## [0.3.0] - 2026-08-25
 
 ### Changed
