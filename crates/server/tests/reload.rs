@@ -297,7 +297,7 @@ fn registry_from_chat_config(path: &Path) -> Arc<Registry> {
 
 /// Reload targets sharing `registry`/`metrics`, with default pricing and
 /// resilience, no key backfill and no auth knobs.
-fn bare_filename_reload_targets(registry: Arc<Registry>, metrics: ReloadMetrics) -> ReloadTargets {
+fn reload_targets(registry: Arc<Registry>, metrics: ReloadMetrics) -> ReloadTargets {
     ReloadTargets {
         registry,
         pricing: Arc::new(ArcSwap::from_pointee(CostTable::default())),
@@ -370,7 +370,7 @@ async fn spawn_config_reloader_survives_a_rename_replace_of_a_bare_filename_conf
     std::env::set_current_dir(&dir).expect("chdir into tempdir");
 
     let metrics = ReloadMetrics::register(&Metrics::new()).expect("reload metrics");
-    let t = bare_filename_reload_targets(Arc::clone(&registry), metrics);
+    let t = reload_targets(Arc::clone(&registry), metrics);
     let trigger = Arc::new(Notify::new());
     let handle =
         spawn_config_reloader(PathBuf::from("lumen.toml"), t, trigger).expect("spawn reloader");
@@ -395,5 +395,162 @@ async fn spawn_config_reloader_survives_a_rename_replace_of_a_bare_filename_conf
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    handle.abort();
+}
+
+/// The current value of `lumen_config_reloads_total`, scraped from the
+/// Prometheus text output (the counter has no public getter).
+fn reloads_total(metrics: &Metrics) -> u64 {
+    metrics
+        .encode_text()
+        .lines()
+        .find_map(|line| line.strip_prefix("lumen_config_reloads_total "))
+        .and_then(|value| value.trim().parse().ok())
+        .expect("lumen_config_reloads_total is registered and exported")
+}
+
+/// Poll `reloads_total` until it stops moving for `quiet`, or `deadline`
+/// passes. Returns the last observed count. A genuine one-shot reload settles
+/// almost immediately; a feedback loop never does, so this returns whatever it
+/// had climbed to by the deadline and the caller's assertion fails on the
+/// magnitude.
+async fn settled_reload_count(metrics: &Metrics, quiet: Duration, deadline: Duration) -> u64 {
+    let start = tokio::time::Instant::now();
+    let mut last = reloads_total(metrics);
+    let mut stable_since = tokio::time::Instant::now();
+    loop {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let now = reloads_total(metrics);
+        if now == last {
+            if stable_since.elapsed() >= quiet {
+                return now;
+            }
+        } else {
+            last = now;
+            stable_since = tokio::time::Instant::now();
+        }
+        if start.elapsed() >= deadline {
+            return reloads_total(metrics);
+        }
+    }
+}
+
+/// Arm the real watcher on a temp directory holding a valid config, and
+/// return (dir, config path, registry, metrics, reloader handle).
+async fn armed_reloader() -> (
+    PathBuf,
+    PathBuf,
+    Arc<Registry>,
+    Metrics,
+    tokio::task::JoinHandle<()>,
+) {
+    let dir = tempdir();
+    let config_path = dir.join("config.toml");
+    std::fs::write(&config_path, ONE_MODEL_CHAT).expect("write config");
+    let registry = registry_from_chat_config(&config_path);
+    let metrics = Metrics::new();
+    let reload_metrics = ReloadMetrics::register(&metrics).expect("reload metrics");
+    let targets = reload_targets(Arc::clone(&registry), reload_metrics);
+    let handle = spawn_config_reloader(config_path.clone(), targets, Arc::new(Notify::new()))
+        .expect("spawn reloader");
+    // Let the watcher finish arming before anything touches the file.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        reloads_total(&metrics),
+        0,
+        "arming the watcher must not reload anything by itself"
+    );
+    (dir, config_path, registry, metrics, handle)
+}
+
+/// Regression test for the self-sustaining hot-reload loop reproduced on
+/// production at v0.3.1: `spawn_config_reloader` watches the config's parent
+/// DIRECTORY, and `notify`'s inotify backend arms that watch with a 0xfee
+/// mask that includes `IN_OPEN` (0x20). Because a reload OPENS the config
+/// file to re-read it, every reload used to schedule the next one: one
+/// `cat /etc/lumen/config.toml` from any process put the gateway into a
+/// ~4 reloads/second loop that only a restart cleared. The project's own
+/// `lumen --check-config` and `lumen keys list` both open the file, so
+/// running the documented pre-reload safety check was enough to trigger it.
+///
+/// Note: like the rename-replace test above, this can only discriminate old
+/// from new code where the backend reports opens at all, i.e. inotify
+/// (Linux). FSEvents does not report file opens, so on macOS the count stays
+/// at 0 either way and this test is a smoke test rather than a regression
+/// guard. That platform gap is known and accepted.
+#[tokio::test]
+async fn reading_the_config_file_does_not_start_a_reload_loop() {
+    let (_dir, config_path, _registry, metrics, handle) = armed_reloader().await;
+
+    // Exactly what `cat`, `lumen --check-config` and `lumen keys list` do:
+    // open the config file and read it. Nothing is written.
+    let bytes = std::fs::read(&config_path).expect("read config");
+    assert!(
+        !bytes.is_empty(),
+        "the config file was read, not just stat'd"
+    );
+
+    // Well past several debounce windows (DEBOUNCE is 250ms): pre-fix this
+    // had already climbed into double digits and was still climbing.
+    let count =
+        settled_reload_count(&metrics, Duration::from_millis(600), Duration::from_secs(3)).await;
+    assert!(
+        count <= 1,
+        "reading the config file must schedule at most one reload, got {count}"
+    );
+
+    // And it is not merely slow: the count is stable, not still climbing.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(
+        reloads_total(&metrics),
+        count,
+        "the reload count must be stable after the debounce window, not climbing"
+    );
+    handle.abort();
+}
+
+/// The flip side of the loop fix: a genuine content change must still be
+/// picked up, exactly once. The change goes in via write-to-staging plus
+/// rename, which is what `PUT /admin/config` and a GitOps sync both do, and
+/// which lands as a single `IN_MOVED_TO` rather than a burst.
+#[tokio::test]
+async fn a_real_config_change_still_triggers_exactly_one_reload() {
+    let (dir, config_path, registry, metrics, handle) = armed_reloader().await;
+    assert!(
+        registry.embedding_route("embed").is_none(),
+        "the embed model is not routable before the change"
+    );
+
+    let staged = dir.join("config.toml.staged");
+    std::fs::write(&staged, TWO_MODELS_CHAT_EMBED).expect("write staged config");
+    std::fs::rename(&staged, &config_path).expect("rename into place");
+
+    // The swap must actually happen: hot reload still works.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if registry.embedding_route("embed").is_some() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "hot reload did not fire for a genuine config change"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // Once, and only once - the reload's own read of the file must not
+    // schedule another one.
+    let count =
+        settled_reload_count(&metrics, Duration::from_millis(600), Duration::from_secs(3)).await;
+    assert_eq!(
+        count, 1,
+        "a single config change must produce exactly one reload, got {count}"
+    );
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(
+        reloads_total(&metrics),
+        1,
+        "the reload count must stay at one, not climb after the change"
+    );
     handle.abort();
 }

@@ -304,6 +304,45 @@ fn watch_target(path: &Path) -> &Path {
         .map_or_else(|| Path::new("."), |p| p)
 }
 
+/// Whether a file-system event from the config directory watch should schedule
+/// a reload. Two independent filters, both of which must pass.
+///
+/// **Kind.** The watch is armed on the config's parent directory, and
+/// `notify`'s inotify backend arms it with a 0xfee mask that includes
+/// `IN_OPEN` (0x20). A reload *opens* the config file to re-read it, so
+/// treating an open as a change made every reload schedule the next one: a
+/// self-sustaining loop, one reload per debounce window (~4/second) until the
+/// process was restarted, which any process merely *reading* the file could
+/// start - including LUMEN's own `lumen --check-config` (the documented
+/// pre-reload safety check) and `lumen keys list`. Non-mutating accesses are
+/// therefore ignored. The single exception is
+/// `Access(Close(AccessMode::Write))`, which is how the inotify backend
+/// reports `IN_CLOSE_WRITE`: an `Access` event that nonetheless marks a
+/// *completed write*. Filtering on the event kind rather than on an explicit
+/// inotify mask keeps this backend-agnostic (FSEvents, kqueue and the polling
+/// fallback report no opens at all, and none of them is harmed by the check).
+///
+/// **Path.** The event must name the config file itself, so a neighbour in the
+/// same directory (the auth SQLite DB and its WAL, `lumen.env`, a staged temp
+/// file mid-rename) is not mistaken for a config change. Matching on the file
+/// name avoids `canonicalize` races while the file is briefly absent mid-rename.
+fn event_should_reload(event: &notify::Event, config_name: Option<&std::ffi::OsStr>) -> bool {
+    use notify::event::{AccessKind, AccessMode};
+    let may_have_changed_the_bytes = match event.kind {
+        // IN_CLOSE_WRITE: a write that just finished.
+        notify::EventKind::Access(AccessKind::Close(AccessMode::Write)) => true,
+        // IN_OPEN, reads, read-only closes: nothing changed. Reacting to
+        // these is the feedback loop described above.
+        notify::EventKind::Access(_) => false,
+        // Create / Modify / Remove, plus the `Any`/`Other` catch-alls a
+        // backend uses for masks it cannot map precisely: assume a change and
+        // let the reload itself decide (an invalid or unchanged config is
+        // cheap and already handled).
+        _ => true,
+    };
+    may_have_changed_the_bytes && event.paths.iter().any(|p| p.file_name() == config_name)
+}
+
 /// Spawn the background reloader: reload on `SIGHUP`, on changes to the config
 /// file, and when `trigger` is notified (the admin API pings it after storing a
 /// provider key, so a rotation applies without a restart). The returned task
@@ -326,19 +365,16 @@ pub fn spawn_config_reloader(
     // in-place write, which a watch on the file itself would miss - a
     // rename unlinks the inode a file-level watch is armed on, most visibly
     // with the inotify backend, silently ending the watch with no error
-    // anywhere), but only react to events that touch the config file - a
-    // neighbour file (e.g. the SQLite DB) must not trigger a reload.
-    // Matching by file name avoids canonicalize races when the file is
-    // briefly absent mid-rename.
+    // anywhere). A directory watch is necessarily broader than the config
+    // file and broader than "the bytes changed", so `event_should_reload`
+    // narrows it back down on both axes: by kind (an open must never
+    // schedule a reload, or the reload's own read of the file loops
+    // forever) and by path (a neighbour file must not trigger a reload).
     let config_name = path.file_name().map(std::ffi::OsStr::to_owned);
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
         if let Ok(event) = res {
-            let touches_config = event
-                .paths
-                .iter()
-                .any(|p| p.file_name() == config_name.as_deref());
-            if touches_config {
+            if event_should_reload(&event, config_name.as_deref()) {
                 // Non-blocking; a full/closed channel just drops the tick (the
                 // next event, or the debounce drain, still triggers a reload).
                 let _ = tx.send(());
@@ -923,6 +959,116 @@ mod tests {
             Some("db-key"),
             "DB key re-applied so the reload doesn't strip it"
         );
+    }
+
+    /// Build a `notify` event of `kind` naming `path`, as the backend would.
+    fn fs_event(kind: notify::EventKind, path: &Path) -> notify::Event {
+        notify::Event::new(kind).add_path(path.to_path_buf())
+    }
+
+    /// The config file's own name, as `spawn_config_reloader` extracts it.
+    fn config_name(path: &Path) -> Option<&std::ffi::OsStr> {
+        path.file_name()
+    }
+
+    /// Regression test for the self-sustaining reload loop (v0.3.1 and
+    /// earlier): the directory watch is armed with an inotify mask that
+    /// includes `IN_OPEN` (0x20, part of the 0xfee `notify` arms), and the
+    /// reload itself OPENS the config file to re-read it. Feeding that open
+    /// back in as a reload trigger made every reload schedule the next one,
+    /// ~4 reloads/second forever, clearable only by a restart. Any read of
+    /// the file by any process (`cat`, `lumen --check-config`, `lumen keys
+    /// list`) kicked it off.
+    #[test]
+    fn an_open_of_the_config_file_does_not_schedule_a_reload() {
+        use notify::event::{AccessKind, AccessMode};
+        let path = Path::new("/etc/lumen/config.toml");
+        let open = fs_event(
+            notify::EventKind::Access(AccessKind::Open(AccessMode::Any)),
+            path,
+        );
+        assert!(
+            !event_should_reload(&open, config_name(path)),
+            "an open of the config file must not schedule a reload: the reload \
+             itself opens the file, so reacting to opens is a feedback loop"
+        );
+    }
+
+    /// The other non-mutating accesses a backend can report. None of them
+    /// changed a byte, so none of them warrants a reload. The inotify mask
+    /// happens to arm only `IN_OPEN` out of this set today, but the reload's
+    /// own file handle is also *closed* read-only, so each of these is
+    /// another latent way into the loop above if a backend ever reports it.
+    #[test]
+    fn reads_and_read_closes_of_the_config_file_do_not_schedule_a_reload() {
+        use notify::event::{AccessKind, AccessMode};
+        let path = Path::new("/etc/lumen/config.toml");
+        for kind in [
+            AccessKind::Read,
+            AccessKind::Close(AccessMode::Read),
+            AccessKind::Open(AccessMode::Read),
+            AccessKind::Open(AccessMode::Execute),
+            AccessKind::Any,
+            AccessKind::Other,
+        ] {
+            let event = fs_event(notify::EventKind::Access(kind), path);
+            assert!(
+                !event_should_reload(&event, config_name(path)),
+                "a non-mutating access ({kind:?}) must not schedule a reload"
+            );
+        }
+    }
+
+    /// The flip side: do not fix the loop by breaking hot reload. Every
+    /// event kind that means "the bytes behind this path changed" must still
+    /// schedule a reload. `Access(Close(Write))` is in the list because that
+    /// is what the inotify backend maps `IN_CLOSE_WRITE` to: an `Access`
+    /// event that nonetheless marks a completed write.
+    #[test]
+    fn content_and_rename_events_on_the_config_file_still_schedule_a_reload() {
+        use notify::event::{
+            AccessKind, AccessMode, CreateKind, DataChange, ModifyKind, RemoveKind, RenameMode,
+        };
+        let path = Path::new("/etc/lumen/config.toml");
+        let kinds = [
+            notify::EventKind::Modify(ModifyKind::Data(DataChange::Any)),
+            notify::EventKind::Modify(ModifyKind::Name(RenameMode::To)),
+            notify::EventKind::Modify(ModifyKind::Any),
+            notify::EventKind::Access(AccessKind::Close(AccessMode::Write)),
+            notify::EventKind::Create(CreateKind::File),
+            notify::EventKind::Remove(RemoveKind::File),
+            notify::EventKind::Any,
+        ];
+        for kind in kinds {
+            let event = fs_event(kind, path);
+            assert!(
+                event_should_reload(&event, config_name(path)),
+                "a content/rename event ({kind:?}) must still schedule a reload"
+            );
+        }
+    }
+
+    /// Path filtering is unchanged: churn on a neighbour in the config
+    /// directory (the auth SQLite DB and its WAL, `lumen.env`, a staged
+    /// temp file mid-rename) is not a config change.
+    #[test]
+    fn a_write_to_a_neighbour_file_does_not_schedule_a_reload() {
+        use notify::event::{DataChange, ModifyKind};
+        let path = Path::new("/etc/lumen/config.toml");
+        for neighbour in [
+            "/etc/lumen/lumen.env",
+            "/etc/lumen/keys.db-wal",
+            "/etc/lumen/config.toml.staged",
+        ] {
+            let event = fs_event(
+                notify::EventKind::Modify(ModifyKind::Data(DataChange::Any)),
+                Path::new(neighbour),
+            );
+            assert!(
+                !event_should_reload(&event, config_name(path)),
+                "{neighbour} is not the config file"
+            );
+        }
     }
 
     #[test]
