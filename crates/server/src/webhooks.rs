@@ -48,8 +48,10 @@
 //!   events; the previous sender keeps its receiver, drains what it already
 //!   had under the settings it had, and exits when its last sender drops.
 //!   Nothing already accepted is discarded to change a capacity;
-//! * the signing secret lives in a cell the sender reads per attempt, so a
-//!   rotation applies to the next delivery without restarting anything.
+//! * the signing secret lives in a cell the sender reads once per **event**,
+//!   so a rotation applies to the next delivery without restarting anything -
+//!   while every attempt at an event already in flight keeps the signature its
+//!   body was signed with, which is what makes a retry verifiable.
 
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -348,8 +350,10 @@ impl WebhookController {
             .as_ref()
             .filter(|p| p.settings.channel_capacity == settings.channel_capacity);
         let pipeline = if let Some(existing) = reuse {
-            // Same capacity: retune in place. The sender task reads both cells
-            // per attempt, so this takes effect on the next one.
+            // Same capacity: retune in place. The sender re-reads the policy
+            // per attempt (so this retargets even a retry in flight) and the
+            // key cell once per event (so a rotation applies to the next
+            // event, never mid-retry).
             existing
                 .policy
                 .store(Arc::new(DeliveryPolicy::from(settings)));

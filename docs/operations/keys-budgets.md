@@ -464,10 +464,14 @@ it and will never hand it back.
 ```bash
 export WEBHOOK_SECRET="whsec_$(openssl rand -hex 24)"
 
+# Note the heredoc: passing the secret with `-d "..."` would put it in curl's
+# argument list, which any local process can read from the process table.
 curl -s -X PUT http://localhost:8080/admin/webhooks/signing-key \
   -H "Authorization: Bearer $LUMEN_MASTER_KEY" \
   -H 'content-type: application/json' \
-  -d "{\"secret\": \"$WEBHOOK_SECRET\"}"
+  --data-binary @- <<JSON
+{"secret": "$WEBHOOK_SECRET"}
+JSON
 ```
 
 `204`. The secret is encrypted with AES-256-GCM under the master key
@@ -504,8 +508,11 @@ above. The `200` response is the new state:
 }
 ```
 
-It is in force from that moment - the very next request that crosses a
-threshold delivers - and it is stored, so a restart comes up identically.
+The new policy is in force from that moment: the very next request that
+crosses a threshold enqueues an event. Delivery itself stays asynchronous
+and best-effort, so a full queue or a receiver that stays down past the
+retry budget still drops it (see the guarantees below). The settings are
+stored, so a restart comes up identically.
 
 **3. Check it.**
 
@@ -696,9 +703,15 @@ fall back to the export route until the receiver is healthy again.
 
 A config reload re-resolves the same precedence: a stored row still wins,
 so a reload never reverts a `PUT`. When the file block *is* what is in
-force, `url`, `events`, `thresholds`, `timeout_ms`, `max_attempts`,
-`retry_base_ms` and `channel_capacity` are all re-applied through the same
-sender task, and removing the block stops emission.
+force, every field is re-applied, and removing the block stops emission.
+
+How a field is applied depends on the field. `url`, `events`, `thresholds`,
+`timeout_ms`, `max_attempts` and `retry_base_ms` are retuned in place, on
+the queue and sender task already running - so a retarget cannot lose what
+is already queued. `channel_capacity` cannot be resized in place, so it
+replaces both: new events go to the new queue while the previous sender
+finishes delivering the events it had already accepted, then exits. Either
+way nothing already accepted is discarded.
 
 The one thing a reload cannot do is see a *new* environment variable: a
 running process cannot observe a change to its own environment. Pointing

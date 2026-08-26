@@ -19,20 +19,32 @@
 //!   offline (e.g. `lumen keys create`) become live without a restart;
 //!   existing entries keep their in-memory spend (memory stays the source of
 //!   truth for accrued spend after boot);
-//! - the **webhook delivery policy and event set** (ADR 011): the receiver
-//!   URL, timeouts, retry budget, enabled events and thresholds. The bounded
-//!   queue and the sender task are kept, so a retarget never drops what is
-//!   already queued, and removing the `[webhooks]` block stops detection.
+//! - the **whole webhook configuration** (ADR 011 and its amendment). A
+//!   reload re-resolves the precedence - a stored row written through
+//!   `PUT /admin/webhooks` wins over the `[webhooks]` file block, and a
+//!   stored row marked disabled means off whatever the file says - then
+//!   applies the winner. Retuning `url`, `events`, `thresholds` or the retry
+//!   knobs keeps the bounded queue and its sender task, so a retarget never
+//!   drops what is already queued; changing `channel_capacity` replaces both,
+//!   with the previous sender draining the events it had already accepted
+//!   before it exits. Removing the block stops detection.
 //!
 //! Read once at boot and therefore **restart-only** (documented in
 //! `docs/backlog.md`): the server bind address (rebinding a live listener is
 //! high-risk and out of scope), `auth.enabled`, `auth.db_path`, the bounded
 //! usage-log channel knobs (`usage_channel_capacity`, `usage_batch_max`,
-//! `usage_flush_ms`) whose capacity is structurally fixed at channel creation,
-//! and the webhook queue's `channel_capacity` plus `signing_key_env` (the
-//! secret is read from the process environment, which a running process cannot
-//! see change). Adding a `[webhooks]` block to a process that booted without
-//! one also needs a restart: there is no queue or sender task to attach to.
+//! `usage_flush_ms`) whose capacity is structurally fixed at channel creation.
+//!
+//! Webhooks have no restart-only field left: with auth enabled the
+//! [`WebhookController`] exists whether or not a `[webhooks]` block does, and
+//! its `apply` creates the queue and sender from nothing (or rebuilds them for
+//! a new `channel_capacity`), so a block added to a running process takes
+//! effect on the next reload. The one thing no reload can do is observe a
+//! *newly set* environment variable, because a running process cannot: pointing
+//! `signing_key_env` at a variable that was unset at startup needs a restart,
+//! or `PUT /admin/webhooks/signing-key`, which needs no variable at all. With
+//! auth *disabled* there is no controller and no `/admin` surface, so enabling
+//! webhooks then does require a restart.
 //!
 //! Provider API keys are re-resolved from the environment on every reload (env
 //! stays the primary source). For providers whose env var is unset, the key is

@@ -232,9 +232,10 @@ Payloads carry accounting facts only - never a key, never prompt or response
 content.
 
 Configure it declaratively in `[webhooks]`, or entirely through the admin API
-(`GET`/`PUT`/`DELETE /admin/webhooks` plus
-`PUT /admin/webhooks/signing-key`, which seals the HMAC secret at rest) - every
-field is editable at runtime, and API-written settings win over the file. See
+(`GET`/`PUT`/`DELETE /admin/webhooks`, plus
+`PUT`/`DELETE /admin/webhooks/signing-key`, which seal and forget the HMAC
+secret at rest) - every field is editable at runtime, and API-written settings
+win over the file. See
 [Outbound webhooks for budget events](https://qdequele.github.io/lumen/operations/keys-budgets.html#outbound-webhooks-for-budget-events).
 
 ### Resilience

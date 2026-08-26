@@ -31,15 +31,15 @@ impl WebhookMetrics {
     pub fn register(metrics: &Metrics) -> Result<Self, prometheus::Error> {
         let queued_total = IntCounter::new(
             "lumen_webhook_queued_total",
-            "Budget events accepted into the bounded webhook queue.",
+            "Webhook events accepted into the bounded queue, across every configured event kind.",
         )?;
         let sent_total = IntCounter::new(
             "lumen_webhook_sent_total",
-            "Budget events the receiver acknowledged with a 2xx.",
+            "Webhook events the receiver acknowledged with a 2xx.",
         )?;
         let dropped_total = IntCounter::new(
             "lumen_webhook_dropped_total",
-            "Budget events dropped because the webhook queue was full; the usage export route remains the system of record (ADR 011).",
+            "Webhook events dropped because the queue was full; the usage export route remains the system of record (ADR 011).",
         )?;
         let retries_total = IntCounter::new(
             "lumen_webhook_retries_total",
@@ -47,7 +47,7 @@ impl WebhookMetrics {
         )?;
         let dead_total = IntCounter::new(
             "lumen_webhook_dead_total",
-            "Budget events abandoned after exhausting their retry budget or hitting a permanent receiver error.",
+            "Webhook events abandoned after exhausting their retry budget or hitting a permanent receiver error.",
         )?;
         let delivery_seconds = Histogram::with_opts(HistogramOpts::new(
             "lumen_webhook_delivery_seconds",

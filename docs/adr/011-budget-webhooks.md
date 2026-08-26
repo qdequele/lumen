@@ -163,6 +163,7 @@ Master-key gated, alongside the other `/admin` routes:
   persisted, so a restart comes up identically.
 - `DELETE /admin/webhooks` - stop emitting, persisted.
 - `PUT /admin/webhooks/signing-key` - store the HMAC secret, sealed at rest.
+- `DELETE /admin/webhooks/signing-key` - forget the stored secret.
 
 There is still exactly **one** receiver (§5 stands): these routes edit that
 receiver, they do not create a collection. Fan-out remains future work.
@@ -197,8 +198,12 @@ ADR 010's drift report.
   new events; the previous sender task keeps its receiver, drains whatever was
   already queued under the settings it had, and exits when its last sender is
   dropped. Nothing already accepted is discarded to change a capacity.
-- The signing secret: held in a swappable cell the sender reads per attempt,
-  so a rotation applies to the next delivery without restarting the task.
+- The signing secret: held in a swappable cell the sender reads once per
+  **event**, so a rotation applies to the next delivery without restarting the
+  task. Deliberately not per attempt: a signature covers a specific body, so
+  re-reading the cell mid-retry would emit attempts the receiver cannot verify.
+  Retries of an event already in flight therefore keep the secret they were
+  signed with, and a rotation reaches the next event instead.
 
 Enabling webhooks on a process that booted without them therefore works too:
 the queue, the sender task and the Prometheus collectors are created on the

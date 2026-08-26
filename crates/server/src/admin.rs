@@ -607,21 +607,33 @@ pub async fn put_webhooks(
 
 /// Stop emitting budget events, persistently.
 ///
-/// Idempotent: a 200 whether or not anything was enabled. When webhooks were
-/// on, the settings are stored as *disabled* rather than deleted, so the
-/// `[webhooks]` config block cannot silently re-enable them on the next reload
-/// and a later re-enable does not have to resend them.
+/// Idempotent: a 200 whether or not anything was enabled. The decision is
+/// always persisted - as a *disabled* row rather than an absent one - so
+/// neither a `[webhooks]` config block nor an enabled-but-unappliable stored
+/// row can bring delivery back on the next reload. Keeping the settings on
+/// that row means a later re-enable does not have to resend them.
 pub async fn delete_webhooks(
     State(state): State<AppState>,
 ) -> Result<Json<WebhookStatus>, ApiError> {
     let auth = runtime(&state)?;
     let controller = webhooks(&state)?;
-    if let Some(settings) = controller.live_settings() {
-        auth.store
-            .save_webhook_config_disabled(&settings)
+    match controller.live_settings() {
+        // Store the live settings as a DISABLED row: the `[webhooks]` config
+        // block cannot then re-enable them on the next reload, and a later
+        // re-enable does not have to resend them.
+        Some(settings) => auth.store.save_webhook_config_disabled(&settings).await,
+        // Nothing is live, but a stored row may still say `enabled = 1`: the
+        // boot or reload apply can fail (a `signing_key_env` this process
+        // cannot resolve, say) and leave an enabled row with no pipeline
+        // behind it. Clearing that flag is what makes this DELETE outlive the
+        // next reload instead of being retried by it.
+        None => auth
+            .store
+            .disable_webhook_config()
             .await
-            .map_err(|e| internal(&e))?;
+            .map(|_disabled| ()),
     }
+    .map_err(|e| internal(&e))?;
     controller.disable(&auth.keys);
     controller
         .refresh_from_store(&auth.store, auth.master.as_ref())

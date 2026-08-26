@@ -1350,3 +1350,67 @@ async fn the_signing_key_routes_never_expose_the_secret() {
     assert_eq!(status["signing_key_stored"], false);
     assert_eq!(status["signed"], false);
 }
+
+#[tokio::test]
+async fn delete_disables_an_enabled_row_whose_pipeline_never_started() {
+    // Regression: an apply can fail and leave an ENABLED stored row with no
+    // live pipeline behind it (a `signing_key_env` this process cannot
+    // resolve, say). A DELETE then had nothing live to shadow, wrote nothing,
+    // and the next reload happily retried the row - so the operator's DELETE
+    // silently did not stick.
+    let upstream = MockServer::start().await;
+    let h = spawn_gateway_without_webhooks(chat_registry(&upstream.uri())).await;
+
+    // A row that is enabled but cannot be applied: the variable is unset in
+    // this process, and no secret is sealed.
+    let unappliable = WebhookSettings {
+        url: "https://backend.example.test/events".to_owned(),
+        signing_key_env: Some("BILLING_WEBHOOK_SECRET_NOT_SET_HERE".to_owned()),
+        ..WebhookSettings::default()
+    };
+    h.store
+        .save_webhook_config(&unappliable)
+        .await
+        .expect("store an enabled row");
+    h.controller
+        .refresh_from_store(&h.store, h.auth.master.as_ref())
+        .await;
+    assert!(
+        h.controller.resolve_and_apply(None, &h.auth.keys).is_err(),
+        "the row names an unresolvable secret, so applying it must fail"
+    );
+    assert!(
+        h.controller.live_settings().is_none(),
+        "nothing is live, but the stored row is still enabled"
+    );
+    assert!(
+        h.store
+            .load_webhook_config()
+            .await
+            .expect("load")
+            .expect("row")
+            .enabled
+    );
+
+    // The DELETE must clear the flag even though there was nothing live.
+    assert_eq!(h.delete_webhooks().await.status(), 200);
+    let stored = h
+        .store
+        .load_webhook_config()
+        .await
+        .expect("load")
+        .expect("the row is still there");
+    assert!(
+        !stored.enabled,
+        "DELETE must persist the disable even with no live pipeline"
+    );
+
+    // ...and re-resolving does not bring it back.
+    h.controller
+        .refresh_from_store(&h.store, h.auth.master.as_ref())
+        .await;
+    h.controller
+        .resolve_and_apply(None, &h.auth.keys)
+        .expect("a disabled row resolves to off, not to an error");
+    assert!(h.controller.live_settings().is_none());
+}

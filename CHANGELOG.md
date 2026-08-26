@@ -8,16 +8,16 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ### Added
 
-- **Outbound webhooks for budget events** (ADR 011, closes #146). A new
-  opt-in `[webhooks]` block makes LUMEN POST `budget.threshold`,
+- **Outbound webhooks for budget events** (ADR 011 and its 2026-08-26
+  amendment, closes #146). LUMEN can POST `budget.threshold`,
   `budget.exhausted`, `key.disabled`, `key.rotated` and `key.deleted` events
   to a billing backend, so a prepaid-credits control plane can auto-recharge
   through `POST /admin/keys/{id}/grant` *before* a customer hits a 402
   `LM-4001`, instead of polling for it. Both budget events cover keys and
   budget groups (ADR 009).
-  - **Absent by default**: with no `[webhooks]` block the gateway makes no
-    outbound call to anything but its configured providers, and no webhook
-    metric is even registered. The block requires `auth.enabled = true`.
+  - **Absent by default**: with no webhook configured the gateway makes no
+    outbound call to anything but its configured providers, and does not even
+    register a webhook metric. Webhooks require `auth.enabled = true`.
   - **Never on the request path**: a crossing is detected by comparing the
     armed thresholds on the atomic budget settle that already happens per
     request, then queued with a non-blocking `try_send` into a bounded
@@ -27,55 +27,48 @@ All notable changes to LUMEN are documented here. The format is based on
     per request beyond it; a grant that buys headroom re-arms the thresholds
     it drops below. `budget.exhausted` fires on the first refusal only.
   - **Billing-grade delivery**: hex HMAC-SHA256 over the exact request body
-    in `x-lumen-signature` (secret from an env var named by
-    `signing_key_env`, never in the config file, redacted in `Debug` and
-    zeroized on drop), a per-event `x-lumen-event-id` stable across retries,
-    and at-least-once delivery with jittered exponential backoff. Payloads
-    carry accounting facts only: never a plaintext key, never client
+    in `x-lumen-signature`, a per-event `x-lumen-event-id` stable across
+    retries, and at-least-once delivery with jittered exponential backoff.
+    Payloads carry accounting facts only: never a plaintext key, never client
     metadata, never prompt or response content.
+  - **Configured either declaratively or over HTTP.** A `[webhooks]` config
+    block serves a GitOps deployment; the admin API serves a control plane
+    that can neither restart the gateway nor edit its environment:
+    `GET`/`PUT`/`DELETE /admin/webhooks` and
+    `PUT`/`DELETE /admin/webhooks/signing-key`, master-key gated like the
+    rest of `/admin`. Settings written through the API are stored and **win**
+    over the block, and a stored `DELETE` wins too, so neither is undone by
+    the next reload. `GET` reports the source (`database` / `config` /
+    `none`), the signing state, and never the secret.
+  - **Every field is editable at runtime**, `channel_capacity` included: an
+    apply rebuilds the queue while the previous sender drains what it had
+    already accepted. Webhooks can also be enabled from scratch on a gateway
+    that booted without a block, because the queue, sender task and
+    Prometheus collectors are created on first enable. The only thing no
+    reload can do is observe a newly set environment variable, which a
+    running process cannot.
+  - **The signing secret** comes from the environment variable named in the
+    settings when it is set, and otherwise from
+    `PUT /admin/webhooks/signing-key`, which seals it with AES-256-GCM under
+    the master key exactly like `PUT /admin/provider-keys/{name}`. It is
+    redacted in `Debug`, zeroized on drop, and returned by no route. A named
+    variable this process cannot resolve, with nothing stored, is refused
+    rather than silently downgraded to unsigned delivery.
+  - Shutdown cancels the sender without draining, so a sick receiver can
+    never delay shutdown.
   - New metrics: `lumen_webhook_queued_total`, `lumen_webhook_sent_total`,
     `lumen_webhook_dropped_total`, `lumen_webhook_retries_total`,
     `lumen_webhook_dead_total` and the `lumen_webhook_delivery_seconds`
     histogram.
-  - Hot reload covers `url`, `events`, `thresholds`, `timeout_ms`,
-    `max_attempts` and `retry_base_ms` through the same queue and sender
-    task; `channel_capacity`, `signing_key_env` and adding the block to a
-    process that booted without one stay restart-only, with a warning rather
-    than a silent no-op. Shutdown cancels the sender without draining, so a
-    sick receiver can never delay shutdown.
-  - Documented in `docs/operations/keys-budgets.md` (payload shape,
-    signature verification, guarantees) and `config.example.toml`.
-- **The webhook configuration is an admin resource** (ADR 011 amendment). The
-  `[webhooks]` config block stays, but a control plane that cannot restart the
-  gateway or edit its environment can now manage the same settings over HTTP,
-  master-key gated like the rest of `/admin`:
-  - `GET /admin/webhooks` reports the live settings, which source they came
-    from (`database` / `config` / `none`), whether deliveries are signed, and
-    whether a secret is sealed in the database. Never the secret itself.
-  - `PUT /admin/webhooks` replaces every setting, applied immediately and
-    stored so a restart comes up identically. `DELETE /admin/webhooks` stops
-    emission, also stored - so neither is undone by the next config reload.
-  - `PUT` / `DELETE /admin/webhooks/signing-key` store and forget the HMAC
-    secret, sealed with AES-256-GCM under the master key exactly like
-    `PUT /admin/provider-keys/{name}`. A rotation applies to the next delivery
-    attempt with nothing restarted, and retries of an in-flight event keep the
-    signature they were created with.
-  - **Every field is now editable at runtime**, including the two that used to
-    be restart-only. `channel_capacity` rebuilds the bounded queue while the
-    previous sender drains its backlog, so nothing already accepted is
-    discarded to resize a channel. Webhooks can also be enabled from scratch on
-    a gateway that booted without a `[webhooks]` block: the queue, the sender
-    task and the Prometheus collectors are created on first enable, which also
-    means a gateway that never enables them exports no `lumen_webhook_*`
-    series at all.
-  - Precedence: a stored row wins over the config block, and a stored row
-    marked disabled means off whatever the file says. The file remains the
-    declarative default for a GitOps deployment that never calls the API.
-  - `WebhooksConfig` moved to `lumen_auth::events::WebhookSettings` (re-exported
-    under the old name), so one type and one validation implementation now serve
-    the TOML block, the `PUT` body, the database row and the delivery pipeline.
   - New migration `0008_webhook_config.sql`: a single-row `webhook_config`
     table plus a `webhook_secret` table holding only ciphertext.
+  - `WebhooksConfig` is now `lumen_auth::events::WebhookSettings`
+    (re-exported under the old name), so one type and one validation
+    implementation serve the TOML block, the `PUT` body, the database row and
+    the delivery pipeline.
+  - Documented in `docs/operations/keys-budgets.md` (creating a webhook
+    through the API, payload shape, signature verification, guarantees) and
+    `config.example.toml`.
 
 ### Changed
 
