@@ -6,6 +6,19 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **Streaming latency: `TCP_NODELAY` on accepted client connections.** axum
+  does not set the flag and the kernel default leaves Nagle's algorithm on,
+  so every small SSE frame the gateway wrote could stall in the send buffer
+  waiting for the previous packet's delayed ACK (tens of ms per frame on a
+  real network). A streaming completion is hundreds of small frames, so the
+  stalls compounded into a severalfold slowdown of end-to-end streaming time
+  versus direct-to-provider; the loopback bench harness could not see it
+  (no delayed-ACK stalls on localhost). The serve path now sets
+  `TCP_NODELAY` on every accepted socket (the upstream leg already had it
+  via reqwest's default), matching the direct-to-provider baseline.
+
 ### Added
 
 - **ADR 011: outbound webhooks for budget events** (design only, no
