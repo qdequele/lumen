@@ -1,7 +1,7 @@
 # ADR 011 - Outbound webhooks for budget events
 
 - Status: accepted
-- Date: 2026-08-25
+- Date: 2026-08-25 (amended 2026-08-26: admin control surface)
 - Tracking issue: #146
 
 ## Context
@@ -143,6 +143,103 @@ swaps atomically.
 - Testing needs a wiremock receiver: exactly-one signed event per crossing,
   5xx retry with backoff, overflow drop with counter, no secret in logs,
   clean cancellation on shutdown (issue #146 acceptance criteria).
+
+## Amendment 2026-08-26: the webhook configuration is an admin resource
+
+§4 above made `[webhooks]` a config-file section, reloadable but with three
+knobs that could only change across a restart (`channel_capacity`,
+`signing_key_env`, and the presence of the block itself). That is the wrong
+shape for the very caller this feature exists for: a billing control plane
+provisions a gateway through the admin API, and cannot restart it or edit its
+environment. The section stays, and it gains a control surface.
+
+### 1. Routes
+
+Master-key gated, alongside the other `/admin` routes:
+
+- `GET /admin/webhooks` - the live settings, secret-free. Reports which
+  source they came from and whether deliveries are signed.
+- `PUT /admin/webhooks` - replace **every** setting; applied immediately and
+  persisted, so a restart comes up identically.
+- `DELETE /admin/webhooks` - stop emitting, persisted.
+- `PUT /admin/webhooks/signing-key` - store the HMAC secret, sealed at rest.
+- `DELETE /admin/webhooks/signing-key` - forget the stored secret.
+
+There is still exactly **one** receiver (§5 stands): these routes edit that
+receiver, they do not create a collection. Fan-out remains future work.
+
+### 2. Precedence: a stored row wins over the file
+
+Settings written through `PUT` land in a single-row `webhook_config` table in
+the auth database. Resolution at boot and on every reload:
+
+1. A stored row with `enabled = 1` wins outright.
+2. A stored row with `enabled = 0` means off, whatever the file says - so
+   `DELETE` is not silently undone by the next reload.
+3. No row at all falls back to the `[webhooks]` file block (or to off).
+
+The file therefore stays the declarative default for a GitOps deployment that
+never calls the API, and the API wins for a control-plane deployment. This is
+the provider-key rule (ADR 008) with the sources swapped: there, config-named
+environment variables are primary and the database fills in; here the database
+is an explicit operator override of a declarative default. The asymmetry is
+deliberate - a `PUT` that the next reload reverted would be a bug, whereas a
+provider key that the environment overrode is the documented contract.
+
+`GET` names the source (`"database"` / `"config"` / `"none"`) so drift between
+the file and the live setting is visible rather than inferred, in the spirit of
+ADR 010's drift report.
+
+### 3. Every field is editable at runtime
+
+- `url`, `events`, `thresholds`, `timeout_ms`, `max_attempts`,
+  `retry_base_ms`: swapped in the live policy cell, as before.
+- `channel_capacity`: the bounded queue is **rebuilt**. The new queue takes
+  new events; the previous sender task keeps its receiver, drains whatever was
+  already queued under the settings it had, and exits when its last sender is
+  dropped. Nothing already accepted is discarded to change a capacity.
+- The signing secret: held in a swappable cell the sender reads once per
+  **event**, so a rotation applies to the next delivery without restarting the
+  task. Deliberately not per attempt: a signature covers a specific body, so
+  re-reading the cell mid-retry would emit attempts the receiver cannot verify.
+  Retries of an event already in flight therefore keep the secret they were
+  signed with, and a rotation reaches the next event instead.
+
+Enabling webhooks on a process that booted without them therefore works too:
+the queue, the sender task and the Prometheus collectors are created on the
+**first** enable, not at boot. A gateway that never enables webhooks exports no
+`lumen_webhook_*` series at all, which keeps the opt-in default honest on
+`/metrics` as well as on the wire.
+
+### 4. The secret, and why it may cross the API
+
+§3 above read the secret only from an environment variable named in config.
+That is still the primary source, and still the only one for an operator who
+manages secrets through their deployment system. But a control plane that
+provisions a gateway it does not own the environment of needs a way in, so
+`PUT /admin/webhooks/signing-key` accepts the secret in the body and seals it
+with AES-256-GCM under the master key - byte for byte the
+`PUT /admin/provider-keys/{name}` mechanism (ADR 008), including its threat
+model: the database file and `LUMEN_MASTER_KEY` together decrypt it, either
+alone does not.
+
+Resolution order, evaluated at boot, on reload, and on every apply:
+
+1. The variable named by `signing_key_env`, when set and non-empty.
+2. The stored secret.
+3. Neither: deliveries are unsigned. Refused as an error when
+   `signing_key_env` was named (that is a broken deployment, not a choice) and
+   allowed with a loud warning when it was deliberately omitted.
+
+No route ever returns the secret, in any form. `GET /admin/webhooks` reports a
+boolean `signed` and the variable *name*, exactly as the provider surface
+reports key presence without key material.
+
+### 5. What this does not change
+
+Detection, edge-triggering, payload construction, at-least-once delivery,
+idempotency and the "never on the request path" guarantee are all untouched.
+The admin surface configures the pipeline; it is not part of it.
 
 ## Future work
 

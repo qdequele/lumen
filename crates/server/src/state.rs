@@ -94,6 +94,11 @@ pub struct AppState {
     /// `accurate` mode holds pre-built BPE encoders. Shared, never rebuilt on
     /// the request path.
     pub token_counter: Arc<TokenCounter>,
+    /// Outbound budget-webhook control surface (ADR 011); `Some` whenever auth
+    /// is enabled, whether or not webhooks are currently on. The `/admin`
+    /// webhook routes read and reconfigure the delivery pipeline through it.
+    /// `None` = no auth, so no `/admin` surface either.
+    pub webhooks: Option<Arc<crate::webhooks::WebhookController>>,
 }
 
 impl AppState {
@@ -127,7 +132,15 @@ impl AppState {
             config_path: None,
             config_apply_lock: Arc::new(std::sync::Mutex::new(())),
             token_counter: Arc::new(TokenCounter::Heuristic),
+            webhooks: None,
         }
+    }
+
+    /// Attach the outbound-webhook controller (builder style).
+    #[must_use]
+    pub fn with_webhooks(mut self, webhooks: Arc<crate::webhooks::WebhookController>) -> Self {
+        self.webhooks = Some(webhooks);
+        self
     }
 
     /// Attach the token counter (builder style). Default is the byte heuristic.

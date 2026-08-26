@@ -17,6 +17,7 @@ lumen-core = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 sqlx = { workspace = true }
 blake3 = { workspace = true }
 aes-gcm = { workspace = true }

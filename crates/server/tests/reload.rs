@@ -165,6 +165,7 @@ async fn rotating_a_db_provider_key_takes_effect_on_reload_without_restart() {
             vec!["cohere".to_owned()],
         ))),
         auth_knobs: None,
+        webhooks: None,
         auth_runtime: None,
     });
     reload_once(&path, &targets).await;
@@ -240,6 +241,7 @@ async fn reload_makes_an_offline_group_and_member_key_live_and_group_enforced() 
         key_backfill: Arc::new(ArcSwap::from_pointee(HashMap::new())),
         key_source: None,
         auth_knobs: None,
+        webhooks: None,
         auth_runtime: Some(Arc::clone(&runtime)),
     });
     reload_once(&path, &targets).await;
@@ -306,6 +308,7 @@ fn reload_targets(registry: Arc<Registry>, metrics: ReloadMetrics) -> ReloadTarg
         key_backfill: Arc::new(ArcSwap::from_pointee(HashMap::new())),
         key_source: None,
         auth_knobs: None,
+        webhooks: None,
         auth_runtime: None,
     }
 }
@@ -396,6 +399,264 @@ async fn spawn_config_reloader_survives_a_rename_replace_of_a_bare_filename_conf
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     handle.abort();
+}
+
+/// A cohere config with auth on, and an optional `[webhooks]` block appended.
+/// Used by the webhook reload test to rewrite the very file the reloader reads.
+fn webhook_config_body(upstream: &str, db: &Path, webhooks: Option<&str>) -> String {
+    format!(
+        r#"
+        [auth]
+        enabled = true
+        db_path = "{db}"
+
+        [[providers]]
+        name = "cohere"
+        kind = "cohere"
+        base_url = "{upstream}"
+        [[providers.models]]
+        id = "rr"
+        upstream_id = "rerank-v3.5"
+        capabilities = ["rerank"]
+        {block}
+        "#,
+        db = db.display(),
+        block = webhooks.unwrap_or_default()
+    )
+}
+
+/// Open `db`, create one $100 key, and build the live auth runtime over it.
+/// Returns the runtime and the key's one-time plaintext.
+async fn webhook_auth_runtime(
+    db: &Path,
+) -> (
+    Arc<lumen_server::auth::AuthRuntime>,
+    lumen_auth::key::PlaintextKey,
+) {
+    use lumen_auth::key::hash_key;
+    use lumen_auth::state::AuthState;
+    use lumen_auth::store::NewKey;
+    use lumen_server::auth::AuthRuntime;
+
+    let store = KeyStore::connect(&format!("sqlite://{}?mode=rwc", db.display()))
+        .await
+        .expect("open store");
+    let (plaintext, _record) = store
+        .create_key(NewKey {
+            name: "prepaid".to_owned(),
+            budget_max: Some(100.0),
+            ..NewKey::default()
+        })
+        .await
+        .expect("create key");
+    let entries = store.load_auth_entries().await.expect("load entries");
+    let runtime = Arc::new(AuthRuntime {
+        keys: AuthState::load(Vec::new(), entries),
+        store,
+        admin_token_hash: hash_key(&"a".repeat(64)),
+        master: Some(master()),
+    });
+    (runtime, plaintext)
+}
+
+#[tokio::test]
+async fn reload_retargets_and_retunes_webhooks_without_dropping_the_queue() {
+    // ADR 011 §4: a reload swaps the receiver URL and the event/threshold set
+    // through the SAME bounded queue and the same sender task, so a retarget
+    // never loses what is already queued. Removing the block stops detection.
+    use lumen_auth::events::EventKind;
+    use lumen_auth::state::usd_to_micro;
+    use lumen_server::webhooks::WebhookController;
+    use tokio_util::sync::CancellationToken;
+
+    let upstream = MockServer::start().await;
+    let dir = tempdir();
+    let db = dir.join("auth.db");
+    let path = dir.join("config.toml");
+
+    let first = "https://first.example/events";
+    let second = "https://second.example/events";
+    let write = |body: &str| {
+        let mut file = std::fs::File::create(&path).expect("write config");
+        file.write_all(body.as_bytes()).expect("write config body");
+    };
+    write(&webhook_config_body(
+        &upstream.uri(),
+        &db,
+        Some(&format!(
+            r#"
+            [webhooks]
+            url = "{first}"
+            events = ["budget.threshold"]
+            thresholds = [50]
+            "#
+        )),
+    ));
+
+    // A live auth runtime with one $100 key, and the webhook stack over it.
+    let (runtime, plaintext) = webhook_auth_runtime(&db).await;
+
+    let boot_config = Config::load(&path).expect("boot config loads");
+    let webhooks = Arc::new(WebhookController::new(
+        Metrics::new(),
+        lumen_providers::http::build_client(),
+        CancellationToken::new(),
+    ));
+    webhooks
+        .refresh_from_store(&runtime.store, runtime.master.as_ref())
+        .await;
+    let source = webhooks
+        .resolve_and_apply(boot_config.webhooks.as_ref(), &runtime.keys)
+        .expect("the boot block applies");
+    assert_eq!(source, lumen_auth::events::SettingsSource::Config);
+    assert_eq!(
+        webhooks.live_settings().expect("enabled").url,
+        first,
+        "the file block is in force with no stored row"
+    );
+
+    let targets = Arc::new(ReloadTargets {
+        registry: registry_with_key(&path, "irrelevant-key"),
+        pricing: Arc::new(ArcSwap::from_pointee(CostTable::default())),
+        resilience: Arc::new(ResilienceRuntime::defaults()),
+        metrics: ReloadMetrics::register(&Metrics::new()).expect("reload metrics"),
+        key_backfill: Arc::new(ArcSwap::from_pointee(HashMap::new())),
+        key_source: None,
+        auth_knobs: None,
+        webhooks: Some(Arc::clone(&webhooks)),
+        auth_runtime: Some(Arc::clone(&runtime)),
+    });
+
+    // Reload with a new URL and a new event/threshold set.
+    write(&webhook_config_body(
+        &upstream.uri(),
+        &db,
+        Some(&format!(
+            r#"
+            [webhooks]
+            url = "{second}"
+            events = ["budget.exhausted"]
+            thresholds = [10]
+            "#
+        )),
+    ));
+    reload_once(&path, &targets).await;
+
+    assert_eq!(
+        webhooks.live_settings().expect("still enabled").url,
+        second,
+        "the reload retargets delivery"
+    );
+    let live = runtime.keys.signals().expect("signals still installed");
+    assert!(live.wants(EventKind::BudgetExhausted));
+    assert!(
+        !live.wants(EventKind::BudgetThreshold),
+        "the reloaded event set replaces the old one"
+    );
+    assert_eq!(live.thresholds(), [10]);
+
+    // The key is still live and enforced; nothing about the reload disturbed
+    // the in-memory budget state.
+    let entry = runtime
+        .keys
+        .authenticate(plaintext.reveal(), 0)
+        .expect("key still live after the reload");
+    assert!(entry.admit(0, 0, usd_to_micro(1.0)).is_ok());
+
+    // Removing the block stops detection entirely.
+    write(&webhook_config_body(&upstream.uri(), &db, None));
+    reload_once(&path, &targets).await;
+    assert!(
+        runtime.keys.signals().is_none(),
+        "removing [webhooks] must stop emitting budget events"
+    );
+    assert!(webhooks.live_settings().is_none());
+}
+
+#[tokio::test]
+async fn a_stored_webhook_row_wins_over_the_config_block_across_reloads() {
+    // ADR 011 amendment §2: a PUT /admin/webhooks must not be undone by the
+    // next reload, and a DELETE must not be re-enabled by it either.
+    use lumen_auth::events::{SettingsSource, WebhookSettings};
+    use lumen_server::webhooks::WebhookController;
+    use tokio_util::sync::CancellationToken;
+
+    let upstream = MockServer::start().await;
+    let dir = tempdir();
+    let db = dir.join("auth.db");
+    let path = dir.join("config.toml");
+    let from_file = "https://from-file.example/events";
+    let from_api = "https://from-api.example/events";
+    let write = |body: &str| {
+        let mut file = std::fs::File::create(&path).expect("write config");
+        file.write_all(body.as_bytes()).expect("write config body");
+    };
+    write(&webhook_config_body(
+        &upstream.uri(),
+        &db,
+        Some(&format!(
+            r#"
+            [webhooks]
+            url = "{from_file}"
+            events = ["budget.threshold"]
+            thresholds = [50]
+            "#
+        )),
+    ));
+
+    let (runtime, _plaintext) = webhook_auth_runtime(&db).await;
+    let webhooks = Arc::new(WebhookController::new(
+        Metrics::new(),
+        lumen_providers::http::build_client(),
+        CancellationToken::new(),
+    ));
+    let targets = Arc::new(ReloadTargets {
+        registry: registry_with_key(&path, "irrelevant-key"),
+        pricing: Arc::new(ArcSwap::from_pointee(CostTable::default())),
+        resilience: Arc::new(ResilienceRuntime::defaults()),
+        metrics: ReloadMetrics::register(&Metrics::new()).expect("reload metrics"),
+        key_backfill: Arc::new(ArcSwap::from_pointee(HashMap::new())),
+        key_source: None,
+        auth_knobs: None,
+        webhooks: Some(Arc::clone(&webhooks)),
+        auth_runtime: Some(Arc::clone(&runtime)),
+    });
+
+    // With no stored row, the file wins.
+    reload_once(&path, &targets).await;
+    assert_eq!(webhooks.source(), SettingsSource::Config);
+    assert_eq!(webhooks.live_settings().expect("enabled").url, from_file);
+
+    // Store a row (as PUT /admin/webhooks does) and reload: the row wins.
+    runtime
+        .store
+        .save_webhook_config(&WebhookSettings {
+            url: from_api.to_owned(),
+            ..WebhookSettings::default()
+        })
+        .await
+        .expect("store the webhook config");
+    reload_once(&path, &targets).await;
+    assert_eq!(webhooks.source(), SettingsSource::Database);
+    assert_eq!(
+        webhooks.live_settings().expect("enabled").url,
+        from_api,
+        "a stored row must survive a reload that would otherwise re-apply the file"
+    );
+
+    // Disable it (as DELETE /admin/webhooks does) and reload: still off, even
+    // though the file block is right there.
+    runtime
+        .store
+        .disable_webhook_config()
+        .await
+        .expect("disable the stored config");
+    reload_once(&path, &targets).await;
+    assert_eq!(webhooks.source(), SettingsSource::None);
+    assert!(
+        webhooks.live_settings().is_none(),
+        "a disabled row must shadow the config block"
+    );
 }
 
 /// The current value of `lumen_config_reloads_total`, scraped from the

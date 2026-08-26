@@ -6,6 +6,7 @@
 //! against in-memory state only.
 
 use crate::crypto::MasterKey;
+use crate::events::WebhookSettings;
 use crate::key::{generate, hash_key, random_id, PlaintextKey};
 use crate::{now_unix, AuthError};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
@@ -42,6 +43,23 @@ pub struct VirtualKeyRecord {
     /// never authenticates and rejects further updates, but its row stays so
     /// `usage_log.key_id` attribution survives (issue #66).
     pub deleted_at: Option<i64>,
+}
+
+/// The stored webhook configuration (ADR 011 amendment §2): the settings plus
+/// whether they are currently in force.
+///
+/// `enabled = false` is meaningful, not merely absent: it shadows a
+/// `[webhooks]` config-file block, so a `DELETE /admin/webhooks` survives the
+/// next reload instead of being quietly re-applied.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct StoredWebhookConfig {
+    /// Whether these settings are in force.
+    pub enabled: bool,
+    /// The settings themselves (kept even while disabled, so a re-enable does
+    /// not have to resend them).
+    pub settings: WebhookSettings,
+    /// When the row was last written, unix seconds.
+    pub updated_at: i64,
 }
 
 /// One budget-group row (ADR 009): a shared budget pool any number of
@@ -1110,6 +1128,173 @@ impl KeyStore {
         String::from_utf8(plaintext)
             .map(Some)
             .map_err(|_| AuthError::Decrypt)
+    }
+
+    // ---- Webhook configuration (ADR 011 amendment) --------------------------
+
+    /// Load the stored webhook configuration, if an operator has ever written
+    /// one. `Ok(None)` means no row: the caller falls back to the
+    /// `[webhooks]` config-file block.
+    ///
+    /// A row with `enabled = 0` is returned as
+    /// [`StoredWebhookConfig::disabled`], which means **off regardless of the
+    /// file** - so a `DELETE /admin/webhooks` is not undone by the next
+    /// config reload.
+    pub async fn load_webhook_config(&self) -> Result<Option<StoredWebhookConfig>, AuthError> {
+        let row = sqlx::query(
+            "SELECT enabled, url, signing_key_env, events, thresholds, channel_capacity, \
+             timeout_ms, max_attempts, retry_base_ms, updated_at FROM webhook_config WHERE id = 1",
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else { return Ok(None) };
+
+        let enabled: i64 = row.try_get("enabled")?;
+        let updated_at: i64 = row.try_get("updated_at")?;
+        // The settings columns are read even for a disabled row: `GET
+        // /admin/webhooks` shows an operator what a re-enable would restore.
+        let events_json: String = row.try_get("events")?;
+        let thresholds_json: String = row.try_get("thresholds")?;
+        let capacity: i64 = row.try_get("channel_capacity")?;
+        let settings = WebhookSettings {
+            url: row.try_get("url")?,
+            signing_key_env: row.try_get("signing_key_env")?,
+            // A row this process wrote is always well-formed JSON; a row
+            // hand-edited into nonsense falls back to the defaults rather
+            // than refusing to boot over a convenience field.
+            events: serde_json::from_str(&events_json).unwrap_or_else(|error| {
+                tracing::warn!(%error, "stored webhook events unreadable; using the defaults");
+                WebhookSettings::default().events
+            }),
+            thresholds: serde_json::from_str(&thresholds_json).unwrap_or_else(|error| {
+                tracing::warn!(%error, "stored webhook thresholds unreadable; using the defaults");
+                WebhookSettings::default().thresholds
+            }),
+            channel_capacity: usize::try_from(capacity).unwrap_or(1),
+            timeout_ms: u64::try_from(row.try_get::<i64, _>("timeout_ms")?).unwrap_or(1),
+            max_attempts: u32::try_from(row.try_get::<i64, _>("max_attempts")?).unwrap_or(1),
+            retry_base_ms: u64::try_from(row.try_get::<i64, _>("retry_base_ms")?).unwrap_or(1),
+        };
+        Ok(Some(StoredWebhookConfig {
+            enabled: enabled != 0,
+            settings,
+            updated_at,
+        }))
+    }
+
+    /// Write (or replace) the webhook configuration and mark it enabled.
+    /// Single-row by construction: the table's `CHECK (id = 1)` makes the
+    /// upsert the only possible shape.
+    pub async fn save_webhook_config(
+        &self,
+        settings: &WebhookSettings,
+    ) -> Result<StoredWebhookConfig, AuthError> {
+        let updated_at = now_unix();
+        // `events` and `thresholds` are simple arrays of plain values, so
+        // serialization cannot fail; fall back to `[]` rather than propagate a
+        // surprise error type through the admin route.
+        let events = serde_json::to_string(&settings.events).unwrap_or_else(|_| "[]".to_owned());
+        let thresholds =
+            serde_json::to_string(&settings.thresholds).unwrap_or_else(|_| "[]".to_owned());
+        sqlx::query(
+            "INSERT INTO webhook_config (id, enabled, url, signing_key_env, events, thresholds, \
+             channel_capacity, timeout_ms, max_attempts, retry_base_ms, updated_at) \
+             VALUES (1, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             ON CONFLICT (id) DO UPDATE SET enabled = 1, url = excluded.url, \
+             signing_key_env = excluded.signing_key_env, events = excluded.events, \
+             thresholds = excluded.thresholds, channel_capacity = excluded.channel_capacity, \
+             timeout_ms = excluded.timeout_ms, max_attempts = excluded.max_attempts, \
+             retry_base_ms = excluded.retry_base_ms, updated_at = excluded.updated_at",
+        )
+        .bind(&settings.url)
+        .bind(settings.signing_key_env.as_deref())
+        .bind(&events)
+        .bind(&thresholds)
+        .bind(i64::try_from(settings.channel_capacity).unwrap_or(i64::MAX))
+        .bind(i64::try_from(settings.timeout_ms).unwrap_or(i64::MAX))
+        .bind(i64::from(settings.max_attempts))
+        .bind(i64::try_from(settings.retry_base_ms).unwrap_or(i64::MAX))
+        .bind(updated_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(StoredWebhookConfig {
+            enabled: true,
+            settings: settings.clone(),
+            updated_at,
+        })
+    }
+
+    /// Mark the stored configuration disabled, keeping its settings so a
+    /// later re-enable does not have to resend them.
+    ///
+    /// Returns `false` when there was no row to disable - the caller reports
+    /// that as "nothing was enabled" rather than inventing a disabled row,
+    /// which would shadow a perfectly good `[webhooks]` file block for good.
+    pub async fn disable_webhook_config(&self) -> Result<bool, AuthError> {
+        let result = sqlx::query(
+            "UPDATE webhook_config SET enabled = 0, updated_at = ? WHERE id = 1 AND enabled = 1",
+        )
+        .bind(now_unix())
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Persist a webhook configuration as disabled, so a `DELETE` can shadow
+    /// a `[webhooks]` config-file block that would otherwise be re-applied by
+    /// the next reload.
+    pub async fn save_webhook_config_disabled(
+        &self,
+        settings: &WebhookSettings,
+    ) -> Result<(), AuthError> {
+        self.save_webhook_config(settings).await?;
+        self.disable_webhook_config().await?;
+        Ok(())
+    }
+
+    /// Store (or replace) the HMAC signing secret, sealed with the master key
+    /// - byte for byte the provider-key mechanism.
+    pub async fn store_webhook_secret(
+        &self,
+        secret: &str,
+        master: &MasterKey,
+    ) -> Result<(), AuthError> {
+        let sealed = master.seal(secret.as_bytes())?;
+        sqlx::query(
+            "INSERT INTO webhook_secret (id, ciphertext, created_at) VALUES (1, ?, ?) \
+             ON CONFLICT (id) DO UPDATE SET ciphertext = excluded.ciphertext",
+        )
+        .bind(sealed)
+        .bind(now_unix())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Load and decrypt the stored signing secret. `Ok(None)` when absent; an
+    /// error when present but undecryptable (wrong master key / corruption) -
+    /// that must fail loudly, not silently deliver unsigned.
+    pub async fn load_webhook_secret(
+        &self,
+        master: &MasterKey,
+    ) -> Result<Option<String>, AuthError> {
+        let row = sqlx::query("SELECT ciphertext FROM webhook_secret WHERE id = 1")
+            .fetch_optional(&self.pool)
+            .await?;
+        let Some(row) = row else { return Ok(None) };
+        let sealed: Vec<u8> = row.try_get("ciphertext")?;
+        let plaintext = master.open(&sealed)?;
+        String::from_utf8(plaintext)
+            .map(Some)
+            .map_err(|_| AuthError::Decrypt)
+    }
+
+    /// Remove the stored signing secret. `false` when there was none.
+    pub async fn delete_webhook_secret(&self) -> Result<bool, AuthError> {
+        let result = sqlx::query("DELETE FROM webhook_secret WHERE id = 1")
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
     }
 
     // ---- Diagnostics --------------------------------------------------------

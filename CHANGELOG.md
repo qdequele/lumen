@@ -6,18 +6,69 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ## [Unreleased]
 
-### Fixed
+### Added
 
-- **Streaming latency: `TCP_NODELAY` on accepted client connections.** axum
-  does not set the flag and the kernel default leaves Nagle's algorithm on,
-  so every small SSE frame the gateway wrote could stall in the send buffer
-  waiting for the previous packet's delayed ACK (tens of ms per frame on a
-  real network). A streaming completion is hundreds of small frames, so the
-  stalls compounded into a severalfold slowdown of end-to-end streaming time
-  versus direct-to-provider; the loopback bench harness could not see it
-  (no delayed-ACK stalls on localhost). The serve path now sets
-  `TCP_NODELAY` on every accepted socket (the upstream leg already had it
-  via reqwest's default), matching the direct-to-provider baseline.
+- **Outbound webhooks for budget events** (ADR 011 and its 2026-08-26
+  amendment, closes #146). LUMEN can POST `budget.threshold`,
+  `budget.exhausted`, `key.disabled`, `key.rotated` and `key.deleted` events
+  to a billing backend, so a prepaid-credits control plane can auto-recharge
+  through `POST /admin/keys/{id}/grant` *before* a customer hits a 402
+  `LM-4001`, instead of polling for it. Both budget events cover keys and
+  budget groups (ADR 009).
+  - **Absent by default**: with no webhook configured the gateway makes no
+    outbound call to anything but its configured providers, and does not even
+    register a webhook metric. Webhooks require `auth.enabled = true`.
+  - **Never on the request path**: a crossing is detected by comparing the
+    armed thresholds on the atomic budget settle that already happens per
+    request, then queued with a non-blocking `try_send` into a bounded
+    channel drained by a background task. A full queue drops the event and
+    counts it (`lumen_webhook_dropped_total`) rather than slowing a request.
+  - **Edge-triggered**: a threshold fires once per budget epoch, not once
+    per request beyond it; a grant that buys headroom re-arms the thresholds
+    it drops below. `budget.exhausted` fires on the first refusal only.
+  - **Billing-grade delivery**: hex HMAC-SHA256 over the exact request body
+    in `x-lumen-signature`, a per-event `x-lumen-event-id` stable across
+    retries, and at-least-once delivery with jittered exponential backoff.
+    Payloads carry accounting facts only: never a plaintext key, never client
+    metadata, never prompt or response content.
+  - **Configured either declaratively or over HTTP.** A `[webhooks]` config
+    block serves a GitOps deployment; the admin API serves a control plane
+    that can neither restart the gateway nor edit its environment:
+    `GET`/`PUT`/`DELETE /admin/webhooks` and
+    `PUT`/`DELETE /admin/webhooks/signing-key`, master-key gated like the
+    rest of `/admin`. Settings written through the API are stored and **win**
+    over the block, and a stored `DELETE` wins too, so neither is undone by
+    the next reload. `GET` reports the source (`database` / `config` /
+    `none`), the signing state, and never the secret.
+  - **Every field is editable at runtime**, `channel_capacity` included: an
+    apply rebuilds the queue while the previous sender drains what it had
+    already accepted. Webhooks can also be enabled from scratch on a gateway
+    that booted without a block, because the queue, sender task and
+    Prometheus collectors are created on first enable. The only thing no
+    reload can do is observe a newly set environment variable, which a
+    running process cannot.
+  - **The signing secret** comes from the environment variable named in the
+    settings when it is set, and otherwise from
+    `PUT /admin/webhooks/signing-key`, which seals it with AES-256-GCM under
+    the master key exactly like `PUT /admin/provider-keys/{name}`. It is
+    redacted in `Debug`, zeroized on drop, and returned by no route. A named
+    variable this process cannot resolve, with nothing stored, is refused
+    rather than silently downgraded to unsigned delivery.
+  - Shutdown cancels the sender without draining, so a sick receiver can
+    never delay shutdown.
+  - New metrics: `lumen_webhook_queued_total`, `lumen_webhook_sent_total`,
+    `lumen_webhook_dropped_total`, `lumen_webhook_retries_total`,
+    `lumen_webhook_dead_total` and the `lumen_webhook_delivery_seconds`
+    histogram.
+  - New migration `0008_webhook_config.sql`: a single-row `webhook_config`
+    table plus a `webhook_secret` table holding only ciphertext.
+  - `WebhooksConfig` is now `lumen_auth::events::WebhookSettings`
+    (re-exported under the old name), so one type and one validation
+    implementation serve the TOML block, the `PUT` body, the database row and
+    the delivery pipeline.
+  - Documented in `docs/operations/keys-budgets.md` (creating a webhook
+    through the API, payload shape, signature verification, guarantees) and
+    `config.example.toml`.
 
 ### Changed
 
@@ -31,18 +82,29 @@ All notable changes to LUMEN are documented here. The format is based on
   connection (NAT reap, upstream restart) is detected in seconds instead of
   stalling the next request on it.
 
-### Added
 
-- **ADR 011: outbound webhooks for budget events** (design only, no
-  implementation yet; tracked in #146). Opt-in `[webhooks]` sender for
-  `budget.threshold` / `budget.exhausted` / key lifecycle events, so a
-  billing backend can top up a budget through the grant routes before the
-  customer hits 402, instead of polling. Detection rides the existing
-  in-memory settle; delivery is a bounded channel and an async sender with
-  HMAC-signed, idempotent, at-least-once semantics. No `[webhooks]` block
-  means no outbound calls and no behavior change.
+- **Docs: README admin row and a maintainer release guide.** The README API
+  table's `/admin/*` row now lists all five verbs and names what the surface
+  actually covers (keys, budgets, usage reporting and export, provider-key
+  rotation, config read/apply); it had not been updated since before ADR 010.
+  CONTRIBUTING.md gains a "Cutting a release" section documenting the
+  draft-first pipeline and the immutable-release rules (no post-publish asset
+  uploads; deleting a published release permanently retires its tag name, so
+  a broken release means cutting the next patch version, never re-tagging).
 
 ### Fixed
+
+- **Streaming latency: `TCP_NODELAY` on accepted client connections.** axum
+  does not set the flag and the kernel default leaves Nagle's algorithm on,
+  so every small SSE frame the gateway wrote could stall in the send buffer
+  waiting for the previous packet's delayed ACK (tens of ms per frame on a
+  real network). A streaming completion is hundreds of small frames, so the
+  stalls compounded into a severalfold slowdown of end-to-end streaming time
+  versus direct-to-provider; the loopback bench harness could not see it
+  (no delayed-ACK stalls on localhost). The serve path now sets
+  `TCP_NODELAY` on every accepted socket (the upstream leg already had it
+  via reqwest's default), matching the direct-to-provider baseline.
+
 
 - **Self-sustaining config hot-reload loop.** The reload watcher is armed on
   the config file's parent *directory* (a file-level watch does not survive a
@@ -61,17 +123,6 @@ All notable changes to LUMEN are documented here. The format is based on
   rather than on an explicit inotify mask keeps this backend-agnostic. Hot
   reload is unchanged otherwise: a genuine config change still triggers
   exactly one reload.
-
-### Changed
-
-- **Docs: README admin row and a maintainer release guide.** The README API
-  table's `/admin/*` row now lists all five verbs and names what the surface
-  actually covers (keys, budgets, usage reporting and export, provider-key
-  rotation, config read/apply); it had not been updated since before ADR 010.
-  CONTRIBUTING.md gains a "Cutting a release" section documenting the
-  draft-first pipeline and the immutable-release rules (no post-publish asset
-  uploads; deleting a published release permanently retires its tag name, so
-  a broken release means cutting the next patch version, never re-tagging).
 
 ## [0.3.1] - 2026-08-25
 

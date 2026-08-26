@@ -18,13 +18,36 @@
 //! - the **virtual-key table**, re-synced from the auth DB so keys created
 //!   offline (e.g. `lumen keys create`) become live without a restart;
 //!   existing entries keep their in-memory spend (memory stays the source of
-//!   truth for accrued spend after boot).
+//!   truth for accrued spend after boot);
+//! - the **whole webhook configuration** (ADR 011 and its amendment). A
+//!   reload re-resolves the precedence - a stored row written through
+//!   `PUT /admin/webhooks` wins over the `[webhooks]` file block, and a
+//!   stored row marked disabled means off whatever the file says - then
+//!   applies the winner. Retuning `url`, `events`, `thresholds` or the retry
+//!   knobs keeps the bounded queue and its sender task, so a retarget never
+//!   drops what is already queued; changing `channel_capacity` replaces both,
+//!   with the previous sender draining the events it had already accepted
+//!   before it exits. Removing the `[webhooks]` block stops detection only
+//!   when no enabled stored row exists - precedence means an enabled row keeps
+//!   delivering whatever the file says, until `DELETE /admin/webhooks` marks
+//!   it disabled.
 //!
 //! Read once at boot and therefore **restart-only** (documented in
 //! `docs/backlog.md`): the server bind address (rebinding a live listener is
-//! high-risk and out of scope), `auth.enabled`, `auth.db_path`, and the bounded
+//! high-risk and out of scope), `auth.enabled`, `auth.db_path`, the bounded
 //! usage-log channel knobs (`usage_channel_capacity`, `usage_batch_max`,
 //! `usage_flush_ms`) whose capacity is structurally fixed at channel creation.
+//!
+//! Webhooks have no restart-only field left: with auth enabled the
+//! [`WebhookController`] exists whether or not a `[webhooks]` block does, and
+//! its `apply` creates the queue and sender from nothing (or rebuilds them for
+//! a new `channel_capacity`), so a block added to a running process takes
+//! effect on the next reload. The one thing no reload can do is observe a
+//! *newly set* environment variable, because a running process cannot: pointing
+//! `signing_key_env` at a variable that was unset at startup needs a restart,
+//! or `PUT /admin/webhooks/signing-key`, which needs no variable at all. With
+//! auth *disabled* there is no controller and no `/admin` surface, so enabling
+//! webhooks then does require a restart.
 //!
 //! Provider API keys are re-resolved from the environment on every reload (env
 //! stays the primary source). For providers whose env var is unset, the key is
@@ -49,6 +72,7 @@ use tokio::sync::Notify;
 use crate::config::{Config, ConfigError};
 use crate::pricing::CostTable;
 use crate::resilience::ResilienceRuntime;
+use crate::webhooks::WebhookController;
 
 /// Why a reload was rejected. The previous config is always kept on error.
 #[derive(Debug, thiserror::Error)]
@@ -159,6 +183,10 @@ pub struct ReloadTargets {
     /// Live auth knobs swapped from the reloaded config; `Some` only when auth
     /// is enabled.
     pub auth_knobs: Option<Arc<AuthKnobs>>,
+    /// The outbound-webhook control surface (ADR 011); `Some` whenever auth
+    /// is enabled, whether or not webhooks are currently on. A reload
+    /// re-resolves the stored row against the file block through it.
+    pub webhooks: Option<Arc<WebhookController>>,
     /// The live auth runtime (in-memory key table + store); `Some` only when
     /// auth is enabled. On each reload the virtual-key table is re-read from
     /// the DB so keys created offline (e.g. `lumen keys create`) become live
@@ -238,6 +266,7 @@ pub fn apply_reload(path: &Path, targets: &ReloadTargets) -> Result<(), ReloadEr
     if let Some(knobs) = &targets.auth_knobs {
         knobs.store_from_config(&config);
     }
+    apply_webhook_reload(&config, targets);
     targets.metrics.inc_success();
     tracing::info!(
         model_count = config.loaded_models().len(),
@@ -245,6 +274,40 @@ pub fn apply_reload(path: &Path, targets: &ReloadTargets) -> Result<(), ReloadEr
         "configuration reloaded; routing table, pricing, resilience policy and auth knobs swapped"
     );
     Ok(())
+}
+
+/// Retune outbound webhooks from a reloaded config (ADR 011 §4).
+///
+/// The queue and the sender task survive the reload; only the delivery policy
+/// and the signalling policy (enabled events, thresholds) are swapped. Two
+/// cases are reported rather than applied, because neither can be honoured
+/// without a restart: a `[webhooks]` block added to a process that booted
+/// without one (there is no queue to attach to), and the structural knobs
+/// `apply_reload` warns about.
+fn apply_webhook_reload(config: &Config, targets: &ReloadTargets) {
+    // Both are `Some` exactly when auth is enabled, and `Config::validate`
+    // refuses `[webhooks]` without it.
+    let (Some(webhooks), Some(auth_runtime)) = (&targets.webhooks, &targets.auth_runtime) else {
+        if config.webhooks.is_some() {
+            tracing::warn!(
+                "config declares [webhooks] but auth is disabled in this process; outbound \
+                 budget events need auth.enabled = true and a restart"
+            );
+        }
+        return;
+    };
+    // The stored row was refreshed by `reload_once` just before this.
+    match webhooks.resolve_and_apply(config.webhooks.as_ref(), &auth_runtime.keys) {
+        Ok(source) => tracing::debug!(?source, "webhook configuration resolved"),
+        // A bad webhook block must not reject the whole reload: routing,
+        // pricing and resilience have already swapped, and refusing them over
+        // a signalling convenience would be the wrong trade. The previous
+        // pipeline keeps running and the operator gets a warning.
+        Err(error) => tracing::warn!(
+            %error,
+            "webhook configuration rejected; keeping the previous webhook settings"
+        ),
+    }
 }
 
 /// Re-read every configured provider's key from the encrypted DB store. A
@@ -462,6 +525,14 @@ pub async fn reload_once(path: &Path, targets: &Arc<ReloadTargets>) {
             ),
         }
     }
+    // The webhook config and its sealed signing secret live in the same DB;
+    // refresh the cache the synchronous resolve below reads (ADR 011
+    // amendment §2). Errors keep the previous cache, logged inside.
+    if let (Some(webhooks), Some(runtime)) = (&targets.webhooks, &targets.auth_runtime) {
+        webhooks
+            .refresh_from_store(&runtime.store, runtime.master.as_ref())
+            .await;
+    }
     let path = path.to_path_buf();
     let targets = Arc::clone(targets);
     let joined = tokio::task::spawn_blocking(move || {
@@ -564,6 +635,7 @@ mod tests {
             key_backfill: Arc::new(ArcSwap::from_pointee(HashMap::new())),
             key_source: None,
             auth_knobs: None,
+            webhooks: None,
             auth_runtime: None,
         }
     }
@@ -742,6 +814,7 @@ mod tests {
             key_backfill: Arc::new(ArcSwap::from_pointee(boot_backfill)),
             key_source: Some(source),
             auth_knobs: None,
+            webhooks: None,
             auth_runtime: None,
         });
 

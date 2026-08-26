@@ -22,6 +22,12 @@ to gate it. See [`SECURITY.md`](https://github.com/qdequele/lumen/blob/main/SECU
 | `lumen_metadata_rejected_total` | none | `x-lumen-metadata` headers dropped as malformed or out of bounds. |
 | `lumen_config_reloads_total` | none | Successful configuration hot reloads. |
 | `lumen_config_reload_failures_total` | none | Configuration reloads rejected as invalid; the previous config kept serving. |
+| `lumen_webhook_queued_total` | none | Webhook events accepted into the outbound queue (ADR 011), across every configured event kind - key lifecycle included, not only the budget ones. The whole `lumen_webhook_*` family appears the first time a webhook is enabled, not at boot. |
+| `lumen_webhook_sent_total` | none | Webhook events the receiver acknowledged with a 2xx. |
+| `lumen_webhook_dropped_total` | none | Webhook events dropped because the queue was full. |
+| `lumen_webhook_retries_total` | none | Webhook delivery attempts that failed and were retried with backoff. |
+| `lumen_webhook_dead_total` | none | Webhook events abandoned after exhausting their retry budget, or permanently rejected by the receiver. |
+| `lumen_webhook_delivery_seconds` | none | Wall time of a single webhook delivery attempt. |
 
 `lumen_tokens_total`, `lumen_rerank_search_units_total`, `lumen_media_total`
 and `lumen_media_bytes_total` also gain one extra label per key listed in
@@ -44,6 +50,8 @@ something watches these:
 |---|---|
 | `increase(lumen_usage_log_dropped_total[5m]) > 0` | Usage-log rows are being shed under pressure: token accounting is incomplete for those requests. Raise `usage_channel_capacity` or investigate DB write latency. |
 | `increase(lumen_config_reload_failures_total[15m]) > 0` | A config reload was rejected; the **old** config keeps serving. The deploy that "went out" did not. |
+| `increase(lumen_webhook_dropped_total[5m]) > 0` | The webhook queue is full and signals are being shed: a billing backend relying on `budget.threshold` for auto-recharge is running blind, and key-lifecycle events are being lost too. Raise `channel_capacity` or fix a slow receiver. |
+| `increase(lumen_webhook_dead_total[15m]) > 0` | Events are being abandoned - the receiver is down past the retry budget, or rejecting deliveries outright (check for a signature mismatch). Reconcile through `GET /admin/usage/export` until it recovers. |
 | `lumen_circuit_state == 1` for 2m | A provider/model circuit is open: calls are short-circuited to fallbacks (or failing). |
 | `lumen_provider_up == 0` for 5m | A background health probe cannot reach a provider (only exported for probed providers). |
 | 5xx share of `lumen_request_duration_seconds_count` > 5% | Upstream or gateway failures; `499` (client cancelled) is deliberately outside the 5xx class and does not count. |

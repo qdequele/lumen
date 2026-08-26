@@ -12,9 +12,13 @@
 //! * [`store`] - the SQLite store (sqlx) with embedded migrations.
 //! * [`state`] - the in-memory key table the request path enforces against.
 //! * [`usage`] - the bounded-channel, batched usage-log writer.
+//! * [`events`] - budget threshold/exhaustion signals for outbound webhooks
+//!   (ADR 011), detected on the settle that already happens per request and
+//!   queued through a bounded channel.
 
 pub mod crypto;
 pub mod error;
+pub mod events;
 pub mod key;
 pub mod state;
 pub mod store;
