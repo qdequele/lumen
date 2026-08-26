@@ -360,6 +360,24 @@ async fn wait_for_events(receiver: &MockServer, count: usize) -> Vec<Value> {
     }
 }
 
+/// Poll `/metrics` until `needle` appears, or the deadline passes. Returns the
+/// final body either way, so the caller's assertion produces the diff.
+///
+/// Delivery is asynchronous, and wiremock records a request as soon as it
+/// arrives - before the sender has read the response and moved its counters.
+/// Waiting on the counter itself is the only way to observe "the delivery
+/// finished" without racing it.
+async fn wait_for_metric(h: &Harness, needle: &str) -> String {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let text = h.metrics_text();
+        if text.contains(needle) || std::time::Instant::now() > deadline {
+            return text;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 /// Hex HMAC-SHA256, computed independently of the implementation under test.
 fn expected_signature(secret: &str, body: &[u8]) -> String {
     let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(secret.as_bytes())
@@ -457,7 +475,8 @@ async fn a_threshold_crossing_delivers_exactly_one_signed_event() {
     let events = received_events(&receiver).await;
     assert_eq!(events.len(), 1, "no re-fire per request: {events:?}");
 
-    assert!(h.metrics_text().contains("lumen_webhook_sent_total 1"));
+    let metrics = wait_for_metric(&h, "lumen_webhook_sent_total 1").await;
+    assert!(metrics.contains("lumen_webhook_sent_total 1"), "{metrics}");
 }
 
 #[tokio::test]
@@ -638,16 +657,12 @@ async fn a_receiver_5xx_is_retried_with_backoff_until_it_succeeds() {
     let key = created["key"].as_str().expect("plaintext key").to_owned();
     assert_eq!(h.chat(&key).await.status(), 200);
 
-    // Three deliveries of the SAME event: same id, same signature-relevant
-    // body, so a receiver can deduplicate.
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    let requests = loop {
-        let requests = received_requests(&receiver).await;
-        if requests.len() >= 3 || std::time::Instant::now() > deadline {
-            break requests;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    };
+    // Wait for the delivery to actually land (two 503s, then the 200), then
+    // inspect the trail it left.
+    let metrics = wait_for_metric(&h, "lumen_webhook_sent_total 1").await;
+    let requests = received_requests(&receiver).await;
+    // Three deliveries of the SAME event: same id, same body, so a receiver
+    // can deduplicate.
     assert_eq!(requests.len(), 3, "two failures then a success");
     let ids: Vec<String> = requests
         .iter()
@@ -657,7 +672,6 @@ async fn a_receiver_5xx_is_retried_with_backoff_until_it_succeeds() {
     assert_eq!(ids[1], ids[2], "a retry keeps the event id");
     assert!(!ids[0].is_empty());
 
-    let metrics = h.metrics_text();
     assert!(metrics.contains("lumen_webhook_sent_total 1"), "{metrics}");
     assert!(
         metrics.contains("lumen_webhook_retries_total 2"),
@@ -689,16 +703,7 @@ async fn an_event_the_receiver_never_accepts_is_abandoned_and_counted() {
     let key = created["key"].as_str().expect("plaintext key").to_owned();
     assert_eq!(h.chat(&key).await.status(), 200);
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        if h.metrics_text().contains("lumen_webhook_dead_total 1")
-            || std::time::Instant::now() > deadline
-        {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    let metrics = h.metrics_text();
+    let metrics = wait_for_metric(&h, "lumen_webhook_dead_total 1").await;
     assert!(metrics.contains("lumen_webhook_dead_total 1"), "{metrics}");
     assert!(metrics.contains("lumen_webhook_sent_total 0"), "{metrics}");
     // `max_attempts = 3`, so two retries were counted before giving up.
@@ -1281,7 +1286,8 @@ async fn a_put_can_enable_webhooks_on_a_gateway_that_booted_without_them() {
         "the API-sealed secret signs deliveries"
     );
     // The collectors appeared only once webhooks were actually enabled.
-    assert!(h.metrics_text().contains("lumen_webhook_sent_total 1"));
+    let metrics = wait_for_metric(&h, "lumen_webhook_sent_total 1").await;
+    assert!(metrics.contains("lumen_webhook_sent_total 1"), "{metrics}");
 }
 
 #[tokio::test]
