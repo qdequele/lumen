@@ -37,6 +37,19 @@ pub fn build_client_with(connect: Duration, overall: Duration) -> reqwest::Clien
         .connect_timeout(connect)
         .timeout(overall)
         .user_agent(concat!("lumen/", env!("CARGO_PKG_VERSION")))
+        // HTTP/2 is negotiated via ALPN where the upstream offers it (the
+        // hosted providers all do), multiplexing concurrent requests over a
+        // few connections instead of one TCP+TLS handshake per in-flight
+        // request; h1-only upstreams (Ollama, TEI) are untouched by ALPN
+        // fallback. The h2 keepalive pings detect a silently dead connection
+        // (NAT reap, upstream restart) in seconds instead of stalling a
+        // request on it until the OS gives up; `while_idle` keeps pooled
+        // connections warm so the next request doesn't pay a new handshake.
+        .http2_keep_alive_interval(Duration::from_secs(30))
+        .http2_keep_alive_timeout(Duration::from_secs(10))
+        .http2_keep_alive_while_idle(true)
+        // Same protection for pooled h1 connections, at the TCP layer.
+        .tcp_keepalive(Duration::from_secs(60))
         .build()
         // Falls back to the default client if the builder somehow fails; the
         // default is always constructible, so this cannot panic in practice.
