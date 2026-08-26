@@ -27,7 +27,10 @@
 //!   knobs keeps the bounded queue and its sender task, so a retarget never
 //!   drops what is already queued; changing `channel_capacity` replaces both,
 //!   with the previous sender draining the events it had already accepted
-//!   before it exits. Removing the block stops detection.
+//!   before it exits. Removing the `[webhooks]` block stops detection only
+//!   when no enabled stored row exists - precedence means an enabled row keeps
+//!   delivering whatever the file says, until `DELETE /admin/webhooks` marks
+//!   it disabled.
 //!
 //! Read once at boot and therefore **restart-only** (documented in
 //! `docs/backlog.md`): the server bind address (rebinding a live listener is

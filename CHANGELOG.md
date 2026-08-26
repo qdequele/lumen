@@ -6,31 +6,6 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ## [Unreleased]
 
-### Fixed
-
-- **Streaming latency: `TCP_NODELAY` on accepted client connections.** axum
-  does not set the flag and the kernel default leaves Nagle's algorithm on,
-  so every small SSE frame the gateway wrote could stall in the send buffer
-  waiting for the previous packet's delayed ACK (tens of ms per frame on a
-  real network). A streaming completion is hundreds of small frames, so the
-  stalls compounded into a severalfold slowdown of end-to-end streaming time
-  versus direct-to-provider; the loopback bench harness could not see it
-  (no delayed-ACK stalls on localhost). The serve path now sets
-  `TCP_NODELAY` on every accepted socket (the upstream leg already had it
-  via reqwest's default), matching the direct-to-provider baseline.
-
-### Changed
-
-- **Upstream HTTP/2 and connection keepalive.** The shared provider client
-  now enables reqwest's `http2` feature: where the upstream offers h2 via
-  ALPN (the hosted providers all do), concurrent requests multiplex over a
-  few connections instead of paying one TCP+TLS handshake per in-flight
-  request; h1-only upstreams (Ollama, TEI) are untouched by ALPN fallback.
-  The client also sends h2 keepalive pings (30 s interval, 10 s timeout,
-  including while idle) and TCP keepalive (60 s) so a silently dead pooled
-  connection (NAT reap, upstream restart) is detected in seconds instead of
-  stalling the next request on it.
-
 ### Added
 
 - **Outbound webhooks for budget events** (ADR 011 and its 2026-08-26
@@ -95,7 +70,41 @@ All notable changes to LUMEN are documented here. The format is based on
     through the API, payload shape, signature verification, guarantees) and
     `config.example.toml`.
 
+### Changed
+
+- **Upstream HTTP/2 and connection keepalive.** The shared provider client
+  now enables reqwest's `http2` feature: where the upstream offers h2 via
+  ALPN (the hosted providers all do), concurrent requests multiplex over a
+  few connections instead of paying one TCP+TLS handshake per in-flight
+  request; h1-only upstreams (Ollama, TEI) are untouched by ALPN fallback.
+  The client also sends h2 keepalive pings (30 s interval, 10 s timeout,
+  including while idle) and TCP keepalive (60 s) so a silently dead pooled
+  connection (NAT reap, upstream restart) is detected in seconds instead of
+  stalling the next request on it.
+
+
+- **Docs: README admin row and a maintainer release guide.** The README API
+  table's `/admin/*` row now lists all five verbs and names what the surface
+  actually covers (keys, budgets, usage reporting and export, provider-key
+  rotation, config read/apply); it had not been updated since before ADR 010.
+  CONTRIBUTING.md gains a "Cutting a release" section documenting the
+  draft-first pipeline and the immutable-release rules (no post-publish asset
+  uploads; deleting a published release permanently retires its tag name, so
+  a broken release means cutting the next patch version, never re-tagging).
+
 ### Fixed
+
+- **Streaming latency: `TCP_NODELAY` on accepted client connections.** axum
+  does not set the flag and the kernel default leaves Nagle's algorithm on,
+  so every small SSE frame the gateway wrote could stall in the send buffer
+  waiting for the previous packet's delayed ACK (tens of ms per frame on a
+  real network). A streaming completion is hundreds of small frames, so the
+  stalls compounded into a severalfold slowdown of end-to-end streaming time
+  versus direct-to-provider; the loopback bench harness could not see it
+  (no delayed-ACK stalls on localhost). The serve path now sets
+  `TCP_NODELAY` on every accepted socket (the upstream leg already had it
+  via reqwest's default), matching the direct-to-provider baseline.
+
 
 - **Self-sustaining config hot-reload loop.** The reload watcher is armed on
   the config file's parent *directory* (a file-level watch does not survive a
@@ -114,17 +123,6 @@ All notable changes to LUMEN are documented here. The format is based on
   rather than on an explicit inotify mask keeps this backend-agnostic. Hot
   reload is unchanged otherwise: a genuine config change still triggers
   exactly one reload.
-
-### Changed
-
-- **Docs: README admin row and a maintainer release guide.** The README API
-  table's `/admin/*` row now lists all five verbs and names what the surface
-  actually covers (keys, budgets, usage reporting and export, provider-key
-  rotation, config read/apply); it had not been updated since before ADR 010.
-  CONTRIBUTING.md gains a "Cutting a release" section documenting the
-  draft-first pipeline and the immutable-release rules (no post-publish asset
-  uploads; deleting a published release permanently retires its tag name, so
-  a broken release means cutting the next patch version, never re-tagging).
 
 ## [0.3.1] - 2026-08-25
 

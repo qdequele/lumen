@@ -464,14 +464,15 @@ it and will never hand it back.
 ```bash
 export WEBHOOK_SECRET="whsec_$(openssl rand -hex 24)"
 
-# Note the heredoc: passing the secret with `-d "..."` would put it in curl's
-# argument list, which any local process can read from the process table.
-curl -s -X PUT http://localhost:8080/admin/webhooks/signing-key \
-  -H "Authorization: Bearer $LUMEN_MASTER_KEY" \
-  -H 'content-type: application/json' \
-  --data-binary @- <<JSON
-{"secret": "$WEBHOOK_SECRET"}
-JSON
+# The secret reaches curl on stdin, never in an argument list (any local
+# process can read those), and `jq` builds the JSON so a secret containing a
+# quote or a backslash cannot corrupt the body. `printf` is a shell builtin,
+# so it does not put the value in the process table either.
+printf '%s' "$WEBHOOK_SECRET" | jq -Rs '{secret: .}' |
+  curl -s -X PUT http://localhost:8080/admin/webhooks/signing-key \
+    -H "Authorization: Bearer $LUMEN_MASTER_KEY" \
+    -H 'content-type: application/json' \
+    --data-binary @-
 ```
 
 `204`. The secret is encrypted with AES-256-GCM under the master key
