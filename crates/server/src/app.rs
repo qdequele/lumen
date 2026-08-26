@@ -38,7 +38,8 @@ use crate::error::ApiError;
 /// * `/health`, `/health/providers`, `/metrics` - operational, never
 ///   authenticated, no I/O (`/health` never depends on provider state);
 /// * `/v1/*` - the API surface; virtual-key auth when enabled (M5);
-/// * `/admin/*` - key management and usage reporting; mounted only when auth
+/// * `/admin/*` - key management, budget webhooks and usage reporting; mounted
+///   only when auth
 ///   is enabled, protected by the master key.
 ///
 /// The body-size limit is read from `state.body_limit` - the single source of
@@ -113,6 +114,16 @@ pub fn build_app(state: AppState) -> Router {
             )
             .route("/admin/groups/{id}/grant", post(admin::grant_group))
             .route("/admin/provider-keys/{name}", put(admin::put_provider_key))
+            .route(
+                "/admin/webhooks",
+                get(admin::get_webhooks)
+                    .put(admin::put_webhooks)
+                    .delete(admin::delete_webhooks),
+            )
+            .route(
+                "/admin/webhooks/signing-key",
+                put(admin::put_webhook_signing_key).delete(admin::delete_webhook_signing_key),
+            )
             .route("/admin/usage", get(admin::usage_report))
             .route("/admin/usage/export", get(admin::usage_export))
             .route(

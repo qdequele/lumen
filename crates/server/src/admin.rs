@@ -28,6 +28,17 @@
 //!   at rest (AES-256-GCM under the master key) and apply it without a restart
 //!   by requesting a hot reload; used for providers whose `api_key_env` is
 //!   unset or empty (env keeps precedence when set).
+//! * `GET /admin/webhooks` - the live outbound-webhook configuration, plus
+//!   which source it came from and whether deliveries are signed. Never the
+//!   signing secret (ADR 011 amendment).
+//! * `PUT /admin/webhooks` - replace every webhook setting. Applied
+//!   immediately and stored, so it survives a restart and is not undone by
+//!   the next config reload.
+//! * `DELETE /admin/webhooks` - stop emitting events, persistently.
+//! * `PUT /admin/webhooks/signing-key` - store the HMAC signing secret,
+//!   sealed at rest (AES-256-GCM under the master key), for a control plane
+//!   that cannot set the gateway's environment.
+//! * `DELETE /admin/webhooks/signing-key` - forget the stored secret.
 //! * `GET /admin/usage` - aggregated usage and spend reporting over the
 //!   `usage_log` table (issue #64).
 //! * `GET /admin/usage/export` - cursor-paginated raw `usage_log` rows, for a
@@ -55,7 +66,7 @@ use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
-use lumen_auth::events::EventKind;
+use lumen_auth::events::{EventKind, SettingsOrigin, SettingsSource, WebhookSettings};
 use lumen_auth::key::hash_key;
 use lumen_auth::state::micro_to_usd;
 use lumen_auth::store::{
@@ -475,6 +486,214 @@ pub async fn grant_group(
     auth.keys
         .grant_group(&id, lumen_auth::state::usd_to_micro(amount));
     Ok(Json(record))
+}
+
+// ---- Outbound webhooks (ADR 011 amendment) ----------------------------------
+
+/// `GET /admin/webhooks` response: what the gateway is actually doing, and
+/// where that came from.
+///
+/// Deliberately reports the signing *state* (`signed`, `signing_key_stored`)
+/// and the variable *name*, never the secret - the same contract the provider
+/// surface keeps for API keys.
+#[derive(Debug, Serialize)]
+pub struct WebhookStatus {
+    /// Whether budget events are currently being emitted.
+    pub enabled: bool,
+    /// Which source the live settings came from: a stored row beats the
+    /// `[webhooks]` config block.
+    pub source: SettingsSource,
+    /// The settings in force; omitted when webhooks are off.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub settings: Option<WebhookSettings>,
+    /// Whether deliveries carry an `x-lumen-signature` header.
+    pub signed: bool,
+    /// Whether a signing secret is sealed in the database.
+    pub signing_key_stored: bool,
+    /// When the stored row was last written, unix seconds; omitted when the
+    /// live settings come from the config file.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<i64>,
+}
+
+/// `PUT /admin/webhooks/signing-key` request body.
+#[derive(Deserialize)]
+pub struct WebhookSecretBody {
+    /// The HMAC-SHA256 signing secret. Sealed at rest immediately; never
+    /// logged, never returned by any route.
+    pub secret: String,
+}
+
+// STRICT rule 5: the secret must be unrepresentable through `Debug`, so a
+// stray `{:?}` on the extracted body cannot leak it.
+impl std::fmt::Debug for WebhookSecretBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WebhookSecretBody")
+            .field("secret", &"REDACTED")
+            .finish()
+    }
+}
+
+/// The webhook controller, or a 401 when auth (and therefore the whole
+/// `/admin` surface) is off.
+fn webhooks(state: &AppState) -> Result<&Arc<crate::webhooks::WebhookController>, ApiError> {
+    state
+        .webhooks
+        .as_ref()
+        .ok_or_else(|| GatewayError::Unauthorized.into())
+}
+
+/// Build the current status snapshot.
+fn webhook_status(controller: &crate::webhooks::WebhookController) -> WebhookStatus {
+    let live = controller.live_settings();
+    let source = controller.source();
+    WebhookStatus {
+        enabled: live.is_some(),
+        // A stored row's timestamp is only meaningful when that row is what is
+        // in force; a config-file deployment has no such moment.
+        updated_at: match source {
+            SettingsSource::Database => controller.stored().map(|s| s.updated_at),
+            SettingsSource::Config | SettingsSource::None => None,
+        },
+        source,
+        settings: live,
+        signed: controller.is_signed(),
+        signing_key_stored: controller.has_stored_secret(),
+    }
+}
+
+/// Report the live webhook configuration.
+pub async fn get_webhooks(State(state): State<AppState>) -> Result<Json<WebhookStatus>, ApiError> {
+    let controller = webhooks(&state)?;
+    Ok(Json(webhook_status(controller)))
+}
+
+/// Replace every webhook setting. Validated, persisted, then applied - in that
+/// order, so a rejected document never reaches the live pipeline and a
+/// successful one survives a restart.
+///
+/// Invalid settings are a 400 `LM-1001` naming the field, like every other
+/// admin write. An unresolvable signing secret (a `signing_key_env` naming a
+/// variable this process cannot see, with nothing stored) is the same: it
+/// would silently downgrade a billing integration to unsigned deliveries.
+pub async fn put_webhooks(
+    State(state): State<AppState>,
+    payload: Result<Json<WebhookSettings>, JsonRejection>,
+) -> Result<Json<WebhookStatus>, ApiError> {
+    let Json(settings) = payload.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
+    let auth = runtime(&state)?;
+    let controller = webhooks(&state)?;
+    settings
+        .validate(SettingsOrigin::AdminApi)
+        .map_err(GatewayError::InvalidRequest)?;
+
+    // Persist, refresh the cache, then apply. Applying first would leave the
+    // database disagreeing with a running pipeline if the write then failed;
+    // this order means a failed apply leaves the stored row ahead of the live
+    // one, which `GET /admin/webhooks` makes visible and the next reload
+    // reconciles.
+    auth.store
+        .save_webhook_config(&settings)
+        .await
+        .map_err(|e| internal(&e))?;
+    controller
+        .refresh_from_store(&auth.store, auth.master.as_ref())
+        .await;
+    controller
+        .apply(&settings, &auth.keys)
+        .map_err(GatewayError::InvalidRequest)?;
+    Ok(Json(webhook_status(controller)))
+}
+
+/// Stop emitting budget events, persistently.
+///
+/// Idempotent: a 200 whether or not anything was enabled. When webhooks were
+/// on, the settings are stored as *disabled* rather than deleted, so the
+/// `[webhooks]` config block cannot silently re-enable them on the next reload
+/// and a later re-enable does not have to resend them.
+pub async fn delete_webhooks(
+    State(state): State<AppState>,
+) -> Result<Json<WebhookStatus>, ApiError> {
+    let auth = runtime(&state)?;
+    let controller = webhooks(&state)?;
+    if let Some(settings) = controller.live_settings() {
+        auth.store
+            .save_webhook_config_disabled(&settings)
+            .await
+            .map_err(|e| internal(&e))?;
+    }
+    controller.disable(&auth.keys);
+    controller
+        .refresh_from_store(&auth.store, auth.master.as_ref())
+        .await;
+    Ok(Json(webhook_status(controller)))
+}
+
+/// Store (or rotate) the HMAC signing secret, sealed with the master key.
+///
+/// The secret is sealed before it can reach a log line, and no route ever
+/// returns it. A rotation applies to the next delivery attempt: the sender
+/// reads its key cell per event, so nothing restarts.
+pub async fn put_webhook_signing_key(
+    State(state): State<AppState>,
+    payload: Result<Json<WebhookSecretBody>, JsonRejection>,
+) -> Result<StatusCode, ApiError> {
+    let Json(body) = payload.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
+    if body.secret.is_empty() {
+        return Err(GatewayError::InvalidRequest("`secret` must not be empty".to_owned()).into());
+    }
+    let auth = runtime(&state)?;
+    let controller = webhooks(&state)?;
+    let master = auth.master.as_ref().ok_or_else(|| {
+        ApiError::from(GatewayError::Internal(
+            "no master key is available to seal the webhook secret".to_owned(),
+        ))
+    })?;
+    auth.store
+        .store_webhook_secret(&body.secret, master)
+        .await
+        .map_err(|e| internal(&e))?;
+    controller
+        .refresh_from_store(&auth.store, auth.master.as_ref())
+        .await;
+    // Re-apply so the rotation takes effect now rather than at the next
+    // reload. A no-op when webhooks are off - the secret simply waits.
+    if let Some(settings) = controller.live_settings() {
+        controller
+            .apply(&settings, &auth.keys)
+            .map_err(GatewayError::InvalidRequest)?;
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Forget the stored signing secret.
+///
+/// Refused with a 400 when that would leave the live configuration unable to
+/// sign at all *and* it names an environment variable this process cannot see:
+/// dropping to unsigned billing events by accident is the failure mode the
+/// whole signing scheme exists to prevent. Deliberately unsigned deliveries
+/// (no `signing_key_env`, no stored secret) remain allowed.
+pub async fn delete_webhook_signing_key(
+    State(state): State<AppState>,
+) -> Result<StatusCode, ApiError> {
+    let auth = runtime(&state)?;
+    let controller = webhooks(&state)?;
+    auth.store
+        .delete_webhook_secret()
+        .await
+        .map_err(|e| internal(&e))?;
+    controller
+        .refresh_from_store(&auth.store, auth.master.as_ref())
+        .await;
+    if let Some(settings) = controller.live_settings() {
+        // The live pipeline keeps its old key on failure (`apply` swaps
+        // nothing when it errors), so delivery stays signed until the operator
+        // supplies a working source - the refusal is advisory, not a rollback.
+        controller
+            .apply(&settings, &auth.keys)
+            .map_err(GatewayError::InvalidRequest)?;
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// `PUT /admin/provider-keys/{name}` body.

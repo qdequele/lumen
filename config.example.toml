@@ -95,18 +95,40 @@ retention_days = 30               # purge usage_log rows older than this
 # auth.flush_interval_ms of accounting can be lost). Receivers MUST be
 # idempotent on x-lumen-event-id.
 #
-# Hot reload covers `url`, `events`, `thresholds`, `timeout_ms`,
-# `max_attempts` and `retry_base_ms`. Restart-only: `channel_capacity` (the
-# queue is built once), `signing_key_env` (a running process cannot observe a
-# changed env var), and adding the block to a process that booted without it.
+# You do not have to use this file at all. The admin API manages the same
+# settings at runtime, which is what a billing control plane wants:
+#
+#   GET    /admin/webhooks               current settings, source, signed state
+#   PUT    /admin/webhooks               replace every setting, applied now
+#   DELETE /admin/webhooks               stop emitting, persistently
+#   PUT    /admin/webhooks/signing-key   store the secret, sealed at rest
+#   DELETE /admin/webhooks/signing-key   forget it
+#
+# Settings written through the API are stored in the auth database and WIN over
+# this block, so a runtime change is not undone by the next reload; GET reports
+# `source` as "database" or "config" so the two are never ambiguous. A DELETE is
+# stored too, so it cannot be quietly re-enabled by this block either. If you
+# manage this file, do not PUT; if you manage the API, this block is just the
+# boot-time default. See docs/operations/keys-budgets.md.
+#
+# A reload re-applies every field of whichever source is in force. The only
+# thing it cannot do is see a NEW environment variable: a running process
+# cannot observe a change to its own environment, so pointing signing_key_env
+# at a variable that was unset at startup needs a restart (or the sealed-secret
+# route above, which needs no variable at all).
 # ---------------------------------------------------------------------------
 # [webhooks]
 # url = "https://backend.example.com/lumen/events"
 #
 # # Name of the env var holding the HMAC-SHA256 signing secret - never the
-# # secret itself, exactly like api_key_env. Named but unset/empty is a boot
-# # error; omitted entirely means UNSIGNED deliveries (only defensible on a
-# # trusted network) and logs a startup warning.
+# # secret itself, exactly like api_key_env. Named but unset/empty with no
+# # secret stored through PUT /admin/webhooks/signing-key is a boot error;
+# # omitting it entirely (and storing nothing) means UNSIGNED deliveries, only
+# # defensible on a trusted network, and logs a startup warning.
+# #
+# # The environment wins when the variable is set and non-empty; the sealed
+# # secret fills in otherwise. A control plane that does not own this host's
+# # environment should skip this field and use the signing-key route.
 # signing_key_env = "LUMEN_WEBHOOK_SECRET"
 #
 # # Which events to deliver. Default: ["budget.threshold", "budget.exhausted"].
@@ -123,7 +145,9 @@ retention_days = 30               # purge usage_log rows older than this
 # # drops below, so the next epoch signals again.
 # thresholds = [50, 80, 95]
 #
-# channel_capacity = 1024   # bounded queue; full = drop + counter, never backpressure
+# channel_capacity = 1024   # bounded queue; full = drop + counter, never
+#                           # backpressure. Editable at runtime: the queue is
+#                           # rebuilt and the previous sender drains its backlog.
 # timeout_ms = 5000         # per-attempt request timeout
 # max_attempts = 5          # total attempts per event, including the first
 # retry_base_ms = 500       # pre-jitter backoff after the first failure, doubling

@@ -57,7 +57,7 @@ use tokio::sync::Notify;
 use crate::config::{Config, ConfigError};
 use crate::pricing::CostTable;
 use crate::resilience::ResilienceRuntime;
-use crate::webhooks::WebhookRuntime;
+use crate::webhooks::WebhookController;
 
 /// Why a reload was rejected. The previous config is always kept on error.
 #[derive(Debug, thiserror::Error)]
@@ -168,10 +168,10 @@ pub struct ReloadTargets {
     /// Live auth knobs swapped from the reloaded config; `Some` only when auth
     /// is enabled.
     pub auth_knobs: Option<Arc<AuthKnobs>>,
-    /// The outbound-webhook runtime (bounded queue + delivery policy);
-    /// `Some` only when the process booted with a `[webhooks]` block
-    /// (ADR 011). A reload retunes the policy and the event set through it.
-    pub webhooks: Option<Arc<WebhookRuntime>>,
+    /// The outbound-webhook control surface (ADR 011); `Some` whenever auth
+    /// is enabled, whether or not webhooks are currently on. A reload
+    /// re-resolves the stored row against the file block through it.
+    pub webhooks: Option<Arc<WebhookController>>,
     /// The live auth runtime (in-memory key table + store); `Some` only when
     /// auth is enabled. On each reload the virtual-key table is re-read from
     /// the DB so keys created offline (e.g. `lumen keys create`) become live
@@ -270,21 +270,28 @@ pub fn apply_reload(path: &Path, targets: &ReloadTargets) -> Result<(), ReloadEr
 /// without one (there is no queue to attach to), and the structural knobs
 /// `apply_reload` warns about.
 fn apply_webhook_reload(config: &Config, targets: &ReloadTargets) {
-    let Some(webhooks) = &targets.webhooks else {
+    // Both are `Some` exactly when auth is enabled, and `Config::validate`
+    // refuses `[webhooks]` without it.
+    let (Some(webhooks), Some(auth_runtime)) = (&targets.webhooks, &targets.auth_runtime) else {
         if config.webhooks.is_some() {
             tracing::warn!(
-                "config declares [webhooks] but this process booted without it; outbound \
-                 budget events need a restart to start"
+                "config declares [webhooks] but auth is disabled in this process; outbound \
+                 budget events need auth.enabled = true and a restart"
             );
         }
         return;
     };
-    let signals = webhooks.apply_reload(config.webhooks.as_ref());
-    // `Config::validate` refuses `[webhooks]` without `auth.enabled`, so an
-    // auth runtime is always present when a block is; clearing on removal is
-    // equally a no-op without one.
-    if let Some(auth_runtime) = &targets.auth_runtime {
-        auth_runtime.keys.set_signals(signals);
+    // The stored row was refreshed by `reload_once` just before this.
+    match webhooks.resolve_and_apply(config.webhooks.as_ref(), &auth_runtime.keys) {
+        Ok(source) => tracing::debug!(?source, "webhook configuration resolved"),
+        // A bad webhook block must not reject the whole reload: routing,
+        // pricing and resilience have already swapped, and refusing them over
+        // a signalling convenience would be the wrong trade. The previous
+        // pipeline keeps running and the operator gets a warning.
+        Err(error) => tracing::warn!(
+            %error,
+            "webhook configuration rejected; keeping the previous webhook settings"
+        ),
     }
 }
 
@@ -466,6 +473,14 @@ pub async fn reload_once(path: &Path, targets: &Arc<ReloadTargets>) {
                 "virtual-key refresh failed; keeping the current in-memory key table"
             ),
         }
+    }
+    // The webhook config and its sealed signing secret live in the same DB;
+    // refresh the cache the synchronous resolve below reads (ADR 011
+    // amendment §2). Errors keep the previous cache, logged inside.
+    if let (Some(webhooks), Some(runtime)) = (&targets.webhooks, &targets.auth_runtime) {
+        webhooks
+            .refresh_from_store(&runtime.store, runtime.master.as_ref())
+            .await;
     }
     let path = path.to_path_buf();
     let targets = Arc::clone(targets);

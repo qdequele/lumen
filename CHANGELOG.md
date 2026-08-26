@@ -45,6 +45,37 @@ All notable changes to LUMEN are documented here. The format is based on
     sick receiver can never delay shutdown.
   - Documented in `docs/operations/keys-budgets.md` (payload shape,
     signature verification, guarantees) and `config.example.toml`.
+- **The webhook configuration is an admin resource** (ADR 011 amendment). The
+  `[webhooks]` config block stays, but a control plane that cannot restart the
+  gateway or edit its environment can now manage the same settings over HTTP,
+  master-key gated like the rest of `/admin`:
+  - `GET /admin/webhooks` reports the live settings, which source they came
+    from (`database` / `config` / `none`), whether deliveries are signed, and
+    whether a secret is sealed in the database. Never the secret itself.
+  - `PUT /admin/webhooks` replaces every setting, applied immediately and
+    stored so a restart comes up identically. `DELETE /admin/webhooks` stops
+    emission, also stored - so neither is undone by the next config reload.
+  - `PUT` / `DELETE /admin/webhooks/signing-key` store and forget the HMAC
+    secret, sealed with AES-256-GCM under the master key exactly like
+    `PUT /admin/provider-keys/{name}`. A rotation applies to the next delivery
+    attempt with nothing restarted, and retries of an in-flight event keep the
+    signature they were created with.
+  - **Every field is now editable at runtime**, including the two that used to
+    be restart-only. `channel_capacity` rebuilds the bounded queue while the
+    previous sender drains its backlog, so nothing already accepted is
+    discarded to resize a channel. Webhooks can also be enabled from scratch on
+    a gateway that booted without a `[webhooks]` block: the queue, the sender
+    task and the Prometheus collectors are created on first enable, which also
+    means a gateway that never enables them exports no `lumen_webhook_*`
+    series at all.
+  - Precedence: a stored row wins over the config block, and a stored row
+    marked disabled means off whatever the file says. The file remains the
+    declarative default for a GitOps deployment that never calls the API.
+  - `WebhooksConfig` moved to `lumen_auth::events::WebhookSettings` (re-exported
+    under the old name), so one type and one validation implementation now serve
+    the TOML block, the `PUT` body, the database row and the delivery pipeline.
+  - New migration `0008_webhook_config.sql`: a single-row `webhook_config`
+    table plus a `webhook_secret` table holding only ciphertext.
 
 ### Changed
 

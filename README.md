@@ -44,7 +44,7 @@ reference.
 | `GET  /health`                 | Liveness. No I/O, never touches the DB or providers.    |
 | `GET  /health/providers`       | Background provider-probe results (opt-in, see below).  |
 | `GET  /metrics`                | Prometheus exposition.                                  |
-| `POST/GET/PUT/PATCH/DELETE /admin/*` | Keys, budgets, usage reporting & export, provider-key rotation, config read/apply. Only mounted when auth is enabled. |
+| `POST/GET/PUT/PATCH/DELETE /admin/*` | Keys, budgets, budget webhooks, usage reporting & export, provider-key rotation, config read/apply. Only mounted when auth is enabled. |
 
 A single model id is owned entirely by you and may serve one to three
 capabilities. The router resolves each request by `(capability, model)`.
@@ -221,14 +221,20 @@ spends. See [Keys, quotas & budgets](https://qdequele.github.io/lumen/operations
 
 ### Budget webhooks (ADR 011)
 
-Absent by default - with no `[webhooks]` block the gateway calls nothing but its
-providers. Enable it and a billing backend gets pushed `budget.threshold`,
-`budget.exhausted` and key-lifecycle events, so it can auto-recharge through
-`POST /admin/keys/{id}/grant` **before** a customer hits a 402 instead of
-polling for it. Detection is a compare on the budget settle that already
-happens per request; delivery is a bounded queue and a background sender with
-HMAC-signed, idempotent, at-least-once semantics. Payloads carry accounting
-facts only - never a key, never prompt or response content. See
+Absent by default - with no webhook configured the gateway calls nothing but its
+providers, and exports no webhook metric. Enable it and a billing backend gets
+pushed `budget.threshold`, `budget.exhausted` and key-lifecycle events, so it
+can auto-recharge through `POST /admin/keys/{id}/grant` **before** a customer
+hits a 402 instead of polling for it. Detection is a compare on the budget
+settle that already happens per request; delivery is a bounded queue and a
+background sender with HMAC-signed, idempotent, at-least-once semantics.
+Payloads carry accounting facts only - never a key, never prompt or response
+content.
+
+Configure it declaratively in `[webhooks]`, or entirely through the admin API
+(`GET`/`PUT`/`DELETE /admin/webhooks` plus
+`PUT /admin/webhooks/signing-key`, which seals the HMAC secret at rest) - every
+field is editable at runtime, and API-written settings win over the file. See
 [Outbound webhooks for budget events](https://qdequele.github.io/lumen/operations/keys-budgets.html#outbound-webhooks-for-budget-events).
 
 ### Resilience
@@ -252,8 +258,8 @@ and [Metrics & dashboards](https://qdequele.github.io/lumen/operations/metrics.h
 
 `SIGHUP`, a file-watch, or an admin provider-key rotation triggers a reload: the
 new config is validated, then the provider registry, price table, resilience
-policy, the runtime-safe `[auth]` knobs and the `[webhooks]` delivery policy
-are atomically swapped; in-flight
+policy, the runtime-safe `[auth]` knobs and the webhook delivery policy are
+atomically swapped; in-flight
 requests are unaffected. An invalid config is **rejected** - the old config
 keeps serving. See
 [Deployment](https://qdequele.github.io/lumen/operations/deployment.html).

@@ -136,6 +136,204 @@ pub struct BudgetEvent {
     pub ts: i64,
 }
 
+/// Where the live webhook settings came from (ADR 011 amendment §2). Reported
+/// by `GET /admin/webhooks` so drift between the config file and the running
+/// configuration is visible rather than inferred.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SettingsSource {
+    /// A row written through `PUT /admin/webhooks`, which wins over the file.
+    Database,
+    /// The `[webhooks]` block of the config file.
+    Config,
+    /// Neither: webhooks are off.
+    None,
+}
+
+/// Which surface a set of settings arrived on, for the one validation rule
+/// that differs between them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsOrigin {
+    /// The `[webhooks]` block of a config file.
+    ConfigFile,
+    /// A `PUT /admin/webhooks` body.
+    AdminApi,
+}
+
+/// The complete webhook configuration.
+///
+/// One type serves four roles - the `[webhooks]` TOML block, the
+/// `PUT /admin/webhooks` request body, the `webhook_config` database row, and
+/// the input the delivery pipeline is built from - so a field can never mean
+/// one thing in a file and another over the wire.
+///
+/// It holds the *name* of the environment variable carrying the HMAC secret,
+/// never the secret itself: a config file, an API response and a database row
+/// are all things that get copied around.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebhookSettings {
+    /// Receiver endpoint. One receiver; a backend needing fan-out does it
+    /// itself (ADR 011 §5).
+    pub url: String,
+    /// Name of the environment variable holding the HMAC-SHA256 signing
+    /// secret. `None` means the secret comes from
+    /// `PUT /admin/webhooks/signing-key`, or that deliveries are unsigned.
+    #[serde(default)]
+    pub signing_key_env: Option<String>,
+    /// Which event kinds to deliver.
+    #[serde(default = "default_events")]
+    pub events: Vec<EventKind>,
+    /// Percent-of-budget thresholds for `budget.threshold`, each fired once
+    /// per budget epoch.
+    #[serde(default = "default_thresholds")]
+    pub thresholds: Vec<u8>,
+    /// Bounded queue capacity. A full queue DROPS events and counts them
+    /// rather than slowing a request down.
+    #[serde(default = "default_channel_capacity")]
+    pub channel_capacity: usize,
+    /// Per-attempt request timeout in ms.
+    #[serde(default = "default_timeout_ms")]
+    pub timeout_ms: u64,
+    /// Total delivery attempts per event, including the first (`1` = no
+    /// retries).
+    #[serde(default = "default_max_attempts")]
+    pub max_attempts: u32,
+    /// Base backoff delay in ms: the pre-jitter wait after the first failed
+    /// attempt, doubling per attempt.
+    #[serde(default = "default_retry_base_ms")]
+    pub retry_base_ms: u64,
+}
+
+fn default_events() -> Vec<EventKind> {
+    vec![EventKind::BudgetThreshold, EventKind::BudgetExhausted]
+}
+fn default_thresholds() -> Vec<u8> {
+    vec![50, 80, 95]
+}
+const fn default_channel_capacity() -> usize {
+    1_024
+}
+const fn default_timeout_ms() -> u64 {
+    5_000
+}
+const fn default_max_attempts() -> u32 {
+    5
+}
+const fn default_retry_base_ms() -> u64 {
+    500
+}
+
+impl Default for WebhookSettings {
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            signing_key_env: None,
+            events: default_events(),
+            thresholds: default_thresholds(),
+            channel_capacity: default_channel_capacity(),
+            timeout_ms: default_timeout_ms(),
+            max_attempts: default_max_attempts(),
+            retry_base_ms: default_retry_base_ms(),
+        }
+    }
+}
+
+impl WebhookSettings {
+    /// Validate the settings, returning a message naming the offending field.
+    ///
+    /// The caller wraps the message in its own error type: a config-file load
+    /// turns it into a `Validation` error, an admin `PUT` into a 400
+    /// `LM-1001`. One implementation, so the two surfaces can never drift
+    /// into accepting different things.
+    ///
+    /// # Errors
+    /// A human-readable message naming the field that is wrong.
+    pub fn validate(&self, origin: SettingsOrigin) -> Result<(), String> {
+        let url = self.url.trim();
+        if url.is_empty() {
+            return Err("webhooks.url must not be empty".to_owned());
+        }
+        if url != self.url {
+            return Err("webhooks.url must not have leading or trailing whitespace".to_owned());
+        }
+        if !(url.starts_with("http://") || url.starts_with("https://")) {
+            return Err("webhooks.url must be an http:// or https:// URL".to_owned());
+        }
+        self.validate_signing_key_env(origin)?;
+        if self.events.is_empty() {
+            return Err("webhooks.events must list at least one event kind".to_owned());
+        }
+        if self.events.contains(&EventKind::BudgetThreshold) {
+            if self.thresholds.is_empty() {
+                return Err(
+                    "webhooks.thresholds must not be empty when 'budget.threshold' is enabled"
+                        .to_owned(),
+                );
+            }
+            if let Some(bad) = self.thresholds.iter().find(|t| **t == 0 || **t > 100) {
+                return Err(format!(
+                    "webhooks.thresholds must be percentages in 1..=100 (found {bad})"
+                ));
+            }
+        }
+        if self.channel_capacity == 0 {
+            return Err("webhooks.channel_capacity must not be 0".to_owned());
+        }
+        for (field, value) in [
+            ("webhooks.timeout_ms", self.timeout_ms),
+            ("webhooks.max_attempts", u64::from(self.max_attempts)),
+            ("webhooks.retry_base_ms", self.retry_base_ms),
+        ] {
+            if value == 0 {
+                return Err(format!("{field} must not be 0"));
+            }
+        }
+        Ok(())
+    }
+
+    /// The `signing_key_env` rules, including the one that differs by origin.
+    fn validate_signing_key_env(&self, origin: SettingsOrigin) -> Result<(), String> {
+        let Some(var) = &self.signing_key_env else {
+            return Ok(());
+        };
+        if var.trim().is_empty() || var.trim() != var {
+            return Err(
+                "webhooks.signing_key_env must be a non-blank env var name with no \
+                        surrounding whitespace"
+                    .to_owned(),
+            );
+        }
+        if !var.starts_with("LUMEN_") {
+            return Ok(());
+        }
+        // `LUMEN_`-prefixed variables live in the config loader's own overlay
+        // namespace, and are only kept out of it by being named in the file it
+        // is reading. That works for a file-declared variable and cannot work
+        // for a database-declared one: at boot the config is parsed before the
+        // database is open, so nothing knows the stored name yet and the
+        // variable would be misread as a config key. Steer an API-managed
+        // secret to `PUT /admin/webhooks/signing-key` (no variable at all) or
+        // to a name outside the prefix.
+        if origin == SettingsOrigin::AdminApi {
+            return Err(format!(
+                "webhooks.signing_key_env '{var}' must not start with 'LUMEN_' when set through \
+                 the admin API: that prefix is the config loader's namespace and cannot be \
+                 excluded from it before the database is read. Use PUT \
+                 /admin/webhooks/signing-key to store the secret directly, or name the variable \
+                 without the prefix"
+            ));
+        }
+        if var.contains("__") {
+            return Err(format!(
+                "webhooks.signing_key_env '{var}' must not contain '__': LUMEN_-prefixed \
+                 variables are parsed as nested config keys on '__'"
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Mint a fresh event id: `evt_` + 16 random bytes in hex.
 fn new_event_id() -> String {
     use rand::Rng as _;

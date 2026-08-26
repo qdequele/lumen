@@ -26,11 +26,10 @@ use lumen_server::{
     resilience::ResilienceRuntime,
     state::AppState,
     tokenizer::TokenCounter,
-    webhooks::{load_signing_key, spawn_webhook_sender, WebhookRuntime},
+    webhooks::WebhookController,
 };
 use lumen_telemetry::{
     logging::init_logging, LatencyMetrics, Metrics, ReloadMetrics, ResilienceMetrics, TokenMetrics,
-    WebhookMetrics,
 };
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -605,7 +604,8 @@ fn run(config: Config, config_path: PathBuf) -> anyhow::Result<()> {
             &client,
             auth_runtime.as_ref(),
             &webhook_cancel,
-        )?;
+        )
+        .await?;
 
         // Config hot reload (M7 §7.3): SIGHUP / file change / admin trigger swaps
         // routing, pricing, resilience and auth knobs and re-reads DB provider
@@ -619,7 +619,7 @@ fn run(config: Config, config_path: PathBuf) -> anyhow::Result<()> {
             key_backfill: Arc::new(ArcSwap::from_pointee(boot_backfill)),
             key_source,
             auth_knobs,
-            webhooks,
+            webhooks: webhooks.clone(),
             auth_runtime: auth_runtime.clone(),
         };
         // Cloned before the move into `arm_config_reload`: the admin config
@@ -648,6 +648,9 @@ fn run(config: Config, config_path: PathBuf) -> anyhow::Result<()> {
         }
         if let Some(logger) = usage_logger {
             state = state.with_usage(logger);
+        }
+        if let Some(controller) = webhooks {
+            state = state.with_webhooks(controller);
         }
         let app = build_app(state);
 
@@ -816,61 +819,77 @@ fn register_metrics(config: &Config) -> anyhow::Result<RegisteredMetrics> {
     })
 }
 
-/// Boot the outbound-webhook stack (ADR 011), or do nothing at all.
+/// Boot the outbound-webhook control surface (ADR 011 and its amendment).
 ///
-/// With no `[webhooks]` block this returns `None` without registering a single
-/// counter or spawning a single task: the gateway's only outbound calls stay
-/// the ones its providers need (sovereignty pillar). With a block, it
-/// registers the webhook metrics, creates the bounded queue, installs the
-/// signalling policy on the live key table and spawns the delivery task.
+/// Returns `None` when auth is off: every event describes a virtual key or a
+/// budget group, so without auth there is nothing to signal about and no
+/// `/admin` surface to configure it from.
 ///
-/// A named-but-unset `signing_key_env` is fatal here rather than a warning: a
-/// billing integration silently downgraded to unsigned deliveries is worse
-/// than a refused boot, and `--check-config` cannot catch it (it never reads
-/// the environment for secrets).
-fn boot_webhooks(
+/// With auth on, the controller is created but stays **inert** - no queue, no
+/// sender task, no Prometheus collector - until something enables webhooks.
+/// That something is either a stored row (written by a previous
+/// `PUT /admin/webhooks`, which wins) or the `[webhooks]` config block. Either
+/// way a `PUT` later in the process's life can enable them from scratch, which
+/// is why nothing here depends on the block being present at boot.
+///
+/// A `[webhooks]` block that cannot be applied is fatal: an operator who
+/// declared webhooks and got a silently dead integration is worse off than one
+/// whose gateway refused to start. A *stored* row that cannot be applied is
+/// not - the database may name an environment variable this deployment does
+/// not have, and refusing to boot would leave no way in to fix it - so it is
+/// logged and webhooks stay off.
+async fn boot_webhooks(
     config: &Config,
     metrics: &Metrics,
     client: &reqwest::Client,
     auth_runtime: Option<&Arc<AuthRuntime>>,
     cancel: &CancellationToken,
-) -> anyhow::Result<Option<Arc<WebhookRuntime>>> {
-    let Some(block) = &config.webhooks else {
+) -> anyhow::Result<Option<Arc<WebhookController>>> {
+    let Some(auth_runtime) = auth_runtime else {
+        // `Config::validate` refuses `[webhooks]` without auth, so a block
+        // here would already have failed to load.
         return Ok(None);
     };
-    // `Config::validate` refuses `[webhooks]` unless auth is enabled, so this
-    // is defence in depth rather than a reachable path.
-    let Some(auth_runtime) = auth_runtime else {
-        anyhow::bail!("[webhooks] requires auth.enabled = true");
-    };
-
-    let webhook_metrics =
-        WebhookMetrics::register(metrics).context("failed to register webhook metrics")?;
-    let signing_key = load_signing_key(block).map_err(|message| anyhow::anyhow!(message))?;
-    let (runtime, receiver, signals) = WebhookRuntime::build(block, webhook_metrics.clone());
-    // Installing the policy also re-arms every loaded key and group against
-    // the configured thresholds, so a key already past one does not re-fire it
-    // on its first settle after a restart.
-    auth_runtime.keys.set_signals(Some(signals));
-    spawn_webhook_sender(
-        receiver,
+    let controller = Arc::new(WebhookController::new(
+        metrics.clone(),
         client.clone(),
-        runtime.policy(),
-        signing_key,
-        webhook_metrics,
         cancel.clone(),
-    );
-    let events: Vec<&str> = block.events.iter().map(|e| e.as_str()).collect();
-    // The URL is operator-configured and secret-free; the signing secret and
-    // even its resolved value never appear here.
-    tracing::info!(
-        url = %block.url,
-        ?events,
-        thresholds = ?block.thresholds,
-        signed = block.signing_key_env.is_some(),
-        "outbound budget webhooks enabled"
-    );
-    Ok(Some(runtime))
+    ));
+    controller
+        .refresh_from_store(&auth_runtime.store, auth_runtime.master.as_ref())
+        .await;
+
+    let from_database = controller.stored().is_some();
+    match controller.resolve_and_apply(config.webhooks.as_ref(), &auth_runtime.keys) {
+        Ok(lumen_auth::events::SettingsSource::None) => {
+            tracing::debug!("outbound budget webhooks are off");
+        }
+        Ok(source) => {
+            let settings = controller
+                .live_settings()
+                .unwrap_or_else(|| unreachable!("an applied source always has live settings"));
+            let events: Vec<&str> = settings.events.iter().map(|e| e.as_str()).collect();
+            // The URL is operator-configured and secret-free; the signing
+            // secret and even its resolved value never appear here.
+            tracing::info!(
+                ?source,
+                url = %settings.url,
+                ?events,
+                thresholds = ?settings.thresholds,
+                signed = controller.is_signed(),
+                "outbound budget webhooks enabled"
+            );
+        }
+        Err(error) if from_database => {
+            tracing::error!(
+                %error,
+                "the stored webhook configuration could not be applied; webhooks are off. \
+                 Fix it with PUT /admin/webhooks"
+            );
+        }
+        Err(error) => anyhow::bail!("invalid [webhooks] configuration: {error}"),
+    }
+    Ok(Some(controller))
 }
 
 /// Everything [`boot_auth_stack`] hands back to [`run`].

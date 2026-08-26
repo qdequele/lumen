@@ -13,7 +13,7 @@ use figment::{
     providers::{Env, Format, Toml},
     Figment,
 };
-use lumen_auth::events::EventKind;
+use lumen_auth::events::SettingsOrigin;
 use lumen_core::Capability;
 use lumen_providers::{ModelSpec, ProviderKind, ProviderSpec};
 use lumen_telemetry::logging::LogFormat;
@@ -58,142 +58,22 @@ pub struct Config {
 
 /// Outbound webhooks for key and group budget events (ADR 011).
 ///
+/// The type itself lives in [`lumen_auth::events`] because four surfaces
+/// share it: this `[webhooks]` block, the `PUT /admin/webhooks` request body,
+/// the `webhook_config` database row, and the delivery pipeline built from any
+/// of them. A field can therefore never mean one thing in a file and another
+/// over the wire.
+///
 /// Strictly opt-in: the whole section is absent by default, and absent means
 /// the gateway calls nothing but its providers (sovereignty pillar). When it
 /// is present the gateway POSTs accounting facts (ids, names, budget figures)
 /// to `url`; never a plaintext key, never request metadata, never prompt or
 /// response content.
 ///
-/// `channel_capacity` is structural (the bounded queue is built once at boot)
-/// and so is the presence of the block itself; `url`, `events`, `thresholds`,
-/// `timeout_ms`, `max_attempts` and `retry_base_ms` are re-read on a hot
-/// reload. The signing secret comes from the process environment, which a
-/// running process cannot change, so it too is read once at boot.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct WebhooksConfig {
-    /// Receiver endpoint. One receiver in v1; a backend that needs fan-out
-    /// does it itself.
-    pub url: String,
-    /// Name of the environment variable holding the HMAC-SHA256 signing
-    /// secret - the same indirection provider keys use, so no secret is ever
-    /// written into a config file. Unset means unsigned deliveries, which is
-    /// only defensible on a trusted network; the boot log says so loudly.
-    #[serde(default)]
-    pub signing_key_env: Option<String>,
-    /// Which event kinds to deliver.
-    #[serde(default = "default_webhook_events")]
-    pub events: Vec<EventKind>,
-    /// Percent-of-budget thresholds for `budget.threshold`, each fired once
-    /// per budget epoch. Sorted and deduplicated when the policy is built.
-    #[serde(default = "default_webhook_thresholds")]
-    pub thresholds: Vec<u8>,
-    /// Bounded queue capacity. A full queue DROPS events and counts them
-    /// (`lumen_webhook_dropped_total`) rather than slowing a request down.
-    #[serde(default = "default_webhook_channel_capacity")]
-    pub channel_capacity: usize,
-    /// Per-attempt request timeout in ms.
-    #[serde(default = "default_webhook_timeout_ms")]
-    pub timeout_ms: u64,
-    /// Total delivery attempts per event, including the first (`1` = no
-    /// retries).
-    #[serde(default = "default_webhook_max_attempts")]
-    pub max_attempts: u32,
-    /// Base backoff delay in ms: the pre-jitter wait after the first failed
-    /// attempt, doubling per attempt.
-    #[serde(default = "default_webhook_retry_base_ms")]
-    pub retry_base_ms: u64,
-}
-
-impl Default for WebhooksConfig {
-    fn default() -> Self {
-        Self {
-            url: String::new(),
-            signing_key_env: None,
-            events: default_webhook_events(),
-            thresholds: default_webhook_thresholds(),
-            channel_capacity: default_webhook_channel_capacity(),
-            timeout_ms: default_webhook_timeout_ms(),
-            max_attempts: default_webhook_max_attempts(),
-            retry_base_ms: default_webhook_retry_base_ms(),
-        }
-    }
-}
-
-impl WebhooksConfig {
-    /// Validate the block. Called only when the block is present, so every
-    /// rule here is unconditional.
-    fn validate(&self, err: &impl Fn(String) -> ConfigError) -> Result<(), ConfigError> {
-        let url = self.url.trim();
-        if url.is_empty() {
-            return Err(err("webhooks.url must not be empty".to_owned()));
-        }
-        if url != self.url {
-            return Err(err(
-                "webhooks.url must not have leading or trailing whitespace".to_owned(),
-            ));
-        }
-        if !(url.starts_with("http://") || url.starts_with("https://")) {
-            return Err(err(
-                "webhooks.url must be an http:// or https:// URL".to_owned()
-            ));
-        }
-        if let Some(var) = &self.signing_key_env {
-            if var.trim().is_empty() || var.trim() != var {
-                return Err(err(
-                    "webhooks.signing_key_env must be a non-blank env var name with no \
-                     surrounding whitespace"
-                        .to_owned(),
-                ));
-            }
-            // A `LUMEN_`-prefixed name is folded into the config overlay
-            // unless it is excluded by name (see `secret_env_keys`), and a
-            // `__` in it would be read as a nested config key that no
-            // exclusion can match. Reject the shape instead of booting into a
-            // confusing "unknown field" error.
-            if var.starts_with("LUMEN_") && var.contains("__") {
-                return Err(err(format!(
-                    "webhooks.signing_key_env '{var}' must not contain '__': LUMEN_-prefixed \
-                     variables are parsed as nested config keys on '__'"
-                )));
-            }
-        }
-        if self.events.is_empty() {
-            return Err(err(
-                "webhooks.events must list at least one event kind (remove the [webhooks] \
-                 block to disable webhooks entirely)"
-                    .to_owned(),
-            ));
-        }
-        if self.events.contains(&EventKind::BudgetThreshold) {
-            if self.thresholds.is_empty() {
-                return Err(err(
-                    "webhooks.thresholds must not be empty when 'budget.threshold' is \
-                     enabled"
-                        .to_owned(),
-                ));
-            }
-            if let Some(bad) = self.thresholds.iter().find(|t| **t == 0 || **t > 100) {
-                return Err(err(format!(
-                    "webhooks.thresholds must be percentages in 1..=100 (found {bad})"
-                )));
-            }
-        }
-        if self.channel_capacity == 0 {
-            return Err(err("webhooks.channel_capacity must not be 0".to_owned()));
-        }
-        for (field, value) in [
-            ("webhooks.timeout_ms", self.timeout_ms),
-            ("webhooks.max_attempts", u64::from(self.max_attempts)),
-            ("webhooks.retry_base_ms", self.retry_base_ms),
-        ] {
-            if value == 0 {
-                return Err(err(format!("{field} must not be 0")));
-            }
-        }
-        Ok(())
-    }
-}
+/// Settings written through `PUT /admin/webhooks` are stored in the database
+/// and **win** over this block, so a runtime change is not undone by the next
+/// reload (ADR 011 amendment §2). Every field is editable at runtime.
+pub use lumen_auth::events::WebhookSettings as WebhooksConfig;
 
 /// Opt-in accurate tokenizer (ADR 003). The estimation fallback (used only when
 /// an upstream reports no usage) defaults to the cheap byte heuristic; set
@@ -713,24 +593,6 @@ const fn default_usage_flush_ms() -> u64 {
 const fn default_retention_days() -> u32 {
     30
 }
-fn default_webhook_events() -> Vec<EventKind> {
-    vec![EventKind::BudgetThreshold, EventKind::BudgetExhausted]
-}
-fn default_webhook_thresholds() -> Vec<u8> {
-    vec![50, 80, 95]
-}
-const fn default_webhook_channel_capacity() -> usize {
-    1_024
-}
-const fn default_webhook_timeout_ms() -> u64 {
-    5_000
-}
-const fn default_webhook_max_attempts() -> u32 {
-    5
-}
-const fn default_webhook_retry_base_ms() -> u64 {
-    500
-}
 const fn default_retry_max_attempts() -> u32 {
     3
 }
@@ -964,7 +826,9 @@ impl Config {
                         .to_owned(),
                 ));
             }
-            webhooks.validate(&err)?;
+            webhooks
+                .validate(SettingsOrigin::ConfigFile)
+                .map_err(&err)?;
         }
 
         self.telemetry.validate(path_label)?;
@@ -1158,6 +1022,7 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lumen_auth::events::EventKind;
 
     const VALID: &str = r#"
         [server]
@@ -1243,7 +1108,11 @@ mod tests {
     #[test]
     fn only_the_configured_signing_var_is_excluded_from_the_overlay() {
         // The exclusion is by exact name, so an unrelated LUMEN_ typo is still
-        // caught rather than silently swallowed.
+        // caught rather than silently swallowed. Asserted against the
+        // exclusion list itself rather than by setting a bogus environment
+        // variable: `figment::Jail` restores the process environment on drop,
+        // but tests share that environment while they run, so a deliberately
+        // load-breaking variable would leak into whatever runs beside it.
         #[allow(clippy::result_large_err)]
         figment::Jail::expect_with(|jail| {
             jail.create_file(
@@ -1253,10 +1122,26 @@ mod tests {
                      signing_key_env = \"LUMEN_WEBHOOK_SECRET\"\n"
                 ),
             )?;
-            jail.set_env("LUMEN_WEBHOOK_SECRET", "whsec-ok");
-            jail.set_env("LUMEN_SERVERR__PORT", "9191");
-            let err = Config::load(Path::new("config.toml")).unwrap_err();
-            assert!(matches!(err, ConfigError::Parse { .. }), "{err:?}");
+            let excluded = secret_env_keys(Path::new("config.toml"));
+            assert_eq!(excluded, ["master_key", "webhook_secret"]);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn a_signing_var_outside_the_lumen_namespace_needs_no_exclusion() {
+        // A name the config loader never looks at does not have to be kept out
+        // of the overlay, so it must not bloat the exclusion list.
+        #[allow(clippy::result_large_err)]
+        figment::Jail::expect_with(|jail| {
+            jail.create_file(
+                "config.toml",
+                &format!(
+                    "{AUTH_ON}\n[webhooks]\nurl = \"https://b.example/e\"\n\
+                     signing_key_env = \"BILLING_WEBHOOK_SECRET\"\n"
+                ),
+            )?;
+            assert_eq!(secret_env_keys(Path::new("config.toml")), ["master_key"]);
             Ok(())
         });
     }

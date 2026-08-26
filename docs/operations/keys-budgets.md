@@ -439,15 +439,112 @@ query string means a space - percent-encode it as `%2B`
 Everything above is *pull*: a control plane asks LUMEN what happened.
 Webhooks are the *push* half (ADR 011), and they exist for one problem in
 particular. A hard budget refuses with `402` `LM-4001` the instant the
-pool empties - so a prepaid-credits backend that only polls will always
-learn about the exhaustion *after* the customer has already been refused.
-A `budget.threshold` event at 80% is the trigger for an auto-recharge that
+pool empties, so a prepaid-credits backend that only polls will always
+learn about the exhaustion *after* the customer has been refused. A
+`budget.threshold` event at 80% is the trigger for an auto-recharge that
 lands as a `POST /admin/keys/{id}/grant` before that ever happens.
 
-**Absent by default.** With no `[webhooks]` block LUMEN makes no outbound
-call to anything but its configured providers. Enabling it is a deliberate
-choice, and it requires `auth.enabled = true` (every event describes a
-virtual key or a budget group); the gateway refuses to boot otherwise.
+**Absent by default.** With no webhook configured, LUMEN makes no outbound
+call to anything but its providers, and does not even export a
+`lumen_webhook_*` metric. Enabling it is a deliberate choice, and it
+requires `auth.enabled = true` (every event describes a virtual key or a
+budget group).
+
+There are two ways to configure one, and they compose: the admin API for a
+control plane, and the config file for a GitOps deployment.
+
+### Creating a webhook through the API
+
+This is the path a billing backend wants: nothing to restart, nothing to
+edit on the host. Three calls, all gated by `LUMEN_MASTER_KEY`.
+
+**1. Store a signing secret.** Generate one, keep your copy - LUMEN seals
+it and will never hand it back.
+
+```bash
+export WEBHOOK_SECRET="whsec_$(openssl rand -hex 24)"
+
+curl -s -X PUT http://localhost:8080/admin/webhooks/signing-key \
+  -H "Authorization: Bearer $LUMEN_MASTER_KEY" \
+  -H 'content-type: application/json' \
+  -d "{\"secret\": \"$WEBHOOK_SECRET\"}"
+```
+
+`204`. The secret is encrypted with AES-256-GCM under the master key
+before it touches the disk, exactly like a stored provider key.
+
+**2. Create the webhook.**
+
+```bash
+curl -s -X PUT http://localhost:8080/admin/webhooks \
+  -H "Authorization: Bearer $LUMEN_MASTER_KEY" \
+  -H 'content-type: application/json' \
+  -d '{
+    "url": "https://backend.example.com/lumen/events",
+    "events": ["budget.threshold", "budget.exhausted", "key.disabled"],
+    "thresholds": [50, 80, 95],
+    "channel_capacity": 1024,
+    "timeout_ms": 5000,
+    "max_attempts": 5,
+    "retry_base_ms": 500
+  }'
+```
+
+`url` is the only required field; every other one has the default shown
+above. The `200` response is the new state:
+
+```json
+{
+  "enabled": true,
+  "source": "database",
+  "settings": { "url": "https://backend.example.com/lumen/events", "...": "..." },
+  "signed": true,
+  "signing_key_stored": true,
+  "updated_at": 1787691194
+}
+```
+
+It is in force from that moment - the very next request that crosses a
+threshold delivers - and it is stored, so a restart comes up identically.
+
+**3. Check it.**
+
+```bash
+curl -s http://localhost:8080/admin/webhooks \
+  -H "Authorization: Bearer $LUMEN_MASTER_KEY"
+```
+
+`signed: true` is the field to watch. If it is `false`, deliveries carry no
+`x-lumen-signature` and your receiver cannot tell them from anyone else's
+traffic.
+
+**Editing** is the same `PUT`: it replaces *every* setting, so send the
+whole document rather than a fragment (there is no `PATCH` - a partial
+update of a delivery policy is how you end up retrying against a URL you
+meant to change). Every field is editable at runtime, `channel_capacity`
+included: LUMEN rebuilds the queue and lets the previous sender drain what
+it already had.
+
+**Rotating the secret** is another `PUT /admin/webhooks/signing-key`. It
+applies to the next delivery attempt, with nothing restarted. Retries of an
+event already in flight keep the signature they were created with, so a
+rotation never makes a pending retry unverifiable.
+
+**Deleting**:
+
+```bash
+curl -s -X DELETE http://localhost:8080/admin/webhooks \
+  -H "Authorization: Bearer $LUMEN_MASTER_KEY"
+```
+
+Emission stops immediately, and the decision is stored: a `[webhooks]`
+block in the config file will *not* quietly re-enable it on the next
+reload. `DELETE /admin/webhooks/signing-key` forgets the secret separately.
+
+### Declaring a webhook in the config file
+
+For a deployment where the config file is the source of truth and no
+control plane calls the API:
 
 ```toml
 [webhooks]
@@ -460,6 +557,19 @@ timeout_ms = 5000
 max_attempts = 5
 retry_base_ms = 500
 ```
+
+`signing_key_env` names the environment variable holding the secret; the
+secret itself never appears in the file. A named-but-unset variable with no
+stored secret is a **boot error**: a billing integration silently
+downgraded to unsigned deliveries is worse than a refused start.
+
+**Which one wins.** Settings written through `PUT /admin/webhooks` are
+stored in the database and take precedence over this block, so a runtime
+change is not undone by the next reload. `GET /admin/webhooks` reports
+`source` as `"database"` or `"config"` so the two are never ambiguous. If
+you manage the file, avoid the `PUT` (or expect the file to become
+decorative); if you manage the API, the block is just the boot-time
+default.
 
 ### The events
 
@@ -534,12 +644,13 @@ def verify(raw_body: bytes, header: str, secret: str) -> bool:
     return hmac.compare_digest(expected, header)
 ```
 
-The secret comes from the environment (`signing_key_env` names the
-variable, never holds the value), exactly like a provider key. A named but
-unset variable is a **boot error**: a billing integration silently
-downgraded to unsigned deliveries is worse than a refused start. Omitting
-`signing_key_env` entirely is allowed - deliveries then carry no signature
-- and logs a startup warning.
+The secret comes from whichever source is configured: the environment
+variable named by `signing_key_env` wins when it is set and non-empty, and
+the secret stored through `PUT /admin/webhooks/signing-key` fills in
+otherwise. No route ever returns it, in any form; `GET /admin/webhooks`
+reports the booleans `signed` and `signing_key_stored` and the variable
+*name*, exactly as the provider surface reports key presence without key
+material.
 
 ### Delivery guarantees, and what they are not
 
@@ -575,21 +686,24 @@ receiver cannot add a millisecond to a customer's request.
 | `lumen_webhook_dead_total` | Events abandoned (retries exhausted, or a permanent rejection) |
 | `lumen_webhook_delivery_seconds` | Wall time of a single delivery attempt |
 
+These series appear the first time a webhook is enabled, not at boot, so a
+gateway that never uses them stays quiet on `/metrics` too.
+
 Sustained `dropped` or `dead` means your billing loop is running blind:
 fall back to the export route until the receiver is healthy again.
 
 ### What a reload can change
 
-`url`, `events`, `thresholds`, `timeout_ms`, `max_attempts` and
-`retry_base_ms` are swapped by a hot reload, through the same queue and
-sender task - so a retarget never loses what is already queued. Removing
-the `[webhooks]` block stops emission entirely.
+A config reload re-resolves the same precedence: a stored row still wins,
+so a reload never reverts a `PUT`. When the file block *is* what is in
+force, `url`, `events`, `thresholds`, `timeout_ms`, `max_attempts`,
+`retry_base_ms` and `channel_capacity` are all re-applied through the same
+sender task, and removing the block stops emission.
 
-Restart-only: `channel_capacity` (the bounded queue is built once),
-`signing_key_env` (a running process cannot observe a changed environment
-variable), and *adding* a `[webhooks]` block to a process that booted
-without one - there is no queue or sender task to attach to. LUMEN warns
-in all three cases rather than pretending the change took effect.
+The one thing a reload cannot do is see a *new* environment variable: a
+running process cannot observe a change to its own environment. Pointing
+`signing_key_env` at a variable that was not set when the gateway started
+needs a restart, or the sealed-secret route instead.
 
 ## Operator notes
 

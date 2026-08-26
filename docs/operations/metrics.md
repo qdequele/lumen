@@ -22,7 +22,7 @@ to gate it. See [`SECURITY.md`](https://github.com/qdequele/lumen/blob/main/SECU
 | `lumen_metadata_rejected_total` | none | `x-lumen-metadata` headers dropped as malformed or out of bounds. |
 | `lumen_config_reloads_total` | none | Successful configuration hot reloads. |
 | `lumen_config_reload_failures_total` | none | Configuration reloads rejected as invalid; the previous config kept serving. |
-| `lumen_webhook_queued_total` | none | Budget events accepted into the outbound webhook queue (ADR 011). Only exported when a `[webhooks]` block is configured. |
+| `lumen_webhook_queued_total` | none | Budget events accepted into the outbound webhook queue (ADR 011). The whole `lumen_webhook_*` family appears the first time a webhook is enabled, not at boot. |
 | `lumen_webhook_sent_total` | none | Budget events the receiver acknowledged with a 2xx. |
 | `lumen_webhook_dropped_total` | none | Budget events dropped because the webhook queue was full. |
 | `lumen_webhook_retries_total` | none | Webhook delivery attempts that failed and were retried with backoff. |

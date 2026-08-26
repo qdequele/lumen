@@ -27,26 +27,49 @@
 //!   is abandoned, the queue is not drained, and shutdown never blocks on a
 //!   sick receiver.
 //!
-//! The signing secret is read from the environment once at boot (a running
-//! process cannot see a changed env var) and is wrapped in [`SigningKey`],
-//! whose `Debug` is redacted and whose bytes are zeroized on drop, so it can
-//! never reach a log line or an error message.
+//! The signing secret is wrapped in [`SigningKey`], whose `Debug` is redacted
+//! and whose bytes are zeroized on drop, so it can never reach a log line or
+//! an error message. It comes from the environment variable named in the
+//! settings, or - for a control plane that does not own the gateway's
+//! environment - from `PUT /admin/webhooks/signing-key`, sealed at rest under
+//! the master key (ADR 011 amendment §4).
+//!
+//! # The control surface
+//!
+//! [`WebhookController`] owns everything above and is the only thing `main`
+//! keeps. It exists whenever auth does, but stays **inert** until webhooks are
+//! first enabled: no queue, no sender task, and no Prometheus collector, so a
+//! gateway that never enables webhooks exports no `lumen_webhook_*` series at
+//! all. Every field is then editable at runtime
+//! ([`apply`](WebhookController::apply)):
+//!
+//! * `url`, `events`, `thresholds` and the retry knobs swap in live cells;
+//! * `channel_capacity` **rebuilds** the queue. The new queue takes new
+//!   events; the previous sender keeps its receiver, drains what it already
+//!   had under the settings it had, and exits when its last sender drops.
+//!   Nothing already accepted is discarded to change a capacity;
+//! * the signing secret lives in a cell the sender reads per attempt, so a
+//!   rotation applies to the next delivery without restarting anything.
 
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use hmac::{Hmac, KeyInit, Mac};
-use lumen_auth::events::{BudgetEvent, BudgetSignals, SignalCounters, SignalQueue};
-use lumen_telemetry::WebhookMetrics;
+use lumen_auth::crypto::MasterKey;
+use lumen_auth::events::{
+    BudgetEvent, BudgetSignals, SettingsOrigin, SettingsSource, SignalCounters, SignalQueue,
+    WebhookSettings,
+};
+use lumen_auth::state::AuthState;
+use lumen_auth::store::{KeyStore, StoredWebhookConfig};
+use lumen_telemetry::{Metrics, WebhookMetrics};
 use sha2::Sha256;
 use tokio::sync::mpsc::Receiver;
 use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
-
-use crate::config::WebhooksConfig;
 
 /// Header carrying the hex HMAC-SHA256 of the request body.
 const SIGNATURE_HEADER: &str = "x-lumen-signature";
@@ -103,110 +126,340 @@ pub struct DeliveryPolicy {
     pub retry_base: Duration,
 }
 
-impl DeliveryPolicy {
-    /// Derive the policy from a validated `[webhooks]` block.
-    #[must_use]
-    pub fn from_config(config: &WebhooksConfig) -> Self {
+impl From<&WebhookSettings> for DeliveryPolicy {
+    fn from(settings: &WebhookSettings) -> Self {
         Self {
-            url: config.url.clone(),
-            timeout: Duration::from_millis(config.timeout_ms),
-            max_attempts: config.max_attempts.max(1),
-            retry_base: Duration::from_millis(config.retry_base_ms),
+            url: settings.url.clone(),
+            timeout: Duration::from_millis(settings.timeout_ms),
+            // Validation rejects 0, but a floor here keeps the loop sane for a
+            // hand-edited database row too.
+            max_attempts: settings.max_attempts.max(1),
+            retry_base: Duration::from_millis(settings.retry_base_ms),
         }
     }
 }
 
-/// The process-wide webhook runtime: the bounded queue (built once) and the
-/// live delivery policy (swapped by a hot reload). Held by `main` so it can be
-/// handed to both the reloader and the sender task.
+/// One live delivery pipeline: the bounded queue plus the cells its sender
+/// task reads. Replaced wholesale by an apply; the sender task holds only the
+/// cells, so a swap that keeps the same capacity never disturbs it.
 #[derive(Debug)]
-pub struct WebhookRuntime {
+struct Pipeline {
+    /// The settings this pipeline was built from, for `GET /admin/webhooks`
+    /// and to decide whether the next apply can reuse the queue.
+    settings: WebhookSettings,
     queue: Arc<SignalQueue>,
     policy: Arc<ArcSwap<DeliveryPolicy>>,
-    /// The queue capacity and signing-key variable this process booted with.
-    /// Both are structural (the channel is built once; a running process
-    /// cannot observe a changed env var), so a reload that alters them is
-    /// reported rather than silently ignored.
-    boot_capacity: usize,
-    boot_signing_key_env: Option<String>,
+    signing: Arc<ArcSwapOption<SigningKey>>,
 }
 
-impl WebhookRuntime {
-    /// Build the runtime from a validated `[webhooks]` block: create the
-    /// bounded queue, the initial policy and the initial signalling policy.
+/// The webhook control surface: builds, retunes and tears down the delivery
+/// pipeline, and answers `GET /admin/webhooks`.
+///
+/// Present whenever auth is (webhooks describe keys and groups, so they need
+/// it), but inert until something enables them - see the module docs.
+pub struct WebhookController {
+    /// The Prometheus registry, so collectors can be registered on the first
+    /// enable rather than at boot.
+    registry: Metrics,
+    /// The shared, pooled HTTP client.
+    client: reqwest::Client,
+    /// Process-lifetime shutdown token, handed to every sender task.
+    cancel: CancellationToken,
+    /// The live pipeline; `None` = webhooks off.
+    live: ArcSwapOption<Pipeline>,
+    /// Registered exactly once. Prometheus refuses a duplicate registration,
+    /// and re-enabling webhooks must not be the thing that fails because of
+    /// it, so the handle is kept and reused.
+    metrics: std::sync::OnceLock<WebhookMetrics>,
+    /// The database's view, refreshed by [`refresh_from_store`] at boot, on
+    /// every config reload, and after each admin write. Cached because
+    /// resolution happens on the synchronous reload path, which has no
+    /// business awaiting a query.
+    stored: ArcSwapOption<StoredWebhookConfig>,
+    /// The sealed-at-rest signing secret, cached for the same reason.
+    stored_secret: ArcSwapOption<SigningKey>,
+    /// Serialises apply/disable. Two concurrent `PUT`s could otherwise
+    /// interleave a queue rebuild with a metrics registration and leave the
+    /// live cell pointing at a pipeline whose task was never spawned.
+    apply_lock: std::sync::Mutex<()>,
+}
+
+impl fmt::Debug for WebhookController {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The signing cells are redacted by `SigningKey`'s own Debug, but keep
+        // this minimal regardless.
+        f.debug_struct("WebhookController")
+            .field("enabled", &self.live.load().is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl WebhookController {
+    /// Create an inert controller. Nothing is registered or spawned until
+    /// [`apply`](Self::apply).
+    #[must_use]
+    pub fn new(registry: Metrics, client: reqwest::Client, cancel: CancellationToken) -> Self {
+        Self {
+            registry,
+            client,
+            cancel,
+            live: ArcSwapOption::empty(),
+            metrics: std::sync::OnceLock::new(),
+            stored: ArcSwapOption::empty(),
+            stored_secret: ArcSwapOption::empty(),
+            apply_lock: std::sync::Mutex::new(()),
+        }
+    }
+
+    /// Refresh the cached database view: the stored settings row and the
+    /// sealed signing secret.
     ///
-    /// Returns the runtime, the receiver the sender task drains, and the
-    /// [`BudgetSignals`] to install on the auth state.
-    #[must_use]
-    pub fn build(
-        config: &WebhooksConfig,
-        metrics: WebhookMetrics,
-    ) -> (Arc<Self>, Receiver<BudgetEvent>, Arc<BudgetSignals>) {
-        let (queue, rx) = SignalQueue::new(
-            config.channel_capacity,
-            Arc::new(QueueCounters::new(metrics)),
-        );
-        let runtime = Arc::new(Self {
-            queue: Arc::clone(&queue),
-            policy: Arc::new(ArcSwap::from_pointee(DeliveryPolicy::from_config(config))),
-            boot_capacity: config.channel_capacity,
-            boot_signing_key_env: config.signing_key_env.clone(),
-        });
-        let signals = runtime.signals_from(config);
-        (runtime, rx, signals)
-    }
-
-    /// Build a signalling policy over this runtime's queue. Used at boot and
-    /// on every reload, so the sender task always keeps its receiver.
-    #[must_use]
-    pub fn signals_from(&self, config: &WebhooksConfig) -> Arc<BudgetSignals> {
-        Arc::new(BudgetSignals::new(
-            Arc::clone(&self.queue),
-            &config.events,
-            &config.thresholds,
-        ))
-    }
-
-    /// Swap the delivery policy (hot reload). The sender task reads the cell
-    /// per attempt, so the next attempt uses the new URL and timeouts.
-    pub fn set_policy(&self, policy: DeliveryPolicy) {
-        self.policy.store(Arc::new(policy));
-    }
-
-    /// The policy cell the sender task reads.
-    #[must_use]
-    pub fn policy(&self) -> Arc<ArcSwap<DeliveryPolicy>> {
-        Arc::clone(&self.policy)
-    }
-
-    /// Apply a reloaded config to this runtime and return the signalling
-    /// policy to install on the auth state (`None` = the `[webhooks]` block
-    /// was removed, so detection stops and no further event is queued).
-    ///
-    /// The queue and the sender task are untouched, so a reload can retarget
-    /// and retune delivery without dropping whatever is already queued. The
-    /// two structural knobs are reported instead of applied.
-    pub fn apply_reload(&self, block: Option<&WebhooksConfig>) -> Option<Arc<BudgetSignals>> {
-        let Some(block) = block else {
-            tracing::info!(
-                "[webhooks] removed from the config; budget events are no longer emitted"
-            );
-            return None;
+    /// Runs at boot, in the reload task, and after an admin write - never on a
+    /// request path. A failure leaves the previous cache in place and is
+    /// logged, so a sick database cannot strip a working configuration.
+    pub async fn refresh_from_store(&self, store: &KeyStore, master: Option<&MasterKey>) {
+        match store.load_webhook_config().await {
+            Ok(stored) => self.stored.store(stored.map(Arc::new)),
+            Err(error) => {
+                tracing::warn!(%error, "could not read the stored webhook config; keeping the previous one");
+            }
+        }
+        let Some(master) = master else {
+            return;
         };
-        if block.channel_capacity != self.boot_capacity {
-            tracing::warn!(
-                configured = block.channel_capacity,
-                in_effect = self.boot_capacity,
-                "webhooks.channel_capacity is structural; the bounded queue keeps its boot size                  until a restart"
-            );
+        match store.load_webhook_secret(master).await {
+            // Only the presence of a secret is ever logged, never its value.
+            Ok(secret) => self
+                .stored_secret
+                .store(secret.map(|value| Arc::new(SigningKey::new(value.into_bytes())))),
+            Err(error) => {
+                tracing::warn!(%error, "could not read the stored webhook signing secret; keeping the previous one");
+            }
         }
-        if block.signing_key_env != self.boot_signing_key_env {
-            tracing::warn!(
-                "webhooks.signing_key_env changed; the signing secret is read from the                  environment at boot and keeps its boot value until a restart"
-            );
+    }
+
+    /// The cached stored row, if any.
+    #[must_use]
+    pub fn stored(&self) -> Option<Arc<StoredWebhookConfig>> {
+        self.stored.load_full()
+    }
+
+    /// Whether a signing secret is sealed in the database. Reported by
+    /// `GET /admin/webhooks`; the value itself is never exposed.
+    #[must_use]
+    pub fn has_stored_secret(&self) -> bool {
+        self.stored_secret.load().is_some()
+    }
+
+    /// The settings currently in force, or `None` when webhooks are off.
+    #[must_use]
+    pub fn live_settings(&self) -> Option<WebhookSettings> {
+        self.live.load().as_ref().map(|p| p.settings.clone())
+    }
+
+    /// Whether deliveries currently carry a signature.
+    #[must_use]
+    pub fn is_signed(&self) -> bool {
+        self.live
+            .load()
+            .as_ref()
+            .is_some_and(|p| p.signing.load().is_some())
+    }
+
+    /// Resolve which settings win and apply them (ADR 011 amendment §2): a
+    /// stored row beats the `[webhooks]` file block, a stored row marked
+    /// disabled means off whatever the file says, and no row falls back to the
+    /// file.
+    ///
+    /// Returns the source that won, so the caller can log or report it.
+    ///
+    /// # Errors
+    /// The winning settings do not validate, the signing secret cannot be
+    /// resolved, or the Prometheus collectors cannot be registered. The
+    /// previous pipeline is left running in every case.
+    pub fn resolve_and_apply(
+        &self,
+        file_block: Option<&WebhookSettings>,
+        keys: &AuthState,
+    ) -> Result<SettingsSource, String> {
+        match self.stored() {
+            Some(stored) if stored.enabled => {
+                self.apply(&stored.settings, keys)?;
+                Ok(SettingsSource::Database)
+            }
+            // A stored row marked disabled shadows the file block on purpose:
+            // a DELETE must not be undone by the next reload.
+            Some(_) => {
+                self.disable(keys);
+                Ok(SettingsSource::None)
+            }
+            None => {
+                if let Some(settings) = file_block {
+                    self.apply(settings, keys)?;
+                    Ok(SettingsSource::Config)
+                } else {
+                    self.disable(keys);
+                    Ok(SettingsSource::None)
+                }
+            }
         }
-        self.set_policy(DeliveryPolicy::from_config(block));
-        Some(self.signals_from(block))
+    }
+
+    /// Where the settings currently in force came from.
+    #[must_use]
+    pub fn source(&self) -> SettingsSource {
+        if self.live.load().is_none() {
+            return SettingsSource::None;
+        }
+        match self.stored() {
+            Some(stored) if stored.enabled => SettingsSource::Database,
+            _ => SettingsSource::Config,
+        }
+    }
+
+    /// Build or retune the pipeline from `settings` and install the matching
+    /// signalling policy on `keys`.
+    ///
+    /// Reuses the existing queue - and so the existing sender task - unless
+    /// `channel_capacity` changed. When it did, a fresh queue and task are
+    /// created and the old task drains its backlog before exiting; nothing
+    /// already accepted is thrown away to resize a channel.
+    ///
+    /// # Errors
+    /// Invalid settings, an unresolvable signing secret, or a metrics
+    /// registration failure. Nothing is swapped on error.
+    pub fn apply(&self, settings: &WebhookSettings, keys: &AuthState) -> Result<(), String> {
+        // Defence in depth. Each surface validates with its own origin before
+        // reaching here - the config loader on parse, the admin route before
+        // it writes - so this pass uses the permissive origin: it re-checks the
+        // rules both surfaces share, and must not re-apply the API-only
+        // `LUMEN_` prefix rule to a perfectly legal file-declared variable.
+        settings.validate(SettingsOrigin::ConfigFile)?;
+        // Held across the whole sequence: validate, register, build, swap.
+        let _guard = self
+            .apply_lock
+            .lock()
+            .map_err(|_| "the webhook apply lock is poisoned".to_owned())?;
+        let signing = self.resolve_signing_key(settings)?;
+        let metrics = self.metrics_handle()?;
+
+        let current = self.live.load_full();
+        let reuse = current
+            .as_ref()
+            .filter(|p| p.settings.channel_capacity == settings.channel_capacity);
+        let pipeline = if let Some(existing) = reuse {
+            // Same capacity: retune in place. The sender task reads both cells
+            // per attempt, so this takes effect on the next one.
+            existing
+                .policy
+                .store(Arc::new(DeliveryPolicy::from(settings)));
+            existing.signing.store(signing);
+            Arc::new(Pipeline {
+                settings: settings.clone(),
+                queue: Arc::clone(&existing.queue),
+                policy: Arc::clone(&existing.policy),
+                signing: Arc::clone(&existing.signing),
+            })
+        } else {
+            // A new capacity means a new queue and a new sender. The previous
+            // sender keeps its receiver and exits once this function drops the
+            // last clone of the old queue, after draining what it already had.
+            let (queue, receiver) = SignalQueue::new(
+                settings.channel_capacity,
+                Arc::new(QueueCounters(metrics.clone())),
+            );
+            let policy = Arc::new(ArcSwap::from_pointee(DeliveryPolicy::from(settings)));
+            let signing_cell = Arc::new(ArcSwapOption::empty());
+            signing_cell.store(signing);
+            spawn_webhook_sender(
+                receiver,
+                self.client.clone(),
+                Arc::clone(&policy),
+                Arc::clone(&signing_cell),
+                metrics,
+                self.cancel.clone(),
+            );
+            Arc::new(Pipeline {
+                settings: settings.clone(),
+                queue,
+                policy,
+                signing: signing_cell,
+            })
+        };
+        // Installing the policy also re-arms every loaded key and group, so a
+        // subject already past a threshold does not re-fire it.
+        keys.set_signals(Some(Arc::new(BudgetSignals::new(
+            Arc::clone(&pipeline.queue),
+            &settings.events,
+            &settings.thresholds,
+        ))));
+        self.live.store(Some(pipeline));
+        Ok(())
+    }
+
+    /// Stop emitting events. The queue's last sender goes with the pipeline,
+    /// so the sender task delivers whatever was already queued and then exits.
+    pub fn disable(&self, keys: &AuthState) {
+        // Best effort: a poisoned lock must not leave webhooks stuck on.
+        let _guard = self.apply_lock.lock();
+        keys.set_signals(None);
+        self.live.store(None);
+    }
+
+    /// Register the webhook collectors on first use and reuse the handle
+    /// afterwards. Must be called with `apply_lock` held: Prometheus refuses a
+    /// duplicate registration, so two racing first-enables would make one of
+    /// them fail for no operator-visible reason.
+    fn metrics_handle(&self) -> Result<WebhookMetrics, String> {
+        if let Some(metrics) = self.metrics.get() {
+            return Ok(metrics.clone());
+        }
+        let metrics = WebhookMetrics::register(&self.registry)
+            .map_err(|error| format!("could not register the webhook metrics: {error}"))?;
+        let _ = self.metrics.set(metrics.clone());
+        Ok(metrics)
+    }
+
+    /// Resolve the signing secret: the named environment variable first, then
+    /// the sealed-at-rest secret (ADR 011 amendment §4).
+    ///
+    /// # Errors
+    /// `signing_key_env` names a variable that is unset or empty and no secret
+    /// is stored either. That is a broken deployment, not a choice: it would
+    /// silently downgrade a billing integration to unsigned deliveries.
+    fn resolve_signing_key(
+        &self,
+        settings: &WebhookSettings,
+    ) -> Result<Option<Arc<SigningKey>>, String> {
+        // Only variable NAMES appear in any message or log line below.
+        if let Some(var) = &settings.signing_key_env {
+            match std::env::var(var) {
+                Ok(value) if !value.is_empty() => {
+                    return Ok(Some(Arc::new(SigningKey::new(value.into_bytes()))));
+                }
+                _ => {
+                    if let Some(stored) = self.stored_secret.load_full() {
+                        tracing::warn!(
+                            "webhooks.signing_key_env names '{var}', which is unset or empty; \
+                             using the secret stored through PUT /admin/webhooks/signing-key"
+                        );
+                        return Ok(Some(stored));
+                    }
+                    return Err(format!(
+                        "webhooks.signing_key_env names '{var}', which is unset or empty in the \
+                         environment, and no signing secret is stored"
+                    ));
+                }
+            }
+        }
+        if let Some(stored) = self.stored_secret.load_full() {
+            return Ok(Some(stored));
+        }
+        tracing::warn!(
+            "webhooks are enabled with no signing secret: deliveries carry no x-lumen-signature \
+             header and the receiver cannot verify authenticity"
+        );
+        Ok(None)
     }
 }
 
@@ -215,44 +468,12 @@ impl WebhookRuntime {
 #[derive(Debug)]
 struct QueueCounters(WebhookMetrics);
 
-impl QueueCounters {
-    fn new(metrics: WebhookMetrics) -> Self {
-        Self(metrics)
-    }
-}
-
 impl SignalCounters for QueueCounters {
     fn inc_queued(&self) {
         self.0.inc_queued();
     }
     fn inc_dropped(&self) {
         self.0.inc_dropped();
-    }
-}
-
-/// Read the signing secret named by `signing_key_env`.
-///
-/// A named-but-unset (or empty) variable is an operator mistake worth failing
-/// on: silently delivering unsigned billing events would be a security
-/// downgrade nobody asked for. An absent `signing_key_env` is a deliberate
-/// choice and only warns.
-///
-/// # Errors
-/// The env var is named in config but missing or empty in the environment.
-pub fn load_signing_key(config: &WebhooksConfig) -> Result<Option<SigningKey>, String> {
-    let Some(var) = &config.signing_key_env else {
-        tracing::warn!(
-            "webhooks are enabled without signing_key_env: deliveries carry no \
-             x-lumen-signature header and the receiver cannot verify authenticity"
-        );
-        return Ok(None);
-    };
-    // Only the variable NAME is ever logged or returned in an error.
-    match std::env::var(var) {
-        Ok(value) if !value.is_empty() => Ok(Some(SigningKey::new(value.into_bytes()))),
-        _ => Err(format!(
-            "webhooks.signing_key_env names '{var}', which is unset or empty in the environment"
-        )),
     }
 }
 
@@ -266,7 +487,7 @@ pub fn spawn_webhook_sender(
     mut rx: Receiver<BudgetEvent>,
     client: reqwest::Client,
     policy: Arc<ArcSwap<DeliveryPolicy>>,
-    signing_key: Option<SigningKey>,
+    signing: Arc<ArcSwapOption<SigningKey>>,
     metrics: WebhookMetrics,
     cancel: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
@@ -282,15 +503,7 @@ pub fn spawn_webhook_sender(
                     None => break,
                 },
             };
-            deliver(
-                &client,
-                &policy,
-                signing_key.as_ref(),
-                &metrics,
-                &cancel,
-                event,
-            )
-            .await;
+            deliver(&client, &policy, &signing, &metrics, &cancel, event).await;
         }
         tracing::debug!("webhook sender stopped");
     })
@@ -350,7 +563,7 @@ fn jitter01() -> f64 {
 async fn deliver(
     client: &reqwest::Client,
     policy: &ArcSwap<DeliveryPolicy>,
-    signing_key: Option<&SigningKey>,
+    signing: &ArcSwapOption<SigningKey>,
     metrics: &WebhookMetrics,
     cancel: &CancellationToken,
     event: BudgetEvent,
@@ -365,7 +578,10 @@ async fn deliver(
             return;
         }
     };
-    let signature = signing_key.map(|key| key.sign(&body));
+    // Read the key cell once per event, not per attempt: every attempt must
+    // carry the same signature as the body it is retrying, and a rotation
+    // mid-retry would otherwise make the retries unverifiable.
+    let signature = signing.load().as_ref().map(|key| key.sign(&body));
 
     for attempt in 0..policy.load().max_attempts {
         if cancel.is_cancelled() {
@@ -530,27 +746,91 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_named_but_unset_signing_env_var_is_an_error_naming_only_the_variable() {
-        let config = WebhooksConfig {
+    /// An inert controller with no HTTP client work to do - enough to
+    /// exercise the signing-key resolution rules on their own.
+    fn controller() -> WebhookController {
+        WebhookController::new(
+            Metrics::new(),
+            reqwest::Client::new(),
+            CancellationToken::new(),
+        )
+    }
+
+    fn settings_with_env(var: Option<&str>) -> WebhookSettings {
+        WebhookSettings {
             url: "https://example.test/hook".to_owned(),
-            signing_key_env: Some("LUMEN_TEST_WEBHOOK_SECRET_ABSENT".to_owned()),
-            ..WebhooksConfig::default()
-        };
-        let error = load_signing_key(&config).expect_err("unset var must fail");
-        assert!(error.contains("LUMEN_TEST_WEBHOOK_SECRET_ABSENT"));
+            signing_key_env: var.map(str::to_owned),
+            ..WebhookSettings::default()
+        }
     }
 
     #[test]
-    fn an_absent_signing_env_var_yields_unsigned_delivery() {
-        let config = WebhooksConfig {
-            url: "https://example.test/hook".to_owned(),
-            signing_key_env: None,
-            ..WebhooksConfig::default()
-        };
-        assert!(load_signing_key(&config)
-            .expect("no env var configured is allowed")
+    fn a_named_but_unset_signing_env_var_is_an_error_naming_only_the_variable() {
+        let error = controller()
+            .resolve_signing_key(&settings_with_env(Some("LUMEN_TEST_WEBHOOK_SECRET_ABSENT")))
+            .expect_err("an unset variable with no stored secret must fail");
+        assert!(
+            error.contains("LUMEN_TEST_WEBHOOK_SECRET_ABSENT"),
+            "{error}"
+        );
+        assert!(error.contains("no signing secret is stored"), "{error}");
+    }
+
+    #[test]
+    fn an_absent_signing_env_var_and_no_stored_secret_yields_unsigned_delivery() {
+        assert!(controller()
+            .resolve_signing_key(&settings_with_env(None))
+            .expect("no secret configured at all is allowed")
             .is_none());
+    }
+
+    #[test]
+    fn the_stored_secret_fills_in_for_an_unset_env_var() {
+        // ADR 011 amendment §4: the environment is primary, the sealed secret
+        // fills in. A named-but-unset variable is only fatal when nothing
+        // else can sign - otherwise deliveries stay signed, which is the
+        // property that actually matters.
+        let controller = controller();
+        controller
+            .stored_secret
+            .store(Some(Arc::new(SigningKey::new("stored-secret"))));
+        let resolved = controller
+            .resolve_signing_key(&settings_with_env(Some("LUMEN_TEST_WEBHOOK_ABSENT_2")))
+            .expect("the stored secret fills in")
+            .expect("some key");
+        assert_eq!(
+            resolved.sign(b"body"),
+            SigningKey::new("stored-secret").sign(b"body")
+        );
+
+        // With no variable named at all, the stored secret is used directly.
+        let resolved = controller
+            .resolve_signing_key(&settings_with_env(None))
+            .expect("stored secret")
+            .expect("some key");
+        assert_eq!(
+            resolved.sign(b"body"),
+            SigningKey::new("stored-secret").sign(b"body")
+        );
+    }
+
+    #[test]
+    fn the_environment_wins_over_the_stored_secret() {
+        // Safe on edition 2021; the variable is scoped to this test's name.
+        std::env::set_var("LUMEN_TEST_WEBHOOK_ENV_WINS", "env-secret");
+        let controller = controller();
+        controller
+            .stored_secret
+            .store(Some(Arc::new(SigningKey::new("stored-secret"))));
+        let resolved = controller
+            .resolve_signing_key(&settings_with_env(Some("LUMEN_TEST_WEBHOOK_ENV_WINS")))
+            .expect("resolves")
+            .expect("some key");
+        assert_eq!(
+            resolved.sign(b"body"),
+            SigningKey::new("env-secret").sign(b"body")
+        );
+        std::env::remove_var("LUMEN_TEST_WEBHOOK_ENV_WINS");
     }
 
     /// A `MakeWriter` that appends everything into a shared buffer, so a test
@@ -600,9 +880,8 @@ mod tests {
             max_attempts: 2,
             retry_base: Duration::from_millis(1),
         });
-        let key = SigningKey::new(SECRET);
-        let metrics = WebhookMetrics::register(&lumen_telemetry::Metrics::new())
-            .expect("register webhook metrics");
+        let signing = ArcSwapOption::from_pointee(SigningKey::new(SECRET));
+        let metrics = WebhookMetrics::register(&Metrics::new()).expect("register webhook metrics");
         let event = BudgetEvent {
             id: "evt_test".to_owned(),
             event: lumen_auth::events::EventKind::BudgetThreshold,
@@ -619,7 +898,7 @@ mod tests {
         deliver(
             &reqwest::Client::new(),
             &policy,
-            Some(&key),
+            &signing,
             &metrics,
             &CancellationToken::new(),
             event,
@@ -646,27 +925,24 @@ mod tests {
     fn an_empty_signing_env_var_is_rejected_without_echoing_its_value() {
         // Safe on edition 2021; the variable is scoped to this test's name.
         std::env::set_var("LUMEN_TEST_WEBHOOK_SECRET_EMPTY", "");
-        let config = WebhooksConfig {
-            url: "https://example.test/hook".to_owned(),
-            signing_key_env: Some("LUMEN_TEST_WEBHOOK_SECRET_EMPTY".to_owned()),
-            ..WebhooksConfig::default()
-        };
-        let error = load_signing_key(&config).expect_err("an empty secret must fail");
+        let error = controller()
+            .resolve_signing_key(&settings_with_env(Some("LUMEN_TEST_WEBHOOK_SECRET_EMPTY")))
+            .expect_err("an empty secret must fail");
         assert!(error.contains("LUMEN_TEST_WEBHOOK_SECRET_EMPTY"));
         assert!(error.contains("unset or empty"));
         std::env::remove_var("LUMEN_TEST_WEBHOOK_SECRET_EMPTY");
     }
 
     #[test]
-    fn the_delivery_policy_mirrors_the_config_block() {
-        let config = WebhooksConfig {
+    fn the_delivery_policy_mirrors_the_settings() {
+        let config = WebhookSettings {
             url: "https://example.test/hook".to_owned(),
             timeout_ms: 1_500,
             max_attempts: 3,
             retry_base_ms: 250,
-            ..WebhooksConfig::default()
+            ..WebhookSettings::default()
         };
-        let policy = DeliveryPolicy::from_config(&config);
+        let policy = DeliveryPolicy::from(&config);
         assert_eq!(policy.url, "https://example.test/hook");
         assert_eq!(policy.timeout, Duration::from_millis(1_500));
         assert_eq!(policy.max_attempts, 3);
