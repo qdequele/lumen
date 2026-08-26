@@ -6,6 +6,31 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **Streaming latency: `TCP_NODELAY` on accepted client connections.** axum
+  does not set the flag and the kernel default leaves Nagle's algorithm on,
+  so every small SSE frame the gateway wrote could stall in the send buffer
+  waiting for the previous packet's delayed ACK (tens of ms per frame on a
+  real network). A streaming completion is hundreds of small frames, so the
+  stalls compounded into a severalfold slowdown of end-to-end streaming time
+  versus direct-to-provider; the loopback bench harness could not see it
+  (no delayed-ACK stalls on localhost). The serve path now sets
+  `TCP_NODELAY` on every accepted socket (the upstream leg already had it
+  via reqwest's default), matching the direct-to-provider baseline.
+
+### Changed
+
+- **Upstream HTTP/2 and connection keepalive.** The shared provider client
+  now enables reqwest's `http2` feature: where the upstream offers h2 via
+  ALPN (the hosted providers all do), concurrent requests multiplex over a
+  few connections instead of paying one TCP+TLS handshake per in-flight
+  request; h1-only upstreams (Ollama, TEI) are untouched by ALPN fallback.
+  The client also sends h2 keepalive pings (30 s interval, 10 s timeout,
+  including while idle) and TCP keepalive (60 s) so a silently dead pooled
+  connection (NAT reap, upstream restart) is detected in seconds instead of
+  stalling the next request on it.
+
 ### Added
 
 - **Outbound webhooks for budget events** (ADR 011 and its 2026-08-26
@@ -69,6 +94,26 @@ All notable changes to LUMEN are documented here. The format is based on
   - Documented in `docs/operations/keys-budgets.md` (creating a webhook
     through the API, payload shape, signature verification, guarantees) and
     `config.example.toml`.
+
+### Fixed
+
+- **Self-sustaining config hot-reload loop.** The reload watcher is armed on
+  the config file's parent *directory* (a file-level watch does not survive a
+  rename-replace), and `notify`'s inotify backend arms that watch with a
+  0xfee mask that includes `IN_OPEN`. Because a reload itself *opens* the
+  config file to re-read it, every reload scheduled the next one: one reload
+  per 250 ms debounce window, roughly four a second, indefinitely, clearable
+  only by a process restart (`systemctl reload` did not help). Any process
+  merely *reading* the config file started it, including LUMEN's own
+  `lumen --check-config`, documented as the safe pre-reload validation step,
+  and `lumen keys list`. Observed on a production box: 16 days of looping,
+  3h45m of CPU burnt and 4.0 GB of journal. Reload now filters watcher events
+  by kind as well as by path: non-mutating accesses (`IN_OPEN`, reads,
+  read-only closes) never schedule a reload, while content and rename events,
+  `IN_CLOSE_WRITE` included, still do. Filtering on `notify`'s event kind
+  rather than on an explicit inotify mask keeps this backend-agnostic. Hot
+  reload is unchanged otherwise: a genuine config change still triggers
+  exactly one reload.
 
 ### Changed
 
