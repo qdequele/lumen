@@ -8,6 +8,13 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ### Changed
 
+- **Internal: `toml_edit`-based config document editors** (ADR 012, task 7 of
+  the config-source-abstraction plan). New `crates/server/src/config_edit.rs`
+  module: pure text-to-text `upsert_provider`, `delete_provider`,
+  `replace_section` and `provider_names`, built on `toml_edit::DocumentMut`
+  instead of `toml::Value`, so an edit preserves every comment and formatting
+  choice outside the table it touches. Not yet wired into any handler; lays
+  the groundwork for the granular per-resource admin config routes (task 8).
 - **`GET`/`PUT /admin/config` now work in both config-source modes** (ADR 012,
   task 6 of the config-source-abstraction plan). Both routes read and write
   through `ConfigContext`/`ConfigSource` instead of the file-only code path:
