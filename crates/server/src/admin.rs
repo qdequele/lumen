@@ -1130,7 +1130,11 @@ const fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
 
 // ---- Config read and apply (ADR 010, ADR 012) -------------------------------
 
-use crate::config::{boot_layer_diff, ConfigError};
+use crate::config::{
+    boot_layer_diff, AuthDynamicKnobs, Config, ConfigError, ImageFetchConfig, ProviderConfig,
+    ResilienceConfig, TelemetryConfig, TokenizerConfig, WebhooksConfig,
+};
+use crate::config_edit;
 use crate::config_source::{ConfigContext, ConfigLoadError, ConfigSourceError};
 
 /// `GET /admin/config` response.
@@ -1184,16 +1188,24 @@ pub async fn put_config(
     headers: axum::http::HeaderMap,
     body: String,
 ) -> Result<StatusCode, ApiError> {
+    let if_match = require_if_match(&headers)?;
+    apply_document(&state, body, &if_match).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Extract and unquote the `If-Match` header every mutating config write
+/// requires (the whole-document `PUT` and every granular endpoint, Task 8).
+/// Missing is `LM-1001` (400) - the identical message on every path that
+/// requires it, so a client cannot tell which endpoint rejected it by text
+/// alone.
+fn require_if_match(headers: &axum::http::HeaderMap) -> Result<String, ApiError> {
     let Some(if_match) = headers.get("if-match").and_then(|v| v.to_str().ok()) else {
         return Err(GatewayError::InvalidRequest(
             "`If-Match` is required: GET /admin/config first and echo its hash".to_owned(),
         )
         .into());
     };
-    let if_match = if_match.trim_matches('"').to_owned();
-
-    apply_document(&state, body, &if_match).await?;
-    Ok(StatusCode::NO_CONTENT)
+    Ok(if_match.trim_matches('"').to_owned())
 }
 
 /// Apply a candidate config document through `state.config`'s
@@ -1404,6 +1416,349 @@ fn describe_validation_rejection(error: &ConfigLoadError) -> ApiError {
             GatewayError::Internal(source_error.to_string()).into()
         }
     }
+}
+
+// ---- Granular config endpoints (ADR 012 Task 8) -----------------------------
+//
+// Every route below shares `apply_document`'s pipeline: load the current
+// document, run a `toml_edit` patch that touches only the field(s) this
+// request named (comments and formatting elsewhere survive), then hand the
+// resulting candidate to the exact same apply-lock / If-Match / boot-layer /
+// validate / persist / hot-reload sequence the whole-document `PUT
+// /admin/config` uses. A granular edit can therefore never produce a
+// document a restart would refuse, and a provider a validation-breaking edit
+// would orphan (e.g. still referenced by another model's fallback chain) is
+// rejected the same way the whole-document PUT would reject it - `LM-1001`
+// naming the dependent model, from `Config::validate_fallbacks`.
+
+/// Parse the current document's raw text into a [`Config`] - deliberately
+/// WITHOUT the `LUMEN_*` environment overlay `Config::load` applies (see
+/// `get_config`'s doc comment): a granular read must show exactly the
+/// document's own declared values, never a value an env var happens to
+/// override.
+///
+/// Every document reaching this function was already validated by
+/// [`ConfigContext::validate_document`] at the moment it was persisted (the
+/// whole-document `PUT` and every granular write both route through
+/// `apply_document`, which validates before persisting), so a parse failure
+/// here can only mean the STORED document itself is corrupt - an internal
+/// inconsistency, never a client mistake, hence the opaque 500 rather than
+/// any `LM-1001`.
+fn config_from_document(text: &str) -> Result<Config, ApiError> {
+    toml::from_str::<Config>(text).map_err(|error| {
+        tracing::error!(
+            %error,
+            "stored config document failed to parse while serving a granular admin read; \
+             this should be unreachable, since every persisted document is validated first"
+        );
+        GatewayError::Internal("stored config document is not valid".to_owned()).into()
+    })
+}
+
+/// Map a [`config_edit::EditError`] to an opaque 500.
+///
+/// `config_edit`'s own doc comment is explicit that it never validates the
+/// edit it performs - a syntactically sound but semantically invalid result
+/// (e.g. a dangling fallback reference) is caught by `apply_document`'s
+/// later `validate_document` call, not here, and surfaces as `LM-1001`
+/// through that path instead. Reaching THIS function at all means the edit
+/// itself failed against a document that was already validated when it was
+/// persisted - an internal inconsistency, not a client mistake.
+fn edit_internal_error(error: &config_edit::EditError) -> ApiError {
+    tracing::error!(%error, "config document edit failed against an already-validated document");
+    GatewayError::Internal(error.to_string()).into()
+}
+
+/// One entry in [`ProvidersList`]: just enough to pick a provider without
+/// fetching its full config (which may include a nested `models` array).
+#[derive(Debug, Serialize)]
+pub struct ProviderSummary {
+    /// The provider's unique name.
+    pub name: String,
+    /// Its [`lumen_providers::ProviderKind`], as the same lowercase string
+    /// the config file itself uses (`kind = "..."`).
+    pub kind: String,
+}
+
+/// `GET /admin/config/providers` response.
+#[derive(Debug, Serialize)]
+pub struct ProvidersList {
+    /// Every provider in the current document, in document order.
+    pub providers: Vec<ProviderSummary>,
+    /// BLAKE3 hash of the current document, to be echoed as `If-Match` on a
+    /// write - identical semantics to `GET /admin/config`'s own `hash`.
+    pub hash: String,
+}
+
+/// List every provider in the current document by name and kind: the picker
+/// view: `GET /admin/config/providers/{name}` is the full detail view.
+pub async fn list_providers(
+    State(state): State<AppState>,
+) -> Result<Json<ProvidersList>, ApiError> {
+    let ctx = config_ctx(&state)?;
+    let doc = ctx
+        .source
+        .load()
+        .await
+        .map_err(|e| source_internal_error(&e))?;
+    let cfg = config_from_document(&doc.toml)?;
+    Ok(Json(ProvidersList {
+        providers: cfg
+            .providers
+            .iter()
+            .map(|p| ProviderSummary {
+                name: p.name.clone(),
+                kind: p.kind.as_str().to_owned(),
+            })
+            .collect(),
+        hash: doc.hash,
+    }))
+}
+
+/// `GET /admin/config/providers/{name}` response: the provider's full config
+/// (never a secret, `api_key_env` is a variable NAME, exactly like the
+/// whole-document `GET`) plus the current hash.
+#[derive(Debug, Serialize)]
+pub struct ProviderDocument {
+    /// The provider's own fields, flattened into the top level of the
+    /// response (not nested under a `provider` key).
+    #[serde(flatten)]
+    pub provider: ProviderConfig,
+    /// See [`ProvidersList::hash`].
+    pub hash: String,
+}
+
+/// Fetch a single provider's full config by name.
+///
+/// # Errors
+/// `LM-1003` (404, the same style every other per-entity admin 404 uses)
+/// when no provider with that name exists in the current document.
+pub async fn get_provider(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<Json<ProviderDocument>, ApiError> {
+    let ctx = config_ctx(&state)?;
+    let doc = ctx
+        .source
+        .load()
+        .await
+        .map_err(|e| source_internal_error(&e))?;
+    let cfg = config_from_document(&doc.toml)?;
+    let provider = cfg
+        .providers
+        .into_iter()
+        .find(|p| p.name == name)
+        .ok_or(GatewayError::RouteNotFound)?;
+    Ok(Json(ProviderDocument {
+        provider,
+        hash: doc.hash,
+    }))
+}
+
+/// Insert or replace a single provider by name.
+///
+/// The path `{name}` must equal the body's own `name` field - `LM-1001`
+/// otherwise, since silently retargeting `{name}` to a differently-named
+/// body would be a confusing way to rename a provider (delete the old one
+/// and PUT the new name instead). Every other field is policed by
+/// [`ProviderConfig`]'s own `deny_unknown_fields`. Requires `If-Match`; runs
+/// through the shared [`apply_document`] pipeline, so e.g. a fallback
+/// reference this write would leave dangling is rejected exactly like the
+/// whole-document `PUT` would reject it.
+pub async fn put_provider(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    headers: axum::http::HeaderMap,
+    payload: Result<Json<ProviderConfig>, JsonRejection>,
+) -> Result<StatusCode, ApiError> {
+    let if_match = require_if_match(&headers)?;
+    let Json(provider) = payload.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
+    if provider.name != name {
+        return Err(GatewayError::InvalidRequest(format!(
+            "path provider name '{name}' does not match the request body's 'name' field '{}'",
+            provider.name
+        ))
+        .into());
+    }
+
+    let ctx = config_ctx(&state)?;
+    let current = ctx
+        .source
+        .load()
+        .await
+        .map_err(|e| source_internal_error(&e))?;
+    let candidate = config_edit::upsert_provider(&current.toml, &provider)
+        .map_err(|e| edit_internal_error(&e))?;
+    apply_document(&state, candidate, &if_match).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Remove a single provider by name.
+///
+/// # Errors
+/// `LM-1003` (404) when no provider with that name exists in the current
+/// document. `LM-1001` (400), from [`apply_document`]'s validation pass,
+/// when the provider is still referenced by another model's fallback chain
+/// - the rejection names the dependent model (`Config::validate_fallbacks`).
+pub async fn delete_provider(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    headers: axum::http::HeaderMap,
+) -> Result<StatusCode, ApiError> {
+    let if_match = require_if_match(&headers)?;
+    let ctx = config_ctx(&state)?;
+    let current = ctx
+        .source
+        .load()
+        .await
+        .map_err(|e| source_internal_error(&e))?;
+    let candidate = config_edit::delete_provider(&current.toml, &name)
+        .map_err(|e| edit_internal_error(&e))?
+        .ok_or(GatewayError::RouteNotFound)?;
+    apply_document(&state, candidate, &if_match).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Extract the JSON value of one scalar config section from a parsed
+/// [`Config`]. `None` for a name outside the fixed set `GET|PUT
+/// /admin/config/{section}` serves (`resilience`, `telemetry`, `tokenizer`,
+/// `image_fetch`, `webhooks`, `auth`) - the caller maps that to `LM-1003`
+/// (404). `auth` reports [`AuthDynamicKnobs`] - the 5
+/// dynamic knobs only, never `enabled`/`db_path` - derived from
+/// `cfg.auth`.
+///
+/// `webhooks` alone can render `null`: `Config.webhooks` is `Option<..>`
+/// (absent by default, ADR 011), unlike every other section here, which
+/// `Config`'s own `#[serde(default)]` always resolves to SOME value even
+/// when the document's table is absent.
+fn section_json(
+    cfg: &Config,
+    section: &str,
+) -> Option<Result<serde_json::Value, serde_json::Error>> {
+    Some(match section {
+        "resilience" => serde_json::to_value(cfg.resilience),
+        "telemetry" => serde_json::to_value(&cfg.telemetry),
+        "tokenizer" => serde_json::to_value(cfg.tokenizer),
+        "image_fetch" => serde_json::to_value(&cfg.image_fetch),
+        "webhooks" => serde_json::to_value(&cfg.webhooks),
+        "auth" => serde_json::to_value(AuthDynamicKnobs::from(&cfg.auth)),
+        _ => return None,
+    })
+}
+
+/// `GET /admin/config/{section}` for the fixed set of scalar sections
+/// (`resilience`, `telemetry`, `tokenizer`, `image_fetch`, `webhooks`,
+/// `auth`): the section's current value plus the document hash, keyed by the
+/// section's own name, e.g. `{"tokenizer": {"mode": "heuristic"}, "hash":
+/// "..."}`.
+///
+/// `webhooks` reports the `[webhooks]` block from the DOCUMENT alone (`null`
+/// when absent) - never the DB-backed `/admin/webhooks` surface (ADR 011
+/// amendment), which this route does not touch and which may report a
+/// different value when a stored row overrides the file.
+///
+/// # Errors
+/// `LM-1003` (404, the same style every other per-entity admin 404 uses) for
+/// a section name outside the fixed set.
+pub async fn get_config_section(
+    State(state): State<AppState>,
+    Path(section): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let ctx = config_ctx(&state)?;
+    let doc = ctx
+        .source
+        .load()
+        .await
+        .map_err(|e| source_internal_error(&e))?;
+    let cfg = config_from_document(&doc.toml)?;
+    let value = match section_json(&cfg, &section) {
+        None => return Err(GatewayError::RouteNotFound.into()),
+        Some(Ok(value)) => value,
+        Some(Err(error)) => {
+            tracing::error!(
+                %error,
+                section = %section,
+                "failed to serialize a config section for a granular admin GET"
+            );
+            return Err(
+                GatewayError::Internal("failed to serialize config section".to_owned()).into(),
+            );
+        }
+    };
+    let mut envelope = serde_json::Map::with_capacity(2);
+    envelope.insert(section, value);
+    envelope.insert("hash".to_owned(), serde_json::Value::String(doc.hash));
+    Ok(Json(serde_json::Value::Object(envelope)))
+}
+
+/// Deserialize `body` as `T` and replace `section` in `doc` wholesale via
+/// [`config_edit::replace_section`]. Shared by every [`put_config_section`]
+/// arm except `auth`, which merges into the existing table instead of
+/// replacing it (see [`config_edit::replace_auth_knobs`]).
+fn replace_section_from_json<T: serde::de::DeserializeOwned + serde::Serialize>(
+    doc: &str,
+    section: &str,
+    body: &str,
+) -> Result<String, ApiError> {
+    let value: T = serde_json::from_str(body)
+        .map_err(|error| GatewayError::InvalidRequest(error.to_string()))?;
+    config_edit::replace_section(doc, section, &value).map_err(|e| edit_internal_error(&e))
+}
+
+/// `PUT /admin/config/{section}` for the same fixed set [`get_config_section`]
+/// serves. The body is that section's own type - its `deny_unknown_fields`
+/// polices its fields, so an `auth` body can carry only the 5 dynamic knobs
+/// ([`AuthDynamicKnobs`]): a body naming `enabled` or `db_path` (boot-layer,
+/// restart-only) is rejected 400, never silently ignored.
+///
+/// `auth` applies via [`config_edit::replace_auth_knobs`] - a field-level
+/// merge into the existing `[auth]` table, so `enabled`/`db_path` survive
+/// untouched even though the request body never mentions them. Every other
+/// section replaces wholesale via [`config_edit::replace_section`]. Requires
+/// `If-Match`; runs through the shared [`apply_document`] pipeline like every
+/// other write in this module.
+///
+/// # Errors
+/// `LM-1003` (404) for a section name outside the fixed set.
+pub async fn put_config_section(
+    State(state): State<AppState>,
+    Path(section): Path<String>,
+    headers: axum::http::HeaderMap,
+    body: String,
+) -> Result<StatusCode, ApiError> {
+    let if_match = require_if_match(&headers)?;
+    let ctx = config_ctx(&state)?;
+    let current = ctx
+        .source
+        .load()
+        .await
+        .map_err(|e| source_internal_error(&e))?;
+
+    let candidate = match section.as_str() {
+        "resilience" => {
+            replace_section_from_json::<ResilienceConfig>(&current.toml, &section, &body)?
+        }
+        "telemetry" => {
+            replace_section_from_json::<TelemetryConfig>(&current.toml, &section, &body)?
+        }
+        "tokenizer" => {
+            replace_section_from_json::<TokenizerConfig>(&current.toml, &section, &body)?
+        }
+        "image_fetch" => {
+            replace_section_from_json::<ImageFetchConfig>(&current.toml, &section, &body)?
+        }
+        "webhooks" => replace_section_from_json::<WebhooksConfig>(&current.toml, &section, &body)?,
+        "auth" => {
+            let knobs: AuthDynamicKnobs = serde_json::from_str(&body)
+                .map_err(|error| GatewayError::InvalidRequest(error.to_string()))?;
+            config_edit::replace_auth_knobs(&current.toml, &knobs)
+                .map_err(|e| edit_internal_error(&e))?
+        }
+        _ => return Err(GatewayError::RouteNotFound.into()),
+    };
+
+    apply_document(&state, candidate, &if_match).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// The config context this process booted with (ADR 012).

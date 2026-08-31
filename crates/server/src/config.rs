@@ -278,6 +278,48 @@ impl Default for AuthConfig {
     }
 }
 
+/// The 5 hot-reloadable `[auth]` knobs (ADR 012 Task 8): every [`AuthConfig`]
+/// field EXCEPT `enabled` and `db_path`, which are boot layer (a database
+/// connection cannot be swapped without a restart) and so are absent from
+/// this type entirely - `deny_unknown_fields` rejects a `PUT
+/// /admin/config/auth` body naming either, rather than silently ignoring it.
+/// Used only as the request/response shape for that granular endpoint; the
+/// document itself still stores these fields inside the single `[auth]`
+/// table alongside `enabled`/`db_path` (see
+/// [`crate::config_edit::replace_auth_knobs`], which grafts a write from
+/// this type into that table without touching the other two).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthDynamicKnobs {
+    /// See [`AuthConfig::flush_interval_ms`].
+    #[serde(default = "default_flush_interval_ms")]
+    pub flush_interval_ms: u64,
+    /// See [`AuthConfig::usage_channel_capacity`].
+    #[serde(default = "default_usage_channel_capacity")]
+    pub usage_channel_capacity: usize,
+    /// See [`AuthConfig::usage_batch_max`].
+    #[serde(default = "default_usage_batch_max")]
+    pub usage_batch_max: usize,
+    /// See [`AuthConfig::usage_flush_ms`].
+    #[serde(default = "default_usage_flush_ms")]
+    pub usage_flush_ms: u64,
+    /// See [`AuthConfig::retention_days`].
+    #[serde(default = "default_retention_days")]
+    pub retention_days: u32,
+}
+
+impl From<&AuthConfig> for AuthDynamicKnobs {
+    fn from(auth: &AuthConfig) -> Self {
+        Self {
+            flush_interval_ms: auth.flush_interval_ms,
+            usage_channel_capacity: auth.usage_channel_capacity,
+            usage_batch_max: auth.usage_batch_max,
+            usage_flush_ms: auth.usage_flush_ms,
+            retention_days: auth.retention_days,
+        }
+    }
+}
+
 /// Telemetry configuration (ADR 002).
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]

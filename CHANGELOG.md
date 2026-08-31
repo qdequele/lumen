@@ -6,6 +6,28 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **Granular admin config endpoints** (ADR 012, task 8 of the
+  config-source-abstraction plan). New routes under the master-key-gated
+  `/admin/config` surface, all sharing the existing `PUT /admin/config`
+  pipeline (apply-lock, `If-Match`, boot-layer guard, full validation,
+  persist, hot reload) so a granular edit can never produce a document a
+  restart would refuse: `GET /admin/config/providers` (name + kind summary
+  list), `GET`/`PUT`/`DELETE /admin/config/providers/{name}` (a single
+  provider's full config; `PUT` requires the path name to match the body's
+  `name`; `DELETE` on a provider still referenced by another model's
+  fallback chain is refused with `LM-1001` naming the dependent model), and
+  `GET`/`PUT /admin/config/{section}` for `resilience`, `telemetry`,
+  `tokenizer`, `image_fetch`, `webhooks` and `auth` (a new
+  `AuthDynamicKnobs` type covering only the 5 hot-reloadable `[auth]`
+  fields - `enabled`/`db_path` are boot-layer and rejected 400 if a `PUT`
+  body names either). An unknown provider name or section is `LM-1003`
+  (404), the same style every other per-entity admin lookup uses.
+  `crates/server/src/config_edit.rs` gains `replace_auth_knobs`, a
+  field-level merge into the existing `[auth]` table that leaves
+  `enabled`/`db_path` untouched.
+
 ### Changed
 
 - **Internal: `toml_edit`-based config document editors** (ADR 012, task 7 of

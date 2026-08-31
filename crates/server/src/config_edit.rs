@@ -12,9 +12,9 @@
 //! sound but semantically invalid edit (e.g. two providers with the same
 //! name) is caught by that later validation pass, not here.
 
-use toml_edit::{ArrayOfTables, DocumentMut, Item};
+use toml_edit::{ArrayOfTables, DocumentMut, Item, Table};
 
-use crate::config::ProviderConfig;
+use crate::config::{AuthDynamicKnobs, ProviderConfig};
 
 /// Failure parsing a config document's TOML text, or serializing a value
 /// into one.
@@ -36,6 +36,10 @@ pub enum EditError {
     /// provider entry could be located, inserted or removed.
     #[error("`providers` is not an array of tables")]
     ProvidersNotArray,
+    /// The `auth` key exists but is not a table, so the dynamic knobs could
+    /// not be grafted into it.
+    #[error("`auth` is not a table")]
+    AuthNotTable,
 }
 
 /// Insert or replace the `[[providers]]` entry named `provider.name`.
@@ -124,6 +128,39 @@ pub fn replace_section(
     document
         .as_table_mut()
         .insert(section, Item::Table(new_table));
+    Ok(document.to_string())
+}
+
+/// Graft the 5 hot-reloadable `[auth]` knobs ([`AuthDynamicKnobs`]) into the
+/// document's existing `[auth]` table, leaving `enabled`, `db_path` and any
+/// other key in that table untouched. Creates an empty `[auth]` table first
+/// if the document has none yet. Comments and formatting elsewhere in the
+/// document are untouched.
+///
+/// Unlike [`replace_section`], this is a field-level MERGE, not a wholesale
+/// replace: `[auth]` also carries the boot-layer `enabled`/`db_path` fields
+/// (ADR 012 §1), which only take effect on a restart, so a granular knob
+/// write must never clobber them - even though the write's own request body
+/// never mentions them at all.
+///
+/// # Errors
+/// [`EditError::Parse`] if `doc` is not valid TOML. [`EditError::Serialize`]
+/// if `knobs` cannot be serialized into a TOML table.
+/// [`EditError::AuthNotTable`] if the document's `auth` key exists but holds
+/// something other than a table.
+pub fn replace_auth_knobs(doc: &str, knobs: &AuthDynamicKnobs) -> Result<String, EditError> {
+    let mut document = doc.parse::<DocumentMut>()?;
+    let new_table = toml_edit::ser::to_document(knobs)?.as_table().clone();
+
+    let auth_item = document
+        .as_table_mut()
+        .entry("auth")
+        .or_insert_with(|| Item::Table(Table::new()));
+    let auth_table = auth_item.as_table_mut().ok_or(EditError::AuthNotTable)?;
+    for (key, value) in &new_table {
+        auth_table.insert(key, value.clone());
+    }
+
     Ok(document.to_string())
 }
 
@@ -287,6 +324,55 @@ mod tests {
         assert!(out.contains("# fleet config"));
         assert!(out.contains("port = 8080 # keep"));
         assert_eq!(provider_names(&out).unwrap(), ["openai"]);
+    }
+
+    const DOC_WITH_AUTH: &str = "# fleet config\n[auth]\nenabled = true\ndb_path = \"lumen.db\"\nflush_interval_ms = 10000\n";
+
+    /// `enabled`/`db_path` (boot layer) must survive a knobs graft untouched,
+    /// while the knob fields the write actually named change and comments
+    /// elsewhere in the document are preserved.
+    #[test]
+    fn replace_auth_knobs_merges_without_touching_boot_fields() {
+        let knobs = AuthDynamicKnobs {
+            flush_interval_ms: 5_000,
+            usage_channel_capacity: 42,
+            usage_batch_max: 7,
+            usage_flush_ms: 250,
+            retention_days: 14,
+        };
+        let out = replace_auth_knobs(DOC_WITH_AUTH, &knobs).unwrap();
+        assert!(out.contains("enabled = true"), "boot field survives: {out}");
+        assert!(
+            out.contains("db_path = \"lumen.db\""),
+            "boot field survives: {out}"
+        );
+        assert!(out.contains("flush_interval_ms = 5000"));
+        assert!(out.contains("usage_channel_capacity = 42"));
+        assert!(out.contains("usage_batch_max = 7"));
+        assert!(out.contains("usage_flush_ms = 250"));
+        assert!(out.contains("retention_days = 14"));
+        assert!(out.contains("# fleet config"));
+
+        let cfg: crate::config::Config = toml::from_str(&out).unwrap();
+        assert!(cfg.auth.enabled);
+        assert_eq!(cfg.auth.db_path, "lumen.db");
+        assert_eq!(cfg.auth.flush_interval_ms, 5_000);
+    }
+
+    /// A document with no `[auth]` table yet still gets one, created purely
+    /// from the knobs (no boot fields to preserve, since none existed).
+    #[test]
+    fn replace_auth_knobs_creates_the_table_when_absent() {
+        let knobs = AuthDynamicKnobs {
+            flush_interval_ms: 1_234,
+            usage_channel_capacity: 1,
+            usage_batch_max: 1,
+            usage_flush_ms: 1,
+            retention_days: 1,
+        };
+        let out = replace_auth_knobs("[server]\nport = 8080\n", &knobs).unwrap();
+        assert!(out.contains("[auth]"));
+        assert!(out.contains("flush_interval_ms = 1234"));
     }
 
     #[test]

@@ -64,7 +64,7 @@ const FILE_PORT: &str = "7777";
 /// (see `FILE_PORT`) distinct from what the env override would set, and a
 /// provider that resolves its key from `PROVIDER_KEY_ENV`, so the
 /// "never expose a resolved value" test has something to resolve.
-const CONFIG_TOML: &str = r#"
+const CONFIG_TOML: &str = r#"# fleet config
 [server]
 port = 7777
 
@@ -117,6 +117,30 @@ impl Harness {
             .expect("request sent")
     }
 
+    /// PUT any admin path with a JSON body and an `If-Match` header (the
+    /// granular provider/section endpoints, Task 8).
+    async fn put_json(&self, path: &str, body: &Value, if_match: &str) -> reqwest::Response {
+        self.client
+            .put(format!("{}{path}", self.base))
+            .bearer_auth(master())
+            .header("If-Match", if_match)
+            .json(body)
+            .send()
+            .await
+            .expect("request sent")
+    }
+
+    /// DELETE any admin path with an `If-Match` header.
+    async fn delete(&self, path: &str, if_match: &str) -> reqwest::Response {
+        self.client
+            .delete(format!("{}{path}", self.base))
+            .bearer_auth(master())
+            .header("If-Match", if_match)
+            .send()
+            .await
+            .expect("request sent")
+    }
+
     /// The config document the harness booted from.
     fn valid_config(&self) -> String {
         std::fs::read_to_string(&self.config_path).expect("read config")
@@ -131,6 +155,14 @@ fn registry() -> Arc<Registry> {
 
 /// Spawn an auth-enabled gateway booted against a real config file on disk.
 async fn spawn_admin(registry: Arc<Registry>) -> Harness {
+    spawn_admin_with_config(registry, CONFIG_TOML).await
+}
+
+/// Like [`spawn_admin`], but with caller-supplied config file content: used
+/// by the Task 8 granular-endpoint tests that need a document shape
+/// `CONFIG_TOML` does not provide (e.g. two providers with a fallback
+/// between their models).
+async fn spawn_admin_with_config(registry: Arc<Registry>, config_toml: &str) -> Harness {
     // Written exactly once per process, before any server in this file can
     // start. `set_var` is not merely "racy with other tests that also write":
     // `PUT /admin/config` calls `Config::load` on a blocking worker, which
@@ -150,7 +182,7 @@ async fn spawn_admin(registry: Arc<Registry>) -> Harness {
 
     let dir = TempDir::new().expect("create temp dir");
     let config_path = dir.path().join("lumen.toml");
-    std::fs::write(&config_path, CONFIG_TOML).expect("write config file");
+    std::fs::write(&config_path, config_toml).expect("write config file");
 
     let store = KeyStore::in_memory().await.expect("open store");
     let groups = store.load_groups().await.expect("load groups");
@@ -809,4 +841,354 @@ async fn put_config_rejects_restart_only_boot_layer_keys_in_db_mode() {
     // Confirm nothing was persisted: GET still reports the empty document.
     let after: Value = h.get("/admin/config").await.json().await.expect("json");
     assert_eq!(after["config"].as_str().expect("config string"), "");
+}
+
+// ---- Task 8: granular admin config endpoints (ADR 012) --------------------
+
+/// A second file-mode fixture, distinct from [`CONFIG_TOML`]: two providers
+/// whose models form a fallback dependency (`primary-model` falls back to
+/// `backup-model`, owned by a different provider), used only by the
+/// delete-still-referenced test below.
+const FALLBACK_CONFIG_TOML: &str = r#"# fleet config
+[[providers]]
+name = "primary"
+kind = "openai"
+
+[[providers.models]]
+id = "primary-model"
+capabilities = ["chat"]
+fallbacks = ["backup-model"]
+
+[[providers]]
+name = "backup"
+kind = "openai"
+
+[[providers.models]]
+id = "backup-model"
+capabilities = ["chat"]
+"#;
+
+/// (a) A `PUT` with a fresh hash applies (204); the new provider then shows
+/// up in `GET /admin/config/providers`; and the whole-document `GET` still
+/// contains the file's original comment - a granular edit is format
+/// preserving, not a rewrite of the whole document.
+#[tokio::test]
+async fn put_provider_with_fresh_hash_applies_and_lists_it() {
+    let h = spawn_admin(registry()).await;
+    let hash = h.current_hash().await;
+
+    let provider = serde_json::json!({
+        "name": "second",
+        "kind": "openai",
+        "models": [
+            {"id": "gpt-4o-mini", "capabilities": ["chat"]}
+        ]
+    });
+    let response = h
+        .put_json("/admin/config/providers/second", &provider, &hash)
+        .await;
+    assert_eq!(response.status(), 204);
+
+    let list: Value = h
+        .get("/admin/config/providers")
+        .await
+        .json()
+        .await
+        .expect("json");
+    let names: Vec<&str> = list["providers"]
+        .as_array()
+        .expect("array")
+        .iter()
+        .map(|p| p["name"].as_str().expect("name"))
+        .collect();
+    assert!(
+        names.contains(&"test-provider") && names.contains(&"second"),
+        "providers: {names:?}"
+    );
+
+    let doc: Value = h.get("/admin/config").await.json().await.expect("json");
+    let text = doc["config"].as_str().expect("config string");
+    assert!(
+        text.contains("# fleet config"),
+        "a granular edit must preserve comments: {text}"
+    );
+    assert!(text.contains("\"second\""));
+}
+
+/// (b) A stale `If-Match` on a provider `PUT` is `412` `LM-1004`; a missing
+/// one is `400` `LM-1001` - the same distinction the whole-document `PUT`
+/// makes.
+#[tokio::test]
+async fn put_provider_requires_a_fresh_if_match() {
+    let h = spawn_admin(registry()).await;
+    let provider = serde_json::json!({"name": "second", "kind": "openai"});
+
+    let stale = h
+        .put_json("/admin/config/providers/second", &provider, &"0".repeat(64))
+        .await;
+    assert_eq!(stale.status(), 412);
+    let stale_body: Value = stale.json().await.expect("json");
+    assert_eq!(
+        stale_body["error"]["code"].as_str().expect("code"),
+        "LM-1004"
+    );
+
+    let missing = h
+        .client
+        .put(format!("{}/admin/config/providers/second", h.base))
+        .bearer_auth(master())
+        .json(&provider)
+        .send()
+        .await
+        .expect("request sent");
+    assert_eq!(missing.status(), 400);
+    let missing_body: Value = missing.json().await.expect("json");
+    assert_eq!(
+        missing_body["error"]["code"].as_str().expect("code"),
+        "LM-1001"
+    );
+
+    // Neither rejected attempt may have been persisted.
+    let list: Value = h
+        .get("/admin/config/providers")
+        .await
+        .json()
+        .await
+        .expect("json");
+    let names: Vec<&str> = list["providers"]
+        .as_array()
+        .expect("array")
+        .iter()
+        .map(|p| p["name"].as_str().expect("name"))
+        .collect();
+    assert!(!names.contains(&"second"), "providers: {names:?}");
+}
+
+/// The path `{name}` must equal the body's own `name` field, else `LM-1001`
+/// (Task 8 route notes): retargeting a name mismatch silently would be a
+/// confusing way to rename a provider.
+#[tokio::test]
+async fn put_provider_path_name_must_match_body_name() {
+    let h = spawn_admin(registry()).await;
+    let hash = h.current_hash().await;
+    let provider = serde_json::json!({"name": "other-name", "kind": "openai"});
+
+    let response = h
+        .put_json("/admin/config/providers/second", &provider, &hash)
+        .await;
+    assert_eq!(response.status(), 400);
+    let body: Value = response.json().await.expect("json");
+    assert_eq!(body["error"]["code"].as_str().expect("code"), "LM-1001");
+}
+
+/// (c) Deleting a provider whose model is still named as another model's
+/// fallback is refused: full validation runs inside `apply_document` and
+/// rejects with `LM-1001` naming the dependent model, exactly like the
+/// whole-document `PUT` would. Nothing is persisted.
+#[tokio::test]
+async fn delete_provider_still_referenced_by_a_fallback_is_rejected() {
+    let h = spawn_admin_with_config(registry(), FALLBACK_CONFIG_TOML).await;
+    let hash = h.current_hash().await;
+
+    let response = h.delete("/admin/config/providers/backup", &hash).await;
+    assert_eq!(response.status(), 400);
+    let body: Value = response.json().await.expect("json");
+    assert_eq!(body["error"]["code"].as_str().expect("code"), "LM-1001");
+    let message = body["error"]["message"].as_str().expect("message");
+    assert!(
+        message.contains("primary-model"),
+        "the rejection must name the dependent model: {message}"
+    );
+
+    let list: Value = h
+        .get("/admin/config/providers")
+        .await
+        .json()
+        .await
+        .expect("json");
+    let names: Vec<&str> = list["providers"]
+        .as_array()
+        .expect("array")
+        .iter()
+        .map(|p| p["name"].as_str().expect("name"))
+        .collect();
+    assert!(
+        names.contains(&"backup"),
+        "a rejected delete must not persist: {names:?}"
+    );
+}
+
+/// (d) `PUT /admin/config/tokenizer {"mode":"accurate"}` applies (204), and
+/// the whole-document `GET` afterward contains `mode = "accurate"`.
+#[tokio::test]
+async fn put_tokenizer_section_applies_and_shows_in_whole_document() {
+    let h = spawn_admin(registry()).await;
+    let hash = h.current_hash().await;
+
+    let response = h
+        .put_json(
+            "/admin/config/tokenizer",
+            &serde_json::json!({"mode": "accurate"}),
+            &hash,
+        )
+        .await;
+    assert_eq!(response.status(), 204);
+
+    let doc: Value = h.get("/admin/config").await.json().await.expect("json");
+    let text = doc["config"].as_str().expect("config string");
+    assert!(text.contains("mode = \"accurate\""), "{text}");
+
+    let section: Value = h
+        .get("/admin/config/tokenizer")
+        .await
+        .json()
+        .await
+        .expect("json");
+    assert_eq!(
+        section["tokenizer"]["mode"].as_str().expect("mode"),
+        "accurate"
+    );
+    assert_eq!(section["hash"].as_str().expect("hash").len(), 64);
+}
+
+/// (e) A `PUT /admin/config/auth` body cannot smuggle `db_path` (or
+/// `enabled`) past `AuthDynamicKnobs`'s `deny_unknown_fields`: `400`
+/// `LM-1001`. The 5-knob-only body is accepted and grafted into the
+/// existing `[auth]` table.
+#[tokio::test]
+async fn put_auth_section_rejects_boot_layer_fields_but_accepts_the_five_knobs() {
+    let h = spawn_admin(registry()).await;
+    let hash = h.current_hash().await;
+
+    let body_with_db_path = serde_json::json!({
+        "flush_interval_ms": 5000,
+        "usage_channel_capacity": 100,
+        "usage_batch_max": 50,
+        "usage_flush_ms": 500,
+        "retention_days": 30,
+        "db_path": "/tmp/should-not-be-allowed.db"
+    });
+    let response = h
+        .put_json("/admin/config/auth", &body_with_db_path, &hash)
+        .await;
+    assert_eq!(response.status(), 400);
+    let body: Value = response.json().await.expect("json");
+    assert_eq!(body["error"]["code"].as_str().expect("code"), "LM-1001");
+
+    let body_with_enabled = serde_json::json!({
+        "flush_interval_ms": 5000,
+        "usage_channel_capacity": 100,
+        "usage_batch_max": 50,
+        "usage_flush_ms": 500,
+        "retention_days": 30,
+        "enabled": true
+    });
+    let response = h
+        .put_json("/admin/config/auth", &body_with_enabled, &hash)
+        .await;
+    assert_eq!(response.status(), 400);
+
+    let valid_body = serde_json::json!({
+        "flush_interval_ms": 5000,
+        "usage_channel_capacity": 100,
+        "usage_batch_max": 50,
+        "usage_flush_ms": 500,
+        "retention_days": 30
+    });
+    let ok = h.put_json("/admin/config/auth", &valid_body, &hash).await;
+    assert_eq!(ok.status(), 204);
+
+    let doc: Value = h.get("/admin/config").await.json().await.expect("json");
+    let text = doc["config"].as_str().expect("config string");
+    assert!(text.contains("flush_interval_ms = 5000"), "{text}");
+}
+
+/// (f) An unknown `{section}` name is `404` `LM-1003` - the same code and
+/// status the whole-document route fallback uses.
+#[tokio::test]
+async fn get_unknown_config_section_is_404() {
+    let h = spawn_admin(registry()).await;
+    let response = h.get("/admin/config/nope").await;
+    assert_eq!(response.status(), 404);
+    let body: Value = response.json().await.expect("json");
+    assert_eq!(body["error"]["code"].as_str().expect("code"), "LM-1003");
+}
+
+#[tokio::test]
+async fn list_providers_reports_name_kind_and_hash() {
+    let h = spawn_admin(registry()).await;
+    let list: Value = h
+        .get("/admin/config/providers")
+        .await
+        .json()
+        .await
+        .expect("json");
+    let providers = list["providers"].as_array().expect("array");
+    assert_eq!(providers.len(), 1);
+    assert_eq!(
+        providers[0]["name"].as_str().expect("name"),
+        "test-provider"
+    );
+    assert_eq!(providers[0]["kind"].as_str().expect("kind"), "openai");
+    assert_eq!(list["hash"].as_str().expect("hash").len(), 64);
+}
+
+/// `GET .../providers/{name}` returns the full provider config, flattened,
+/// plus `hash` - and, like the whole-document `GET`, never the resolved
+/// secret behind `api_key_env`, only its name.
+#[tokio::test]
+async fn get_provider_by_name_returns_full_config_and_hash() {
+    let h = spawn_admin(registry()).await;
+    let doc: Value = h
+        .get("/admin/config/providers/test-provider")
+        .await
+        .json()
+        .await
+        .expect("json");
+    assert_eq!(doc["name"].as_str().expect("name"), "test-provider");
+    assert_eq!(doc["kind"].as_str().expect("kind"), "openai");
+    assert_eq!(
+        doc["api_key_env"].as_str().expect("api_key_env"),
+        PROVIDER_KEY_ENV
+    );
+    assert!(!doc.to_string().contains(PROVIDER_KEY_VALUE));
+    assert_eq!(doc["hash"].as_str().expect("hash").len(), 64);
+}
+
+#[tokio::test]
+async fn get_unknown_provider_is_404() {
+    let h = spawn_admin(registry()).await;
+    let response = h.get("/admin/config/providers/does-not-exist").await;
+    assert_eq!(response.status(), 404);
+    let body: Value = response.json().await.expect("json");
+    assert_eq!(body["error"]["code"].as_str().expect("code"), "LM-1003");
+}
+
+/// `None` from `delete_provider` (no such name) is `404` BEFORE
+/// `apply_document` ever runs - so this holds even with a fresh `If-Match`,
+/// never a `412`.
+#[tokio::test]
+async fn delete_unknown_provider_is_404() {
+    let h = spawn_admin(registry()).await;
+    let hash = h.current_hash().await;
+    let response = h
+        .delete("/admin/config/providers/does-not-exist", &hash)
+        .await;
+    assert_eq!(response.status(), 404);
+}
+
+/// The `webhooks` section reports the `[webhooks]` block from the DOCUMENT
+/// alone; absent, it is `null` (never the DB-backed `/admin/webhooks`
+/// surface's view, which this route does not touch).
+#[tokio::test]
+async fn get_webhooks_section_is_null_when_absent_from_the_document() {
+    let h = spawn_admin(registry()).await;
+    let section: Value = h
+        .get("/admin/config/webhooks")
+        .await
+        .json()
+        .await
+        .expect("json");
+    assert!(section["webhooks"].is_null());
+    assert_eq!(section["hash"].as_str().expect("hash").len(), 64);
 }
