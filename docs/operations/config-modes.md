@@ -132,8 +132,11 @@ curl -s -X PUT http://localhost:8080/admin/config \
   server.port; edit the boot config file and restart"`. In file mode an
   *unchanged* boot-layer block still passes, since the candidate there is
   the whole file; in db mode the stored document never carries boot keys at
-  all, so any boot-layer key the candidate names is refused outright,
-  whether or not it matches the running default.
+  all, so a boot-layer key in the candidate is compared against the
+  **built-in default** for that field - a value that happens to equal the
+  default passes, and only a candidate boot-layer key that actually differs
+  from it is refused. A well-formed db-mode candidate simply carries no
+  boot-layer keys at all.
 - **A candidate that fails validation** (bad TOML, an unknown field, a
   dangling `fallbacks` reference, ...) is `400` `LM-1001`, naming the field
   or the dependent model.
