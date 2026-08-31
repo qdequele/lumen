@@ -380,6 +380,50 @@ async fn put_config_rejects_a_stale_if_match() {
     );
 }
 
+/// Regression coverage for ADR 012 task 1's `ConfigSource` extraction: the
+/// hash check must still run BEFORE the submitted body is ever staged or
+/// validated, exactly like the pre-extraction inline sequence did. A request
+/// that is both stale AND semantically invalid must fail on staleness alone
+/// (412 `LM-1004`) - not 400, and not after writing anything to disk - the
+/// same way a request that is only stale (never even glanced at the body) has
+/// always behaved.
+#[tokio::test]
+async fn put_config_stale_if_match_wins_over_an_invalid_body() {
+    let h = spawn_admin(registry()).await;
+    let before = std::fs::read(&h.config_path).expect("read config");
+
+    let response = h
+        .put_config("this is not valid toml {{{", "0".repeat(64).as_str())
+        .await;
+    assert_eq!(
+        response.status(),
+        412,
+        "staleness must be checked before the body is validated"
+    );
+    let body: Value = response.json().await.expect("json");
+    assert_eq!(
+        body["error"]["code"].as_str().expect("code"),
+        "LM-1004",
+        "a stale If-Match must win over an invalid body, not be masked by it"
+    );
+    assert_eq!(
+        std::fs::read(&h.config_path).expect("read config"),
+        before,
+        "a request rejected as stale must never touch the live file"
+    );
+
+    let dir = h.config_path.parent().expect("a parent directory");
+    let strays: Vec<_> = std::fs::read_dir(dir)
+        .expect("read dir")
+        .filter_map(Result::ok)
+        .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
+        .collect();
+    assert!(
+        strays.is_empty(),
+        "a stale rejection must fail before staging anything, invalid body or not"
+    );
+}
+
 #[tokio::test]
 async fn put_config_requires_an_if_match_header() {
     // 400, not 428: a missing header is a malformed request like any other,

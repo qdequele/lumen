@@ -14,9 +14,11 @@ All notable changes to LUMEN are documented here. The format is based on
   rename) out of `admin::apply_config_document` into a new
   `crates/server/src/config_source.rs` module, behind an async `ConfigSource`
   trait with a compare-and-swap `persist`. `admin.rs` calls `FileSource`
-  today; no observable behavior change (`PUT /admin/config` still validates
-  before staging anything permanently, same `.bak` naming, same 412 on a
-  stale `If-Match`). Groundwork for a future SQLite-backed config source.
+  today; no observable behavior change (`PUT /admin/config` still checks
+  `If-Match` before touching disk at all, still validates before staging
+  anything permanently, same `.bak` naming, same 412 `LM-1004` on a stale
+  `If-Match` - including when the submitted body is also invalid TOML).
+  Groundwork for a future SQLite-backed config source.
 
 ## [0.4.0] - 2026-08-26
 

@@ -1218,6 +1218,22 @@ pub async fn put_config(
 /// and building on top of whatever state that left behind is not a risk
 /// worth taking.
 ///
+/// A stale `If-Match` is checked FIRST, before any file I/O for validation
+/// even starts: previously (when the hash check, staging and validation were
+/// one inline sequence) a stale request short-circuited with zero disk
+/// writes, and a request that was BOTH stale and invalid TOML got a 412
+/// (`LM-1004`), never a 400. Now that validation runs through its own
+/// throwaway staged file (see below), that ordering has to be reproduced
+/// explicitly, or a stale-and-invalid request would stage a validation file
+/// and answer 400 instead of 412 - changing which error a client sees for no
+/// functional reason, and doing avoidable disk I/O for a request that was
+/// always going to be rejected. `FileSource::persist_blocking` re-checks the
+/// hash again anyway (see its doc comment): that second check is what
+/// actually defends the CAS guarantee against a real race (a concurrent
+/// external edit landing between this fast check and the eventual write);
+/// this one is purely about preserving the old fail-fast ordering and error
+/// precedence.
+///
 /// Validation happens BEFORE `FileSource::persist_blocking` is ever called
 /// (ADR 012: `ConfigSource::persist` deliberately does not validate), staged
 /// in its own throwaway temp file rather than the one `persist_blocking`
@@ -1236,6 +1252,26 @@ fn apply_config_document(
             "config apply lock poisoned by an earlier failed apply".to_owned(),
         ))
     })?;
+
+    let current = std::fs::read(path)
+        .map_err(|e| ApiError::from(GatewayError::Internal(format!("reading config: {e}"))))?;
+    let current_hash = config_hash(&current);
+    if current_hash != if_match {
+        // See `describe_rejection`'s doc comment: `ApiError`'s `IntoResponse`
+        // only logs `code`/`status` for a non-5xx response, so without this a
+        // rejected apply (stale `If-Match` included) would leave no trace in
+        // the gateway's own logs at all.
+        tracing::warn!(
+            config_path = %path.display(),
+            current_hash = %current_hash,
+            provided_if_match = %if_match,
+            "config apply rejected: If-Match does not match the current file hash"
+        );
+        return Err(GatewayError::ConfigStale(
+            "config changed since it was read; GET /admin/config and re-apply".to_owned(),
+        )
+        .into());
+    }
 
     // Same directory as `path`, same naming convention as
     // `FileSource::persist_blocking`'s own staging file: this one is never

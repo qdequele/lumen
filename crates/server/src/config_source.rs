@@ -107,6 +107,11 @@ pub trait ConfigSource: Send + Sync {
 /// ever had, now behind the trait. The file stays the source of truth; `.bak`
 /// of the previous document is kept alongside it on every successful
 /// `persist`.
+///
+/// `Clone` (cheap: one `PathBuf`) is what lets `load`/`persist` below move an
+/// owned copy of `self` into `tokio::task::spawn_blocking`'s `'static`
+/// closure instead of trying to smuggle a borrow of `&self` across the
+/// thread hop.
 #[derive(Debug, Clone)]
 pub struct FileSource {
     path: PathBuf,
