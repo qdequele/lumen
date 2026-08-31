@@ -8,6 +8,22 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ### Added
 
+- **End-to-end test coverage for the config source abstraction, both modes**
+  (ADR 012, task 9 of the config-source-abstraction plan - the final task).
+  New `crates/server/tests/config_source_e2e.rs`: a file-mode provider
+  reroute (`PUT /admin/config/providers/{name}`) lands live against a real
+  upstream with no restart; a db-mode cold start (empty stored document,
+  `GET /health` 200, chat `LM-2001`) installs its first config through
+  `PUT /admin/config` and starts routing, still with no restart; a stale
+  `If-Match` after a successful db-mode apply is `LM-1004`; an external
+  (human/GitOps) edit to a file-mode config on disk makes an `If-Match`
+  taken before that edit stale; and neither a whole-document nor a granular
+  db-mode `PUT` ever writes a resolved provider secret into
+  `config_versions` - only the `api_key_env` name, verified by querying the
+  table directly. Also adds the db-mode regression test for
+  `PUT /admin/config/auth` deferred from task 8's review: the 5-knob merge
+  does not trip the boot-layer guard in db mode.
+
 - **Granular admin config endpoints** (ADR 012, task 8 of the
   config-source-abstraction plan). New routes under the master-key-gated
   `/admin/config` surface, all sharing the existing `PUT /admin/config`
