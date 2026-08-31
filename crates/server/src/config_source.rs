@@ -15,6 +15,8 @@
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
+use lumen_auth::store::KeyStore;
+
 /// A config document read from a [`ConfigSource`], paired with the content
 /// hash a later `persist` must present as `expected_hash` to replace it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -259,6 +261,66 @@ impl ConfigSource for FileSource {
     }
 }
 
+/// [`ConfigSource`] backed by a SQLite database table: the config document
+/// is stored in `config_versions`, one immutable row per write, with the
+/// newest row always bearing the live document. Unlike [`FileSource`], there
+/// is no on-disk backup or external watcher: the row history IS the backup,
+/// and a change can only arrive through `persist`, never through an external
+/// editor or GitOps sync.
+#[derive(Debug, Clone)]
+pub struct DbSource {
+    store: KeyStore,
+}
+
+impl DbSource {
+    /// Back this source with the given SQLite store (typically the live
+    /// [`KeyStore`] that serves the auth API and keys).
+    #[must_use]
+    pub fn new(store: KeyStore) -> Self {
+        Self { store }
+    }
+}
+
+#[async_trait::async_trait]
+impl ConfigSource for DbSource {
+    async fn load(&self) -> Result<VersionedConfig, ConfigSourceError> {
+        let result = self
+            .store
+            .current_config()
+            .await
+            .map_err(|e| ConfigSourceError::Db(format!("{e}")))?;
+
+        match result {
+            Some((toml, hash)) => Ok(VersionedConfig { toml, hash }),
+            None => Ok(VersionedConfig {
+                toml: EMPTY_DOC.into(),
+                hash: empty_doc_hash(),
+            }),
+        }
+    }
+
+    async fn persist(&self, toml: &str, expected_hash: &str) -> Result<String, ConfigSourceError> {
+        let new_hash = config_hash(toml.as_bytes());
+        let empty_hash = empty_doc_hash();
+        let outcome = self
+            .store
+            .insert_config_version(toml, &new_hash, expected_hash, &empty_hash)
+            .await
+            .map_err(|e| ConfigSourceError::Db(format!("{e}")))?;
+
+        match outcome {
+            lumen_auth::store::ConfigCasOutcome::Applied => Ok(new_hash),
+            lumen_auth::store::ConfigCasOutcome::Stale { current_hash } => {
+                Err(ConfigSourceError::Stale { current_hash })
+            }
+        }
+    }
+
+    fn watch_path(&self) -> Option<&Path> {
+        None
+    }
+}
+
 /// A process id + monotonic counter suffix, unique within this process's
 /// lifetime. Not a security token - only meant to keep a crash-orphaned
 /// staging file from colliding with a live one; the ordinary case is
@@ -359,6 +421,7 @@ fn sync_parent_dir(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lumen_auth::store::KeyStore;
 
     #[tokio::test]
     async fn file_source_load_returns_bytes_and_hash() {
@@ -404,5 +467,22 @@ mod tests {
         let path = dir.path().join("config.toml");
         let src = FileSource::new(path.clone());
         assert_eq!(src.watch_path(), Some(path.as_path()));
+    }
+
+    #[tokio::test]
+    async fn db_source_empty_first_load_and_cas() {
+        let store = KeyStore::in_memory().await.unwrap();
+        let src = DbSource::new(store);
+        let doc = src.load().await.unwrap();
+        assert_eq!(doc.toml, "");
+        assert_eq!(doc.hash, empty_doc_hash());
+        let h1 = src
+            .persist("[tokenizer]\nmode = \"accurate\"\n", &doc.hash)
+            .await
+            .unwrap();
+        let doc = src.load().await.unwrap();
+        assert_eq!(doc.hash, h1);
+        let err = src.persist("x = 1", &empty_doc_hash()).await.unwrap_err();
+        assert!(matches!(err, ConfigSourceError::Stale { .. }));
     }
 }
