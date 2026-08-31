@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use lumen_auth::store::KeyStore;
+use lumen_providers::RegistryError;
 
 use crate::config::{Config, ConfigError, ConfigSourceKind};
 
@@ -336,6 +337,17 @@ pub enum ConfigLoadError {
     /// The document was read but did not parse or pass validation.
     #[error(transparent)]
     Config(#[from] ConfigError),
+    /// The document parsed and validated, but a routing table could not be
+    /// built from it - e.g. a keyless provider missing `base_url` (issue
+    /// #74). Parsing and validation alone miss this class of error, so
+    /// [`ConfigContext::validate_document`] runs this check too (mirroring
+    /// `reload::validate_candidate`, the same check by a different, sync
+    /// route). [`ConfigContext::load_config`] never produces this variant:
+    /// its caller (`reload::reload_once`) rebuilds the registry itself right
+    /// after, merging in the DB provider-key backfill first, so a redundant
+    /// throwaway build here would just be wasted work on every reload.
+    #[error(transparent)]
+    Registry(#[from] RegistryError),
 }
 
 /// Where the dynamic config document lives, bundled with the boot file path
@@ -343,9 +355,10 @@ pub enum ConfigLoadError {
 /// config" or "is this candidate document valid" goes through, instead of
 /// learning `ConfigSourceKind`'s two different loading recipes itself.
 ///
-/// Cheap to clone (an `Arc<dyn ConfigSource>` and two owned values), and
+/// Not `Clone` itself (`dyn ConfigSource` is not object-safe for `Clone`);
 /// meant to be shared behind its own `Arc` across the hot-reload task and the
-/// admin handlers (`AppState::config`).
+/// admin handlers (`AppState::config`) - cheap to clone an `Arc<ConfigContext>`,
+/// as every call site in this codebase does.
 pub struct ConfigContext {
     /// The file this process booted from. In file mode this is the whole
     /// document (boot layer + dynamic layer); in DB mode it holds only the
@@ -424,23 +437,48 @@ impl ConfigContext {
     /// on-disk boot layer via [`Config::load_with_dynamic`], mirroring
     /// `load_config`.
     ///
+    /// Runs the SAME two checks `reload::validate_candidate` runs, in the
+    /// same order (parse-and-validate, then a candidate registry build): a
+    /// keyless provider missing `base_url` passes `Config::validate` and is
+    /// only caught by the registry build (issue #74), so skipping it here
+    /// would let this validator wave through a document `apply_reload` (via
+    /// `load_config` + a real registry rebuild) would then reject at the next
+    /// reload - a document that passed `PUT /admin/config` only to silently
+    /// break hot reload afterward. This is the validator intended for the
+    /// mode-agnostic admin apply pipeline (ADR 012 §3); `validate_candidate`
+    /// exists only because Task 5 keeps `admin::apply_config_document`
+    /// synchronous (the current file-mode-only handler runs inside its own
+    /// `spawn_blocking` and this method is `async`) - once that handler is
+    /// reworked to the granular, mode-agnostic pipeline, it should call this
+    /// method directly and `validate_candidate` can retire.
+    ///
     /// # Errors
     /// [`ConfigLoadError::Config`] if `text` does not parse or fails
-    /// validation. Never [`ConfigLoadError::Source`]: no [`ConfigSource`]
+    /// validation; [`ConfigLoadError::Registry`] if a registry cannot be
+    /// built from it. Never [`ConfigLoadError::Source`]: no [`ConfigSource`]
     /// method is called.
     pub async fn validate_document(&self, text: &str) -> Result<(), ConfigLoadError> {
-        match self.kind {
+        let config = match self.kind {
             ConfigSourceKind::File => {
                 let text = text.to_owned();
                 let label = self.boot_path.display().to_string();
-                load_blocking(move || Config::load_text(&text, &label)).await?;
+                load_blocking(move || Config::load_text(&text, &label)).await?
             }
             ConfigSourceKind::Db => {
                 let text = text.to_owned();
                 let boot_path = self.boot_path.clone();
-                load_blocking(move || Config::load_with_dynamic(&boot_path, &text)).await?;
+                load_blocking(move || Config::load_with_dynamic(&boot_path, &text)).await?
             }
-        }
+        };
+        // A throwaway client: this runs on an admin route, never the hot
+        // path. Off the runtime worker is not required here (no file/DB
+        // I/O, just in-memory routing-table construction), matching
+        // `reload::validate_candidate`'s identical call.
+        lumen_providers::Registry::build(
+            config.provider_specs(),
+            lumen_providers::http::build_client(),
+            std::time::Duration::from_secs(300),
+        )?;
         Ok(())
     }
 }
@@ -622,5 +660,81 @@ mod tests {
         assert_eq!(doc.hash, h1);
         let err = src.persist("x = 1", &empty_doc_hash()).await.unwrap_err();
         assert!(matches!(err, ConfigSourceError::Stale { .. }));
+    }
+
+    /// A provider whose `kind` has no built-in default `base_url`: passes
+    /// `Config::validate` (issue #74's whole point - the keylessness/missing
+    /// URL is only a REGISTRY-construction failure, not a config-shape one),
+    /// so a validator that skips the registry build would wave it through.
+    const CANDIDATE_MISSING_BASE_URL: &str = r#"
+        [[providers]]
+        name = "nowhere"
+        kind = "vllm"
+        [[providers.models]]
+        id = "m"
+        capabilities = ["chat"]
+    "#;
+
+    #[tokio::test]
+    async fn validate_document_file_mode_runs_the_registry_check_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        // The boot file's own content is irrelevant to `validate_document`:
+        // file mode parses the CANDIDATE text, never a read of `boot_path`.
+        std::fs::write(&path, "").unwrap();
+        let ctx = ConfigContext::file(path);
+
+        ctx.validate_document(
+            r#"
+            [[providers]]
+            name = "openai"
+            kind = "openai"
+            [[providers.models]]
+            id = "gpt"
+            capabilities = ["chat"]
+            "#,
+        )
+        .await
+        .expect("a config that both parses and builds a registry is accepted");
+
+        let err = ctx
+            .validate_document(CANDIDATE_MISSING_BASE_URL)
+            .await
+            .expect_err("a config that parses but cannot build a registry must be rejected");
+        assert!(
+            matches!(err, ConfigLoadError::Registry(_)),
+            "expected a Registry error, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_document_db_mode_runs_the_registry_check_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let boot_path = dir.path().join("boot.toml");
+        std::fs::write(&boot_path, "[server]\nport = 8080\n").unwrap();
+        let store = KeyStore::in_memory().await.unwrap();
+        let ctx = ConfigContext::db(boot_path, DbSource::new(store));
+
+        ctx.validate_document(
+            r#"
+            [[providers]]
+            name = "openai"
+            kind = "openai"
+            [[providers.models]]
+            id = "gpt"
+            capabilities = ["chat"]
+            "#,
+        )
+        .await
+        .expect("a candidate dynamic document that builds a registry is accepted");
+
+        let err = ctx
+            .validate_document(CANDIDATE_MISSING_BASE_URL)
+            .await
+            .expect_err("a candidate dynamic document the registry rejects must be rejected too");
+        assert!(
+            matches!(err, ConfigLoadError::Registry(_)),
+            "expected a Registry error, got {err:?}"
+        );
     }
 }

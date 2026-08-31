@@ -584,6 +584,33 @@ async fn boot_config_context(
                 );
             }
             let config = Config::load_with_dynamic(config_path, &doc.toml)?;
+            // `load_with_dynamic` merges the stored document OVER the boot
+            // file (`Config::load_with_dynamic`'s own doc comment already
+            // flags this), so a stored document that itself contains an
+            // `[auth]` block can silently override boot-layer values even
+            // though `ensure_boot_only` only ever guarded the BOOT file, not
+            // the dynamic one. Left unchecked, a stored `[auth] enabled =
+            // false` (or a different `db_path`) would leave this process
+            // with auth off - `boot_auth_stack` never runs, `/admin` never
+            // mounts, `/v1/*` runs as an open proxy - recoverable only by
+            // editing SQLite directly. Re-assert both boot-layer auth values
+            // against what was just checked/connected above, naming the
+            // stored document as the cause so the failure is actionable.
+            anyhow::ensure!(
+                config.auth.enabled,
+                "config_source = \"db\": the stored config document sets [auth] enabled = false, \
+                 which would silently disable auth for a restart-only boot-layer value; fix the \
+                 stored document (PUT /admin/config must never touch [auth]) or the boot file"
+            );
+            anyhow::ensure!(
+                config.auth.db_path == boot.auth.db_path,
+                "config_source = \"db\": the stored config document sets auth.db_path to '{}', \
+                 which would silently repoint this restart-only boot-layer value away from the \
+                 boot file's '{}'; fix the stored document (PUT /admin/config must never touch \
+                 [auth]) or the boot file",
+                config.auth.db_path,
+                boot.auth.db_path
+            );
             Ok((
                 config,
                 ConfigContext::db(config_path.to_path_buf(), source),
@@ -772,9 +799,23 @@ fn arm_config_reload(
     targets: ReloadTargets,
     trigger: &Arc<tokio::sync::Notify>,
 ) -> bool {
+    // Captured before `ctx` moves into `spawn_config_reloader`, so the log
+    // line below can name what actually got armed: the file watcher never
+    // exists in DB mode (`ctx.source.watch_path()` is `None` there), and
+    // claiming otherwise would mislead an operator debugging why an external
+    // edit to the boot file (DB mode has no dynamic file to watch anyway)
+    // never triggered a reload.
+    let watch_armed = ctx.kind == ConfigSourceKind::File;
     match spawn_config_reloader(ctx, targets, Arc::clone(trigger)) {
         Ok(_handle) => {
-            tracing::info!("config hot reload armed (SIGHUP + file watch + admin trigger)");
+            if watch_armed {
+                tracing::info!("config hot reload armed (SIGHUP + file watch + admin trigger)");
+            } else {
+                tracing::info!(
+                    "config hot reload armed (SIGHUP + admin trigger; no file watch in \
+                     config_source = \"db\" mode)"
+                );
+            }
             true
         }
         Err(error) => {

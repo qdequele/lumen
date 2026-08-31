@@ -1124,8 +1124,9 @@ use crate::config_source::{config_hash, ConfigContext};
 /// TOML document verbatim) do not apply to a DB-backed document, and the
 /// granular, mode-agnostic rework of these two handlers is deferred to a
 /// later task. Until then DB mode simply has no config-management surface
-/// through these routes (the document can still only be changed by a future
-/// granular endpoint or the boot-time `PUT /admin/config` gap this closes).
+/// through these routes at all - the stored document can only be changed by
+/// a direct write to `config_versions` (e.g. the offline bootstrap path a
+/// future granular endpoint will replace), never through this admin API.
 fn db_mode_config_unavailable() -> ApiError {
     GatewayError::Internal(
         "config management through GET/PUT /admin/config is not yet available when \

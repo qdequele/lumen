@@ -248,10 +248,23 @@ port = {port}
     let base = format!("http://127.0.0.1:{port}");
     let ready = wait_until_ready(&base, Duration::from_secs(3)).await;
 
+    // Taken before the blocking `wait()` below moves `child`: needed to read
+    // the process's output afterward, and `Child::wait()` itself only
+    // reaps the exit status, not the piped output.
+    let mut stdout_pipe = child.stdout.take();
+    let mut stderr_pipe = child.stderr.take();
     let status = tokio::task::spawn_blocking(move || child.wait())
         .await
         .expect("join wait")
         .expect("wait for exit");
+    let mut out = String::new();
+    let mut err = String::new();
+    if let Some(mut pipe) = stdout_pipe.take() {
+        let _ = pipe.read_to_string(&mut out);
+    }
+    if let Some(mut pipe) = stderr_pipe.take() {
+        let _ = pipe.read_to_string(&mut err);
+    }
 
     assert!(
         !ready,
@@ -260,5 +273,136 @@ port = {port}
     assert!(
         !status.success(),
         "boot must fail (non-zero exit), not hang or succeed"
+    );
+    // The actual `anyhow::ensure!` message from `boot_config_context`, not
+    // just a bare non-zero exit: pins the FAILURE REASON, not merely that
+    // *something* went wrong (a config parse error, a bind failure, etc.
+    // would also exit non-zero, but only this message names the real cause).
+    // `tracing`'s default writer is stdout (confirmed empirically: this
+    // message lands there, never on stderr, since logging is already
+    // initialised by the time `run` fails and reports through
+    // `tracing::error!`, not a bare `eprintln!`), so that is what this
+    // asserts against - `err` is captured anyway as a diagnostic in the
+    // failure message, in case that ever changes.
+    assert!(
+        out.contains("config_source = \"db\" requires [auth] enabled = true with a database"),
+        "expected the auth-required message in stdout\n--- stdout ---\n{out}\n--- stderr ---\n{err}"
+    );
+}
+
+/// A stored document that itself sets `[auth]` must not silently win over
+/// the boot file's own value: `Config::load_with_dynamic` merges the stored
+/// document OVER the boot layer, so without `boot_config_context`'s explicit
+/// re-assertion, a document like this would leave the process with auth
+/// OFF - `boot_auth_stack` never runs, `/admin` never mounts, `/v1/*` runs as
+/// an open proxy - even though the boot file (and the `anyhow::ensure!` at
+/// the top of DB-mode boot) required `auth.enabled = true` a moment earlier.
+/// Boot must refuse instead, naming the stored document as the cause.
+#[tokio::test]
+async fn db_mode_refuses_to_boot_when_the_stored_document_disables_auth() {
+    let port = free_port();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("lumen.db");
+    let config = write_temp_config("auth-override", &db_mode_boot_config(port, &db_path));
+
+    let store = KeyStore::connect(&format!("sqlite://{}", db_path.display()))
+        .await
+        .expect("open store to pre-seed");
+    let source = DbSource::new(store);
+    source
+        .persist(
+            "[auth]\nenabled = false\n",
+            &config_hash(EMPTY_DOC.as_bytes()),
+        )
+        .await
+        .expect("pre-seed a document that disables auth");
+
+    let mut child = lumen()
+        .args(["--config"])
+        .arg(&config)
+        .env("LUMEN_MASTER_KEY", master_key())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn lumen");
+
+    let base = format!("http://127.0.0.1:{port}");
+    let ready = wait_until_ready(&base, Duration::from_secs(3)).await;
+
+    let mut stdout_pipe = child.stdout.take();
+    let status = tokio::task::spawn_blocking(move || child.wait())
+        .await
+        .expect("join wait")
+        .expect("wait for exit");
+    let mut out = String::new();
+    if let Some(mut pipe) = stdout_pipe.take() {
+        let _ = pipe.read_to_string(&mut out);
+    }
+
+    assert!(
+        !ready,
+        "a stored document that disables auth must never let db mode come up as an open proxy"
+    );
+    assert!(!status.success(), "boot must fail, not silently continue");
+    assert!(
+        out.contains("the stored config document sets [auth] enabled = false"),
+        "expected the actionable stored-document message in stdout, got: {out}"
+    );
+}
+
+/// The `db_path` sibling of the test above: a stored document repointing
+/// `auth.db_path` away from the boot file's own value must also be refused,
+/// not silently followed (it is just as much a restart-only boot-layer value
+/// as `auth.enabled`).
+#[tokio::test]
+async fn db_mode_refuses_to_boot_when_the_stored_document_repoints_db_path() {
+    let port = free_port();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("lumen.db");
+    let config = write_temp_config("db-path-override", &db_mode_boot_config(port, &db_path));
+
+    let store = KeyStore::connect(&format!("sqlite://{}", db_path.display()))
+        .await
+        .expect("open store to pre-seed");
+    let source = DbSource::new(store);
+    let elsewhere = dir.path().join("elsewhere.db");
+    source
+        .persist(
+            &format!("[auth]\ndb_path = \"{}\"\n", elsewhere.display()),
+            &config_hash(EMPTY_DOC.as_bytes()),
+        )
+        .await
+        .expect("pre-seed a document that repoints db_path");
+
+    let mut child = lumen()
+        .args(["--config"])
+        .arg(&config)
+        .env("LUMEN_MASTER_KEY", master_key())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn lumen");
+
+    let base = format!("http://127.0.0.1:{port}");
+    let ready = wait_until_ready(&base, Duration::from_secs(3)).await;
+
+    let mut stdout_pipe = child.stdout.take();
+    let status = tokio::task::spawn_blocking(move || child.wait())
+        .await
+        .expect("join wait")
+        .expect("wait for exit");
+    let mut out = String::new();
+    if let Some(mut pipe) = stdout_pipe.take() {
+        let _ = pipe.read_to_string(&mut out);
+    }
+
+    assert!(
+        !ready,
+        "a stored document that repoints auth.db_path must never let db mode boot"
+    );
+    assert!(!status.success(), "boot must fail, not silently continue");
+    assert!(
+        out.contains("sets auth.db_path to"),
+        "expected the actionable stored-document message in stdout, got: {out}"
     );
 }

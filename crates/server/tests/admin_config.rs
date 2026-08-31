@@ -15,7 +15,7 @@ use lumen_auth::store::KeyStore;
 use lumen_auth::usage::{spawn_usage_writer, UsageWriterConfig};
 use lumen_providers::Registry;
 use lumen_server::auth::AuthRuntime;
-use lumen_server::config_source::ConfigContext;
+use lumen_server::config_source::{ConfigContext, DbSource};
 use lumen_server::AppState;
 use lumen_telemetry::{LatencyMetrics, Metrics, TokenMetrics};
 use serde_json::Value;
@@ -576,5 +576,75 @@ capabilities = ["chat"]
     assert!(
         !message.contains(&config_dir) && !message.contains(".tmp"),
         "the response must not leak the staging file's filesystem path: {message}"
+    );
+}
+
+// ---- DB mode: GET/PUT /admin/config has no surface yet (Task 6) -----------
+
+/// Build an auth-enabled `AppState` over a `ConfigContext::db`, so the
+/// db-mode gate on `get_config`/`put_config` can be exercised without ever
+/// going through `main.rs`'s boot sequence.
+async fn spawn_admin_db_mode(registry: Arc<Registry>) -> String {
+    let store = KeyStore::in_memory().await.expect("open store");
+    let groups = store.load_groups().await.expect("load groups");
+    let entries = store.load_auth_entries().await.expect("load entries");
+    let keys = AuthState::load(groups, entries);
+    let runtime = Arc::new(AuthRuntime {
+        keys,
+        store: store.clone(),
+        admin_token_hash: hash_key(&master()),
+        master: Some(MasterKey::from_env_value(&master()).expect("master key")),
+    });
+
+    let dir = TempDir::new().expect("create temp dir");
+    let boot_path = dir.path().join("boot.toml");
+    std::fs::write(&boot_path, "[auth]\nenabled = true\n").expect("write boot file");
+    let ctx = Arc::new(ConfigContext::db(boot_path, DbSource::new(store)));
+
+    let metrics = Metrics::new();
+    let tokens = TokenMetrics::register(&metrics, &[]).expect("register token metrics");
+    let latency = LatencyMetrics::register(&metrics).expect("register latency metrics");
+    let state = AppState::new(metrics, registry, tokens, latency)
+        .with_auth(runtime)
+        .with_config_context(ctx);
+    // `dir` is dropped here (nothing later reads `boot_path` off disk), which
+    // is fine: `db_mode_config_unavailable` short-circuits before either
+    // handler ever touches `ctx.boot_path`.
+    common::spawn_state(state, LIMIT).await
+}
+
+#[tokio::test]
+async fn get_config_is_internal_error_in_db_mode() {
+    let base = spawn_admin_db_mode(registry()).await;
+    let response = reqwest::Client::new()
+        .get(format!("{base}/admin/config"))
+        .bearer_auth(master())
+        .send()
+        .await
+        .expect("request sent");
+    assert_eq!(
+        response.status(),
+        500,
+        "GET /admin/config has no DB-mode surface yet (Task 6)"
+    );
+}
+
+#[tokio::test]
+async fn put_config_is_internal_error_in_db_mode() {
+    let base = spawn_admin_db_mode(registry()).await;
+    // No `If-Match` header at all: the db-mode gate must short-circuit
+    // BEFORE the `If-Match` check, so this is still a 500, never the 400 a
+    // missing header would otherwise produce in file mode.
+    let response = reqwest::Client::new()
+        .put(format!("{base}/admin/config"))
+        .bearer_auth(master())
+        .body("[[providers]]\n")
+        .send()
+        .await
+        .expect("request sent");
+    assert_eq!(
+        response.status(),
+        500,
+        "PUT /admin/config has no DB-mode surface yet (Task 6)"
     );
 }
