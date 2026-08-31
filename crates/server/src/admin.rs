@@ -1116,7 +1116,24 @@ const fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
 // `config_hash` moves to `config_source` (ADR 012) so both the admin route
 // and every `ConfigSource` implementation share one definition; re-exported
 // here so existing call sites in this module are unaffected.
-use crate::config_source::config_hash;
+use crate::config::ConfigSourceKind;
+use crate::config_source::{config_hash, ConfigContext};
+
+/// A `GET`/`PUT /admin/config` request while `ctx.kind` is
+/// [`ConfigSourceKind::Db`]: file-based semantics (reading and rewriting one
+/// TOML document verbatim) do not apply to a DB-backed document, and the
+/// granular, mode-agnostic rework of these two handlers is deferred to a
+/// later task. Until then DB mode simply has no config-management surface
+/// through these routes (the document can still only be changed by a future
+/// granular endpoint or the boot-time `PUT /admin/config` gap this closes).
+fn db_mode_config_unavailable() -> ApiError {
+    GatewayError::Internal(
+        "config management through GET/PUT /admin/config is not yet available when \
+         config_source = \"db\""
+            .to_owned(),
+    )
+    .into()
+}
 
 /// `GET /admin/config` response.
 #[derive(Debug, Serialize)]
@@ -1135,8 +1152,11 @@ pub struct ConfigDocument {
 /// were file content, and a subsequent PUT would write them permanently into
 /// the file. The operator must see and edit exactly what is on disk.
 pub async fn get_config(State(state): State<AppState>) -> Result<Json<ConfigDocument>, ApiError> {
-    let path = config_path(&state)?;
-    let bytes = tokio::fs::read(path.as_ref())
+    let ctx = config_ctx(&state)?;
+    if ctx.kind != ConfigSourceKind::File {
+        return Err(db_mode_config_unavailable());
+    }
+    let bytes = tokio::fs::read(&ctx.boot_path)
         .await
         .map_err(|e| GatewayError::Internal(format!("reading config: {e}")))?;
     let config = String::from_utf8(bytes)
@@ -1151,13 +1171,14 @@ pub async fn get_config(State(state): State<AppState>) -> Result<Json<ConfigDocu
 ///
 /// 1. Compare `If-Match` against the current file's hash, so two operators
 ///    editing at once cannot silently lose one edit.
-/// 2. Stage the submitted bytes in a temporary file in the SAME directory
-///    (a rename is only atomic within a filesystem).
-/// 3. Validate the staged file. Writing first and validating after would
-///    leave an invalid document on disk that breaks the next SIGHUP or
-///    restart with no visible cause.
-/// 4. Back up the current file, then rename the staged file into place.
-/// 5. Ping the hot-reload trigger.
+/// 2. Validate the submitted bytes in memory (no staging file - see
+///    `apply_config_document`'s doc comment). Writing first and validating
+///    after would leave an invalid document on disk that breaks the next
+///    SIGHUP or restart with no visible cause.
+/// 3. Stage the bytes in a temporary file in the SAME directory (a rename is
+///    only atomic within a filesystem), back up the current file, then
+///    rename the staged file into place (`FileSource::persist_blocking`).
+/// 4. Ping the hot-reload trigger.
 ///
 /// This route can repoint a provider's `base_url` and thereby redirect
 /// customer traffic. It is the highest-privilege operation in the gateway,
@@ -1173,7 +1194,10 @@ pub async fn put_config(
     headers: axum::http::HeaderMap,
     body: String,
 ) -> Result<StatusCode, ApiError> {
-    let path = config_path(&state)?;
+    let ctx = config_ctx(&state)?;
+    if ctx.kind != ConfigSourceKind::File {
+        return Err(db_mode_config_unavailable());
+    }
 
     let Some(if_match) = headers.get("if-match").and_then(|v| v.to_str().ok()) else {
         return Err(GatewayError::InvalidRequest(
@@ -1183,10 +1207,10 @@ pub async fn put_config(
     };
     let if_match = if_match.trim_matches('"').to_owned();
 
-    let path_for_blocking = path.clone();
+    let ctx_for_blocking = Arc::clone(&ctx);
     let lock = Arc::clone(&state.config_apply_lock);
     let outcome = tokio::task::spawn_blocking(move || {
-        apply_config_document(&path_for_blocking, &body, &if_match, &lock)
+        apply_config_document(&ctx_for_blocking, &body, &if_match, &lock)
     })
     .await
     .map_err(|e| GatewayError::Internal(format!("config apply task failed: {e}")))?;
@@ -1235,18 +1259,23 @@ pub async fn put_config(
 /// precedence.
 ///
 /// Validation happens BEFORE `FileSource::persist_blocking` is ever called
-/// (ADR 012: `ConfigSource::persist` deliberately does not validate), staged
-/// in its own throwaway temp file rather than the one `persist_blocking`
-/// stages internally: writing first and validating after would leave an
-/// invalid document on disk that breaks the next SIGHUP or restart with no
-/// visible cause, so the document must be known-good before `persist_blocking`
-/// ever gets to stage, back up or rename anything.
+/// (ADR 012: `ConfigSource::persist` deliberately does not validate), and
+/// runs directly against `body` in memory - never a staged temp file: writing
+/// first and validating after would leave an invalid document on disk that
+/// breaks the next SIGHUP or restart with no visible cause, so the document
+/// must be known-good before `persist_blocking` ever gets to stage, back up
+/// or rename anything, and validating the in-memory candidate directly (via
+/// `crate::reload::validate_candidate`, itself built on
+/// `Config::load_text`/`ConfigContext::validate_document`'s text-based
+/// parsing) means there is never a staging file whose path could leak into an
+/// error message in the first place.
 fn apply_config_document(
-    path: &std::path::Path,
+    ctx: &ConfigContext,
     body: &str,
     if_match: &str,
     lock: &std::sync::Mutex<()>,
 ) -> Result<(), ApiError> {
+    let path = ctx.boot_path.as_path();
     let _guard = lock.lock().map_err(|_| {
         ApiError::from(GatewayError::Internal(
             "config apply lock poisoned by an earlier failed apply".to_owned(),
@@ -1273,22 +1302,9 @@ fn apply_config_document(
         .into());
     }
 
-    // Same directory as `path`, same naming convention as
-    // `FileSource::persist_blocking`'s own staging file: this one is never
-    // renamed anywhere, only read by `validate_candidate` and then removed,
-    // but a crash-orphaned copy should still be recognisable as ours and not
-    // collide with a concurrent call's.
-    let validation_path = path.with_extension(format!(
-        "toml.validate.{}.tmp",
-        crate::config_source::unique_suffix()
-    ));
-    let validation_guard = crate::config_source::StagingGuard::new(&validation_path);
-    std::fs::write(&validation_path, body)
-        .map_err(|e| ApiError::from(GatewayError::Internal(format!("staging config: {e}"))))?;
-    if let Err(error) = crate::reload::validate_candidate(&validation_path) {
+    if let Err(error) = crate::reload::validate_candidate(ctx, body) {
         return Err(describe_rejection(path, &error));
     }
-    drop(validation_guard);
 
     let source = crate::config_source::FileSource::new(path.to_path_buf());
     let new_hash = source.persist_blocking(body, if_match).map_err(|error| {
@@ -1366,12 +1382,13 @@ fn describe_rejection(path: &std::path::Path, error: &crate::reload::ReloadError
         crate::reload::ReloadError::Config(config_error) => match config_error {
             crate::config::ConfigError::Parse { message, .. }
             | crate::config::ConfigError::Validation { message, .. } => message.clone(),
-            // The staged file was just written by this handler; it going
-            // missing before validation runs is not a client mistake to
-            // explain away as a bad document.
+            // `validate_candidate` parses `body` in memory (never a staged
+            // file), so this can only mean the boot file itself vanished
+            // between the hash check above and validation - not a client
+            // mistake to explain away as a bad document.
             crate::config::ConfigError::NotFound { .. } => {
                 return GatewayError::Internal(
-                    "staged config file disappeared before it could be validated".to_owned(),
+                    "the config file this process booted from is missing".to_owned(),
                 )
                 .into();
             }
@@ -1389,15 +1406,15 @@ fn describe_rejection(path: &std::path::Path, error: &crate::reload::ReloadError
     GatewayError::InvalidRequest(format!("config rejected: {message}")).into()
 }
 
-/// The config file path this process booted from.
+/// The config context this process booted with (ADR 012).
 ///
 /// `None` only in tests: `main.rs` always sets it. A 500 is therefore the
 /// honest answer, not a client error, because nothing the caller sent caused
 /// it. `GatewayError` has no `NotFound(String)` variant, and inventing one
 /// for a condition that cannot occur in production would be noise.
-fn config_path(state: &AppState) -> Result<Arc<std::path::PathBuf>, ApiError> {
+fn config_ctx(state: &AppState) -> Result<Arc<ConfigContext>, ApiError> {
     state
-        .config_path
+        .config
         .clone()
         .ok_or_else(|| GatewayError::Internal("no config file backs this server".to_owned()).into())
 }

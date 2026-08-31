@@ -785,6 +785,27 @@ fn secret_env_keys(path: &Path) -> Vec<String> {
 /// behavior is unchanged; `Config::load_with_dynamic` (db mode) passes the
 /// real dynamic text.
 fn secret_env_keys_with_dynamic(path: &Path, dynamic_toml: &str) -> Vec<String> {
+    let peek_figment = Figment::new()
+        .merge(Toml::file(path))
+        .merge(Toml::string(dynamic_toml));
+    secret_env_keys_from_figment(&peek_figment)
+}
+
+/// [`secret_env_keys`], for a candidate document that exists only as TEXT, not
+/// yet on disk: [`Config::load_text`] validates exactly the bytes about to be
+/// persisted (the `PUT /admin/config` candidate in file mode), so the
+/// signing-variable peek must run over that text directly rather than a file
+/// path.
+fn secret_env_keys_from_text(text: &str) -> Vec<String> {
+    let peek_figment = Figment::new().merge(Toml::string(text));
+    secret_env_keys_from_figment(&peek_figment)
+}
+
+/// Shared peek logic behind [`secret_env_keys_with_dynamic`] and
+/// [`secret_env_keys_from_text`]: find the webhook signing variable's name (if
+/// any) in an already-assembled figment, so it can be excluded from the real
+/// `LUMEN_` env overlay.
+fn secret_env_keys_from_figment(peek_figment: &Figment) -> Vec<String> {
     /// Just enough of the config to find the signing variable's name.
     #[derive(Deserialize)]
     struct Peek {
@@ -796,9 +817,6 @@ fn secret_env_keys_with_dynamic(path: &Path, dynamic_toml: &str) -> Vec<String> 
     }
 
     let mut keys = vec!["master_key".to_owned()];
-    let peek_figment = Figment::new()
-        .merge(Toml::file(path))
-        .merge(Toml::string(dynamic_toml));
     if let Ok(peek) = peek_figment.extract::<Peek>() {
         if let Some(var) = peek.webhooks.and_then(|w| w.signing_key_env) {
             if let Some(suffix) = var.strip_prefix("LUMEN_") {
@@ -1006,6 +1024,26 @@ impl Config {
             .merge(Toml::string(dynamic_toml))
             .merge(Env::prefixed("LUMEN_").ignore(&ignored).split("__"));
         Self::from_figment(&figment, &label)
+    }
+
+    /// Text-based sibling of [`Self::load`] (ADR 012): parse and validate
+    /// `text` as a self-contained config document (`Toml::string`, never a
+    /// file read), overlaid with the same `LUMEN_*` environment variables.
+    ///
+    /// Used by [`crate::config_source::ConfigContext::validate_document`] in
+    /// file mode to validate exactly the candidate bytes a `PUT
+    /// /admin/config` is about to persist, without ever staging them to disk
+    /// first (a candidate that never becomes a temp file can never leak that
+    /// temp file's path into an error message). `label` names the document in
+    /// any error message - never a filesystem path derived from `text`
+    /// itself, since a candidate string has none.
+    pub fn load_text(text: &str, label: &str) -> Result<Self, ConfigError> {
+        let secrets = secret_env_keys_from_text(text);
+        let ignored: Vec<&str> = secrets.iter().map(String::as_str).collect();
+        let figment = Figment::new()
+            .merge(Toml::string(text))
+            .merge(Env::prefixed("LUMEN_").ignore(&ignored).split("__"));
+        Self::from_figment(&figment, label)
     }
 
     /// Build a config from an arbitrary figment (used by tests) and validate it.

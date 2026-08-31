@@ -14,8 +14,11 @@
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use lumen_auth::store::KeyStore;
+
+use crate::config::{Config, ConfigError, ConfigSourceKind};
 
 /// A config document read from a [`ConfigSource`], paired with the content
 /// hash a later `persist` must present as `expected_hash` to replace it.
@@ -319,6 +322,141 @@ impl ConfigSource for DbSource {
     fn watch_path(&self) -> Option<&Path> {
         None
     }
+}
+
+/// Failure while turning a [`ConfigSource`] document into a validated
+/// [`Config`] (`ConfigContext::load_config` / `validate_document`): either the
+/// source itself could not be read, or the document it returned did not parse
+/// or validate.
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigLoadError {
+    /// The [`ConfigSource`] could not be read (I/O, DB, stale CAS, not UTF-8).
+    #[error(transparent)]
+    Source(#[from] ConfigSourceError),
+    /// The document was read but did not parse or pass validation.
+    #[error(transparent)]
+    Config(#[from] ConfigError),
+}
+
+/// Where the dynamic config document lives, bundled with the boot file path
+/// and the mode (ADR 012): the one thing every caller that needs "the current
+/// config" or "is this candidate document valid" goes through, instead of
+/// learning `ConfigSourceKind`'s two different loading recipes itself.
+///
+/// Cheap to clone (an `Arc<dyn ConfigSource>` and two owned values), and
+/// meant to be shared behind its own `Arc` across the hot-reload task and the
+/// admin handlers (`AppState::config`).
+pub struct ConfigContext {
+    /// The file this process booted from. In file mode this is the whole
+    /// document (boot layer + dynamic layer); in DB mode it holds only the
+    /// boot layer (`server`, `log_format`, `auth.enabled`/`auth.db_path`,
+    /// `config_source`) and the dynamic layer lives in `source` instead.
+    pub boot_path: PathBuf,
+    /// Where the dynamic document is read from and written to.
+    pub source: Arc<dyn ConfigSource>,
+    /// Which mode `source` implements - cached here (rather than re-derived
+    /// from `source`'s concrete type) so callers can match on it without
+    /// downcasting a trait object.
+    pub kind: ConfigSourceKind,
+}
+
+impl ConfigContext {
+    /// File mode (ADR 012 §1, today's only mode): `path` holds the whole
+    /// document, boot and dynamic layers together, and is both `boot_path`
+    /// and the [`FileSource`] this context reads and writes.
+    #[must_use]
+    pub fn file(path: PathBuf) -> Self {
+        Self {
+            source: Arc::new(FileSource::new(path.clone())),
+            boot_path: path,
+            kind: ConfigSourceKind::File,
+        }
+    }
+
+    /// DB mode: `boot_path` supplies the boot layer only, and `source` is the
+    /// already-connected [`DbSource`] the dynamic document lives in.
+    #[must_use]
+    pub fn db(boot_path: PathBuf, source: DbSource) -> Self {
+        Self {
+            source: Arc::new(source),
+            boot_path,
+            kind: ConfigSourceKind::Db,
+        }
+    }
+
+    /// Parse and fully validate the CURRENT document into a [`Config`].
+    ///
+    /// File mode: [`Config::load`] on `boot_path` (the whole document). DB
+    /// mode: `source.load()` for the dynamic document, merged with
+    /// `boot_path`'s boot layer via [`Config::load_with_dynamic`]. Either
+    /// way, the actual figment parse runs on `spawn_blocking` - it is
+    /// synchronous work (TOML parsing, and in file mode a file read), never
+    /// safe to run on a runtime worker thread.
+    ///
+    /// # Errors
+    /// [`ConfigLoadError::Source`] if the source itself could not be read;
+    /// [`ConfigLoadError::Config`] if the resulting document does not parse
+    /// or fails validation.
+    pub async fn load_config(&self) -> Result<Config, ConfigLoadError> {
+        match self.kind {
+            ConfigSourceKind::File => {
+                let boot_path = self.boot_path.clone();
+                load_blocking(move || Config::load(&boot_path)).await
+            }
+            ConfigSourceKind::Db => {
+                let doc = self.source.load().await?;
+                let boot_path = self.boot_path.clone();
+                load_blocking(move || Config::load_with_dynamic(&boot_path, &doc.toml)).await
+            }
+        }
+    }
+
+    /// Parse and fully validate a CANDIDATE document's text, without ever
+    /// persisting it - the apply pipeline's validator, run before a
+    /// `ConfigSource::persist` is ever called.
+    ///
+    /// File mode: `text` is the whole candidate document (boot layer +
+    /// dynamic layer together, matching today's single-file semantics), so
+    /// it is parsed with [`Config::load_text`] - a `Toml::string` parse of
+    /// `text` itself, deliberately NOT a read of `boot_path` on disk, so this
+    /// validates exactly the bytes about to replace it. DB mode: `text` is
+    /// the candidate DYNAMIC document alone, merged against `boot_path`'s
+    /// on-disk boot layer via [`Config::load_with_dynamic`], mirroring
+    /// `load_config`.
+    ///
+    /// # Errors
+    /// [`ConfigLoadError::Config`] if `text` does not parse or fails
+    /// validation. Never [`ConfigLoadError::Source`]: no [`ConfigSource`]
+    /// method is called.
+    pub async fn validate_document(&self, text: &str) -> Result<(), ConfigLoadError> {
+        match self.kind {
+            ConfigSourceKind::File => {
+                let text = text.to_owned();
+                let label = self.boot_path.display().to_string();
+                load_blocking(move || Config::load_text(&text, &label)).await?;
+            }
+            ConfigSourceKind::Db => {
+                let text = text.to_owned();
+                let boot_path = self.boot_path.clone();
+                load_blocking(move || Config::load_with_dynamic(&boot_path, &text)).await?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Run a synchronous `Config`-parsing closure on the blocking pool and fold
+/// both failure modes (the join itself, and the parse/validate result) into
+/// one [`ConfigLoadError`]. Shared by every branch of
+/// [`ConfigContext::load_config`] and [`ConfigContext::validate_document`].
+async fn load_blocking<F>(f: F) -> Result<Config, ConfigLoadError>
+where
+    F: FnOnce() -> Result<Config, ConfigError> + Send + 'static,
+{
+    let joined = tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| ConfigSourceError::Io(format!("config load task failed: {e}")))?;
+    Ok(joined?)
 }
 
 /// A process id + monotonic counter suffix, unique within this process's

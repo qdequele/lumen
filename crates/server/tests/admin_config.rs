@@ -15,6 +15,7 @@ use lumen_auth::store::KeyStore;
 use lumen_auth::usage::{spawn_usage_writer, UsageWriterConfig};
 use lumen_providers::Registry;
 use lumen_server::auth::AuthRuntime;
+use lumen_server::config_source::ConfigContext;
 use lumen_server::AppState;
 use lumen_telemetry::{LatencyMetrics, Metrics, TokenMetrics};
 use serde_json::Value;
@@ -176,7 +177,7 @@ async fn spawn_admin(registry: Arc<Registry>) -> Harness {
     let state = AppState::new(metrics, registry, tokens, latency)
         .with_auth(Arc::clone(&runtime))
         .with_usage(logger)
-        .with_config_path(config_path.clone());
+        .with_config_context(Arc::new(ConfigContext::file(config_path.clone())));
     let base = common::spawn_state(state, LIMIT).await;
 
     Harness {

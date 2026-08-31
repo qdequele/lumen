@@ -1,6 +1,7 @@
 //! Shared application state handed to axum handlers.
 
 use crate::auth::AuthRuntime;
+use crate::config_source::ConfigContext;
 use crate::health::ProviderHealth;
 use crate::pricing::CostTable;
 use crate::resilience::ResilienceRuntime;
@@ -76,11 +77,12 @@ pub struct AppState {
     /// without a restart (the reloader re-reads the key from the DB). `None` =
     /// no reloader (e.g. tests, or a watcher-setup failure at boot).
     pub reload_trigger: Option<Arc<tokio::sync::Notify>>,
-    /// Path of the config file this process was booted from; `None` when the
-    /// server was built without one (tests). The config admin routes read and
-    /// rewrite this exact file: the file stays the source of truth, so a
-    /// gateway restarted without a control plane comes up identically.
-    pub config_path: Option<Arc<std::path::PathBuf>>,
+    /// Where the dynamic config document lives (ADR 012); `None` when the
+    /// server was built without one (tests). The config admin routes read
+    /// and rewrite through this context: file mode stays the source of truth
+    /// exactly as before, and DB mode reads and writes the `config_versions`
+    /// table instead.
+    pub config: Option<Arc<ConfigContext>>,
     /// Serialises the whole `PUT /admin/config` sequence (hash check, stage,
     /// validate, back up, rename) across concurrent requests. Without it two
     /// racing applies (two operators, or a client retry racing its own
@@ -129,7 +131,7 @@ impl AppState {
             body_limit: 10 * 1024 * 1024,
             image_fetch: Arc::new(ImageFetchPolicy::default()),
             reload_trigger: None,
-            config_path: None,
+            config: None,
             config_apply_lock: Arc::new(std::sync::Mutex::new(())),
             token_counter: Arc::new(TokenCounter::Heuristic),
             webhooks: None,
@@ -165,10 +167,11 @@ impl AppState {
         self
     }
 
-    /// Set the config file path the config admin routes read and rewrite.
+    /// Set the config context the config admin routes and the hot reloader
+    /// read and rewrite through (builder style).
     #[must_use]
-    pub fn with_config_path(mut self, path: std::path::PathBuf) -> Self {
-        self.config_path = Some(Arc::new(path));
+    pub fn with_config_context(mut self, ctx: Arc<ConfigContext>) -> Self {
+        self.config = Some(ctx);
         self
     }
 
