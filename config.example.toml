@@ -14,6 +14,38 @@
 log_format = "pretty"
 
 # ---------------------------------------------------------------------------
+# Where the DYNAMIC half of this config lives (ADR 012) - everything below
+# except [server], log_format and [auth] enabled/db_path. Restart-only: like
+# every other boot-layer key, changing this needs a restart, never a reload.
+#
+#   "file" (default) - this file IS the dynamic document. PUT /admin/config
+#                       and the granular /admin/config/* routes stage a new
+#                       copy, back up the previous one to <this file>.bak,
+#                       and rename atomically; an external edit (a human, a
+#                       GitOps sync) is picked up by the file watcher.
+#   "db"              - the dynamic document lives in the config_versions
+#                       table of the auth database instead. Requires
+#                       auth.enabled = true. When this is "db", THIS FILE MAY
+#                       CONTAIN ONLY: [server], log_format, [auth] enabled
+#                       and db_path, and this config_source key itself - any
+#                       other key (a [[providers]] block, [resilience], an
+#                       [auth] key beyond enabled/db_path, ...) is a boot
+#                       error naming the offending key, never a silent second
+#                       source. A fresh db-mode deployment with nothing ever
+#                       written boots into an empty-but-valid config (no
+#                       providers) and logs that a PUT /admin/config is
+#                       expected - a pure API-driven bootstrap.
+#
+# Both modes expose the identical admin API (GET/PUT /admin/config, plus the
+# granular GET/PUT/DELETE /admin/config/providers/{name} and
+# GET/PUT /admin/config/{section} routes), so a client cannot tell which one
+# it is talking to. See docs/operations/config-modes.md for the full mode
+# reference, the endpoint table, the If-Match/boot-layer-guard flow, and the
+# file<->db migration procedures.
+# ---------------------------------------------------------------------------
+config_source = "file"
+
+# ---------------------------------------------------------------------------
 # HTTP server
 # ---------------------------------------------------------------------------
 [server]

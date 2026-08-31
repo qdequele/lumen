@@ -32,6 +32,7 @@
 - [Logging](operations/logging.md)
 - [Usage log & multi-tenant metadata](operations/usage-log.md)
 - [Keys, quotas & budgets](operations/keys-budgets.md)
+- [Config source modes](operations/config-modes.md)
 - [Resilience tuning](operations/resilience.md)
 - [Deployment](operations/deployment.md)
 - [Upgrades](operations/upgrades.md)
@@ -59,6 +60,7 @@
 - [009 - Shared parent budgets](adr/009-shared-parent-budgets.md)
 - [010 - Operator console and fleet control](adr/010-operator-console-and-fleet-control.md)
 - [011 - Outbound webhooks for budget events](adr/011-budget-webhooks.md)
+- [012 - Config source abstraction](adr/012-config-source-abstraction.md)
 
 # Project
 

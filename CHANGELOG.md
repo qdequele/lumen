@@ -8,6 +8,23 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ### Added
 
+- **Docs: config source modes (ADR 012, task 10 of the config-source-abstraction
+  plan - the final task).** New `docs/operations/config-modes.md`: the
+  `config_source = "file" | "db"` boot key, the boot-layer/dynamic-layer
+  split and the db-mode boot-file contract, the full granular admin config
+  endpoint table, the `If-Match`/boot-layer-guard write pipeline, first-boot
+  empty-document behavior, `config_versions` retention (newest 50), and the
+  file<->db migration procedures. `docs/errors.md` widens `LM-1001`
+  (missing `If-Match`, restart-only key refusal, dependent-provider delete,
+  provider name/body mismatch), `LM-1003` (unknown granular provider/section)
+  and `LM-1004` (every config write in both modes, hash is source-verbatim).
+  `config.example.toml` documents `config_source` at the top of the file,
+  including the boot-only key set db mode enforces. `docs/backlog.md` gains
+  the three items the design spec deferred: config history/rollback
+  endpoints over `config_versions`, a `lumen config export/import` CLI, and
+  per-model granular endpoints. README's `/admin/*` capabilities row now
+  names the granular config surface and links the new doc.
+
 - **End-to-end test coverage for the config source abstraction, both modes**
   (ADR 012, task 9 of the config-source-abstraction plan - the final task).
   New `crates/server/tests/config_source_e2e.rs`: a file-mode provider
