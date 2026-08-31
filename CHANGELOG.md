@@ -6,6 +6,18 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed
+
+- **Internal: `ConfigSource` trait + `FileSource`** (ADR 012, task 1 of the
+  config-source-abstraction plan). Extracted the file read / staged-write
+  machinery (`config_hash`, unique `.tmp` staging, `.bak` backup, atomic
+  rename) out of `admin::apply_config_document` into a new
+  `crates/server/src/config_source.rs` module, behind an async `ConfigSource`
+  trait with a compare-and-swap `persist`. `admin.rs` calls `FileSource`
+  today; no observable behavior change (`PUT /admin/config` still validates
+  before staging anything permanently, same `.bak` naming, same 412 on a
+  stale `If-Match`). Groundwork for a future SQLite-backed config source.
+
 ## [0.4.0] - 2026-08-26
 
 ### Added

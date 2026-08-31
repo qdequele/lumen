@@ -353,7 +353,7 @@ const DEBOUNCE: Duration = Duration::from_millis(250);
 /// The directory `spawn_config_reloader` should watch for `path`: the parent
 /// directory when `path` has one, or the current working directory when it
 /// does not (e.g. `lumen --config lumen.toml`, the form used in the
-/// quickstart, has an empty parent). Mirrors `admin::sync_parent_dir`'s
+/// quickstart, has an empty parent). Mirrors `config_source::sync_parent_dir`'s
 /// identical fallback for the identical empty-parent case.
 ///
 /// Watching `path` itself instead of its directory (the bug this function

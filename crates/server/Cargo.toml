@@ -31,6 +31,7 @@ tower = { workspace = true }
 tower-http = { workspace = true }
 hyper = { workspace = true }
 futures = { workspace = true }
+async-trait = { workspace = true }
 bytes = { workspace = true }
 dashmap = { workspace = true }
 arc-swap = { workspace = true }
@@ -61,7 +62,6 @@ figment = { workspace = true, features = ["test"] }
 wiremock = { workspace = true }
 serde_json = { workspace = true }
 criterion = { workspace = true }
-async-trait = { workspace = true }
 tempfile = { workspace = true }
 
 [target.'cfg(unix)'.dev-dependencies]
