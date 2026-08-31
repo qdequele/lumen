@@ -1375,6 +1375,14 @@ fn describe_rejection(path: &std::path::Path, error: &crate::reload::ReloadError
                 )
                 .into();
             }
+            // Same shape as Parse/Validation above: name the field, drop the
+            // `path` (this variant's own is the caller-supplied label, not a
+            // figment-owned staging path, but there is nothing client-useful
+            // in repeating it here either).
+            crate::config::ConfigError::DynamicKeyInBootConfig { key, .. } => format!(
+                "unexpected key '{key}' in boot-only document: remove it from the boot \
+                 file, or set config_source = \"file\""
+            ),
         },
         crate::reload::ReloadError::Registry(registry_error) => registry_error.to_string(),
     };

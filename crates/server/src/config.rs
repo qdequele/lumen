@@ -22,38 +22,74 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 /// Top-level gateway configuration.
-#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+///
+/// Every field belongs to exactly one of two layers (ADR 012): the
+/// restart-only **boot layer** (server bind, log format, `auth.enabled` /
+/// `auth.db_path`, and `config_source` itself - see [`BootView`]) or the
+/// hot-reloadable **dynamic layer** (everything else). The classification is
+/// exhaustive and pinned by a test (`every_config_field_is_classified_boot_or_dynamic`
+/// in this module's `#[cfg(test)]`): a new top-level field must be added to
+/// [`BootView`] and [`ensure_boot_only`] (if boot) or left out of both (if
+/// dynamic), or that test fails.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    /// HTTP server settings.
+    /// HTTP server settings. Boot layer.
     #[serde(default)]
     pub server: ServerConfig,
-    /// Configured upstream providers.
+    /// Configured upstream providers. Dynamic layer.
     #[serde(default)]
     pub providers: Vec<ProviderConfig>,
-    /// Log output format.
+    /// Log output format. Boot layer.
     #[serde(default)]
     pub log_format: LogFormatConfig,
     /// Virtual keys, budgets and usage logging (M5). Disabled by default.
+    /// `enabled` and `db_path` are boot layer (a database connection cannot
+    /// be swapped without a restart); every other `[auth]` knob is dynamic.
     #[serde(default)]
     pub auth: AuthConfig,
-    /// Telemetry knobs (metadata label allowlist, ADR 002).
+    /// Telemetry knobs (metadata label allowlist, ADR 002). Dynamic layer.
     #[serde(default)]
     pub telemetry: TelemetryConfig,
     /// Resilience knobs: retries, circuit breaker, timeouts, health checks (M6).
+    /// Dynamic layer.
     #[serde(default)]
     pub resilience: ResilienceConfig,
     /// Guarded server-side image fetching for multimodal embeddings (M9).
+    /// Dynamic layer.
     #[serde(default)]
     pub image_fetch: ImageFetchConfig,
-    /// Local token-estimation strategy (ADR 003). Default: the byte heuristic.
+    /// Local token-estimation strategy (ADR 003). Default: the byte
+    /// heuristic. Dynamic layer.
     #[serde(default)]
     pub tokenizer: TokenizerConfig,
     /// Outbound webhooks for budget events (ADR 011). Absent by default:
     /// with no `[webhooks]` block the gateway makes no outbound call to
-    /// anything but the configured providers.
+    /// anything but the configured providers. Dynamic layer.
     #[serde(default)]
     pub webhooks: Option<WebhooksConfig>,
+    /// Where the dynamic config document lives (ADR 012): the file this
+    /// process booted from (`"file"`, the default) or a database-backed
+    /// source with a granular admin API (`"db"`, which requires
+    /// `auth.enabled = true`). Boot layer: changing it needs a restart.
+    #[serde(default)]
+    pub config_source: ConfigSourceKind,
+}
+
+/// Where the dynamic config document lives (ADR 012 §1). Chosen at boot by
+/// the `config_source` key; switching modes is a restart-time decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigSourceKind {
+    /// The dynamic document lives in the boot TOML file itself (today's only
+    /// mode): `PUT /admin/config` writes it back atomically and the file
+    /// watcher hot-reloads on external edits.
+    #[default]
+    File,
+    /// The dynamic document lives in the `config_versions` table of the auth
+    /// database. Requires `auth.enabled = true`; the boot TOML may then hold
+    /// only boot-layer keys (see [`ensure_boot_only`]).
+    Db,
 }
 
 /// Outbound webhooks for key and group budget events (ADR 011).
@@ -666,6 +702,21 @@ pub enum ConfigError {
         /// What is wrong, naming the field.
         message: String,
     },
+    /// A boot-only document (the `config_source = "db"` boot TOML) named a
+    /// dynamic-layer key (ADR 012 §1): never silently ignored as a second
+    /// source of that key, always a boot error.
+    #[error(
+        "boot config '{path}': unexpected key '{key}' in boot-only document: remove it from \
+         the boot file, or set config_source = \"file\""
+    )]
+    DynamicKeyInBootConfig {
+        /// The boot document's path or label.
+        path: String,
+        /// The offending key, dotted for a nested field (e.g.
+        /// `auth.flush_interval_ms`) or bare for a top-level one (e.g.
+        /// `providers`).
+        key: String,
+    },
 }
 
 /// Render a `figment` extraction error without the trailing `" in {source}
@@ -724,6 +775,16 @@ fn describe_figment_error(error: &figment::Error) -> String {
 /// excluded (figment would read it as a nested key); config validation rejects
 /// that shape outright.
 fn secret_env_keys(path: &Path) -> Vec<String> {
+    secret_env_keys_with_dynamic(path, "")
+}
+
+/// [`secret_env_keys`], extended for `config_source = "db"` boot: the
+/// `[webhooks]` block lives in the *dynamic* document there (ADR 012), not in
+/// the boot file, so the signing-variable peek must also scan `dynamic_toml`.
+/// `Config::load` (file mode) calls this with `dynamic_toml = ""`, so its
+/// behavior is unchanged; `Config::load_with_dynamic` (db mode) passes the
+/// real dynamic text.
+fn secret_env_keys_with_dynamic(path: &Path, dynamic_toml: &str) -> Vec<String> {
     /// Just enough of the config to find the signing variable's name.
     #[derive(Deserialize)]
     struct Peek {
@@ -735,7 +796,10 @@ fn secret_env_keys(path: &Path) -> Vec<String> {
     }
 
     let mut keys = vec!["master_key".to_owned()];
-    if let Ok(peek) = Figment::new().merge(Toml::file(path)).extract::<Peek>() {
+    let peek_figment = Figment::new()
+        .merge(Toml::file(path))
+        .merge(Toml::string(dynamic_toml));
+    if let Ok(peek) = peek_figment.extract::<Peek>() {
         if let Some(var) = peek.webhooks.and_then(|w| w.signing_key_env) {
             if let Some(suffix) = var.strip_prefix("LUMEN_") {
                 keys.push(suffix.to_lowercase());
@@ -743,6 +807,155 @@ fn secret_env_keys(path: &Path) -> Vec<String> {
         }
     }
     keys
+}
+
+/// The boot-layer fields of [`Config`] (ADR 012 §1), snapshotted from a TOML
+/// document with no env overlay and no semantic validation - a pure
+/// change-detector over the document text, not a boot-readiness check.
+///
+/// Field-for-field mirror of `Config`'s boot-classified fields; see the
+/// classification note on [`Config`] itself. An explicit value equal to the
+/// default is indistinguishable from an absent one (figment resolves both to
+/// the same `Config`), which is the intended behavior: `boot_layer_diff`
+/// answers "would a restart see a different effective boot config", not "did
+/// the byte text change".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BootView {
+    /// [`ServerConfig::host`].
+    pub host: String,
+    /// [`ServerConfig::port`].
+    pub port: u16,
+    /// [`ServerConfig::body_limit`].
+    pub body_limit: usize,
+    /// [`ServerConfig::first_token_timeout_ms`].
+    pub first_token_timeout_ms: u64,
+    /// [`ServerConfig::sse_heartbeat_ms`].
+    pub sse_heartbeat_ms: u64,
+    /// [`Config::log_format`].
+    pub log_format: LogFormatConfig,
+    /// [`AuthConfig::enabled`].
+    pub auth_enabled: bool,
+    /// [`AuthConfig::db_path`].
+    pub db_path: String,
+    /// [`Config::config_source`].
+    pub config_source: ConfigSourceKind,
+}
+
+/// Snapshot the boot-layer fields of the document at `toml_text` (see
+/// [`BootView`]). Parses with `Toml::string` only - deliberately no
+/// `LUMEN_*` env overlay, since a boot-layer diff compares two documents and
+/// the env overlay would apply identically to both sides - and extracts a
+/// full [`Config`] WITHOUT running [`Config::validate`]: this is a change
+/// detector, not a readiness check, so a document that is individually
+/// invalid (e.g. a boot-only file missing every dynamic default) must still
+/// produce a view to diff against.
+pub fn boot_view(toml_text: &str, label: &str) -> Result<BootView, ConfigError> {
+    let figment = Figment::new().merge(Toml::string(toml_text));
+    let config: Config = figment.extract().map_err(|e| ConfigError::Parse {
+        path: label.to_owned(),
+        message: describe_figment_error(&e),
+    })?;
+    Ok(BootView {
+        host: config.server.host,
+        port: config.server.port,
+        body_limit: config.server.body_limit,
+        first_token_timeout_ms: config.server.first_token_timeout_ms,
+        sse_heartbeat_ms: config.server.sse_heartbeat_ms,
+        log_format: config.log_format,
+        auth_enabled: config.auth.enabled,
+        db_path: config.auth.db_path,
+        config_source: config.config_source,
+    })
+}
+
+/// Dotted key names of every boot-layer field that differs between `current`
+/// and `candidate` (e.g. `server.port`, `auth.db_path`, `config_source`).
+/// Empty means a restart would boot into an equivalent boot configuration -
+/// a dynamic-only change (providers, resilience, ...) never appears here.
+pub fn boot_layer_diff(current: &str, candidate: &str) -> Result<Vec<String>, ConfigError> {
+    let before = boot_view(current, "current")?;
+    let after = boot_view(candidate, "candidate")?;
+    let mut diffs = Vec::new();
+    if before.host != after.host {
+        diffs.push("server.host".to_owned());
+    }
+    if before.port != after.port {
+        diffs.push("server.port".to_owned());
+    }
+    if before.body_limit != after.body_limit {
+        diffs.push("server.body_limit".to_owned());
+    }
+    if before.first_token_timeout_ms != after.first_token_timeout_ms {
+        diffs.push("server.first_token_timeout_ms".to_owned());
+    }
+    if before.sse_heartbeat_ms != after.sse_heartbeat_ms {
+        diffs.push("server.sse_heartbeat_ms".to_owned());
+    }
+    if before.log_format != after.log_format {
+        diffs.push("log_format".to_owned());
+    }
+    if before.auth_enabled != after.auth_enabled {
+        diffs.push("auth.enabled".to_owned());
+    }
+    if before.db_path != after.db_path {
+        diffs.push("auth.db_path".to_owned());
+    }
+    if before.config_source != after.config_source {
+        diffs.push("config_source".to_owned());
+    }
+    Ok(diffs)
+}
+
+/// Top-level keys a boot-only document (`config_source = "db"`) may contain.
+const BOOT_ONLY_TOP_LEVEL_KEYS: [&str; 4] = ["server", "log_format", "auth", "config_source"];
+
+/// Keys allowed inside `[auth]` in a boot-only document - the rest of
+/// `AuthConfig` is dynamic (see the classification note on [`Config`]).
+const BOOT_ONLY_AUTH_KEYS: [&str; 2] = ["enabled", "db_path"];
+
+/// Reject any key in `toml_text` that is not boot-layer (ADR 012 §1): in
+/// `config_source = "db"` mode the boot file may hold ONLY `server`,
+/// `log_format`, `auth.enabled`, `auth.db_path` and `config_source` itself -
+/// a dynamic key there would be a second, silently-diverging source for a
+/// value the DB is supposed to own exclusively, which is exactly the
+/// drift-prone pattern ADR 012 refuses. Parses with plain `toml::Value` (not
+/// `Config`) so a document that is boot-only but otherwise dynamically
+/// invalid still gets this specific, actionable error instead of a generic
+/// parse failure.
+pub fn ensure_boot_only(toml_text: &str, label: &str) -> Result<(), ConfigError> {
+    let value: toml::Value =
+        toml_text
+            .parse()
+            .map_err(|e: toml::de::Error| ConfigError::Parse {
+                path: label.to_owned(),
+                message: e.to_string(),
+            })?;
+    let Some(table) = value.as_table() else {
+        // A syntactically valid TOML document is always a table at the top
+        // level; `toml::Value::parse` cannot produce anything else here.
+        return Ok(());
+    };
+    for (key, entry) in table {
+        if !BOOT_ONLY_TOP_LEVEL_KEYS.contains(&key.as_str()) {
+            return Err(ConfigError::DynamicKeyInBootConfig {
+                path: label.to_owned(),
+                key: key.clone(),
+            });
+        }
+        if key == "auth" {
+            if let Some(auth_table) = entry.as_table() {
+                for auth_key in auth_table.keys() {
+                    if !BOOT_ONLY_AUTH_KEYS.contains(&auth_key.as_str()) {
+                        return Err(ConfigError::DynamicKeyInBootConfig {
+                            path: label.to_owned(),
+                            key: format!("auth.{auth_key}"),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 impl Config {
@@ -763,6 +976,34 @@ impl Config {
         let ignored: Vec<&str> = secrets.iter().map(String::as_str).collect();
         let figment = Figment::new()
             .merge(Toml::file(path))
+            .merge(Env::prefixed("LUMEN_").ignore(&ignored).split("__"));
+        Self::from_figment(&figment, &label)
+    }
+
+    /// Load and validate configuration for `config_source = "db"` boot
+    /// (ADR 012): `boot_path` supplies the boot layer (server bind, log
+    /// format, `auth.enabled` / `auth.db_path`, `config_source`), and
+    /// `dynamic_toml` (the current document from a
+    /// [`crate::config_source::DbSource`]) supplies everything else
+    /// (providers, resilience, telemetry, webhooks, ...). The two merge into
+    /// one `Config` the same way the single file does in file mode, then
+    /// `LUMEN_*` env vars overlay both, exactly as [`Self::load`]. Boot-layer
+    /// values always come from `boot_path`: nothing in this function stops
+    /// `dynamic_toml` from also naming a boot key, but the write path that
+    /// produces `dynamic_toml` (`ensure_boot_only` applied to admin writes)
+    /// is responsible for never letting one land there.
+    pub fn load_with_dynamic(boot_path: &Path, dynamic_toml: &str) -> Result<Self, ConfigError> {
+        let label = boot_path.display().to_string();
+        // Mirrors `Self::load`: an explicitly requested boot file that does
+        // not exist is an error, not a silent fall-through to defaults.
+        if !boot_path.exists() {
+            return Err(ConfigError::NotFound { path: label });
+        }
+        let secrets = secret_env_keys_with_dynamic(boot_path, dynamic_toml);
+        let ignored: Vec<&str> = secrets.iter().map(String::as_str).collect();
+        let figment = Figment::new()
+            .merge(Toml::file(boot_path))
+            .merge(Toml::string(dynamic_toml))
             .merge(Env::prefixed("LUMEN_").ignore(&ignored).split("__"));
         Self::from_figment(&figment, &label)
     }
@@ -1929,5 +2170,100 @@ mod tests {
         assert_eq!(models.len(), 2);
         assert_eq!(models[0].provider, "openai-main");
         assert!(models.iter().any(|m| m.id == "gpt-4o"));
+    }
+
+    // ---- Boot vs dynamic layer split (ADR 012, task 4) ---------------------
+
+    #[test]
+    fn boot_layer_diff_names_changed_restart_only_keys() {
+        let a = "[server]\nport = 8080\n";
+        let b = "[server]\nport = 9090\nhost = \"127.0.0.1\"\n"; // host explicit = default: no diff
+        assert_eq!(
+            boot_layer_diff(a, b).unwrap(),
+            vec!["server.port".to_owned()]
+        );
+        assert!(boot_layer_diff(a, a).unwrap().is_empty());
+        // Dynamic-only change: no boot diff.
+        let c = "[server]\nport = 8080\n[tokenizer]\nmode = \"accurate\"\n";
+        assert!(boot_layer_diff(a, c).unwrap().is_empty());
+    }
+
+    #[test]
+    fn ensure_boot_only_rejects_dynamic_keys_and_auth_knobs() {
+        assert!(ensure_boot_only("[server]\nport = 1\n[auth]\nenabled = true\n", "t").is_ok());
+        let err = ensure_boot_only("[[providers]]\nname = \"x\"\n", "t").unwrap_err();
+        assert!(err.to_string().contains("providers"));
+        let err = ensure_boot_only("[auth]\nflush_interval_ms = 5\n", "t").unwrap_err();
+        assert!(err.to_string().contains("flush_interval_ms"));
+    }
+
+    #[test]
+    #[allow(clippy::result_large_err)]
+    fn load_with_dynamic_merges_boot_file_and_db_text() {
+        // figment::Jail as in the existing config tests.
+        figment::Jail::expect_with(|jail| {
+            jail.create_file(
+                "boot.toml",
+                "config_source = \"db\"\n[server]\nport = 9999\n[auth]\nenabled = true\ndb_path = \"x.db\"\n",
+            )?;
+            let cfg = Config::load_with_dynamic(
+                std::path::Path::new("boot.toml"),
+                "[tokenizer]\nmode = \"accurate\"\n",
+            )
+            .unwrap();
+            assert_eq!(cfg.server.port, 9999);
+            assert_eq!(cfg.tokenizer.mode, TokenizerMode::Accurate);
+            assert_eq!(cfg.config_source, ConfigSourceKind::Db);
+            Ok(())
+        });
+    }
+
+    #[test]
+    #[allow(clippy::result_large_err)]
+    fn empty_dynamic_document_is_valid() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file("boot.toml", "[auth]\nenabled = true\ndb_path = \"x.db\"\n")?;
+            let cfg = Config::load_with_dynamic(std::path::Path::new("boot.toml"), "").unwrap();
+            assert!(cfg.providers.is_empty());
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn every_config_field_is_classified_boot_or_dynamic() {
+        // Pin the exhaustive classification of Config's top-level fields, so
+        // adding one fails CI until it is classified in BootView,
+        // ensure_boot_only AND here.
+        //
+        // Uses serde_json, not toml: a toml serializer has nowhere to put an
+        // `Option::None` value (TOML has no `null`), so `webhooks: None` would
+        // be silently dropped and the census would miss it. serde_json keeps
+        // every field (`null` included), so the key set below is genuinely
+        // exhaustive over `Config`'s fields, not just the ones that happen to
+        // serialize as TOML.
+        let cfg = Config::default();
+        let value = serde_json::to_value(&cfg).unwrap();
+        let mut keys: Vec<&str> = value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "auth",
+                "config_source",
+                "image_fetch",
+                "log_format",
+                "providers",
+                "resilience",
+                "server",
+                "telemetry",
+                "tokenizer",
+                "webhooks",
+            ]
+        );
     }
 }
