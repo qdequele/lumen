@@ -83,15 +83,23 @@ pub struct AppState {
     /// exactly as before, and DB mode reads and writes the `config_versions`
     /// table instead.
     pub config: Option<Arc<ConfigContext>>,
-    /// Serialises the whole `PUT /admin/config` sequence (hash check, stage,
-    /// validate, back up, rename) across concurrent requests. Without it two
-    /// racing applies (two operators, or a client retry racing its own
-    /// original) could both pass the `If-Match` check against the same
-    /// pre-apply hash and then interleave their writes, defeating the very
-    /// lost-update guarantee `If-Match` exists to provide. Always present
-    /// (not gated behind a builder) so no construction site needs editing;
-    /// the data behind it is `()` - only the mutual exclusion matters.
-    pub config_apply_lock: Arc<std::sync::Mutex<()>>,
+    /// Serialises the whole config-apply sequence (hash check, boot-layer
+    /// diff, validate, persist) across concurrent requests - shared by `PUT
+    /// /admin/config` and every granular config endpoint (ADR 012, Task 8).
+    /// Without it two racing applies (two operators, or a client retry racing
+    /// its own original) could both pass the `If-Match` check against the
+    /// same pre-apply hash and then interleave their writes, defeating the
+    /// very lost-update guarantee `If-Match` exists to provide. A
+    /// `tokio::sync::Mutex`, not `std::sync::Mutex`: the pipeline holds the
+    /// guard across `.await` points (`ConfigSource::load`/`persist`,
+    /// `ConfigContext::validate_document`), which would either deadlock the
+    /// executor or require dropping and reacquiring the guard around every
+    /// await if this were a std mutex. Never on the request path (admin-only),
+    /// so holding it across awaits is not the blocking-runtime hazard it would
+    /// be elsewhere. Always present (not gated behind a builder) so no
+    /// construction site needs editing; the data behind it is `()` - only the
+    /// mutual exclusion matters.
+    pub config_apply_lock: Arc<tokio::sync::Mutex<()>>,
     /// Local token-estimation strategy (ADR 003). Default: the byte heuristic;
     /// `accurate` mode holds pre-built BPE encoders. Shared, never rebuilt on
     /// the request path.
@@ -132,7 +140,7 @@ impl AppState {
             image_fetch: Arc::new(ImageFetchPolicy::default()),
             reload_trigger: None,
             config: None,
-            config_apply_lock: Arc::new(std::sync::Mutex::new(())),
+            config_apply_lock: Arc::new(tokio::sync::Mutex::new(())),
             token_counter: Arc::new(TokenCounter::Heuristic),
             webhooks: None,
         }

@@ -342,7 +342,16 @@ async fn put_config_rejects_a_config_the_registry_cannot_build() {
     // default base URL (unlike `"openai"`, which falls back to
     // api.openai.com and would pass registry construction too), so this is
     // the shape that actually exercises `RegistryError::MissingBaseUrl`.
+    // `[server] port = 7777` is repeated verbatim (matching the harness's
+    // own file) so this candidate exercises the registry-build rejection
+    // specifically, not the boot-layer guard - an omitted `[server]` block
+    // would resolve to the DEFAULT port (8080), which differs from the
+    // harness's explicit 7777 and would be refused earlier, for the wrong
+    // reason, by `boot_layer_diff`.
     let bad = r#"
+[server]
+port = 7777
+
 [[providers]]
 name = "nowhere"
 kind = "vllm"
@@ -542,8 +551,15 @@ async fn put_config_rejection_names_the_field_but_not_the_staging_path() {
 
     // A duplicate provider name (not under `[server]`, so it cannot be
     // masked by the harness's `LUMEN_SERVER__PORT` env override the way
-    // `server.port = 0` would be).
+    // `server.port = 0` would be). `[server] port = 7777` is repeated
+    // verbatim so this candidate exercises the semantic-validation rejection
+    // specifically, not the boot-layer guard - an omitted `[server]` block
+    // would resolve to the default port (8080) and be refused earlier, for
+    // the wrong reason, by `boot_layer_diff`.
     let bad = r#"
+[server]
+port = 7777
+
 [[providers]]
 name = "dup"
 kind = "openai"
@@ -579,12 +595,112 @@ capabilities = ["chat"]
     );
 }
 
-// ---- DB mode: GET/PUT /admin/config has no surface yet (Task 6) -----------
+// ---- File mode: boot-layer guard (Task 6) ----------------------------------
+
+/// (a) A PUT that changes `server.port` (a boot-layer field, ADR 012 §1) is
+/// refused with `LM-1001` naming the changed key: only a restart picks up a
+/// new bind port, and this route promises everything it accepts applies
+/// immediately.
+#[tokio::test]
+async fn put_config_rejects_a_changed_restart_only_key() {
+    let h = spawn_admin(registry()).await;
+    let before = std::fs::read(&h.config_path).expect("read config");
+    let hash = h.current_hash().await;
+
+    let changed_port = h.valid_config().replace("port = 7777", "port = 9999");
+    assert_ne!(
+        changed_port,
+        h.valid_config(),
+        "the replacement must actually apply"
+    );
+
+    let response = h.put_config(&changed_port, &hash).await;
+    assert_eq!(response.status(), 400);
+    let body: Value = response.json().await.expect("json");
+    assert_eq!(body["error"]["code"].as_str().expect("code"), "LM-1001");
+    let message = body["error"]["message"].as_str().expect("message");
+    assert!(
+        message.contains("server.port"),
+        "the rejection must name the changed boot-layer key: {message}"
+    );
+    assert_eq!(
+        std::fs::read(&h.config_path).expect("read config"),
+        before,
+        "a boot-layer rejection must leave the file untouched"
+    );
+}
+
+/// (b) A PUT whose `[server]` block is byte-for-byte UNCHANGED, but which
+/// adds a new `[[providers]]` entry (a dynamic-layer change), is accepted:
+/// the whole file is the candidate in file mode, so an unchanged boot block
+/// must not itself trigger the restart-only guard.
+#[tokio::test]
+async fn put_config_accepts_an_unchanged_boot_layer_with_a_new_provider() {
+    let h = spawn_admin(registry()).await;
+    let hash = h.current_hash().await;
+
+    let updated = format!(
+        "{}\n[[providers]]\nname = \"second\"\nkind = \"openai\"\n[[providers.models]]\nid = \"m2\"\ncapabilities = [\"chat\"]\n",
+        h.valid_config()
+    );
+    let response = h.put_config(&updated, &hash).await;
+    assert_eq!(response.status(), 204);
+    assert_eq!(
+        std::fs::read_to_string(&h.config_path).expect("read config"),
+        updated
+    );
+}
+
+// ---- DB mode: GET/PUT /admin/config over ConfigContext::db (Task 6) -------
+
+/// A thin harness mirroring [`Harness`] but over a `ConfigContext::db`, so
+/// the db-mode config pipeline can be exercised the same way the file-mode
+/// tests above exercise `Harness`.
+struct DbHarness {
+    base: String,
+    client: reqwest::Client,
+    /// Kept alive for the harness's lifetime: `boot_path` lives inside this
+    /// directory, and db-mode `validate_document`/`load_config` read it off
+    /// disk (`Config::load_with_dynamic`) on every PUT - dropping the
+    /// directory early would make every apply fail with a missing boot file.
+    _dir: TempDir,
+}
+
+impl DbHarness {
+    async fn get(&self, path: &str) -> reqwest::Response {
+        self.client
+            .get(format!("{}{path}", self.base))
+            .bearer_auth(master())
+            .send()
+            .await
+            .expect("send")
+    }
+
+    async fn current_hash(&self) -> String {
+        let body: Value = self.get("/admin/config").await.json().await.expect("json");
+        body["hash"].as_str().expect("hash").to_owned()
+    }
+
+    async fn put_config(&self, body: &str, if_match: &str) -> reqwest::Response {
+        self.client
+            .put(format!("{}/admin/config", self.base))
+            .bearer_auth(master())
+            .header("If-Match", if_match)
+            .body(body.to_owned())
+            .send()
+            .await
+            .expect("request sent")
+    }
+}
 
 /// Build an auth-enabled `AppState` over a `ConfigContext::db`, so the
-/// db-mode gate on `get_config`/`put_config` can be exercised without ever
-/// going through `main.rs`'s boot sequence.
-async fn spawn_admin_db_mode(registry: Arc<Registry>) -> String {
+/// db-mode config pipeline can be exercised without ever going through
+/// `main.rs`'s boot sequence. The boot file sets `auth.enabled = true` only
+/// (no `[server]` block, so it never contributes a boot-layer key to a
+/// `boot_layer_diff` - see the module doc comment on that function: the diff
+/// only ever compares the two DOCUMENT TEXTS being loaded/applied through
+/// `ConfigSource`, never `ctx.boot_path` on disk).
+async fn spawn_admin_db_mode(registry: Arc<Registry>) -> DbHarness {
     let store = KeyStore::in_memory().await.expect("open store");
     let groups = store.load_groups().await.expect("load groups");
     let entries = store.load_auth_entries().await.expect("load entries");
@@ -607,44 +723,90 @@ async fn spawn_admin_db_mode(registry: Arc<Registry>) -> String {
     let state = AppState::new(metrics, registry, tokens, latency)
         .with_auth(runtime)
         .with_config_context(ctx);
-    // `dir` is dropped here (nothing later reads `boot_path` off disk), which
-    // is fine: `db_mode_config_unavailable` short-circuits before either
-    // handler ever touches `ctx.boot_path`.
-    common::spawn_state(state, LIMIT).await
+    let base = common::spawn_state(state, LIMIT).await;
+    DbHarness {
+        base,
+        client: reqwest::Client::new(),
+        _dir: dir,
+    }
 }
 
+/// A valid dynamic-only document: no boot-layer keys at all, matching what a
+/// well-behaved db-mode candidate always looks like.
+const DB_MODE_VALID_DOC: &str = r#"
+[[providers]]
+name = "db-provider"
+kind = "openai"
+[[providers.models]]
+id = "gpt-4o"
+capabilities = ["chat"]
+"#;
+
 #[tokio::test]
-async fn get_config_is_internal_error_in_db_mode() {
-    let base = spawn_admin_db_mode(registry()).await;
-    let response = reqwest::Client::new()
-        .get(format!("{base}/admin/config"))
-        .bearer_auth(master())
-        .send()
-        .await
-        .expect("request sent");
+async fn get_config_returns_empty_document_before_first_put_in_db_mode() {
+    let h = spawn_admin_db_mode(registry()).await;
+    let body: Value = h.get("/admin/config").await.json().await.expect("json");
+    assert_eq!(body["config"].as_str().expect("config string"), "");
     assert_eq!(
-        response.status(),
-        500,
-        "GET /admin/config has no DB-mode surface yet (Task 6)"
+        body["hash"].as_str().expect("hash"),
+        lumen_server::config_source::empty_doc_hash(),
+        "an empty document must hash the same way an empty file would"
     );
 }
 
+/// (c) The full db-mode round trip: GET before any PUT returns the empty
+/// document and its hash; a PUT with that hash as `If-Match` applies and
+/// returns 204; GET afterward returns exactly what was applied; and a second
+/// PUT reusing the now-stale original hash is refused as `LM-1004`.
 #[tokio::test]
-async fn put_config_is_internal_error_in_db_mode() {
-    let base = spawn_admin_db_mode(registry()).await;
-    // No `If-Match` header at all: the db-mode gate must short-circuit
-    // BEFORE the `If-Match` check, so this is still a 500, never the 400 a
-    // missing header would otherwise produce in file mode.
-    let response = reqwest::Client::new()
-        .put(format!("{base}/admin/config"))
-        .bearer_auth(master())
-        .body("[[providers]]\n")
-        .send()
-        .await
-        .expect("request sent");
+async fn put_config_round_trips_in_db_mode() {
+    let h = spawn_admin_db_mode(registry()).await;
+    let empty_hash = h.current_hash().await;
+    assert_eq!(empty_hash, lumen_server::config_source::empty_doc_hash());
+
+    let response = h.put_config(DB_MODE_VALID_DOC, &empty_hash).await;
+    assert_eq!(response.status(), 204);
+
+    let body: Value = h.get("/admin/config").await.json().await.expect("json");
     assert_eq!(
-        response.status(),
-        500,
-        "PUT /admin/config has no DB-mode surface yet (Task 6)"
+        body["config"].as_str().expect("config string"),
+        DB_MODE_VALID_DOC
     );
+    let applied_hash = body["hash"].as_str().expect("hash").to_owned();
+    assert_ne!(applied_hash, empty_hash);
+
+    // Reusing the stale (pre-apply) hash must be refused, never silently
+    // reapplied or accepted as a no-op.
+    let stale_response = h.put_config(DB_MODE_VALID_DOC, &empty_hash).await;
+    assert_eq!(stale_response.status(), 412);
+    let stale_body: Value = stale_response.json().await.expect("json");
+    assert_eq!(
+        stale_body["error"]["code"].as_str().expect("code"),
+        "LM-1004"
+    );
+}
+
+/// (d) A db-mode candidate containing a boot-layer key (`[server] port`)
+/// that differs from the built-in default is refused with the same
+/// restart-only `LM-1001`, even though the current (empty) dynamic document
+/// has no boot keys of its own to compare against - the comparison is
+/// against the DEFAULT a boot-key-free document resolves to.
+#[tokio::test]
+async fn put_config_rejects_restart_only_boot_layer_keys_in_db_mode() {
+    let h = spawn_admin_db_mode(registry()).await;
+    let empty_hash = h.current_hash().await;
+
+    let response = h.put_config("[server]\nport = 1\n", &empty_hash).await;
+    assert_eq!(response.status(), 400);
+    let body: Value = response.json().await.expect("json");
+    assert_eq!(body["error"]["code"].as_str().expect("code"), "LM-1001");
+    let message = body["error"]["message"].as_str().expect("message");
+    assert!(
+        message.contains("server.port"),
+        "the rejection must name the changed boot-layer key: {message}"
+    );
+
+    // Confirm nothing was persisted: GET still reports the empty document.
+    let after: Value = h.get("/admin/config").await.json().await.expect("json");
+    assert_eq!(after["config"].as_str().expect("config string"), "");
 }

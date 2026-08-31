@@ -43,19 +43,36 @@
 //!   `usage_log` table (issue #64).
 //! * `GET /admin/usage/export` - cursor-paginated raw `usage_log` rows, for a
 //!   control plane building its own multi-dimensional view (ADR 010).
-//! * `GET /admin/config` - the config file verbatim, plus a BLAKE3 content
-//!   hash to be echoed as `If-Match` on the `PUT` that applies a new one
-//!   (ADR 010). Never a serialisation of the merged in-memory `Config`: that
-//!   would render environment overrides as if they were file content.
-//! * `PUT /admin/config` - apply a new config document (ADR 010). The
-//!   submitted bytes are staged in a temp file next to the real one,
-//!   validated there (parse + registry build), then the current file is
-//!   backed up to `.bak` and the staged file is renamed into place. Requires
-//!   an `If-Match` header carrying the current hash from `GET /admin/config`;
-//!   a stale hash is a 412 (`LM-1004`), a missing header or an invalid
-//!   document is a 400 (`LM-1001`). This is the highest-privilege route in
-//!   the gateway: it can repoint a provider's `base_url` and thereby redirect
-//!   customer traffic.
+//! * `GET /admin/config` - the current dynamic config document verbatim, plus
+//!   a BLAKE3 content hash to be echoed as `If-Match` on the `PUT` that
+//!   applies a new one (ADR 010, generalised to any [`ConfigSource`] by
+//!   ADR 012). File mode: the whole config file, byte for byte. DB mode: the
+//!   document stored in `config_versions`, or the empty string with the
+//!   empty document's hash before the very first `PUT`. Never a serialisation
+//!   of the merged in-memory `Config`: that would render environment
+//!   overrides, or (in DB mode) the boot-layer file, as if they were dynamic
+//!   document content.
+//! * `PUT /admin/config` - apply a new config document, in either mode
+//!   (ADR 010, ADR 012). Requires an `If-Match` header carrying the current
+//!   hash from `GET /admin/config`; a missing header is a 400 (`LM-1001`), a
+//!   stale hash a 412 (`LM-1004`). The candidate's boot-layer fields
+//!   (`server.*`, `log_format`, `auth.enabled`, `auth.db_path`,
+//!   `config_source`) are compared against the current document's first
+//!   ([`boot_layer_diff`](crate::config::boot_layer_diff)): any difference is
+//!   a 400 (`LM-1001`) naming the changed keys, since a boot-layer value only
+//!   takes effect on a restart and this route applies everything it accepts
+//!   immediately. File mode: since the candidate IS the whole document, an
+//!   unchanged boot-layer block passes and only an actual edit to one of
+//!   those fields is refused. DB mode: the current document (read from
+//!   `ConfigSource`) never holds boot keys at all (ADR 012 §1), so any
+//!   boot-layer key present in the CANDIDATE that differs from the built-in
+//!   default is refused the same way - a well-formed db-mode candidate
+//!   carries no boot-layer keys whatsoever. The candidate is then validated
+//!   (parse, semantic validation, a throwaway registry build) and persisted
+//!   through the configured `ConfigSource` (a staged write with a `.bak`
+//!   backup in file mode; an immutable, CAS-guarded row insert in DB mode).
+//!   This is the highest-privilege route in the gateway: it can repoint a
+//!   provider's `base_url` and thereby redirect customer traffic.
 //!
 //! Every change is applied to the database AND the in-memory state, so it
 //! takes effect immediately without a restart.
@@ -1113,93 +1130,60 @@ const fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
 
 // ---- Config read and apply (ADR 010, ADR 012) -------------------------------
 
-// `config_hash` moves to `config_source` (ADR 012) so both the admin route
-// and every `ConfigSource` implementation share one definition; re-exported
-// here so existing call sites in this module are unaffected.
-use crate::config::ConfigSourceKind;
-use crate::config_source::{config_hash, ConfigContext};
-
-/// A `GET`/`PUT /admin/config` request while `ctx.kind` is
-/// [`ConfigSourceKind::Db`]: file-based semantics (reading and rewriting one
-/// TOML document verbatim) do not apply to a DB-backed document, and the
-/// granular, mode-agnostic rework of these two handlers is deferred to a
-/// later task. Until then DB mode simply has no config-management surface
-/// through these routes at all - the stored document can only be changed by
-/// a direct write to `config_versions` (e.g. the offline bootstrap path a
-/// future granular endpoint will replace), never through this admin API.
-fn db_mode_config_unavailable() -> ApiError {
-    GatewayError::Internal(
-        "config management through GET/PUT /admin/config is not yet available when \
-         config_source = \"db\""
-            .to_owned(),
-    )
-    .into()
-}
+use crate::config::{boot_layer_diff, ConfigError};
+use crate::config_source::{ConfigContext, ConfigLoadError, ConfigSourceError};
 
 /// `GET /admin/config` response.
 #[derive(Debug, Serialize)]
 pub struct ConfigDocument {
-    /// The config file's contents, byte for byte.
+    /// The current dynamic document's contents, byte for byte (empty before
+    /// the first `PUT` in DB mode).
     pub config: String,
     /// BLAKE3 hash of those bytes, to be echoed as `If-Match` on a PUT.
     pub hash: String,
 }
 
-/// Return the config file verbatim.
+/// Return the current dynamic config document verbatim, in either mode.
 ///
 /// Deliberately NOT a serialisation of the in-memory `Config`: `Config::load`
-/// merges the TOML file with `LUMEN_`-prefixed environment variables, so
-/// rendering the merged struct would show environment overrides as if they
-/// were file content, and a subsequent PUT would write them permanently into
-/// the file. The operator must see and edit exactly what is on disk.
+/// (file mode) merges the TOML file with `LUMEN_`-prefixed environment
+/// variables and (DB mode) the separate boot-layer file, so rendering the
+/// merged struct would show environment overrides or boot-layer content as if
+/// they were part of the dynamic document, and a subsequent PUT would write
+/// them permanently into it. The operator must see and edit exactly what
+/// [`ConfigSource::load`](crate::config_source::ConfigSource::load) reports.
 pub async fn get_config(State(state): State<AppState>) -> Result<Json<ConfigDocument>, ApiError> {
     let ctx = config_ctx(&state)?;
-    if ctx.kind != ConfigSourceKind::File {
-        return Err(db_mode_config_unavailable());
-    }
-    let bytes = tokio::fs::read(&ctx.boot_path)
+    let doc = ctx
+        .source
+        .load()
         .await
-        .map_err(|e| GatewayError::Internal(format!("reading config: {e}")))?;
-    let config = String::from_utf8(bytes)
-        .map_err(|_| GatewayError::Internal("config file is not valid UTF-8".to_owned()))?;
-    let hash = config_hash(config.as_bytes());
-    Ok(Json(ConfigDocument { config, hash }))
+        .map_err(|e| source_internal_error(&e))?;
+    Ok(Json(ConfigDocument {
+        config: doc.toml,
+        hash: doc.hash,
+    }))
 }
 
 /// Apply a new config document.
 ///
-/// The file stays the source of truth. The sequence is deliberate:
-///
-/// 1. Compare `If-Match` against the current file's hash, so two operators
-///    editing at once cannot silently lose one edit.
-/// 2. Validate the submitted bytes in memory (no staging file - see
-///    `apply_config_document`'s doc comment). Writing first and validating
-///    after would leave an invalid document on disk that breaks the next
-///    SIGHUP or restart with no visible cause.
-/// 3. Stage the bytes in a temporary file in the SAME directory (a rename is
-///    only atomic within a filesystem), back up the current file, then
-///    rename the staged file into place (`FileSource::persist_blocking`).
-/// 4. Ping the hot-reload trigger.
-///
-/// This route can repoint a provider's `base_url` and thereby redirect
-/// customer traffic. It is the highest-privilege operation in the gateway,
-/// which is why the apply is logged.
+/// The submitted `body` is required to be a well-formed candidate document
+/// for `ctx`'s mode (file mode: the whole document; DB mode: the dynamic
+/// document alone, no boot-layer keys). `PUT /admin/config` is a thin
+/// wrapper: header extraction here, then the shared [`apply_document`]
+/// pipeline (also used by every granular config endpoint, Task 8).
 ///
 /// # Errors
 ///
-/// A 400 (`LM-1001`) when `If-Match` is missing or the document is invalid
-/// TOML or fails registry construction; a 412 (`LM-1004`) when `If-Match`
-/// does not match the current file's hash.
+/// A 400 (`LM-1001`) when `If-Match` is missing, a boot-layer key differs
+/// from the current document, or the candidate is invalid TOML or fails
+/// registry construction; a 412 (`LM-1004`) when `If-Match` does not match
+/// the current document's hash.
 pub async fn put_config(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     body: String,
 ) -> Result<StatusCode, ApiError> {
-    let ctx = config_ctx(&state)?;
-    if ctx.kind != ConfigSourceKind::File {
-        return Err(db_mode_config_unavailable());
-    }
-
     let Some(if_match) = headers.get("if-match").and_then(|v| v.to_str().ok()) else {
         return Err(GatewayError::InvalidRequest(
             "`If-Match` is required: GET /admin/config first and echo its hash".to_owned(),
@@ -1208,127 +1192,108 @@ pub async fn put_config(
     };
     let if_match = if_match.trim_matches('"').to_owned();
 
-    let ctx_for_blocking = Arc::clone(&ctx);
-    let lock = Arc::clone(&state.config_apply_lock);
-    let outcome = tokio::task::spawn_blocking(move || {
-        apply_config_document(&ctx_for_blocking, &body, &if_match, &lock)
-    })
-    .await
-    .map_err(|e| GatewayError::Internal(format!("config apply task failed: {e}")))?;
-    outcome?;
-
-    if let Some(trigger) = &state.reload_trigger {
-        trigger.notify_one();
-        tracing::info!("config applied through the admin API; hot reload requested");
-    } else {
-        tracing::info!(
-            "config applied through the admin API; no reloader armed, applies at restart"
-        );
-    }
+    apply_document(&state, body, &if_match).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// The blocking half of [`put_config`]: validation, then the staged write
-/// (hash check, staging, backup and atomic rename) delegated to
-/// [`FileSource`](crate::config_source::FileSource). Runs on a blocking
-/// thread; never on the runtime.
+/// Apply a candidate config document through `state.config`'s
+/// [`ConfigSource`](crate::config_source::ConfigSource), in either mode.
+/// Shared by `PUT /admin/config` and every granular config endpoint
+/// (Task 8, ADR 012).
 ///
-/// The whole sequence runs under `lock` (see [`AppState::config_apply_lock`]):
-/// two concurrent `PUT`s must never interleave, or the second could clobber
-/// the first's staged bytes before validation runs, defeating the very
-/// lost-update guarantee `If-Match` exists to provide. A poisoned lock is
-/// surfaced as an internal error rather than silently recovered into: it can
-/// only mean an earlier apply panicked mid-sequence (which the workspace's
-/// no-`unwrap`/`expect`/`panic!` rule should make unreachable in practice),
-/// and building on top of whatever state that left behind is not a risk
-/// worth taking.
+/// The whole sequence runs under `state.config_apply_lock` (a
+/// `tokio::sync::Mutex`, held across every `.await` below): two concurrent
+/// applies must never interleave, or the second could pass its own
+/// `If-Match` check against a hash the first has already moved past,
+/// defeating the very lost-update guarantee `If-Match` exists to provide.
 ///
-/// A stale `If-Match` is checked FIRST, before any file I/O for validation
-/// even starts: previously (when the hash check, staging and validation were
-/// one inline sequence) a stale request short-circuited with zero disk
-/// writes, and a request that was BOTH stale and invalid TOML got a 412
-/// (`LM-1004`), never a 400. Now that validation runs through its own
-/// throwaway staged file (see below), that ordering has to be reproduced
-/// explicitly, or a stale-and-invalid request would stage a validation file
-/// and answer 400 instead of 412 - changing which error a client sees for no
-/// functional reason, and doing avoidable disk I/O for a request that was
-/// always going to be rejected. `FileSource::persist_blocking` re-checks the
-/// hash again anyway (see its doc comment): that second check is what
-/// actually defends the CAS guarantee against a real race (a concurrent
-/// external edit landing between this fast check and the eventual write);
-/// this one is purely about preserving the old fail-fast ordering and error
-/// precedence.
-///
-/// Validation happens BEFORE `FileSource::persist_blocking` is ever called
-/// (ADR 012: `ConfigSource::persist` deliberately does not validate), and
-/// runs directly against `body` in memory - never a staged temp file: writing
-/// first and validating after would leave an invalid document on disk that
-/// breaks the next SIGHUP or restart with no visible cause, so the document
-/// must be known-good before `persist_blocking` ever gets to stage, back up
-/// or rename anything, and validating the in-memory candidate directly (via
-/// `crate::reload::validate_candidate`, itself built on
-/// `Config::load_text`/`ConfigContext::validate_document`'s text-based
-/// parsing) means there is never a staging file whose path could leak into an
-/// error message in the first place.
-fn apply_config_document(
-    ctx: &ConfigContext,
-    body: &str,
+/// 1. Compare `if_match` against the current document's hash
+///    ([`ConfigSource::load`](crate::config_source::ConfigSource::load)),
+///    BEFORE any validation work - so a stale request never even glances at
+///    the candidate body. A mismatch is `LM-1004` (412).
+/// 2. Diff the current and candidate documents' boot-layer fields
+///    ([`boot_layer_diff`]): any difference is `LM-1001` (400) naming the
+///    changed keys. A boot-layer value (`server.*`, `log_format`,
+///    `auth.enabled`, `auth.db_path`, `config_source`) only takes effect on a
+///    restart, and this route applies everything it accepts immediately.
+///    File mode: the candidate is the whole document, so an UNCHANGED
+///    boot-layer block passes and only an actual edit is refused. DB mode:
+///    the current document never holds boot keys at all (ADR 012 §1), so any
+///    boot-layer key the candidate DOES carry, if it differs from the
+///    built-in default, is refused the same way.
+/// 3. Validate the candidate
+///    ([`ConfigContext::validate_document`](crate::config_source::ConfigContext::validate_document):
+///    parse, semantic validation, a throwaway registry build) - `LM-1001`
+///    (400) on failure, logged in full at `warn` and scrubbed of any
+///    filesystem path before it reaches the client
+///    ([`describe_validation_rejection`]).
+/// 4. Persist through `ctx.source`. Its own compare-and-swap is a second,
+///    independent line of defense against a write racing a CONCURRENT
+///    EXTERNAL edit (a human editor or GitOps sync outside this lock, in
+///    file mode) - `LM-1004` (412) on that race too.
+/// 5. Ping the hot-reload trigger, if one is armed, so the new document
+///    applies without a restart.
+async fn apply_document(
+    state: &AppState,
+    candidate: String,
     if_match: &str,
-    lock: &std::sync::Mutex<()>,
 ) -> Result<(), ApiError> {
-    let path = ctx.boot_path.as_path();
-    let _guard = lock.lock().map_err(|_| {
-        ApiError::from(GatewayError::Internal(
-            "config apply lock poisoned by an earlier failed apply".to_owned(),
-        ))
-    })?;
+    let ctx = config_ctx(state)?;
+    let _guard = state.config_apply_lock.lock().await;
 
-    let current = std::fs::read(path)
-        .map_err(|e| ApiError::from(GatewayError::Internal(format!("reading config: {e}"))))?;
-    let current_hash = config_hash(&current);
-    if current_hash != if_match {
-        // See `describe_rejection`'s doc comment: `ApiError`'s `IntoResponse`
-        // only logs `code`/`status` for a non-5xx response, so without this a
-        // rejected apply (stale `If-Match` included) would leave no trace in
-        // the gateway's own logs at all.
+    let current = ctx
+        .source
+        .load()
+        .await
+        .map_err(|e| source_internal_error(&e))?;
+    if current.hash != if_match {
         tracing::warn!(
-            config_path = %path.display(),
-            current_hash = %current_hash,
+            current_hash = %current.hash,
             provided_if_match = %if_match,
-            "config apply rejected: If-Match does not match the current file hash"
+            "config apply rejected: If-Match does not match the current document hash"
         );
-        return Err(GatewayError::ConfigStale(
-            "config changed since it was read; GET /admin/config and re-apply".to_owned(),
-        )
+        return Err(stale_config_error());
+    }
+
+    let diff = boot_layer_diff(&current.toml, &candidate).map_err(|error| {
+        // `boot_layer_diff` labels both sides "current"/"candidate" (never a
+        // real path - see its own doc comment), so `error.to_string()` is
+        // already safe to hand to the client directly; still logged at `warn`
+        // for the same reason every other rejection below is (see
+        // `describe_validation_rejection`'s doc comment): `ApiError`'s
+        // `IntoResponse` only logs at `debug` for a non-5xx response.
+        tracing::warn!(%error, "config apply rejected: candidate document failed to parse");
+        GatewayError::InvalidRequest(error.to_string())
+    })?;
+    if !diff.is_empty() {
+        tracing::warn!(
+            keys = %diff.join(", "),
+            "config apply rejected: restart-only boot-layer keys changed"
+        );
+        return Err(GatewayError::InvalidRequest(format!(
+            "restart-only keys changed: {}; edit the boot config file and restart",
+            diff.join(", ")
+        ))
         .into());
     }
 
-    if let Err(error) = crate::reload::validate_candidate(ctx, body) {
-        return Err(describe_rejection(path, &error));
-    }
+    ctx.validate_document(&candidate)
+        .await
+        .map_err(|error| describe_validation_rejection(&error))?;
 
-    let source = crate::config_source::FileSource::new(path.to_path_buf());
-    let new_hash = source.persist_blocking(body, if_match).map_err(|error| {
-        match error {
-            crate::config_source::ConfigSourceError::Stale { current_hash } => {
-                // See `describe_rejection`'s doc comment: `ApiError`'s
-                // `IntoResponse` only logs `code`/`status` for a non-5xx
-                // response, so without this a rejected apply (stale
-                // `If-Match` included) would leave no trace in the gateway's
-                // own logs at all.
-                tracing::warn!(
-                    config_path = %path.display(),
-                    current_hash = %current_hash,
-                    provided_if_match = %if_match,
-                    "config apply rejected: If-Match does not match the current file hash"
-                );
-                ApiError::from(GatewayError::ConfigStale(
-                    "config changed since it was read; GET /admin/config and re-apply".to_owned(),
-                ))
-            }
-            other => ApiError::from(GatewayError::Internal(other.to_string())),
+    let new_hash = match ctx.source.persist(&candidate, &current.hash).await {
+        Ok(hash) => hash,
+        Err(ConfigSourceError::Stale { current_hash }) => {
+            tracing::warn!(
+                current_hash = %current_hash,
+                provided_if_match = %if_match,
+                "config apply rejected: If-Match does not match the current document hash \
+                 (lost the race at persist time)"
+            );
+            return Err(stale_config_error());
         }
-    })?;
+        Err(other) => return Err(source_internal_error(&other)),
+    };
 
     // ADR 010 names this the highest-privilege route in the gateway (it can
     // repoint a provider's `base_url` and thereby redirect customer
@@ -1341,30 +1306,58 @@ fn apply_config_document(
     // against `GET /admin/config` history or backups, tell exactly what
     // changed. Hashes only, never content - this must never become a vector
     // for logging secrets or provider topology. `old_hash` is `if_match`
-    // itself: `persist_blocking` only returns `Ok` when the document it
-    // replaced still hashed to exactly that.
+    // itself: `persist` only returns `Ok` when the document it replaced
+    // still hashed to exactly that.
     tracing::info!(
-        config_path = %path.display(),
         old_hash = %if_match,
         new_hash = %new_hash,
         "config applied through the admin API"
     );
+
+    if let Some(trigger) = &state.reload_trigger {
+        trigger.notify_one();
+        tracing::info!("config applied through the admin API; hot reload requested");
+    } else {
+        tracing::info!(
+            "config applied through the admin API; no reloader armed, applies at restart"
+        );
+    }
     Ok(())
 }
 
-/// Turn a `validate_candidate` failure into the client-facing rejection,
-/// without leaking the staged file's filesystem path.
+/// `LM-1004` (412), the same message on every path that produces it (the
+/// fast `If-Match` check in [`apply_document`] and `ConfigSource::persist`'s
+/// own compare-and-swap alike).
+fn stale_config_error() -> ApiError {
+    GatewayError::ConfigStale(
+        "config changed since it was read; GET /admin/config and re-apply".to_owned(),
+    )
+    .into()
+}
+
+/// Map a [`ConfigSourceError`] from `load`/`persist` (I/O, DB, not-UTF-8) to
+/// an opaque 500: never a client mistake, and never safe to echo back
+/// (a filesystem or database detail).
+fn source_internal_error(error: &ConfigSourceError) -> ApiError {
+    GatewayError::Internal(error.to_string()).into()
+}
+
+/// Turn a [`ConfigContext::validate_document`](crate::config_source::ConfigContext::validate_document)
+/// failure into the client-facing rejection, without leaking a filesystem
+/// path.
 ///
 /// `ConfigError::Parse` and `ConfigError::Validation` both have a `path`
-/// field carrying that path, and their own `Display` (used by `{error}`
-/// below, never by this function) names it - correctly, since that `Display`
-/// is what reaches the log line just below, not the client. This function
-/// instead takes each variant's `message` field alone: `Validation`'s is
-/// hand-written by `Config::validate` and never contained a path to begin
-/// with, and `Parse`'s no longer does either (`describe_figment_error` in
-/// `config.rs` strips figment's own trailing `" in {source} {name}"`, which
-/// is the fragment that used to carry it). `RegistryError`'s variants never
-/// embed a path, so those pass through unchanged.
+/// field - in file mode, `ConfigContext::validate_document` labels it with
+/// the REAL boot file path (there is no staging file to leak instead, but
+/// the real path is no more the client's business than a staging path was) -
+/// and their own `Display` (used by `{error}` below, never by this function)
+/// names it. This function instead takes each variant's `message` field
+/// alone: `Validation`'s is hand-written by `Config::validate` and never
+/// contained a path to begin with, and `Parse`'s no longer does either
+/// (`describe_figment_error` in `config.rs` strips figment's own trailing
+/// `" in {source} {name}"`, which is the fragment that used to carry it).
+/// `RegistryError`'s variants never embed a path, so those pass through
+/// unchanged.
 ///
 /// The full detail - path included - still needs to reach a human somewhere,
 /// since a rejected apply is exactly the kind of thing an operator wants a
@@ -1373,38 +1366,44 @@ fn apply_config_document(
 /// response, at `debug`, never the message or this error's `Display`. So
 /// this function logs it directly, at `warn`, before scrubbing the message
 /// down to what the client is allowed to see.
-fn describe_rejection(path: &std::path::Path, error: &crate::reload::ReloadError) -> ApiError {
-    tracing::warn!(
-        config_path = %path.display(),
-        error = %error,
-        "config apply rejected"
-    );
-    let message = match error {
-        crate::reload::ReloadError::Config(config_error) => match config_error {
-            crate::config::ConfigError::Parse { message, .. }
-            | crate::config::ConfigError::Validation { message, .. } => message.clone(),
-            // `validate_candidate` parses `body` in memory (never a staged
-            // file), so this can only mean the boot file itself vanished
-            // between the hash check above and validation - not a client
-            // mistake to explain away as a bad document.
-            crate::config::ConfigError::NotFound { .. } => {
-                return GatewayError::Internal(
-                    "the config file this process booted from is missing".to_owned(),
-                )
-                .into();
+fn describe_validation_rejection(error: &ConfigLoadError) -> ApiError {
+    tracing::warn!(error = %error, "config apply rejected: candidate document failed validation");
+    match error {
+        ConfigLoadError::Config(config_error) => match config_error {
+            ConfigError::Parse { message, .. } | ConfigError::Validation { message, .. } => {
+                GatewayError::InvalidRequest(format!("config rejected: {message}")).into()
             }
+            // `validate_document` parses the candidate TEXT directly (file
+            // mode) or merges it against `ctx.boot_path` (DB mode); either
+            // way this can only mean the boot file itself vanished between
+            // the hash check above and validation - not a client mistake to
+            // explain away as a bad document.
+            ConfigError::NotFound { .. } => GatewayError::Internal(
+                "the boot config file this process needs to validate against is missing".to_owned(),
+            )
+            .into(),
             // Same shape as Parse/Validation above: name the field, drop the
             // `path` (this variant's own is the caller-supplied label, not a
-            // figment-owned staging path, but there is nothing client-useful
-            // in repeating it here either).
-            crate::config::ConfigError::DynamicKeyInBootConfig { key, .. } => format!(
-                "unexpected key '{key}' in boot-only document: remove it from the boot \
-                 file, or set config_source = \"file\""
-            ),
+            // path derived from the candidate, but there is nothing
+            // client-useful in repeating it here either).
+            ConfigError::DynamicKeyInBootConfig { key, .. } => {
+                GatewayError::InvalidRequest(format!(
+                    "config rejected: unexpected key '{key}' in boot-only document: remove it \
+                     from the boot file, or set config_source = \"file\""
+                ))
+                .into()
+            }
         },
-        crate::reload::ReloadError::Registry(registry_error) => registry_error.to_string(),
-    };
-    GatewayError::InvalidRequest(format!("config rejected: {message}")).into()
+        ConfigLoadError::Registry(registry_error) => {
+            GatewayError::InvalidRequest(format!("config rejected: {registry_error}")).into()
+        }
+        // `validate_document`'s own doc comment guarantees it never calls a
+        // `ConfigSource` method, so this arm is unreachable in practice;
+        // treated as internal rather than assumed safe to show a client.
+        ConfigLoadError::Source(source_error) => {
+            GatewayError::Internal(source_error.to_string()).into()
+        }
+    }
 }
 
 /// The config context this process booted with (ADR 012).

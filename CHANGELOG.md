@@ -8,6 +8,22 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ### Changed
 
+- **`GET`/`PUT /admin/config` now work in both config-source modes** (ADR 012,
+  task 6 of the config-source-abstraction plan). Both routes read and write
+  through `ConfigContext`/`ConfigSource` instead of the file-only code path:
+  `GET` returns the current dynamic document and its hash in either mode (DB
+  mode: the empty string and its hash before the first `PUT`); `PUT` runs a
+  new boot-layer guard (`boot_layer_diff`) before validating and persisting a
+  candidate, refusing with `LM-1001` (400, naming the changed keys) any
+  attempt to change a restart-only field (`server.*`, `log_format`,
+  `auth.enabled`, `auth.db_path`, `config_source`) - those only take effect on
+  a restart, and this route promises everything it accepts applies
+  immediately. File mode keeps its previous behavior (an unchanged
+  boot-layer block still passes; `If-Match` semantics, staged write and
+  `.bak` backup unchanged). DB mode's admin surface, previously an
+  unconditional 500, is now fully supported. `AppState::config_apply_lock`
+  is now a `tokio::sync::Mutex` (was `std::sync::Mutex`), since the apply
+  pipeline holds it across the async `ConfigSource`/`ConfigContext` calls.
 - **Internal: `ConfigSource` trait + `FileSource`** (ADR 012, task 1 of the
   config-source-abstraction plan). Extracted the file read / staged-write
   machinery (`config_hash`, unique `.tmp` staging, `.bak` backup, atomic
