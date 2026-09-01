@@ -10,15 +10,19 @@
 //! 5. db mode: neither a whole-document nor a granular `PUT` ever writes a
 //!    RESOLVED provider secret into `config_versions` - only the env var
 //!    name.
+//! 6. db mode: a document accepted by `PUT /admin/config` never leaves
+//!    behind something a REAL restart would refuse to boot (final-review fix
+//!    wave, Finding 1's restart invariant).
 //!
 //! Also covers a Task 8 review follow-up deferred here: a db-mode regression
 //! test for `PUT /admin/config/auth` (see
 //! `db_mode_auth_knobs_put_does_not_trip_the_boot_layer_guard`).
 //!
-//! Tests 1 and 2 spawn the real `lumen` binary (mirroring
+//! Tests 1, 2 and 6 spawn the real `lumen` binary (mirroring
 //! `tests/config_source_boot.rs` and `tests/signal_shutdown.rs`): they need
 //! the full `main.rs` boot sequence - `arm_config_reload` wiring the admin
-//! trigger, the file watcher and `ReloadTargets` together - which is not
+//! trigger, the file watcher and `ReloadTargets` together (tests 1-2), or a
+//! genuine second boot over the same on-disk state (test 6) - which is not
 //! reachable from a library call. Tests 3-5 and the Task 8 regression only
 //! exercise the admin config pipeline itself (no routing, no reload), so
 //! they use the same in-process `AppState` harness style as
@@ -482,6 +486,119 @@ capabilities = ["chat"]
         "the one post-install chat request must have reached the real upstream\n\
          --- stdout ---\n{out}\n--- stderr ---\n{err}"
     );
+}
+
+// ============================================================================
+// Test 6: db mode, a document accepted by PUT /admin/config never leaves
+// behind something a REAL restart would refuse to boot (final-review fix
+// wave, Finding 1's restart invariant - the headline guarantee
+// `ensure_dynamic_only`, config.rs, exists to protect).
+// ============================================================================
+
+#[tokio::test]
+async fn db_mode_valid_config_survives_a_real_restart() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("lumen.db");
+
+    // Two different ports for the two boots below, on purpose: reusing the
+    // just-killed process's port would race the OS releasing it, and the
+    // invariant under test has nothing to do with port reuse - only with
+    // whether the SAME database's stored document boots cleanly a second
+    // time.
+    let first_port = free_port();
+    let boot_config = |port: u16, unique: &str| {
+        write_temp_config(
+            unique,
+            &format!(
+                r#"
+config_source = "db"
+
+[server]
+host = "127.0.0.1"
+port = {port}
+
+[auth]
+enabled = true
+db_path = "{db}"
+"#,
+                db = db_path.display(),
+            ),
+        )
+    };
+    let first_config = boot_config(first_port, "db-restart-invariant-1");
+
+    let _plaintext = preseed_virtual_key(&db_path, "restart-invariant-test").await;
+    let (mut child, base) = spawn_lumen_ready(first_port, &first_config).await;
+    let client = reqwest::Client::new();
+    let empty_hash = admin_config_hash(&client, &base).await;
+
+    // A well-formed dynamic-only candidate: no boot-layer keys at all - the
+    // shape Finding 1's guard now requires of every db-mode apply. Before
+    // that fix, a candidate carrying e.g. `[auth] enabled = false` (equal to
+    // the built-in default) would ALSO have passed this same `PUT` with no
+    // error, only to brick the second boot below.
+    let doc = r#"
+[[providers]]
+name = "restart-provider"
+kind = "openai"
+base_url = "http://127.0.0.1:1"
+
+[[providers.models]]
+id = "gpt"
+capabilities = ["chat"]
+"#;
+    let response = client
+        .put(format!("{base}/admin/config"))
+        .bearer_auth(master())
+        .header("If-Match", &empty_hash)
+        .body(doc)
+        .send()
+        .await
+        .expect("put config");
+    assert_eq!(response.status(), 204);
+
+    let applied_hash = admin_config_hash(&client, &base).await;
+    assert_ne!(applied_hash, empty_hash);
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let (out1, err1) = drain_output(child);
+
+    // A fresh boot of the SAME database: the restart invariant under test is
+    // that a document `PUT /admin/config` accepted can never make a
+    // subsequent real boot refuse to start (`auth.enabled = false` stored
+    // alongside a boot file expecting auth on) or silently reinterpret a
+    // boot-layer setting (a stored `server.port` overriding the boot file's).
+    let second_port = free_port();
+    let second_config = boot_config(second_port, "db-restart-invariant-2");
+    let (mut child2, base2) = spawn_lumen_ready(second_port, &second_config).await;
+    let client2 = reqwest::Client::new();
+
+    let health = client2
+        .get(format!("{base2}/health"))
+        .send()
+        .await
+        .expect("get health");
+    assert_eq!(
+        health.status(),
+        200,
+        "a restart over a document the admin API accepted must succeed\n\
+         --- first boot stdout ---\n{out1}\n--- first boot stderr ---\n{err1}"
+    );
+
+    let hash_after_restart = admin_config_hash(&client2, &base2).await;
+    assert_eq!(
+        hash_after_restart, applied_hash,
+        "the persisted document must survive the restart unchanged"
+    );
+
+    let _ = child2.kill();
+    let _ = child2.wait();
+    let (out2, err2) = drain_output(child2);
+    // Drained for the same reason every other real-binary test in this file
+    // drains: an un-drained pipe on a killed child can hang the test, and an
+    // unused capture would otherwise warn.
+    let _ = (out2, err2);
 }
 
 // ============================================================================

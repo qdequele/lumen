@@ -69,7 +69,7 @@ use lumen_providers::{Registry, RegistryError};
 use lumen_telemetry::ReloadMetrics;
 use tokio::sync::Notify;
 
-use crate::config::{Config, ConfigError, ConfigSourceKind};
+use crate::config::{Config, ConfigError};
 use crate::config_source::ConfigContext;
 use crate::pricing::CostTable;
 use crate::resilience::ResilienceRuntime;
@@ -194,53 +194,6 @@ pub struct ReloadTargets {
     /// without a restart; existing entries only have their limits re-applied
     /// and keep their in-memory spend.
     pub auth_runtime: Option<Arc<crate::auth::AuthRuntime>>,
-}
-
-/// Validate a CANDIDATE document's text against `ctx`, without persisting or
-/// swapping anything.
-///
-/// Runs the two checks a reload runs, in the same order: a `Config`-level
-/// parse and validate (via [`ConfigContext::validate_document`]-equivalent
-/// parsing, but synchronous - see below - and re-parsed here to also get the
-/// `Config` needed for the registry check) and a candidate registry build.
-/// The second is not redundant: a keyless provider missing a `base_url`
-/// passes validation and only fails when the registry is built, which is why
-/// `apply_reload` puts the registry rebuild first.
-///
-/// Deliberately synchronous (unlike [`ConfigContext::validate_document`],
-/// which is async to accommodate a DB-backed source's own `load`): this
-/// function never reads `ctx.source`, only `ctx.boot_path` and `ctx.kind`, so
-/// it can run inline inside `admin::apply_config_document`'s existing
-/// `spawn_blocking` closure without restructuring that handler into async
-/// (deferred to the full source-based admin rework).
-///
-/// Used by `PUT /admin/config` to reject a bad document BEFORE it is ever
-/// persisted, so an invalid apply cannot leave a document behind that would
-/// break the next restart.
-///
-/// # Errors
-///
-/// [`ReloadError::Config`] if the document does not parse or validate;
-/// [`ReloadError::Registry`] if a registry cannot be built from it.
-pub fn validate_candidate(ctx: &ConfigContext, text: &str) -> Result<(), ReloadError> {
-    let config = match ctx.kind {
-        // A `Toml::string` parse of `text` itself, deliberately never a read
-        // of `ctx.boot_path` on disk: this validates exactly the candidate
-        // bytes about to replace the live document, with no staging file and
-        // therefore nothing to leak into an error message.
-        ConfigSourceKind::File => Config::load_text(text, &ctx.boot_path.display().to_string())?,
-        // `text` is the candidate DYNAMIC document alone; the boot layer
-        // still comes from `ctx.boot_path` on disk, exactly as a real reload
-        // would merge them.
-        ConfigSourceKind::Db => Config::load_with_dynamic(&ctx.boot_path, text)?,
-    };
-    // A throwaway client: this runs on an admin route, never the hot path.
-    Registry::build(
-        config.provider_specs(),
-        lumen_providers::http::build_client(),
-        Duration::from_secs(300),
-    )?;
-    Ok(())
 }
 
 /// Atomically swap the routing table, price table, resilience policy and

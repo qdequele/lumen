@@ -1131,8 +1131,9 @@ const fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
 // ---- Config read and apply (ADR 010, ADR 012) -------------------------------
 
 use crate::config::{
-    boot_layer_diff, AuthDynamicKnobs, Config, ConfigError, ImageFetchConfig, ProviderConfig,
-    ResilienceConfig, TelemetryConfig, TokenizerConfig, WebhooksConfig,
+    boot_layer_diff, ensure_dynamic_only, AuthDynamicKnobs, Config, ConfigError, ConfigSourceKind,
+    ImageFetchConfig, ProviderConfig, ResilienceConfig, TelemetryConfig, TokenizerConfig,
+    WebhooksConfig,
 };
 use crate::config_edit;
 use crate::config_source::{ConfigContext, ConfigLoadError, ConfigSourceError};
@@ -1229,21 +1230,28 @@ fn require_if_match(headers: &axum::http::HeaderMap) -> Result<String, ApiError>
 ///    `auth.enabled`, `auth.db_path`, `config_source`) only takes effect on a
 ///    restart, and this route applies everything it accepts immediately.
 ///    File mode: the candidate is the whole document, so an UNCHANGED
-///    boot-layer block passes and only an actual edit is refused. DB mode:
-///    the current document never holds boot keys at all (ADR 012 §1), so any
-///    boot-layer key the candidate DOES carry, if it differs from the
-///    built-in default, is refused the same way.
-/// 3. Validate the candidate
+///    boot-layer block passes and only an actual edit is refused.
+/// 3. DB mode only: reject any boot-layer key the candidate carries at all
+///    ([`ensure_dynamic_only`]), regardless of its value - `LM-1001` (400)
+///    naming the key. In db mode the current document never holds boot keys
+///    (ADR 012 §1), so every boot field on that side already resolves to its
+///    built-in default; a candidate that sets one EXPLICITLY to that same
+///    default would pass step 2's diff (nothing differs) but still leave a
+///    key in the stored document that `Config::load_with_dynamic` would
+///    merge over the boot file - and silently win - at the next restart.
+///    This step, unlike step 2, does not compare against anything: it
+///    refuses the key outright.
+/// 4. Validate the candidate
 ///    ([`ConfigContext::validate_document`](crate::config_source::ConfigContext::validate_document):
 ///    parse, semantic validation, a throwaway registry build) - `LM-1001`
 ///    (400) on failure, logged in full at `warn` and scrubbed of any
 ///    filesystem path before it reaches the client
 ///    ([`describe_validation_rejection`]).
-/// 4. Persist through `ctx.source`. Its own compare-and-swap is a second,
+/// 5. Persist through `ctx.source`. Its own compare-and-swap is a second,
 ///    independent line of defense against a write racing a CONCURRENT
 ///    EXTERNAL edit (a human editor or GitOps sync outside this lock, in
 ///    file mode) - `LM-1004` (412) on that race too.
-/// 5. Ping the hot-reload trigger, if one is armed, so the new document
+/// 6. Ping the hot-reload trigger, if one is armed, so the new document
 ///    applies without a restart.
 async fn apply_document(
     state: &AppState,
@@ -1287,6 +1295,28 @@ async fn apply_document(
             diff.join(", ")
         ))
         .into());
+    }
+
+    if ctx.kind == ConfigSourceKind::Db {
+        // `boot_layer_diff` above only catches a boot-layer key that
+        // DIFFERS from the current document - in db mode the current
+        // document never carries boot keys at all, so a candidate that sets
+        // one explicitly to its own built-in default (`[auth] enabled =
+        // false`, `[auth] db_path = "lumen.db"`, `[server] port = 8080`,
+        // ...) produces no diff there and would otherwise reach `persist`.
+        // `Config::load_with_dynamic` merges the dynamic document OVER the
+        // boot file on every restart, so that stored key would silently win
+        // at the next boot regardless of its value - unconditionally refuse
+        // every boot-layer key in a db-mode candidate here, before it is
+        // ever validated or persisted.
+        ensure_dynamic_only(&candidate, "candidate").map_err(|error| {
+            tracing::warn!(
+                %error,
+                "config apply rejected: candidate document carried a boot-layer key in \
+                 config_source = \"db\" mode"
+            );
+            GatewayError::InvalidRequest(error.to_string())
+        })?;
     }
 
     ctx.validate_document(&candidate)
@@ -1402,6 +1432,20 @@ fn describe_validation_rejection(error: &ConfigLoadError) -> ApiError {
                 GatewayError::InvalidRequest(format!(
                     "config rejected: unexpected key '{key}' in boot-only document: remove it \
                      from the boot file, or set config_source = \"file\""
+                ))
+                .into()
+            }
+            // `ensure_dynamic_only` runs directly in `apply_document`, before
+            // `validate_document` is ever called, so this arm is unreachable
+            // in practice today - kept for exhaustiveness (and so a future
+            // caller of `validate_document` alone still gets a sensible
+            // mapping) with the same message shape `apply_document` itself
+            // uses for this error.
+            ConfigError::BootKeyInDynamicConfig { key, .. } => {
+                GatewayError::InvalidRequest(format!(
+                    "config rejected: unexpected key '{key}' in dynamic document: boot-layer \
+                     keys are restart-only in config_source = \"db\" mode; set them in the \
+                     boot config file instead"
                 ))
                 .into()
             }

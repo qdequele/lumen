@@ -35,7 +35,7 @@ fn master() -> String {
 /// denies unknown fields, so a `LUMEN_`-prefixed provider-key var here would
 /// make every `Config::load` call in this file fail with "unknown field"
 /// (only surfaces once a test exercises a real load, i.e. `PUT`'s
-/// `validate_candidate` - `GET` never calls `Config::load`).
+/// `ConfigContext::validate_document` - `GET` never calls `Config::load`).
 const PROVIDER_KEY_ENV: &str = "TEST_PROVIDER_API_KEY";
 /// The sentinel value exported under `PROVIDER_KEY_ENV`. Must never appear in
 /// the rendered config: only the env var *name* is file content.
@@ -841,6 +841,48 @@ async fn put_config_rejects_restart_only_boot_layer_keys_in_db_mode() {
     // Confirm nothing was persisted: GET still reports the empty document.
     let after: Value = h.get("/admin/config").await.json().await.expect("json");
     assert_eq!(after["config"].as_str().expect("config string"), "");
+}
+
+/// Final-review fix wave, Finding 1: a candidate that sets a boot-layer key
+/// EXPLICITLY to its own built-in default produces NO diff against
+/// `boot_layer_diff` alone - in db mode the current (empty) document already
+/// resolves every boot field to its default, so a candidate that names the
+/// same default is indistinguishable from one that never mentioned the key.
+/// But `Config::load_with_dynamic` merges the dynamic document OVER the boot
+/// file on every restart, so the stored key would silently win regardless:
+/// `auth.enabled = false` refuses to boot outright, a different `db_path`
+/// under the covers would point at the wrong database, and `server.port =
+/// 8080` would silently rebind. Each of the three cases below is refused
+/// unconditionally, independent of whether the value differs from the
+/// default - the dynamic document may never carry a boot-layer key at all.
+#[tokio::test]
+async fn put_config_rejects_a_boot_layer_key_in_db_mode_even_at_its_default_value() {
+    let h = spawn_admin_db_mode(registry()).await;
+    let empty_hash = h.current_hash().await;
+
+    for (doc, key) in [
+        ("[auth]\nenabled = false\n", "auth.enabled"),
+        ("[auth]\ndb_path = \"lumen.db\"\n", "auth.db_path"),
+        ("[server]\nport = 8080\n", "server"),
+    ] {
+        let response = h.put_config(doc, &empty_hash).await;
+        assert_eq!(
+            response.status(),
+            400,
+            "candidate {doc:?} (boot key at its own default) must still be refused"
+        );
+        let body: Value = response.json().await.expect("json");
+        assert_eq!(body["error"]["code"].as_str().expect("code"), "LM-1001");
+        let message = body["error"]["message"].as_str().expect("message");
+        assert!(
+            message.contains(key),
+            "the rejection must name the offending boot-layer key {key}: {message}"
+        );
+
+        // Confirm nothing was persisted: GET still reports the empty document.
+        let after: Value = h.get("/admin/config").await.json().await.expect("json");
+        assert_eq!(after["config"].as_str().expect("config string"), "");
+    }
 }
 
 // ---- Task 8: granular admin config endpoints (ADR 012) --------------------

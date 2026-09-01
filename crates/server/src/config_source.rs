@@ -340,12 +340,13 @@ pub enum ConfigLoadError {
     /// The document parsed and validated, but a routing table could not be
     /// built from it - e.g. a keyless provider missing `base_url` (issue
     /// #74). Parsing and validation alone miss this class of error, so
-    /// [`ConfigContext::validate_document`] runs this check too (mirroring
-    /// `reload::validate_candidate`, the same check by a different, sync
-    /// route). [`ConfigContext::load_config`] never produces this variant:
-    /// its caller (`reload::reload_once`) rebuilds the registry itself right
-    /// after, merging in the DB provider-key backfill first, so a redundant
-    /// throwaway build here would just be wasted work on every reload.
+    /// [`ConfigContext::validate_document`] runs this check too, the same
+    /// registry-build check `reload::apply_reload` runs before swapping the
+    /// live routing table. [`ConfigContext::load_config`] never produces
+    /// this variant: its caller (`reload::reload_once`) rebuilds the
+    /// registry itself right after, merging in the DB provider-key backfill
+    /// first, so a redundant throwaway build here would just be wasted work
+    /// on every reload.
     #[error(transparent)]
     Registry(#[from] RegistryError),
 }
@@ -437,20 +438,21 @@ impl ConfigContext {
     /// on-disk boot layer via [`Config::load_with_dynamic`], mirroring
     /// `load_config`.
     ///
-    /// Runs the SAME two checks `reload::validate_candidate` runs, in the
-    /// same order (parse-and-validate, then a candidate registry build): a
-    /// keyless provider missing `base_url` passes `Config::validate` and is
-    /// only caught by the registry build (issue #74), so skipping it here
-    /// would let this validator wave through a document `apply_reload` (via
+    /// Runs the same two checks in the same order as `reload::apply_reload`
+    /// (parse-and-validate, then a candidate registry build): a keyless
+    /// provider missing `base_url` passes `Config::validate` and is only
+    /// caught by the registry build (issue #74), so skipping it here would
+    /// let this validator wave through a document `apply_reload` (via
     /// `load_config` + a real registry rebuild) would then reject at the next
     /// reload - a document that passed `PUT /admin/config` only to silently
-    /// break hot reload afterward. This is the validator intended for the
-    /// mode-agnostic admin apply pipeline (ADR 012 §3); `validate_candidate`
-    /// exists only because Task 5 keeps `admin::apply_config_document`
-    /// synchronous (the current file-mode-only handler runs inside its own
-    /// `spawn_blocking` and this method is `async`) - once that handler is
-    /// reworked to the granular, mode-agnostic pipeline, it should call this
-    /// method directly and `validate_candidate` can retire.
+    /// break hot reload afterward. This is the validator the mode-agnostic
+    /// admin apply pipeline (ADR 012 §3) uses: `admin::apply_document` calls
+    /// it directly for both `PUT /admin/config` and every granular config
+    /// endpoint. An earlier, file-mode-only iteration of the admin handler
+    /// ran this same pair of checks synchronously as `reload::validate_candidate`,
+    /// since Task 5 kept that handler synchronous; it has since been removed
+    /// as dead code now that this method is the sole validator on the apply
+    /// path.
     ///
     /// # Errors
     /// [`ConfigLoadError::Config`] if `text` does not parse or fails
@@ -472,8 +474,7 @@ impl ConfigContext {
         };
         // A throwaway client: this runs on an admin route, never the hot
         // path. Off the runtime worker is not required here (no file/DB
-        // I/O, just in-memory routing-table construction), matching
-        // `reload::validate_candidate`'s identical call.
+        // I/O, just in-memory routing-table construction).
         lumen_providers::Registry::build(
             config.provider_specs(),
             lumen_providers::http::build_client(),

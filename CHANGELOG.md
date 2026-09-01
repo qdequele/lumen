@@ -98,6 +98,25 @@ All notable changes to LUMEN are documented here. The format is based on
   `If-Match` - including when the submitted body is also invalid TOML).
   Groundwork for a future SQLite-backed config source.
 
+### Fixed
+
+- **DB mode refuses every boot-layer key in the dynamic document, even one
+  set to its built-in default** (ADR 012, final-review fix). Previously a
+  `PUT /admin/config` (or granular) candidate carrying a boot-layer key
+  whose value happened to equal the compiled-in default (`[auth]
+  enabled = false`, `[auth] db_path = "lumen.db"`, `[server] port = 8080`,
+  ...) slipped past the boot-layer guard, persisted into `config_versions`,
+  and - because the stored document merges over the boot file at startup -
+  could refuse the next restart (auth re-assertions) or silently repoint a
+  boot setting. A new `ensure_dynamic_only` check now rejects any such key
+  with `LM-1001` naming it, restoring the invariant that a document the
+  API accepts always survives a restart; pinned by a real-restart e2e test.
+  The file->db migration procedure in `docs/operations/config-modes.md`
+  now includes the required strip-the-boot-keys step. Also retired the
+  dead `reload::validate_candidate` (superseded by
+  `ConfigContext::validate_document` since the task 6 rework) and its
+  stale doc-comment references.
+
 ## [0.4.0] - 2026-08-26
 
 ### Added

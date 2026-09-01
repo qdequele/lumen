@@ -56,6 +56,16 @@ Any dynamic-layer key in that file - a `[[providers]]` block, a
 source. The error message tells you the fix: remove the key from the boot
 file, or set `config_source = "file"`.
 
+The same split is enforced in the other direction on every admin write, and
+just as strictly: in db mode, `PUT /admin/config` and every granular write
+refuse a candidate that carries **any** boot-layer key at all -
+`server.*`, `log_format`, `config_source`, or `auth.enabled`/`auth.db_path` -
+independent of what value it names, even one identical to the field's own
+built-in default. A dynamic document may never carry a boot-layer key; the
+only way to change one is to edit the boot file and restart. See
+[If-Match and the boot-layer guard](#if-match-and-the-boot-layer-guard)
+below for why an equal-to-default value cannot be waved through.
+
 A db-mode boot re-asserts `auth.enabled` and `auth.db_path` against the
 stored document after the merge: `PUT /admin/config` (and every granular
 write) is itself refused from ever touching `[auth] enabled`/`db_path` (see
@@ -131,12 +141,24 @@ curl -s -X PUT http://localhost:8080/admin/config \
   `LM-1001`, naming the changed key(s): `"restart-only keys changed:
   server.port; edit the boot config file and restart"`. In file mode an
   *unchanged* boot-layer block still passes, since the candidate there is
-  the whole file; in db mode the stored document never carries boot keys at
-  all, so a boot-layer key in the candidate is compared against the
-  **built-in default** for that field - a value that happens to equal the
-  default passes, and only a candidate boot-layer key that actually differs
-  from it is refused. A well-formed db-mode candidate simply carries no
-  boot-layer keys at all.
+  the whole file.
+- **A db-mode candidate that carries any boot-layer key at all** is `400`
+  `LM-1001`, unconditionally - naming the key: `"unexpected key
+  'auth.enabled' in dynamic document: boot-layer keys are restart-only in
+  config_source = \"db\" mode; set them in the boot config file instead"`.
+  This is stricter than the diff above, and deliberately so: the stored
+  document in db mode never carries boot keys, so every boot field on that
+  side already resolves to its built-in default, and a candidate that sets
+  one EXPLICITLY to that same default (`[auth] enabled = false`, `[auth]
+  db_path = "lumen.db"`, `[server] port = 8080`, ...) would otherwise
+  produce no diff against the current document and pass straight through.
+  But a restart merges the stored dynamic document OVER the boot file
+  (`Config::load_with_dynamic`), so that stored key would silently win at
+  the next boot regardless of whether its value ever differed from the
+  default - refusing to boot at all if it disables auth, pointing at the
+  wrong database, or silently rebinding the listen port. A well-formed
+  db-mode candidate simply carries no boot-layer keys at all; this check
+  does not compare values, it refuses the key outright.
 - **A candidate that fails validation** (bad TOML, an unknown field, a
   dangling `fallbacks` reference, ...) is `400` `LM-1001`, naming the field
   or the dependent model.
@@ -205,8 +227,9 @@ requires a restart, since `config_source` is itself boot-layer.
 ### File to DB
 
 1. `GET /admin/config` against the running file-mode process and save the
-   response body - that is already exactly the dynamic document db mode
-   needs.
+   response body. In file mode this is the WHOLE config file, byte for byte
+   (boot layer and dynamic layer together, see the admin API table above) -
+   it still needs step 4 below before it is a valid db-mode candidate.
 2. Edit the boot TOML: set `config_source = "db"`, and strip every
    dynamic-layer key (`[[providers]]`, `[resilience]`, `[telemetry]`,
    `[tokenizer]`, `[image_fetch]`, `[webhooks]`, and every `[auth]` key
@@ -215,9 +238,19 @@ requires a restart, since `config_source` is itself boot-layer.
 3. Restart. The process boots with an empty stored document (first boot in
    db mode, see above) - `/health` is healthy, `/v1/*` answers `LM-2001`
    until the next step.
-4. `PUT /admin/config` with the document saved in step 1, using the empty
-   document's hash as `If-Match` (the `GET /admin/config` a fresh db-mode
-   boot returns before any write).
+4. Before the `PUT`, strip every boot-layer key from the document saved in
+   step 1: `[server]`, `log_format`, `config_source`, and `auth.enabled`/
+   `auth.db_path` (keep the five dynamic `[auth]` knobs - `flush_interval_ms`,
+   `usage_channel_capacity`, `usage_batch_max`, `usage_flush_ms`,
+   `retention_days` - if the file set any of them). The saved document is
+   the file-mode `GET`'s WHOLE file, and the db-mode boot-layer guard (see
+   [If-Match and the boot-layer guard](#if-match-and-the-boot-layer-guard))
+   now refuses a candidate carrying any boot-layer key unconditionally, even
+   one whose value equals its built-in default - `PUT`-ing step 1's document
+   as-is is refused `400` `LM-1001`.
+5. `PUT /admin/config` with the stripped document from step 4, using the
+   empty document's hash as `If-Match` (the `GET /admin/config` a fresh
+   db-mode boot returns before any write).
 
 ### DB to file
 

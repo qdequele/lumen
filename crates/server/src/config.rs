@@ -759,17 +759,40 @@ pub enum ConfigError {
         /// `providers`).
         key: String,
     },
+    /// A dynamic-layer document (the `config_source = "db"` candidate applied
+    /// through `PUT /admin/config` or a granular write) named a boot-layer
+    /// key (ADR 012 §1, the inverse of [`DynamicKeyInBootConfig`]): never
+    /// applied, even when the value happens to equal the field's built-in
+    /// default - see [`ensure_dynamic_only`] for why an equal-to-default
+    /// value cannot be waved through.
+    #[error(
+        "dynamic config '{path}': unexpected key '{key}' in dynamic document: boot-layer keys \
+         are restart-only in config_source = \"db\" mode; set them in the boot config file \
+         instead"
+    )]
+    BootKeyInDynamicConfig {
+        /// The candidate document's label (never a filesystem path - see the
+        /// call site in `admin::apply_document`).
+        path: String,
+        /// The offending key, dotted for a nested field (e.g.
+        /// `auth.db_path`) or bare for a top-level one (e.g. `server`).
+        key: String,
+    },
 }
 
 /// Render a `figment` extraction error without the trailing `" in {source}
 /// {name}"` fragment its own `Display` appends (e.g. `" in /srv/lumen/lumen
-/// .toml.4127-0.tmp TOML file"`): `source` is the path figment actually read,
-/// which is the real config path on a normal boot but the staged `.tmp` file
-/// during `PUT /admin/config` validation (`crate::reload::validate_candidate`
-/// runs `Config::load` against the staging copy). `ConfigError::Parse`
-/// already carries the correct path in its own `path` field, so repeating
-/// figment's copy is redundant on a normal load and a filesystem-path leak on
-/// a `PUT` rejection.
+/// .toml TOML file"`): `source` is the path figment actually read, which is
+/// the real boot config path on a normal boot (`Config::load` /
+/// `Config::load_with_dynamic`, both merge `Toml::file`). `PUT /admin/config`
+/// candidate validation never reads a file at all - `Config::load_text`
+/// (file mode) and the dynamic half of `Config::load_with_dynamic` (db mode)
+/// merge only `Toml::string`, so there is no staging copy for this fragment
+/// to name. `ConfigError::Parse` already carries the correct path in its own
+/// `path` field, so repeating figment's copy would still be redundant on a
+/// normal load and, on a `PUT` rejection, a needless filesystem-path leak
+/// (`describe_validation_rejection` in `admin.rs` strips `path` from what
+/// reaches the client for exactly that reason).
 ///
 /// Reconstructed structurally from `figment::Error`'s public fields (`kind`,
 /// `path`, `profile`, `metadata`), not by trimming the formatted string: this
@@ -1007,6 +1030,76 @@ pub fn ensure_boot_only(toml_text: &str, label: &str) -> Result<(), ConfigError>
                 for auth_key in auth_table.keys() {
                     if !BOOT_ONLY_AUTH_KEYS.contains(&auth_key.as_str()) {
                         return Err(ConfigError::DynamicKeyInBootConfig {
+                            path: label.to_owned(),
+                            key: format!("auth.{auth_key}"),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Top-level keys forbidden in a dynamic-only document (`config_source =
+/// "db"` mode candidate): the boot-layer top-level keys, mirroring
+/// [`BOOT_ONLY_TOP_LEVEL_KEYS`] minus `auth` itself (an `[auth]` table is
+/// allowed there - it is only two of its KEYS that are forbidden, checked
+/// separately below).
+const DYNAMIC_FORBIDDEN_TOP_LEVEL_KEYS: [&str; 3] = ["server", "log_format", "config_source"];
+
+/// Keys forbidden inside `[auth]` in a dynamic-only document: the boot-layer
+/// half of `AuthConfig`, mirroring [`BOOT_ONLY_AUTH_KEYS`]. The five dynamic
+/// auth knobs (`flush_interval_ms`, `usage_channel_capacity`,
+/// `usage_batch_max`, `usage_flush_ms`, `retention_days`) remain allowed.
+const DYNAMIC_FORBIDDEN_AUTH_KEYS: [&str; 2] = ["enabled", "db_path"];
+
+/// Reject any boot-layer key in `toml_text` (ADR 012 §1): the inverse of
+/// [`ensure_boot_only`], applied to every `config_source = "db"` candidate
+/// document (`admin::apply_document`, unconditionally, regardless of the
+/// candidate's values) BEFORE [`ConfigContext::validate_document`](crate::config_source::ConfigContext::validate_document)
+/// runs.
+///
+/// This closes a hole [`boot_layer_diff`] cannot: in db mode the CURRENT
+/// document never carries boot keys at all, so every boot field on that side
+/// already resolves to its built-in default. A candidate that sets a boot
+/// key EXPLICITLY to that same default (`[auth] enabled = false`, `[auth]
+/// db_path = "lumen.db"`, `[server] port = 8080`, ...) then produces an
+/// empty diff against `boot_layer_diff` and would otherwise pass straight
+/// through to `persist` - but [`Config::load_with_dynamic`] merges the
+/// dynamic document OVER the boot file on every subsequent boot, so the
+/// stored key would silently win at the next restart: `auth.enabled =
+/// false` refuses to boot outright (`main.rs`'s `ensure!`), a different
+/// `auth.db_path` points the process at the wrong database, and a different
+/// `server.port` silently rebinds away from whatever the boot file
+/// specified. A dynamic document may therefore never carry a boot-layer key
+/// at all, independent of its value - the only way to change one is to edit
+/// the boot file and restart.
+pub fn ensure_dynamic_only(toml_text: &str, label: &str) -> Result<(), ConfigError> {
+    let value: toml::Value =
+        toml_text
+            .parse()
+            .map_err(|e: toml::de::Error| ConfigError::Parse {
+                path: label.to_owned(),
+                message: e.to_string(),
+            })?;
+    let Some(table) = value.as_table() else {
+        // A syntactically valid TOML document is always a table at the top
+        // level; `toml::Value::parse` cannot produce anything else here.
+        return Ok(());
+    };
+    for (key, entry) in table {
+        if DYNAMIC_FORBIDDEN_TOP_LEVEL_KEYS.contains(&key.as_str()) {
+            return Err(ConfigError::BootKeyInDynamicConfig {
+                path: label.to_owned(),
+                key: key.clone(),
+            });
+        }
+        if key == "auth" {
+            if let Some(auth_table) = entry.as_table() {
+                for auth_key in auth_table.keys() {
+                    if DYNAMIC_FORBIDDEN_AUTH_KEYS.contains(&auth_key.as_str()) {
+                        return Err(ConfigError::BootKeyInDynamicConfig {
                             path: label.to_owned(),
                             key: format!("auth.{auth_key}"),
                         });
@@ -2275,6 +2368,80 @@ mod tests {
         assert!(err.to_string().contains("providers"));
         let err = ensure_boot_only("[auth]\nflush_interval_ms = 5\n", "t").unwrap_err();
         assert!(err.to_string().contains("flush_interval_ms"));
+    }
+
+    /// A dynamic-only document with none of the forbidden top-level keys and
+    /// none of the forbidden `[auth]` keys - the shape a well-behaved db-mode
+    /// candidate always has - is accepted.
+    #[test]
+    fn ensure_dynamic_only_accepts_a_document_with_no_boot_keys() {
+        assert!(ensure_dynamic_only(
+            "[[providers]]\nname = \"x\"\nkind = \"openai\"\n[auth]\nflush_interval_ms = 5\n\
+             usage_channel_capacity = 10\nusage_batch_max = 2\nusage_flush_ms = 100\n\
+             retention_days = 30\n[resilience]\n[telemetry]\n[tokenizer]\n[webhooks]\n\
+             url = \"https://example.test\"\n",
+            "t"
+        )
+        .is_ok());
+        assert!(ensure_dynamic_only("", "t").is_ok());
+    }
+
+    /// Each forbidden top-level key is rejected on its own, naming itself in
+    /// the error - even when the document is otherwise the empty/default
+    /// document a `boot_layer_diff` would see as unchanged (the whole point
+    /// of this guard: a value equal to the default must still be refused).
+    #[test]
+    fn ensure_dynamic_only_rejects_every_forbidden_top_level_key() {
+        for (toml, key) in [
+            ("[server]\n", "server"),
+            ("[server]\nport = 8080\n", "server"),
+            ("log_format = \"json\"\n", "log_format"),
+            ("config_source = \"db\"\n", "config_source"),
+        ] {
+            let err = ensure_dynamic_only(toml, "t").unwrap_err();
+            assert!(
+                matches!(&err, ConfigError::BootKeyInDynamicConfig { key: k, .. } if k == key),
+                "expected BootKeyInDynamicConfig naming {key:?}, got {err:?}"
+            );
+            assert!(
+                err.to_string().contains(key),
+                "error must name {key}: {err}"
+            );
+            assert!(
+                err.to_string().contains("restart-only"),
+                "error must explain the fix: {err}"
+            );
+        }
+    }
+
+    /// The two boot-layer `[auth]` keys are rejected even when set to their
+    /// own built-in default value - the exact hole `boot_layer_diff` alone
+    /// cannot catch (Finding 1): in db mode the current document has no auth
+    /// keys, so `enabled = false` and `db_path = "lumen.db"` both resolve to
+    /// what a boot-key-free document already resolves to, producing no diff.
+    #[test]
+    fn ensure_dynamic_only_rejects_auth_boot_keys_even_at_their_default() {
+        let err = ensure_dynamic_only("[auth]\nenabled = false\n", "t").unwrap_err();
+        assert!(err.to_string().contains("auth.enabled"));
+
+        let err = ensure_dynamic_only("[auth]\ndb_path = \"lumen.db\"\n", "t").unwrap_err();
+        assert!(err.to_string().contains("auth.db_path"));
+
+        // A non-default value must be rejected too, not just the default.
+        let err = ensure_dynamic_only("[auth]\nenabled = true\n", "t").unwrap_err();
+        assert!(err.to_string().contains("auth.enabled"));
+    }
+
+    /// The five dynamic `[auth]` knobs stay allowed - only `enabled` and
+    /// `db_path` are boot-layer.
+    #[test]
+    fn ensure_dynamic_only_accepts_the_five_dynamic_auth_knobs() {
+        assert!(ensure_dynamic_only(
+            "[auth]\nflush_interval_ms = 1\nusage_channel_capacity = 2\nusage_batch_max = 3\n\
+             usage_flush_ms = 4\nretention_days = 5\n",
+            "t"
+        )
+        .is_ok());
     }
 
     #[test]
