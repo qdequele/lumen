@@ -114,6 +114,22 @@ pub enum DeleteGroupOutcome {
     NotFound,
 }
 
+/// The outcome of a [`KeyStore::insert_config_version`] compare-and-swap
+/// (ADR 012).
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConfigCasOutcome {
+    /// `expected_hash` matched the current version; the new one was
+    /// inserted and is now current.
+    Applied,
+    /// `expected_hash` did not match the current version - nothing changed.
+    /// A caller sees this when another writer applied a config in between
+    /// its read and its write, and should reload before retrying.
+    Stale {
+        /// The hash of the version that is actually current.
+        current_hash: String,
+    },
+}
+
 /// Parameters for creating a key.
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 pub struct NewKey {
@@ -449,6 +465,13 @@ impl KeyStore {
     async fn migrate(pool: SqlitePool) -> Result<Self, AuthError> {
         sqlx::migrate!("./migrations").run(&pool).await?;
         Ok(Self { pool })
+    }
+
+    /// The underlying pool - a **test/diagnostic** escape hatch for
+    /// assertions that need a raw query (e.g. row counts), mirroring
+    /// [`Self::debug_dump`]. Never call this from request-path code.
+    pub fn pool(&self) -> &SqlitePool {
+        &self.pool
     }
 
     // ---- Virtual keys -------------------------------------------------------
@@ -1297,6 +1320,64 @@ impl KeyStore {
         Ok(result.rows_affected() > 0)
     }
 
+    // ---- Config versions (ADR 012) -------------------------------------------
+
+    /// The current config: `(toml, hash)` of the newest row, or `None` when
+    /// the table is empty (no config was ever written through the DB
+    /// source).
+    pub async fn current_config(&self) -> Result<Option<(String, String)>, AuthError> {
+        let row = sqlx::query("SELECT toml, hash FROM config_versions ORDER BY id DESC LIMIT 1")
+            .fetch_optional(&self.pool)
+            .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let toml: String = row.try_get("toml")?;
+        let hash: String = row.try_get("hash")?;
+        Ok(Some((toml, hash)))
+    }
+
+    /// Compare-and-swap insert of a new config version (ADR 012): the write
+    /// only applies when `expected_hash` matches the hash of the current
+    /// newest row (or `empty_hash` while the table is still empty), so two
+    /// concurrent writers never silently clobber one another. On success,
+    /// only the newest 50 versions are retained. The whole check, insert and
+    /// prune happen in one transaction.
+    pub async fn insert_config_version(
+        &self,
+        toml: &str,
+        hash: &str,
+        expected_hash: &str,
+        empty_hash: &str,
+    ) -> Result<ConfigCasOutcome, AuthError> {
+        let mut tx = self.pool.begin().await?;
+        let current: Option<String> =
+            sqlx::query_scalar("SELECT hash FROM config_versions ORDER BY id DESC LIMIT 1")
+                .fetch_optional(&mut *tx)
+                .await?;
+        let current_hash = current.unwrap_or_else(|| empty_hash.to_owned());
+        if current_hash != expected_hash {
+            // Nothing was written yet; dropping `tx` rolls back (a no-op here).
+            return Ok(ConfigCasOutcome::Stale { current_hash });
+        }
+        sqlx::query(
+            "INSERT INTO config_versions (toml, hash, applied_at, actor) VALUES (?, ?, ?, NULL)",
+        )
+        .bind(toml)
+        .bind(hash)
+        .bind(rfc3339_now())
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "DELETE FROM config_versions WHERE id NOT IN \
+             (SELECT id FROM config_versions ORDER BY id DESC LIMIT 50)",
+        )
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(ConfigCasOutcome::Applied)
+    }
+
     // ---- Diagnostics --------------------------------------------------------
 
     /// Render every stored row as text - a **test/diagnostic** helper backing
@@ -1338,5 +1419,64 @@ impl KeyStore {
             dump.push('\n');
         }
         Ok(dump)
+    }
+}
+
+/// Format [`now_unix`] as an RFC 3339 UTC timestamp (`YYYY-MM-DDTHH:MM:SSZ`)
+/// for `config_versions.applied_at`.
+fn rfc3339_now() -> String {
+    format_rfc3339(now_unix())
+}
+
+/// Format Unix seconds as an RFC 3339 UTC timestamp (`YYYY-MM-DDTHH:MM:SSZ`).
+///
+/// Computed from epoch seconds directly (civil-from-days), the same
+/// dependency-free approach `providers::bedrock::sigv4::format_amz_time`
+/// uses for AWS request signing - auth does not depend on providers, and one
+/// timestamp column does not justify pulling in a date/time crate.
+#[allow(clippy::cast_sign_loss)] // `now_unix` never returns negative (see its own doc comment).
+fn format_rfc3339(secs: i64) -> String {
+    let secs = secs.max(0) as u64;
+    let days = secs / 86_400;
+    let rem = secs % 86_400;
+    let (hour, minute, second) = (rem / 3_600, (rem % 3_600) / 60, rem % 60);
+    let (year, month, day) = civil_from_days(days);
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
+/// Convert a count of days since the Unix epoch (1970-01-01) into a civil
+/// `(year, month, day)` in UTC. Howard Hinnant's public-domain algorithm,
+/// duplicated from `providers::bedrock::sigv4::civil_from_days` rather than
+/// pulling that crate in as a dependency just for this.
+#[allow(
+    clippy::cast_possible_wrap,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+fn civil_from_days(days_since_epoch: u64) -> (i64, u32, u32) {
+    // Shift the epoch to 0000-03-01 so leap days fall at the end of each cycle.
+    let z = days_since_epoch as i64 + 719_468;
+    let era = z / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11] (March-based)
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
+    let year = if month <= 2 { year + 1 } else { year };
+    (year, month, day)
+}
+
+#[cfg(test)]
+mod rfc3339_tests {
+    use super::format_rfc3339;
+
+    #[test]
+    fn format_rfc3339_matches_known_epochs() {
+        assert_eq!(format_rfc3339(0), "1970-01-01T00:00:00Z");
+        assert_eq!(format_rfc3339(1_000_000_000), "2001-09-09T01:46:40Z");
+        // 2020 is a leap year: 2020-02-29 exists.
+        assert_eq!(format_rfc3339(1_582_934_400), "2020-02-29T00:00:00Z");
     }
 }

@@ -44,7 +44,7 @@ reference.
 | `GET  /health`                 | Liveness. No I/O, never touches the DB or providers.    |
 | `GET  /health/providers`       | Background provider-probe results (opt-in, see below).  |
 | `GET  /metrics`                | Prometheus exposition.                                  |
-| `POST/GET/PUT/PATCH/DELETE /admin/*` | Keys, budgets, budget webhooks, usage reporting & export, provider-key rotation, config read/apply. Only mounted when auth is enabled. |
+| `POST/GET/PUT/PATCH/DELETE /admin/*` | Keys, budgets, budget webhooks, usage reporting & export, provider-key rotation, whole-document and granular (per-provider, per-section) config read/apply. Only mounted when auth is enabled. See [Config source modes](docs/operations/config-modes.md). |
 
 A single model id is owned entirely by you and may serve one to three
 capabilities. The router resolves each request by `(capability, model)`.

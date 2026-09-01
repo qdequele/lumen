@@ -18,7 +18,8 @@ use lumen_auth::usage::{spawn_usage_writer, UsageWriterConfig};
 use lumen_server::{
     auth::{now_unix, AuthRuntime},
     build_app,
-    config::Config,
+    config::{ensure_boot_only, Config, ConfigSourceKind},
+    config_source::{ConfigContext, ConfigSource, DbSource},
     health::{spawn_health_checks, ProbeTarget, ProviderHealth},
     lifecycle, log_startup,
     pricing::CostTable,
@@ -123,7 +124,11 @@ fn main() -> ExitCode {
     };
 
     // Load and validate config BEFORE the async runtime so a bad config exits
-    // fast with a precise, operator-facing message (never a stack trace).
+    // fast with a precise, operator-facing message (never a stack trace). In
+    // `config_source = "db"` mode this only sees the boot layer (dynamic
+    // fields default), which is enough for `log_format` below; `run` redoes
+    // the full ADR 012 boot sequence (including the DB-mode merge) once the
+    // async runtime is up, since opening the auth database needs it.
     let config = match Config::load(&config_path) {
         Ok(cfg) => cfg,
         Err(err) => {
@@ -135,7 +140,7 @@ fn main() -> ExitCode {
     // Logging is initialised only after config parses, so the format is known.
     init_logging(config.log_format.into(), "info");
 
-    match run(config, config_path) {
+    match run(config_path) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             tracing::error!(error = %format!("{err:#}"), "server exited with error");
@@ -539,13 +544,94 @@ fn build_token_counter(config: &Config) -> Arc<TokenCounter> {
     token_counter
 }
 
-fn run(config: Config, config_path: PathBuf) -> anyhow::Result<()> {
+/// ADR 012 boot sequence: read `config_path` and, from its own
+/// `config_source` key, decide file vs DB mode, returning the fully merged
+/// [`Config`], the [`ConfigContext`] every admin/reload consumer shares, and
+/// (DB mode only) the already-open [`KeyStore`] so `boot_auth_stack` can
+/// reuse its connection pool instead of opening a second one onto the same
+/// database.
+///
+/// File mode is byte-for-byte today's boot: `boot` itself is the whole
+/// (boot + dynamic) config, and the context just wraps the same path the
+/// process has always read and rewritten. DB mode reads ONLY the boot layer
+/// from `config_path` (a dynamic key there is a boot error -
+/// [`ensure_boot_only`]), requires `auth.enabled = true`, opens the auth
+/// database early, and merges the stored dynamic document over the boot
+/// layer via [`Config::load_with_dynamic`]. An empty stored document (a
+/// fresh DB-mode deployment with nothing ever persisted) is a valid,
+/// provider-less boot state - logged, not an error - since the operator's
+/// next step is `PUT /admin/config`, not a restart.
+async fn boot_config_context(
+    config_path: &Path,
+) -> anyhow::Result<(Config, ConfigContext, Option<KeyStore>)> {
+    let boot = Config::load(config_path)?;
+    match boot.config_source {
+        ConfigSourceKind::File => Ok((boot, ConfigContext::file(config_path.to_path_buf()), None)),
+        ConfigSourceKind::Db => {
+            let text = std::fs::read_to_string(config_path)?;
+            ensure_boot_only(&text, &config_path.display().to_string())?;
+            anyhow::ensure!(
+                boot.auth.enabled,
+                "config_source = \"db\" requires [auth] enabled = true with a database"
+            );
+            let store = KeyStore::connect(&boot.auth.db_url()).await?; // runs migrations
+            let source = DbSource::new(store.clone());
+            let doc = source.load().await?;
+            if doc.toml.is_empty() {
+                tracing::warn!(
+                    "config_source = \"db\" and no config stored yet; \
+                     PUT /admin/config to install one"
+                );
+            }
+            let config = Config::load_with_dynamic(config_path, &doc.toml)?;
+            // `load_with_dynamic` merges the stored document OVER the boot
+            // file (`Config::load_with_dynamic`'s own doc comment already
+            // flags this), so a stored document that itself contains an
+            // `[auth]` block can silently override boot-layer values even
+            // though `ensure_boot_only` only ever guarded the BOOT file, not
+            // the dynamic one. Left unchecked, a stored `[auth] enabled =
+            // false` (or a different `db_path`) would leave this process
+            // with auth off - `boot_auth_stack` never runs, `/admin` never
+            // mounts, `/v1/*` runs as an open proxy - recoverable only by
+            // editing SQLite directly. Re-assert both boot-layer auth values
+            // against what was just checked/connected above, naming the
+            // stored document as the cause so the failure is actionable.
+            anyhow::ensure!(
+                config.auth.enabled,
+                "config_source = \"db\": the stored config document sets [auth] enabled = false, \
+                 which would silently disable auth for a restart-only boot-layer value; fix the \
+                 stored document (PUT /admin/config must never touch [auth]) or the boot file"
+            );
+            anyhow::ensure!(
+                config.auth.db_path == boot.auth.db_path,
+                "config_source = \"db\": the stored config document sets auth.db_path to '{}', \
+                 which would silently repoint this restart-only boot-layer value away from the \
+                 boot file's '{}'; fix the stored document (PUT /admin/config must never touch \
+                 [auth]) or the boot file",
+                config.auth.db_path,
+                boot.auth.db_path
+            );
+            Ok((
+                config,
+                ConfigContext::db(config_path.to_path_buf(), source),
+                Some(store),
+            ))
+        }
+    }
+}
+
+fn run(config_path: PathBuf) -> anyhow::Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("failed to build tokio runtime")?;
 
     runtime.block_on(async move {
+        // ADR 012: the boot document's own `config_source` key picks file vs
+        // DB mode; see `boot_config_context`'s doc comment.
+        let (config, ctx, prebuilt_store) = boot_config_context(&config_path).await?;
+        let ctx = Arc::new(ctx);
+
         log_startup(&config);
 
         let addr = format!("{}:{}", config.server.host, config.server.port);
@@ -576,7 +662,7 @@ fn run(config: Config, config_path: PathBuf) -> anyhow::Result<()> {
         let mut provider_specs = config.provider_specs();
         let (auth_runtime, usage_logger, usage_writer, boot_backfill, key_source, auth_knobs) =
             if config.auth.enabled {
-                let boot = boot_auth_stack(&config, &mut provider_specs).await?;
+                let boot = boot_auth_stack(&config, &mut provider_specs, prebuilt_store).await?;
                 (
                     Some(boot.runtime),
                     Some(boot.usage_logger),
@@ -623,10 +709,11 @@ fn run(config: Config, config_path: PathBuf) -> anyhow::Result<()> {
             auth_runtime: auth_runtime.clone(),
         };
         // Cloned before the move into `arm_config_reload`: the admin config
-        // routes need the same path the reloader watches, so a `PUT` rewrites
-        // exactly the file a SIGHUP or file-watch reload would re-read.
-        let config_path_for_state = config_path.clone();
-        let reload_armed = arm_config_reload(config_path, reload_targets, &reload_trigger);
+        // routes read and write through the same context the reloader
+        // watches, so a `PUT` (file mode) or a granular DB write is exactly
+        // what a SIGHUP or file-watch reload would re-read.
+        let ctx_for_state = Arc::clone(&ctx);
+        let reload_armed = arm_config_reload(ctx, reload_targets, &reload_trigger);
 
         let health = boot_health(&config, &client, &resilience_metrics);
 
@@ -638,7 +725,7 @@ fn run(config: Config, config_path: PathBuf) -> anyhow::Result<()> {
             .with_body_limit(config.server.body_limit)
             .with_image_fetch(build_image_fetch_policy(&config))
             .with_token_counter(build_token_counter(&config))
-            .with_config_path(config_path_for_state);
+            .with_config_context(ctx_for_state);
         // Expose the reload trigger only when the reloader is actually armed.
         if reload_armed {
             state = state.with_reload_trigger(Arc::clone(&reload_trigger));
@@ -702,18 +789,33 @@ async fn drain_on_shutdown(
     }
 }
 
-/// Arm the config hot reloader (SIGHUP + file watch + admin trigger). A
-/// watcher-setup failure only disables reload - the server still runs - so it
-/// is logged, not fatal. Returns whether the reloader is armed, so the caller
-/// only exposes the admin reload trigger when a reload can actually happen.
+/// Arm the config hot reloader (SIGHUP + file watch (file mode only) + admin
+/// trigger). A watcher-setup failure only disables reload - the server still
+/// runs - so it is logged, not fatal. Returns whether the reloader is armed,
+/// so the caller only exposes the admin reload trigger when a reload can
+/// actually happen.
 fn arm_config_reload(
-    config_path: PathBuf,
+    ctx: Arc<ConfigContext>,
     targets: ReloadTargets,
     trigger: &Arc<tokio::sync::Notify>,
 ) -> bool {
-    match spawn_config_reloader(config_path, targets, Arc::clone(trigger)) {
+    // Captured before `ctx` moves into `spawn_config_reloader`, so the log
+    // line below can name what actually got armed: the file watcher never
+    // exists in DB mode (`ctx.source.watch_path()` is `None` there), and
+    // claiming otherwise would mislead an operator debugging why an external
+    // edit to the boot file (DB mode has no dynamic file to watch anyway)
+    // never triggered a reload.
+    let watch_armed = ctx.kind == ConfigSourceKind::File;
+    match spawn_config_reloader(ctx, targets, Arc::clone(trigger)) {
         Ok(_handle) => {
-            tracing::info!("config hot reload armed (SIGHUP + file watch + admin trigger)");
+            if watch_armed {
+                tracing::info!("config hot reload armed (SIGHUP + file watch + admin trigger)");
+            } else {
+                tracing::info!(
+                    "config hot reload armed (SIGHUP + admin trigger; no file watch in \
+                     config_source = \"db\" mode)"
+                );
+            }
             true
         }
         Err(error) => {
@@ -942,9 +1044,17 @@ fn spawn_budget_flush_task(runtime: Arc<AuthRuntime>, knobs: Arc<AuthKnobs>) {
 /// in-memory key table, usage writer, periodic budget flush and retention
 /// purge. The flush and purge tasks read their cadence/window from the shared
 /// [`AuthKnobs`] so a hot reload retunes them with no restart.
+///
+/// `prebuilt_store`: `Some` when the caller already opened the auth database
+/// as part of its own boot sequence (ADR 012 `config_source = "db"`, which
+/// must open the store early to load the dynamic document before `Config` is
+/// even fully known) - reused here instead of opening a second pool onto the
+/// same file. File mode always passes `None`, taking today's own-connect path
+/// byte-for-byte.
 async fn boot_auth_stack(
     config: &Config,
     provider_specs: &mut [lumen_providers::ProviderSpec],
+    prebuilt_store: Option<KeyStore>,
 ) -> anyhow::Result<AuthBoot> {
     use zeroize::Zeroize;
     let mut master_value = std::env::var(MASTER_KEY_ENV).with_context(|| {
@@ -955,9 +1065,12 @@ async fn boot_auth_stack(
     // A live knob cell shared with the flush/purge tasks and swapped on reload.
     let auth_knobs = Arc::new(AuthKnobs::from_config(config));
 
-    let store = KeyStore::connect(&config.auth.db_url())
-        .await
-        .with_context(|| format!("failed to open auth database '{}'", config.auth.db_path))?;
+    let store = match prebuilt_store {
+        Some(store) => store,
+        None => KeyStore::connect(&config.auth.db_url())
+            .await
+            .with_context(|| format!("failed to open auth database '{}'", config.auth.db_path))?,
+    };
 
     // Provider keys stored encrypted in the DB back-fill any provider whose
     // env var is unset (env vars stay the primary source). The snapshot is

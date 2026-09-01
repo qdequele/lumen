@@ -17,6 +17,7 @@ use lumen_auth::crypto::MasterKey;
 use lumen_auth::store::KeyStore;
 use lumen_providers::{http, Registry};
 use lumen_server::config::Config;
+use lumen_server::config_source::ConfigContext;
 use lumen_server::pricing::CostTable;
 use lumen_server::reload::{reload_once, spawn_config_reloader, ProviderKeySource, ReloadTargets};
 use lumen_server::resilience::ResilienceRuntime;
@@ -81,6 +82,12 @@ fn registry_with_key(path: &Path, key: &str) -> Arc<Registry> {
         )
         .expect("registry builds"),
     )
+}
+
+/// A file-mode `ConfigContext` over `path`, for `reload_once` and
+/// `spawn_config_reloader` calls.
+fn ctx(path: &Path) -> Arc<ConfigContext> {
+    Arc::new(ConfigContext::file(path.to_path_buf()))
 }
 
 async fn mount_rerank(upstream: &MockServer) {
@@ -168,7 +175,7 @@ async fn rotating_a_db_provider_key_takes_effect_on_reload_without_restart() {
         webhooks: None,
         auth_runtime: None,
     });
-    reload_once(&path, &targets).await;
+    reload_once(&ctx(&path), &targets).await;
 
     // The next request - through the SAME running gateway - uses the new key.
     send_rerank(&base, &client).await;
@@ -244,7 +251,7 @@ async fn reload_makes_an_offline_group_and_member_key_live_and_group_enforced() 
         webhooks: None,
         auth_runtime: Some(Arc::clone(&runtime)),
     });
-    reload_once(&path, &targets).await;
+    reload_once(&ctx(&path), &targets).await;
 
     // Live now...
     let entry = runtime
@@ -375,8 +382,8 @@ async fn spawn_config_reloader_survives_a_rename_replace_of_a_bare_filename_conf
     let metrics = ReloadMetrics::register(&Metrics::new()).expect("reload metrics");
     let t = reload_targets(Arc::clone(&registry), metrics);
     let trigger = Arc::new(Notify::new());
-    let handle =
-        spawn_config_reloader(PathBuf::from("lumen.toml"), t, trigger).expect("spawn reloader");
+    let handle = spawn_config_reloader(ctx(&PathBuf::from("lumen.toml")), t, trigger)
+        .expect("spawn reloader");
 
     // Give the watcher a moment to be fully armed before the replace.
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -540,7 +547,7 @@ async fn reload_retargets_and_retunes_webhooks_without_dropping_the_queue() {
             "#
         )),
     ));
-    reload_once(&path, &targets).await;
+    reload_once(&ctx(&path), &targets).await;
 
     assert_eq!(
         webhooks.live_settings().expect("still enabled").url,
@@ -565,7 +572,7 @@ async fn reload_retargets_and_retunes_webhooks_without_dropping_the_queue() {
 
     // Removing the block stops detection entirely.
     write(&webhook_config_body(&upstream.uri(), &db, None));
-    reload_once(&path, &targets).await;
+    reload_once(&ctx(&path), &targets).await;
     assert!(
         runtime.keys.signals().is_none(),
         "removing [webhooks] must stop emitting budget events"
@@ -623,7 +630,7 @@ async fn a_stored_webhook_row_wins_over_the_config_block_across_reloads() {
     });
 
     // With no stored row, the file wins.
-    reload_once(&path, &targets).await;
+    reload_once(&ctx(&path), &targets).await;
     assert_eq!(webhooks.source(), SettingsSource::Config);
     assert_eq!(webhooks.live_settings().expect("enabled").url, from_file);
 
@@ -636,7 +643,7 @@ async fn a_stored_webhook_row_wins_over_the_config_block_across_reloads() {
         })
         .await
         .expect("store the webhook config");
-    reload_once(&path, &targets).await;
+    reload_once(&ctx(&path), &targets).await;
     assert_eq!(webhooks.source(), SettingsSource::Database);
     assert_eq!(
         webhooks.live_settings().expect("enabled").url,
@@ -651,7 +658,7 @@ async fn a_stored_webhook_row_wins_over_the_config_block_across_reloads() {
         .disable_webhook_config()
         .await
         .expect("disable the stored config");
-    reload_once(&path, &targets).await;
+    reload_once(&ctx(&path), &targets).await;
     assert_eq!(webhooks.source(), SettingsSource::None);
     assert!(
         webhooks.live_settings().is_none(),
@@ -712,7 +719,7 @@ async fn armed_reloader() -> (
     let metrics = Metrics::new();
     let reload_metrics = ReloadMetrics::register(&metrics).expect("reload metrics");
     let targets = reload_targets(Arc::clone(&registry), reload_metrics);
-    let handle = spawn_config_reloader(config_path.clone(), targets, Arc::new(Notify::new()))
+    let handle = spawn_config_reloader(ctx(&config_path), targets, Arc::new(Notify::new()))
         .expect("spawn reloader");
     // Let the watcher finish arming before anything touches the file.
     tokio::time::sleep(Duration::from_millis(300)).await;
