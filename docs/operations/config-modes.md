@@ -1,8 +1,8 @@
 # Config source modes: file and DB (ADR 012)
 
 The dynamic half of LUMEN's configuration - providers, routing, resilience,
-pricing, tokenizer, telemetry, image fetch, the hot-reloadable `[auth]`
-knobs, and `[webhooks]` - lives in exactly one place at a time: either the
+pricing, tokenizer, image fetch, the two hot-reloadable `[auth]` knobs, and
+`[webhooks]` - lives in exactly one place at a time: either the
 boot TOML file (today's default) or a table in the auth SQLite database. The
 `config_source` boot key picks which. Both modes expose the identical admin
 API, so a client cannot tell which one it is talking to.
@@ -38,20 +38,24 @@ the admin API without a restart.
 
 | Boot layer (restart-only) | Dynamic layer (hot-reloadable, admin-API editable) |
 |---|---|
-| `server.host`, `server.port`, `server.body_limit`, `server.first_token_timeout_ms`, `server.sse_heartbeat_ms` | `[[providers]]` (routing, models, pricing, fallbacks) |
+| `[server]`: `host`, `port`, `body_limit`, `first_token_timeout_ms`, `sse_heartbeat_ms` | `[[providers]]` (routing, models, pricing, fallbacks) |
 | `log_format` | `[resilience]` |
-| `auth.enabled`, `auth.db_path` | `[telemetry]` |
-| `config_source` itself | `[tokenizer]` |
-| | `[image_fetch]` |
-| | `[webhooks]` |
-| | `auth.flush_interval_ms`, `auth.usage_channel_capacity`, `auth.usage_batch_max`, `auth.usage_flush_ms`, `auth.retention_days` |
+| `[telemetry]` (the label allowlist becomes the Prometheus label set, fixed at startup) | `[tokenizer]` |
+| `auth.enabled`, `auth.db_path` | `[image_fetch]` |
+| `auth.usage_channel_capacity`, `auth.usage_batch_max`, `auth.usage_flush_ms` (the usage-log channel is sized at startup) | `[webhooks]` |
+| `config_source` itself | `auth.flush_interval_ms`, `auth.retention_days` |
+
+Every dynamic-layer setting takes effect on the next hot reload, which an
+admin write triggers itself - so everything the admin API accepts is live
+as soon as the call returns.
 
 In **file mode** this split is invisible day to day: the one file holds both
 layers, exactly as before ADR 012. In **db mode** the boot file may hold
-*only* the left-hand column's keys, under `[server]`, `log_format`, and
-`[auth] enabled`/`db_path` (plus the top-level `config_source` key itself).
-Any dynamic-layer key in that file - a `[[providers]]` block, a
-`[resilience]` table, an `[auth]` key outside `enabled`/`db_path` - is a
+*only* the left-hand column's keys: `[server]`, `log_format`,
+`[telemetry]`, the boot-layer `[auth]` keys, and the top-level
+`config_source` key itself. Any dynamic-layer key in that file - a
+`[[providers]]` block, a `[resilience]` table, `auth.flush_interval_ms` or
+`auth.retention_days` - is a
 **boot error** naming the offending key, never a silently-ignored second
 source. The error message tells you the fix: remove the key from the boot
 file, or set `config_source = "file"`.
@@ -59,7 +63,8 @@ file, or set `config_source = "file"`.
 The same split is enforced in the other direction on every admin write, and
 just as strictly: in db mode, `PUT /admin/config` and every granular write
 refuse a candidate that carries **any** boot-layer key at all -
-`server.*`, `log_format`, `config_source`, or `auth.enabled`/`auth.db_path` -
+`server.*`, `log_format`, `telemetry.*`, `config_source`, or a boot-layer
+`[auth]` key -
 independent of what value it names, even one identical to the field's own
 built-in default. A dynamic document may never carry a boot-layer key; the
 only way to change one is to edit the boot file and restart. See
@@ -104,8 +109,8 @@ identically in both modes, and every mutating one requires `If-Match`.
 | `GET` | `/admin/config/providers/{name}` | One provider's full config (its own fields, flattened) plus the document hash. |
 | `PUT` | `/admin/config/providers/{name}` | Create or replace that provider (including its `models`). The path `{name}` must equal the body's own `name` field. |
 | `DELETE` | `/admin/config/providers/{name}` | Remove the provider. |
-| `GET` | `/admin/config/{section}` | One of `resilience`, `telemetry`, `tokenizer`, `image_fetch`, `webhooks`, `auth`. Response: `{"<section>": <value>, "hash": "<current hash>"}`. |
-| `PUT` | `/admin/config/{section}` | Replace that section. `auth` is special - see [The `auth` section](#the-auth-section-five-knobs-only) below. `webhooks` also accepts `null`, which removes the `[webhooks]` block. |
+| `GET` | `/admin/config/{section}` | One of `resilience`, `tokenizer`, `image_fetch`, `webhooks`, `auth` (the dynamic sections; `telemetry` is boot-layer and has no granular route). Response: `{"<section>": <value>, "hash": "<current hash>"}`. |
+| `PUT` | `/admin/config/{section}` | Replace that section. `auth` is special - see [The `auth` section](#the-auth-section-two-knobs-only) below. `webhooks` also accepts `null`, which removes the `[webhooks]` block. |
 
 Two admin surfaces are deliberately **untouched** by any of this:
 `PUT /admin/provider-keys/{name}` (encrypted secrets, see
@@ -137,7 +142,8 @@ curl -s -X PUT http://localhost:8080/admin/config \
   operator's apply landed first, or in file mode a human edited the file
   directly) is `412` `LM-1004`. Re-`GET` and re-apply.
 - **A candidate that changes a boot-layer key** (`server.*`, `log_format`,
-  `auth.enabled`, `auth.db_path`, `config_source` itself) is `400`
+  `telemetry.*`, `auth.enabled`, `auth.db_path`, the usage-log channel
+  knobs, `config_source` itself) is `400`
   `LM-1001`, naming the changed key(s): `"restart-only keys changed:
   server.port; edit the boot config file and restart"`. In file mode an
   *unchanged* boot-layer block still passes, since the candidate there is
@@ -185,15 +191,16 @@ validation pass every other write goes through. Fetching an unknown
 provider name or an unknown `{section}` is `404` `LM-1003`, the same style
 every other per-entity admin lookup in LUMEN uses.
 
-### The `auth` section: five knobs only
+### The `auth` section: two knobs only
 
-`GET`/`PUT /admin/config/auth` covers exactly the five dynamic `[auth]`
-knobs - `flush_interval_ms`, `usage_channel_capacity`, `usage_batch_max`,
-`usage_flush_ms`, `retention_days` - never `enabled` or `db_path`, which are
-boot-layer. A `PUT` body naming either of those two is rejected `400`
+`GET`/`PUT /admin/config/auth` covers exactly the two dynamic `[auth]`
+knobs - `flush_interval_ms` and `retention_days`, which the background
+tasks read live - never `enabled`, `db_path` or the usage-log channel knobs
+(`usage_channel_capacity`, `usage_batch_max`, `usage_flush_ms`), which are
+boot-layer. A `PUT` body naming any of those is rejected `400`
 (`deny_unknown_fields` on the request type), not silently ignored. Unlike
 every other section, which the write replaces wholesale, `auth` merges
-field-by-field into the existing `[auth]` table, so `enabled`/`db_path`
+field-by-field into the existing `[auth]` table, so the boot-layer keys
 survive untouched even though the request body never mentions them:
 
 ```bash
@@ -201,7 +208,7 @@ curl -s -X PUT http://localhost:8080/admin/config/auth \
   -H "Authorization: Bearer $LUMEN_MASTER_KEY" \
   -H 'If-Match: "b1946ac9..."' \
   -H 'content-type: application/json' \
-  -d '{"flush_interval_ms": 5000, "usage_channel_capacity": 10000, "usage_batch_max": 500, "usage_flush_ms": 2000, "retention_days": 30}'
+  -d '{"flush_interval_ms": 5000, "retention_days": 30}'
 ```
 
 ## DB-mode storage and retention
@@ -239,18 +246,18 @@ requires a restart, since `config_source` is itself boot-layer.
    dynamic layer together, see the admin API table above) - it still needs
    step 4 below before it is a valid db-mode candidate.
 2. Edit the boot TOML: set `config_source = "db"`, and strip every
-   dynamic-layer key (`[[providers]]`, `[resilience]`, `[telemetry]`,
-   `[tokenizer]`, `[image_fetch]`, `[webhooks]`, and every `[auth]` key
-   except `enabled`/`db_path`) - the boot file must contain only boot-layer
-   keys once db mode is selected. Confirm `auth.enabled = true`.
+   dynamic-layer key (`[[providers]]`, `[resilience]`, `[tokenizer]`,
+   `[image_fetch]`, `[webhooks]`, and `auth.flush_interval_ms` /
+   `auth.retention_days`) - the boot file must contain only boot-layer keys
+   once db mode is selected. Confirm `auth.enabled = true`.
 3. Restart. The process boots with an empty stored document (first boot in
    db mode, see above) - `/health` is healthy, `/v1/*` answers `LM-2001`
    until the next step.
 4. Before the `PUT`, strip every boot-layer key from the document saved in
-   step 1: `[server]`, `log_format`, `config_source`, and `auth.enabled`/
-   `auth.db_path` (keep the five dynamic `[auth]` knobs - `flush_interval_ms`,
-   `usage_channel_capacity`, `usage_batch_max`, `usage_flush_ms`,
-   `retention_days` - if the file set any of them). The saved document is
+   step 1: `[server]`, `log_format`, `[telemetry]`, `config_source`, and the
+   boot-layer `[auth]` keys (`enabled`, `db_path`, `usage_channel_capacity`,
+   `usage_batch_max`, `usage_flush_ms`). Keep `auth.flush_interval_ms` and
+   `auth.retention_days` if the file set them. The saved document is
    the file-mode `GET`'s WHOLE file, and the db-mode boot-layer guard (see
    [If-Match and the boot-layer guard](#if-match-and-the-boot-layer-guard))
    now refuses a candidate carrying any boot-layer key unconditionally, even
@@ -266,8 +273,8 @@ requires a restart, since `config_source` is itself boot-layer.
    response's `config` field (`jq -r .config`, as in the file-to-DB step 1) -
    the dynamic document alone, no boot keys.
 2. Merge it with the boot-layer keys the process is currently running with
-   (`[server]`, `log_format`, `[auth] enabled`/`db_path`) into one TOML
-   file.
+   (`[server]`, `log_format`, `[telemetry]`, and the boot-layer `[auth]`
+   keys) into one TOML file.
 3. Set `config_source = "file"` (or remove the key - `"file"` is the
    default) in that same file.
 4. Point `--config` (or the existing config path) at the merged file and

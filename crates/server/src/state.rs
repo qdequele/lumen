@@ -70,8 +70,10 @@ pub struct AppState {
     /// Configured max request body size in bytes (for the `LM-1002` message).
     pub body_limit: usize,
     /// Guarded image-fetch policy for multimodal embeddings (M9). Default:
-    /// disabled (a remote image URL yields `LM-2005`).
-    pub image_fetch: Arc<ImageFetchPolicy>,
+    /// disabled (a remote image URL yields `LM-2005`). Hot-swapped by config
+    /// reload; take a per-request snapshot via
+    /// [`image_fetch`](AppState::image_fetch).
+    pub image_fetch: Arc<ArcSwap<ImageFetchPolicy>>,
     /// Hot-reload trigger; `Some` when the config reloader is armed. The admin
     /// API pings it after storing a provider key so the rotation is applied
     /// without a restart (the reloader re-reads the key from the DB). `None` =
@@ -102,8 +104,10 @@ pub struct AppState {
     pub config_apply_lock: Arc<tokio::sync::Mutex<()>>,
     /// Local token-estimation strategy (ADR 003). Default: the byte heuristic;
     /// `accurate` mode holds pre-built BPE encoders. Shared, never rebuilt on
-    /// the request path.
-    pub token_counter: Arc<TokenCounter>,
+    /// the request path: a config reload that changes `[tokenizer] mode`
+    /// builds the new counter off it and swaps it in. Take a per-request
+    /// snapshot via [`token_counter`](AppState::token_counter).
+    pub token_counter: Arc<ArcSwap<TokenCounter>>,
     /// Outbound budget-webhook control surface (ADR 011); `Some` whenever auth
     /// is enabled, whether or not webhooks are currently on. The `/admin`
     /// webhook routes read and reconfigure the delivery pipeline through it.
@@ -137,11 +141,11 @@ impl AppState {
             // Matches `config::default_body_limit()`; overridden via
             // `with_body_limit` once the real config is known (main.rs boot).
             body_limit: 10 * 1024 * 1024,
-            image_fetch: Arc::new(ImageFetchPolicy::default()),
+            image_fetch: Arc::new(ArcSwap::from_pointee(ImageFetchPolicy::default())),
             reload_trigger: None,
             config: None,
             config_apply_lock: Arc::new(tokio::sync::Mutex::new(())),
-            token_counter: Arc::new(TokenCounter::Heuristic),
+            token_counter: Arc::new(ArcSwap::from_pointee(TokenCounter::Heuristic)),
             webhooks: None,
         }
     }
@@ -156,15 +160,43 @@ impl AppState {
     /// Attach the token counter (builder style). Default is the byte heuristic.
     #[must_use]
     pub fn with_token_counter(mut self, token_counter: Arc<TokenCounter>) -> Self {
-        self.token_counter = token_counter;
+        self.token_counter = Arc::new(ArcSwap::new(token_counter));
         self
+    }
+
+    /// Share an existing token-counter cell (builder style), so the config
+    /// reloader swaps the very counter this state serves requests with.
+    #[must_use]
+    pub fn with_token_counter_cell(mut self, cell: Arc<ArcSwap<TokenCounter>>) -> Self {
+        self.token_counter = cell;
+        self
+    }
+
+    /// The current token counter, snapshotted for one request.
+    #[must_use]
+    pub fn token_counter(&self) -> Arc<TokenCounter> {
+        self.token_counter.load_full()
     }
 
     /// Attach the guarded image-fetch policy (builder style).
     #[must_use]
     pub fn with_image_fetch(mut self, policy: Arc<ImageFetchPolicy>) -> Self {
-        self.image_fetch = policy;
+        self.image_fetch = Arc::new(ArcSwap::new(policy));
         self
+    }
+
+    /// Share an existing image-fetch policy cell (builder style), so the
+    /// config reloader swaps the very policy this state serves requests with.
+    #[must_use]
+    pub fn with_image_fetch_cell(mut self, cell: Arc<ArcSwap<ImageFetchPolicy>>) -> Self {
+        self.image_fetch = cell;
+        self
+    }
+
+    /// The current image-fetch policy, snapshotted for one request.
+    #[must_use]
+    pub fn image_fetch(&self) -> Arc<ImageFetchPolicy> {
+        self.image_fetch.load_full()
     }
 
     /// Attach the hot-reload trigger (builder style) so the admin API can

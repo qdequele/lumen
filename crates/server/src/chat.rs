@@ -29,7 +29,6 @@
 //!   don't reap a slow upstream.
 
 use std::convert::Infallible;
-use std::sync::Arc;
 
 use axum::body::Body;
 use axum::extract::rejection::JsonRejection;
@@ -385,7 +384,7 @@ fn settle_non_streaming(
         completion_tokens_details: None,
     });
 
-    if ctx.state.token_counter.refines(client_model) {
+    if ctx.state.token_counter().refines(client_model) {
         defer_chat_refinement(
             ctx,
             accounting,
@@ -424,7 +423,7 @@ fn defer_chat_refinement(
     response: &lumen_core::ChatResponse,
 ) {
     accounting.mark_completed();
-    let counter = Arc::clone(&ctx.state.token_counter);
+    let counter = ctx.state.token_counter();
     let model = client_model.to_owned();
     let message_texts: Vec<String> = ctx
         .req

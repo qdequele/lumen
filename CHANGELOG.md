@@ -101,6 +101,21 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ### Fixed
 
+- **Every setting the admin config API accepts now applies live** (ADR 012).
+  `[tokenizer]` and `[image_fetch]` were saved by an admin write but only
+  took effect after a restart; a hot reload now swaps both (the tokenizer is
+  rebuilt only when its mode changes). `[telemetry]` and the usage-log
+  channel knobs (`usage_channel_capacity`, `usage_batch_max`,
+  `usage_flush_ms`) cannot change while running (the metric label set and
+  the channel are fixed at startup), so they are now boot-layer: the admin
+  API refuses to change them (`400` `LM-1001`) instead of accepting a value
+  that never applied, `/admin/config/telemetry` is gone, and
+  `/admin/config/auth` covers only `flush_interval_ms` and `retention_days`.
+  In db mode these keys now live in the boot file.
+- **Docs brought in line with the code**: the config and deployment guides
+  now cover db mode, `metrics.md` lists `lumen_token_breakdown_total`, and a
+  shipped backlog item is marked resolved.
+
 - **Config source review fixes** (ADR 012). The db-mode config write
   (`config_versions` compare-and-swap) now runs in a `BEGIN IMMEDIATE`
   transaction: the default deferred transaction failed with "database is

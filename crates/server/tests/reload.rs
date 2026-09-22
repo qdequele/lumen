@@ -174,6 +174,8 @@ async fn rotating_a_db_provider_key_takes_effect_on_reload_without_restart() {
         auth_knobs: None,
         webhooks: None,
         auth_runtime: None,
+        image_fetch: None,
+        token_counter: None,
     });
     reload_once(&ctx(&path), &targets).await;
 
@@ -250,6 +252,8 @@ async fn reload_makes_an_offline_group_and_member_key_live_and_group_enforced() 
         auth_knobs: None,
         webhooks: None,
         auth_runtime: Some(Arc::clone(&runtime)),
+        image_fetch: None,
+        token_counter: None,
     });
     reload_once(&ctx(&path), &targets).await;
 
@@ -317,6 +321,8 @@ fn reload_targets(registry: Arc<Registry>, metrics: ReloadMetrics) -> ReloadTarg
         auth_knobs: None,
         webhooks: None,
         auth_runtime: None,
+        image_fetch: None,
+        token_counter: None,
     }
 }
 
@@ -532,6 +538,8 @@ async fn reload_retargets_and_retunes_webhooks_without_dropping_the_queue() {
         auth_knobs: None,
         webhooks: Some(Arc::clone(&webhooks)),
         auth_runtime: Some(Arc::clone(&runtime)),
+        image_fetch: None,
+        token_counter: None,
     });
 
     // Reload with a new URL and a new event/threshold set.
@@ -627,6 +635,8 @@ async fn a_stored_webhook_row_wins_over_the_config_block_across_reloads() {
         auth_knobs: None,
         webhooks: Some(Arc::clone(&webhooks)),
         auth_runtime: Some(Arc::clone(&runtime)),
+        image_fetch: None,
+        token_counter: None,
     });
 
     // With no stored row, the file wins.

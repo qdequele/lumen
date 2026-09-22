@@ -28,10 +28,15 @@ the config file; the file stays authoritative), PostgreSQL `ALTER SYSTEM`
 ### 1. Boot layer vs dynamic layer, chosen at boot
 
 The config schema splits logically (no file-format change): a restart-only
-boot layer (server bind, log format, auth enabled/DB path, and a new
-`config_source = "file" | "db"` key, default `"file"`; the master key is
-read from the fixed `LUMEN_MASTER_KEY` variable, never from config) and the
-hot-reloadable dynamic layer (everything else). In file mode one TOML holds
+boot layer (`[server]`, log format, `[telemetry]`, auth enabled/DB path,
+the usage-log channel knobs, and a new `config_source = "file" | "db"`
+key, default `"file"`; the master key is read from the fixed
+`LUMEN_MASTER_KEY` variable, never from config) and the hot-reloadable
+dynamic layer (everything else). The rule for the split is what a reload
+can actually swap: `[telemetry]` becomes the Prometheus label set when the
+metrics are registered and the usage-log channel is sized at startup, so
+both are boot-layer; the tokenizer and image-fetch policy are rebuilt and
+swapped by the reload, so they are dynamic. In file mode one TOML holds
 both layers, exactly as today. In DB mode the boot TOML may contain only
 boot keys; a dynamic key present there is a boot error, never a silently
 ignored second source. `config_source = "db"` requires auth with a

@@ -126,9 +126,9 @@ pub async fn rerank_handler(
     // exact BPE on the blocking pool - the response is never delayed, only
     // usage_log/Prometheus gain precision. In practice rerank model ids rarely
     // match an OpenAI tiktoken family, so this refinement is usually a no-op.
-    if tokens_in_estimated && state.token_counter.refines(&executed.model_used) {
+    if tokens_in_estimated && state.token_counter().refines(&executed.model_used) {
         accounting.mark_completed();
-        let counter = std::sync::Arc::clone(&state.token_counter);
+        let counter = state.token_counter();
         let model = executed.model_used.clone();
         let query = req.query.clone();
         let docs: Vec<String> = req.documents.iter().map(|d| d.text().to_owned()).collect();

@@ -15,6 +15,8 @@
 //!   state preserved;
 //! - the safe **auth knobs** ([`AuthKnobs`]: budget-flush cadence and usage-log
 //!   retention window), read live by the background tasks on their next tick;
+//! - the **image-fetch policy** (`[image_fetch]`) and the **tokenizer**
+//!   (`[tokenizer]`; rebuilt only when its mode changes), read per request;
 //! - the **virtual-key table**, re-synced from the auth DB so keys created
 //!   offline (e.g. `lumen keys create`) become live without a restart;
 //!   existing entries keep their in-memory spend (memory stays the source of
@@ -36,7 +38,10 @@
 //! `docs/backlog.md`): the server bind address (rebinding a live listener is
 //! high-risk and out of scope), `auth.enabled`, `auth.db_path`, the bounded
 //! usage-log channel knobs (`usage_channel_capacity`, `usage_batch_max`,
-//! `usage_flush_ms`) whose capacity is structurally fixed at channel creation.
+//! `usage_flush_ms`) whose capacity is structurally fixed at channel creation,
+//! and `[telemetry]` (its metadata label allowlist becomes the Prometheus
+//! label set, fixed when the metrics are registered). All of these are
+//! boot-layer (ADR 012), so the admin API refuses to change them.
 //!
 //! Webhooks have no restart-only field left: with auth enabled the
 //! [`WebhookController`] exists whether or not a `[webhooks]` block does, and
@@ -65,14 +70,16 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use lumen_auth::crypto::MasterKey;
 use lumen_auth::store::KeyStore;
+use lumen_providers::image_fetch::ImageFetchPolicy;
 use lumen_providers::{Registry, RegistryError};
 use lumen_telemetry::ReloadMetrics;
 use tokio::sync::Notify;
 
-use crate::config::{Config, ConfigError};
+use crate::config::{Config, ConfigError, TokenizerMode};
 use crate::config_source::ConfigContext;
 use crate::pricing::CostTable;
 use crate::resilience::ResilienceRuntime;
+use crate::tokenizer::TokenCounter;
 use crate::webhooks::WebhookController;
 
 /// Why a reload was rejected. The previous config is always kept on error.
@@ -194,10 +201,20 @@ pub struct ReloadTargets {
     /// without a restart; existing entries only have their limits re-applied
     /// and keep their in-memory spend.
     pub auth_runtime: Option<Arc<crate::auth::AuthRuntime>>,
+    /// The image-fetch policy cell the embeddings handler reads
+    /// ([`AppState::image_fetch`](crate::AppState::image_fetch)); a reload
+    /// swaps in the policy built from the new `[image_fetch]` section.
+    pub image_fetch: Option<Arc<ArcSwap<ImageFetchPolicy>>>,
+    /// The token-counter cell every handler reads
+    /// ([`AppState::token_counter`](crate::AppState::token_counter)); a
+    /// reload rebuilds it only when `[tokenizer] mode` changed, since
+    /// `accurate` mode loads BPE encoders.
+    pub token_counter: Option<Arc<ArcSwap<TokenCounter>>>,
 }
 
-/// Atomically swap the routing table, price table, resilience policy and
-/// auth knobs from an already loaded-and-validated `config`. Increments the
+/// Atomically swap the routing table, price table, resilience policy, auth
+/// knobs, image-fetch policy and tokenizer from an already
+/// loaded-and-validated `config`. Increments the
 /// success/failure counters. On any error every target is left exactly as it
 /// was (the fallible registry rebuild runs first, before any swap).
 ///
@@ -237,11 +254,21 @@ pub fn apply_reload(config: &Config, targets: &ReloadTargets) -> Result<(), Relo
         knobs.store_from_config(config);
     }
     apply_webhook_reload(config, targets);
+    if let Some(cell) = &targets.image_fetch {
+        cell.store(Arc::new(config.image_fetch.to_policy()));
+    }
+    if let Some(cell) = &targets.token_counter {
+        let wants_accurate = config.tokenizer.mode == TokenizerMode::Accurate;
+        if cell.load().is_accurate() != wants_accurate {
+            cell.store(Arc::new(TokenCounter::from_config(&config.tokenizer)));
+        }
+    }
     targets.metrics.inc_success();
     tracing::info!(
         model_count = config.loaded_models().len(),
         provider_count = config.providers.len(),
-        "configuration reloaded; routing table, pricing, resilience policy and auth knobs swapped"
+        "configuration reloaded; routing table, pricing, resilience policy, auth knobs, \
+         image-fetch policy and tokenizer swapped"
     );
     Ok(())
 }
@@ -660,6 +687,8 @@ mod tests {
             auth_knobs: None,
             webhooks: None,
             auth_runtime: None,
+            image_fetch: None,
+            token_counter: None,
         }
     }
 
@@ -679,6 +708,48 @@ mod tests {
         // The new model is now routable - the swap took effect.
         assert!(registry.embedding_route("embed").is_some());
         assert!(registry.knows_model("gpt"));
+    }
+
+    #[test]
+    fn valid_reload_swaps_image_fetch_policy_and_tokenizer() {
+        use crate::config::TokenizerConfig;
+        let dir = tempdir();
+        let path = write_config(&dir, ONE_MODEL);
+        let registry = registry_from(&path);
+        let boot = load(&path);
+        let image_fetch = Arc::new(ArcSwap::from_pointee(boot.image_fetch.to_policy()));
+        let token_counter = Arc::new(ArcSwap::from_pointee(TokenCounter::from_config(
+            &TokenizerConfig::default(),
+        )));
+        let mut t = targets(
+            Arc::clone(&registry),
+            ReloadMetrics::register(&Metrics::new()).unwrap(),
+        );
+        t.image_fetch = Some(Arc::clone(&image_fetch));
+        t.token_counter = Some(Arc::clone(&token_counter));
+        assert!(!image_fetch.load().enabled);
+        assert!(!token_counter.load().is_accurate());
+
+        write_config(
+            &dir,
+            &format!(
+                "{ONE_MODEL}\n[image_fetch]\nenabled = true\n[tokenizer]\nmode = \"accurate\"\n"
+            ),
+        );
+        apply_reload(&load(&path), &t).expect("valid reload");
+        assert!(
+            image_fetch.load().enabled,
+            "image-fetch policy must swap on reload"
+        );
+        assert!(
+            token_counter.load().is_accurate(),
+            "tokenizer must swap on reload"
+        );
+
+        // An unchanged mode keeps the very same counter (no BPE rebuild).
+        let before = token_counter.load_full();
+        apply_reload(&load(&path), &t).expect("valid reload");
+        assert!(Arc::ptr_eq(&before, &token_counter.load_full()));
     }
 
     #[test]
@@ -839,6 +910,8 @@ mod tests {
             auth_knobs: None,
             webhooks: None,
             auth_runtime: None,
+            image_fetch: None,
+            token_counter: None,
         });
 
         // Rotate the DB key, then run one reload through the real entry point.

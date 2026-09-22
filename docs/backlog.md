@@ -440,8 +440,9 @@ milestone.
   see the note above under "M8 (vision - image input to chat)"). The remaining
   gap is a true dimension-based tile count, which needs image decoding this
   gateway deliberately does not do on the request path.
-- **Provider-native image URI forms.** Anthropic/Gemini file & GCS URI image
-  sources (beyond inline base64 + remote URL) are not modelled.
+- ~~**Provider-native image URI forms.** Anthropic/Gemini file & GCS URI image
+  sources (beyond inline base64 + remote URL) are not modelled.~~ **Resolved
+  (issue #12, 0.2.0).** See [Providers](providers.md) and `LM-2008`.
 - **Tool-role messages with image parts are silently flattened** (noted while
   fixing issue #73). The Cohere translator gates its v2 image blocks on the
   user role (Cohere's `ToolMessageV2` cannot carry images), so an image part

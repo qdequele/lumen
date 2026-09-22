@@ -56,8 +56,9 @@
 //!   (ADR 010, ADR 012). Requires an `If-Match` header carrying the current
 //!   hash from `GET /admin/config`; a missing header is a 400 (`LM-1001`), a
 //!   stale hash a 412 (`LM-1004`). The candidate's boot-layer fields
-//!   (`server.*`, `log_format`, `auth.enabled`, `auth.db_path`,
-//!   `config_source`) are compared against the current document's first
+//!   (`server.*`, `log_format`, `telemetry.*`, `auth.enabled`,
+//!   `auth.db_path`, the usage-log channel knobs, `config_source`) are
+//!   compared against the current document's first
 //!   ([`boot_layer_diff`](crate::config::boot_layer_diff)): any difference is
 //!   a 400 (`LM-1001`) naming the changed keys, since a boot-layer value only
 //!   takes effect on a restart and this route applies everything it accepts
@@ -1132,8 +1133,7 @@ const fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
 
 use crate::config::{
     boot_layer_diff, ensure_dynamic_only, AuthDynamicKnobs, Config, ConfigError, ConfigSourceKind,
-    ImageFetchConfig, ProviderConfig, ResilienceConfig, TelemetryConfig, TokenizerConfig,
-    WebhooksConfig,
+    ImageFetchConfig, ProviderConfig, ResilienceConfig, TokenizerConfig, WebhooksConfig,
 };
 use crate::config_edit;
 use crate::config_source::{ConfigContext, ConfigLoadError, ConfigSourceError};
@@ -1234,8 +1234,10 @@ fn require_if_match(headers: &axum::http::HeaderMap) -> Result<String, ApiError>
 /// 2. Diff the current and candidate documents' boot-layer fields
 ///    ([`boot_layer_diff`]): any difference is `LM-1001` (400) naming the
 ///    changed keys. A boot-layer value (`server.*`, `log_format`,
-///    `auth.enabled`, `auth.db_path`, `config_source`) only takes effect on a
-///    restart, and this route applies everything it accepts immediately.
+///    `telemetry.*`, `auth.enabled`, `auth.db_path`, the usage-log channel
+///    knobs, `config_source`) only takes effect on a restart, and this route
+///    applies everything it accepts immediately (the hot reload swaps every
+///    dynamic-layer section).
 ///    File mode: the candidate is the whole document, so an UNCHANGED
 ///    boot-layer block passes and only an actual edit is refused.
 /// 3. DB mode only: reject any boot-layer key the candidate carries at all
@@ -1664,11 +1666,11 @@ pub async fn delete_provider(
 
 /// Extract the JSON value of one scalar config section from a parsed
 /// [`Config`]. `None` for a name outside the fixed set `GET|PUT
-/// /admin/config/{section}` serves (`resilience`, `telemetry`, `tokenizer`,
+/// /admin/config/{section}` serves (`resilience`, `tokenizer`,
 /// `image_fetch`, `webhooks`, `auth`) - the caller maps that to `LM-1003`
-/// (404). `auth` reports [`AuthDynamicKnobs`] - the 5
-/// dynamic knobs only, never `enabled`/`db_path` - derived from
-/// `cfg.auth`.
+/// (404). `auth` reports [`AuthDynamicKnobs`] - the 2 dynamic knobs only,
+/// never a boot-layer `[auth]` key - derived from `cfg.auth`. `telemetry` is
+/// not served: it is wholly boot-layer.
 ///
 /// `webhooks` alone can render `null`: `Config.webhooks` is `Option<..>`
 /// (absent by default, ADR 011), unlike every other section here, which
@@ -1680,7 +1682,6 @@ fn section_json(
 ) -> Option<Result<serde_json::Value, serde_json::Error>> {
     Some(match section {
         "resilience" => serde_json::to_value(cfg.resilience),
-        "telemetry" => serde_json::to_value(&cfg.telemetry),
         "tokenizer" => serde_json::to_value(cfg.tokenizer),
         "image_fetch" => serde_json::to_value(&cfg.image_fetch),
         "webhooks" => serde_json::to_value(&cfg.webhooks),
@@ -1690,7 +1691,7 @@ fn section_json(
 }
 
 /// `GET /admin/config/{section}` for the fixed set of scalar sections
-/// (`resilience`, `telemetry`, `tokenizer`, `image_fetch`, `webhooks`,
+/// (`resilience`, `tokenizer`, `image_fetch`, `webhooks`,
 /// `auth`): the section's current value plus the document hash, keyed by the
 /// section's own name, e.g. `{"tokenizer": {"mode": "heuristic"}, "hash":
 /// "..."}`.
@@ -1757,9 +1758,10 @@ where
 
 /// `PUT /admin/config/{section}` for the same fixed set [`get_config_section`]
 /// serves. The body is that section's own type - its `deny_unknown_fields`
-/// polices its fields, so an `auth` body can carry only the 5 dynamic knobs
-/// ([`AuthDynamicKnobs`]): a body naming `enabled` or `db_path` (boot-layer,
-/// restart-only) is rejected 400, never silently ignored.
+/// polices its fields, so an `auth` body can carry only the 2 dynamic knobs
+/// ([`AuthDynamicKnobs`]): a body naming any boot-layer `[auth]` key
+/// (`enabled`, `db_path`, or a usage-log channel knob; restart-only) is
+/// rejected 400, never silently ignored.
 ///
 /// `auth` applies via [`config_edit::replace_auth_knobs`] - a field-level
 /// merge into the existing `[auth]` table, so `enabled`/`db_path` survive
@@ -1780,7 +1782,6 @@ pub async fn put_config_section(
 
     let edit: ConfigEdit = match section.as_str() {
         "resilience" => replace_section_edit::<ResilienceConfig>(&section, &body)?,
-        "telemetry" => replace_section_edit::<TelemetryConfig>(&section, &body)?,
         "tokenizer" => replace_section_edit::<TokenizerConfig>(&section, &body)?,
         "image_fetch" => replace_section_edit::<ImageFetchConfig>(&section, &body)?,
         "webhooks" => {

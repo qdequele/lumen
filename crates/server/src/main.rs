@@ -682,9 +682,10 @@ fn run(config_path: PathBuf) -> anyhow::Result<()> {
         )
         .await?;
 
-        // Config hot reload (M7 §7.3): SIGHUP / file change / admin trigger swaps
-        // routing, pricing, resilience and auth knobs and re-reads DB provider
-        // keys (rotation without restart). See `reload` module docs.
+        // Config hot reload (M7 §7.3; scope in the `reload` module docs). The
+        // cells below are shared with `AppState` so a swap reaches handlers.
+        let image_fetch = Arc::new(ArcSwap::new(build_image_fetch_policy(&config)));
+        let token_counter = Arc::new(ArcSwap::new(build_token_counter(&config)));
         let reload_trigger = Arc::new(tokio::sync::Notify::new());
         let reload_targets = ReloadTargets {
             registry: Arc::clone(&registry),
@@ -696,6 +697,8 @@ fn run(config_path: PathBuf) -> anyhow::Result<()> {
             auth_knobs,
             webhooks: webhooks.clone(),
             auth_runtime: auth_runtime.clone(),
+            image_fetch: Some(Arc::clone(&image_fetch)),
+            token_counter: Some(Arc::clone(&token_counter)),
         };
         // Cloned before the move into `arm_config_reload`: the admin config
         // routes read and write through the same context the reloader
@@ -706,28 +709,23 @@ fn run(config_path: PathBuf) -> anyhow::Result<()> {
 
         let health = boot_health(&config, &client, &resilience_metrics);
 
-        let mut state = AppState::new(metrics, registry, tokens, latency)
+        let state = AppState::new(metrics, registry, tokens, latency)
             .with_guards(guards)
             .with_pricing_cell(pricing)
             .with_resilience(resilience)
             .with_health(health)
             .with_body_limit(config.server.body_limit)
-            .with_image_fetch(build_image_fetch_policy(&config))
-            .with_token_counter(build_token_counter(&config))
+            .with_image_fetch_cell(image_fetch)
+            .with_token_counter_cell(token_counter)
             .with_config_context(ctx_for_state);
         // Expose the reload trigger only when the reloader is actually armed.
-        if reload_armed {
-            state = state.with_reload_trigger(Arc::clone(&reload_trigger));
-        }
-        if let Some(runtime) = auth_runtime.clone() {
-            state = state.with_auth(runtime);
-        }
-        if let Some(logger) = usage_logger {
-            state = state.with_usage(logger);
-        }
-        if let Some(controller) = webhooks {
-            state = state.with_webhooks(controller);
-        }
+        let state = attach_optional(
+            state,
+            reload_armed.then(|| Arc::clone(&reload_trigger)),
+            auth_runtime.clone(),
+            usage_logger,
+            webhooks,
+        );
         let app = build_app(state);
 
         lifecycle::serve(listener, app, DRAIN_TIMEOUT, lifecycle::shutdown_signal())
@@ -744,6 +742,31 @@ fn run(config_path: PathBuf) -> anyhow::Result<()> {
         tracing::info!("shutdown complete");
         Ok(())
     })
+}
+
+/// Attach the subsystems that exist only in some deployments: the reload
+/// trigger (only when the reloader is armed), and the auth runtime, usage log
+/// and webhook controller (only when auth is enabled).
+fn attach_optional(
+    mut state: AppState,
+    reload_trigger: Option<Arc<tokio::sync::Notify>>,
+    auth_runtime: Option<Arc<AuthRuntime>>,
+    usage_logger: Option<lumen_auth::usage::UsageLogger>,
+    webhooks: Option<Arc<WebhookController>>,
+) -> AppState {
+    if let Some(trigger) = reload_trigger {
+        state = state.with_reload_trigger(trigger);
+    }
+    if let Some(runtime) = auth_runtime {
+        state = state.with_auth(runtime);
+    }
+    if let Some(logger) = usage_logger {
+        state = state.with_usage(logger);
+    }
+    if let Some(controller) = webhooks {
+        state = state.with_webhooks(controller);
+    }
+    state
 }
 
 /// Clean-shutdown drain: a final budget flush (so a clean shutdown loses zero

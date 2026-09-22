@@ -24,15 +24,17 @@ use std::path::Path;
 /// Top-level gateway configuration.
 ///
 /// Every field belongs to exactly one of two layers (ADR 012): the
-/// restart-only **boot layer** (server bind, log format, `auth.enabled` /
-/// `auth.db_path`, and `config_source` itself - see [`BootView`]) or the
-/// hot-reloadable **dynamic layer** (everything else). The classification is
+/// restart-only **boot layer** (`[server]`, log format, `[telemetry]`,
+/// `auth.enabled` / `auth.db_path`, the three usage-log channel knobs, and
+/// `config_source` itself - see [`BootView`]) or the hot-reloadable
+/// **dynamic layer** (everything else). The classification is
 /// exhaustive and pinned by a test (`every_config_field_is_classified_boot_or_dynamic`
 /// in this module's `#[cfg(test)]`): a new top-level field must be added to
 /// [`BootView`] and the key classifier behind [`ensure_boot_only`] /
 /// [`ensure_dynamic_only`] (if boot) or left out of both (if dynamic), or
-/// that test fails. A new `[server]` field needs nothing: all of `server` is
-/// boot-layer and [`boot_layer_diff`] compares it field by field.
+/// that test fails. A new `[server]` or `[telemetry]` field needs nothing:
+/// both tables are wholly boot-layer and [`boot_layer_diff`] compares them
+/// field by field.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -46,11 +48,16 @@ pub struct Config {
     #[serde(default)]
     pub log_format: LogFormatConfig,
     /// Virtual keys, budgets and usage logging (M5). Disabled by default.
-    /// `enabled` and `db_path` are boot layer (a database connection cannot
-    /// be swapped without a restart); every other `[auth]` knob is dynamic.
+    /// `enabled`, `db_path` and the three usage-log channel knobs
+    /// (`usage_channel_capacity`, `usage_batch_max`, `usage_flush_ms`) are
+    /// boot layer: a database connection and a bounded channel cannot be
+    /// swapped without a restart. `flush_interval_ms` and `retention_days`
+    /// are dynamic.
     #[serde(default)]
     pub auth: AuthConfig,
-    /// Telemetry knobs (metadata label allowlist, ADR 002). Dynamic layer.
+    /// Telemetry knobs (metadata label allowlist, ADR 002). Boot layer: the
+    /// allowlist becomes the Prometheus label set, fixed when the metrics are
+    /// registered at startup.
     #[serde(default)]
     pub telemetry: TelemetryConfig,
     /// Resilience knobs: retries, circuit breaker, timeouts, health checks (M6).
@@ -244,13 +251,15 @@ pub struct AuthConfig {
     /// never allow a budget overrun (enforcement is in memory).
     #[serde(default = "default_flush_interval_ms")]
     pub flush_interval_ms: u64,
-    /// Bounded usage-log channel capacity.
+    /// Bounded usage-log channel capacity. Boot layer (restart-only).
     #[serde(default = "default_usage_channel_capacity")]
     pub usage_channel_capacity: usize,
-    /// Usage-log batch size that triggers an immediate write.
+    /// Usage-log batch size that triggers an immediate write. Boot layer
+    /// (restart-only).
     #[serde(default = "default_usage_batch_max")]
     pub usage_batch_max: usize,
     /// Maximum time a pending usage batch waits before being written, ms.
+    /// Boot layer (restart-only).
     #[serde(default = "default_usage_flush_ms")]
     pub usage_flush_ms: u64,
     /// Usage-log retention in days (purged by a background task).
@@ -280,31 +289,23 @@ impl Default for AuthConfig {
     }
 }
 
-/// The 5 hot-reloadable `[auth]` knobs (ADR 012 Task 8): every [`AuthConfig`]
-/// field EXCEPT `enabled` and `db_path`, which are boot layer (a database
-/// connection cannot be swapped without a restart) and so are absent from
-/// this type entirely - `deny_unknown_fields` rejects a `PUT
-/// /admin/config/auth` body naming either, rather than silently ignoring it.
+/// The two hot-reloadable `[auth]` knobs: `flush_interval_ms` and
+/// `retention_days`, which the background tasks read live on every tick.
+/// Every other [`AuthConfig`] field is boot layer (`enabled`, `db_path`, and
+/// the usage-log channel's `usage_channel_capacity`, `usage_batch_max`,
+/// `usage_flush_ms`, all fixed at startup) and so is absent from this type
+/// entirely - `deny_unknown_fields` rejects a `PUT /admin/config/auth` body
+/// naming any of them, rather than accepting a value that would not apply.
 /// Used only as the request/response shape for that granular endpoint; the
 /// document itself still stores these fields inside the single `[auth]`
-/// table alongside `enabled`/`db_path` (see
-/// [`crate::config_edit::replace_auth_knobs`], which grafts a write from
-/// this type into that table without touching the other two).
+/// table (see [`crate::config_edit::replace_auth_knobs`], which grafts a
+/// write from this type into that table without touching the other keys).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AuthDynamicKnobs {
     /// See [`AuthConfig::flush_interval_ms`].
     #[serde(default = "default_flush_interval_ms")]
     pub flush_interval_ms: u64,
-    /// See [`AuthConfig::usage_channel_capacity`].
-    #[serde(default = "default_usage_channel_capacity")]
-    pub usage_channel_capacity: usize,
-    /// See [`AuthConfig::usage_batch_max`].
-    #[serde(default = "default_usage_batch_max")]
-    pub usage_batch_max: usize,
-    /// See [`AuthConfig::usage_flush_ms`].
-    #[serde(default = "default_usage_flush_ms")]
-    pub usage_flush_ms: u64,
     /// See [`AuthConfig::retention_days`].
     #[serde(default = "default_retention_days")]
     pub retention_days: u32,
@@ -314,9 +315,6 @@ impl From<&AuthConfig> for AuthDynamicKnobs {
     fn from(auth: &AuthConfig) -> Self {
         Self {
             flush_interval_ms: auth.flush_interval_ms,
-            usage_channel_capacity: auth.usage_channel_capacity,
-            usage_batch_max: auth.usage_batch_max,
-            usage_flush_ms: auth.usage_flush_ms,
             retention_days: auth.retention_days,
         }
     }
@@ -898,9 +896,9 @@ fn secret_env_keys_from_figment(peek_figment: &Figment) -> Vec<String> {
 /// document with no env overlay and no semantic validation - a pure
 /// change-detector over the document text, not a boot-readiness check.
 ///
-/// `server` is kept whole: every [`ServerConfig`] field is boot-layer, so
-/// [`boot_layer_diff`] compares them generically and a field added to
-/// `ServerConfig` later is covered without touching this type. An explicit
+/// `server` and `telemetry` are kept whole: every field of both is
+/// boot-layer, so [`boot_layer_diff`] compares them generically and a field
+/// added to either later is covered without touching this type. An explicit
 /// value equal to the default is indistinguishable from an absent one
 /// (figment resolves both to the same `Config`), which is the intended
 /// behavior: `boot_layer_diff` answers "would a restart see a different
@@ -911,10 +909,18 @@ pub struct BootView {
     pub server: ServerConfig,
     /// [`Config::log_format`].
     pub log_format: LogFormatConfig,
+    /// [`Config::telemetry`], every field of which is boot-layer.
+    pub telemetry: TelemetryConfig,
     /// [`AuthConfig::enabled`].
     pub auth_enabled: bool,
     /// [`AuthConfig::db_path`].
     pub db_path: String,
+    /// [`AuthConfig::usage_channel_capacity`].
+    pub usage_channel_capacity: usize,
+    /// [`AuthConfig::usage_batch_max`].
+    pub usage_batch_max: usize,
+    /// [`AuthConfig::usage_flush_ms`].
+    pub usage_flush_ms: u64,
     /// [`Config::config_source`].
     pub config_source: ConfigSourceKind,
 }
@@ -936,8 +942,12 @@ pub fn boot_view(toml_text: &str, label: &str) -> Result<BootView, ConfigError> 
     Ok(BootView {
         server: config.server,
         log_format: config.log_format,
+        telemetry: config.telemetry,
         auth_enabled: config.auth.enabled,
         db_path: config.auth.db_path,
+        usage_channel_capacity: config.auth.usage_channel_capacity,
+        usage_batch_max: config.auth.usage_batch_max,
+        usage_flush_ms: config.auth.usage_flush_ms,
         config_source: config.config_source,
     })
 }
@@ -949,15 +959,29 @@ pub fn boot_view(toml_text: &str, label: &str) -> Result<BootView, ConfigError> 
 pub fn boot_layer_diff(current: &str, candidate: &str) -> Result<Vec<String>, ConfigError> {
     let before = boot_view(current, "current")?;
     let after = boot_view(candidate, "candidate")?;
-    let mut diffs = server_field_diffs(&before.server, &after.server);
+    let mut diffs = table_field_diffs("server", &before.server, &after.server);
     if before.log_format != after.log_format {
         diffs.push("log_format".to_owned());
     }
+    diffs.extend(table_field_diffs(
+        "telemetry",
+        &before.telemetry,
+        &after.telemetry,
+    ));
     if before.auth_enabled != after.auth_enabled {
         diffs.push("auth.enabled".to_owned());
     }
     if before.db_path != after.db_path {
         diffs.push("auth.db_path".to_owned());
+    }
+    if before.usage_channel_capacity != after.usage_channel_capacity {
+        diffs.push("auth.usage_channel_capacity".to_owned());
+    }
+    if before.usage_batch_max != after.usage_batch_max {
+        diffs.push("auth.usage_batch_max".to_owned());
+    }
+    if before.usage_flush_ms != after.usage_flush_ms {
+        diffs.push("auth.usage_flush_ms".to_owned());
     }
     if before.config_source != after.config_source {
         diffs.push("config_source".to_owned());
@@ -965,10 +989,11 @@ pub fn boot_layer_diff(current: &str, candidate: &str) -> Result<Vec<String>, Co
     Ok(diffs)
 }
 
-/// `server.<field>` for every [`ServerConfig`] field that differs, found by
-/// comparing the two serialized forms field by field rather than from a
-/// hand-kept list, so a new field can never be silently left out.
-fn server_field_diffs(before: &ServerConfig, after: &ServerConfig) -> Vec<String> {
+/// `<table>.<field>` for every field that differs between two copies of a
+/// wholly boot-layer table (`server`, `telemetry`), found by comparing the
+/// serialized forms field by field rather than from a hand-kept list, so a
+/// new field can never be silently left out.
+fn table_field_diffs<T: Serialize + PartialEq>(table: &str, before: &T, after: &T) -> Vec<String> {
     if before == after {
         return Vec::new();
     }
@@ -976,22 +1001,28 @@ fn server_field_diffs(before: &ServerConfig, after: &ServerConfig) -> Vec<String
         (Ok(serde_json::Value::Object(before)), Ok(serde_json::Value::Object(after))) => before
             .iter()
             .filter(|(key, value)| after.get(key.as_str()) != Some(*value))
-            .map(|(key, _)| format!("server.{key}"))
+            .map(|(key, _)| format!("{table}.{key}"))
             .collect(),
         // A plain struct always serializes to an object; if it ever did not,
         // still refuse the change (the structs differ) rather than wave it
         // through.
-        _ => vec!["server".to_owned()],
+        _ => vec![table.to_owned()],
     }
 }
 
 /// Top-level keys that are boot-layer in their entirety (ADR 012 §1).
-const BOOT_TOP_LEVEL_KEYS: [&str; 3] = ["server", "log_format", "config_source"];
+const BOOT_TOP_LEVEL_KEYS: [&str; 4] = ["server", "log_format", "telemetry", "config_source"];
 
 /// The boot-layer keys inside `[auth]`, the one table split across both
-/// layers; its other keys (`flush_interval_ms`, `usage_channel_capacity`,
-/// `usage_batch_max`, `usage_flush_ms`, `retention_days`) are dynamic.
-const BOOT_AUTH_KEYS: [&str; 2] = ["enabled", "db_path"];
+/// layers; its other keys (`flush_interval_ms`, `retention_days`) are
+/// dynamic.
+const BOOT_AUTH_KEYS: [&str; 5] = [
+    "enabled",
+    "db_path",
+    "usage_channel_capacity",
+    "usage_batch_max",
+    "usage_flush_ms",
+];
 
 /// Which config layer a document key belongs to (ADR 012 §1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1046,7 +1077,9 @@ fn classify_keys(toml_text: &str, label: &str) -> Result<Vec<(String, Layer)>, C
 
 /// Reject any key in `toml_text` that is not boot-layer (ADR 012 §1): in
 /// `config_source = "db"` mode the boot file may hold ONLY `server`,
-/// `log_format`, `auth.enabled`, `auth.db_path` and `config_source` itself -
+/// `log_format`, `telemetry`, `auth.enabled`, `auth.db_path`, the usage-log
+/// channel knobs (`auth.usage_channel_capacity`, `auth.usage_batch_max`,
+/// `auth.usage_flush_ms`) and `config_source` itself -
 /// a dynamic key there would be a second, silently-diverging source for a
 /// value the DB is supposed to own exclusively, which is exactly the
 /// drift-prone pattern ADR 012 refuses.
@@ -2356,6 +2389,13 @@ mod tests {
     #[test]
     fn ensure_boot_only_rejects_dynamic_keys_and_auth_knobs() {
         assert!(ensure_boot_only("[server]\nport = 1\n[auth]\nenabled = true\n", "t").is_ok());
+        // Telemetry and the usage-log channel knobs are boot-layer too.
+        assert!(ensure_boot_only(
+            "[telemetry]\nmetadata_labels = [\"tenant\"]\n[auth]\nusage_channel_capacity = 1\n\
+             usage_batch_max = 1\nusage_flush_ms = 1\n",
+            "t"
+        )
+        .is_ok());
         let err = ensure_boot_only("[[providers]]\nname = \"x\"\n", "t").unwrap_err();
         assert!(err.to_string().contains("providers"));
         let err = ensure_boot_only("[auth]\nflush_interval_ms = 5\n", "t").unwrap_err();
@@ -2369,8 +2409,7 @@ mod tests {
     fn ensure_dynamic_only_accepts_a_document_with_no_boot_keys() {
         assert!(ensure_dynamic_only(
             "[[providers]]\nname = \"x\"\nkind = \"openai\"\n[auth]\nflush_interval_ms = 5\n\
-             usage_channel_capacity = 10\nusage_batch_max = 2\nusage_flush_ms = 100\n\
-             retention_days = 30\n[resilience]\n[telemetry]\n[tokenizer]\n[webhooks]\n\
+             retention_days = 30\n[resilience]\n[tokenizer]\n[image_fetch]\n[webhooks]\n\
              url = \"https://example.test\"\n",
             "t"
         )
@@ -2424,16 +2463,36 @@ mod tests {
         assert!(err.to_string().contains("auth.enabled"));
     }
 
-    /// The five dynamic `[auth]` knobs stay allowed - only `enabled` and
-    /// `db_path` are boot-layer.
+    /// The two dynamic `[auth]` knobs stay allowed; the usage-log channel
+    /// knobs are boot-layer (the channel is sized once at startup), and so
+    /// is all of `[telemetry]` (its label allowlist is fixed when the
+    /// Prometheus metrics are registered).
     #[test]
-    fn ensure_dynamic_only_accepts_the_five_dynamic_auth_knobs() {
-        assert!(ensure_dynamic_only(
-            "[auth]\nflush_interval_ms = 1\nusage_channel_capacity = 2\nusage_batch_max = 3\n\
-             usage_flush_ms = 4\nretention_days = 5\n",
-            "t"
+    fn ensure_dynamic_only_accepts_only_the_two_dynamic_auth_knobs() {
+        assert!(
+            ensure_dynamic_only("[auth]\nflush_interval_ms = 1\nretention_days = 5\n", "t").is_ok()
+        );
+        for key in [
+            "usage_channel_capacity",
+            "usage_batch_max",
+            "usage_flush_ms",
+        ] {
+            let err = ensure_dynamic_only(&format!("[auth]\n{key} = 1\n"), "t").unwrap_err();
+            assert!(err.to_string().contains(&format!("auth.{key}")), "{err}");
+        }
+        let err = ensure_dynamic_only("[telemetry]\nmetadata_labels = []\n", "t").unwrap_err();
+        assert!(err.to_string().contains("telemetry"), "{err}");
+    }
+
+    #[test]
+    fn boot_layer_diff_covers_telemetry_and_the_usage_channel_knobs() {
+        let mut diff = boot_layer_diff(
+            "",
+            "[telemetry]\nmetadata_labels = [\"tenant\"]\n[auth]\nusage_batch_max = 7\n",
         )
-        .is_ok());
+        .unwrap();
+        diff.sort_unstable();
+        assert_eq!(diff, ["auth.usage_batch_max", "telemetry.metadata_labels"]);
     }
 
     #[test]

@@ -842,7 +842,7 @@ async fn file_mode_external_edit_makes_a_stale_if_match_refused_with_412() {
 
 #[tokio::test]
 async fn db_mode_auth_knobs_put_does_not_trip_the_boot_layer_guard() {
-    // `config_edit::replace_auth_knobs` grafts only the 5 hot-reloadable
+    // `config_edit::replace_auth_knobs` grafts only the 2 hot-reloadable
     // `[auth]` keys into the DYNAMIC document; `enabled`/`db_path` live in
     // the boot file only (`spawn_db_harness`'s `boot.toml`) and are never
     // part of what this route reads or writes. `boot_layer_diff` compares
@@ -854,9 +854,6 @@ async fn db_mode_auth_knobs_put_does_not_trip_the_boot_layer_guard() {
 
     let knobs = json!({
         "flush_interval_ms": 5000,
-        "usage_channel_capacity": 100,
-        "usage_batch_max": 50,
-        "usage_flush_ms": 500,
         "retention_days": 30
     });
     let response = h.put_json("/admin/config/auth", &knobs, &hash).await;
@@ -870,7 +867,7 @@ async fn db_mode_auth_knobs_put_does_not_trip_the_boot_layer_guard() {
     let text = doc["config"].as_str().expect("config string");
     assert!(text.contains("flush_interval_ms = 5000"), "{text}");
     assert!(
-        !text.contains("enabled") && !text.contains("db_path"),
+        !text.contains("enabled") && !text.contains("db_path") && !text.contains("usage_"),
         "the stored dynamic document must never gain the boot-layer auth keys: {text}"
     );
 }

@@ -1093,56 +1093,60 @@ async fn put_tokenizer_section_applies_and_shows_in_whole_document() {
     assert_eq!(section["hash"].as_str().expect("hash").len(), 64);
 }
 
-/// (e) A `PUT /admin/config/auth` body cannot smuggle `db_path` (or
-/// `enabled`) past `AuthDynamicKnobs`'s `deny_unknown_fields`: `400`
-/// `LM-1001`. The 5-knob-only body is accepted and grafted into the
-/// existing `[auth]` table.
+/// (e) `PUT /admin/config/auth` carries only the two hot-reloadable knobs
+/// (`flush_interval_ms`, `retention_days`). A body naming any boot-layer
+/// `[auth]` key - `db_path`, `enabled`, or one of the usage-log channel knobs,
+/// which size a channel fixed at startup - is `400` `LM-1001` via
+/// `AuthDynamicKnobs`'s `deny_unknown_fields`, never accepted-then-ignored.
+/// The two-knob body is accepted and grafted into the existing `[auth]`
+/// table.
 #[tokio::test]
-async fn put_auth_section_rejects_boot_layer_fields_but_accepts_the_five_knobs() {
+async fn put_auth_section_rejects_boot_layer_fields_but_accepts_the_two_knobs() {
     let h = spawn_admin(registry()).await;
     let hash = h.current_hash().await;
 
-    let body_with_db_path = serde_json::json!({
-        "flush_interval_ms": 5000,
-        "usage_channel_capacity": 100,
-        "usage_batch_max": 50,
-        "usage_flush_ms": 500,
-        "retention_days": 30,
-        "db_path": "/tmp/should-not-be-allowed.db"
-    });
-    let response = h
-        .put_json("/admin/config/auth", &body_with_db_path, &hash)
-        .await;
-    assert_eq!(response.status(), 400);
-    let body: Value = response.json().await.expect("json");
-    assert_eq!(body["error"]["code"].as_str().expect("code"), "LM-1001");
+    for (key, value) in [
+        (
+            "db_path",
+            serde_json::json!("/tmp/should-not-be-allowed.db"),
+        ),
+        ("enabled", serde_json::json!(true)),
+        ("usage_channel_capacity", serde_json::json!(100)),
+        ("usage_batch_max", serde_json::json!(50)),
+        ("usage_flush_ms", serde_json::json!(500)),
+    ] {
+        let mut body = serde_json::json!({"flush_interval_ms": 5000, "retention_days": 30});
+        body[key] = value;
+        let response = h.put_json("/admin/config/auth", &body, &hash).await;
+        assert_eq!(response.status(), 400, "{key} must be refused");
+        let body: Value = response.json().await.expect("json");
+        assert_eq!(body["error"]["code"].as_str().expect("code"), "LM-1001");
+    }
 
-    let body_with_enabled = serde_json::json!({
-        "flush_interval_ms": 5000,
-        "usage_channel_capacity": 100,
-        "usage_batch_max": 50,
-        "usage_flush_ms": 500,
-        "retention_days": 30,
-        "enabled": true
-    });
-    let response = h
-        .put_json("/admin/config/auth", &body_with_enabled, &hash)
-        .await;
-    assert_eq!(response.status(), 400);
-
-    let valid_body = serde_json::json!({
-        "flush_interval_ms": 5000,
-        "usage_channel_capacity": 100,
-        "usage_batch_max": 50,
-        "usage_flush_ms": 500,
-        "retention_days": 30
-    });
+    let valid_body = serde_json::json!({"flush_interval_ms": 5000, "retention_days": 30});
     let ok = h.put_json("/admin/config/auth", &valid_body, &hash).await;
     assert_eq!(ok.status(), 204);
 
     let doc: Value = h.get("/admin/config").await.json().await.expect("json");
     let text = doc["config"].as_str().expect("config string");
     assert!(text.contains("flush_interval_ms = 5000"), "{text}");
+}
+
+/// `[telemetry]` is boot-layer (its label allowlist is fixed when the
+/// Prometheus metrics are registered), so it has no granular route, and a
+/// whole-document PUT changing it is refused as restart-only.
+#[tokio::test]
+async fn telemetry_is_restart_only() {
+    let h = spawn_admin(registry()).await;
+    assert_eq!(h.get("/admin/config/telemetry").await.status(), 404);
+
+    let hash = h.current_hash().await;
+    let candidate = format!("{CONFIG_TOML}\n[telemetry]\nmetadata_labels = [\"tenant\"]\n");
+    let response = h.put_config(&candidate, &hash).await;
+    assert_eq!(response.status(), 400);
+    let body: Value = response.json().await.expect("json");
+    let message = body["error"]["message"].as_str().expect("message");
+    assert!(message.contains("telemetry.metadata_labels"), "{message}");
 }
 
 /// (f) An unknown `{section}` name is `404` `LM-1003` - the same code and

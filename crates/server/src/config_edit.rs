@@ -143,15 +143,16 @@ pub fn remove_section(doc: &str, section: &str) -> Result<String, EditError> {
     Ok(document.to_string())
 }
 
-/// Graft the 5 hot-reloadable `[auth]` knobs ([`AuthDynamicKnobs`]) into the
+/// Graft the 2 hot-reloadable `[auth]` knobs ([`AuthDynamicKnobs`]) into the
 /// document's existing `[auth]` table, leaving `enabled`, `db_path` and any
 /// other key in that table untouched. Creates an empty `[auth]` table first
 /// if the document has none yet. Comments and formatting elsewhere in the
 /// document are untouched.
 ///
 /// Unlike [`replace_section`], this is a field-level MERGE, not a wholesale
-/// replace: `[auth]` also carries the boot-layer `enabled`/`db_path` fields
-/// (ADR 012 §1), which only take effect on a restart, so a granular knob
+/// replace: `[auth]` also carries boot-layer fields (`enabled`, `db_path`,
+/// the usage-log channel knobs; ADR 012 §1), which only take effect on a
+/// restart, so a granular knob
 /// write must never clobber them - even though the write's own request body
 /// never mentions them at all.
 ///
@@ -380,9 +381,6 @@ mod tests {
     fn replace_auth_knobs_merges_without_touching_boot_fields() {
         let knobs = AuthDynamicKnobs {
             flush_interval_ms: 5_000,
-            usage_channel_capacity: 42,
-            usage_batch_max: 7,
-            usage_flush_ms: 250,
             retention_days: 14,
         };
         let out = replace_auth_knobs(DOC_WITH_AUTH, &knobs).unwrap();
@@ -392,9 +390,6 @@ mod tests {
             "boot field survives: {out}"
         );
         assert!(out.contains("flush_interval_ms = 5000"));
-        assert!(out.contains("usage_channel_capacity = 42"));
-        assert!(out.contains("usage_batch_max = 7"));
-        assert!(out.contains("usage_flush_ms = 250"));
         assert!(out.contains("retention_days = 14"));
         assert!(out.contains("# fleet config"));
 
@@ -410,9 +405,6 @@ mod tests {
     fn replace_auth_knobs_creates_the_table_when_absent() {
         let knobs = AuthDynamicKnobs {
             flush_interval_ms: 1_234,
-            usage_channel_capacity: 1,
-            usage_batch_max: 1,
-            usage_flush_ms: 1,
             retention_days: 1,
         };
         let out = replace_auth_knobs("[server]\nport = 8080\n", &knobs).unwrap();
@@ -463,9 +455,6 @@ auth = { enabled = true, db_path = \"lumen.db\" }\n";
     fn inline_auth_table_accepts_the_dynamic_knobs() {
         let knobs = AuthDynamicKnobs {
             flush_interval_ms: 5_000,
-            usage_channel_capacity: 42,
-            usage_batch_max: 7,
-            usage_flush_ms: 250,
             retention_days: 14,
         };
         let out = replace_auth_knobs(INLINE_DOC, &knobs).unwrap();
