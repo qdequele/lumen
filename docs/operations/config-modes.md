@@ -82,7 +82,7 @@ providers, every dynamic section at its built-in default. `GET /health` is
 `200`, `/v1/*` answers the normal `LM-2001` (no such model) rather than
 refusing to start, and the log carries:
 
-```
+```text
 config_source = "db" and no config stored yet; PUT /admin/config to install one
 ```
 
@@ -227,9 +227,17 @@ requires a restart, since `config_source` is itself boot-layer.
 ### File to DB
 
 1. `GET /admin/config` against the running file-mode process and save the
-   response body. In file mode this is the WHOLE config file, byte for byte
-   (boot layer and dynamic layer together, see the admin API table above) -
-   it still needs step 4 below before it is a valid db-mode candidate.
+   response's `config` field (the response is a JSON `{"config", "hash"}`
+   envelope; the TOML document is the `config` string, not the raw body):
+
+   ```bash
+   curl -s http://localhost:8080/admin/config \
+     -H "Authorization: Bearer $LUMEN_MASTER_KEY" | jq -r .config > saved.toml
+   ```
+
+   In file mode this is the WHOLE config file, byte for byte (boot layer and
+   dynamic layer together, see the admin API table above) - it still needs
+   step 4 below before it is a valid db-mode candidate.
 2. Edit the boot TOML: set `config_source = "db"`, and strip every
    dynamic-layer key (`[[providers]]`, `[resilience]`, `[telemetry]`,
    `[tokenizer]`, `[image_fetch]`, `[webhooks]`, and every `[auth]` key
@@ -255,7 +263,8 @@ requires a restart, since `config_source` is itself boot-layer.
 ### DB to file
 
 1. `GET /admin/config` against the running db-mode process and save the
-   response body - the dynamic document alone, no boot keys.
+   response's `config` field (`jq -r .config`, as in the file-to-DB step 1) -
+   the dynamic document alone, no boot keys.
 2. Merge it with the boot-layer keys the process is currently running with
    (`[server]`, `log_format`, `[auth] enabled`/`db_path`) into one TOML
    file.

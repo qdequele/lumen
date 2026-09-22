@@ -9,7 +9,7 @@ All notable changes to LUMEN are documented here. The format is based on
 ### Added
 
 - **Docs: config source modes (ADR 012, task 10 of the config-source-abstraction
-  plan - the final task).** New `docs/operations/config-modes.md`: the
+  plan).** New `docs/operations/config-modes.md`: the
   `config_source = "file" | "db"` boot key, the boot-layer/dynamic-layer
   split and the db-mode boot-file contract, the full granular admin config
   endpoint table, the `If-Match`/boot-layer-guard write pipeline, first-boot
@@ -26,7 +26,7 @@ All notable changes to LUMEN are documented here. The format is based on
   names the granular config surface and links the new doc.
 
 - **End-to-end test coverage for the config source abstraction, both modes**
-  (ADR 012, task 9 of the config-source-abstraction plan - the final task).
+  (ADR 012, task 9 of the config-source-abstraction plan).
   New `crates/server/tests/config_source_e2e.rs`: a file-mode provider
   reroute (`PUT /admin/config/providers/{name}`) lands live against a real
   upstream with no restart; a db-mode cold start (empty stored document,
@@ -68,8 +68,9 @@ All notable changes to LUMEN are documented here. The format is based on
   module: pure text-to-text `upsert_provider`, `delete_provider`,
   `replace_section` and `provider_names`, built on `toml_edit::DocumentMut`
   instead of `toml::Value`, so an edit preserves every comment and formatting
-  choice outside the table it touches. Not yet wired into any handler; lays
-  the groundwork for the granular per-resource admin config routes (task 8).
+  choice outside the table it touches. Backs the granular per-resource
+  admin config routes (`/admin/config/providers/{name}`,
+  `/admin/config/{section}`).
 - **`GET`/`PUT /admin/config` now work in both config-source modes** (ADR 012,
   task 6 of the config-source-abstraction plan). Both routes read and write
   through `ConfigContext`/`ConfigSource` instead of the file-only code path:
@@ -96,7 +97,7 @@ All notable changes to LUMEN are documented here. The format is based on
   `If-Match` before touching disk at all, still validates before staging
   anything permanently, same `.bak` naming, same 412 `LM-1004` on a stale
   `If-Match` - including when the submitted body is also invalid TOML).
-  Groundwork for a future SQLite-backed config source.
+  The SQLite-backed `DbSource` sits behind the same trait.
 
 ### Fixed
 

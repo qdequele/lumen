@@ -96,6 +96,50 @@ fn drain_output(mut child: Child) -> (String, String) {
     (out, err)
 }
 
+/// Read a child pipe to the end on its own thread, so neither pipe can fill
+/// and block the child while the other one is being waited on.
+fn spawn_reader<R: Read + Send + 'static>(pipe: Option<R>) -> std::thread::JoinHandle<String> {
+    std::thread::spawn(move || {
+        let mut buf = String::new();
+        if let Some(mut pipe) = pipe {
+            let _ = pipe.read_to_string(&mut buf);
+        }
+        buf
+    })
+}
+
+/// Wait, bounded by `timeout`, for a child that is expected to exit on its
+/// own (a boot the test expects to be refused). Both pipes are drained
+/// concurrently. If the child is still running at the deadline it is killed
+/// and the test fails with its output, instead of hanging until the CI job
+/// timeout when a regression turns a refused boot into a hang.
+async fn wait_for_exit(
+    mut child: Child,
+    timeout: Duration,
+) -> (std::process::ExitStatus, String, String) {
+    let stdout = spawn_reader(child.stdout.take());
+    let stderr = spawn_reader(child.stderr.take());
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll child exit") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            let out = stdout.join().unwrap_or_default();
+            let err = stderr.join().unwrap_or_default();
+            panic!(
+                "lumen did not exit within {timeout:?}\n--- stdout ---\n{out}\n--- stderr ---\n{err}"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    let out = stdout.join().unwrap_or_default();
+    let err = stderr.join().unwrap_or_default();
+    (status, out, err)
+}
+
 #[tokio::test]
 async fn db_mode_boots_with_no_stored_config_and_warns() {
     let port = free_port();
@@ -233,7 +277,7 @@ port = {port}
         ),
     );
 
-    let mut child = lumen()
+    let child = lumen()
         .args(["--config"])
         .arg(&config)
         .env("LUMEN_MASTER_KEY", master_key())
@@ -248,23 +292,7 @@ port = {port}
     let base = format!("http://127.0.0.1:{port}");
     let ready = wait_until_ready(&base, Duration::from_secs(3)).await;
 
-    // Taken before the blocking `wait()` below moves `child`: needed to read
-    // the process's output afterward, and `Child::wait()` itself only
-    // reaps the exit status, not the piped output.
-    let mut stdout_pipe = child.stdout.take();
-    let mut stderr_pipe = child.stderr.take();
-    let status = tokio::task::spawn_blocking(move || child.wait())
-        .await
-        .expect("join wait")
-        .expect("wait for exit");
-    let mut out = String::new();
-    let mut err = String::new();
-    if let Some(mut pipe) = stdout_pipe.take() {
-        let _ = pipe.read_to_string(&mut out);
-    }
-    if let Some(mut pipe) = stderr_pipe.take() {
-        let _ = pipe.read_to_string(&mut err);
-    }
+    let (status, out, err) = wait_for_exit(child, Duration::from_secs(10)).await;
 
     assert!(
         !ready,
@@ -317,7 +345,7 @@ async fn db_mode_refuses_to_boot_when_the_stored_document_disables_auth() {
         .await
         .expect("pre-seed a document that disables auth");
 
-    let mut child = lumen()
+    let child = lumen()
         .args(["--config"])
         .arg(&config)
         .env("LUMEN_MASTER_KEY", master_key())
@@ -329,15 +357,7 @@ async fn db_mode_refuses_to_boot_when_the_stored_document_disables_auth() {
     let base = format!("http://127.0.0.1:{port}");
     let ready = wait_until_ready(&base, Duration::from_secs(3)).await;
 
-    let mut stdout_pipe = child.stdout.take();
-    let status = tokio::task::spawn_blocking(move || child.wait())
-        .await
-        .expect("join wait")
-        .expect("wait for exit");
-    let mut out = String::new();
-    if let Some(mut pipe) = stdout_pipe.take() {
-        let _ = pipe.read_to_string(&mut out);
-    }
+    let (status, out, _err) = wait_for_exit(child, Duration::from_secs(10)).await;
 
     assert!(
         !ready,
@@ -374,7 +394,7 @@ async fn db_mode_refuses_to_boot_when_the_stored_document_repoints_db_path() {
         .await
         .expect("pre-seed a document that repoints db_path");
 
-    let mut child = lumen()
+    let child = lumen()
         .args(["--config"])
         .arg(&config)
         .env("LUMEN_MASTER_KEY", master_key())
@@ -386,15 +406,7 @@ async fn db_mode_refuses_to_boot_when_the_stored_document_repoints_db_path() {
     let base = format!("http://127.0.0.1:{port}");
     let ready = wait_until_ready(&base, Duration::from_secs(3)).await;
 
-    let mut stdout_pipe = child.stdout.take();
-    let status = tokio::task::spawn_blocking(move || child.wait())
-        .await
-        .expect("join wait")
-        .expect("wait for exit");
-    let mut out = String::new();
-    if let Some(mut pipe) = stdout_pipe.take() {
-        let _ = pipe.read_to_string(&mut out);
-    }
+    let (status, out, _err) = wait_for_exit(child, Duration::from_secs(10)).await;
 
     assert!(
         !ready,

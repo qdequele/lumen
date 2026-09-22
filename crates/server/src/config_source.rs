@@ -1,7 +1,7 @@
 //! The `ConfigSource` abstraction (ADR 012): where the config document lives
-//! and how it is read and atomically replaced, behind a trait so a future
-//! source (e.g. SQLite, see the ADR's later phases) can sit next to the file
-//! source without every caller learning a new API.
+//! and how it is read and atomically replaced, behind a trait so the file
+//! source ([`FileSource`]) and the SQLite source ([`DbSource`]) share one API
+//! and every caller stays mode-agnostic.
 //!
 //! [`FileSource`] is the extraction of the file read / staged-write machinery
 //! that used to live inline in `admin::apply_config_document`: unique `.tmp`
@@ -72,8 +72,8 @@ pub enum ConfigSourceError {
         /// The hash of the document currently stored, as of this rejection.
         current_hash: String,
     },
-    /// A database-backed source failed (reserved for a future `DbSource`;
-    /// [`FileSource`] never produces this variant).
+    /// A database-backed source failed: produced by [`DbSource`]'s `load`
+    /// and `persist` ([`FileSource`] never produces this variant).
     #[error("config source database error: {0}")]
     Db(String),
     /// The stored bytes are not valid UTF-8, so they cannot be returned as a
@@ -105,12 +105,12 @@ pub trait ConfigSource: Send + Sync {
     /// File path an external writer (a human editor, a GitOps sync) might
     /// change, for a hot-reload watcher to arm on. `None` means there is no
     /// such path - a change can only ever arrive through this trait's own
-    /// `persist` (e.g. a future DB-backed source with no on-disk mirror).
+    /// `persist` (e.g. [`DbSource`], which has no on-disk mirror).
     fn watch_path(&self) -> Option<&Path>;
 }
 
-/// [`ConfigSource`] backed by a plain file on disk: the only source LUMEN has
-/// ever had, now behind the trait. The file stays the source of truth; `.bak`
+/// [`ConfigSource`] backed by a plain file on disk (`config_source = "file"`,
+/// the default). The file stays the source of truth; `.bak`
 /// of the previous document is kept alongside it on every successful
 /// `persist`.
 ///
