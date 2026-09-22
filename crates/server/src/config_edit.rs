@@ -131,6 +131,18 @@ pub fn replace_section(
     Ok(document.to_string())
 }
 
+/// Remove the named top-level table, if present. Removing an absent section
+/// is not an error. Comments and formatting elsewhere in the document are
+/// untouched.
+///
+/// # Errors
+/// [`EditError::Parse`] if `doc` is not valid TOML.
+pub fn remove_section(doc: &str, section: &str) -> Result<String, EditError> {
+    let mut document = doc.parse::<DocumentMut>()?;
+    document.as_table_mut().remove(section);
+    Ok(document.to_string())
+}
+
 /// Graft the 5 hot-reloadable `[auth]` knobs ([`AuthDynamicKnobs`]) into the
 /// document's existing `[auth]` table, leaving `enabled`, `db_path` and any
 /// other key in that table untouched. Creates an empty `[auth]` table first
@@ -156,6 +168,7 @@ pub fn replace_auth_knobs(doc: &str, knobs: &AuthDynamicKnobs) -> Result<String,
         .as_table_mut()
         .entry("auth")
         .or_insert_with(|| Item::Table(Table::new()));
+    normalize_to_table(auth_item);
     let auth_table = auth_item.as_table_mut().ok_or(EditError::AuthNotTable)?;
     for (key, value) in &new_table {
         auth_table.insert(key, value.clone());
@@ -171,10 +184,11 @@ pub fn replace_auth_knobs(doc: &str, knobs: &AuthDynamicKnobs) -> Result<String,
 /// [`EditError::ProvidersNotArray`] if the document's `providers` key exists
 /// but holds something other than an array of tables.
 pub fn provider_names(doc: &str) -> Result<Vec<String>, EditError> {
-    let document = doc.parse::<DocumentMut>()?;
-    let Some(item) = document.as_table().get("providers") else {
+    let mut document = doc.parse::<DocumentMut>()?;
+    let Some(item) = document.as_table_mut().get_mut("providers") else {
         return Ok(Vec::new());
     };
+    normalize_to_array_of_tables(item);
     let providers = item
         .as_array_of_tables()
         .ok_or(EditError::ProvidersNotArray)?;
@@ -192,8 +206,39 @@ fn providers_array_mut(document: &mut DocumentMut) -> Result<&mut ArrayOfTables,
         .as_table_mut()
         .entry("providers")
         .or_insert_with(|| Item::ArrayOfTables(ArrayOfTables::new()));
+    normalize_to_array_of_tables(item);
     item.as_array_of_tables_mut()
         .ok_or(EditError::ProvidersNotArray)
+}
+
+/// Rewrite an inline table (`auth = { enabled = true }`) as a standard
+/// `[table]`, so an edit can address its keys. Both spellings are valid TOML
+/// and load identically; any other item is left as is.
+fn normalize_to_table(item: &mut Item) {
+    if item.is_inline_table() {
+        match std::mem::take(item).into_table() {
+            Ok(table) => *item = Item::Table(table),
+            Err(original) => *item = original,
+        }
+    }
+}
+
+/// Rewrite an inline array of inline tables (`providers = [{ ... }]`, or an
+/// empty `providers = []`) as a standard `[[array]]` of tables, so an edit
+/// can address its entries. Both spellings are valid TOML and load
+/// identically; any other item (a non-table array included) is left as is.
+fn normalize_to_array_of_tables(item: &mut Item) {
+    let Some(array) = item.as_array() else {
+        return;
+    };
+    if array.is_empty() {
+        *item = Item::ArrayOfTables(ArrayOfTables::new());
+        return;
+    }
+    match std::mem::take(item).into_array_of_tables() {
+        Ok(tables) => *item = Item::ArrayOfTables(tables),
+        Err(original) => *item = original,
+    }
 }
 
 /// The `name` field of the table at `index` in `providers`, if present and a
@@ -385,5 +430,62 @@ mod tests {
     fn parse_error_on_invalid_toml() {
         let err = provider_names("not = [valid").unwrap_err();
         assert!(matches!(err, EditError::Parse(_)));
+    }
+
+    const INLINE_DOC: &str = "# keep me\n\
+providers = [{ name = \"openai\", kind = \"openai\" }, { name = \"ollama\", kind = \"ollama\" }]\n\
+auth = { enabled = true, db_path = \"lumen.db\" }\n";
+
+    #[test]
+    fn inline_provider_array_supports_every_provider_edit() {
+        assert_eq!(provider_names(INLINE_DOC).unwrap(), ["openai", "ollama"]);
+
+        let p: ProviderConfig = toml::from_str("name = \"cohere\"\nkind = \"cohere\"").unwrap();
+        let out = upsert_provider(INLINE_DOC, &p).unwrap();
+        assert_eq!(
+            provider_names(&out).unwrap(),
+            ["openai", "ollama", "cohere"]
+        );
+        assert!(out.contains("# keep me"));
+
+        let out = delete_provider(INLINE_DOC, "openai").unwrap().unwrap();
+        assert_eq!(provider_names(&out).unwrap(), ["ollama"]);
+    }
+
+    #[test]
+    fn empty_inline_provider_array_accepts_an_upsert() {
+        let p: ProviderConfig = toml::from_str("name = \"cohere\"\nkind = \"cohere\"").unwrap();
+        let out = upsert_provider("providers = []\n", &p).unwrap();
+        assert_eq!(provider_names(&out).unwrap(), ["cohere"]);
+    }
+
+    #[test]
+    fn inline_auth_table_accepts_the_dynamic_knobs() {
+        let knobs = AuthDynamicKnobs {
+            flush_interval_ms: 5_000,
+            usage_channel_capacity: 42,
+            usage_batch_max: 7,
+            usage_flush_ms: 250,
+            retention_days: 14,
+        };
+        let out = replace_auth_knobs(INLINE_DOC, &knobs).unwrap();
+        let cfg: crate::config::Config = toml::from_str(&out).unwrap();
+        assert!(cfg.auth.enabled, "boot-layer auth.enabled must survive");
+        assert_eq!(cfg.auth.db_path, "lumen.db");
+        assert_eq!(cfg.auth.retention_days, 14);
+    }
+
+    #[test]
+    fn remove_section_drops_only_that_table() {
+        let doc = "# keep me\n[tokenizer]\nmode = \"accurate\"\n\n[webhooks]\nurl = \"https://h.example\"\n";
+        let out = remove_section(doc, "webhooks").unwrap();
+        assert!(!out.contains("webhooks"));
+        assert!(out.contains("# keep me"));
+        assert!(out.contains("mode = \"accurate\""));
+        assert_eq!(
+            remove_section(&out, "webhooks").unwrap(),
+            out,
+            "absent is a no-op"
+        );
     }
 }

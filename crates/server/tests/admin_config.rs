@@ -1234,3 +1234,57 @@ async fn get_webhooks_section_is_null_when_absent_from_the_document() {
     assert!(section["webhooks"].is_null());
     assert_eq!(section["hash"].as_str().expect("hash").len(), 64);
 }
+
+/// `PUT /admin/config/webhooks` accepts the same `null` its GET reports for
+/// an absent block, and removes the block: a webhooks block set through the
+/// granular API can be cleared through it too.
+#[tokio::test]
+async fn put_webhooks_section_null_removes_the_block() {
+    // `[webhooks]` requires auth (every budget event names a key or group).
+    let h = spawn_admin_with_config(
+        registry(),
+        &format!("{CONFIG_TOML}\n[auth]\nenabled = true\n"),
+    )
+    .await;
+
+    let hash = h.current_hash().await;
+    let response = h
+        .put_json(
+            "/admin/config/webhooks",
+            &serde_json::json!({"url": "https://hooks.example.com/lumen"}),
+            &hash,
+        )
+        .await;
+    assert_eq!(response.status(), 204);
+    let section: Value = h
+        .get("/admin/config/webhooks")
+        .await
+        .json()
+        .await
+        .expect("json");
+    assert_eq!(
+        section["webhooks"]["url"].as_str().expect("url"),
+        "https://hooks.example.com/lumen"
+    );
+
+    let hash = h.current_hash().await;
+    let response = h
+        .put_json("/admin/config/webhooks", &Value::Null, &hash)
+        .await;
+    assert_eq!(response.status(), 204);
+    let section: Value = h
+        .get("/admin/config/webhooks")
+        .await
+        .json()
+        .await
+        .expect("json");
+    assert!(section["webhooks"].is_null(), "{section}");
+    let doc: Value = h.get("/admin/config").await.json().await.expect("json");
+    assert!(
+        !doc["config"]
+            .as_str()
+            .expect("config")
+            .contains("[webhooks]"),
+        "the block must be gone from the document"
+    );
+}

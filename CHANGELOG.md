@@ -101,6 +101,20 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ### Fixed
 
+- **Config source review fixes** (ADR 012). The db-mode config write
+  (`config_versions` compare-and-swap) now runs in a `BEGIN IMMEDIATE`
+  transaction: the default deferred transaction failed with "database is
+  locked" whenever the usage-log writer or budget flusher wrote to the same
+  file at the same moment, turning db-mode config writes into intermittent
+  500s. A stored document carrying any boot-layer key is now refused on the
+  read side too (boot and every reload), so a hand-edited or restored row
+  can no longer silently rebind the server port or override the boot file.
+  Granular config writes now patch the document loaded under the apply
+  lock, not a copy read before it. Granular edits accept the inline TOML
+  forms (`auth = { ... }`, `providers = [{ ... }]`) instead of failing with
+  a 500. `PUT /admin/config/webhooks` accepts `null` to remove the block.
+  The boot-layer diff now compares every `[server]` field generically.
+
 - **DB mode refuses every boot-layer key in the dynamic document, even one
   set to its built-in default** (ADR 012, final-review fix). Previously a
   `PUT /admin/config` (or granular) candidate carrying a boot-layer key

@@ -29,8 +29,10 @@ use std::path::Path;
 /// hot-reloadable **dynamic layer** (everything else). The classification is
 /// exhaustive and pinned by a test (`every_config_field_is_classified_boot_or_dynamic`
 /// in this module's `#[cfg(test)]`): a new top-level field must be added to
-/// [`BootView`] and [`ensure_boot_only`] (if boot) or left out of both (if
-/// dynamic), or that test fails.
+/// [`BootView`] and the key classifier behind [`ensure_boot_only`] /
+/// [`ensure_dynamic_only`] (if boot) or left out of both (if dynamic), or
+/// that test fails. A new `[server]` field needs nothing: all of `server` is
+/// boot-layer and [`boot_layer_diff`] compares it field by field.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -896,24 +898,17 @@ fn secret_env_keys_from_figment(peek_figment: &Figment) -> Vec<String> {
 /// document with no env overlay and no semantic validation - a pure
 /// change-detector over the document text, not a boot-readiness check.
 ///
-/// Field-for-field mirror of `Config`'s boot-classified fields; see the
-/// classification note on [`Config`] itself. An explicit value equal to the
-/// default is indistinguishable from an absent one (figment resolves both to
-/// the same `Config`), which is the intended behavior: `boot_layer_diff`
-/// answers "would a restart see a different effective boot config", not "did
-/// the byte text change".
+/// `server` is kept whole: every [`ServerConfig`] field is boot-layer, so
+/// [`boot_layer_diff`] compares them generically and a field added to
+/// `ServerConfig` later is covered without touching this type. An explicit
+/// value equal to the default is indistinguishable from an absent one
+/// (figment resolves both to the same `Config`), which is the intended
+/// behavior: `boot_layer_diff` answers "would a restart see a different
+/// effective boot config", not "did the byte text change".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BootView {
-    /// [`ServerConfig::host`].
-    pub host: String,
-    /// [`ServerConfig::port`].
-    pub port: u16,
-    /// [`ServerConfig::body_limit`].
-    pub body_limit: usize,
-    /// [`ServerConfig::first_token_timeout_ms`].
-    pub first_token_timeout_ms: u64,
-    /// [`ServerConfig::sse_heartbeat_ms`].
-    pub sse_heartbeat_ms: u64,
+    /// [`Config::server`], every field of which is boot-layer.
+    pub server: ServerConfig,
     /// [`Config::log_format`].
     pub log_format: LogFormatConfig,
     /// [`AuthConfig::enabled`].
@@ -939,11 +934,7 @@ pub fn boot_view(toml_text: &str, label: &str) -> Result<BootView, ConfigError> 
         message: describe_figment_error(&e),
     })?;
     Ok(BootView {
-        host: config.server.host,
-        port: config.server.port,
-        body_limit: config.server.body_limit,
-        first_token_timeout_ms: config.server.first_token_timeout_ms,
-        sse_heartbeat_ms: config.server.sse_heartbeat_ms,
+        server: config.server,
         log_format: config.log_format,
         auth_enabled: config.auth.enabled,
         db_path: config.auth.db_path,
@@ -958,22 +949,7 @@ pub fn boot_view(toml_text: &str, label: &str) -> Result<BootView, ConfigError> 
 pub fn boot_layer_diff(current: &str, candidate: &str) -> Result<Vec<String>, ConfigError> {
     let before = boot_view(current, "current")?;
     let after = boot_view(candidate, "candidate")?;
-    let mut diffs = Vec::new();
-    if before.host != after.host {
-        diffs.push("server.host".to_owned());
-    }
-    if before.port != after.port {
-        diffs.push("server.port".to_owned());
-    }
-    if before.body_limit != after.body_limit {
-        diffs.push("server.body_limit".to_owned());
-    }
-    if before.first_token_timeout_ms != after.first_token_timeout_ms {
-        diffs.push("server.first_token_timeout_ms".to_owned());
-    }
-    if before.sse_heartbeat_ms != after.sse_heartbeat_ms {
-        diffs.push("server.sse_heartbeat_ms".to_owned());
-    }
+    let mut diffs = server_field_diffs(&before.server, &after.server);
     if before.log_format != after.log_format {
         diffs.push("log_format".to_owned());
     }
@@ -989,126 +965,132 @@ pub fn boot_layer_diff(current: &str, candidate: &str) -> Result<Vec<String>, Co
     Ok(diffs)
 }
 
-/// Top-level keys a boot-only document (`config_source = "db"`) may contain.
-const BOOT_ONLY_TOP_LEVEL_KEYS: [&str; 4] = ["server", "log_format", "auth", "config_source"];
+/// `server.<field>` for every [`ServerConfig`] field that differs, found by
+/// comparing the two serialized forms field by field rather than from a
+/// hand-kept list, so a new field can never be silently left out.
+fn server_field_diffs(before: &ServerConfig, after: &ServerConfig) -> Vec<String> {
+    if before == after {
+        return Vec::new();
+    }
+    match (serde_json::to_value(before), serde_json::to_value(after)) {
+        (Ok(serde_json::Value::Object(before)), Ok(serde_json::Value::Object(after))) => before
+            .iter()
+            .filter(|(key, value)| after.get(key.as_str()) != Some(*value))
+            .map(|(key, _)| format!("server.{key}"))
+            .collect(),
+        // A plain struct always serializes to an object; if it ever did not,
+        // still refuse the change (the structs differ) rather than wave it
+        // through.
+        _ => vec!["server".to_owned()],
+    }
+}
 
-/// Keys allowed inside `[auth]` in a boot-only document - the rest of
-/// `AuthConfig` is dynamic (see the classification note on [`Config`]).
-const BOOT_ONLY_AUTH_KEYS: [&str; 2] = ["enabled", "db_path"];
+/// Top-level keys that are boot-layer in their entirety (ADR 012 §1).
+const BOOT_TOP_LEVEL_KEYS: [&str; 3] = ["server", "log_format", "config_source"];
+
+/// The boot-layer keys inside `[auth]`, the one table split across both
+/// layers; its other keys (`flush_interval_ms`, `usage_channel_capacity`,
+/// `usage_batch_max`, `usage_flush_ms`, `retention_days`) are dynamic.
+const BOOT_AUTH_KEYS: [&str; 2] = ["enabled", "db_path"];
+
+/// Which config layer a document key belongs to (ADR 012 §1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Layer {
+    Boot,
+    Dynamic,
+}
+
+/// Every key of `toml_text` with its layer, in document order: top-level
+/// keys by name, except `[auth]`, which is split into its own dotted keys
+/// (`auth.enabled`, `auth.retention_days`, ...). Parses with plain
+/// `toml::Value`, not `Config`, so a document that is otherwise invalid still
+/// gets the specific boot/dynamic error from the callers below instead of a
+/// generic parse failure. The single source of the classification both
+/// [`ensure_boot_only`] and [`ensure_dynamic_only`] enforce.
+fn classify_keys(toml_text: &str, label: &str) -> Result<Vec<(String, Layer)>, ConfigError> {
+    let value: toml::Value =
+        toml_text
+            .parse()
+            .map_err(|e: toml::de::Error| ConfigError::Parse {
+                path: label.to_owned(),
+                message: e.to_string(),
+            })?;
+    let mut keys = Vec::new();
+    // A syntactically valid TOML document is always a table at the top
+    // level; `toml::Value::parse` cannot produce anything else here.
+    let Some(table) = value.as_table() else {
+        return Ok(keys);
+    };
+    for (key, entry) in table {
+        if BOOT_TOP_LEVEL_KEYS.contains(&key.as_str()) {
+            keys.push((key.clone(), Layer::Boot));
+        } else if key == "auth" {
+            // A non-table `auth` has no keys to classify; the full parse
+            // rejects it later with a precise type error.
+            if let Some(auth) = entry.as_table() {
+                for auth_key in auth.keys() {
+                    let layer = if BOOT_AUTH_KEYS.contains(&auth_key.as_str()) {
+                        Layer::Boot
+                    } else {
+                        Layer::Dynamic
+                    };
+                    keys.push((format!("auth.{auth_key}"), layer));
+                }
+            }
+        } else {
+            keys.push((key.clone(), Layer::Dynamic));
+        }
+    }
+    Ok(keys)
+}
 
 /// Reject any key in `toml_text` that is not boot-layer (ADR 012 §1): in
 /// `config_source = "db"` mode the boot file may hold ONLY `server`,
 /// `log_format`, `auth.enabled`, `auth.db_path` and `config_source` itself -
 /// a dynamic key there would be a second, silently-diverging source for a
 /// value the DB is supposed to own exclusively, which is exactly the
-/// drift-prone pattern ADR 012 refuses. Parses with plain `toml::Value` (not
-/// `Config`) so a document that is boot-only but otherwise dynamically
-/// invalid still gets this specific, actionable error instead of a generic
-/// parse failure.
+/// drift-prone pattern ADR 012 refuses.
 pub fn ensure_boot_only(toml_text: &str, label: &str) -> Result<(), ConfigError> {
-    let value: toml::Value =
-        toml_text
-            .parse()
-            .map_err(|e: toml::de::Error| ConfigError::Parse {
-                path: label.to_owned(),
-                message: e.to_string(),
-            })?;
-    let Some(table) = value.as_table() else {
-        // A syntactically valid TOML document is always a table at the top
-        // level; `toml::Value::parse` cannot produce anything else here.
-        return Ok(());
-    };
-    for (key, entry) in table {
-        if !BOOT_ONLY_TOP_LEVEL_KEYS.contains(&key.as_str()) {
-            return Err(ConfigError::DynamicKeyInBootConfig {
-                path: label.to_owned(),
-                key: key.clone(),
-            });
-        }
-        if key == "auth" {
-            if let Some(auth_table) = entry.as_table() {
-                for auth_key in auth_table.keys() {
-                    if !BOOT_ONLY_AUTH_KEYS.contains(&auth_key.as_str()) {
-                        return Err(ConfigError::DynamicKeyInBootConfig {
-                            path: label.to_owned(),
-                            key: format!("auth.{auth_key}"),
-                        });
-                    }
-                }
-            }
-        }
+    match classify_keys(toml_text, label)?
+        .into_iter()
+        .find(|(_, layer)| *layer == Layer::Dynamic)
+    {
+        Some((key, _)) => Err(ConfigError::DynamicKeyInBootConfig {
+            path: label.to_owned(),
+            key,
+        }),
+        None => Ok(()),
     }
-    Ok(())
 }
 
-/// Top-level keys forbidden in a dynamic-only document (`config_source =
-/// "db"` mode candidate): the boot-layer top-level keys, mirroring
-/// [`BOOT_ONLY_TOP_LEVEL_KEYS`] minus `auth` itself (an `[auth]` table is
-/// allowed there - it is only two of its KEYS that are forbidden, checked
-/// separately below).
-const DYNAMIC_FORBIDDEN_TOP_LEVEL_KEYS: [&str; 3] = ["server", "log_format", "config_source"];
-
-/// Keys forbidden inside `[auth]` in a dynamic-only document: the boot-layer
-/// half of `AuthConfig`, mirroring [`BOOT_ONLY_AUTH_KEYS`]. The five dynamic
-/// auth knobs (`flush_interval_ms`, `usage_channel_capacity`,
-/// `usage_batch_max`, `usage_flush_ms`, `retention_days`) remain allowed.
-const DYNAMIC_FORBIDDEN_AUTH_KEYS: [&str; 2] = ["enabled", "db_path"];
-
 /// Reject any boot-layer key in `toml_text` (ADR 012 §1): the inverse of
-/// [`ensure_boot_only`], applied to every `config_source = "db"` candidate
-/// document (`admin::apply_document`, unconditionally, regardless of the
-/// candidate's values) BEFORE [`ConfigContext::validate_document`](crate::config_source::ConfigContext::validate_document)
-/// runs.
+/// [`ensure_boot_only`], applied to every `config_source = "db"` dynamic
+/// document regardless of the key's value - on the admin write path
+/// (`admin::apply_document`, before validation) and on the read path
+/// ([`crate::config_source::ConfigContext::load_config`], at boot and on
+/// every reload).
 ///
-/// This closes a hole [`boot_layer_diff`] cannot: in db mode the CURRENT
-/// document never carries boot keys at all, so every boot field on that side
-/// already resolves to its built-in default. A candidate that sets a boot
-/// key EXPLICITLY to that same default (`[auth] enabled = false`, `[auth]
-/// db_path = "lumen.db"`, `[server] port = 8080`, ...) then produces an
-/// empty diff against `boot_layer_diff` and would otherwise pass straight
-/// through to `persist` - but [`Config::load_with_dynamic`] merges the
-/// dynamic document OVER the boot file on every subsequent boot, so the
-/// stored key would silently win at the next restart: `auth.enabled =
-/// false` refuses to boot outright (`main.rs`'s `ensure!`), a different
-/// `auth.db_path` points the process at the wrong database, and a different
-/// `server.port` silently rebinds away from whatever the boot file
-/// specified. A dynamic document may therefore never carry a boot-layer key
-/// at all, independent of its value - the only way to change one is to edit
-/// the boot file and restart.
+/// [`boot_layer_diff`] cannot close this on its own: in db mode the CURRENT
+/// document never carries boot keys, so every boot field on that side
+/// resolves to its built-in default, and a candidate that sets one
+/// EXPLICITLY to that same default (`[auth] enabled = false`, `[server]
+/// port = 8080`, ...) produces an empty diff. But
+/// [`Config::load_with_dynamic`] merges the dynamic document OVER the boot
+/// file, so the stored key would silently win at the next boot: auth
+/// switched off, a different database, a different bind port. A dynamic
+/// document may therefore never carry a boot-layer key at all; the only way
+/// to change one is to edit the boot file and restart.
 pub fn ensure_dynamic_only(toml_text: &str, label: &str) -> Result<(), ConfigError> {
-    let value: toml::Value =
-        toml_text
-            .parse()
-            .map_err(|e: toml::de::Error| ConfigError::Parse {
-                path: label.to_owned(),
-                message: e.to_string(),
-            })?;
-    let Some(table) = value.as_table() else {
-        // A syntactically valid TOML document is always a table at the top
-        // level; `toml::Value::parse` cannot produce anything else here.
-        return Ok(());
-    };
-    for (key, entry) in table {
-        if DYNAMIC_FORBIDDEN_TOP_LEVEL_KEYS.contains(&key.as_str()) {
-            return Err(ConfigError::BootKeyInDynamicConfig {
-                path: label.to_owned(),
-                key: key.clone(),
-            });
-        }
-        if key == "auth" {
-            if let Some(auth_table) = entry.as_table() {
-                for auth_key in auth_table.keys() {
-                    if DYNAMIC_FORBIDDEN_AUTH_KEYS.contains(&auth_key.as_str()) {
-                        return Err(ConfigError::BootKeyInDynamicConfig {
-                            path: label.to_owned(),
-                            key: format!("auth.{auth_key}"),
-                        });
-                    }
-                }
-            }
-        }
+    match classify_keys(toml_text, label)?
+        .into_iter()
+        .find(|(_, layer)| *layer == Layer::Boot)
+    {
+        Some((key, _)) => Err(ConfigError::BootKeyInDynamicConfig {
+            path: label.to_owned(),
+            key,
+        }),
+        None => Ok(()),
     }
-    Ok(())
 }
 
 impl Config {
@@ -1140,11 +1122,12 @@ impl Config {
     /// [`crate::config_source::DbSource`]) supplies everything else
     /// (providers, resilience, telemetry, webhooks, ...). The two merge into
     /// one `Config` the same way the single file does in file mode, then
-    /// `LUMEN_*` env vars overlay both, exactly as [`Self::load`]. Boot-layer
-    /// values always come from `boot_path`: nothing in this function stops
-    /// `dynamic_toml` from also naming a boot key, but the write path that
-    /// produces `dynamic_toml` (`ensure_boot_only` applied to admin writes)
-    /// is responsible for never letting one land there.
+    /// `LUMEN_*` env vars overlay both, exactly as [`Self::load`]. Nothing in
+    /// this function stops `dynamic_toml` from also naming a boot key, which
+    /// would then override the boot file; callers enforce that it cannot
+    /// with [`ensure_dynamic_only`], on the admin write path
+    /// (`admin::apply_document`) and on the read path
+    /// ([`crate::config_source::ConfigContext::load_config`]).
     pub fn load_with_dynamic(boot_path: &Path, dynamic_toml: &str) -> Result<Self, ConfigError> {
         let label = boot_path.display().to_string();
         // Mirrors `Self::load`: an explicitly requested boot file that does
@@ -2348,6 +2331,15 @@ mod tests {
     // ---- Boot vs dynamic layer split (ADR 012, task 4) ---------------------
 
     #[test]
+    fn boot_layer_diff_compares_every_server_field() {
+        let base = "[server]\nport = 8080\n";
+        let changed = "[server]\nport = 8080\nbody_limit = 1024\nsse_heartbeat_ms = 5\n";
+        let mut diff = boot_layer_diff(base, changed).unwrap();
+        diff.sort_unstable();
+        assert_eq!(diff, ["server.body_limit", "server.sse_heartbeat_ms"]);
+    }
+
+    #[test]
     fn boot_layer_diff_names_changed_restart_only_keys() {
         let a = "[server]\nport = 8080\n";
         let b = "[server]\nport = 9090\nhost = \"127.0.0.1\"\n"; // host explicit = default: no diff
@@ -2479,8 +2471,8 @@ mod tests {
     #[test]
     fn every_config_field_is_classified_boot_or_dynamic() {
         // Pin the exhaustive classification of Config's top-level fields, so
-        // adding one fails CI until it is classified in BootView,
-        // ensure_boot_only AND here.
+        // adding one fails CI until it is classified in BootView, the
+        // classify_keys constants AND here.
         //
         // Uses serde_json, not toml: a toml serializer has nowhere to put an
         // `Option::None` value (TOML has no `null`), so `webhooks: None` would

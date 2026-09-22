@@ -1350,7 +1350,15 @@ impl KeyStore {
         expected_hash: &str,
         empty_hash: &str,
     ) -> Result<ConfigCasOutcome, AuthError> {
-        let mut tx = self.pool.begin().await?;
+        // IMMEDIATE, not the default DEFERRED: a deferred transaction reads
+        // first and must then upgrade to a write lock for the INSERT, and
+        // SQLite refuses a read-to-write upgrade that contends with another
+        // writer with an immediate SQLITE_BUSY ("database is locked"),
+        // without ever consulting busy_timeout. The usage-log writer and
+        // budget flusher write to this same file continuously, so a deferred
+        // CAS would fail intermittently in production. Taking the write lock
+        // up front makes the CAS wait on busy_timeout instead.
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let current: Option<String> =
             sqlx::query_scalar("SELECT hash FROM config_versions ORDER BY id DESC LIMIT 1")
                 .fetch_optional(&mut *tx)

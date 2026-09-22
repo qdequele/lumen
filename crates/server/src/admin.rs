@@ -1190,7 +1190,7 @@ pub async fn put_config(
     body: String,
 ) -> Result<StatusCode, ApiError> {
     let if_match = require_if_match(&headers)?;
-    apply_document(&state, body, &if_match).await?;
+    apply_document(&state, &if_match, move |_current| Ok(body)).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1209,10 +1209,17 @@ fn require_if_match(headers: &axum::http::HeaderMap) -> Result<String, ApiError>
     Ok(if_match.trim_matches('"').to_owned())
 }
 
-/// Apply a candidate config document through `state.config`'s
+/// Apply a config edit through `state.config`'s
 /// [`ConfigSource`](crate::config_source::ConfigSource), in either mode.
 /// Shared by `PUT /admin/config` and every granular config endpoint
 /// (Task 8, ADR 012).
+///
+/// `edit` turns the current document into the candidate (the whole-document
+/// `PUT` ignores it and returns its body; a granular write patches it). It
+/// runs on the document loaded under the lock, after the `If-Match` check,
+/// so the patch is always applied to exactly the version whose hash the
+/// client presented - never to a copy read before the lock that a
+/// concurrent write could have replaced.
 ///
 /// The whole sequence runs under `state.config_apply_lock` (a
 /// `tokio::sync::Mutex`, held across every `.await` below): two concurrent
@@ -1253,11 +1260,10 @@ fn require_if_match(headers: &axum::http::HeaderMap) -> Result<String, ApiError>
 ///    file mode) - `LM-1004` (412) on that race too.
 /// 6. Ping the hot-reload trigger, if one is armed, so the new document
 ///    applies without a restart.
-async fn apply_document(
-    state: &AppState,
-    candidate: String,
-    if_match: &str,
-) -> Result<(), ApiError> {
+async fn apply_document<F>(state: &AppState, if_match: &str, edit: F) -> Result<(), ApiError>
+where
+    F: FnOnce(&str) -> Result<String, ApiError>,
+{
     let ctx = config_ctx(state)?;
     let _guard = state.config_apply_lock.lock().await;
 
@@ -1274,6 +1280,8 @@ async fn apply_document(
         );
         return Err(stale_config_error());
     }
+
+    let candidate = edit(&current.toml)?;
 
     let diff = boot_layer_diff(&current.toml, &candidate).map_err(|error| {
         // `boot_layer_diff` labels both sides "current"/"candidate" (never a
@@ -1625,15 +1633,10 @@ pub async fn put_provider(
         .into());
     }
 
-    let ctx = config_ctx(&state)?;
-    let current = ctx
-        .source
-        .load()
-        .await
-        .map_err(|e| source_internal_error(&e))?;
-    let candidate = config_edit::upsert_provider(&current.toml, &provider)
-        .map_err(|e| edit_internal_error(&e))?;
-    apply_document(&state, candidate, &if_match).await?;
+    apply_document(&state, &if_match, move |current| {
+        config_edit::upsert_provider(current, &provider).map_err(|e| edit_internal_error(&e))
+    })
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1650,16 +1653,12 @@ pub async fn delete_provider(
     headers: axum::http::HeaderMap,
 ) -> Result<StatusCode, ApiError> {
     let if_match = require_if_match(&headers)?;
-    let ctx = config_ctx(&state)?;
-    let current = ctx
-        .source
-        .load()
-        .await
-        .map_err(|e| source_internal_error(&e))?;
-    let candidate = config_edit::delete_provider(&current.toml, &name)
-        .map_err(|e| edit_internal_error(&e))?
-        .ok_or(GatewayError::RouteNotFound)?;
-    apply_document(&state, candidate, &if_match).await?;
+    apply_document(&state, &if_match, move |current| {
+        config_edit::delete_provider(current, &name)
+            .map_err(|e| edit_internal_error(&e))?
+            .ok_or_else(|| GatewayError::RouteNotFound.into())
+    })
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1735,18 +1734,25 @@ pub async fn get_config_section(
     Ok(Json(serde_json::Value::Object(envelope)))
 }
 
-/// Deserialize `body` as `T` and replace `section` in `doc` wholesale via
-/// [`config_edit::replace_section`]. Shared by every [`put_config_section`]
-/// arm except `auth`, which merges into the existing table instead of
-/// replacing it (see [`config_edit::replace_auth_knobs`]).
-fn replace_section_from_json<T: serde::de::DeserializeOwned + serde::Serialize>(
-    doc: &str,
-    section: &str,
-    body: &str,
-) -> Result<String, ApiError> {
+/// A deferred document edit, built from the request before the apply lock
+/// is taken and run by [`apply_document`] on the document it loads.
+type ConfigEdit = Box<dyn FnOnce(&str) -> Result<String, ApiError> + Send>;
+
+/// Deserialize `body` as `T` and return an edit replacing `section` wholesale
+/// via [`config_edit::replace_section`]. Shared by every
+/// [`put_config_section`] arm except `auth` (a field-level merge, see
+/// [`config_edit::replace_auth_knobs`]) and `webhooks` (which also accepts
+/// `null` to remove the block).
+fn replace_section_edit<T>(section: &str, body: &str) -> Result<ConfigEdit, ApiError>
+where
+    T: serde::de::DeserializeOwned + serde::Serialize + Send + 'static,
+{
     let value: T = serde_json::from_str(body)
         .map_err(|error| GatewayError::InvalidRequest(error.to_string()))?;
-    config_edit::replace_section(doc, section, &value).map_err(|e| edit_internal_error(&e))
+    let section = section.to_owned();
+    Ok(Box::new(move |doc| {
+        config_edit::replace_section(doc, &section, &value).map_err(|e| edit_internal_error(&e))
+    }))
 }
 
 /// `PUT /admin/config/{section}` for the same fixed set [`get_config_section`]
@@ -1771,37 +1777,36 @@ pub async fn put_config_section(
     body: String,
 ) -> Result<StatusCode, ApiError> {
     let if_match = require_if_match(&headers)?;
-    let ctx = config_ctx(&state)?;
-    let current = ctx
-        .source
-        .load()
-        .await
-        .map_err(|e| source_internal_error(&e))?;
 
-    let candidate = match section.as_str() {
-        "resilience" => {
-            replace_section_from_json::<ResilienceConfig>(&current.toml, &section, &body)?
+    let edit: ConfigEdit = match section.as_str() {
+        "resilience" => replace_section_edit::<ResilienceConfig>(&section, &body)?,
+        "telemetry" => replace_section_edit::<TelemetryConfig>(&section, &body)?,
+        "tokenizer" => replace_section_edit::<TokenizerConfig>(&section, &body)?,
+        "image_fetch" => replace_section_edit::<ImageFetchConfig>(&section, &body)?,
+        "webhooks" => {
+            // `null` removes the block, mirroring the `null` GET reports when
+            // it is absent; anything else replaces it.
+            let value: Option<WebhooksConfig> = serde_json::from_str(&body)
+                .map_err(|error| GatewayError::InvalidRequest(error.to_string()))?;
+            Box::new(move |doc| {
+                match &value {
+                    Some(settings) => config_edit::replace_section(doc, "webhooks", settings),
+                    None => config_edit::remove_section(doc, "webhooks"),
+                }
+                .map_err(|e| edit_internal_error(&e))
+            })
         }
-        "telemetry" => {
-            replace_section_from_json::<TelemetryConfig>(&current.toml, &section, &body)?
-        }
-        "tokenizer" => {
-            replace_section_from_json::<TokenizerConfig>(&current.toml, &section, &body)?
-        }
-        "image_fetch" => {
-            replace_section_from_json::<ImageFetchConfig>(&current.toml, &section, &body)?
-        }
-        "webhooks" => replace_section_from_json::<WebhooksConfig>(&current.toml, &section, &body)?,
         "auth" => {
             let knobs: AuthDynamicKnobs = serde_json::from_str(&body)
                 .map_err(|error| GatewayError::InvalidRequest(error.to_string()))?;
-            config_edit::replace_auth_knobs(&current.toml, &knobs)
-                .map_err(|e| edit_internal_error(&e))?
+            Box::new(move |doc| {
+                config_edit::replace_auth_knobs(doc, &knobs).map_err(|e| edit_internal_error(&e))
+            })
         }
         _ => return Err(GatewayError::RouteNotFound.into()),
     };
 
-    apply_document(&state, candidate, &if_match).await?;
+    apply_document(&state, &if_match, edit).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

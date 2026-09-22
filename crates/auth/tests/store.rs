@@ -895,3 +895,62 @@ async fn config_versions_retention_keeps_newest_50() {
     assert_eq!(n, 50);
     assert_eq!(store.current_config().await.unwrap().unwrap().1, "h59");
 }
+
+/// The config CAS must not fail when another connection writes to the same
+/// file mid-transaction. In production the usage-log writer and budget
+/// flusher commit to this database continuously; a DEFERRED transaction that
+/// reads and then upgrades to write gets an immediate SQLITE_BUSY ("database
+/// is locked", never retried by busy_timeout) when it contends with such a
+/// writer, surfacing as a 500 on db-mode config writes.
+#[tokio::test]
+async fn config_version_cas_survives_concurrent_writers_on_the_same_file() {
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(format!("config-cas-contention-{}.db", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let store = KeyStore::connect(&format!("sqlite://{}", path.display()))
+        .await
+        .unwrap();
+    sqlx::query("CREATE TABLE noise (x INTEGER)")
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer = {
+        let pool = store.pool().clone();
+        let stop = std::sync::Arc::clone(&stop);
+        tokio::spawn(async move {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                sqlx::query("INSERT INTO noise (x) VALUES (1)")
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+        })
+    };
+
+    let mut prev = "e".to_owned();
+    let mut result = Ok(());
+    for i in 0..300 {
+        let h = format!("h{i}");
+        match store
+            .insert_config_version(&format!("v = {i}"), &h, &prev, "e")
+            .await
+        {
+            Ok(ConfigCasOutcome::Applied) => prev = h,
+            Ok(ConfigCasOutcome::Stale { current_hash }) => {
+                result = Err(format!("iteration {i}: unexpected Stale ({current_hash})"));
+                break;
+            }
+            Err(error) => {
+                result = Err(format!("iteration {i}: {error}"));
+                break;
+            }
+        }
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    writer.await.unwrap();
+    let _ = std::fs::remove_file(&path);
+    result.unwrap();
+}

@@ -66,13 +66,13 @@ only way to change one is to edit the boot file and restart. See
 [If-Match and the boot-layer guard](#if-match-and-the-boot-layer-guard)
 below for why an equal-to-default value cannot be waved through.
 
-A db-mode boot re-asserts `auth.enabled` and `auth.db_path` against the
-stored document after the merge: `PUT /admin/config` (and every granular
-write) is itself refused from ever touching `[auth] enabled`/`db_path` (see
-[If-Match and the boot-layer guard](#if-match-and-the-boot-layer-guard)
-below), so this is a belt-and-braces check against a document edited by
-hand outside the API - it can never boot with auth silently disabled or
-repointed to a different database file.
+The read side enforces the same rule: in db mode, every load of the stored
+document (at boot, and on every reload) refuses one that carries a
+boot-layer key, whatever its origin - a hand edit of `config_versions` or a
+restored backup included. Boot fails naming the key; a reload keeps the
+running config and logs the rejection. The gateway can therefore never
+come up with auth silently disabled, pointed at another database file, or
+bound to a different port than the boot file says.
 
 ## First boot in DB mode
 
@@ -105,7 +105,7 @@ identically in both modes, and every mutating one requires `If-Match`.
 | `PUT` | `/admin/config/providers/{name}` | Create or replace that provider (including its `models`). The path `{name}` must equal the body's own `name` field. |
 | `DELETE` | `/admin/config/providers/{name}` | Remove the provider. |
 | `GET` | `/admin/config/{section}` | One of `resilience`, `telemetry`, `tokenizer`, `image_fetch`, `webhooks`, `auth`. Response: `{"<section>": <value>, "hash": "<current hash>"}`. |
-| `PUT` | `/admin/config/{section}` | Replace that section. `auth` is special - see [The `auth` section](#the-auth-section-five-knobs-only) below. |
+| `PUT` | `/admin/config/{section}` | Replace that section. `auth` is special - see [The `auth` section](#the-auth-section-five-knobs-only) below. `webhooks` also accepts `null`, which removes the `[webhooks]` block. |
 
 Two admin surfaces are deliberately **untouched** by any of this:
 `PUT /admin/provider-keys/{name}` (encrypted secrets, see

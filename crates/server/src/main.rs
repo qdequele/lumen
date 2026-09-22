@@ -556,66 +556,55 @@ fn build_token_counter(config: &Config) -> Arc<TokenCounter> {
 /// process has always read and rewritten. DB mode reads ONLY the boot layer
 /// from `config_path` (a dynamic key there is a boot error -
 /// [`ensure_boot_only`]), requires `auth.enabled = true`, opens the auth
-/// database early, and merges the stored dynamic document over the boot
-/// layer via [`Config::load_with_dynamic`]. An empty stored document (a
+/// database early, and loads the stored dynamic document through
+/// [`ConfigContext::load_config`], which refuses one carrying a boot-layer
+/// key and merges it over the boot layer. An empty stored document (a
 /// fresh DB-mode deployment with nothing ever persisted) is a valid,
 /// provider-less boot state - logged, not an error - since the operator's
 /// next step is `PUT /admin/config`, not a restart.
 async fn boot_config_context(
     config_path: &Path,
 ) -> anyhow::Result<(Config, ConfigContext, Option<KeyStore>)> {
-    let boot = Config::load(config_path)?;
+    // Reading and parsing the boot file is synchronous file I/O, and this
+    // runs inside the runtime: do it on the blocking pool.
+    let path = config_path.to_path_buf();
+    let boot = tokio::task::spawn_blocking(move || -> anyhow::Result<Config> {
+        let boot = Config::load(&path)?;
+        if boot.config_source == ConfigSourceKind::Db {
+            let text = std::fs::read_to_string(&path)?;
+            ensure_boot_only(&text, &path.display().to_string())?;
+        }
+        Ok(boot)
+    })
+    .await
+    .context("boot config load task failed")??;
+
     match boot.config_source {
         ConfigSourceKind::File => Ok((boot, ConfigContext::file(config_path.to_path_buf()), None)),
         ConfigSourceKind::Db => {
-            let text = std::fs::read_to_string(config_path)?;
-            ensure_boot_only(&text, &config_path.display().to_string())?;
             anyhow::ensure!(
                 boot.auth.enabled,
                 "config_source = \"db\" requires [auth] enabled = true with a database"
             );
             let store = KeyStore::connect(&boot.auth.db_url()).await?; // runs migrations
             let source = DbSource::new(store.clone());
-            let doc = source.load().await?;
-            if doc.toml.is_empty() {
+            if source.load().await?.toml.is_empty() {
                 tracing::warn!(
                     "config_source = \"db\" and no config stored yet; \
                      PUT /admin/config to install one"
                 );
             }
-            let config = Config::load_with_dynamic(config_path, &doc.toml)?;
-            // `load_with_dynamic` merges the stored document OVER the boot
-            // file (`Config::load_with_dynamic`'s own doc comment already
-            // flags this), so a stored document that itself contains an
-            // `[auth]` block can silently override boot-layer values even
-            // though `ensure_boot_only` only ever guarded the BOOT file, not
-            // the dynamic one. Left unchecked, a stored `[auth] enabled =
-            // false` (or a different `db_path`) would leave this process
-            // with auth off - `boot_auth_stack` never runs, `/admin` never
-            // mounts, `/v1/*` runs as an open proxy - recoverable only by
-            // editing SQLite directly. Re-assert both boot-layer auth values
-            // against what was just checked/connected above, naming the
-            // stored document as the cause so the failure is actionable.
-            anyhow::ensure!(
-                config.auth.enabled,
-                "config_source = \"db\": the stored config document sets [auth] enabled = false, \
-                 which would silently disable auth for a restart-only boot-layer value; fix the \
-                 stored document (PUT /admin/config must never touch [auth]) or the boot file"
-            );
-            anyhow::ensure!(
-                config.auth.db_path == boot.auth.db_path,
-                "config_source = \"db\": the stored config document sets auth.db_path to '{}', \
-                 which would silently repoint this restart-only boot-layer value away from the \
-                 boot file's '{}'; fix the stored document (PUT /admin/config must never touch \
-                 [auth]) or the boot file",
-                config.auth.db_path,
-                boot.auth.db_path
-            );
-            Ok((
-                config,
-                ConfigContext::db(config_path.to_path_buf(), source),
-                Some(store),
-            ))
+            let ctx = ConfigContext::db(config_path.to_path_buf(), source);
+            // `load_config` refuses a stored document that carries any
+            // boot-layer key (`ensure_dynamic_only`) before merging it over
+            // the boot file, so the bind address, log format, auth switch
+            // and DB path always come from the boot file alone - a stored
+            // document can neither disable auth nor silently rebind.
+            let config = ctx
+                .load_config()
+                .await
+                .context("config_source = \"db\": the stored config document cannot be loaded")?;
+            Ok((config, ctx, Some(store)))
         }
     }
 }

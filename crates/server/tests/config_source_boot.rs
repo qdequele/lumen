@@ -318,32 +318,29 @@ port = {port}
     );
 }
 
-/// A stored document that itself sets `[auth]` must not silently win over
-/// the boot file's own value: `Config::load_with_dynamic` merges the stored
-/// document OVER the boot layer, so without `boot_config_context`'s explicit
-/// re-assertion, a document like this would leave the process with auth
-/// OFF - `boot_auth_stack` never runs, `/admin` never mounts, `/v1/*` runs as
-/// an open proxy - even though the boot file (and the `anyhow::ensure!` at
-/// the top of DB-mode boot) required `auth.enabled = true` a moment earlier.
-/// Boot must refuse instead, naming the stored document as the cause.
-#[tokio::test]
-async fn db_mode_refuses_to_boot_when_the_stored_document_disables_auth() {
+/// Pre-seed `stored` straight into `config_versions` (bypassing the admin
+/// write guard, as a hand edit or a restored backup would), boot, and assert
+/// the process refuses to start and names `expected_key` as the cause.
+///
+/// `Config::load_with_dynamic` merges the stored document OVER the boot
+/// file, so any boot-layer key in it would silently win: `auth.enabled =
+/// false` would run `/v1/*` as an open proxy with no `/admin`, a different
+/// `auth.db_path` would point the process at another database, and a
+/// `[server]` port would rebind it. `ConfigContext::load_config` must refuse
+/// every one of them on the read side.
+async fn assert_stored_document_refuses_boot(unique: &str, stored: &str, expected_key: &str) {
     let port = free_port();
     let dir = tempfile::tempdir().expect("tempdir");
     let db_path = dir.path().join("lumen.db");
-    let config = write_temp_config("auth-override", &db_mode_boot_config(port, &db_path));
+    let config = write_temp_config(unique, &db_mode_boot_config(port, &db_path));
 
     let store = KeyStore::connect(&format!("sqlite://{}", db_path.display()))
         .await
         .expect("open store to pre-seed");
-    let source = DbSource::new(store);
-    source
-        .persist(
-            "[auth]\nenabled = false\n",
-            &config_hash(EMPTY_DOC.as_bytes()),
-        )
+    DbSource::new(store)
+        .persist(stored, &config_hash(EMPTY_DOC.as_bytes()))
         .await
-        .expect("pre-seed a document that disables auth");
+        .expect("pre-seed the stored document");
 
     let child = lumen()
         .args(["--config"])
@@ -356,65 +353,41 @@ async fn db_mode_refuses_to_boot_when_the_stored_document_disables_auth() {
 
     let base = format!("http://127.0.0.1:{port}");
     let ready = wait_until_ready(&base, Duration::from_secs(3)).await;
-
-    let (status, out, _err) = wait_for_exit(child, Duration::from_secs(10)).await;
+    let (status, out, err) = wait_for_exit(child, Duration::from_secs(10)).await;
 
     assert!(
         !ready,
-        "a stored document that disables auth must never let db mode come up as an open proxy"
+        "a stored boot-layer key ({expected_key}) must never let db mode boot"
     );
     assert!(!status.success(), "boot must fail, not silently continue");
     assert!(
-        out.contains("the stored config document sets [auth] enabled = false"),
-        "expected the actionable stored-document message in stdout, got: {out}"
+        out.contains("the stored config document cannot be loaded")
+            && out.contains(&format!("unexpected key '{expected_key}'")),
+        "expected the stored-document refusal naming '{expected_key}'\n--- stdout ---\n{out}\n--- stderr ---\n{err}"
     );
 }
 
-/// The `db_path` sibling of the test above: a stored document repointing
-/// `auth.db_path` away from the boot file's own value must also be refused,
-/// not silently followed (it is just as much a restart-only boot-layer value
-/// as `auth.enabled`).
+#[tokio::test]
+async fn db_mode_refuses_to_boot_when_the_stored_document_disables_auth() {
+    assert_stored_document_refuses_boot(
+        "auth-override",
+        "[auth]\nenabled = false\n",
+        "auth.enabled",
+    )
+    .await;
+}
+
 #[tokio::test]
 async fn db_mode_refuses_to_boot_when_the_stored_document_repoints_db_path() {
-    let port = free_port();
-    let dir = tempfile::tempdir().expect("tempdir");
-    let db_path = dir.path().join("lumen.db");
-    let config = write_temp_config("db-path-override", &db_mode_boot_config(port, &db_path));
+    assert_stored_document_refuses_boot(
+        "db-path-override",
+        "[auth]\ndb_path = \"elsewhere.db\"\n",
+        "auth.db_path",
+    )
+    .await;
+}
 
-    let store = KeyStore::connect(&format!("sqlite://{}", db_path.display()))
-        .await
-        .expect("open store to pre-seed");
-    let source = DbSource::new(store);
-    let elsewhere = dir.path().join("elsewhere.db");
-    source
-        .persist(
-            &format!("[auth]\ndb_path = \"{}\"\n", elsewhere.display()),
-            &config_hash(EMPTY_DOC.as_bytes()),
-        )
-        .await
-        .expect("pre-seed a document that repoints db_path");
-
-    let child = lumen()
-        .args(["--config"])
-        .arg(&config)
-        .env("LUMEN_MASTER_KEY", master_key())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn lumen");
-
-    let base = format!("http://127.0.0.1:{port}");
-    let ready = wait_until_ready(&base, Duration::from_secs(3)).await;
-
-    let (status, out, _err) = wait_for_exit(child, Duration::from_secs(10)).await;
-
-    assert!(
-        !ready,
-        "a stored document that repoints auth.db_path must never let db mode boot"
-    );
-    assert!(!status.success(), "boot must fail, not silently continue");
-    assert!(
-        out.contains("sets auth.db_path to"),
-        "expected the actionable stored-document message in stdout, got: {out}"
-    );
+#[tokio::test]
+async fn db_mode_refuses_to_boot_when_the_stored_document_rebinds_the_server() {
+    assert_stored_document_refuses_boot("server-override", "[server]\nport = 9\n", "server").await;
 }

@@ -19,7 +19,7 @@ use std::sync::Arc;
 use lumen_auth::store::KeyStore;
 use lumen_providers::RegistryError;
 
-use crate::config::{Config, ConfigError, ConfigSourceKind};
+use crate::config::{ensure_dynamic_only, Config, ConfigError, ConfigSourceKind};
 
 /// A config document read from a [`ConfigSource`], paired with the content
 /// hash a later `persist` must present as `expected_hash` to replace it.
@@ -407,10 +407,19 @@ impl ConfigContext {
     /// synchronous work (TOML parsing, and in file mode a file read), never
     /// safe to run on a runtime worker thread.
     ///
+    /// DB mode also refuses a stored document carrying any boot-layer key
+    /// ([`ensure_dynamic_only`]) before merging it. `Config::load_with_dynamic`
+    /// merges the dynamic document OVER the boot file, so such a key would
+    /// silently override the boot file (a different `server.port`, `auth`
+    /// switched off). The admin write path already refuses these keys; this
+    /// read-side check covers every other way a row can reach
+    /// `config_versions` (a hand edit, a restored backup), at boot and on
+    /// every reload alike.
+    ///
     /// # Errors
     /// [`ConfigLoadError::Source`] if the source itself could not be read;
-    /// [`ConfigLoadError::Config`] if the resulting document does not parse
-    /// or fails validation.
+    /// [`ConfigLoadError::Config`] if the resulting document does not parse,
+    /// fails validation, or (DB mode) carries a boot-layer key.
     pub async fn load_config(&self) -> Result<Config, ConfigLoadError> {
         match self.kind {
             ConfigSourceKind::File => {
@@ -420,7 +429,11 @@ impl ConfigContext {
             ConfigSourceKind::Db => {
                 let doc = self.source.load().await?;
                 let boot_path = self.boot_path.clone();
-                load_blocking(move || Config::load_with_dynamic(&boot_path, &doc.toml)).await
+                load_blocking(move || {
+                    ensure_dynamic_only(&doc.toml, "stored config document")?;
+                    Config::load_with_dynamic(&boot_path, &doc.toml)
+                })
+                .await
             }
         }
     }
@@ -736,6 +749,35 @@ mod tests {
         assert!(
             matches!(err, ConfigLoadError::Registry(_)),
             "expected a Registry error, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn load_config_db_mode_refuses_a_stored_boot_layer_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let boot_path = dir.path().join("boot.toml");
+        std::fs::write(&boot_path, "[server]\nport = 8080\n").unwrap();
+        let store = KeyStore::in_memory().await.unwrap();
+        let source = DbSource::new(store);
+        // Written straight through the source, bypassing the admin guard, as
+        // a hand edit or a restored backup would.
+        source
+            .persist("[server]\nport = 9\n", &empty_doc_hash())
+            .await
+            .unwrap();
+        let ctx = ConfigContext::db(boot_path, source);
+
+        let err = ctx
+            .load_config()
+            .await
+            .expect_err("a stored document with a boot-layer key must not load");
+        assert!(
+            matches!(
+                err,
+                ConfigLoadError::Config(ConfigError::BootKeyInDynamicConfig { ref key, .. })
+                    if key == "server"
+            ),
+            "expected BootKeyInDynamicConfig for 'server', got {err:?}"
         );
     }
 }
