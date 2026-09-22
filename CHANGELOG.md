@@ -101,6 +101,13 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ### Fixed
 
+- **rustls bumped to 0.23.45 for RUSTSEC-2026-0285**: rustls accepted TLS 1.3
+  handshake messages sent across an encryption-level boundary (e.g. a
+  plaintext `EncryptedExtensions` in the same record as the `ServerHello`)
+  instead of rejecting the connection. The transcript stays authenticated,
+  so a handshake cannot be altered, but the `audit` CI job fails on it.
+  Lockfile-only (`rustls-webpki` moves to 0.103.15 with it).
+
 - **Every setting the admin config API accepts now applies live** (ADR 012).
   `[tokenizer]` and `[image_fetch]` were saved by an admin write but only
   took effect after a restart; a hot reload now swaps both (the tokenizer is
