@@ -22,7 +22,8 @@ migration story and what version numbers promise.
 ## Schema migrations run themselves
 
 When auth is enabled, the gateway applies its embedded, numbered SQLite
-migrations **automatically at boot** (six of them as of 0.2.0). There is
+migrations **automatically at boot** (one per schema change, listed in
+`crates/auth/migrations/`). There is
 no separate migrate command and nothing to run by hand.
 
 - **Forward-only.** There are no down-migrations. Rolling back to an older

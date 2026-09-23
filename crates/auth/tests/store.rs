@@ -10,7 +10,9 @@
 use lumen_auth::crypto::MasterKey;
 use lumen_auth::events::{EventKind, WebhookSettings};
 use lumen_auth::key::hash_key;
-use lumen_auth::store::{KeyPatch, KeyStore, NewKey, UsageFilter, UsageGroupBy, UsageRecord};
+use lumen_auth::store::{
+    ConfigCasOutcome, KeyPatch, KeyStore, NewKey, UsageFilter, UsageGroupBy, UsageRecord,
+};
 
 fn new_key(name: &str) -> NewKey {
     NewKey {
@@ -843,4 +845,112 @@ async fn the_settings_row_never_carries_the_secret_only_the_variable_name() {
     );
     let rendered = format!("{loaded:?}");
     assert!(!rendered.contains("whsec-elsewhere"), "{rendered}");
+}
+
+// ---- Config versions (ADR 012) --------------------------------------------
+
+#[tokio::test]
+async fn config_version_cas_applies_and_rejects_stale() {
+    let store = KeyStore::in_memory().await.unwrap();
+    let empty = "empty-hash";
+    // Empty table: only the empty hash matches.
+    let out = store
+        .insert_config_version("a = 1", "h1", "wrong", empty)
+        .await
+        .unwrap();
+    assert!(matches!(out, ConfigCasOutcome::Stale { .. }));
+    let out = store
+        .insert_config_version("a = 1", "h1", empty, empty)
+        .await
+        .unwrap();
+    assert!(matches!(out, ConfigCasOutcome::Applied));
+    assert_eq!(
+        store.current_config().await.unwrap(),
+        Some(("a = 1".into(), "h1".into()))
+    );
+    // Stale expected hash after a write.
+    let out = store
+        .insert_config_version("a = 2", "h2", empty, empty)
+        .await
+        .unwrap();
+    assert!(matches!(out, ConfigCasOutcome::Stale { current_hash } if current_hash == "h1"));
+}
+
+#[tokio::test]
+async fn config_versions_retention_keeps_newest_50() {
+    let store = KeyStore::in_memory().await.unwrap();
+    let mut prev = "e".to_owned();
+    for i in 0..60 {
+        let h = format!("h{i}");
+        store
+            .insert_config_version(&format!("v = {i}"), &h, &prev, "e")
+            .await
+            .unwrap();
+        prev = h;
+    }
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM config_versions")
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+    assert_eq!(n, 50);
+    assert_eq!(store.current_config().await.unwrap().unwrap().1, "h59");
+}
+
+/// The config CAS must not fail when another connection writes to the same
+/// file mid-transaction. In production the usage-log writer and budget
+/// flusher commit to this database continuously; a DEFERRED transaction that
+/// reads and then upgrades to write gets an immediate SQLITE_BUSY ("database
+/// is locked", never retried by busy_timeout) when it contends with such a
+/// writer, surfacing as a 500 on db-mode config writes.
+#[tokio::test]
+async fn config_version_cas_survives_concurrent_writers_on_the_same_file() {
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(format!("config-cas-contention-{}.db", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let store = KeyStore::connect(&format!("sqlite://{}", path.display()))
+        .await
+        .unwrap();
+    sqlx::query("CREATE TABLE noise (x INTEGER)")
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer = {
+        let pool = store.pool().clone();
+        let stop = std::sync::Arc::clone(&stop);
+        tokio::spawn(async move {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                sqlx::query("INSERT INTO noise (x) VALUES (1)")
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+        })
+    };
+
+    let mut prev = "e".to_owned();
+    let mut result = Ok(());
+    for i in 0..300 {
+        let h = format!("h{i}");
+        match store
+            .insert_config_version(&format!("v = {i}"), &h, &prev, "e")
+            .await
+        {
+            Ok(ConfigCasOutcome::Applied) => prev = h,
+            Ok(ConfigCasOutcome::Stale { current_hash }) => {
+                result = Err(format!("iteration {i}: unexpected Stale ({current_hash})"));
+                break;
+            }
+            Err(error) => {
+                result = Err(format!("iteration {i}: {error}"));
+                break;
+            }
+        }
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    writer.await.unwrap();
+    let _ = std::fs::remove_file(&path);
+    result.unwrap();
 }

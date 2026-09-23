@@ -44,7 +44,7 @@ reference.
 | `GET  /health`                 | Liveness. No I/O, never touches the DB or providers.    |
 | `GET  /health/providers`       | Background provider-probe results (opt-in, see below).  |
 | `GET  /metrics`                | Prometheus exposition.                                  |
-| `POST/GET/PUT/PATCH/DELETE /admin/*` | Keys, budgets, budget webhooks, usage reporting & export, provider-key rotation, config read/apply. Only mounted when auth is enabled. |
+| `POST/GET/PUT/PATCH/DELETE /admin/*` | Keys, budgets, budget webhooks, usage reporting & export, provider-key rotation, whole-document and granular (per-provider, per-section) config read/apply. Only mounted when auth is enabled. See [Config source modes](docs/operations/config-modes.md). |
 
 A single model id is owned entirely by you and may serve one to three
 capabilities. The router resolves each request by `(capability, model)`.
@@ -257,12 +257,14 @@ and [Metrics & dashboards](https://qdequele.github.io/lumen/operations/metrics.h
 
 ### Config hot reload
 
-`SIGHUP`, a file-watch, or an admin provider-key rotation triggers a reload: the
-new config is validated, then the provider registry, price table, resilience
-policy, the runtime-safe `[auth]` knobs and the webhook delivery policy are
-atomically swapped; in-flight
-requests are unaffected. An invalid config is **rejected** - the old config
-keeps serving. See
+`SIGHUP`, a file-watch, an admin config write, or an admin provider-key
+rotation triggers a reload: the new config is validated, then the provider
+registry, price table, resilience policy, the runtime-safe `[auth]` knobs, the
+webhook delivery policy, the image-fetch policy and the tokenizer are
+atomically swapped; in-flight requests are unaffected. An invalid config is
+**rejected** - the old config keeps serving. Boot-layer settings (bind address
+and the rest of `[server]`, log format, telemetry labels, the auth switch and
+database path, usage-log channel sizing) need a restart. See
 [Deployment](https://qdequele.github.io/lumen/operations/deployment.html).
 
 ### `--check-config`

@@ -63,6 +63,16 @@ prometheus = { version = "0.14", default-features = false }
 # Config
 figment = { version = "0.10", features = ["toml", "env"] }
 notify = "8"
+# Direct TOML parsing (ADR 012 boot-vs-dynamic layer classification): figment
+# does not expose a generic `Value`, so the boot-only key allowlist walks a
+# `toml::Value` table directly. Same version figment vendors internally, so
+# this adds no new major version to the dependency graph.
+toml = "0.8"
+# Format-preserving TOML document editing (ADR 012 Task 7): comments and
+# formatting outside the edited table survive an admin `upsert_provider` /
+# `replace_section`, unlike a parse-mutate-reserialize round trip through
+# `toml::Value`.
+toml_edit = { version = "0.25", features = ["serde"] }
 
 # Concurrency / data structures
 arc-swap = "1"

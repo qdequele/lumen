@@ -11,6 +11,7 @@ to gate it. See [`SECURITY.md`](https://github.com/qdequele/lumen/blob/main/SECU
 |---|---|---|
 | `lumen_tokens_total` | `capability, model, provider, direction, estimated` | Tokens processed, cumulative. `direction` is `input`/`output`; `estimated` is `true`/`false` (ADR 003). |
 | `lumen_tokens_estimated_total` | none | Subset of the above that was locally estimated rather than upstream-reported. |
+| `lumen_token_breakdown_total` | `capability, model, provider, kind` | Upstream-reported token breakdown, a subset of `lumen_tokens_total`: `kind` is `cached`, `reasoning` or `cache_write` (issue #99). Never estimated. See [Token accounting](token-accounting.md). |
 | `lumen_rerank_search_units_total` | `model, provider` | Rerank search units, upstream-reported when available. |
 | `lumen_media_total` | `capability, model, provider, media_type` | Media items (images, ...) processed - a billing dimension alongside tokens (M9). |
 | `lumen_media_bytes_total` | `capability, model, provider, media_type` | Decoded media bytes processed (M9). |

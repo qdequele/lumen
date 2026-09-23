@@ -130,6 +130,24 @@ pub fn build_app(state: AppState) -> Router {
                 "/admin/config",
                 get(admin::get_config).put(admin::put_config),
             )
+            // Granular config endpoints (ADR 012 Task 8). The `providers`
+            // routes are registered BEFORE the `{section}` catch-all below:
+            // matchit (axum's router) always prefers a static segment
+            // ("providers") over a same-position parameter ("{section}"), so
+            // this ordering is not load-bearing for correctness, but keeps
+            // the more specific routes visually adjacent to the resource
+            // they specialize.
+            .route("/admin/config/providers", get(admin::list_providers))
+            .route(
+                "/admin/config/providers/{name}",
+                get(admin::get_provider)
+                    .put(admin::put_provider)
+                    .delete(admin::delete_provider),
+            )
+            .route(
+                "/admin/config/{section}",
+                get(admin::get_config_section).put(admin::put_config_section),
+            )
             .route_layer(middleware::from_fn_with_state(
                 state.clone(),
                 auth::require_master_key,

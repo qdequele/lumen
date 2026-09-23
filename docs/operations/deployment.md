@@ -154,11 +154,13 @@ limiting are the v2 items that lift this constraint - see
 
 ## Hot reload
 
-A `SIGHUP`, a file-watch event, or an admin provider-key rotation
-(`PUT /admin/provider-keys/{name}`) triggers a config reload: the new config
-is validated first, and only then are the provider registry, price table,
-resilience policy and the runtime-safe `[auth]` knobs
-(`flush_interval_ms`, `retention_days`) atomically swapped in. Every reload
+A `SIGHUP`, a file-watch event (file mode), an admin config write
+(`PUT /admin/config` or a granular `/admin/config/*` write), or an admin
+provider-key rotation (`PUT /admin/provider-keys/{name}`) triggers a config
+reload: the new config is validated first, and only then are the provider
+registry, price table, resilience policy, the runtime-safe `[auth]` knobs
+(`flush_interval_ms`, `retention_days`), the webhook policy, the
+image-fetch policy and the tokenizer atomically swapped in. Every reload
 also re-reads DB-stored provider keys, so a key rotated via the admin API
 takes effect without a restart even without an explicit trigger call; a DB
 read error keeps the previous snapshot rather than stripping a working key.
@@ -167,14 +169,20 @@ In-flight requests are unaffected. If the new config is invalid, it is
 `lumen_config_reload_failures_total` increments so the failed reload is
 visible in your dashboards.
 
-Some settings stay boot-time only and need a real restart: the bind
-address, `auth.enabled`, `auth.db_path`, and the bounded usage-log channel
-knobs (`usage_channel_capacity`, `usage_batch_max`, `usage_flush_ms`) -
-rebinding a live listener or resizing a running channel is out of scope for
-a live swap.
+The **boot layer** stays boot-time only and needs a real restart:
+`[server]` (bind address, body limit, stream timeouts), `log_format`,
+`[telemetry]` (its label allowlist becomes the Prometheus label set,
+fixed when the metrics are registered), `auth.enabled`, `auth.db_path`,
+the bounded usage-log channel knobs (`usage_channel_capacity`,
+`usage_batch_max`, `usage_flush_ms`), and `config_source` - rebinding a
+live listener, re-registering metrics or resizing a running channel is out
+of scope for a live swap. The admin config API refuses a change to any of
+them (`400` `LM-1001`) rather than accepting a value that would not apply;
+edit the file and restart instead.
 
 `PUT /admin/config` (ADR 010) applies a new config document remotely instead
-of an operator editing the file by hand: it stages the submitted bytes next
+of an operator editing the file by hand. In file mode (the default) it
+stages the submitted bytes next
 to the real config file, validates the staged copy, then backs up the
 current file to `.bak` and renames the staged file into place before
 triggering the same reload path as above. This means **the gateway process
@@ -192,7 +200,10 @@ manual atomic-deploy scripts use), an apply's rename REPLACES the symlink
 itself with a regular file - the same rename that lands the new document in
 place cannot also preserve "the path is a symlink pointing elsewhere"; a
 setup that depends on the config path staying a symlink across reloads is
-not compatible with applying through this route. See
+not compatible with applying through this route. None of this applies in
+db mode ([Config source modes](config-modes.md)): the document lives in the
+auth database, so the process needs no write access to the config file,
+and a read-only config mount is fine. See
 [Applying a new config over the admin API](../getting-started/configuration.md#applying-a-new-config-over-the-admin-api)
 for the full request contract, and its security note on what holding the
 master key implies once this route exists.

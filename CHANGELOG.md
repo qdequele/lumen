@@ -6,6 +6,154 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **Docs: config source modes (ADR 012, task 10 of the config-source-abstraction
+  plan).** New `docs/operations/config-modes.md`: the
+  `config_source = "file" | "db"` boot key, the boot-layer/dynamic-layer
+  split and the db-mode boot-file contract, the full granular admin config
+  endpoint table, the `If-Match`/boot-layer-guard write pipeline, first-boot
+  empty-document behavior, `config_versions` retention (newest 50), and the
+  file<->db migration procedures. `docs/errors.md` widens `LM-1001`
+  (missing `If-Match`, restart-only key refusal, dependent-provider delete,
+  provider name/body mismatch), `LM-1003` (unknown granular provider/section)
+  and `LM-1004` (every config write in both modes, hash is source-verbatim).
+  `config.example.toml` documents `config_source` at the top of the file,
+  including the boot-only key set db mode enforces. `docs/backlog.md` gains
+  the three items the design spec deferred: config history/rollback
+  endpoints over `config_versions`, a `lumen config export/import` CLI, and
+  per-model granular endpoints. README's `/admin/*` capabilities row now
+  names the granular config surface and links the new doc.
+
+- **End-to-end test coverage for the config source abstraction, both modes**
+  (ADR 012, task 9 of the config-source-abstraction plan).
+  New `crates/server/tests/config_source_e2e.rs`: a file-mode provider
+  reroute (`PUT /admin/config/providers/{name}`) lands live against a real
+  upstream with no restart; a db-mode cold start (empty stored document,
+  `GET /health` 200, chat `LM-2001`) installs its first config through
+  `PUT /admin/config` and starts routing, still with no restart; a stale
+  `If-Match` after a successful db-mode apply is `LM-1004`; an external
+  (human/GitOps) edit to a file-mode config on disk makes an `If-Match`
+  taken before that edit stale; and neither a whole-document nor a granular
+  db-mode `PUT` ever writes a resolved provider secret into
+  `config_versions` - only the `api_key_env` name, verified by querying the
+  table directly. Also adds the db-mode regression test for
+  `PUT /admin/config/auth` deferred from task 8's review: the 5-knob merge
+  does not trip the boot-layer guard in db mode.
+
+- **Granular admin config endpoints** (ADR 012, task 8 of the
+  config-source-abstraction plan). New routes under the master-key-gated
+  `/admin/config` surface, all sharing the existing `PUT /admin/config`
+  pipeline (apply-lock, `If-Match`, boot-layer guard, full validation,
+  persist, hot reload) so a granular edit can never produce a document a
+  restart would refuse: `GET /admin/config/providers` (name + kind summary
+  list), `GET`/`PUT`/`DELETE /admin/config/providers/{name}` (a single
+  provider's full config; `PUT` requires the path name to match the body's
+  `name`; `DELETE` on a provider still referenced by another model's
+  fallback chain is refused with `LM-1001` naming the dependent model), and
+  `GET`/`PUT /admin/config/{section}` for `resilience`, `tokenizer`,
+  `image_fetch`, `webhooks` and `auth` (a new `AuthDynamicKnobs` type
+  covering only the 2 hot-reloadable `[auth]` fields, `flush_interval_ms`
+  and `retention_days` - the boot-layer `[auth]` keys are rejected 400 if a
+  `PUT` body names one). An unknown provider name or section is `LM-1003`
+  (404), the same style every other per-entity admin lookup uses.
+  `crates/server/src/config_edit.rs` gains `replace_auth_knobs`, a
+  field-level merge into the existing `[auth]` table that leaves
+  `enabled`/`db_path` untouched.
+
+### Changed
+
+- **Internal: `toml_edit`-based config document editors** (ADR 012, task 7 of
+  the config-source-abstraction plan). New `crates/server/src/config_edit.rs`
+  module: pure text-to-text `upsert_provider`, `delete_provider`,
+  `replace_section` and `provider_names`, built on `toml_edit::DocumentMut`
+  instead of `toml::Value`, so an edit preserves every comment and formatting
+  choice outside the table it touches. Backs the granular per-resource
+  admin config routes (`/admin/config/providers/{name}`,
+  `/admin/config/{section}`).
+- **`GET`/`PUT /admin/config` now work in both config-source modes** (ADR 012,
+  task 6 of the config-source-abstraction plan). Both routes read and write
+  through `ConfigContext`/`ConfigSource` instead of the file-only code path:
+  `GET` returns the current dynamic document and its hash in either mode (DB
+  mode: the empty string and its hash before the first `PUT`); `PUT` runs a
+  new boot-layer guard (`boot_layer_diff`) before validating and persisting a
+  candidate, refusing with `LM-1001` (400, naming the changed keys) any
+  attempt to change a restart-only field (`server.*`, `log_format`,
+  `auth.enabled`, `auth.db_path`, `config_source`) - those only take effect on
+  a restart, and this route promises everything it accepts applies
+  immediately. File mode keeps its previous behavior (an unchanged
+  boot-layer block still passes; `If-Match` semantics, staged write and
+  `.bak` backup unchanged). DB mode's admin surface, previously an
+  unconditional 500, is now fully supported. `AppState::config_apply_lock`
+  is now a `tokio::sync::Mutex` (was `std::sync::Mutex`), since the apply
+  pipeline holds it across the async `ConfigSource`/`ConfigContext` calls.
+- **Internal: `ConfigSource` trait + `FileSource`** (ADR 012, task 1 of the
+  config-source-abstraction plan). Extracted the file read / staged-write
+  machinery (`config_hash`, unique `.tmp` staging, `.bak` backup, atomic
+  rename) out of `admin::apply_config_document` into a new
+  `crates/server/src/config_source.rs` module, behind an async `ConfigSource`
+  trait with a compare-and-swap `persist`. `admin.rs` calls `FileSource`
+  today; no observable behavior change (`PUT /admin/config` still checks
+  `If-Match` before touching disk at all, still validates before staging
+  anything permanently, same `.bak` naming, same 412 `LM-1004` on a stale
+  `If-Match` - including when the submitted body is also invalid TOML).
+  The SQLite-backed `DbSource` sits behind the same trait.
+
+### Fixed
+
+- **rustls bumped to 0.23.45 for RUSTSEC-2026-0285**: rustls accepted TLS 1.3
+  handshake messages sent across an encryption-level boundary (e.g. a
+  plaintext `EncryptedExtensions` in the same record as the `ServerHello`)
+  instead of rejecting the connection. The transcript stays authenticated,
+  so a handshake cannot be altered, but the `audit` CI job fails on it.
+  Lockfile-only (`rustls-webpki` moves to 0.103.15 with it).
+
+- **Every setting the admin config API accepts now applies live** (ADR 012).
+  `[tokenizer]` and `[image_fetch]` were saved by an admin write but only
+  took effect after a restart; a hot reload now swaps both (the tokenizer is
+  rebuilt only when its mode changes). `[telemetry]` and the usage-log
+  channel knobs (`usage_channel_capacity`, `usage_batch_max`,
+  `usage_flush_ms`) cannot change while running (the metric label set and
+  the channel are fixed at startup), so they are now boot-layer: the admin
+  API refuses to change them (`400` `LM-1001`) instead of accepting a value
+  that never applied, `/admin/config/telemetry` is gone, and
+  `/admin/config/auth` covers only `flush_interval_ms` and `retention_days`.
+  In db mode these keys now live in the boot file.
+- **Docs brought in line with the code**: the config and deployment guides
+  now cover db mode, `metrics.md` lists `lumen_token_breakdown_total`, and a
+  shipped backlog item is marked resolved.
+
+- **Config source review fixes** (ADR 012). The db-mode config write
+  (`config_versions` compare-and-swap) now runs in a `BEGIN IMMEDIATE`
+  transaction: the default deferred transaction failed with "database is
+  locked" whenever the usage-log writer or budget flusher wrote to the same
+  file at the same moment, turning db-mode config writes into intermittent
+  500s. A stored document carrying any boot-layer key is now refused on the
+  read side too (boot and every reload), so a hand-edited or restored row
+  can no longer silently rebind the server port or override the boot file.
+  Granular config writes now patch the document loaded under the apply
+  lock, not a copy read before it. Granular edits accept the inline TOML
+  forms (`auth = { ... }`, `providers = [{ ... }]`) instead of failing with
+  a 500. `PUT /admin/config/webhooks` accepts `null` to remove the block.
+  The boot-layer diff now compares every `[server]` field generically.
+
+- **DB mode refuses every boot-layer key in the dynamic document, even one
+  set to its built-in default** (ADR 012, final-review fix). Previously a
+  `PUT /admin/config` (or granular) candidate carrying a boot-layer key
+  whose value happened to equal the compiled-in default (`[auth]
+  enabled = false`, `[auth] db_path = "lumen.db"`, `[server] port = 8080`,
+  ...) slipped past the boot-layer guard, persisted into `config_versions`,
+  and - because the stored document merges over the boot file at startup -
+  could refuse the next restart (auth re-assertions) or silently repoint a
+  boot setting. A new `ensure_dynamic_only` check now rejects any such key
+  with `LM-1001` naming it, restoring the invariant that a document the
+  API accepts always survives a restart; pinned by a real-restart e2e test.
+  The file->db migration procedure in `docs/operations/config-modes.md`
+  now includes the required strip-the-boot-keys step. Also retired the
+  dead `reload::validate_candidate` (superseded by
+  `ConfigContext::validate_document` since the task 6 rework) and its
+  stale doc-comment references.
+
 ## [0.4.0] - 2026-08-26
 
 ### Added

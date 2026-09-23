@@ -15,6 +15,8 @@
 //!   state preserved;
 //! - the safe **auth knobs** ([`AuthKnobs`]: budget-flush cadence and usage-log
 //!   retention window), read live by the background tasks on their next tick;
+//! - the **image-fetch policy** (`[image_fetch]`) and the **tokenizer**
+//!   (`[tokenizer]`; rebuilt only when its mode changes), read per request;
 //! - the **virtual-key table**, re-synced from the auth DB so keys created
 //!   offline (e.g. `lumen keys create`) become live without a restart;
 //!   existing entries keep their in-memory spend (memory stays the source of
@@ -36,7 +38,10 @@
 //! `docs/backlog.md`): the server bind address (rebinding a live listener is
 //! high-risk and out of scope), `auth.enabled`, `auth.db_path`, the bounded
 //! usage-log channel knobs (`usage_channel_capacity`, `usage_batch_max`,
-//! `usage_flush_ms`) whose capacity is structurally fixed at channel creation.
+//! `usage_flush_ms`) whose capacity is structurally fixed at channel creation,
+//! and `[telemetry]` (its metadata label allowlist becomes the Prometheus
+//! label set, fixed when the metrics are registered). All of these are
+//! boot-layer (ADR 012), so the admin API refuses to change them.
 //!
 //! Webhooks have no restart-only field left: with auth enabled the
 //! [`WebhookController`] exists whether or not a `[webhooks]` block does, and
@@ -57,7 +62,7 @@
 //! error keeps the previous snapshot so a reload never strips a working key.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -65,13 +70,16 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use lumen_auth::crypto::MasterKey;
 use lumen_auth::store::KeyStore;
+use lumen_providers::image_fetch::ImageFetchPolicy;
 use lumen_providers::{Registry, RegistryError};
 use lumen_telemetry::ReloadMetrics;
 use tokio::sync::Notify;
 
-use crate::config::{Config, ConfigError};
+use crate::config::{Config, ConfigError, TokenizerMode};
+use crate::config_source::ConfigContext;
 use crate::pricing::CostTable;
 use crate::resilience::ResilienceRuntime;
+use crate::tokenizer::TokenCounter;
 use crate::webhooks::WebhookController;
 
 /// Why a reload was rejected. The previous config is always kept on error.
@@ -193,56 +201,35 @@ pub struct ReloadTargets {
     /// without a restart; existing entries only have their limits re-applied
     /// and keep their in-memory spend.
     pub auth_runtime: Option<Arc<crate::auth::AuthRuntime>>,
+    /// The image-fetch policy cell the embeddings handler reads
+    /// ([`AppState::image_fetch`](crate::AppState::image_fetch)); a reload
+    /// swaps in the policy built from the new `[image_fetch]` section.
+    pub image_fetch: Option<Arc<ArcSwap<ImageFetchPolicy>>>,
+    /// The token-counter cell every handler reads
+    /// ([`AppState::token_counter`](crate::AppState::token_counter)); a
+    /// reload rebuilds it only when `[tokenizer] mode` changed, since
+    /// `accurate` mode loads BPE encoders.
+    pub token_counter: Option<Arc<ArcSwap<TokenCounter>>>,
 }
 
-/// Validate a config document at `path` without swapping anything.
-///
-/// Runs the two checks a reload runs, in the same order: `Config::load`
-/// (parse, merge with `LUMEN_` env vars, validate) and a candidate registry
-/// build. The second is not redundant: a keyless provider missing a
-/// `base_url` passes validation and only fails when the registry is built,
-/// which is why `apply_reload` puts the registry rebuild first.
-///
-/// Used by `PUT /admin/config` to reject a bad document BEFORE it reaches
-/// the real config path, so an invalid apply cannot leave a file behind that
-/// would break the next restart.
-///
-/// # Errors
-///
-/// [`ReloadError::Config`] if the document does not parse or validate;
-/// [`ReloadError::Registry`] if a registry cannot be built from it.
-pub fn validate_candidate(path: &Path) -> Result<(), ReloadError> {
-    let config = Config::load(path)?;
-    // A throwaway client: this runs on an admin route, never the hot path.
-    Registry::build(
-        config.provider_specs(),
-        lumen_providers::http::build_client(),
-        Duration::from_secs(300),
-    )?;
-    Ok(())
-}
-
-/// Re-load `path`, validate it, and (only on success) atomically swap the
-/// routing table, price table, resilience policy and auth knobs. Increments the
+/// Atomically swap the routing table, price table, resilience policy, auth
+/// knobs, image-fetch policy and tokenizer from an already
+/// loaded-and-validated `config`. Increments the
 /// success/failure counters. On any error every target is left exactly as it
 /// was (the fallible registry rebuild runs first, before any swap).
+///
+/// `config` is expected to already be the result of a successful
+/// [`ConfigContext::load_config`] - this function does no parsing or file
+/// I/O of its own, only the in-memory rebuild and swap, which is why
+/// [`reload_once`] can run it without a further `spawn_blocking` hop.
 ///
 /// The DB provider-key snapshot in `targets.key_backfill` is read as-is here;
 /// [`reload_once`] refreshes it from the DB (async) before calling this.
 ///
 /// # Errors
-/// [`ReloadError`] if the file is missing/invalid or the registry rebuild
-/// fails; the running config is unaffected in both cases.
-pub fn apply_reload(path: &Path, targets: &ReloadTargets) -> Result<(), ReloadError> {
-    // `Config::load` parses AND validates; a bad file never reaches `reload`.
-    let config = match Config::load(path) {
-        Ok(config) => config,
-        Err(error) => {
-            targets.metrics.inc_failure();
-            tracing::warn!(%error, "config reload rejected; keeping the running config");
-            return Err(error.into());
-        }
-    };
+/// [`ReloadError::Registry`] if the registry cannot be rebuilt from `config`;
+/// the running config is unaffected.
+pub fn apply_reload(config: &Config, targets: &ReloadTargets) -> Result<(), ReloadError> {
     // `provider_specs` resolves keys from the environment; re-apply the current
     // DB-key snapshot for any provider still keyless, mirroring boot back-fill
     // so a reload never strips a DB-stored key (env keeps precedence). The
@@ -261,17 +248,27 @@ pub fn apply_reload(path: &Path, targets: &ReloadTargets) -> Result<(), ReloadEr
     // Registry swapped; the remaining swaps are infallible.
     targets
         .pricing
-        .store(Arc::new(CostTable::from_config(&config)));
-    targets.resilience.reload_policy(&config);
+        .store(Arc::new(CostTable::from_config(config)));
+    targets.resilience.reload_policy(config);
     if let Some(knobs) = &targets.auth_knobs {
-        knobs.store_from_config(&config);
+        knobs.store_from_config(config);
     }
-    apply_webhook_reload(&config, targets);
+    apply_webhook_reload(config, targets);
+    if let Some(cell) = &targets.image_fetch {
+        cell.store(Arc::new(config.image_fetch.to_policy()));
+    }
+    if let Some(cell) = &targets.token_counter {
+        let wants_accurate = config.tokenizer.mode == TokenizerMode::Accurate;
+        if cell.load().is_accurate() != wants_accurate {
+            cell.store(Arc::new(TokenCounter::from_config(&config.tokenizer)));
+        }
+    }
     targets.metrics.inc_success();
     tracing::info!(
         model_count = config.loaded_models().len(),
         provider_count = config.providers.len(),
-        "configuration reloaded; routing table, pricing, resilience policy and auth knobs swapped"
+        "configuration reloaded; routing table, pricing, resilience policy, auth knobs, \
+         image-fetch policy and tokenizer swapped"
     );
     Ok(())
 }
@@ -353,7 +350,7 @@ const DEBOUNCE: Duration = Duration::from_millis(250);
 /// The directory `spawn_config_reloader` should watch for `path`: the parent
 /// directory when `path` has one, or the current working directory when it
 /// does not (e.g. `lumen --config lumen.toml`, the form used in the
-/// quickstart, has an empty parent). Mirrors `admin::sync_parent_dir`'s
+/// quickstart, has an empty parent). Mirrors `config_source::sync_parent_dir`'s
 /// identical fallback for the identical empty-parent case.
 ///
 /// Watching `path` itself instead of its directory (the bug this function
@@ -406,22 +403,35 @@ fn event_should_reload(event: &notify::Event, config_name: Option<&std::ffi::OsS
     may_have_changed_the_bytes && event.paths.iter().any(|p| p.file_name() == config_name)
 }
 
-/// Spawn the background reloader: reload on `SIGHUP`, on changes to the config
-/// file, and when `trigger` is notified (the admin API pings it after storing a
-/// provider key, so a rotation applies without a restart). The returned task
-/// runs until the process exits; the file watcher is kept alive inside it.
+/// Spawn the background reloader: reload on `SIGHUP`, on a change to `ctx`'s
+/// watched path (file mode only), and when `trigger` is notified (the admin
+/// API pings it after storing a provider key, so a rotation applies without a
+/// restart). The returned task runs until the process exits; the file
+/// watcher, when armed, is kept alive inside it.
+///
+/// The `notify` file watcher is armed only when `ctx.source.watch_path()` is
+/// `Some`: a DB-backed source has no on-disk mirror to watch, so a change can
+/// only ever arrive through `ConfigSource::persist` itself, which the admin
+/// trigger already covers. SIGHUP and the admin trigger are armed in both
+/// modes.
 ///
 /// # Errors
-/// Returns the `notify` error if the file watcher cannot be created or armed;
-/// the caller should log it and continue (hot reload via SIGHUP still works if
-/// the watcher fails - but here both share the watcher setup, so a failure
-/// disables both and is surfaced to the caller).
+/// Returns the `notify` error if the file watcher cannot be created or armed
+/// (file mode only); the caller should log it and continue (hot reload via
+/// SIGHUP and the admin trigger still work if the watcher fails).
 pub fn spawn_config_reloader(
-    path: PathBuf,
+    ctx: Arc<ConfigContext>,
     targets: ReloadTargets,
     trigger: Arc<Notify>,
 ) -> Result<tokio::task::JoinHandle<()>, notify::Error> {
     use notify::{RecursiveMode, Watcher};
+
+    // A channel that a file-mode watcher's callback pushes onto. Created
+    // unconditionally, but only ever pushed to when a watcher exists below:
+    // in DB mode `_tx` (kept alive in the spawned task, see below) is the
+    // channel's only sender, so `rx.recv()` simply never resolves - a
+    // permanently idle `select!` branch, not a disconnect.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
 
     // Watch the parent directory (editors, GitOps syncs and `PUT
     // /admin/config` all replace the file via rename rather than an
@@ -433,42 +443,53 @@ pub fn spawn_config_reloader(
     // narrows it back down on both axes: by kind (an open must never
     // schedule a reload, or the reload's own read of the file loops
     // forever) and by path (a neighbour file must not trigger a reload).
-    let config_name = path.file_name().map(std::ffi::OsStr::to_owned);
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
-    let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-        if let Ok(event) = res {
-            if event_should_reload(&event, config_name.as_deref()) {
-                // Non-blocking; a full/closed channel just drops the tick (the
-                // next event, or the debounce drain, still triggers a reload).
-                let _ = tx.send(());
-            }
+    let watcher = match ctx.source.watch_path() {
+        Some(path) => {
+            let path = path.to_path_buf();
+            let config_name = path.file_name().map(std::ffi::OsStr::to_owned);
+            let tx = tx.clone();
+            let mut watcher =
+                notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+                    if let Ok(event) = res {
+                        if event_should_reload(&event, config_name.as_deref()) {
+                            // Non-blocking; a full/closed channel just drops
+                            // the tick (the next event, or the debounce
+                            // drain, still triggers a reload).
+                            let _ = tx.send(());
+                        }
+                    }
+                })?;
+            watcher.watch(watch_target(&path), RecursiveMode::NonRecursive)?;
+            Some(watcher)
         }
-    })?;
-    watcher.watch(watch_target(&path), RecursiveMode::NonRecursive)?;
+        None => None,
+    };
 
     let targets = Arc::new(targets);
     let handle = tokio::spawn(async move {
-        // Keep the watcher alive for the lifetime of the task.
+        // Keep the watcher (if armed) and this scope's own sender alive for
+        // the lifetime of the task - see the comment on `tx` above.
         let _watcher = watcher;
+        let _tx = tx;
         let mut sighup = hangup_signal();
         loop {
             tokio::select! {
                 () = wait_for_hangup(&mut sighup) => {
                     tracing::info!("SIGHUP received; reloading config");
-                    reload_once(&path, &targets).await;
+                    reload_once(&ctx, &targets).await;
                 }
                 () = trigger.notified() => {
                     tracing::info!("admin reload trigger fired; reloading config");
-                    reload_once(&path, &targets).await;
+                    reload_once(&ctx, &targets).await;
                 }
                 event = rx.recv() => {
                     if event.is_none() {
-                        break; // sender dropped (never, in practice)
+                        break; // sender dropped (never, in practice: `_tx` above)
                     }
                     // Coalesce the rest of the burst before reloading.
                     tokio::time::sleep(DEBOUNCE).await;
                     while rx.try_recv().is_ok() {}
-                    reload_once(&path, &targets).await;
+                    reload_once(&ctx, &targets).await;
                 }
             }
         }
@@ -477,12 +498,15 @@ pub fn spawn_config_reloader(
 }
 
 /// Run one reload: refresh the DB provider-key snapshot (async, in this task,
-/// off the request path) then apply the config on a blocking thread (it does
-/// synchronous figment file I/O, so the runtime worker is never blocked -
-/// CLAUDE.md rule 2 in spirit). A DB refresh error keeps the previous snapshot;
-/// an invalid config keeps the running config. Public so the boot path and the
-/// tests share exactly one reload entry point.
-pub async fn reload_once(path: &Path, targets: &Arc<ReloadTargets>) {
+/// off the request path), load and validate the current document via
+/// `ctx.load_config()`, then apply it on a blocking thread (the registry
+/// rebuild's HTTP-client construction, kept off the runtime worker - CLAUDE.md
+/// rule 2 in spirit; the actual figment/file work already ran inside
+/// `load_config`). A DB refresh error keeps the previous snapshot; a load or
+/// validation error keeps the running config (ADR 008's sick-source rule,
+/// extended to the whole document). Public so the boot path and the tests
+/// share exactly one reload entry point.
+pub async fn reload_once(ctx: &Arc<ConfigContext>, targets: &Arc<ReloadTargets>) {
     // Rotation without restart: re-read provider keys from the encrypted DB.
     // Keep the previous snapshot on any error so a sick DB never strips a key.
     if let Some(source) = &targets.key_source {
@@ -533,10 +557,22 @@ pub async fn reload_once(path: &Path, targets: &Arc<ReloadTargets>) {
             .refresh_from_store(&runtime.store, runtime.master.as_ref())
             .await;
     }
-    let path = path.to_path_buf();
+    // Load and fully validate the current document. Any failure here - the
+    // source itself unreadable, or the document invalid - keeps the running
+    // config exactly as it was: the ADR 008 rule that a sick source never
+    // strips a working gateway, extended from "the DB is unreachable" to
+    // "the whole document failed to load".
+    let config = match ctx.load_config().await {
+        Ok(config) => config,
+        Err(error) => {
+            targets.metrics.inc_failure();
+            tracing::warn!(%error, "config reload rejected; keeping the running config");
+            return;
+        }
+    };
     let targets = Arc::clone(targets);
     let joined = tokio::task::spawn_blocking(move || {
-        let _ = apply_reload(&path, &targets);
+        let _ = apply_reload(&config, &targets);
     })
     .await;
     if let Err(error) = joined {
@@ -583,6 +619,7 @@ mod tests {
     use lumen_providers::http;
     use lumen_telemetry::Metrics;
     use std::io::Write;
+    use std::path::PathBuf;
 
     fn write_config(dir: &Path, body: &str) -> PathBuf {
         let path = dir.join("config.toml");
@@ -624,6 +661,19 @@ mod tests {
         )
     }
 
+    /// Load and validate `path` into a `Config`, the way a caller of
+    /// `apply_reload` is expected to have already done via
+    /// `ConfigContext::load_config` before calling it.
+    fn load(path: &Path) -> Config {
+        Config::load(path).expect("config loads")
+    }
+
+    /// A file-mode `ConfigContext` over `path`, for `reload_once` and
+    /// `spawn_config_reloader` tests.
+    fn ctx(path: &Path) -> Arc<ConfigContext> {
+        Arc::new(ConfigContext::file(path.to_path_buf()))
+    }
+
     /// Reload targets sharing `registry`/`metrics`, with default pricing and
     /// resilience, no key backfill and no auth knobs.
     fn targets(registry: Arc<Registry>, metrics: ReloadMetrics) -> ReloadTargets {
@@ -637,6 +687,8 @@ mod tests {
             auth_knobs: None,
             webhooks: None,
             auth_runtime: None,
+            image_fetch: None,
+            token_counter: None,
         }
     }
 
@@ -651,11 +703,53 @@ mod tests {
         let metrics = ReloadMetrics::register(&Metrics::new()).unwrap();
         let t = targets(Arc::clone(&registry), metrics);
         write_config(&dir, TWO_MODELS);
-        apply_reload(&path, &t).expect("valid reload");
+        apply_reload(&load(&path), &t).expect("valid reload");
 
         // The new model is now routable - the swap took effect.
         assert!(registry.embedding_route("embed").is_some());
         assert!(registry.knows_model("gpt"));
+    }
+
+    #[test]
+    fn valid_reload_swaps_image_fetch_policy_and_tokenizer() {
+        use crate::config::TokenizerConfig;
+        let dir = tempdir();
+        let path = write_config(&dir, ONE_MODEL);
+        let registry = registry_from(&path);
+        let boot = load(&path);
+        let image_fetch = Arc::new(ArcSwap::from_pointee(boot.image_fetch.to_policy()));
+        let token_counter = Arc::new(ArcSwap::from_pointee(TokenCounter::from_config(
+            &TokenizerConfig::default(),
+        )));
+        let mut t = targets(
+            Arc::clone(&registry),
+            ReloadMetrics::register(&Metrics::new()).unwrap(),
+        );
+        t.image_fetch = Some(Arc::clone(&image_fetch));
+        t.token_counter = Some(Arc::clone(&token_counter));
+        assert!(!image_fetch.load().enabled);
+        assert!(!token_counter.load().is_accurate());
+
+        write_config(
+            &dir,
+            &format!(
+                "{ONE_MODEL}\n[image_fetch]\nenabled = true\n[tokenizer]\nmode = \"accurate\"\n"
+            ),
+        );
+        apply_reload(&load(&path), &t).expect("valid reload");
+        assert!(
+            image_fetch.load().enabled,
+            "image-fetch policy must swap on reload"
+        );
+        assert!(
+            token_counter.load().is_accurate(),
+            "tokenizer must swap on reload"
+        );
+
+        // An unchanged mode keeps the very same counter (no BPE rebuild).
+        let before = token_counter.load_full();
+        apply_reload(&load(&path), &t).expect("valid reload");
+        assert!(Arc::ptr_eq(&before, &token_counter.load_full()));
     }
 
     #[test]
@@ -701,7 +795,7 @@ mod tests {
             capabilities = ["chat"]
             "#,
         );
-        apply_reload(&path, &t).expect("valid reload");
+        apply_reload(&load(&path), &t).expect("valid reload");
 
         // Pricing + resilience policy swapped...
         assert_eq!(t.pricing.load().token_cost("gpt", 1_000_000, 0), 2.5);
@@ -759,7 +853,7 @@ mod tests {
             capabilities = ["chat"]
             "#,
         );
-        apply_reload(&path, &t).expect("valid reload");
+        apply_reload(&load(&path), &t).expect("valid reload");
 
         // The live knobs the background tasks read now reflect the new config,
         // with no restart. The very cell handed to those tasks was swapped.
@@ -816,6 +910,8 @@ mod tests {
             auth_knobs: None,
             webhooks: None,
             auth_runtime: None,
+            image_fetch: None,
+            token_counter: None,
         });
 
         // Rotate the DB key, then run one reload through the real entry point.
@@ -823,7 +919,7 @@ mod tests {
             .store_provider_key("cohere", "new-key", &admin_master)
             .await
             .expect("rotate key");
-        reload_once(&path, &t).await;
+        reload_once(&ctx(&path), &t).await;
 
         // The reloaded backfill now carries the rotated key, so the rebuilt
         // registry provider will authenticate with it (env stays unset here).
@@ -882,7 +978,7 @@ mod tests {
         );
         t.auth_runtime = Some(Arc::clone(&runtime));
         let t = Arc::new(t);
-        reload_once(&path, &t).await;
+        reload_once(&ctx(&path), &t).await;
 
         assert!(
             runtime
@@ -893,8 +989,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn invalid_reload_keeps_the_old_table_and_counts_the_failure() {
+    // A `Config`-level failure (parse or validation) now surfaces through
+    // `ConfigContext::load_config` rather than `apply_reload` (which takes an
+    // already-parsed `&Config`), so these two "keep-previous" cases go
+    // through `reload_once` - the real entry point that owns the load step -
+    // instead of calling `apply_reload` directly.
+
+    #[tokio::test]
+    async fn invalid_reload_keeps_the_old_table_and_counts_the_failure() {
         let dir = tempdir();
         let path = write_config(&dir, TWO_MODELS);
         let registry = registry_from(&path);
@@ -920,9 +1022,8 @@ mod tests {
             capabilities = ["chat"]
             "#,
         );
-        let t = targets(Arc::clone(&registry), reload);
-        let err = apply_reload(&path, &t).unwrap_err();
-        assert!(matches!(err, ReloadError::Config(_)));
+        let t = Arc::new(targets(Arc::clone(&registry), reload));
+        reload_once(&ctx(&path), &t).await;
 
         // Old routing table intact: the pre-reload models still resolve.
         assert!(registry.embedding_route("embed").is_some());
@@ -937,7 +1038,9 @@ mod tests {
     fn reload_to_an_embed_model_on_an_embeddingless_kind_is_rejected() {
         // A groq embed model (no base_url override) is a guaranteed upstream
         // 404, caught by the registry rebuild (issue #74): the reload must
-        // fail with the registry error and keep the old routing table.
+        // fail with the registry error and keep the old routing table. This
+        // is a REGISTRY failure, not a `Config`-load failure, so `Config::load`
+        // itself succeeds and `apply_reload` can still be called directly.
         let dir = tempdir();
         let path = write_config(&dir, TWO_MODELS);
         let registry = registry_from(&path);
@@ -957,7 +1060,7 @@ mod tests {
             "#,
         );
         let t = targets(Arc::clone(&registry), reload);
-        let err = apply_reload(&path, &t).unwrap_err();
+        let err = apply_reload(&load(&path), &t).unwrap_err();
         assert!(
             matches!(
                 err,
@@ -973,8 +1076,8 @@ mod tests {
         assert!(registry.embedding_route("groq-embed").is_none());
     }
 
-    #[test]
-    fn reload_of_a_deleted_file_is_rejected_and_keeps_the_table() {
+    #[tokio::test]
+    async fn reload_of_a_deleted_file_is_rejected_and_keeps_the_table() {
         let dir = tempdir();
         let path = write_config(&dir, ONE_MODEL);
         let registry = registry_from(&path);
@@ -982,16 +1085,101 @@ mod tests {
         let reload = ReloadMetrics::register(&metrics).unwrap();
 
         std::fs::remove_file(&path).expect("remove config");
-        let t = targets(Arc::clone(&registry), reload);
-        let err = apply_reload(&path, &t).unwrap_err();
-        assert!(matches!(
-            err,
-            ReloadError::Config(ConfigError::NotFound { .. })
-        ));
+        let t = Arc::new(targets(Arc::clone(&registry), reload));
+        reload_once(&ctx(&path), &t).await;
+
         assert!(registry.chat_route("gpt").is_some(), "old table kept");
         assert!(metrics
             .encode_text()
             .contains("lumen_config_reload_failures_total 1"));
+    }
+
+    /// ADR 012 DB-mode reload, mirroring the file-mode tests above but over a
+    /// `ConfigContext::db`: a document persisted straight to the
+    /// `config_versions` table (as `PUT /admin/config` will in the granular
+    /// DB-mode rework) becomes live on the very next `reload_once`, with no
+    /// restart. Then the ADR 008 sick-source rule, extended to the whole
+    /// document (module docs): once the table itself is gone, `reload_once`
+    /// must keep the last-known-good registry rather than strip it.
+    #[tokio::test]
+    async fn db_mode_reload_resolves_a_persisted_doc_then_keeps_previous_when_the_store_breaks() {
+        use crate::config_source::{empty_doc_hash, ConfigSource, DbSource};
+        use lumen_auth::store::KeyStore;
+        use wiremock::MockServer;
+
+        let upstream = MockServer::start().await;
+        let dir = tempdir();
+        // DB mode's boot file holds ONLY the boot layer: auth must be
+        // enabled (ADR 012 §1 requires a database), everything else -
+        // providers included - comes from the DB document below.
+        let boot_path = write_config(
+            &dir,
+            r"
+            [auth]
+            enabled = true
+            ",
+        );
+
+        let store = KeyStore::in_memory().await.expect("store");
+        let source = DbSource::new(store.clone());
+        let doc = format!(
+            r#"
+            [[providers]]
+            name = "openai"
+            kind = "openai"
+            base_url = "{}"
+            [[providers.models]]
+            id = "gpt"
+            capabilities = ["chat"]
+            "#,
+            upstream.uri()
+        );
+        source
+            .persist(&doc, &empty_doc_hash())
+            .await
+            .expect("persist the initial doc");
+
+        let ctx = Arc::new(ConfigContext::db(boot_path, source));
+        // Boot with an empty registry, as a fresh DB-mode process would if it
+        // started before anything was ever persisted.
+        let registry = Arc::new(
+            Registry::build(
+                Vec::new(),
+                http::build_client(),
+                std::time::Duration::from_secs(300),
+            )
+            .expect("empty registry"),
+        );
+        let metrics = Metrics::new();
+        let t = Arc::new(targets(
+            Arc::clone(&registry),
+            ReloadMetrics::register(&metrics).unwrap(),
+        ));
+
+        reload_once(&ctx, &t).await;
+        assert!(
+            registry.chat_route("gpt").is_some(),
+            "the persisted DB document's model is routable after one reload"
+        );
+
+        // Break the source: the config_versions table itself is gone, so
+        // `DbSource::load` now fails outright.
+        sqlx::query("DROP TABLE config_versions")
+            .execute(store.pool())
+            .await
+            .expect("drop the config_versions table");
+
+        reload_once(&ctx, &t).await;
+        assert!(
+            registry.chat_route("gpt").is_some(),
+            "a broken DB source must keep the previous, working registry"
+        );
+        assert!(
+            metrics
+                .encode_text()
+                .contains("lumen_config_reload_failures_total 1"),
+            "the failed reload against the broken store must be counted"
+        );
     }
 
     #[test]

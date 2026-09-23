@@ -31,6 +31,30 @@ milestone.
   route would remove the need to serialize concurrent top-ups in the
   control plane.
 
+## Noted while building ADR 012 (config source abstraction)
+
+- **Config history/rollback endpoints.** DB mode already keeps the newest 50
+  `config_versions` rows (append-only, pruned on each write), but there is no
+  admin route to list or roll back to one - v1 ships the storage, not the
+  API. A `GET /admin/config/history` (id, hash, `applied_at`) and a
+  `POST /admin/config/rollback/{id}` (re-persist an older row's TOML as a new
+  version, through the same validate/persist/reload pipeline every other
+  write uses) would close this without a schema change.
+- **`lumen config export/import` CLI.** File<->DB mode migration today is a
+  manual `GET`/merge/restart procedure (see
+  [Config source modes](operations/config-modes.md#migrating-between-modes)).
+  An offline `lumen config export --config <path>` (dump the boot file's
+  dynamic keys, or a DB-mode document, as portable TOML) and
+  `lumen config import` (the reverse: install exported TOML through the
+  admin API, or write it into a file-mode boot file) would make the
+  procedure a single command instead of copy-paste.
+- **Per-model granular endpoints.** The granular admin API (ADR 012) stops at
+  provider granularity: `PUT`/`DELETE /admin/config/providers/{name}`
+  replace or remove a provider's entire `models` array along with it. A
+  `PUT`/`DELETE /admin/config/providers/{name}/models/{id}` pair for editing
+  or removing one model without resending its siblings is a natural
+  follow-up once a real console workflow wants it.
+
 ## Deferred to v2 (from the vision)
 
 - Web admin UI
@@ -416,8 +440,9 @@ milestone.
   see the note above under "M8 (vision - image input to chat)"). The remaining
   gap is a true dimension-based tile count, which needs image decoding this
   gateway deliberately does not do on the request path.
-- **Provider-native image URI forms.** Anthropic/Gemini file & GCS URI image
-  sources (beyond inline base64 + remote URL) are not modelled.
+- ~~**Provider-native image URI forms.** Anthropic/Gemini file & GCS URI image
+  sources (beyond inline base64 + remote URL) are not modelled.~~ **Resolved
+  (issue #12, 0.2.0).** See [Providers](providers.md) and `LM-2008`.
 - **Tool-role messages with image parts are silently flattened** (noted while
   fixing issue #73). The Cohere translator gates its v2 image blocks on the
   user role (Cohere's `ToolMessageV2` cannot carry images), so an image part

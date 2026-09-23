@@ -116,8 +116,12 @@ pub async fn embeddings(
     // cancellation. Runs after admission so a rejected key never triggers a
     // fetch.
     let mut req = req;
-    lumen_providers::image_fetch::resolve_image_parts(&mut req.input, &state.image_fetch, &cancel)
-        .await?;
+    lumen_providers::image_fetch::resolve_image_parts(
+        &mut req.input,
+        &state.image_fetch(),
+        &cancel,
+    )
+    .await?;
 
     // Execute across the chain with retries, fallback, circuit breaking and the
     // per-model timeouts. A fresh request clone (per attempt/link) carries that
@@ -204,9 +208,9 @@ fn finish_embed(
     // (resolved before execution), so this measures decoded bytes with no I/O.
     let media = lumen_core::measure_media(&req.input);
 
-    if estimated && state.token_counter.refines(model_used) {
+    if estimated && state.token_counter().refines(model_used) {
         accounting.mark_completed();
-        let counter = std::sync::Arc::clone(&state.token_counter);
+        let counter = state.token_counter();
         let model = model_used.to_owned();
         let texts: Vec<String> = req.input.iter().map(str::to_owned).collect();
         let pricing_task = pricing.clone();

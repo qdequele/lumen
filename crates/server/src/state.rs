@@ -1,6 +1,7 @@
 //! Shared application state handed to axum handlers.
 
 use crate::auth::AuthRuntime;
+use crate::config_source::ConfigContext;
 use crate::health::ProviderHealth;
 use crate::pricing::CostTable;
 use crate::resilience::ResilienceRuntime;
@@ -69,31 +70,44 @@ pub struct AppState {
     /// Configured max request body size in bytes (for the `LM-1002` message).
     pub body_limit: usize,
     /// Guarded image-fetch policy for multimodal embeddings (M9). Default:
-    /// disabled (a remote image URL yields `LM-2005`).
-    pub image_fetch: Arc<ImageFetchPolicy>,
+    /// disabled (a remote image URL yields `LM-2005`). Hot-swapped by config
+    /// reload; take a per-request snapshot via
+    /// [`image_fetch`](AppState::image_fetch).
+    pub image_fetch: Arc<ArcSwap<ImageFetchPolicy>>,
     /// Hot-reload trigger; `Some` when the config reloader is armed. The admin
     /// API pings it after storing a provider key so the rotation is applied
     /// without a restart (the reloader re-reads the key from the DB). `None` =
     /// no reloader (e.g. tests, or a watcher-setup failure at boot).
     pub reload_trigger: Option<Arc<tokio::sync::Notify>>,
-    /// Path of the config file this process was booted from; `None` when the
-    /// server was built without one (tests). The config admin routes read and
-    /// rewrite this exact file: the file stays the source of truth, so a
-    /// gateway restarted without a control plane comes up identically.
-    pub config_path: Option<Arc<std::path::PathBuf>>,
-    /// Serialises the whole `PUT /admin/config` sequence (hash check, stage,
-    /// validate, back up, rename) across concurrent requests. Without it two
-    /// racing applies (two operators, or a client retry racing its own
-    /// original) could both pass the `If-Match` check against the same
-    /// pre-apply hash and then interleave their writes, defeating the very
-    /// lost-update guarantee `If-Match` exists to provide. Always present
-    /// (not gated behind a builder) so no construction site needs editing;
-    /// the data behind it is `()` - only the mutual exclusion matters.
-    pub config_apply_lock: Arc<std::sync::Mutex<()>>,
+    /// Where the dynamic config document lives (ADR 012); `None` when the
+    /// server was built without one (tests). The config admin routes read
+    /// and rewrite through this context: file mode stays the source of truth
+    /// exactly as before, and DB mode reads and writes the `config_versions`
+    /// table instead.
+    pub config: Option<Arc<ConfigContext>>,
+    /// Serialises the whole config-apply sequence (hash check, boot-layer
+    /// diff, validate, persist) across concurrent requests - shared by `PUT
+    /// /admin/config` and every granular config endpoint (ADR 012, Task 8).
+    /// Without it two racing applies (two operators, or a client retry racing
+    /// its own original) could both pass the `If-Match` check against the
+    /// same pre-apply hash and then interleave their writes, defeating the
+    /// very lost-update guarantee `If-Match` exists to provide. A
+    /// `tokio::sync::Mutex`, not `std::sync::Mutex`: the pipeline holds the
+    /// guard across `.await` points (`ConfigSource::load`/`persist`,
+    /// `ConfigContext::validate_document`), which would either deadlock the
+    /// executor or require dropping and reacquiring the guard around every
+    /// await if this were a std mutex. Never on the request path (admin-only),
+    /// so holding it across awaits is not the blocking-runtime hazard it would
+    /// be elsewhere. Always present (not gated behind a builder) so no
+    /// construction site needs editing; the data behind it is `()` - only the
+    /// mutual exclusion matters.
+    pub config_apply_lock: Arc<tokio::sync::Mutex<()>>,
     /// Local token-estimation strategy (ADR 003). Default: the byte heuristic;
     /// `accurate` mode holds pre-built BPE encoders. Shared, never rebuilt on
-    /// the request path.
-    pub token_counter: Arc<TokenCounter>,
+    /// the request path: a config reload that changes `[tokenizer] mode`
+    /// builds the new counter off it and swaps it in. Take a per-request
+    /// snapshot via [`token_counter`](AppState::token_counter).
+    pub token_counter: Arc<ArcSwap<TokenCounter>>,
     /// Outbound budget-webhook control surface (ADR 011); `Some` whenever auth
     /// is enabled, whether or not webhooks are currently on. The `/admin`
     /// webhook routes read and reconfigure the delivery pipeline through it.
@@ -127,11 +141,11 @@ impl AppState {
             // Matches `config::default_body_limit()`; overridden via
             // `with_body_limit` once the real config is known (main.rs boot).
             body_limit: 10 * 1024 * 1024,
-            image_fetch: Arc::new(ImageFetchPolicy::default()),
+            image_fetch: Arc::new(ArcSwap::from_pointee(ImageFetchPolicy::default())),
             reload_trigger: None,
-            config_path: None,
-            config_apply_lock: Arc::new(std::sync::Mutex::new(())),
-            token_counter: Arc::new(TokenCounter::Heuristic),
+            config: None,
+            config_apply_lock: Arc::new(tokio::sync::Mutex::new(())),
+            token_counter: Arc::new(ArcSwap::from_pointee(TokenCounter::Heuristic)),
             webhooks: None,
         }
     }
@@ -146,15 +160,43 @@ impl AppState {
     /// Attach the token counter (builder style). Default is the byte heuristic.
     #[must_use]
     pub fn with_token_counter(mut self, token_counter: Arc<TokenCounter>) -> Self {
-        self.token_counter = token_counter;
+        self.token_counter = Arc::new(ArcSwap::new(token_counter));
         self
+    }
+
+    /// Share an existing token-counter cell (builder style), so the config
+    /// reloader swaps the very counter this state serves requests with.
+    #[must_use]
+    pub fn with_token_counter_cell(mut self, cell: Arc<ArcSwap<TokenCounter>>) -> Self {
+        self.token_counter = cell;
+        self
+    }
+
+    /// The current token counter, snapshotted for one request.
+    #[must_use]
+    pub fn token_counter(&self) -> Arc<TokenCounter> {
+        self.token_counter.load_full()
     }
 
     /// Attach the guarded image-fetch policy (builder style).
     #[must_use]
     pub fn with_image_fetch(mut self, policy: Arc<ImageFetchPolicy>) -> Self {
-        self.image_fetch = policy;
+        self.image_fetch = Arc::new(ArcSwap::new(policy));
         self
+    }
+
+    /// Share an existing image-fetch policy cell (builder style), so the
+    /// config reloader swaps the very policy this state serves requests with.
+    #[must_use]
+    pub fn with_image_fetch_cell(mut self, cell: Arc<ArcSwap<ImageFetchPolicy>>) -> Self {
+        self.image_fetch = cell;
+        self
+    }
+
+    /// The current image-fetch policy, snapshotted for one request.
+    #[must_use]
+    pub fn image_fetch(&self) -> Arc<ImageFetchPolicy> {
+        self.image_fetch.load_full()
     }
 
     /// Attach the hot-reload trigger (builder style) so the admin API can
@@ -165,10 +207,11 @@ impl AppState {
         self
     }
 
-    /// Set the config file path the config admin routes read and rewrite.
+    /// Set the config context the config admin routes and the hot reloader
+    /// read and rewrite through (builder style).
     #[must_use]
-    pub fn with_config_path(mut self, path: std::path::PathBuf) -> Self {
-        self.config_path = Some(Arc::new(path));
+    pub fn with_config_context(mut self, ctx: Arc<ConfigContext>) -> Self {
+        self.config = Some(ctx);
         self
     }
 
