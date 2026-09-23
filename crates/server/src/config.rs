@@ -1153,7 +1153,7 @@ impl Config {
     /// format, `auth.enabled` / `auth.db_path`, `config_source`), and
     /// `dynamic_toml` (the current document from a
     /// [`crate::config_source::DbSource`]) supplies everything else
-    /// (providers, resilience, telemetry, webhooks, ...). The two merge into
+    /// (providers, resilience, tokenizer, webhooks, ...). The two merge into
     /// one `Config` the same way the single file does in file mode, then
     /// `LUMEN_*` env vars overlay both, exactly as [`Self::load`]. Nothing in
     /// this function stops `dynamic_toml` from also naming a boot key, which

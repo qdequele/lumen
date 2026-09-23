@@ -51,11 +51,11 @@ All notable changes to LUMEN are documented here. The format is based on
   provider's full config; `PUT` requires the path name to match the body's
   `name`; `DELETE` on a provider still referenced by another model's
   fallback chain is refused with `LM-1001` naming the dependent model), and
-  `GET`/`PUT /admin/config/{section}` for `resilience`, `telemetry`,
-  `tokenizer`, `image_fetch`, `webhooks` and `auth` (a new
-  `AuthDynamicKnobs` type covering only the 5 hot-reloadable `[auth]`
-  fields - `enabled`/`db_path` are boot-layer and rejected 400 if a `PUT`
-  body names either). An unknown provider name or section is `LM-1003`
+  `GET`/`PUT /admin/config/{section}` for `resilience`, `tokenizer`,
+  `image_fetch`, `webhooks` and `auth` (a new `AuthDynamicKnobs` type
+  covering only the 2 hot-reloadable `[auth]` fields, `flush_interval_ms`
+  and `retention_days` - the boot-layer `[auth]` keys are rejected 400 if a
+  `PUT` body names one). An unknown provider name or section is `LM-1003`
   (404), the same style every other per-entity admin lookup uses.
   `crates/server/src/config_edit.rs` gains `replace_auth_knobs`, a
   field-level merge into the existing `[auth]` table that leaves
