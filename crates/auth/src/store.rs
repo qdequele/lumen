@@ -1113,6 +1113,25 @@ impl KeyStore {
 
     // ---- Provider keys (encrypted at rest) ----------------------------------
 
+    /// Names of the providers that have a key stored in the DB. Reads names
+    /// only - nothing is decrypted - so it is safe to call for display.
+    ///
+    /// # Errors
+    ///
+    /// A database error.
+    pub async fn provider_key_names(
+        &self,
+    ) -> Result<std::collections::BTreeSet<String>, AuthError> {
+        let mut names = std::collections::BTreeSet::new();
+        for row in sqlx::query("SELECT name FROM provider_keys")
+            .fetch_all(&self.pool)
+            .await?
+        {
+            names.insert(row.try_get::<String, _>("name")?);
+        }
+        Ok(names)
+    }
+
     /// Store (or replace) a provider key, sealed with the master key.
     pub async fn store_provider_key(
         &self,

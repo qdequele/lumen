@@ -81,7 +81,11 @@ router is only mounted when auth is on, so on a default deployment (where
 rather than 401.
 
 ```json
-{ "config": "<raw toml, byte for byte>", "hash": "<64 hex chars, BLAKE3>" }
+{
+  "config": "<raw toml, byte for byte>",
+  "hash": "<64 hex chars, BLAKE3>",
+  "key_sources": { "openai": "env", "cohere": "stored", "local": "not_required" }
+}
 ```
 
 `config` is the document's exact bytes, never a re-serialisation of the
@@ -97,6 +101,17 @@ To read or change one provider or one section without handling the whole
 document, use the granular endpoints (`/admin/config/providers/{name}`,
 `/admin/config/{section}`) described in
 [Config source modes](../operations/config-modes.md#the-admin-api-surface).
+
+`key_sources` maps each provider in the dynamic document (the file in file
+mode, the stored document in db mode) to where its API key resolves
+from, using the same precedence as startup and hot reload: `env` (the
+provider's `api_key_env` variable is set in the gateway's environment, which
+wins), `stored` (a key stored via `PUT /admin/provider-keys/{name}`
+back-fills an unset variable), `missing` (no key anywhere and the provider
+kind needs one), or `not_required` (a keyless kind such as Ollama, TEI,
+vLLM, NIM or Bedrock). It reports the source only, never the key. If the
+document does not parse, `key_sources` is an empty object; `config` is still
+returned verbatim.
 
 ## Applying a new config over the admin API
 

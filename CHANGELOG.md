@@ -154,6 +154,15 @@ All notable changes to LUMEN are documented here. The format is based on
   `ConfigContext::validate_document` since the task 6 rework) and its
   stale doc-comment references.
 
+- **`GET /admin/config` reports each provider's key source.** The response
+  gains a `key_sources` map, provider name to `env`, `stored`, `missing` or
+  `not_required`, resolved with the same precedence as startup and hot reload
+  (a set `api_key_env` variable wins, a key stored via
+  `PUT /admin/provider-keys/{name}` back-fills an unset one). Operators can see
+  which providers would come up keyless without reading secrets: only stored
+  key names are queried, nothing is decrypted, and the key itself is never
+  returned.
+
 ## [0.4.0] - 2026-08-26
 
 ### Added
