@@ -1,11 +1,11 @@
 # Providers
 
-LUMEN ships twenty-six built-in provider kinds - fifteen native integrations
-(their own request/response translation, including deployment-routed `azure`
-and SigV4-signed `bedrock`) plus eleven **OpenAI-compatible** hosts that reuse
-the OpenAI path with a per-kind base URL. Each `[[providers]]` block in your
-config selects one with a `kind` string and gives it a unique `name` (your own
-label). Each `[[providers.models]]` block under it exposes a model to clients:
+LUMEN ships twenty-seven built-in provider kinds - sixteen native integrations
+(their own request/response translation, including deployment-routed `azure`,
+SigV4-signed `bedrock` and SystemOne-only `typesafe`) plus eleven
+**OpenAI-compatible** hosts that reuse the OpenAI path with a per-kind base
+URL. Each `[[providers]]` block in your config selects one with a `kind`
+string and gives it a unique `name` (your own label). Each `[[providers.models]]` block under it exposes a model to clients:
 
 ```toml
 [[providers]]
@@ -17,7 +17,7 @@ api_key_env = "OPENAI_API_KEY"   # NAME of the env var holding the key
 [[providers.models]]
 id = "gpt-4o"             # the id clients send (owned entirely by you)
 upstream_id = "gpt-4o-2024-08-06"   # what LUMEN sends upstream (defaults to `id`)
-capabilities = ["chat"]   # any of "chat", "embed", "rerank"
+capabilities = ["chat"]   # any of "chat", "embed", "rerank", "systemone"
 ```
 
 Rules that apply to every provider:
@@ -47,23 +47,24 @@ Rules that apply to every provider:
   item (a mixed item is sent as its image, its caption text is not combined).
   See the multimodal-embeddings design spec for the full guard list.
 
-| `kind`      | Chat | Embed | Rerank | `api_key_env` | `base_url`     | Embed batch limit |
-|-------------|:----:|:-----:|:------:|:-------------:|:--------------:|:-----------------:|
-| `openai`    |  ✅  |  ✅   |        | required      | optional       | 2048              |
-| `mistral`   |  ✅  |  ✅   |        | required      | optional       | 512               |
-| `anthropic` |  ✅  |       |        | required      | optional       | -                 |
-| `google`    |  ✅  |  ✅   |        | required      | optional       | 100               |
-| `vertex_ai` |  ✅  |  ✅   |        | required (SA JSON) | **required** (GCP region) | 1 |
-| `bedrock`   |  ✅  |  ✅   |        | AWS SigV4     | optional       | 1                 |
-| `cohere`    |  ✅  |  ✅   |   ✅   | required      | optional       | 96                |
-| `jina`      |      |  ✅   |   ✅   | required      | optional       | 2048              |
-| `voyage`    |      |  ✅   |   ✅   | required      | optional       | 128               |
-| `mixedbread`|      |      |   ✅   | required      | optional       | -                 |
-| `pinecone`  |      |      |   ✅   | required      | optional       | -                 |
-| `nvidia`    |      |      |   ✅   | keyless       | **required**   | -                 |
-| `tei`       |      |  ✅   |   ✅   | keyless       | **required**   | 32                |
-| `ollama`    |  ✅  |  ✅   |        | keyless       | **required**   | 512               |
-| `azure`     |  ✅  |  ✅   |        | required      | **required**   | 2048              |
+| `kind`      | Chat | Embed | Rerank | SystemOne | `api_key_env` | `base_url`     | Embed batch limit |
+|-------------|:----:|:-----:|:------:|:---------:|:-------------:|:--------------:|:-----------------:|
+| `openai`    |  ✅  |  ✅   |        |           | required      | optional       | 2048              |
+| `mistral`   |  ✅  |  ✅   |        |           | required      | optional       | 512               |
+| `anthropic` |  ✅  |       |        |           | required      | optional       | -                 |
+| `google`    |  ✅  |  ✅   |        |           | required      | optional       | 100               |
+| `vertex_ai` |  ✅  |  ✅   |        |           | required (SA JSON) | **required** (GCP region) | 1 |
+| `bedrock`   |  ✅  |  ✅   |        |           | AWS SigV4     | optional       | 1                 |
+| `cohere`    |  ✅  |  ✅   |   ✅   |           | required      | optional       | 96                |
+| `jina`      |      |  ✅   |   ✅   |           | required      | optional       | 2048              |
+| `voyage`    |      |  ✅   |   ✅   |           | required      | optional       | 128               |
+| `mixedbread`|      |      |   ✅   |           | required      | optional       | -                 |
+| `pinecone`  |      |      |   ✅   |           | required      | optional       | -                 |
+| `nvidia`    |      |      |   ✅   |           | keyless       | **required**   | -                 |
+| `tei`       |      |  ✅   |   ✅   |           | keyless       | **required**   | 32                |
+| `ollama`    |  ✅  |  ✅   |        |           | keyless       | **required**   | 512               |
+| `azure`     |  ✅  |  ✅   |        |           | required      | **required**   | 2048              |
+| `typesafe`  |      |       |        |    ✅     | required      | optional       | -                 |
 
 The `together` kind (in the OpenAI-compatible table below) additionally serves
 **rerank** (LlamaRank) natively; see its section for the model config.
@@ -501,6 +502,56 @@ api_key_env = "PINECONE_API_KEY"
 id = "pinecone-rerank"
 upstream_id = "pinecone-rerank-v0"
 capabilities = ["rerank"]
+```
+
+## typesafe
+
+- **kind**: `typesafe` · **capabilities**: systemone only (TypeSafe's Jev
+  typed-decision models, served on `POST /v1/systemone`; see
+  [SystemOne](systemone/systemone.md) and
+  [ADR 013](adr/013-systemone-capability.md)).
+- **Auth**: `api_key_env` (e.g. `TYPESAFE_API_KEY`), **required**, sent as a
+  bearer token. Never logged, redacted from `Debug`.
+- **base_url**: optional; defaults to `https://api.typesafe.ai`. An override
+  is the API root, with or without a trailing `/v1`; the gateway posts to
+  `{base}/v1/systemone`.
+- **Schema note**: the request and response are TypeSafe's own, forwarded
+  verbatim (only `model` is rewritten to the `upstream_id`); `state`, question
+  and answer JSON keeps its key order byte-for-byte. The question contract is
+  validated at the edge (`LM-2011` / `LM-1001`) before any upstream call.
+- **Models**: `jev-latest` (stable alias), `jev-preview` (preview alias) and
+  versioned ids such as `jev-1.13.0`, mapped through `upstream_id`.
+- **Errors**: TypeSafe `401` / `422` surface as `LM-3003` (502, not retried,
+  upstream body not forwarded); `429` is `LM-3001` honouring `Retry-After`;
+  `529 Overloaded` is a retryable 5xx, so retries and `fallbacks` apply.
+- **Cost**: Jev bills input tokens only, $0.042 per 1M (TypeSafe pricing,
+  2026-09): set `cost_per_1m_input = 0.042` and no output price.
+- **Usage**: upstream `usage.input_tokens` / `output_tokens` when reported;
+  otherwise an `estimated` input count over `state` plus every question
+  (ADR 003), output 0.
+- **Upstream limits** (TypeSafe, 2026-09): 64k tokens of context per request
+  (32k for `state` plus the longest question), 250k tokens/s and 1200 RPM,
+  dynamic. Not enforced by the gateway.
+
+```toml
+[[providers]]
+name = "typesafe"
+kind = "typesafe"
+api_key_env = "TYPESAFE_API_KEY"
+
+[[providers.models]]
+id = "jev"
+upstream_id = "jev-latest"
+capabilities = ["systemone"]
+cost_per_1m_input = 0.042
+
+# A pinned version for reproducible answers, falling back to the stable alias
+# when it is overloaded (529) or its circuit is open.
+[[providers.models]]
+id = "jev-1.13.0"
+capabilities = ["systemone"]
+cost_per_1m_input = 0.042
+fallbacks = ["jev"]
 ```
 
 ## nvidia (NIM)

@@ -25,6 +25,7 @@ pub mod rerank;
 pub mod resilience;
 pub mod routes;
 pub mod state;
+pub mod systemone;
 pub mod tokenizer;
 pub mod webhooks;
 

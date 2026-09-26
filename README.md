@@ -3,8 +3,8 @@
 > **L**ightweight **U**nified **M**odel **EN**dpoint
 
 A universal, self-hostable LLM gateway written in Rust. One OpenAI-compatible
-endpoint in front of many providers - for **chat**, **embeddings** and
-**reranking** alike. It is designed to be light, fast and sovereign: a single
+endpoint in front of many providers - for **chat**, **embeddings**,
+**reranking** and **SystemOne typed decisions** alike. It is designed to be light, fast and sovereign: a single
 static binary, **zero telemetry**, and prompts that are **never logged by
 default**.
 
@@ -39,6 +39,7 @@ reference.
 | `POST /v1/chat/completions`    | Chat completions, OpenAI format, streaming SSE.         |
 | `POST /v1/embeddings`          | Embeddings, OpenAI format.                              |
 | `POST /v1/rerank`              | Reranking, Cohere format (`query`, `documents`, `top_n`).|
+| `POST /v1/systemone`           | SystemOne typed decisions (TypeSafe Jev), TypeSafe format (`state`, `questions`); TypeSafe SDKs work via `TYPESAFE_BASE_URL`. See [SystemOne](docs/systemone/systemone.md). |
 | `GET  /v1/models`              | Lists configured models with a `capabilities` array.    |
 | `GET  /v1/models/{id}`         | Retrieves one model (same object as the list entry); unknown id is a 404 (`LM-2001`). |
 | `GET  /health`                 | Liveness. No I/O, never touches the DB or providers.    |
@@ -46,8 +47,8 @@ reference.
 | `GET  /metrics`                | Prometheus exposition.                                  |
 | `POST/GET/PUT/PATCH/DELETE /admin/*` | Keys, budgets, budget webhooks, usage reporting & export, provider-key rotation, whole-document and granular (per-provider, per-section) config read/apply. Only mounted when auth is enabled. See [Config source modes](docs/operations/config-modes.md). |
 
-A single model id is owned entirely by you and may serve one to three
-capabilities. The router resolves each request by `(capability, model)`.
+A single model id is owned entirely by you and may serve one or more of the
+four capabilities (`chat`, `embed`, `rerank`, `systemone`). The router resolves each request by `(capability, model)`.
 
 **Vision (image input):** `POST /v1/chat/completions` also accepts OpenAI's
 content-parts message shape (text + `image_url` parts) for any model whose
@@ -165,30 +166,31 @@ non-empty (an empty list is rejected with `LM-2010`).
 
 ## Providers × capabilities
 
-Twenty-six provider kinds: fifteen **native** integrations plus eleven
+Twenty-seven provider kinds: sixteen **native** integrations plus eleven
 **OpenAI-compatible** hosts. The `kind` string is what you put in a
 `[[providers]]` block. **Self-hosted** kinds are keyless and require a
 `base_url`; hosted kinds read their API key from the env var named by
 `api_key_env` (`bedrock` uses AWS env credentials; for `vertex_ai` the
 `api_key_env` var holds a GCP service-account JSON).
 
-| `kind`      | Chat | Embed | Rerank | Auth                  | Notes                          |
-|-------------|:----:|:-----:|:------:|-----------------------|--------------------------------|
-| `openai`    |  ✅  |  ✅   |        | `api_key_env`         |                                |
-| `mistral`   |  ✅  |  ✅   |        | `api_key_env`         | OpenAI-style API, native module |
-| `anthropic` |  ✅  |       |        | `api_key_env`         | bidirectional translation      |
-| `google`    |  ✅  |  ✅   |        | `api_key_env`         | Gemini Developer API           |
-| `vertex_ai` |  ✅  |  ✅   |        | GCP service account   | Gemini on GCP; `base_url` = region |
-| `bedrock`   |  ✅  |  ✅   |        | AWS SigV4 (env creds) | Converse API                   |
-| `azure`     |  ✅  |  ✅   |        | `api_key_env`, **`base_url`** | deployment-routed URLs |
-| `cohere`    |  ✅  |  ✅   |   ✅   | `api_key_env`         | one model can serve all three  |
-| `jina`      |      |  ✅   |   ✅   | `api_key_env`         |                                |
-| `voyage`    |      |  ✅   |   ✅   | `api_key_env`         |                                |
-| `mixedbread`|      |      |   ✅   | `api_key_env`         | `mxbai-rerank-*`               |
-| `pinecone`  |      |      |   ✅   | `api_key_env`         | `Api-Key` header; reports units |
-| `nvidia`    |      |      |   ✅   | keyless, **`base_url`** | NIM `/v1/ranking`; logit scores |
-| `tei`       |      |  ✅   |   ✅   | keyless, **`base_url`** | self-hosted (Text Embeddings Inference) |
-| `ollama`    |  ✅  |  ✅   |        | keyless, **`base_url`** | self-hosted; chat via its OpenAI-compatible `/v1` |
+| `kind`      | Chat | Embed | Rerank | SystemOne | Auth                  | Notes                          |
+|-------------|:----:|:-----:|:------:|:---------:|-----------------------|--------------------------------|
+| `openai`    |  ✅  |  ✅   |        |           | `api_key_env`         |                                |
+| `mistral`   |  ✅  |  ✅   |        |           | `api_key_env`         | OpenAI-style API, native module |
+| `anthropic` |  ✅  |       |        |           | `api_key_env`         | bidirectional translation      |
+| `google`    |  ✅  |  ✅   |        |           | `api_key_env`         | Gemini Developer API           |
+| `vertex_ai` |  ✅  |  ✅   |        |           | GCP service account   | Gemini on GCP; `base_url` = region |
+| `bedrock`   |  ✅  |  ✅   |        |           | AWS SigV4 (env creds) | Converse API                   |
+| `azure`     |  ✅  |  ✅   |        |           | `api_key_env`, **`base_url`** | deployment-routed URLs |
+| `cohere`    |  ✅  |  ✅   |   ✅   |           | `api_key_env`         | one model can serve chat, embed and rerank |
+| `jina`      |      |  ✅   |   ✅   |           | `api_key_env`         |                                |
+| `voyage`    |      |  ✅   |   ✅   |           | `api_key_env`         |                                |
+| `mixedbread`|      |      |   ✅   |           | `api_key_env`         | `mxbai-rerank-*`               |
+| `pinecone`  |      |      |   ✅   |           | `api_key_env`         | `Api-Key` header; reports units |
+| `nvidia`    |      |      |   ✅   |           | keyless, **`base_url`** | NIM `/v1/ranking`; logit scores |
+| `tei`       |      |  ✅   |   ✅   |           | keyless, **`base_url`** | self-hosted (Text Embeddings Inference) |
+| `ollama`    |  ✅  |  ✅   |        |           | keyless, **`base_url`** | self-hosted; chat via its OpenAI-compatible `/v1` |
+| `typesafe`  |      |       |        |    ✅     | `api_key_env`         | Jev typed decisions; input-only pricing |
 
 **OpenAI-compatible hosts** (chat + embed, reusing the OpenAI path with a
 built-in base URL): `groq`, `together`, `fireworks`, `deepseek`, `openrouter`,

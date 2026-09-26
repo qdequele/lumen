@@ -17,6 +17,7 @@ jobs:
           [
             sse_parser,
             chat_request,
+            systemone_request,
             anthropic_translate_request,
             anthropic_translate_response,
             google_translate_request,

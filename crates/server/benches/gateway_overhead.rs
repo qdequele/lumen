@@ -19,7 +19,7 @@ use criterion::{criterion_group, criterion_main, Criterion};
 use futures::stream::BoxStream;
 use lumen_core::{
     ChatChoice, ChatMessage, ChatProvider, ChatRequest, ChatResponse, MessageContent,
-    ProviderError, Usage,
+    ProviderError, SystemOneRequest, Usage,
 };
 use lumen_router::circuit::{BreakerConfig, CircuitBreakers};
 use lumen_router::executor::{execute, ExecConfig, Link};
@@ -153,5 +153,54 @@ fn bench_json_roundtrip(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_executor, bench_json_roundtrip);
+/// A SystemOne request body with `questions` mixed noul/choice/score
+/// questions and a string `state` of `state_bytes` bytes.
+fn systemone_body(questions: usize, state_bytes: usize) -> Vec<u8> {
+    let qs: Vec<String> = (0..questions)
+        .map(|i| match i % 3 {
+            0 => format!(r#""q{i}":{{"type":"noul","instructions":"Is this urgent?"}}"#),
+            1 => format!(
+                r#""q{i}":{{"type":"choice","instructions":"Which team?","criteria":{{"billing":"Payments","technical":"Bugs","sales":null}}}}"#
+            ),
+            _ => format!(
+                r#""q{i}":{{"type":"score","instructions":"How angry?","criteria":["Calm","Frustrated","Very angry"]}}"#
+            ),
+        })
+        .collect();
+    format!(
+        r#"{{"model":"jev-latest","state":"{}","questions":{{{}}}}}"#,
+        "a".repeat(state_bytes),
+        qs.join(",")
+    )
+    .into_bytes()
+}
+
+/// The per-request SystemOne pipeline (ADR 013): parse + validate + estimate,
+/// then one attempt's clone + upstream serialization, for a small request
+/// and a max-size one (128 KB state, 300 questions).
+fn bench_systemone(c: &mut Criterion) {
+    for (name, body) in [
+        ("small", systemone_body(3, 1024)),
+        ("large", systemone_body(300, 128 * 1024)),
+    ] {
+        c.bench_function(&format!("systemone_request_pipeline_{name}"), |b| {
+            b.iter(|| {
+                let req: SystemOneRequest =
+                    serde_json::from_slice(black_box(&body)).expect("parse");
+                req.validate().expect("valid");
+                black_box(lumen_core::tokens::estimate_systemone(&req));
+                let mut attempt = req.clone();
+                "jev-1.13.0".clone_into(&mut attempt.model);
+                black_box(serde_json::to_vec(&attempt).expect("serialize").len());
+            });
+        });
+    }
+}
+
+criterion_group!(
+    benches,
+    bench_executor,
+    bench_json_roundtrip,
+    bench_systemone
+);
 criterion_main!(benches);

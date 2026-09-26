@@ -2,15 +2,17 @@
 //!
 //! This crate is deliberately free of any web framework, HTTP client or
 //! database dependency: it defines the vocabulary the rest of the workspace
-//! speaks. Three capabilities are first-class citizens - chat, embeddings and
-//! reranking - each with its own request/response types and provider trait.
+//! speaks. Four capabilities are first-class citizens - chat, embeddings,
+//! reranking and SystemOne typed decisions - each with its own
+//! request/response types and provider trait.
 //!
 //! # Modules
 //! * [`chat`] - OpenAI `chat/completions` request/response/chunk types.
 //! * [`embed`] - OpenAI `embeddings` types.
 //! * [`rerank`] - Cohere `rerank` types.
-//! * [`provider`] - the [`ChatProvider`], [`EmbeddingProvider`] and
-//!   [`RerankProvider`] traits.
+//! * [`systemone`] - TypeSafe `systemone` types (ADR 013).
+//! * [`provider`] - the [`ChatProvider`], [`EmbeddingProvider`],
+//!   [`RerankProvider`] and [`SystemOneProvider`] traits.
 //! * [`error`] - the [`ProviderError`] / [`GatewayError`] taxonomy.
 //! * [`capability`] - the [`Capability`] enum.
 
@@ -23,6 +25,7 @@ pub mod error;
 pub mod media;
 pub mod provider;
 pub mod rerank;
+pub mod systemone;
 pub mod tokens;
 
 pub use capability::Capability;
@@ -39,10 +42,11 @@ pub use error::{
     BudgetScope, ErrorBody, ErrorEnvelope, ErrorType, GatewayError, ProviderError, QuotaKind,
 };
 pub use media::{measure_media, MediaTypeUsage, MediaUsage};
-pub use provider::{ChatProvider, EmbeddingProvider, RerankProvider};
+pub use provider::{ChatProvider, EmbeddingProvider, RerankProvider, SystemOneProvider};
 pub use rerank::{
     RerankDocument, RerankRequest, RerankResponse, RerankResult, RerankResultDocument, RerankUsage,
 };
+pub use systemone::{SystemOneRequest, SystemOneResponse, SystemOneUsage};
 
 #[cfg(test)]
 mod tests {

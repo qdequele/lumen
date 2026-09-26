@@ -55,11 +55,21 @@ Numbers are hardware-specific; re-run the commands on your target to get yours.
 | `executor_overhead_chat` (executor around an instant provider) | **1.21 µs** | 1.04 – 1.40 µs |
 | `json_request_deserialize` (parse a chat request) | **1.34 µs** | 1.15 – 1.55 µs |
 | `json_response_serialize` (serialize a chat response) | **0.60 µs** | 0.55 – 0.66 µs |
+| `systemone_request_pipeline_small` (SystemOne parse + validate + estimate + one attempt's clone and serialize; 1 KB state, 3 questions; ADR 013) | **3.3 µs** | 3.1 – 3.6 µs |
+| `systemone_request_pipeline_large` (same, at the documented maximum: 128 KB state, 300 questions) | **~280 µs** | 241 – 322 µs |
 
 **Total added CPU per non-streaming chat request ≈ 3.2 µs** (executor + parse +
 serialize). Streaming passthrough adds even less per chunk: it forwards upstream
 `Bytes` verbatim with no per-chunk serde (ADR 004), so the per-chunk cost is a
 bounded copy plus the `[DONE]`/heartbeat scan, not a deserialize.
+
+SystemOne cost scales with the body: a typical request matches chat, while a
+maximum-size one (2026-09 measurement, noisy host) spends roughly 100 µs in
+the unavoidable JSON scan and the rest in per-question raw copies and the
+upstream re-serialization. It stays inside the 1 ms budget; a byte-splice
+passthrough that would roughly halve the large case is in `docs/backlog.md`.
+The large case needs `CARGO_PROFILE_RELEASE_STRIP=false` to build on macOS
+27, where `strip = true` corrupts proc-macro dylibs (pre-existing, unrelated).
 
 ### Streaming time to first bit (measured here)
 

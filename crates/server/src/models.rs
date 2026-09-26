@@ -26,7 +26,7 @@ pub struct ModelEntry {
     pub object: &'static str,
     /// The provider that owns this model.
     pub owned_by: String,
-    /// Capabilities this model serves (`chat` / `embed` / `rerank`).
+    /// Capabilities this model serves (`chat` / `embed` / `rerank` / `systemone`).
     pub capabilities: Vec<&'static str>,
     /// Input modalities this model accepts (`text`, `image`).
     pub modalities: Vec<String>,

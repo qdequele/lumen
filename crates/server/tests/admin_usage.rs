@@ -472,6 +472,15 @@ async fn invalid_parameters_are_400_lm1001() {
     }
 }
 
+#[tokio::test]
+async fn every_capability_is_an_accepted_filter() {
+    let h = spawn_admin(common::empty_registry()).await;
+    for capability in ["chat", "embed", "rerank", "systemone"] {
+        let resp = h.usage(&format!("?capability={capability}")).await;
+        assert_eq!(resp.status(), 200, "capability {capability}");
+    }
+}
+
 // ---- End to end through the gateway ----------------------------------------------
 
 #[tokio::test]

@@ -80,6 +80,21 @@ fn full_registry(upstream: &str) -> Arc<Registry> {
             }],
         },
         ProviderSpec {
+            name: "typesafe".to_owned(),
+            kind: ProviderKind::Typesafe,
+            api_key: Some("ts-test".to_owned()),
+            base_url: Some(upstream.to_owned()),
+            api_version: None,
+            strict: false,
+            connect_timeout_ms: None,
+            models: vec![ModelSpec {
+                id: "jev".to_owned(),
+                upstream_id: "jev-latest".to_owned(),
+                capabilities: vec![Capability::SystemOne],
+                modalities: vec!["text".to_owned()],
+            }],
+        },
+        ProviderSpec {
             name: "tei".to_owned(),
             kind: ProviderKind::Tei,
             api_key: None,
@@ -128,6 +143,15 @@ fn dollar_pricing() -> CostTable {
         id = "rerank-fast"
         capabilities = ["rerank"]
         cost_per_1k_searches = 1000.0
+
+        [[providers]]
+        name = "typesafe"
+        kind = "typesafe"
+        [[providers.models]]
+        id = "jev"
+        capabilities = ["systemone"]
+        # Input-only pricing, like Jev itself: output tokens are free.
+        cost_per_1m_input = 1000000.0
     "#;
     let config: Config = Figment::new()
         .merge(Toml::string(toml))
@@ -298,6 +322,28 @@ async fn mount_cohere_rerank(upstream: &MockServer) {
         .await;
 }
 
+/// A TypeSafe `/v1/systemone` responder reporting `input_tokens` of usage
+/// (and 20 free output tokens).
+async fn mount_typesafe(upstream: &MockServer, input_tokens: u32) {
+    Mock::given(method("POST"))
+        .and(path("/v1/systemone"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "model": "jev-1.13.0",
+            "answers": { "q": { "type": "noul", "noul": 0.9 } },
+            "usage": { "input_tokens": input_tokens, "output_tokens": 20 }
+        })))
+        .mount(upstream)
+        .await;
+}
+
+fn systemone_body() -> Value {
+    json!({
+        "model": "jev",
+        "state": "abcd",
+        "questions": { "q": { "type": "noul", "instructions": "?" } }
+    })
+}
+
 fn embed_body() -> Value {
     // "abcd" = 4 bytes → exactly 1 estimated token → $1 at test pricing.
     json!({ "model": "embed-small", "input": "abcd" })
@@ -464,6 +510,133 @@ async fn exhausted_budget_is_402_fg4001_with_zero_upstream_calls() {
 
     // wiremock received NOTHING (criterion 2).
     assert!(upstream.received_requests().await.expect("reqs").is_empty());
+}
+
+#[tokio::test]
+async fn systemone_budget_is_enforced_before_the_upstream_call() {
+    // ADR 013: SystemOne admission reserves the state+questions input
+    // estimate (several tokens, i.e. several dollars here) like any other
+    // capability; a key that cannot cover it never reaches TypeSafe.
+    let upstream = MockServer::start().await;
+    mount_typesafe(&upstream, 5).await;
+    let h = spawn_auth(full_registry(&upstream.uri()), &[]).await;
+    let key = h.create_key(Some(0.5), None, None).await;
+
+    let resp = h
+        .client
+        .post(format!("{}/v1/systemone", h.base))
+        .bearer_auth(&key)
+        .json(&systemone_body())
+        .send()
+        .await
+        .expect("send");
+    assert_eq!(resp.status(), 402);
+    let body: Value = resp.json().await.expect("json");
+    assert_eq!(body["error"]["code"], "LM-4001");
+    assert!(upstream.received_requests().await.expect("reqs").is_empty());
+}
+
+#[tokio::test]
+async fn systemone_usage_row_records_tokens_and_input_only_cost() {
+    let upstream = MockServer::start().await;
+    mount_typesafe(&upstream, 5).await;
+    let h = spawn_auth(full_registry(&upstream.uri()), &[]).await;
+    let key = h.create_key(Some(100.0), None, None).await;
+
+    let resp = h
+        .client
+        .post(format!("{}/v1/systemone", h.base))
+        .bearer_auth(&key)
+        .json(&systemone_body())
+        .send()
+        .await
+        .expect("send");
+    assert_eq!(resp.status(), 200);
+
+    h.wait_usage_rows(1).await;
+    let dump = h.store.debug_dump().await.expect("dump");
+    // model, capability, tokens_in=5 / tokens_out=20 (upstream), cost $5:
+    // output tokens are free at this price table.
+    // Columns: model|model_used|capability|tokens_in|tokens_out|search_units|
+    // cached|reasoning|cache_write|estimated|cost.
+    assert!(
+        dump.contains("'jev'|'jev'|'systemone'|5|20|NULL|NULL|NULL|NULL|0|5.0|"),
+        "dump:\n{dump}"
+    );
+    // The request content never reaches the usage log.
+    assert!(
+        !dump.contains("abcd"),
+        "state leaked into usage_log:\n{dump}"
+    );
+}
+
+#[tokio::test]
+async fn systemone_reservation_is_refunded_on_upstream_error_and_disconnect() {
+    // ADR 003 / ADR 013: an admitted request that never settles (upstream
+    // 502, or the client hanging up mid-call) leaves the key's spend at 0.
+    let failing = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/systemone"))
+        .respond_with(ResponseTemplate::new(422))
+        .mount(&failing)
+        .await;
+    let h = spawn_auth(full_registry(&failing.uri()), &[]).await;
+    let key = h.create_key(Some(100.0), None, None).await;
+    let entry = h
+        .runtime
+        .keys
+        .authenticate(&key, lumen_server::auth::now_unix())
+        .expect("key");
+
+    let resp = h
+        .client
+        .post(format!("{}/v1/systemone", h.base))
+        .bearer_auth(&key)
+        .json(&systemone_body())
+        .send()
+        .await
+        .expect("send");
+    assert_eq!(resp.status(), 502);
+    assert_eq!(entry.spent_micro(), 0, "refunded after an upstream error");
+
+    let slow = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/systemone"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({ "model": "jev", "answers": {} }))
+                .set_delay(Duration::from_secs(3)),
+        )
+        .mount(&slow)
+        .await;
+    let h = spawn_auth(full_registry(&slow.uri()), &[]).await;
+    let key = h.create_key(Some(100.0), None, None).await;
+    let entry = h
+        .runtime
+        .keys
+        .authenticate(&key, lumen_server::auth::now_unix())
+        .expect("key");
+    let result = h
+        .client
+        .post(format!("{}/v1/systemone", h.base))
+        .bearer_auth(&key)
+        .timeout(Duration::from_millis(200))
+        .json(&systemone_body())
+        .send()
+        .await;
+    assert!(result.is_err(), "client should have timed out");
+    // The upstream call was in flight, so the reservation was live...
+    assert_eq!(slow.received_requests().await.expect("reqs").len(), 1);
+    // ...and the dropped handler refunds it.
+    let mut refunded = false;
+    for _ in 0..100 {
+        if entry.spent_micro() == 0 {
+            refunded = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(refunded, "refunded after the client hung up");
 }
 
 #[tokio::test]

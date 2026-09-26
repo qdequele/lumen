@@ -8,6 +8,33 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ### Added
 
+- **SystemOne capability and the TypeSafe (Jev) provider (ADR 013).** A
+  fourth first-class capability, `systemone`, served at `POST /v1/systemone`
+  with TypeSafe's own wire shape: a `state` plus named `noul` / `choice` /
+  `score` questions in, one typed answer per question (with calibrated
+  probabilities and `confidence`) out. The TypeSafe SDKs work through the
+  gateway unchanged by pointing `TYPESAFE_BASE_URL` at LUMEN. New provider
+  kind `typesafe` (bearer auth, default base URL `https://api.typesafe.ai`,
+  `529 Overloaded` retried and failed over like any retryable 5xx).
+  `state`, question bodies and answers are carried as raw JSON, so key order
+  reaches Jev exactly as sent and a large state is never re-serialized. The
+  documented question contract is validated at the edge: an empty
+  `questions` map is the new `LM-2011` (400), any other malformed question an
+  `LM-1001` naming it, both before any upstream call. Virtual keys, hard
+  budgets, quotas, fallbacks, `usage_log` and `lumen_tokens_total` apply as
+  for every other capability; token usage is upstream-reported when present,
+  otherwise estimated over the state plus questions and flagged `estimated`
+  (ADR 003). Price Jev with `cost_per_1m_input = 0.042` (output is free).
+  `GET /admin/usage?capability=systemone` is accepted. Duplicate top-level
+  keys and duplicate question ids are rejected; a malformed upstream `usage`
+  block never fails a billed answer (it falls back to the flagged estimate).
+  New `systemone_request` fuzz target and `systemone_request_pipeline_*`
+  benches (~3 us typical, ~280 us at the 128 KB / 300-question maximum). A
+  Jev-backed
+  `/v1/rerank` is not included; design proposals for how a rerank model maps
+  onto SystemOne questions, including per-tenant mappings, are in
+  `docs/design/systemone-rerank-mapping.md`.
+
 - **Docs: config source modes (ADR 012, task 10 of the config-source-abstraction
   plan).** New `docs/operations/config-modes.md`: the
   `config_source = "file" | "db"` boot key, the boot-layer/dynamic-layer
