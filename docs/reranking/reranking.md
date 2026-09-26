@@ -97,6 +97,44 @@ The model that actually served the request (primary or a fallback) is
 reported in the `x-lumen-model-used` response header. See
 [Resilience](../operations/resilience.md).
 
+## Jev as a reranker (TypeSafe)
+
+A `typesafe` model that declares `rerank` is served by Jev through a
+converter. Each request becomes SystemOne calls whose `state` is
+`{"query": ...}` and whose questions are one `noul` per document, the
+document carried in structured instructions; Jev's noul (its calibrated
+probability that the document is relevant) is the `relevance_score`.
+
+```toml
+[[providers.models]]
+id = "jev-rerank"
+upstream_id = "jev-latest"
+capabilities = ["rerank"]
+cost_per_1m_input = 0.042
+
+# Optional: the question asked about every document. Unset fields default
+# to a generic relevance question.
+[providers.models.rerank]
+instructions = "Could `document` be the precedent cited in the query?"
+criteria.true = "The document states the specific rule the query cites."
+criteria.false = "The document is only on a similar topic."
+```
+
+- Clients call plain `/v1/rerank`; ordering, `top_n`, `return_documents`,
+  `rank_fields` and fallbacks (e.g. `fallbacks = ["cohere-rerank"]`) work as
+  for any reranker.
+- Documents are packed into as few upstream calls as Jev's context allows (at
+  most 100 documents and about 48k estimated tokens per call), run up to 4 at
+  a time. A document longer than about 4,096 tokens is truncated first, like
+  Cohere's default `max_tokens_per_doc`.
+- Because scores are calibrated probabilities, they are comparable across
+  requests: a cut-off such as 0.5 means the same thing everywhere.
+- Usage: Jev's upstream `input_tokens` is `usage.total_tokens` (unflagged);
+  search units are derived. A rerank model with `cost_per_1m_input` is billed
+  per input token, on top of any `cost_per_1k_searches`.
+- The converter is per model: one converter per model id. Per-key or
+  per-tenant converters are not supported yet.
+
 ## Providers
 
 Which provider kinds serve `rerank` and their setup is in

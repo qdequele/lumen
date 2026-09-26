@@ -543,6 +543,57 @@ pub struct ModelConfig {
     /// and serve every capability this model declares (validated at boot).
     #[serde(default)]
     pub fallbacks: Vec<String>,
+    /// How `/v1/rerank` is converted to SystemOne questions (Jev as a
+    /// reranker, ADR 013 amendment). Only valid on a `kind = "typesafe"`
+    /// model that declares `rerank`; every field is optional and defaults to
+    /// a generic relevance question.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rerank: Option<RerankConverterConfig>,
+}
+
+/// The `[providers.models.rerank]` converter block.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RerankConverterConfig {
+    /// The yes/no question asked about each `document`, relative to the
+    /// query in the state.
+    #[serde(default)]
+    pub instructions: Option<String>,
+    /// What a yes and a no mean.
+    #[serde(default)]
+    pub criteria: Option<RerankCriteriaConfig>,
+}
+
+/// `criteria.true` / `criteria.false` of a rerank converter.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RerankCriteriaConfig {
+    /// What a yes (relevant) means.
+    #[serde(default, rename = "true")]
+    pub yes: Option<String>,
+    /// What a no (not relevant) means.
+    #[serde(default, rename = "false")]
+    pub no: Option<String>,
+}
+
+impl RerankConverterConfig {
+    /// The converter, with defaults for every unset field.
+    #[must_use]
+    pub fn to_converter(&self) -> lumen_providers::typesafe::rerank::RerankConverter {
+        let mut converter = lumen_providers::typesafe::rerank::RerankConverter::default();
+        if let Some(instructions) = &self.instructions {
+            instructions.clone_into(&mut converter.instructions);
+        }
+        if let Some(criteria) = &self.criteria {
+            if let Some(yes) = &criteria.yes {
+                yes.clone_into(&mut converter.criteria_true);
+            }
+            if let Some(no) = &criteria.no {
+                no.clone_into(&mut converter.criteria_false);
+            }
+        }
+        converter
+    }
 }
 
 impl ModelConfig {
@@ -551,6 +602,36 @@ impl ModelConfig {
     pub fn resolved_upstream_id(&self) -> &str {
         self.upstream_id.as_deref().unwrap_or(&self.id)
     }
+}
+
+/// A `[providers.models.rerank]` converter is only meaningful on a
+/// `typesafe` model that declares `rerank` (ADR 013 amendment), and its
+/// fields, when set, must not be blank.
+fn validate_rerank_converter(
+    provider: &ProviderConfig,
+    model: &ModelConfig,
+    err: &impl Fn(String) -> ConfigError,
+) -> Result<(), ConfigError> {
+    let Some(converter) = &model.rerank else {
+        return Ok(());
+    };
+    if provider.kind != ProviderKind::Typesafe || !model.capabilities.contains(&Capability::Rerank)
+    {
+        return Err(err(format!(
+            "model '{}': a `rerank` converter block is only valid on a kind = \"typesafe\" \
+             model that declares the rerank capability",
+            model.id
+        )));
+    }
+    let blank = |v: &Option<String>| v.as_deref().is_some_and(|t| t.trim().is_empty());
+    let criteria = converter.criteria.clone().unwrap_or_default();
+    if blank(&converter.instructions) || blank(&criteria.yes) || blank(&criteria.no) {
+        return Err(err(format!(
+            "model '{}': rerank converter fields must not be empty",
+            model.id
+        )));
+    }
+    Ok(())
 }
 
 /// Log output format, mirrored to [`LogFormat`].
@@ -1304,6 +1385,7 @@ impl Config {
                         )));
                     }
                 }
+                validate_rerank_converter(provider, model, &err)?;
                 if let Some(first_owner) = model_owner.insert(model.id.as_str(), &provider.name) {
                     return Err(err(format!(
                         "duplicate model id '{}': declared by both provider '{}' and provider \
@@ -1427,6 +1509,10 @@ impl Config {
                         upstream_id: m.resolved_upstream_id().to_owned(),
                         capabilities: m.capabilities.clone(),
                         modalities: m.modalities.clone(),
+                        rerank_converter: m
+                            .rerank
+                            .as_ref()
+                            .map(RerankConverterConfig::to_converter),
                     })
                     .collect(),
             })
@@ -1910,6 +1996,64 @@ mod tests {
         assert!(msg.contains("dup"), "{msg}");
         assert!(msg.contains("provider-one"), "{msg}");
         assert!(msg.contains("provider-two"), "{msg}");
+    }
+
+    #[test]
+    fn typesafe_rerank_converter_parses_with_defaults() {
+        let config = load_str(
+            r#"
+            [[providers]]
+            name = "typesafe"
+            kind = "typesafe"
+            api_key_env = "TYPESAFE_API_KEY"
+            [[providers.models]]
+            id = "plain"
+            capabilities = ["rerank"]
+            [[providers.models]]
+            id = "custom"
+            capabilities = ["rerank"]
+            [providers.models.rerank]
+            criteria.false = "Unrelated."
+            "#,
+        )
+        .expect("valid");
+        let specs = config.provider_specs();
+        let models = &specs[0].models;
+        assert_eq!(models[0].rerank_converter, None);
+        let custom = models[1].rerank_converter.clone().expect("converter");
+        assert_eq!(custom.criteria_false, "Unrelated.");
+        assert_eq!(
+            custom.instructions,
+            lumen_providers::typesafe::rerank::DEFAULT_INSTRUCTIONS
+        );
+    }
+
+    #[test]
+    fn rerank_converter_is_rejected_where_it_cannot_apply() {
+        for (kind, caps, block) in [
+            ("cohere", r#"["rerank"]"#, r#"instructions = "q""#),
+            ("typesafe", r#"["systemone"]"#, r#"instructions = "q""#),
+            ("typesafe", r#"["rerank"]"#, r#"instructions = "  ""#),
+        ] {
+            let result = load_str(&format!(
+                r#"
+                [[providers]]
+                name = "p"
+                kind = "{kind}"
+                api_key_env = "KEY"
+                [[providers.models]]
+                id = "m"
+                capabilities = {caps}
+                [providers.models.rerank]
+                {block}
+                "#
+            ));
+            let err = result.expect_err("rejected");
+            assert!(
+                err.to_string().contains("rerank"),
+                "{kind} {caps} {block}: {err}"
+            );
+        }
     }
 
     #[test]

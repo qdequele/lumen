@@ -9,7 +9,7 @@
 //! passed in already - the registry never reads env vars or holds config.
 
 use arc_swap::ArcSwap;
-use lumen_core::{Capability, ChatProvider, EmbeddingProvider, RerankProvider};
+use lumen_core::{Capability, ChatProvider, EmbeddingProvider, RerankProvider, SystemOneProvider};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -31,6 +31,8 @@ use crate::openai::OpenAiProvider;
 use crate::pinecone::PineconeProvider;
 use crate::tei::TeiProvider;
 use crate::together::TogetherRerankProvider;
+use crate::typesafe::rerank::{RerankConverter, TypesafeRerankProvider};
+use crate::typesafe::TypesafeProvider;
 use crate::voyage::VoyageProvider;
 
 /// A model exposed by a provider, with its upstream id and capabilities.
@@ -44,6 +46,10 @@ pub struct ModelSpec {
     pub capabilities: Vec<Capability>,
     /// Declared input modalities (e.g. `["text","image"]`).
     pub modalities: Vec<String>,
+    /// How `/v1/rerank` is converted to SystemOne questions, for a `typesafe`
+    /// model declaring `rerank`; `None` uses the default converter. Ignored
+    /// by every other kind.
+    pub rerank_converter: Option<RerankConverter>,
 }
 
 /// A provider instance to build. `api_key` is already resolved from the
@@ -215,6 +221,28 @@ impl std::fmt::Debug for RerankRoute {
     }
 }
 
+/// A resolved SystemOne route: the provider to call and the upstream model id
+/// (ADR 013).
+#[derive(Clone)]
+pub struct SystemOneRoute {
+    /// The provider serving the model.
+    pub provider: Arc<dyn SystemOneProvider>,
+    /// The configured provider name (for attributing upstream errors).
+    pub provider_name: String,
+    /// The upstream model id to send (already alias-resolved).
+    pub upstream_id: String,
+}
+
+impl std::fmt::Debug for SystemOneRoute {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SystemOneRoute")
+            .field("provider_name", &self.provider_name)
+            .field("upstream_id", &self.upstream_id)
+            .field("provider", &"<dyn SystemOneProvider>")
+            .finish()
+    }
+}
+
 /// A resolved chat route: the provider to call and the upstream model id.
 #[derive(Clone)]
 pub struct ChatRoute {
@@ -257,6 +285,8 @@ struct Inner {
     embedding: HashMap<String, EmbeddingRoute>,
     /// model id -> rerank route.
     rerank: HashMap<String, RerankRoute>,
+    /// model id -> SystemOne route.
+    systemone: HashMap<String, SystemOneRoute>,
     /// model id -> declared capabilities (all of them, even not-yet-served
     /// ones like chat). Lets the router tell "unknown model" apart from
     /// "known model, wrong capability".
@@ -274,6 +304,7 @@ struct BuiltProviders {
     chat: Option<Arc<dyn ChatProvider>>,
     embed: Option<Arc<dyn EmbeddingProvider>>,
     rerank: Option<Arc<dyn RerankProvider>>,
+    systemone: Option<Arc<dyn SystemOneProvider>>,
 }
 
 /// The process-wide provider registry.
@@ -335,6 +366,12 @@ impl Registry {
     #[must_use]
     pub fn rerank_route(&self, model_id: &str) -> Option<RerankRoute> {
         self.inner.load().rerank.get(model_id).cloned()
+    }
+
+    /// Resolve a model id to a SystemOne route, if one serves it.
+    #[must_use]
+    pub fn systemone_route(&self, model_id: &str) -> Option<SystemOneRoute> {
+        self.inner.load().systemone.get(model_id).cloned()
     }
 
     /// Whether any provider declares this model id (for any capability).
@@ -471,7 +508,7 @@ fn build_inner(
             }
 
             if model.capabilities.contains(&Capability::Rerank) {
-                if let Some(provider) = &built.rerank {
+                if let Some(provider) = rerank_provider(spec, model, &built) {
                     inner.rerank.insert(
                         model.id.clone(),
                         RerankRoute {
@@ -484,10 +521,46 @@ fn build_inner(
                     warn_unsupported(spec, &model.id, "rerank");
                 }
             }
+
+            if model.capabilities.contains(&Capability::SystemOne) {
+                if let Some(provider) = &built.systemone {
+                    inner.systemone.insert(
+                        model.id.clone(),
+                        SystemOneRoute {
+                            provider: provider.clone(),
+                            provider_name: spec.name.clone(),
+                            upstream_id: model.upstream_id.clone(),
+                        },
+                    );
+                } else {
+                    warn_unsupported(spec, &model.id, "systemone");
+                }
+            }
         }
     }
 
     Ok(inner)
+}
+
+/// The rerank provider serving `model`: TypeSafe converts rerank to
+/// SystemOne through a per-model converter (ADR 013 amendment); every other
+/// kind shares its one rerank instance.
+fn rerank_provider(
+    spec: &ProviderSpec,
+    model: &ModelSpec,
+    built: &BuiltProviders,
+) -> Option<Arc<dyn RerankProvider>> {
+    if spec.kind == ProviderKind::Typesafe {
+        built.systemone.as_ref().map(|inner| {
+            Arc::new(TypesafeRerankProvider::new(
+                inner.clone(),
+                spec.name.clone(),
+                model.rerank_converter.clone().unwrap_or_default(),
+            )) as Arc<dyn RerankProvider>
+        })
+    } else {
+        built.rerank.clone()
+    }
 }
 
 /// Whether an `ollama` base_url mistakenly carries the OpenAI-compatible
@@ -584,6 +657,7 @@ fn build_providers(
                 chat: Some(chat),
                 embed: Some(embed),
                 rerank: None,
+                systemone: None,
             })
         }
         // Cloudflare Workers AI: chat + embed via the same OpenAI-compatible
@@ -615,6 +689,7 @@ fn build_providers(
                 chat: Some(chat),
                 embed: Some(embed),
                 rerank: Some(rerank),
+                systemone: None,
             })
         }
         // Together AI: chat + embed via the same OpenAI-compatible wiring as
@@ -648,6 +723,7 @@ fn build_providers(
                 chat: Some(chat),
                 embed: Some(embed),
                 rerank: Some(rerank),
+                systemone: None,
             })
         }
         ProviderKind::Mixedbread => {
@@ -661,6 +737,7 @@ fn build_providers(
                 chat: None,
                 embed: None,
                 rerank: Some(rerank),
+                systemone: None,
             })
         }
         ProviderKind::Pinecone => {
@@ -674,6 +751,7 @@ fn build_providers(
                 chat: None,
                 embed: None,
                 rerank: Some(rerank),
+                systemone: None,
             })
         }
         // NVIDIA NIM: rerank via `/v1/ranking`. `base_url` is required (the NIM
@@ -690,6 +768,23 @@ fn build_providers(
                 chat: None,
                 embed: None,
                 rerank: Some(rerank),
+                systemone: None,
+            })
+        }
+        // TypeSafe: SystemOne typed decisions only (ADR 013). `base_url`
+        // defaults to the public API and is overridable.
+        ProviderKind::Typesafe => {
+            let systemone: Arc<dyn SystemOneProvider> = Arc::new(TypesafeProvider::new(
+                client.clone(),
+                spec.name.clone(),
+                spec.base_url.clone(),
+                spec.api_key.clone(),
+            ));
+            Ok(BuiltProviders {
+                chat: None,
+                embed: None,
+                rerank: None,
+                systemone: Some(systemone),
             })
         }
         ProviderKind::Mistral => {
@@ -705,6 +800,7 @@ fn build_providers(
                 chat: Some(chat),
                 embed: Some(embed),
                 rerank: None,
+                systemone: None,
             })
         }
         ProviderKind::Anthropic => {
@@ -721,6 +817,7 @@ fn build_providers(
                 chat: Some(chat),
                 embed: None,
                 rerank: None,
+                systemone: None,
             })
         }
         // Ollama: native embeddings via `{root}/api/embed`, chat via its
@@ -767,6 +864,7 @@ fn build_providers(
                 chat: Some(chat),
                 embed: Some(embed),
                 rerank: None,
+                systemone: None,
             })
         }
         ProviderKind::Cohere => {
@@ -786,6 +884,7 @@ fn build_providers(
                 chat: Some(chat),
                 embed: Some(embed),
                 rerank: Some(rerank),
+                systemone: None,
             })
         }
         ProviderKind::Jina => {
@@ -801,6 +900,7 @@ fn build_providers(
                 chat: None,
                 embed: Some(embed),
                 rerank: Some(rerank),
+                systemone: None,
             })
         }
         ProviderKind::Tei => {
@@ -817,6 +917,7 @@ fn build_providers(
                 chat: None,
                 embed: Some(embed),
                 rerank: Some(rerank),
+                systemone: None,
             })
         }
         ProviderKind::Voyage => {
@@ -832,6 +933,7 @@ fn build_providers(
                 chat: None,
                 embed: Some(embed),
                 rerank: Some(rerank),
+                systemone: None,
             })
         }
         // Gemini Developer API: chat via `generateContent`, embeddings via
@@ -852,6 +954,7 @@ fn build_providers(
                 chat: Some(chat),
                 embed: Some(embed),
                 rerank: None,
+                systemone: None,
             })
         }
         ProviderKind::Azure => {
@@ -871,6 +974,7 @@ fn build_providers(
                 chat: Some(chat),
                 embed: Some(embed),
                 rerank: None,
+                systemone: None,
             })
         }
         // Vertex AI carries its config in the existing spec fields: `base_url`
@@ -900,6 +1004,7 @@ fn build_providers(
                 chat: Some(chat),
                 embed: Some(embed),
                 rerank: None,
+                systemone: None,
             })
         }
         ProviderKind::Bedrock => {
@@ -935,6 +1040,7 @@ fn build_providers(
                 chat: Some(chat),
                 embed: Some(embed),
                 rerank: None,
+                systemone: None,
             })
         }
     }
@@ -1037,6 +1143,7 @@ mod tests {
             upstream_id: id.to_owned(),
             capabilities: caps.to_vec(),
             modalities: vec!["text".to_owned()],
+            rerank_converter: None,
         }
     }
 
@@ -1370,6 +1477,7 @@ mod tests {
                     upstream_id: "text-embedding-3-small".to_owned(),
                     capabilities: vec![Capability::Embed],
                     modalities: vec!["text".to_owned()],
+                    rerank_converter: None,
                 }],
             )],
             reqwest::Client::new(),
@@ -1695,6 +1803,51 @@ mod tests {
             assert!(reg.embedding_route("rr").is_none(), "{kind:?} no embed");
             assert!(reg.chat_route("rr").is_none(), "{kind:?} no chat");
         }
+    }
+
+    #[test]
+    fn typesafe_serves_systemone_and_rerank_through_the_converter() {
+        let reg = Registry::build(
+            vec![spec(
+                ProviderKind::Typesafe,
+                "typesafe",
+                None,
+                vec![
+                    model("jev", &[Capability::SystemOne]),
+                    model("jev-rerank", &[Capability::Rerank]),
+                ],
+            )],
+            reqwest::Client::new(),
+            Duration::from_secs(300),
+        )
+        .expect("typesafe builds with the default base URL");
+        let route = reg.systemone_route("jev").expect("systemone route");
+        assert_eq!(route.provider_name, "typesafe");
+        assert!(reg.rerank_route("jev").is_none());
+        let rerank = reg
+            .rerank_route("jev-rerank")
+            .expect("rerank via converter");
+        assert_eq!(rerank.provider_name, "typesafe");
+        assert!(reg.systemone_route("jev-rerank").is_none());
+        assert!(reg.chat_route("jev").is_none());
+        assert!(reg.embedding_route("jev").is_none());
+    }
+
+    #[test]
+    fn systemone_is_not_served_by_non_systemone_kinds() {
+        let reg = Registry::build(
+            vec![spec(
+                ProviderKind::Cohere,
+                "cohere",
+                None,
+                vec![model("rr", &[Capability::SystemOne])],
+            )],
+            reqwest::Client::new(),
+            Duration::from_secs(300),
+        )
+        .expect("builds");
+        assert!(reg.systemone_route("rr").is_none());
+        assert!(reg.knows_model("rr"));
     }
 
     #[test]

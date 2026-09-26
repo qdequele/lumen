@@ -28,6 +28,7 @@ fn registry() -> Arc<Registry> {
                 // A single Cohere model configured for BOTH embed and rerank.
                 capabilities: vec![Capability::Embed, Capability::Rerank],
                 modalities: vec!["text".to_owned()],
+                rerank_converter: None,
             }],
         },
         ProviderSpec {
@@ -44,6 +45,7 @@ fn registry() -> Arc<Registry> {
                     upstream_id: "gpt-4o".to_owned(),
                     capabilities: vec![Capability::Chat],
                     modalities: vec!["text".to_owned()],
+                    rerank_converter: None,
                 },
                 ModelSpec {
                     // A slash-containing id (HF-style), legal in config: the
@@ -52,6 +54,7 @@ fn registry() -> Arc<Registry> {
                     upstream_id: "mistralai/Mistral-7B-Instruct-v0.3".to_owned(),
                     capabilities: vec![Capability::Chat],
                     modalities: vec!["text".to_owned()],
+                    rerank_converter: None,
                 },
             ],
         },

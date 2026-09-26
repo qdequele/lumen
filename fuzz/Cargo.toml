@@ -31,6 +31,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "systemone_request"
+path = "fuzz_targets/systemone_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "anthropic_translate_request"
 path = "fuzz_targets/anthropic_translate_request.rs"
 test = false

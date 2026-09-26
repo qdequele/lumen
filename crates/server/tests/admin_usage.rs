@@ -472,6 +472,15 @@ async fn invalid_parameters_are_400_lm1001() {
     }
 }
 
+#[tokio::test]
+async fn every_capability_is_an_accepted_filter() {
+    let h = spawn_admin(common::empty_registry()).await;
+    for capability in ["chat", "embed", "rerank", "systemone"] {
+        let resp = h.usage(&format!("?capability={capability}")).await;
+        assert_eq!(resp.status(), 200, "capability {capability}");
+    }
+}
+
 // ---- End to end through the gateway ----------------------------------------------
 
 #[tokio::test]
@@ -502,6 +511,7 @@ async fn gateway_requests_show_up_with_their_provider() {
                     upstream_id: "text-embedding-3-small".to_owned(),
                     capabilities: vec![Capability::Embed],
                     modalities: vec!["text".to_owned()],
+                    rerank_converter: None,
                 }],
             }],
             http::build_client(),
@@ -585,6 +595,7 @@ fn embed_registry(upstream: &str) -> Arc<Registry> {
                     upstream_id: "text-embedding-3-small".to_owned(),
                     capabilities: vec![Capability::Embed],
                     modalities: vec!["text".to_owned()],
+                    rerank_converter: None,
                 }],
             }],
             http::build_client(),

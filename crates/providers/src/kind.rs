@@ -34,6 +34,9 @@ pub enum ProviderKind {
     Nvidia,
     /// AWS Bedrock via the Converse API (SigV4 auth, per-region endpoint).
     Bedrock,
+    /// TypeSafe SystemOne typed decisions (Jev) via `/v1/systemone`; bearer
+    /// auth (ADR 013).
+    Typesafe,
     // --- OpenAI-compatible hosts (served by the OpenAI provider with a
     //     per-kind base URL; chat + embeddings). ------------------------------
     Groq,
@@ -74,6 +77,7 @@ impl ProviderKind {
             ProviderKind::Pinecone => "pinecone",
             ProviderKind::Nvidia => "nvidia",
             ProviderKind::Bedrock => "bedrock",
+            ProviderKind::Typesafe => "typesafe",
             ProviderKind::Groq => "groq",
             ProviderKind::Together => "together",
             ProviderKind::Fireworks => "fireworks",

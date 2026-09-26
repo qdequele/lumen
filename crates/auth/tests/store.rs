@@ -922,10 +922,20 @@ async fn config_version_cas_survives_concurrent_writers_on_the_same_file() {
         let stop = std::sync::Arc::clone(&stop);
         tokio::spawn(async move {
             while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                sqlx::query("INSERT INTO noise (x) VALUES (1)")
+                // The noise writer only exists to contend with the CAS under
+                // test; on a slow runner it can itself be starved past
+                // busy_timeout by back-to-back CAS transactions. That is not
+                // what this test checks, so a busy noise write just retries.
+                if let Err(error) = sqlx::query("INSERT INTO noise (x) VALUES (1)")
                     .execute(&pool)
                     .await
-                    .unwrap();
+                {
+                    let busy = error
+                        .as_database_error()
+                        .and_then(sqlx::error::DatabaseError::code)
+                        .is_some_and(|code| code == "5" || code == "6");
+                    assert!(busy, "noise writer failed: {error}");
+                }
             }
         })
     };

@@ -14,7 +14,8 @@ path = "src/lib.rs"
 
 [dependencies]
 serde = { workspace = true }
-serde_json = { workspace = true }
+# `raw_value`: SystemOne state/questions/answers pass through verbatim (ADR 013).
+serde_json = { workspace = true, features = ["raw_value"] }
 base64 = { workspace = true }
 bytes = { workspace = true }
 thiserror = { workspace = true }

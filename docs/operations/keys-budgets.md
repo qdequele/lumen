@@ -368,7 +368,7 @@ Query parameters (all optional):
 | `group_id` | Only rows attributed to this [budget group](#budget-groups) id. | all rows |
 | `model` | Only rows for this client-facing model id. | all models |
 | `provider` | Only rows attributed to this provider instance. | all providers |
-| `capability` | `chat`, `embed` or `rerank`. | all capabilities |
+| `capability` | `chat`, `embed`, `rerank` or `systemone`. | all capabilities |
 | `since` | Window start (inclusive): unix seconds or RFC3339. | `until` - 24 h |
 | `until` | Window end (inclusive): unix seconds or RFC3339. | now |
 | `group_by` | `model`, `model_used`, `provider`, `capability`, `key_id`, `group_id`, `status` or `total`. | `model` |

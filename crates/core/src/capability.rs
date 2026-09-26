@@ -5,7 +5,7 @@ use std::fmt;
 
 /// A capability that a model (and the provider backing it) can serve.
 ///
-/// A single provider may implement one to three of the capability traits;
+/// A single provider may implement one to four of the capability traits;
 /// the router dispatches by `(capability, model)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -16,6 +16,9 @@ pub enum Capability {
     Embed,
     /// Document reranking (`POST /v1/rerank`).
     Rerank,
+    /// Typed decisions over a state (`POST /v1/systemone`, ADR 013).
+    #[serde(rename = "systemone")]
+    SystemOne,
 }
 
 impl Capability {
@@ -26,6 +29,7 @@ impl Capability {
             Capability::Chat => "chat",
             Capability::Embed => "embed",
             Capability::Rerank => "rerank",
+            Capability::SystemOne => "systemone",
         }
     }
 }

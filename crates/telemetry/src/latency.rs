@@ -9,7 +9,7 @@
 //!   the client as a stream, so the middleware cannot (and should not) wait
 //!   for it.
 //! * [`observe_request`](LatencyMetrics::observe_request) - end-to-end time of
-//!   one accounted API call (chat/embed/rerank), labelled by capability, model
+//!   one accounted API call (chat/embed/rerank/systemone), labelled by capability, model
 //!   and provider. For streaming chat this covers the FULL stream, because it
 //!   is recorded when accounting closes (stream end or client disconnect).
 //!
@@ -82,7 +82,7 @@ impl LatencyMetrics {
             .observe(seconds);
     }
 
-    /// Record one accounted API call (chat/embed/rerank), attributed to the
+    /// Record one accounted API call (chat/embed/rerank/systemone), attributed to the
     /// model/provider that actually served it.
     pub fn observe_request(
         &self,

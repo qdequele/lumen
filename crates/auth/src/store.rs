@@ -206,7 +206,7 @@ pub struct UsageRecord {
     /// Provider instance that served the request (issue #64). Empty for rows
     /// written before the column existed.
     pub provider: String,
-    /// `chat` | `embed` | `rerank`.
+    /// `chat` | `embed` | `rerank` | `systemone`.
     pub capability: String,
     /// Input/prompt tokens.
     pub tokens_in: i64,
@@ -253,7 +253,7 @@ pub struct UsageFilter {
     pub model: Option<String>,
     /// Only rows served by this provider instance.
     pub provider: Option<String>,
-    /// Only rows of this capability (`chat` | `embed` | `rerank`).
+    /// Only rows of this capability (`chat` | `embed` | `rerank` | `systemone`).
     pub capability: Option<String>,
     /// Window start, unix seconds (inclusive).
     pub since: i64,
@@ -274,7 +274,7 @@ pub enum UsageGroupBy {
     ModelUsed,
     /// Group by the provider instance that served the request.
     Provider,
-    /// Group by capability (`chat` | `embed` | `rerank`).
+    /// Group by capability (`chat` | `embed` | `rerank` | `systemone`).
     Capability,
     /// Group by virtual key id (rows without a key group under `""`).
     KeyId,
@@ -392,7 +392,7 @@ pub struct UsageRow {
     pub model_used: String,
     /// Provider instance that served the request.
     pub provider: String,
-    /// `chat` | `embed` | `rerank`.
+    /// `chat` | `embed` | `rerank` | `systemone`.
     pub capability: String,
     /// Input/prompt tokens.
     pub tokens_in: i64,

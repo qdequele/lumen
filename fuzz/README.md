@@ -11,6 +11,8 @@ and on demand locally.
   consume its output.
 - `chat_request` - deserializing + re-serializing an OpenAI `ChatRequest`,
   exercising the `extra` (unknown-field) passthrough flatten.
+- `systemone_request` - the hand-written raw-JSON `SystemOneRequest`
+  deserializer (ADR 013), its edge validation, token estimate and round trip.
 - `anthropic_translate_request` / `anthropic_translate_response` - the
   Anthropic provider's `translate_request`/`translate_response` (client<->
   upstream JSON translation), reached through the `#[cfg(fuzzing)]` shim in
@@ -24,6 +26,7 @@ and on demand locally.
 cargo install cargo-fuzz
 cargo +nightly fuzz run sse_parser                     -- -max_total_time=600
 cargo +nightly fuzz run chat_request                   -- -max_total_time=600
+cargo +nightly fuzz run systemone_request              -- -max_total_time=600
 cargo +nightly fuzz run anthropic_translate_request     -- -max_total_time=600
 cargo +nightly fuzz run anthropic_translate_response    -- -max_total_time=600
 cargo +nightly fuzz run google_translate_request        -- -max_total_time=600

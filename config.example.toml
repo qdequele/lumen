@@ -292,15 +292,16 @@ health_check_interval_ms = 30000  # probe cadence (must not be 0 when enabled)
 # Each `[[providers]]` block declares one upstream. `kind` selects the built-in
 # implementation - one of the native integrations (openai | anthropic | google |
 # azure | vertex_ai | bedrock | mistral | cohere | jina | voyage | mixedbread |
-# pinecone | nvidia | tei | ollama) or one of the OpenAI-compatible hosts (groq |
-# together | fireworks | deepseek | openrouter | perplexity | xai | deepinfra |
-# huggingface | cloudflare | vllm). See docs/providers.md for the full matrix.
+# pinecone | nvidia | tei | ollama | typesafe) or one of the OpenAI-compatible
+# hosts (groq | together | fireworks | deepseek | openrouter | perplexity | xai |
+# deepinfra | huggingface | cloudflare | vllm). See docs/providers.md for the
+# full matrix.
 # `name` is your own label and must be unique.
 #
 # Each `[[providers.models]]` block exposes a model to clients:
 #   id            the id clients send (owned entirely by you)
 #   upstream_id   what LUMEN sends upstream (defaults to `id`)
-#   capabilities  any of: "chat", "embed", "rerank"
+#   capabilities  any of: "chat", "embed", "rerank", "systemone"
 #   modalities    input modalities; defaults to ["text"]. Add "image" to accept
 #                 image content parts on /v1/embeddings (M9). Image input to a
 #                 model without "image" is rejected with LM-2003.
@@ -535,6 +536,46 @@ api_key_env = "PINECONE_API_KEY"
 id = "pinecone-rerank"
 upstream_id = "pinecone-rerank-v0"
 capabilities = ["rerank"]
+
+# TypeSafe: SystemOne typed decisions (Jev), served on POST /v1/systemone
+# (ADR 013, docs/systemone/systemone.md). Bearer auth; api_key_env is required.
+# base_url defaults to https://api.typesafe.ai (a trailing /v1 is tolerated).
+# The TypeSafe SDKs work unchanged with TYPESAFE_BASE_URL set to this gateway.
+[[providers]]
+name = "typesafe"
+kind = "typesafe"
+api_key_env = "TYPESAFE_API_KEY"
+# base_url = "https://api.typesafe.ai"   # optional override
+
+[[providers.models]]
+id = "jev"
+upstream_id = "jev-latest"   # stable alias; also jev-preview, or a version
+capabilities = ["systemone"]
+# Jev bills input tokens only: no cost_per_1m_output needed.
+cost_per_1m_input = 0.042
+
+# A pinned version for reproducible answers, falling back to the stable alias
+# when it is overloaded (TypeSafe 529, retryable) or its circuit is open.
+[[providers.models]]
+id = "jev-1.13.0"
+capabilities = ["systemone"]
+cost_per_1m_input = 0.042
+fallbacks = ["jev"]
+
+# Jev as a reranker: POST /v1/rerank on this model is converted to one
+# SystemOne call whose state is the query and whose questions are one noul per
+# document; the noul is the relevance_score. The [providers.models.rerank]
+# block is optional (every field defaults to a generic relevance question) and
+# is only valid on a typesafe model declaring "rerank".
+[[providers.models]]
+id = "jev-rerank"
+upstream_id = "jev-latest"
+capabilities = ["rerank"]
+cost_per_1m_input = 0.042   # rerank models priced per token are billed per token
+[providers.models.rerank]
+instructions = "Is `document` relevant to the query in the state, that is, does it answer the query or contain information that directly helps answer it?"
+criteria.true = "The document answers the query or contains information that directly helps answer it."
+criteria.false = "The document is off-topic, or only shares keywords with the query without helping answer it."
 
 # NVIDIA NIM: reranking via `{base}/v1/ranking`. base_url REQUIRED (the NIM
 # root); keyless for self-hosted NIMs (set api_key_env for the hosted API).

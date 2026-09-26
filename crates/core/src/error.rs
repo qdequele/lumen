@@ -281,6 +281,10 @@ pub enum GatewayError {
     #[error("`documents` must not be empty")]
     EmptyDocuments,
 
+    /// A SystemOne request supplied no questions to answer (ADR 013).
+    #[error("`questions` must not be empty")]
+    EmptyQuestions,
+
     /// An image content part was sent to a model whose declared `modalities`
     /// do not include `"image"`. Rejected before any upstream call. Shared by
     /// chat vision (M8) and multimodal embeddings (M9).
@@ -433,6 +437,7 @@ impl GatewayError {
             GatewayError::ImageUrlRejected => "LM-2006",
             GatewayError::ImageFetchFailed => "LM-2007",
             GatewayError::EmptyDocuments => "LM-2010",
+            GatewayError::EmptyQuestions => "LM-2011",
             GatewayError::UpstreamRateLimited { .. } => "LM-3001",
             GatewayError::UpstreamInvalidResponse { .. } => "LM-3002",
             GatewayError::Upstream { .. } => "LM-3003",
@@ -465,6 +470,7 @@ impl GatewayError {
             GatewayError::InvalidRequest(_)
             | GatewayError::UnsupportedCapability { .. }
             | GatewayError::EmptyDocuments
+            | GatewayError::EmptyQuestions
             | GatewayError::ImageInputNotSupported { .. }
             | GatewayError::ImageUrlNotSupported { .. }
             | GatewayError::ImageSourceNotSupported { .. }
@@ -509,6 +515,7 @@ impl GatewayError {
             | GatewayError::ImageFetchDisabled
             | GatewayError::ImageUrlRejected
             | GatewayError::EmptyDocuments
+            | GatewayError::EmptyQuestions
             | GatewayError::PayloadTooLarge { .. }
             | GatewayError::Unauthorized
             | GatewayError::BudgetExceeded { .. }
@@ -725,6 +732,9 @@ mod tests {
         );
         // Empty rerank documents (pinned by the M3 spec).
         assert_eq!(GatewayError::EmptyDocuments.code(), "LM-2010");
+        // Empty SystemOne questions (ADR 013).
+        assert_eq!(GatewayError::EmptyQuestions.code(), "LM-2011");
+        assert_eq!(GatewayError::EmptyQuestions.http_status(), 400);
         // Vision (M8) + multimodal-embeddings image-fetch (M9) codes.
         assert_eq!(
             GatewayError::ImageInputNotSupported {

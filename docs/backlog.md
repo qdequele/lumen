@@ -31,6 +31,28 @@ milestone.
   route would remove the need to serialize concurrent top-ups in the
   control plane.
 
+## Noted while building ADR 013 (SystemOne capability)
+
+- **Byte-splice passthrough for `/v1/systemone`.** The request is parsed into
+  per-question raw boxes and re-serialized for each upstream attempt. Since
+  the only mutation is `model`, the handler could keep the client's `Bytes`,
+  validate through one borrowed pass, and splice the upstream model id into
+  the recorded byte range per attempt (`.body(..)` instead of `.json(..)`).
+  The perf audit measured about 255 us down to about 125 us at maximum size
+  (128 KB state, 300 questions); a typical request is already ~3 us. The same
+  applies to the response: forward upstream bytes untouched when no usage
+  estimate has to be injected.
+- **Jev-backed `/v1/rerank`.** Design proposals (custom rerank models,
+  per-group model aliasing, profile header) in
+  `docs/design/systemone-rerank-mapping.md`; awaiting a decision.
+- **`GET /v1/models` in TypeSafe's shape.** The TypeSafe SDKs' `models.list()`
+  expects `{"models":[{name, description, release_date}]}`; LUMEN keeps the
+  OpenAI list shape, so that one SDK call does not work through the gateway.
+- **`strip = true` breaks release builds of proc-macro dylibs on macOS 27**
+  (`mis-aligned LINKEDIT string pool` loading `sqlx-macros`), so `cargo bench`
+  fails locally unless `CARGO_PROFILE_RELEASE_STRIP=false`. Consider
+  `strip = "debuginfo"` or a separate bench profile.
+
 ## Noted while building ADR 012 (config source abstraction)
 
 - **Config history/rollback endpoints.** DB mode already keeps the newest 50
