@@ -64,9 +64,10 @@ Rules that apply to every provider:
 | `tei`       |      |  ✅   |   ✅   |           | keyless       | **required**   | 32                |
 | `ollama`    |  ✅  |  ✅   |        |           | keyless       | **required**   | 512               |
 | `azure`     |  ✅  |  ✅   |        |           | required      | **required**   | 2048              |
-| `typesafe`  |      |       |        |    ✅     | required      | optional       | -                 |
+| `typesafe`  |      |       |   ✅   |    ✅     | required      | optional       | -                 |
 
-The `together` kind (in the OpenAI-compatible table below) additionally serves
+The `typesafe` kind serves rerank through a converter over Jev (see its
+section). The `together` kind (in the OpenAI-compatible table below) additionally serves
 **rerank** (LlamaRank) natively; see its section for the model config.
 
 OpenAI-compatible hosts (chat + embed via the OpenAI path). The Embed column
@@ -506,10 +507,11 @@ capabilities = ["rerank"]
 
 ## typesafe
 
-- **kind**: `typesafe` · **capabilities**: systemone only (TypeSafe's Jev
+- **kind**: `typesafe` · **capabilities**: systemone (TypeSafe's Jev
   typed-decision models, served on `POST /v1/systemone`; see
   [SystemOne](systemone/systemone.md) and
-  [ADR 013](adr/013-systemone-capability.md)).
+  [ADR 013](adr/013-systemone-capability.md)), and rerank through a converter
+  ([Jev as a reranker](reranking/reranking.md#jev-as-a-reranker-typesafe)).
 - **Auth**: `api_key_env` (e.g. `TYPESAFE_API_KEY`), **required**, sent as a
   bearer token. Never logged, redacted from `Debug`.
 - **base_url**: optional; defaults to `https://api.typesafe.ai`. An override
@@ -552,6 +554,13 @@ id = "jev-1.13.0"
 capabilities = ["systemone"]
 cost_per_1m_input = 0.042
 fallbacks = ["jev"]
+
+# Jev as a reranker: plain /v1/rerank, one noul question per document.
+[[providers.models]]
+id = "jev-rerank"
+upstream_id = "jev-latest"
+capabilities = ["rerank"]
+cost_per_1m_input = 0.042
 ```
 
 ## nvidia (NIM)

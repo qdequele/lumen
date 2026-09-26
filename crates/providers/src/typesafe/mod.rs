@@ -12,6 +12,8 @@
 //! `Retry-After`), and TypeSafe's `529 Overloaded` is a retryable 5xx, so the
 //! executor retries and falls back as it would for any overloaded upstream.
 
+pub mod rerank;
+
 use async_trait::async_trait;
 use lumen_core::{ProviderError, SystemOneProvider, SystemOneRequest, SystemOneResponse};
 use std::fmt;

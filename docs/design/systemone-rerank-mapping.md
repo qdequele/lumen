@@ -1,6 +1,8 @@
 # Design proposals: a Jev-backed `/v1/rerank` (SystemOne rerank mapping)
 
-- Status: proposal, for discussion (nothing here is implemented)
+- Status: proposal, for discussion. A minimal form of Proposal A (one
+  converter per model id, noul strategy only) shipped as the ADR 013
+  amendment; the rest is still open
 - Date: 2026-09-26
 - Builds on: ADR 013 (SystemOne capability), ADR 012 (config source and
   granular admin endpoints), ADR 009 (budget groups)

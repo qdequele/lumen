@@ -190,7 +190,7 @@ Twenty-seven provider kinds: sixteen **native** integrations plus eleven
 | `nvidia`    |      |      |   ✅   |           | keyless, **`base_url`** | NIM `/v1/ranking`; logit scores |
 | `tei`       |      |  ✅   |   ✅   |           | keyless, **`base_url`** | self-hosted (Text Embeddings Inference) |
 | `ollama`    |  ✅  |  ✅   |        |           | keyless, **`base_url`** | self-hosted; chat via its OpenAI-compatible `/v1` |
-| `typesafe`  |      |       |        |    ✅     | `api_key_env`         | Jev typed decisions; input-only pricing |
+| `typesafe`  |      |       |   ✅   |    ✅     | `api_key_env`         | Jev typed decisions; rerank via a converter; input-only pricing |
 
 **OpenAI-compatible hosts** (chat + embed, reusing the OpenAI path with a
 built-in base URL): `groq`, `together`, `fireworks`, `deepseek`, `openrouter`,

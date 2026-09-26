@@ -81,6 +81,20 @@ struct RequestBody {
 }
 
 impl SystemOneRequest {
+    /// Build a request programmatically (e.g. the rerank converter). Call
+    /// [`validate`](Self::validate) if the parts are not known-good.
+    #[must_use]
+    pub fn new(model: String, state: Box<RawValue>, questions: RawEntries) -> Self {
+        Self {
+            model,
+            body: Arc::new(RequestBody {
+                state,
+                questions,
+                extra: Vec::new(),
+            }),
+        }
+    }
+
     /// The content to evaluate: a string, object or array, verbatim.
     #[must_use]
     pub fn state(&self) -> &RawValue {

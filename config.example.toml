@@ -562,6 +562,21 @@ capabilities = ["systemone"]
 cost_per_1m_input = 0.042
 fallbacks = ["jev"]
 
+# Jev as a reranker: POST /v1/rerank on this model is converted to one
+# SystemOne call whose state is the query and whose questions are one noul per
+# document; the noul is the relevance_score. The [providers.models.rerank]
+# block is optional (every field defaults to a generic relevance question) and
+# is only valid on a typesafe model declaring "rerank".
+[[providers.models]]
+id = "jev-rerank"
+upstream_id = "jev-latest"
+capabilities = ["rerank"]
+cost_per_1m_input = 0.042   # rerank models priced per token are billed per token
+[providers.models.rerank]
+instructions = "Is `document` relevant to the query in the state, that is, does it answer the query or contain information that directly helps answer it?"
+criteria.true = "The document answers the query or contains information that directly helps answer it."
+criteria.false = "The document is off-topic, or only shares keywords with the query without helping answer it."
+
 # NVIDIA NIM: reranking via `{base}/v1/ranking`. base_url REQUIRED (the NIM
 # root); keyless for self-hosted NIMs (set api_key_env for the hosted API).
 # Scores are raw logits (unbounded, comparable only within one response).

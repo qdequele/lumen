@@ -30,18 +30,21 @@ fn registry_for(upstream: &str) -> Arc<Registry> {
                 upstream_id: "text-embedding-3-small".to_owned(),
                 capabilities: vec![Capability::Embed],
                 modalities: vec!["text".to_owned()],
+                rerank_converter: None,
             },
             ModelSpec {
                 id: "chat-only".to_owned(),
                 upstream_id: "gpt-4o".to_owned(),
                 capabilities: vec![Capability::Chat],
                 modalities: vec!["text".to_owned()],
+                rerank_converter: None,
             },
             ModelSpec {
                 id: "embed-image".to_owned(),
                 upstream_id: "multimodal-embed".to_owned(),
                 capabilities: vec![Capability::Embed],
                 modalities: vec!["text".to_owned(), "image".to_owned()],
+                rerank_converter: None,
             },
         ],
     }];
@@ -71,6 +74,7 @@ fn registry_for_cohere(upstream: &str) -> Arc<Registry> {
             upstream_id: "embed-v4.0".to_owned(),
             capabilities: vec![Capability::Embed],
             modalities: vec!["text".to_owned()],
+            rerank_converter: None,
         }],
     }];
     Arc::new(
@@ -178,6 +182,7 @@ async fn token_input_to_text_only_provider_is_400_fg1001_without_upstream_call()
             upstream_id: "tei-embed".to_owned(),
             capabilities: vec![Capability::Embed],
             modalities: vec!["text".to_owned()],
+            rerank_converter: None,
         }],
     }];
     let registry = Arc::new(

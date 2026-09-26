@@ -304,6 +304,7 @@ mod tests {
             upstream_id: id.to_owned(),
             capabilities: caps.to_vec(),
             modalities: vec!["text".to_owned()],
+            rerank_converter: None,
         }
     }
 

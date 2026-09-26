@@ -18,7 +18,7 @@ use lumen_server::pricing::CostTable;
 use lumen_server::resilience::ResilienceRuntime;
 use serde_json::{json, Value};
 use wiremock::matchers::{method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 const LIMIT: usize = 10 * 1024 * 1024;
 const KEY: &str = "ts-test-key-do-not-leak";
@@ -51,6 +51,14 @@ fn config(primary: &str, fallback: &str) -> Config {
         upstream_id = "jev-1.13.0"
         capabilities = ["systemone"]
         fallbacks = ["jev-fb"]
+        [[providers.models]]
+        id = "jev-rerank"
+        upstream_id = "jev-latest"
+        capabilities = ["rerank"]
+        cost_per_1m_input = 0.042
+        [providers.models.rerank]
+        instructions = "Could `document` be the cited precedent?"
+        criteria.true = "States the cited rule."
 
         [[providers]]
         name = "typesafe-backup"
@@ -411,4 +419,93 @@ async fn client_disconnect_during_slow_upstream_does_not_hang_server() {
         .await
         .expect("health");
     assert_eq!(health.status(), 200);
+}
+
+// ---- Jev as a reranker (ADR 013 amendment) ----------------------------------
+
+/// Answers each noul question with the `#score` suffix of its document.
+struct EchoScores;
+
+impl Respond for EchoScores {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let body: Value = serde_json::from_slice(&request.body).expect("json body");
+        let questions = body["questions"].as_object().expect("questions");
+        let answers: serde_json::Map<String, Value> = questions
+            .iter()
+            .map(|(id, q)| {
+                let doc = q["instructions"]["document"].as_str().unwrap_or_default();
+                let score: f64 = doc
+                    .rsplit('#')
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0.0);
+                (id.clone(), json!({"type": "noul", "noul": score}))
+            })
+            .collect();
+        ResponseTemplate::new(200).set_body_json(json!({
+            "model": "jev-1.13.0",
+            "answers": answers,
+            "usage": {"input_tokens": 100, "output_tokens": 3}
+        }))
+    }
+}
+
+#[tokio::test]
+async fn jev_serves_v1_rerank_through_the_configured_converter() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/systemone"))
+        .respond_with(EchoScores)
+        .mount(&upstream)
+        .await;
+    let base = spawn(&upstream.uri(), &upstream.uri()).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/rerank"))
+        .json(&json!({
+            "model": "jev-rerank",
+            "query": "cited precedent",
+            "documents": ["low #0.1", "high #0.9", {"text": "mid #0.5"}],
+            "top_n": 2,
+            "return_documents": true
+        }))
+        .send()
+        .await
+        .expect("send");
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers()
+            .get("x-lumen-model-used")
+            .and_then(|v| v.to_str().ok()),
+        Some("jev-rerank")
+    );
+    let body: Value = resp.json().await.expect("json");
+    // Sorted by Jev's noul, top_n applied, documents echoed by original index.
+    assert_eq!(body["results"].as_array().expect("results").len(), 2);
+    assert_eq!(body["results"][0]["index"], 1);
+    assert_eq!(body["results"][0]["document"]["text"], "high #0.9");
+    assert_eq!(body["results"][1]["index"], 2);
+    // Jev's upstream token count, unflagged; search units derived.
+    assert_eq!(body["usage"]["total_tokens"], 100);
+    assert!(body["usage"].get("tokens_estimated").is_none());
+    assert_eq!(body["usage"]["estimated"], true);
+
+    // The configured converter reached Jev: custom question and yes-criterion,
+    // default no-criterion, the upstream model id, the query in the state.
+    let received = upstream.received_requests().await.expect("recorded");
+    let sent: Value = serde_json::from_slice(&received[0].body).expect("json");
+    assert_eq!(sent["model"], "jev-latest");
+    assert_eq!(sent["state"], json!({"query": "cited precedent"}));
+    let q = &sent["questions"]["0"];
+    assert_eq!(q["type"], "noul");
+    assert_eq!(q["instructions"]["document"], "low #0.1");
+    assert_eq!(
+        q["instructions"]["question"],
+        "Could `document` be the cited precedent?"
+    );
+    assert_eq!(q["criteria"]["true"], "States the cited rule.");
+    assert_eq!(
+        q["criteria"]["false"],
+        lumen_providers::typesafe::rerank::DEFAULT_CRITERIA_FALSE
+    );
 }

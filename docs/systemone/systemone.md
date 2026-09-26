@@ -252,9 +252,11 @@ $TYPESAFE_BASE_URL/v1/systemone`.
   LUMEN's OpenAI list shape (each SystemOne model is listed with
   `"capabilities": ["systemone"]`), which the TypeSafe SDKs do not parse. Every
   other SDK call goes to `/v1/systemone` and works.
-- **No Jev-backed `/v1/rerank` yet.** Scoring rerank documents with a
-  per-document `noul` question is a separate design, still open; see
-  [SystemOne rerank mapping](../design/systemone-rerank-mapping.md).
+- **Jev as a reranker** goes through `/v1/rerank`, not this endpoint: declare
+  a `typesafe` model with `capabilities = ["rerank"]`; see
+  [Jev as a reranker](../reranking/reranking.md#jev-as-a-reranker-typesafe).
+  Per-key or per-tenant converters are not supported yet
+  ([design notes](../design/systemone-rerank-mapping.md)).
 - **No streaming.** `/v1/systemone` is request/response only, like TypeSafe's
   endpoint.
 

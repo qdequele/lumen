@@ -1,7 +1,7 @@
 # ADR 013 - SystemOne (typed decision) capability and the TypeSafe provider
 
 - Status: accepted
-- Date: 2026-09-26
+- Date: 2026-09-26 (amended 2026-09-26: Jev as a reranker)
 
 ## Context
 
@@ -103,7 +103,33 @@ fallbacks and metrics in front of it.
   from it. Limits are pinned to the documented values (2026-09) and covered by
   tests; an upstream loosening shows up as a LUMEN rejection, an upstream
   tightening as an `LM-3003`.
-- A Jev-backed `/v1/rerank` (documents scored by a noul per document) is
-  deliberately NOT part of this decision. How a rerank model maps onto
-  SystemOne questions, and whether that mapping can vary per key or tenant,
-  needs its own design; see `docs/design/systemone-rerank-mapping.md`.
+- A per-key or per-tenant choice of rerank converter is NOT part of this
+  decision; see `docs/design/systemone-rerank-mapping.md`.
+
+## Amendment (2026-09-26): Jev as a reranker
+
+A `typesafe` model that declares `rerank` is served by a converter,
+`TypesafeRerankProvider`, which implements `RerankProvider` over the model's
+`SystemOneProvider`, so the whole `/v1/rerank` path (validation, ordering,
+`top_n`, document echo, admission, fallbacks) is unchanged.
+
+- **Mapping.** `state = {"query": <query>}`; one `noul` question per
+  document, id = the document index, with structured instructions
+  `{"document": <text>, "question": <converter instructions>}` and the
+  converter's `criteria.true` / `criteria.false`. `relevance_score` is the
+  noul. One call carries many documents, so the query is billed once per
+  call, and Jev evaluates questions independently, so documents never see
+  each other.
+- **Converter config.** An optional `[providers.models.rerank]` block
+  (`instructions`, `criteria.true`, `criteria.false`), each defaulting to a
+  generic relevance question. It is operator-authored, per model id, and
+  rejected at boot on any other kind or capability. Clients cannot supply it.
+- **Packing.** At most 100 documents and about 48k estimated tokens per
+  upstream call (under Jev's 64k), up to 4 calls in flight; a document over
+  about 4,096 estimated tokens is truncated (Cohere's default), so one
+  document always fits the 32k state-plus-question budget.
+- **Accounting.** The summed upstream `input_tokens` is rerank
+  `usage.total_tokens` (if any call omits usage, the whole count falls back
+  to the ADR 003 estimate). Rerank cost becomes search-unit price plus
+  `cost_per_1m_input` on those tokens; models priced only per search are
+  unaffected.

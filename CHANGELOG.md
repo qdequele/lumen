@@ -8,6 +8,18 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ### Added
 
+- **Jev as a reranker (ADR 013 amendment).** A `typesafe` model declaring
+  `capabilities = ["rerank"]` serves plain `POST /v1/rerank` through a
+  converter: the query becomes the SystemOne `state`, each document one
+  `noul` question, and Jev's calibrated noul the `relevance_score`. An
+  optional `[providers.models.rerank]` block sets the question
+  (`instructions`, `criteria.true`, `criteria.false`); unset fields default
+  to a generic relevance question. Documents are packed into as few upstream
+  calls as Jev's context allows and run concurrently. Rerank cost now adds
+  `cost_per_1m_input` on the token count to the search-unit price, so a
+  token-priced reranker is billed per token (search-unit-only models are
+  unchanged).
+
 - **SystemOne capability and the TypeSafe (Jev) provider (ADR 013).** A
   fourth first-class capability, `systemone`, served at `POST /v1/systemone`
   with TypeSafe's own wire shape: a `state` plus named `noul` / `choice` /

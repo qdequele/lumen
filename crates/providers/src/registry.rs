@@ -31,6 +31,7 @@ use crate::openai::OpenAiProvider;
 use crate::pinecone::PineconeProvider;
 use crate::tei::TeiProvider;
 use crate::together::TogetherRerankProvider;
+use crate::typesafe::rerank::{RerankConverter, TypesafeRerankProvider};
 use crate::typesafe::TypesafeProvider;
 use crate::voyage::VoyageProvider;
 
@@ -45,6 +46,10 @@ pub struct ModelSpec {
     pub capabilities: Vec<Capability>,
     /// Declared input modalities (e.g. `["text","image"]`).
     pub modalities: Vec<String>,
+    /// How `/v1/rerank` is converted to SystemOne questions, for a `typesafe`
+    /// model declaring `rerank`; `None` uses the default converter. Ignored
+    /// by every other kind.
+    pub rerank_converter: Option<RerankConverter>,
 }
 
 /// A provider instance to build. `api_key` is already resolved from the
@@ -503,7 +508,7 @@ fn build_inner(
             }
 
             if model.capabilities.contains(&Capability::Rerank) {
-                if let Some(provider) = &built.rerank {
+                if let Some(provider) = rerank_provider(spec, model, &built) {
                     inner.rerank.insert(
                         model.id.clone(),
                         RerankRoute {
@@ -535,6 +540,27 @@ fn build_inner(
     }
 
     Ok(inner)
+}
+
+/// The rerank provider serving `model`: TypeSafe converts rerank to
+/// SystemOne through a per-model converter (ADR 013 amendment); every other
+/// kind shares its one rerank instance.
+fn rerank_provider(
+    spec: &ProviderSpec,
+    model: &ModelSpec,
+    built: &BuiltProviders,
+) -> Option<Arc<dyn RerankProvider>> {
+    if spec.kind == ProviderKind::Typesafe {
+        built.systemone.as_ref().map(|inner| {
+            Arc::new(TypesafeRerankProvider::new(
+                inner.clone(),
+                spec.name.clone(),
+                model.rerank_converter.clone().unwrap_or_default(),
+            )) as Arc<dyn RerankProvider>
+        })
+    } else {
+        built.rerank.clone()
+    }
 }
 
 /// Whether an `ollama` base_url mistakenly carries the OpenAI-compatible
@@ -1117,6 +1143,7 @@ mod tests {
             upstream_id: id.to_owned(),
             capabilities: caps.to_vec(),
             modalities: vec!["text".to_owned()],
+            rerank_converter: None,
         }
     }
 
@@ -1450,6 +1477,7 @@ mod tests {
                     upstream_id: "text-embedding-3-small".to_owned(),
                     capabilities: vec![Capability::Embed],
                     modalities: vec!["text".to_owned()],
+                    rerank_converter: None,
                 }],
             )],
             reqwest::Client::new(),
@@ -1778,15 +1806,16 @@ mod tests {
     }
 
     #[test]
-    fn typesafe_resolves_for_systemone_only() {
-        // A typesafe model that also (wrongly) declares rerank still builds;
-        // rerank just never resolves for it (unsupported-capability warning).
+    fn typesafe_serves_systemone_and_rerank_through_the_converter() {
         let reg = Registry::build(
             vec![spec(
                 ProviderKind::Typesafe,
                 "typesafe",
                 None,
-                vec![model("jev", &[Capability::SystemOne, Capability::Rerank])],
+                vec![
+                    model("jev", &[Capability::SystemOne]),
+                    model("jev-rerank", &[Capability::Rerank]),
+                ],
             )],
             reqwest::Client::new(),
             Duration::from_secs(300),
@@ -1795,9 +1824,13 @@ mod tests {
         let route = reg.systemone_route("jev").expect("systemone route");
         assert_eq!(route.provider_name, "typesafe");
         assert!(reg.rerank_route("jev").is_none());
+        let rerank = reg
+            .rerank_route("jev-rerank")
+            .expect("rerank via converter");
+        assert_eq!(rerank.provider_name, "typesafe");
+        assert!(reg.systemone_route("jev-rerank").is_none());
         assert!(reg.chat_route("jev").is_none());
         assert!(reg.embedding_route("jev").is_none());
-        assert!(reg.systemone_route("other").is_none());
     }
 
     #[test]

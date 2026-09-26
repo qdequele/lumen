@@ -2,7 +2,9 @@
 //!
 //! Flow: validate → route (model → provider) → admit (budget/quota, memory
 //! only) → rerank (with gateway-side ordering, `top_n` clamping and optional
-//! document echo) → account (search units, tokens, cost) → response. Like
+//! document echo) → account (search units, tokens, cost) → response. A
+//! `typesafe` rerank model is served by Jev through a converter (ADR 013
+//! amendment); nothing here is specific to it beyond token pricing. Like
 //! embeddings, a per-request [`CancellationToken`] aborts the upstream call
 //! if the client disconnects.
 
@@ -52,7 +54,10 @@ pub async fn rerank_handler(
     let pricing = state.pricing();
     let estimated_tokens = tokens::estimate_rerank(&req);
     let estimated_units = estimate_search_units(req.documents.len());
-    let estimated_cost = pricing.search_cost(&client_model, estimated_units);
+    // Search-unit price plus, for token-billed rerankers (Jev, and any model
+    // pricing `cost_per_1m_input`), the token price.
+    let estimated_cost = pricing.search_cost(&client_model, estimated_units)
+        + pricing.token_cost(&client_model, estimated_tokens, 0);
     let mut accounting = Accounting::begin(
         &state,
         &headers,
@@ -115,8 +120,10 @@ pub async fn rerank_handler(
         response.usage.tokens_estimated = Some(true);
     }
 
-    // Cost is search-unit based and independent of the token count.
-    let cost = pricing.search_cost(&executed.model_used, search_units);
+    // Cost: search units, plus input tokens for models priced per token
+    // (`cost_per_1m_input`; zero for the search-unit-only rerankers).
+    let cost = pricing.search_cost(&executed.model_used, search_units)
+        + pricing.token_cost(&executed.model_used, tokens_in, 0);
 
     // Settle accounting (ADR 003). Upstream-reported token counts (Jina,
     // Voyage) settle inline, unflagged - there is nothing to refine. A

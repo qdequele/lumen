@@ -55,12 +55,14 @@ fn full_registry(upstream: &str) -> Arc<Registry> {
                     upstream_id: "gpt-4o-2024-08-06".to_owned(),
                     capabilities: vec![Capability::Chat],
                     modalities: vec!["text".to_owned()],
+                    rerank_converter: None,
                 },
                 ModelSpec {
                     id: "embed-small".to_owned(),
                     upstream_id: "text-embedding-3-small".to_owned(),
                     capabilities: vec![Capability::Embed],
                     modalities: vec!["text".to_owned()],
+                    rerank_converter: None,
                 },
             ],
         },
@@ -77,6 +79,7 @@ fn full_registry(upstream: &str) -> Arc<Registry> {
                 upstream_id: "rerank-v3.5".to_owned(),
                 capabilities: vec![Capability::Rerank],
                 modalities: vec!["text".to_owned()],
+                rerank_converter: None,
             }],
         },
         ProviderSpec {
@@ -87,12 +90,22 @@ fn full_registry(upstream: &str) -> Arc<Registry> {
             api_version: None,
             strict: false,
             connect_timeout_ms: None,
-            models: vec![ModelSpec {
-                id: "jev".to_owned(),
-                upstream_id: "jev-latest".to_owned(),
-                capabilities: vec![Capability::SystemOne],
-                modalities: vec!["text".to_owned()],
-            }],
+            models: vec![
+                ModelSpec {
+                    id: "jev".to_owned(),
+                    upstream_id: "jev-latest".to_owned(),
+                    capabilities: vec![Capability::SystemOne],
+                    modalities: vec!["text".to_owned()],
+                    rerank_converter: None,
+                },
+                ModelSpec {
+                    id: "jev-rerank".to_owned(),
+                    upstream_id: "jev-latest".to_owned(),
+                    capabilities: vec![Capability::Rerank],
+                    modalities: vec!["text".to_owned()],
+                    rerank_converter: None,
+                },
+            ],
         },
         ProviderSpec {
             name: "tei".to_owned(),
@@ -107,6 +120,7 @@ fn full_registry(upstream: &str) -> Arc<Registry> {
                 upstream_id: "tei-model".to_owned(),
                 capabilities: vec![Capability::Embed],
                 modalities: vec!["text".to_owned()],
+                rerank_converter: None,
             }],
         },
     ];
@@ -151,6 +165,10 @@ fn dollar_pricing() -> CostTable {
         id = "jev"
         capabilities = ["systemone"]
         # Input-only pricing, like Jev itself: output tokens are free.
+        cost_per_1m_input = 1000000.0
+        [[providers.models]]
+        id = "jev-rerank"
+        capabilities = ["rerank"]
         cost_per_1m_input = 1000000.0
     "#;
     let config: Config = Figment::new()
@@ -567,6 +585,44 @@ async fn systemone_usage_row_records_tokens_and_input_only_cost() {
     assert!(
         !dump.contains("abcd"),
         "state leaked into usage_log:\n{dump}"
+    );
+}
+
+#[tokio::test]
+async fn jev_rerank_is_billed_per_input_token() {
+    // A token-priced rerank model (Jev through the converter) is charged
+    // `cost_per_1m_input` on the upstream token count, not only per search.
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/systemone"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "model": "jev-1.13.0",
+            "answers": { "0": { "type": "noul", "noul": 0.7 } },
+            "usage": { "input_tokens": 5, "output_tokens": 1 }
+        })))
+        .mount(&upstream)
+        .await;
+    let h = spawn_auth(full_registry(&upstream.uri()), &[]).await;
+    let key = h.create_key(Some(100.0), None, None).await;
+
+    let resp = h
+        .client
+        .post(format!("{}/v1/rerank", h.base))
+        .bearer_auth(&key)
+        .json(&json!({ "model": "jev-rerank", "query": "q", "documents": ["d"] }))
+        .send()
+        .await
+        .expect("send");
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.expect("json");
+    assert_eq!(body["results"][0]["relevance_score"], 0.7);
+
+    h.wait_usage_rows(1).await;
+    let dump = h.store.debug_dump().await.expect("dump");
+    // tokens_in=5 (upstream), one derived search unit priced at 0, $5 of tokens.
+    assert!(
+        dump.contains("'jev-rerank'|'jev-rerank'|'rerank'|5|0|1|NULL|NULL|NULL|0|5.0|"),
+        "dump:\n{dump}"
     );
 }
 
