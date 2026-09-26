@@ -86,7 +86,7 @@ impl TokenBreakdown {
 /// What is being called: capability, client-facing model id, provider name.
 #[derive(Debug, Clone, Copy)]
 pub struct Target<'a> {
-    /// `chat` | `embed` | `rerank`.
+    /// `chat` | `embed` | `rerank` | `systemone`.
     pub capability: &'static str,
     /// Client-facing model id (the aliased id, not the upstream one).
     pub model: &'a str,

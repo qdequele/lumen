@@ -25,6 +25,10 @@
 
 - [Reranking](reranking/reranking.md)
 
+# SystemOne (typed decisions)
+
+- [SystemOne](systemone/systemone.md)
+
 # Operations
 
 - [Token accounting & cost](operations/token-accounting.md)
@@ -61,6 +65,7 @@
 - [010 - Operator console and fleet control](adr/010-operator-console-and-fleet-control.md)
 - [011 - Outbound webhooks for budget events](adr/011-budget-webhooks.md)
 - [012 - Config source abstraction](adr/012-config-source-abstraction.md)
+- [013 - SystemOne capability](adr/013-systemone-capability.md)
 
 # Project
 

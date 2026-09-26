@@ -20,6 +20,7 @@
 use crate::chat::{ChatRequest, MessageContent};
 use crate::embed::EmbedRequest;
 use crate::rerank::RerankRequest;
+use crate::systemone::SystemOneRequest;
 
 /// The heuristic's byte-per-token ratio.
 const BYTES_PER_TOKEN: u64 = 4;
@@ -117,6 +118,19 @@ pub fn estimate_rerank(req: &RerankRequest) -> u64 {
         .iter()
         .map(|d| query + estimate_text(d.text()))
         .sum()
+}
+
+/// Estimate the input tokens of a SystemOne request: the state is ingested
+/// once and every question is evaluated against it, so the estimate is the
+/// state's JSON plus each question body's JSON (ADR 013).
+#[must_use]
+pub fn estimate_systemone(req: &SystemOneRequest) -> u64 {
+    let questions: u64 = req
+        .questions()
+        .iter()
+        .map(|(_, body)| estimate_text(body.get()))
+        .sum();
+    estimate_text(req.state().get()).saturating_add(questions)
 }
 
 #[cfg(test)]
@@ -230,6 +244,19 @@ mod tests {
                 .expect("valid request");
         // (1 query + 1 doc) + (1 query + 2 doc) = 5
         assert_eq!(estimate_rerank(&req), 5);
+    }
+
+    #[test]
+    fn systemone_counts_state_once_plus_every_question() {
+        // state `"abcdef"` is 8 bytes (2 tokens); each question body below is
+        // 36 bytes (9 tokens).
+        let req: SystemOneRequest = serde_json::from_str(
+            r#"{"model":"m","state":"abcdef","questions":{
+                "a":{"type":"noul","instructions":"?!"},
+                "b":{"type":"noul","instructions":"!?"}}}"#,
+        )
+        .expect("valid request");
+        assert_eq!(estimate_systemone(&req), 2 + 9 + 9);
     }
 
     #[test]

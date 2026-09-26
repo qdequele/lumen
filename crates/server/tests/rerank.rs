@@ -30,12 +30,14 @@ fn registry_for(upstream: &str) -> Arc<Registry> {
                 upstream_id: "rerank-v3.5".to_owned(),
                 capabilities: vec![Capability::Rerank],
                 modalities: vec!["text".to_owned()],
+                rerank_converter: None,
             },
             ModelSpec {
                 id: "embed-only".to_owned(),
                 upstream_id: "embed-v4.0".to_owned(),
                 capabilities: vec![Capability::Embed],
                 modalities: vec!["text".to_owned()],
+                rerank_converter: None,
             },
         ],
     }];
@@ -285,6 +287,7 @@ fn registry_for_jina(upstream: &str) -> Arc<Registry> {
             upstream_id: "jina-reranker-v2".to_owned(),
             capabilities: vec![Capability::Rerank],
             modalities: vec!["text".to_owned()],
+            rerank_converter: None,
         }],
     }];
     Arc::new(
@@ -313,6 +316,7 @@ fn registry_for_voyage(upstream: &str) -> Arc<Registry> {
             upstream_id: "rerank-2".to_owned(),
             capabilities: vec![Capability::Rerank],
             modalities: vec!["text".to_owned()],
+            rerank_converter: None,
         }],
     }];
     Arc::new(

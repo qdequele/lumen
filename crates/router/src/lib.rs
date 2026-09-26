@@ -6,7 +6,8 @@
 //! unknown model (`LM-2001`, 404) from a known model that does not serve the
 //! requested capability (`LM-2002`, 400).
 //!
-//! Fallback chains, circuit breaking and load balancing arrive in M6.
+//! Fallback chains, circuit breaking and load balancing arrive in M6. The
+//! SystemOne capability (ADR 013) resolves exactly like the other three.
 
 #![forbid(unsafe_code)]
 
@@ -16,7 +17,7 @@ pub mod peek;
 pub mod retry;
 
 use lumen_core::{Capability, GatewayError};
-use lumen_providers::{ChatRoute, EmbeddingRoute, Registry, RerankRoute};
+use lumen_providers::{ChatRoute, EmbeddingRoute, Registry, RerankRoute, SystemOneRoute};
 
 /// Resolve a model id to a chat route, or the appropriate routing error.
 ///
@@ -133,6 +134,15 @@ pub fn resolve_embedding_chain(
     Ok(chain)
 }
 
+/// One resolved link of a SystemOne fallback chain (ADR 013).
+#[derive(Debug, Clone)]
+pub struct SystemOneChainLink {
+    /// The resolved route.
+    pub route: SystemOneRoute,
+    /// The client-facing model id of this link.
+    pub model_id: String,
+}
+
 /// Resolve a primary + fallbacks to a rerank chain (see [`resolve_chat_chain`]).
 ///
 /// # Errors
@@ -150,6 +160,29 @@ pub fn resolve_rerank_chain(
             }),
             None if position == 0 => return Err(miss(registry, id, Capability::Rerank)),
             None => warn_skipped_fallback(id, "rerank"),
+        }
+    }
+    Ok(chain)
+}
+
+/// Resolve a primary + fallbacks to a SystemOne chain (see
+/// [`resolve_chat_chain`]).
+///
+/// # Errors
+/// The primary's routing miss.
+pub fn resolve_systemone_chain(
+    registry: &Registry,
+    model_ids: &[String],
+) -> Result<Vec<SystemOneChainLink>, GatewayError> {
+    let mut chain = Vec::with_capacity(model_ids.len());
+    for (position, id) in model_ids.iter().enumerate() {
+        match registry.systemone_route(id) {
+            Some(route) => chain.push(SystemOneChainLink {
+                route,
+                model_id: id.clone(),
+            }),
+            None if position == 0 => return Err(miss(registry, id, Capability::SystemOne)),
+            None => warn_skipped_fallback(id, "systemone"),
         }
     }
     Ok(chain)
@@ -182,6 +215,18 @@ pub fn embedding_links(chain: &[EmbeddingChainLink]) -> Vec<executor::Link> {
 /// Build the executor-facing [`Link`](executor::Link) metadata for a rerank chain.
 #[must_use]
 pub fn rerank_links(chain: &[RerankChainLink]) -> Vec<executor::Link> {
+    chain
+        .iter()
+        .map(|l| executor::Link {
+            provider_name: l.route.provider_name.clone(),
+            model_id: l.model_id.clone(),
+        })
+        .collect()
+}
+
+/// Build the executor-facing [`Link`](executor::Link) metadata for a SystemOne chain.
+#[must_use]
+pub fn systemone_links(chain: &[SystemOneChainLink]) -> Vec<executor::Link> {
     chain
         .iter()
         .map(|l| executor::Link {
@@ -259,6 +304,7 @@ mod tests {
             upstream_id: id.to_owned(),
             capabilities: caps.to_vec(),
             modalities: vec!["text".to_owned()],
+            rerank_converter: None,
         }
     }
 
@@ -330,6 +376,42 @@ mod tests {
         let chain = resolve_chat_chain(&reg, &ids).unwrap();
         assert_eq!(chain.len(), 1);
         assert_eq!(chain[0].model_id, "gpt");
+    }
+
+    #[test]
+    fn systemone_chain_resolves_and_rejects_other_capabilities() {
+        let reg = Registry::build(
+            vec![ProviderSpec {
+                name: "typesafe".to_owned(),
+                kind: ProviderKind::Typesafe,
+                api_key: Some("ts-test-xxx".to_owned()),
+                base_url: None,
+                api_version: None,
+                strict: false,
+                connect_timeout_ms: None,
+                models: vec![
+                    model("jev-latest", &[Capability::SystemOne]),
+                    model("jev-1.13.0", &[Capability::SystemOne]),
+                ],
+            }],
+            reqwest::Client::new(),
+            std::time::Duration::from_secs(300),
+        )
+        .expect("registry builds");
+        let ids = vec!["jev-1.13.0".to_owned(), "jev-latest".to_owned()];
+        let chain = resolve_systemone_chain(&reg, &ids).unwrap();
+        let links = systemone_links(&chain);
+        assert_eq!(links.len(), 2);
+        assert_eq!(links[0].provider_name, "typesafe");
+        assert_eq!(links[1].model_id, "jev-latest");
+
+        let err = resolve_systemone_chain(&reg, &["nope".to_owned()]).unwrap_err();
+        assert_eq!(err.code(), "LM-2001");
+
+        let chat = registry_with(vec![model("gpt", &[Capability::Chat])]);
+        let err = resolve_systemone_chain(&chat, &["gpt".to_owned()]).unwrap_err();
+        assert_eq!(err.code(), "LM-2002");
+        assert!(err.to_string().contains("systemone"));
     }
 
     #[test]

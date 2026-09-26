@@ -794,7 +794,7 @@ pub struct UsageParams {
     pub model: Option<String>,
     /// Only rows served by this provider instance.
     pub provider: Option<String>,
-    /// Only rows of this capability: `chat` | `embed` | `rerank`.
+    /// Only rows of this capability: `chat` | `embed` | `rerank` | `systemone`.
     pub capability: Option<String>,
     /// Window start (inclusive): unix seconds or RFC3339. Default: 24 hours
     /// before `until`.
@@ -853,9 +853,9 @@ pub async fn usage_report(
         })?,
     };
     if let Some(capability) = params.capability.as_deref() {
-        if !matches!(capability, "chat" | "embed" | "rerank") {
+        if !matches!(capability, "chat" | "embed" | "rerank" | "systemone") {
             return Err(GatewayError::InvalidRequest(format!(
-                "invalid `capability` '{capability}': expected chat, embed or rerank"
+                "invalid `capability` '{capability}': expected chat, embed, rerank or systemone"
             ))
             .into());
         }

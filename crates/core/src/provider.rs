@@ -10,6 +10,7 @@ use crate::chat::{ChatChunk, ChatRequest, ChatResponse};
 use crate::embed::{EmbedRequest, EmbedResponse};
 use crate::error::ProviderError;
 use crate::rerank::{RerankRequest, RerankResponse};
+use crate::systemone::{SystemOneRequest, SystemOneResponse};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::{self, BoxStream, StreamExt};
@@ -114,4 +115,16 @@ pub trait RerankProvider: Send + Sync {
         req: RerankRequest,
         cancel: CancellationToken,
     ) -> Result<RerankResponse, ProviderError>;
+}
+
+/// A provider that can answer typed SystemOne questions about a state
+/// (ADR 013).
+#[async_trait]
+pub trait SystemOneProvider: Send + Sync {
+    /// Evaluate every question in `req` against its `state`.
+    async fn evaluate(
+        &self,
+        req: SystemOneRequest,
+        cancel: CancellationToken,
+    ) -> Result<SystemOneResponse, ProviderError>;
 }
