@@ -1146,6 +1146,81 @@ pub struct ConfigDocument {
     pub config: String,
     /// BLAKE3 hash of those bytes, to be echoed as `If-Match` on a PUT.
     pub hash: String,
+    /// Where each provider in the file gets its API key, provider name → source.
+    /// Never the key itself.
+    pub key_sources: std::collections::BTreeMap<String, KeySource>,
+}
+
+/// Where a provider's API key resolves from, mirroring startup and hot reload:
+/// the `api_key_env` variable wins, and a key stored via
+/// `PUT /admin/provider-keys/{name}` back-fills a provider whose variable is
+/// unset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KeySource {
+    /// The provider's `api_key_env` variable is set in the gateway's environment.
+    Env,
+    /// Stored encrypted in the gateway DB.
+    Stored,
+    /// No key anywhere, and the provider kind needs one.
+    Missing,
+    /// A keyless kind (Ollama, TEI, vLLM, NIM, Bedrock) with no key configured.
+    NotRequired,
+}
+
+/// The provider fields `key_sources` needs, peeked from the file on disk.
+#[derive(Deserialize)]
+struct ProvidersPeek {
+    #[serde(default)]
+    providers: Vec<ProviderPeek>,
+}
+
+#[derive(Deserialize)]
+struct ProviderPeek {
+    name: String,
+    kind: lumen_providers::ProviderKind,
+    api_key_env: Option<String>,
+}
+
+/// Resolve each provider's key source. Unparseable files yield an empty map -
+/// the verbatim `config` is the payload here, `key_sources` a display aid.
+async fn key_sources(
+    state: &AppState,
+    config: &str,
+) -> Result<std::collections::BTreeMap<String, KeySource>, ApiError> {
+    use figment::providers::{Format as _, Toml};
+    let Ok(peek) = figment::Figment::new()
+        .merge(Toml::string(config))
+        .extract::<ProvidersPeek>()
+    else {
+        return Ok(std::collections::BTreeMap::new());
+    };
+    let stored = runtime(state)?
+        .store
+        .provider_key_names()
+        .await
+        .map_err(|e| internal(&e))?;
+    Ok(peek
+        .providers
+        .into_iter()
+        .map(|p| {
+            // Same test as `Config::provider_specs`: a set variable wins, even empty.
+            let source = if p
+                .api_key_env
+                .as_deref()
+                .is_some_and(|v| std::env::var(v).is_ok())
+            {
+                KeySource::Env
+            } else if stored.contains(&p.name) {
+                KeySource::Stored
+            } else if p.kind.requires_api_key() {
+                KeySource::Missing
+            } else {
+                KeySource::NotRequired
+            };
+            (p.name, source)
+        })
+        .collect())
 }
 
 /// Return the current dynamic config document verbatim, in either mode.
@@ -1164,9 +1239,11 @@ pub async fn get_config(State(state): State<AppState>) -> Result<Json<ConfigDocu
         .load()
         .await
         .map_err(|e| source_internal_error(&e))?;
+    let key_sources = key_sources(&state, &doc.toml).await?;
     Ok(Json(ConfigDocument {
         config: doc.toml,
         hash: doc.hash,
+        key_sources,
     }))
 }
 

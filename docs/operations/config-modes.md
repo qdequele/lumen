@@ -129,7 +129,7 @@ requires an `If-Match` header carrying the hash from a prior `GET`:
 ```bash
 curl -s http://localhost:8080/admin/config \
   -H "Authorization: Bearer $LUMEN_MASTER_KEY"
-# {"config": "...", "hash": "b1946ac9..."}
+# {"config": "...", "hash": "b1946ac9...", "key_sources": {"openai": "env"}}
 
 curl -s -X PUT http://localhost:8080/admin/config \
   -H "Authorization: Bearer $LUMEN_MASTER_KEY" \

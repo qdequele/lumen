@@ -1292,3 +1292,73 @@ async fn put_webhooks_section_null_removes_the_block() {
         "the block must be gone from the document"
     );
 }
+
+#[tokio::test]
+async fn get_config_reports_where_each_provider_key_comes_from() {
+    let h = spawn_admin(registry()).await;
+    // GET reads the file on disk, so rewrite it with one provider per source.
+    std::fs::write(
+        &h.config_path,
+        r#"
+[[providers]]
+name = "from-env"
+kind = "openai"
+api_key_env = "TEST_PROVIDER_API_KEY"
+
+[[providers]]
+name = "from-db"
+kind = "cohere"
+api_key_env = "LUMEN_TEST_UNSET_KEY_VAR"
+
+[[providers]]
+name = "no-key"
+kind = "anthropic"
+api_key_env = "LUMEN_TEST_UNSET_KEY_VAR"
+
+[[providers]]
+name = "local"
+kind = "ollama"
+base_url = "http://127.0.0.1:11434"
+"#,
+    )
+    .expect("rewrite config");
+    let stored = h
+        .client
+        .put(format!("{}/admin/provider-keys/from-db", h.base))
+        .bearer_auth(master())
+        .json(&serde_json::json!({ "key": "stored-secret" }))
+        .send()
+        .await
+        .expect("send");
+    assert_eq!(stored.status(), 204);
+
+    let body: Value = h.get("/admin/config").await.json().await.expect("json");
+    assert_eq!(
+        body["key_sources"],
+        serde_json::json!({
+            "from-env": "env",
+            "from-db": "stored",
+            "no-key": "missing",
+            "local": "not_required",
+        })
+    );
+    let text = body.to_string();
+    assert!(!text.contains("stored-secret") && !text.contains(PROVIDER_KEY_VALUE));
+}
+
+/// `key_sources` works off the dynamic document in db mode too: empty before
+/// the first PUT, then one entry per provider in the stored document.
+#[tokio::test]
+async fn get_config_reports_key_sources_in_db_mode() {
+    let h = spawn_admin_db_mode(registry()).await;
+    let body: Value = h.get("/admin/config").await.json().await.expect("json");
+    assert_eq!(body["key_sources"], serde_json::json!({}));
+
+    let hash = h.current_hash().await;
+    assert_eq!(h.put_config(DB_MODE_VALID_DOC, &hash).await.status(), 204);
+    let body: Value = h.get("/admin/config").await.json().await.expect("json");
+    assert_eq!(
+        body["key_sources"],
+        serde_json::json!({ "db-provider": "missing" })
+    );
+}
