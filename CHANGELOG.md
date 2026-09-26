@@ -6,6 +6,8 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-09-26
+
 ### Added
 
 - **Docs: config source modes (ADR 012, task 10 of the config-source-abstraction
@@ -1757,7 +1759,8 @@ This closes every remaining streaming criterion:
 - Docs: error-code reference (`docs/errors.md`), ADR 001 (crate/lib naming),
   and this changelog.
 
-[Unreleased]: https://github.com/qdequele/lumen/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/qdequele/lumen/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/qdequele/lumen/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/qdequele/lumen/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/qdequele/lumen/compare/v0.2.0...v0.3.1
 [0.3.0]: https://github.com/qdequele/lumen/compare/v0.2.0...e99e750
