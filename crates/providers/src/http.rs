@@ -31,8 +31,42 @@ pub fn build_client() -> reqwest::Client {
 /// all providers, so `connect` is the process-wide default; a provider that
 /// sets `connect_timeout_ms` is given a dedicated client built here with its own
 /// connect timeout (ADR 005, 2026-07-15 amendment).
+///
+/// This client never follows redirects. reqwest strips `Authorization` on a
+/// cross-host hop, but not the custom auth headers several providers use
+/// (`x-api-key`, `api-key`, `x-goog-api-key`, `Api-Key`), so following a 3xx
+/// from an upstream, a stale `base_url` or a hostile proxy would hand the
+/// provider key to whatever host it names. Provider APIs never legitimately
+/// redirect: a 3xx surfaces as a fatal upstream error through
+/// `classify_status` instead. Traffic that carries no provider credential
+/// uses [`build_credential_free_client_with`].
 #[must_use]
 pub fn build_client_with(connect: Duration, overall: Duration) -> reqwest::Client {
+    base_builder(connect, overall)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        // Falls back to the default client if the builder somehow fails; the
+        // default is always constructible, so this cannot panic in practice.
+        .unwrap_or_default()
+}
+
+/// Build an HTTP client with the same timeouts and keepalives as
+/// [`build_client_with`], but reqwest's default redirect policy (up to 10
+/// hops). For requests that carry NO provider credential: the background
+/// health probe (a liveness endpoint behind a `301` stays up) and outbound
+/// webhook deliveries (a redirecting receiver still gets its events). Never
+/// hand this client to a provider.
+#[must_use]
+pub fn build_credential_free_client_with(connect: Duration, overall: Duration) -> reqwest::Client {
+    base_builder(connect, overall)
+        .redirect(reqwest::redirect::Policy::default())
+        .build()
+        // Same always-constructible fallback as `build_client_with`.
+        .unwrap_or_default()
+}
+
+/// Timeouts, user agent and keepalives shared by every gateway client.
+fn base_builder(connect: Duration, overall: Duration) -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .connect_timeout(connect)
         .timeout(overall)
@@ -50,10 +84,6 @@ pub fn build_client_with(connect: Duration, overall: Duration) -> reqwest::Clien
         .http2_keep_alive_while_idle(true)
         // Same protection for pooled h1 connections, at the TCP layer.
         .tcp_keepalive(Duration::from_secs(60))
-        .build()
-        // Falls back to the default client if the builder somehow fails; the
-        // default is always constructible, so this cannot panic in practice.
-        .unwrap_or_default()
 }
 
 /// POST `body` as JSON to `url`, with optional bearer auth, honouring `cancel`.

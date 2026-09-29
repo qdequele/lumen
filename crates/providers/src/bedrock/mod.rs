@@ -55,10 +55,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
-use self::sigv4::{sign_request, uri_encode_segment, SigningParams};
+use self::sigv4::{sign_request, sign_request_with_method, uri_encode_segment, SigningParams};
 use self::stream::{translate_eventstream, BedrockStreamTranslator};
 use crate::chat::{items_to_chunks, items_to_sse_bytes};
 use crate::http::{map_transport, with_cancel};
+use crate::key_check::{self, KeyCheck, Verdict};
 use crate::mapping::{classify_status, parse_retry_after};
 
 /// Where a provider's signing credentials come from. Kept private: the public
@@ -385,6 +386,78 @@ impl BedrockProvider {
             builder = builder.header("x-amz-security-token", token);
         }
         Ok(builder)
+    }
+
+    /// Check the AWS credentials without spending tokens: a SigV4-signed
+    /// `GET /foundation-models` (`ListFoundationModels`) on the Bedrock
+    /// control plane. An `AccessDeniedException` still counts as valid
+    /// credentials (they authenticated; the IAM policy just lacks that
+    /// action). Model-access grants and invoke permissions are not verified.
+    pub async fn check_key(&self, cancel: &CancellationToken) -> KeyCheck {
+        let Ok(creds) = self.request_credentials() else {
+            return KeyCheck::missing_key("AWS credentials");
+        };
+        let (endpoint, host) = self.control_plane();
+        let path = "/foundation-models";
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let signed = sign_request_with_method(
+            &SigningParams {
+                access_key_id: &creds.access_key_id,
+                secret_access_key: &creds.secret_access_key,
+                session_token: creds.session_token.as_deref(),
+                region: &self.region,
+            },
+            "GET",
+            &host,
+            path,
+            b"",
+            now,
+        );
+        let url = format!("{endpoint}{path}");
+        let mut builder = self
+            .client
+            .get(&url)
+            .header("content-type", "application/json")
+            .header("x-amz-date", &signed.amz_date)
+            .header("x-amz-content-sha256", &signed.content_sha256)
+            .header("authorization", &signed.authorization);
+        if let Some(token) = &signed.security_token {
+            builder = builder.header("x-amz-security-token", token);
+        }
+        key_check::run(
+            builder,
+            key_check::endpoint_label(&reqwest::Method::GET, &url),
+            Verdict::AwsAccessDenied,
+            cancel,
+        )
+        .await
+    }
+
+    /// The control-plane endpoint and signing host for the key check. For
+    /// an AWS runtime host that is the region's public control plane in the
+    /// same partition and FIPS variant (`bedrock-runtime-fips.` maps to
+    /// `bedrock-fips.`, `.amazonaws.com.cn` stays in China). A VPC runtime
+    /// endpoint has no derivable control-plane twin, so it falls back to the
+    /// public host (unreachable from an air-gapped VPC). Any other host (a
+    /// proxy or a test mock) is used as-is.
+    fn control_plane(&self) -> (String, String) {
+        let host = self.host();
+        let suffix = if host.ends_with(".amazonaws.com.cn") {
+            "amazonaws.com.cn"
+        } else if host.ends_with(".amazonaws.com") {
+            "amazonaws.com"
+        } else {
+            return (self.endpoint.clone(), host.to_owned());
+        };
+        let service = if host.starts_with("bedrock-runtime-fips.") {
+            "bedrock-fips"
+        } else {
+            "bedrock"
+        };
+        let host = format!("{service}.{}.{suffix}", self.region);
+        (format!("https://{host}"), host)
     }
 
     /// Send a signed non-streaming Converse request, honouring `cancel`.
@@ -1030,6 +1103,56 @@ mod tests {
             "https://bedrock-runtime.ap-southeast-2.amazonaws.com"
         );
         assert_eq!(p.host(), "bedrock-runtime.ap-southeast-2.amazonaws.com");
+    }
+
+    #[test]
+    fn key_check_targets_the_regional_control_plane_for_aws_hosts() {
+        let at = |base: Option<&str>| {
+            BedrockProvider::new(
+                reqwest::Client::new(),
+                "bedrock",
+                "eu-west-3",
+                base.map(str::to_owned),
+                None,
+            )
+            .control_plane()
+        };
+        let public = (
+            "https://bedrock.eu-west-3.amazonaws.com".to_owned(),
+            "bedrock.eu-west-3.amazonaws.com".to_owned(),
+        );
+        assert_eq!(at(None), public);
+        // A VPC runtime endpoint has no derivable control-plane twin: fall
+        // back to the public regional host.
+        assert_eq!(
+            at(Some(
+                "https://vpce-0abc.bedrock-runtime.eu-west-3.vpce.amazonaws.com"
+            )),
+            public
+        );
+        // FIPS and China-partition runtime hosts keep their variant.
+        assert_eq!(
+            at(Some("https://bedrock-runtime-fips.eu-west-3.amazonaws.com")),
+            (
+                "https://bedrock-fips.eu-west-3.amazonaws.com".to_owned(),
+                "bedrock-fips.eu-west-3.amazonaws.com".to_owned()
+            )
+        );
+        assert_eq!(
+            at(Some("https://bedrock-runtime.eu-west-3.amazonaws.com.cn")),
+            (
+                "https://bedrock.eu-west-3.amazonaws.com.cn".to_owned(),
+                "bedrock.eu-west-3.amazonaws.com.cn".to_owned()
+            )
+        );
+        // A proxy (or test mock) is used as-is.
+        assert_eq!(
+            at(Some("http://127.0.0.1:4566/")),
+            (
+                "http://127.0.0.1:4566".to_owned(),
+                "127.0.0.1:4566".to_owned()
+            )
+        );
     }
 
     #[test]

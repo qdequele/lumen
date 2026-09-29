@@ -317,6 +317,10 @@ milestone.
   and an unauthenticated call there would 401 a healthy server - a worse
   signal than bare reachability. Plumbing provider credentials into the probe
   task to unlock this is deferred to keep the probe free and side-effect-free.
+  An on-demand, credentialed check now exists as `POST
+  /admin/providers/{name}/check` (`crates/providers/src/key_check.rs`);
+  running it from the background probe is still deferred (it would change
+  the probe's no-credentials contract, so it needs an ADR first).
 
 - ~~**`health_stays_fast_under_upstream_429_storm` flaky under a 500-connection
   storm.**~~ **Resolved** (issue #27; the storm path's kernel-level connect

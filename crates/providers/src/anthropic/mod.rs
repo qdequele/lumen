@@ -30,10 +30,10 @@ use crate::chat::{items_to_chunks, items_to_sse_bytes, translate_sse_stream, Str
 use crate::http::{open_stream_with_headers, post_json_with_headers};
 
 /// Default Anthropic API base (no version suffix; the path adds `/v1/messages`).
-const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
+pub(crate) const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 
 /// The Anthropic API version header value pinned by this build.
-const ANTHROPIC_VERSION: &str = "2023-06-01";
+pub(crate) const ANTHROPIC_VERSION: &str = "2023-06-01";
 
 /// Anthropic requires `max_tokens`; used when the client omits it.
 const DEFAULT_MAX_TOKENS: u32 = 4096;

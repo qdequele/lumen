@@ -6,7 +6,34 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ## [Unreleased]
 
+### Security
+
+- **The provider HTTP client no longer follows redirects.** reqwest strips
+  `Authorization` on a cross-host redirect, but not the custom auth headers
+  Anthropic (`x-api-key`), Azure (`api-key`), Gemini (`x-goog-api-key`) and
+  Pinecone (`Api-Key`) use, so an upstream, a stale `base_url` or a hostile
+  proxy answering with a 3xx to another host would have received the
+  provider key. The shared client (and every per-provider client built for
+  `connect_timeout_ms`) now uses a no-redirect policy: a 3xx surfaces as a
+  fatal upstream error (`LM-3003`, 502 naming the provider), and the key
+  check reports it as `key_valid: null` with a `redirected` detail. The
+  background health probe and webhook deliveries, which carry no provider
+  credential, get their own client and keep following redirects as before.
+
 ### Added
+
+- **Provider key check without inference.** `POST
+  /admin/providers/{name}/check` (master key) verifies a provider's live
+  credentials with one request to a free, authenticated endpoint of its kind
+  (`GET /models`, OpenRouter `/key`, Cohere `check-api-key`, a Vertex AI
+  OAuth token mint, a SigV4-signed Bedrock `ListFoundationModels`, ...), so
+  no tokens are spent. It answers `200` with `key_valid` as
+  `true`/`false`/`null` plus `reachable`, `http_status`, `latency_ms`,
+  `endpoint` and `detail`; a rejected key is never reported as a gateway
+  401, and the key is never echoed. Kinds with no known free endpoint
+  (Jina, Voyage, Mixedbread, TypeSafe, Perplexity) report `null` without a
+  request. Library: `Registry::check_key`, `BedrockProvider::check_key`,
+  `VertexProvider::check_key`.
 
 - **Model release dates on `GET /v1/models`.** A model may declare
   `release_date = "YYYY-MM-DD"` (quoted, or as a bare TOML date) in its

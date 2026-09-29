@@ -118,6 +118,10 @@ pub fn build_app(state: AppState) -> Router {
             .route("/admin/groups/{id}/grant", post(admin::grant_group))
             .route("/admin/provider-keys/{name}", put(admin::put_provider_key))
             .route(
+                "/admin/providers/{name}/check",
+                post(admin::check_provider_key),
+            )
+            .route(
                 "/admin/webhooks",
                 get(admin::get_webhooks)
                     .put(admin::put_webhooks)

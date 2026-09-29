@@ -38,6 +38,7 @@ use super::stream::GoogleTranslator;
 use super::{translate_request, translate_response, GeminiResponse};
 use crate::chat::{items_to_chunks, items_to_sse_bytes, translate_sse_stream, StreamItem};
 use crate::http::{open_stream, post_json};
+use crate::key_check::{elapsed_ms, endpoint_label, KeyCheck, CHECK_TIMEOUT};
 
 /// A Google Vertex AI chat provider.
 pub struct VertexProvider {
@@ -208,6 +209,92 @@ impl VertexProvider {
     pub fn with_strict(mut self, strict: bool) -> Self {
         self.strict = strict;
         self
+    }
+
+    /// Check the service-account credentials without spending tokens: mint a
+    /// fresh OAuth token (bypassing the cache). Success proves the key signs
+    /// and Google accepts it; it does not prove IAM access to any model.
+    pub async fn check_key(&self, cancel: &CancellationToken) -> KeyCheck {
+        let Some(ready) = &self.state else {
+            return KeyCheck::missing_key("service-account credentials");
+        };
+        if !ready.auth.can_sign() {
+            return KeyCheck::without_request(
+                Some(false),
+                "service-account private key could not sign a token request",
+            );
+        }
+        let endpoint = endpoint_label(&reqwest::Method::POST, ready.auth.token_uri());
+        let started = std::time::Instant::now();
+        let minted = tokio::time::timeout(CHECK_TIMEOUT, ready.auth.mint_fresh(cancel)).await;
+        let latency_ms = Some(elapsed_ms(started));
+        let (key_valid, reachable, http_status, detail) = match minted {
+            Ok(Ok(())) => (
+                Some(true),
+                Some(true),
+                Some(200),
+                "service account accepted (OAuth token minted); model IAM \
+                 permissions are not verified"
+                    .to_owned(),
+            ),
+            Ok(Err(ProviderError::Cancelled)) => return KeyCheck::cancelled(endpoint),
+            Ok(Err(ProviderError::Upstream { status, .. }))
+                if matches!(status, 400 | 401 | 403) =>
+            {
+                (
+                    Some(false),
+                    Some(true),
+                    Some(status),
+                    format!("service account rejected by the token endpoint (HTTP {status})"),
+                )
+            }
+            // A 2xx whose body is not a token response is rewritten by the
+            // token source as a synthetic, non-retryable 502 (a real 5xx is
+            // always classified retryable): no upstream 502 happened, so no
+            // HTTP status is reported for it.
+            Ok(Err(ProviderError::Upstream {
+                status: 502,
+                retryable: false,
+                ..
+            })) => (
+                None,
+                Some(true),
+                None,
+                "unexpected token endpoint response".to_owned(),
+            ),
+            Ok(Err(ProviderError::Upstream { status, .. })) => (
+                None,
+                Some(true),
+                Some(status),
+                format!("token endpoint error (HTTP {status})"),
+            ),
+            Ok(Err(ProviderError::RateLimited { .. })) => (
+                None,
+                Some(true),
+                Some(429),
+                "token endpoint rate limited (HTTP 429)".to_owned(),
+            ),
+            Ok(Err(_)) => (
+                None,
+                Some(false),
+                None,
+                "token endpoint unreachable".to_owned(),
+            ),
+            Err(_) => (
+                None,
+                Some(false),
+                None,
+                "token endpoint timed out".to_owned(),
+            ),
+        };
+        KeyCheck {
+            key_valid,
+            reachable,
+            http_status,
+            latency_ms,
+            endpoint: Some(endpoint),
+            detail,
+        }
     }
 
     /// The ready state, or the request-time error for an unconfigured provider:
