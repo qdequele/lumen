@@ -50,6 +50,14 @@ pub fn build_client_with(connect: Duration, overall: Duration) -> reqwest::Clien
         .http2_keep_alive_while_idle(true)
         // Same protection for pooled h1 connections, at the TCP layer.
         .tcp_keepalive(Duration::from_secs(60))
+        // Never follow redirects. reqwest strips `Authorization` on a
+        // cross-host hop, but not the custom auth headers several providers
+        // use (`x-api-key`, `api-key`, `x-goog-api-key`, `Api-Key`), so
+        // following a 3xx from an upstream, a stale `base_url` or a hostile
+        // proxy would hand the provider key to whatever host it names.
+        // Provider APIs never legitimately redirect: a 3xx surfaces as a
+        // fatal upstream error through `classify_status` instead.
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         // Falls back to the default client if the builder somehow fails; the
         // default is always constructible, so this cannot panic in practice.

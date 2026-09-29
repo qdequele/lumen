@@ -6,6 +6,18 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ## [Unreleased]
 
+### Security
+
+- **The provider HTTP client no longer follows redirects.** reqwest strips
+  `Authorization` on a cross-host redirect, but not the custom auth headers
+  Anthropic (`x-api-key`), Azure (`api-key`), Gemini (`x-goog-api-key`) and
+  Pinecone (`Api-Key`) use, so an upstream, a stale `base_url` or a hostile
+  proxy answering with a 3xx to another host would have received the
+  provider key. The shared client (and every per-provider client built for
+  `connect_timeout_ms`) now uses a no-redirect policy: a 3xx surfaces as a
+  fatal upstream error (`LM-3003`, 502 naming the provider), and the key
+  check reports it as `key_valid: null` with a `redirected` detail.
+
 ### Added
 
 - **Provider key check without inference.** `POST
