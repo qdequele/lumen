@@ -65,6 +65,7 @@ fn openai_registry(upstream: &str) -> Arc<Registry> {
                 capabilities: vec![Capability::Chat],
                 modalities: vec!["text".to_owned()],
                 rerank_converter: None,
+                release_date: None,
             },
             ModelSpec {
                 id: "embed-only".to_owned(),
@@ -72,6 +73,7 @@ fn openai_registry(upstream: &str) -> Arc<Registry> {
                 capabilities: vec![Capability::Embed],
                 modalities: vec!["text".to_owned()],
                 rerank_converter: None,
+                release_date: None,
             },
         ],
     }];
@@ -100,6 +102,7 @@ fn anthropic_registry(upstream: &str) -> Arc<Registry> {
             capabilities: vec![Capability::Chat],
             modalities: vec!["text".to_owned()],
             rerank_converter: None,
+            release_date: None,
         }],
     }];
     Arc::new(
@@ -127,6 +130,7 @@ fn google_registry(upstream: &str) -> Arc<Registry> {
             capabilities: vec![Capability::Chat],
             modalities: vec!["text".to_owned()],
             rerank_converter: None,
+            release_date: None,
         }],
     }];
     Arc::new(
@@ -155,6 +159,7 @@ fn anthropic_vision_registry(upstream: &str) -> Arc<Registry> {
             capabilities: vec![Capability::Chat],
             modalities: vec!["text".to_owned(), "image".to_owned()],
             rerank_converter: None,
+            release_date: None,
         }],
     }];
     Arc::new(
@@ -183,6 +188,7 @@ fn google_vision_registry(upstream: &str) -> Arc<Registry> {
             capabilities: vec![Capability::Chat],
             modalities: vec!["text".to_owned(), "image".to_owned()],
             rerank_converter: None,
+            release_date: None,
         }],
     }];
     Arc::new(
@@ -212,6 +218,7 @@ fn cohere_vision_registry(upstream: &str) -> Arc<Registry> {
             capabilities: vec![Capability::Chat],
             modalities: vec!["text".to_owned(), "image".to_owned()],
             rerank_converter: None,
+            release_date: None,
         }],
     }];
     Arc::new(
@@ -241,6 +248,7 @@ fn ollama_registry(upstream: &str) -> Arc<Registry> {
             capabilities: vec![Capability::Chat],
             modalities: vec!["text".to_owned()],
             rerank_converter: None,
+            release_date: None,
         }],
     }];
     Arc::new(
@@ -293,6 +301,7 @@ async fn openai_compatible_kind_routes_through_the_openai_path() {
             capabilities: vec![Capability::Chat],
             modalities: vec!["text".to_owned()],
             rerank_converter: None,
+            release_date: None,
         }],
     }];
     let registry = Arc::new(

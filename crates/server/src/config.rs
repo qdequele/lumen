@@ -14,7 +14,7 @@ use figment::{
     Figment,
 };
 use lumen_auth::events::SettingsOrigin;
-use lumen_core::Capability;
+use lumen_core::{Capability, ReleaseDate};
 use lumen_providers::{ModelSpec, ProviderKind, ProviderSpec};
 use lumen_telemetry::logging::LogFormat;
 use serde::{Deserialize, Serialize};
@@ -549,6 +549,12 @@ pub struct ModelConfig {
     /// a generic relevance question.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rerank: Option<RerankConverterConfig>,
+    /// The date the model was released, ISO 8601 `YYYY-MM-DD` (validated at
+    /// load). Exposed on `GET /v1/models` as `release_date` and as the
+    /// OpenAI-compatible integer `created`, so clients can sort by release.
+    /// Metadata only: it never affects routing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_date: Option<ReleaseDate>,
 }
 
 /// The `[providers.models.rerank]` converter block.
@@ -1513,6 +1519,7 @@ impl Config {
                             .rerank
                             .as_ref()
                             .map(RerankConverterConfig::to_converter),
+                        release_date: m.release_date,
                     })
                     .collect(),
             })
@@ -2026,6 +2033,93 @@ mod tests {
             custom.instructions,
             lumen_providers::typesafe::rerank::DEFAULT_INSTRUCTIONS
         );
+    }
+
+    #[test]
+    fn release_date_parses_and_reaches_the_registry_spec() {
+        let config = load_str(
+            r#"
+            [[providers]]
+            name = "openai"
+            kind = "openai"
+            api_key_env = "OPENAI_API_KEY"
+            [[providers.models]]
+            id = "gpt-4o"
+            capabilities = ["chat"]
+            release_date = "2024-05-13"
+            [[providers.models]]
+            id = "undated"
+            capabilities = ["chat"]
+            [[providers.models]]
+            id = "unquoted"
+            capabilities = ["chat"]
+            release_date = 2025-02-27
+            "#,
+        )
+        .expect("valid");
+        let specs = config.provider_specs();
+        let models = &specs[0].models;
+        assert_eq!(
+            models[0].release_date.map(|d| d.to_string()).as_deref(),
+            Some("2024-05-13")
+        );
+        assert_eq!(models[1].release_date, None);
+        // A native (unquoted) TOML date literal is accepted too.
+        assert_eq!(
+            models[2].release_date.map(|d| d.to_string()).as_deref(),
+            Some("2025-02-27")
+        );
+    }
+
+    #[test]
+    fn unquoted_release_date_parses_on_the_toml_crate_path_too() {
+        // `config_edit` (DB mode, admin upserts) parses with the `toml`
+        // crate directly rather than figment; both must agree.
+        let m: ModelConfig = toml::from_str(
+            r#"
+            id = "gpt-4o"
+            capabilities = ["chat"]
+            release_date = 2024-05-13
+            "#,
+        )
+        .expect("valid");
+        assert_eq!(
+            m.release_date.map(|d| d.to_string()).as_deref(),
+            Some("2024-05-13")
+        );
+    }
+
+    #[test]
+    fn invalid_release_date_is_rejected_at_load() {
+        for bad in [
+            r#""2024-02-30""#,
+            r#""May 13, 2024""#,
+            "20240513",
+            // Unquoted TOML datetime / time literals are not dates.
+            "2024-05-13T00:00:00",
+            "2024-05-13T00:00:00Z",
+            "10:30:00",
+            r#"{ "$__toml_private_datetime" = "nope" }"#,
+        ] {
+            let err = load_str(&format!(
+                r#"
+                [[providers]]
+                name = "openai"
+                kind = "openai"
+                api_key_env = "OPENAI_API_KEY"
+                [[providers.models]]
+                id = "gpt-4o"
+                capabilities = ["chat"]
+                release_date = {bad}
+                "#
+            ))
+            .expect_err("rejected");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("release") || msg.contains("date"),
+                "{bad}: {msg}"
+            );
+        }
     }
 
     #[test]

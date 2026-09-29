@@ -9,7 +9,9 @@
 //! passed in already - the registry never reads env vars or holds config.
 
 use arc_swap::ArcSwap;
-use lumen_core::{Capability, ChatProvider, EmbeddingProvider, RerankProvider, SystemOneProvider};
+use lumen_core::{
+    Capability, ChatProvider, EmbeddingProvider, ReleaseDate, RerankProvider, SystemOneProvider,
+};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -50,6 +52,9 @@ pub struct ModelSpec {
     /// model declaring `rerank`; `None` uses the default converter. Ignored
     /// by every other kind.
     pub rerank_converter: Option<RerankConverter>,
+    /// Operator-declared release date, surfaced on `GET /v1/models` so
+    /// clients can sort by release. Metadata only: never used for routing.
+    pub release_date: Option<ReleaseDate>,
 }
 
 /// A provider instance to build. `api_key` is already resolved from the
@@ -275,6 +280,8 @@ pub struct LoadedModelSummary {
     pub capabilities: Vec<Capability>,
     /// Declared input modalities.
     pub modalities: Vec<String>,
+    /// Operator-declared release date, if any.
+    pub release_date: Option<ReleaseDate>,
 }
 
 #[derive(Default)]
@@ -460,6 +467,7 @@ fn build_inner(
                 owned_by: spec.name.clone(),
                 capabilities: model.capabilities.clone(),
                 modalities: model.modalities.clone(),
+                release_date: model.release_date,
             });
 
             if model.capabilities.contains(&Capability::Chat) {
@@ -1144,6 +1152,7 @@ mod tests {
             capabilities: caps.to_vec(),
             modalities: vec!["text".to_owned()],
             rerank_converter: None,
+            release_date: None,
         }
     }
 
@@ -1478,6 +1487,7 @@ mod tests {
                     capabilities: vec![Capability::Embed],
                     modalities: vec!["text".to_owned()],
                     rerank_converter: None,
+                    release_date: None,
                 }],
             )],
             reqwest::Client::new(),

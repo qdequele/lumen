@@ -34,7 +34,9 @@ optional; see `config.example.toml` for the full set. Details in
 
 **`[[providers]]` / `[[providers.models]]`** - one `[[providers]]` block per
 upstream (`id`, `upstream_id`, `capabilities`, `modalities`, costs,
-per-model `fallbacks`). See [Providers](../providers.md) for the full
+per-model `fallbacks`, and an optional `release_date` ISO date that
+`GET /v1/models` returns as `release_date` and as the OpenAI integer
+`created`, so clients can sort models by release). See [Providers](../providers.md) for the full
 provider matrix and per-provider notes.
 
 **`[image_fetch]`** - server-side fetching of remote image URLs for

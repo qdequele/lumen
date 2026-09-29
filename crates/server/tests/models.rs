@@ -29,6 +29,7 @@ fn registry() -> Arc<Registry> {
                 capabilities: vec![Capability::Embed, Capability::Rerank],
                 modalities: vec!["text".to_owned()],
                 rerank_converter: None,
+                release_date: None,
             }],
         },
         ProviderSpec {
@@ -46,6 +47,7 @@ fn registry() -> Arc<Registry> {
                     capabilities: vec![Capability::Chat],
                     modalities: vec!["text".to_owned()],
                     rerank_converter: None,
+                    release_date: Some("2024-05-13".parse().unwrap()),
                 },
                 ModelSpec {
                     // A slash-containing id (HF-style), legal in config: the
@@ -55,6 +57,7 @@ fn registry() -> Arc<Registry> {
                     capabilities: vec![Capability::Chat],
                     modalities: vec!["text".to_owned()],
                     rerank_converter: None,
+                    release_date: None,
                 },
             ],
         },
@@ -209,4 +212,37 @@ async fn empty_config_lists_no_models() {
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["object"], "list");
     assert!(body["data"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn release_date_is_exposed_for_sorting_and_omitted_when_unset() {
+    let base = common::spawn_with(registry(), LIMIT).await;
+
+    let body: Value = reqwest::get(format!("{base}/v1/models"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let data = body["data"].as_array().unwrap();
+
+    // A dated model carries the ISO date plus the OpenAI-compatible integer
+    // `created` (midnight UTC of that date), so either can be sorted on.
+    let gpt = data.iter().find(|m| m["id"] == "gpt").unwrap();
+    assert_eq!(gpt["release_date"], "2024-05-13");
+    assert_eq!(gpt["created"], 1_715_558_400_u64);
+
+    // An undated model omits both rather than reporting a fake epoch 0.
+    let multi = data.iter().find(|m| m["id"] == "multi").unwrap();
+    assert!(multi.get("release_date").is_none());
+    assert!(multi.get("created").is_none());
+
+    // Retrieve serves the same fields.
+    let retrieved: Value = reqwest::get(format!("{base}/v1/models/gpt"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(retrieved, *gpt);
 }

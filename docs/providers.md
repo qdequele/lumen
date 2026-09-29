@@ -18,6 +18,7 @@ api_key_env = "OPENAI_API_KEY"   # NAME of the env var holding the key
 id = "gpt-4o"             # the id clients send (owned entirely by you)
 upstream_id = "gpt-4o-2024-08-06"   # what LUMEN sends upstream (defaults to `id`)
 capabilities = ["chat"]   # any of "chat", "embed", "rerank", "systemone"
+release_date = "2024-08-06"   # optional; lets clients sort GET /v1/models by release
 ```
 
 Rules that apply to every provider:
@@ -26,6 +27,11 @@ Rules that apply to every provider:
   variable; LUMEN reads it only when a request actually routes to that
   provider. A hosted provider whose env var is unset fails only at use, not at
   boot - a partial set of keys is fine.
+- **`release_date` is metadata only.** An ISO date (`"2024-08-06"`, or the
+  unquoted TOML date `2024-08-06`), validated at load. `GET /v1/models`
+  returns it as `release_date` and as the OpenAI integer `created` (Unix
+  seconds, midnight UTC); both are omitted for an undated model. It never
+  affects routing.
 - **Model ids are globally unique** across all providers. A collision aborts
   startup and names both offending providers. Several ids may map to one
   `upstream_id` (versioned aliasing).

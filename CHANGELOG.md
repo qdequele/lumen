@@ -6,6 +6,17 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **Model release dates on `GET /v1/models`.** A model may declare
+  `release_date = "YYYY-MM-DD"` (quoted, or as a bare TOML date) in its
+  `[[providers.models]]` block (validated at load: an impossible or malformed date aborts startup or is
+  refused by a reload). `GET /v1/models` and `GET /v1/models/{id}` then
+  return it as `release_date` and as the OpenAI-compatible integer `created`
+  (Unix seconds at midnight UTC), so clients can sort models by release.
+  Both fields are omitted for an undated model rather than reporting a
+  misleading epoch 0. Metadata only: it never affects routing.
+
 ## [0.5.0] - 2026-09-26
 
 ### Added

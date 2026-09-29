@@ -31,6 +31,7 @@ fn registry_for(upstream: &str) -> Arc<Registry> {
                 capabilities: vec![Capability::Rerank],
                 modalities: vec!["text".to_owned()],
                 rerank_converter: None,
+                release_date: None,
             },
             ModelSpec {
                 id: "embed-only".to_owned(),
@@ -38,6 +39,7 @@ fn registry_for(upstream: &str) -> Arc<Registry> {
                 capabilities: vec![Capability::Embed],
                 modalities: vec!["text".to_owned()],
                 rerank_converter: None,
+                release_date: None,
             },
         ],
     }];
@@ -288,6 +290,7 @@ fn registry_for_jina(upstream: &str) -> Arc<Registry> {
             capabilities: vec![Capability::Rerank],
             modalities: vec!["text".to_owned()],
             rerank_converter: None,
+            release_date: None,
         }],
     }];
     Arc::new(
@@ -317,6 +320,7 @@ fn registry_for_voyage(upstream: &str) -> Arc<Registry> {
             capabilities: vec![Capability::Rerank],
             modalities: vec!["text".to_owned()],
             rerank_converter: None,
+            release_date: None,
         }],
     }];
     Arc::new(
