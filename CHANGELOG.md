@@ -16,7 +16,9 @@ All notable changes to LUMEN are documented here. The format is based on
   provider key. The shared client (and every per-provider client built for
   `connect_timeout_ms`) now uses a no-redirect policy: a 3xx surfaces as a
   fatal upstream error (`LM-3003`, 502 naming the provider), and the key
-  check reports it as `key_valid: null` with a `redirected` detail.
+  check reports it as `key_valid: null` with a `redirected` detail. The
+  background health probe and webhook deliveries, which carry no provider
+  credential, get their own client and keep following redirects as before.
 
 ### Added
 

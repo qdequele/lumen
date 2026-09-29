@@ -154,3 +154,33 @@ async fn key_check_reports_a_redirect_without_following_it() {
     assert!(outcome.detail.contains("redirect"), "{}", outcome.detail);
     assert_key_never_reached(&target).await;
 }
+
+#[tokio::test]
+async fn credential_free_client_keeps_following_redirects() {
+    // Health probes and webhook deliveries carry no provider credential, so
+    // they keep the default redirect behaviour (a `301 -> 200` liveness
+    // endpoint stays up, a redirecting webhook receiver still gets events).
+    let target = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&target)
+        .await;
+    let upstream = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(
+            ResponseTemplate::new(301)
+                .insert_header("location", format!("{}/moved", target.uri()).as_str()),
+        )
+        .mount(&upstream)
+        .await;
+
+    let client =
+        http::build_credential_free_client_with(Duration::from_secs(5), Duration::from_secs(10));
+    let response = client
+        .get(format!("{}/health", upstream.uri()))
+        .send()
+        .await
+        .expect("request succeeds");
+    assert_eq!(response.status(), 200, "redirect was not followed");
+}
