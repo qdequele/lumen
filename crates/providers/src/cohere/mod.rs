@@ -40,7 +40,7 @@ use crate::chat::{items_to_chunks, items_to_sse_bytes, translate_sse_stream, Str
 use crate::http::{open_stream, post_json};
 
 /// Default Cohere API base (no version suffix; paths add `/v2/...`).
-const DEFAULT_BASE_URL: &str = "https://api.cohere.com";
+pub(crate) const DEFAULT_BASE_URL: &str = "https://api.cohere.com";
 
 /// Cohere's documented maximum number of texts per embed request.
 const MAX_BATCH_SIZE: usize = 96;

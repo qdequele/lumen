@@ -45,7 +45,7 @@ use crate::http::{open_stream_with_headers, post_json_with_headers};
 /// supplies one. Pinned rather than "latest" so a given LUMEN build's
 /// upstream wire shape never shifts under an operator without a deliberate
 /// config change.
-const DEFAULT_API_VERSION: &str = "2024-10-21";
+pub(crate) const DEFAULT_API_VERSION: &str = "2024-10-21";
 
 /// Azure OpenAI's documented maximum number of inputs per embeddings request
 /// (the same array-size ceiling as the OpenAI embedding models it hosts).
@@ -138,7 +138,7 @@ impl AzureProvider {
 /// than the minimum for either position, which keeps one tiny, obviously
 /// correct encoder for both (a dependency on the `url`/`percent-encoding`
 /// crates just for two values is not warranted).
-fn percent_encode(input: &str) -> String {
+pub(crate) fn percent_encode(input: &str) -> String {
     // Worst case every byte expands to three characters.
     let mut out = String::with_capacity(input.len().saturating_mul(3));
     for &byte in input.as_bytes() {
@@ -168,7 +168,7 @@ const fn hex_digit(nibble: u8) -> char {
 /// trailing slash and any query string stripped) and the `api-version`
 /// carried by an `?api-version=...` query parameter, `None` when absent
 /// (the caller applies the field/default precedence).
-fn split_endpoint_and_version(base_url: &str) -> (String, Option<String>) {
+pub(crate) fn split_endpoint_and_version(base_url: &str) -> (String, Option<String>) {
     let trimmed = base_url.trim_end_matches('/');
     let Some((endpoint, query)) = trimmed.split_once('?') else {
         return (trimmed.to_owned(), None);

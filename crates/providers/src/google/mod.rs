@@ -51,7 +51,7 @@ use crate::chat::{items_to_chunks, items_to_sse_bytes, translate_sse_stream, Str
 use crate::http::{open_stream_with_headers, post_json_with_headers};
 
 /// Default Gemini API base (the path adds `/v1beta/models/...`).
-const DEFAULT_BASE_URL: &str = "https://generativelanguage.googleapis.com";
+pub(crate) const DEFAULT_BASE_URL: &str = "https://generativelanguage.googleapis.com";
 
 /// OpenAI chat fields `generateContent` has no equivalent for (issue #72):
 /// no OpenAI-shaped logprobs (nor `top_logprobs`), no logit biasing, no

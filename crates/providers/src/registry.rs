@@ -13,6 +13,7 @@ use lumen_core::{Capability, ChatProvider, EmbeddingProvider, RerankProvider, Sy
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 
 use crate::anthropic::AnthropicProvider;
 use crate::azure::AzureProvider;
@@ -22,6 +23,7 @@ use crate::cohere::CohereProvider;
 use crate::google::vertex::VertexProvider;
 use crate::google::GoogleProvider;
 use crate::jina::JinaProvider;
+use crate::key_check::{HttpProber, KeyCheck, KeyProber};
 use crate::kind::ProviderKind;
 use crate::mistral::MistralProvider;
 use crate::mixedbread::MixedbreadProvider;
@@ -295,6 +297,9 @@ struct Inner {
     model_modalities: HashMap<String, Vec<String>>,
     /// Every exposed model, in configuration order, for `GET /v1/models`.
     models: Vec<LoadedModelSummary>,
+    /// provider name -> its key checker, built from the same spec (and so the
+    /// same live credentials) as its routes.
+    probers: HashMap<String, (ProviderKind, Arc<KeyProber>)>,
 }
 
 /// Concrete provider instances built for one spec. A single provider type may
@@ -410,6 +415,22 @@ impl Registry {
             .find(|m| m.id == model_id)
             .cloned()
     }
+
+    /// Check a configured provider's credentials without spending tokens (see
+    /// [`crate::key_check`]), returning the provider's kind alongside the
+    /// outcome. `None` when no provider has that name. Kind and credentials
+    /// come from ONE routing-table snapshot, so a concurrent hot reload can
+    /// never pair one generation's kind with another's outcome; a rotated key
+    /// is what gets checked once its reload lands.
+    pub async fn check_key(
+        &self,
+        provider: &str,
+        cancel: &CancellationToken,
+    ) -> Option<(ProviderKind, KeyCheck)> {
+        // Clone the Arc out so the table snapshot is not held across the await.
+        let (kind, prober) = self.inner.load().probers.get(provider).cloned()?;
+        Some((kind, prober.check(cancel).await))
+    }
 }
 
 fn build_inner(
@@ -433,6 +454,7 @@ fn build_inner(
 
         // One instance per provider, shared across all of its models via `Arc`.
         let built = build_providers(spec, provider_client)?;
+        insert_prober(&mut inner, spec, provider_client)?;
 
         for model in &spec.models {
             if let Some(first) = owner.insert(model.id.as_str(), spec.name.as_str()) {
@@ -582,6 +604,83 @@ fn warn_unsupported(spec: &ProviderSpec, model_id: &str, capability: &str) {
         "model declares a capability this provider kind has no implementation \
          for yet; it will not resolve for that capability"
     );
+}
+
+/// Build the key checker for one spec and register it under the provider's
+/// name: Vertex AI and Bedrock sign with their provider's own machinery,
+/// every other kind is one plain request.
+fn insert_prober(
+    inner: &mut Inner,
+    spec: &ProviderSpec,
+    client: &reqwest::Client,
+) -> Result<(), RegistryError> {
+    let prober = match spec.kind {
+        ProviderKind::VertexAi => KeyProber::Vertex(vertex_from_spec(spec, client)?),
+        ProviderKind::Bedrock => KeyProber::Bedrock(bedrock_from_spec(spec, client)?),
+        kind => KeyProber::Http(HttpProber {
+            client: client.clone(),
+            kind,
+            base_url: spec.base_url.clone(),
+            api_key: spec.api_key.clone(),
+            api_version: spec.api_version.clone(),
+        }),
+    };
+    inner
+        .probers
+        .insert(spec.name.clone(), (spec.kind, Arc::new(prober)));
+    Ok(())
+}
+
+/// Vertex AI carries its config in the existing spec fields: `base_url`
+/// holds the GCP region, `api_key` holds the inline service-account JSON
+/// (the provider secret). The project id comes from the credentials.
+fn vertex_from_spec(
+    spec: &ProviderSpec,
+    client: &reqwest::Client,
+) -> Result<VertexProvider, RegistryError> {
+    let location = spec.base_url.clone().ok_or(RegistryError::MissingBaseUrl {
+        name: spec.name.clone(),
+        kind: spec.kind.as_str(),
+    })?;
+    VertexProvider::new(
+        client.clone(),
+        spec.name.clone(),
+        spec.api_key.as_deref(),
+        None,
+        Some(location),
+        None,
+    )
+    .map_err(|e| RegistryError::ProviderConfig {
+        name: spec.name.clone(),
+        message: e.to_string(),
+    })
+    .map(|p| p.with_strict(spec.strict))
+}
+
+/// The signing region comes from the endpoint host (standard or VPC shapes)
+/// or from AWS_REGION / AWS_DEFAULT_REGION; a region that cannot be
+/// determined is a BUILD error - silently signing for a default region would
+/// just 403 at request time. Credentials are re-read from the AWS environment
+/// variables on every request (with the optional api_key override for the
+/// secret), so a missing key here is not a build error: the provider reports
+/// it at request time, and rotated values are picked up without a reload.
+fn bedrock_from_spec(
+    spec: &ProviderSpec,
+    client: &reqwest::Client,
+) -> Result<BedrockProvider, RegistryError> {
+    let region = bedrock::resolve_region(spec.base_url.as_deref()).ok_or_else(|| {
+        RegistryError::MissingRegion {
+            name: spec.name.clone(),
+        }
+    })?;
+    Ok(BedrockProvider::new_with_env_credentials(
+        client.clone(),
+        spec.name.clone(),
+        region,
+        spec.base_url.clone(),
+        spec.api_key.clone(),
+    )
+    .with_strict(spec.strict))
 }
 
 /// Build the capability-provider instances for one spec.
@@ -977,24 +1076,8 @@ fn build_providers(
                 systemone: None,
             })
         }
-        // Vertex AI carries its config in the existing spec fields: `base_url`
-        // holds the GCP region, `api_key` holds the inline service-account JSON
-        // (the provider secret). The project id comes from the credentials.
         ProviderKind::VertexAi => {
-            let location = require_base_url()?;
-            let provider = VertexProvider::new(
-                client.clone(),
-                spec.name.clone(),
-                spec.api_key.as_deref(),
-                None,
-                Some(location),
-                None,
-            )
-            .map_err(|e| RegistryError::ProviderConfig {
-                name: spec.name.clone(),
-                message: e.to_string(),
-            })?
-            .with_strict(spec.strict);
+            let provider = vertex_from_spec(spec, client)?;
             // Chat via `generateContent`, embeddings via `:predict` (issue
             // #62) - the same authenticated instance behind both traits.
             let provider = Arc::new(provider);
@@ -1008,32 +1091,10 @@ fn build_providers(
             })
         }
         ProviderKind::Bedrock => {
-            // The signing region comes from the endpoint host (standard or VPC
-            // shapes) or from AWS_REGION / AWS_DEFAULT_REGION; a region that
-            // cannot be determined is a BUILD error - silently signing for a
-            // default region would just 403 at request time. Credentials are
-            // re-read from the AWS environment variables on every request (with
-            // the optional api_key override for the secret), so a missing key
-            // here is not a build error: the provider reports it at request
-            // time, and rotated values are picked up without a reload.
-            let region = bedrock::resolve_region(spec.base_url.as_deref()).ok_or_else(|| {
-                RegistryError::MissingRegion {
-                    name: spec.name.clone(),
-                }
-            })?;
             // One signed instance serves both traits: chat via Converse and
             // embeddings via per-model InvokeModel (Titan / Cohere on Bedrock,
             // issue #95). SigV4 signing and region resolution are shared.
-            let provider = Arc::new(
-                BedrockProvider::new_with_env_credentials(
-                    client.clone(),
-                    spec.name.clone(),
-                    region,
-                    spec.base_url.clone(),
-                    spec.api_key.clone(),
-                )
-                .with_strict(spec.strict),
-            );
+            let provider = Arc::new(bedrock_from_spec(spec, client)?);
             let chat: Arc<dyn ChatProvider> = provider.clone();
             let embed: Arc<dyn EmbeddingProvider> = provider;
             Ok(BuiltProviders {

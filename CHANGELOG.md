@@ -6,6 +6,21 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **Provider key check without inference.** `POST
+  /admin/providers/{name}/check` (master key) verifies a provider's live
+  credentials with one request to a free, authenticated endpoint of its kind
+  (`GET /models`, OpenRouter `/key`, Cohere `check-api-key`, a Vertex AI
+  OAuth token mint, a SigV4-signed Bedrock `ListFoundationModels`, ...), so
+  no tokens are spent. It answers `200` with `key_valid` as
+  `true`/`false`/`null` plus `reachable`, `http_status`, `latency_ms`,
+  `endpoint` and `detail`; a rejected key is never reported as a gateway
+  401, and the key is never echoed. Kinds with no known free endpoint
+  (Jina, Voyage, Mixedbread, TypeSafe, Perplexity) report `null` without a
+  request. Library: `Registry::check_key`, `BedrockProvider::check_key`,
+  `VertexProvider::check_key`.
+
 ## [0.5.0] - 2026-09-26
 
 ### Added

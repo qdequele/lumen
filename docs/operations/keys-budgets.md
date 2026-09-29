@@ -94,6 +94,7 @@ together, so they take effect immediately with no restart.
 | `DELETE` | `/admin/groups/{id}` | Soft-delete a group. Refused while it still has active member keys. |
 | `POST` | `/admin/groups/{id}/grant` | Atomically add to a group's shared budget cap (concurrency-safe top-up). |
 | `PUT` | `/admin/provider-keys/{name}` | Store a provider API key encrypted at rest. |
+| `POST` | `/admin/providers/{name}/check` | Check a provider's live credentials without spending tokens. |
 | `GET` | `/admin/usage` | Aggregated usage and spend from the usage log. |
 
 ### Budget groups
@@ -348,6 +349,73 @@ re-reads provider keys from the encrypted store (off the request path) and
 rebuilds the provider registry - a rotated key takes effect without a
 restart. Environment-sourced keys keep precedence over a stored key. See
 [Deployment - Hot reload](deployment.md#hot-reload).
+
+### Check a provider key (`POST /admin/providers/{name}/check`)
+
+Verifies a configured provider's **live** credentials (the ones the routing
+table uses right now, so a key just rotated with `PUT
+/admin/provider-keys/{name}` is the one checked) without running a chat,
+embedding or rerank call. The gateway sends one request to a free,
+authenticated endpoint of that provider kind and never an inference route,
+so no tokens are spent.
+
+```bash
+curl -s -X POST http://localhost:8080/admin/providers/openai/check \
+  -H "Authorization: Bearer $LUMEN_MASTER_KEY"
+```
+
+```json
+{
+  "provider": "openai",
+  "kind": "openai",
+  "key_valid": true,
+  "reachable": true,
+  "http_status": 200,
+  "latency_ms": 142,
+  "endpoint": "GET https://api.openai.com/v1/models",
+  "detail": "key accepted"
+}
+```
+
+`key_valid` is a tri-state:
+
+| Value | Meaning |
+|---|---|
+| `true` | The upstream accepted the credentials. |
+| `false` | The upstream rejected them (401/403), or none are configured (then `reachable` is `null`: no request was made). |
+| `null` | This check cannot tell: a keyless provider, a kind with no free check endpoint, a rate limit (429), a 404, a 5xx, or an unreachable host (`reachable: false`). |
+
+The verdict is data: the call answers `200` whatever the key's state, so a
+rejected provider key is never mistaken for a rejected master key. An
+unknown `{name}` is `404` `LM-1003`. The response never contains the key,
+and `endpoint` drops any `user:password@` a `base_url` carries. Each check
+is capped at 10 seconds.
+
+What each kind probes:
+
+| Kind | Check request |
+|---|---|
+| `openai`, `groq`, `together`, `fireworks`, `deepseek`, `xai`, `deepinfra`, `mistral`, `vllm` (with a key) | `GET {base_url}/models` |
+| `openrouter` | `GET {base_url}/key` (its model list is public, so it would pass any key) |
+| `huggingface` | `GET https://huggingface.co/api/whoami-v2`, or `GET {base_url}/models` with a custom `base_url` |
+| `cloudflare` | `GET {account}/ai/models/search?per_page=1` |
+| `anthropic` | `GET {base_url}/v1/models?limit=1` |
+| `cohere` | `POST {base_url}/v1/check-api-key` (reads its `valid` flag) |
+| `google` | `GET {base_url}/v1beta/models?pageSize=1` (a 400 `API_KEY_INVALID` counts as rejected) |
+| `azure` | `GET {endpoint}/openai/models?api-version=...` |
+| `pinecone` | `GET {base_url}/indexes` |
+| `vertex_ai` | Mint a fresh OAuth token from the service account (the cache is bypassed) |
+| `bedrock` | SigV4-signed `GET /foundation-models` on the region's control plane (`bedrock.{region}.amazonaws.com`, `bedrock-fips.` for a FIPS runtime host, `.amazonaws.com.cn` in China). A VPC runtime endpoint falls back to the public control plane, so from an air-gapped VPC the check reports `reachable: false` |
+| `tei`, `ollama`, `nvidia`, `vllm` without a key | Nothing to check: `key_valid: null` |
+| `jina`, `voyage`, `mixedbread`, `typesafe`, `perplexity`, `nvidia` / `tei` with a key | No free check endpoint is known: `key_valid: null`, no request |
+
+A passing check proves the credentials **authenticate**, not that inference
+will succeed. These still only show up on a real request: an exhausted
+quota or credit balance, a model the key is not entitled to, a missing
+Bedrock model-access grant, a wrong Azure deployment name, and RPM limits.
+For Bedrock, an `AccessDeniedException` on the listing still reports
+`key_valid: true` (the credentials authenticated; the IAM policy just lacks
+`bedrock:ListFoundationModels`), with a `detail` saying so.
 
 ### Usage & spend reporting (`GET /admin/usage`)
 
