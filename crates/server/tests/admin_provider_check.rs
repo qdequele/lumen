@@ -41,6 +41,7 @@ fn registry(upstream: &str) -> Arc<Registry> {
             capabilities: vec![Capability::Chat],
             modalities: vec!["text".to_owned()],
             rerank_converter: None,
+            release_date: None,
         }],
     }];
     Arc::new(

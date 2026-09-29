@@ -35,6 +35,7 @@ fn spec(kind: ProviderKind, base_url: Option<String>, api_key: Option<&str>) -> 
             capabilities: vec![Capability::Chat],
             modalities: vec!["text".to_owned()],
             rerank_converter: None,
+            release_date: None,
         }],
     }
 }

@@ -1,14 +1,15 @@
 //! `GET /v1/models` and `GET /v1/models/{id}` - model discovery.
 //!
 //! Lists every model the operator configured, in the OpenAI list shape extended
-//! with a `capabilities` array, and serves single-model retrieval from the same
+//! with a `capabilities` array (and, when declared, a `release_date` mirrored
+//! into OpenAI's `created`), and serves single-model retrieval from the same
 //! registry snapshot. Both routes reflect ONLY the local configuration - the
 //! gateway never introspects upstreams (spec 3.3), so they touch no provider
 //! and do no I/O.
 
 use axum::extract::{Path, State};
 use axum::Json;
-use lumen_core::GatewayError;
+use lumen_core::{GatewayError, ReleaseDate};
 use lumen_providers::LoadedModelSummary;
 use serde::Serialize;
 
@@ -24,12 +25,21 @@ pub struct ModelEntry {
     pub id: String,
     /// Always `"model"` (OpenAI compatibility).
     pub object: &'static str,
+    /// Unix seconds at midnight UTC of the release date (the OpenAI `created`
+    /// field). Omitted when the operator declared no `release_date`, rather
+    /// than reporting a misleading epoch 0.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created: Option<u64>,
     /// The provider that owns this model.
     pub owned_by: String,
     /// Capabilities this model serves (`chat` / `embed` / `rerank` / `systemone`).
     pub capabilities: Vec<&'static str>,
     /// Input modalities this model accepts (`text`, `image`).
     pub modalities: Vec<String>,
+    /// Operator-declared release date, ISO 8601 `YYYY-MM-DD`. Omitted when
+    /// unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub release_date: Option<ReleaseDate>,
 }
 
 impl From<LoadedModelSummary> for ModelEntry {
@@ -37,9 +47,11 @@ impl From<LoadedModelSummary> for ModelEntry {
         ModelEntry {
             id: m.id,
             object: "model",
+            created: m.release_date.map(ReleaseDate::unix_seconds),
             owned_by: m.owned_by,
             capabilities: m.capabilities.iter().map(|c| c.as_str()).collect(),
             modalities: m.modalities,
+            release_date: m.release_date,
         }
     }
 }

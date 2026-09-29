@@ -300,6 +300,7 @@ mod tests {
             id = "gpt-4o"
             capabilities = ["chat"]
             cost_per_1m_input = 2.5
+            release_date = "2024-05-13"
 
             [[models]]
             id = "gpt-4o-mini"

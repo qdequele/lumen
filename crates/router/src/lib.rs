@@ -305,6 +305,7 @@ mod tests {
             capabilities: caps.to_vec(),
             modalities: vec!["text".to_owned()],
             rerank_converter: None,
+            release_date: None,
         }
     }
 

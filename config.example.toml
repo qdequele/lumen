@@ -305,6 +305,11 @@ health_check_interval_ms = 30000  # probe cadence (must not be 0 when enabled)
 #   modalities    input modalities; defaults to ["text"]. Add "image" to accept
 #                 image content parts on /v1/embeddings (M9). Image input to a
 #                 model without "image" is rejected with LM-2003.
+#   release_date  optional ISO date the model was released, quoted
+#                 ("2024-08-06") or as a bare TOML date (2024-08-06).
+#                 GET /v1/models returns it as `release_date` and as the
+#                 OpenAI integer `created` (midnight UTC), so clients can sort
+#                 models by release. Metadata only, never used for routing.
 # Model ids must be unique across ALL providers (a collision aborts startup and
 # names both offending providers). Several ids MAY map to the same upstream_id.
 # ---------------------------------------------------------------------------
@@ -325,6 +330,9 @@ capabilities = ["chat"]
 # An image part sent to a model without it is rejected with LM-2003 (400)
 # before any upstream call. See docs/providers.md#vision-image-input.
 # modalities = ["text", "image"]
+# When the model was released (ISO "YYYY-MM-DD", validated at boot). Surfaced
+# on GET /v1/models as `release_date` + `created` for sorting by release.
+release_date = "2024-08-06"
 # Optional prices (USD) - the source of cost counting and hard budgets.
 # A model without prices costs 0: budgets then never bite on it.
 cost_per_1m_input = 2.5
