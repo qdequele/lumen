@@ -15,6 +15,7 @@
 //!   [`RerankProvider`] and [`SystemOneProvider`] traits.
 //! * [`error`] - the [`ProviderError`] / [`GatewayError`] taxonomy.
 //! * [`capability`] - the [`Capability`] enum.
+//! * [`release`] - the [`ReleaseDate`] a model was released.
 
 #![forbid(unsafe_code)]
 
@@ -24,6 +25,7 @@ pub mod embed;
 pub mod error;
 pub mod media;
 pub mod provider;
+pub mod release;
 pub mod rerank;
 pub mod systemone;
 pub mod tokens;
@@ -43,6 +45,7 @@ pub use error::{
 };
 pub use media::{measure_media, MediaTypeUsage, MediaUsage};
 pub use provider::{ChatProvider, EmbeddingProvider, RerankProvider, SystemOneProvider};
+pub use release::{ReleaseDate, ReleaseDateError};
 pub use rerank::{
     RerankDocument, RerankRequest, RerankResponse, RerankResult, RerankResultDocument, RerankUsage,
 };

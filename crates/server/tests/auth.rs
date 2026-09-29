@@ -56,6 +56,7 @@ fn full_registry(upstream: &str) -> Arc<Registry> {
                     capabilities: vec![Capability::Chat],
                     modalities: vec!["text".to_owned()],
                     rerank_converter: None,
+                    release_date: None,
                 },
                 ModelSpec {
                     id: "embed-small".to_owned(),
@@ -63,6 +64,7 @@ fn full_registry(upstream: &str) -> Arc<Registry> {
                     capabilities: vec![Capability::Embed],
                     modalities: vec!["text".to_owned()],
                     rerank_converter: None,
+                    release_date: None,
                 },
             ],
         },
@@ -80,6 +82,7 @@ fn full_registry(upstream: &str) -> Arc<Registry> {
                 capabilities: vec![Capability::Rerank],
                 modalities: vec!["text".to_owned()],
                 rerank_converter: None,
+                release_date: None,
             }],
         },
         ProviderSpec {
@@ -97,6 +100,7 @@ fn full_registry(upstream: &str) -> Arc<Registry> {
                     capabilities: vec![Capability::SystemOne],
                     modalities: vec!["text".to_owned()],
                     rerank_converter: None,
+                    release_date: None,
                 },
                 ModelSpec {
                     id: "jev-rerank".to_owned(),
@@ -104,6 +108,7 @@ fn full_registry(upstream: &str) -> Arc<Registry> {
                     capabilities: vec![Capability::Rerank],
                     modalities: vec!["text".to_owned()],
                     rerank_converter: None,
+                    release_date: None,
                 },
             ],
         },
@@ -121,6 +126,7 @@ fn full_registry(upstream: &str) -> Arc<Registry> {
                 capabilities: vec![Capability::Embed],
                 modalities: vec!["text".to_owned()],
                 rerank_converter: None,
+                release_date: None,
             }],
         },
     ];

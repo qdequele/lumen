@@ -40,7 +40,7 @@ reference.
 | `POST /v1/embeddings`          | Embeddings, OpenAI format.                              |
 | `POST /v1/rerank`              | Reranking, Cohere format (`query`, `documents`, `top_n`).|
 | `POST /v1/systemone`           | SystemOne typed decisions (TypeSafe Jev), TypeSafe format (`state`, `questions`); TypeSafe SDKs work via `TYPESAFE_BASE_URL`. See [SystemOne](docs/systemone/systemone.md). |
-| `GET  /v1/models`              | Lists configured models with a `capabilities` array.    |
+| `GET  /v1/models`              | Lists configured models with a `capabilities` array (plus `release_date` / `created` when configured, to sort by release). |
 | `GET  /v1/models/{id}`         | Retrieves one model (same object as the list entry); unknown id is a 404 (`LM-2001`). |
 | `GET  /health`                 | Liveness. No I/O, never touches the DB or providers.    |
 | `GET  /health/providers`       | Background provider-probe results (opt-in, see below).  |
