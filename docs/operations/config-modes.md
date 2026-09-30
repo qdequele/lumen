@@ -260,8 +260,8 @@ requires a restart, since `config_source` is itself boot-layer.
    db mode, see above) - `/health` is healthy, `/v1/*` answers `LM-2001`
    until the next step.
 4. Before the `PUT`, strip every boot-layer key from the document saved in
-   step 1: `[server]`, `log_format`, `[telemetry]`, `config_source`, and the
-   boot-layer `[auth]` keys (`enabled`, `db_path`, `usage_channel_capacity`,
+   step 1: `[server]`, `log_format`, `[telemetry]`, `[usage_events]`,
+   `config_source`, and the boot-layer `[auth]` keys (`enabled`, `db_path`, `usage_channel_capacity`,
    `usage_batch_max`, `usage_flush_ms`). Keep `auth.flush_interval_ms` and
    `auth.retention_days` if the file set them. The saved document is
    the file-mode `GET`'s WHOLE file, and the db-mode boot-layer guard (see
@@ -279,8 +279,8 @@ requires a restart, since `config_source` is itself boot-layer.
    response's `config` field (`jq -r .config`, as in the file-to-DB step 1) -
    the dynamic document alone, no boot keys.
 2. Merge it with the boot-layer keys the process is currently running with
-   (`[server]`, `log_format`, `[telemetry]`, and the boot-layer `[auth]`
-   keys) into one TOML file.
+   (`[server]`, `log_format`, `[telemetry]`, `[usage_events]`, and the
+   boot-layer `[auth]` keys) into one TOML file.
 3. Set `config_source = "file"` (or remove the key - `"file"` is the
    default) in that same file.
 4. Point `--config` (or the existing config path) at the merged file and

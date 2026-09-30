@@ -191,8 +191,14 @@ impl UsageEventsConfig {
                 )
             }
         }
-        if self.signing_key_env.trim().is_empty() {
-            return Err("usage_events.signing_key_env must name an env var".to_owned());
+        if self.signing_key_env.trim().is_empty()
+            || self.signing_key_env.trim() != self.signing_key_env
+        {
+            return Err(
+                "usage_events.signing_key_env must be a non-blank env var name with no \
+                 surrounding whitespace"
+                    .to_owned(),
+            );
         }
         let source_ok = (1..=64).contains(&self.source.len())
             && self
@@ -2062,6 +2068,9 @@ mod tests {
             ("http://127.0.0.1:8091", true),
             ("http://10.0.0.5", true),
             ("http://localhost:8091", true),
+            ("http://[::1]:8091", true),
+            ("http://172.16.0.1", true),
+            ("http://192.168.1.10", true),
             ("ftp://lab.example", false),
         ] {
             let block = UE_OK.replace("https://lab.example", url);
@@ -2078,6 +2087,8 @@ mod tests {
             "batch_size = 1001",
             "timeout_ms = 50",
             "signing_key_env = \"\"",
+            "signing_key_env = \"  \"",
+            "signing_key_env = \" LUMEN_UE_SECRET \"",
         ] {
             let key = bad.split(" =").next().unwrap();
             let mut lines: Vec<&str> = UE_OK.lines().filter(|l| !l.starts_with(key)).collect();

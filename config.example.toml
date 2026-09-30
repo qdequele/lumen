@@ -16,10 +16,9 @@ log_format = "pretty"
 # ---------------------------------------------------------------------------
 # Where the DYNAMIC half of this config lives (ADR 012) - everything below
 # except the restart-only boot layer: [server], log_format, [telemetry],
-# [usage_events], and
-# [auth] enabled/db_path/usage_channel_capacity/usage_batch_max/
-# usage_flush_ms. Restart-only: like
-# every other boot-layer key, changing this needs a restart, never a reload.
+# [usage_events], and [auth] enabled/db_path/usage_channel_capacity/
+# usage_batch_max/usage_flush_ms. Restart-only: like every other boot-layer
+# key, changing this needs a restart, never a reload.
 #
 #   "file" (default) - this file IS the dynamic document. PUT /admin/config
 #                       and the granular /admin/config/* routes stage a new
