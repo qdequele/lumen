@@ -583,22 +583,30 @@ pub struct RerankCriteriaConfig {
 }
 
 impl RerankConverterConfig {
-    /// The converter, with defaults for every unset field.
+    /// The template (a `noul` strategy, no context), with defaults for every
+    /// unset field.
     #[must_use]
-    pub fn to_converter(&self) -> lumen_providers::typesafe::rerank::RerankConverter {
-        let mut converter = lumen_providers::typesafe::rerank::RerankConverter::default();
-        if let Some(instructions) = &self.instructions {
-            instructions.clone_into(&mut converter.instructions);
+    pub fn to_template(&self) -> lumen_providers::typesafe::rerank::RerankTemplate {
+        use lumen_providers::typesafe::rerank::{
+            RerankStrategy, RerankTemplate, DEFAULT_CRITERIA_FALSE, DEFAULT_CRITERIA_TRUE,
+            DEFAULT_INSTRUCTIONS,
+        };
+        let criteria = self.criteria.as_ref();
+        RerankTemplate {
+            context: None,
+            strategy: RerankStrategy::Noul {
+                instructions: self
+                    .instructions
+                    .clone()
+                    .unwrap_or_else(|| DEFAULT_INSTRUCTIONS.to_owned()),
+                criteria_true: criteria
+                    .and_then(|c| c.yes.clone())
+                    .unwrap_or_else(|| DEFAULT_CRITERIA_TRUE.to_owned()),
+                criteria_false: criteria
+                    .and_then(|c| c.no.clone())
+                    .unwrap_or_else(|| DEFAULT_CRITERIA_FALSE.to_owned()),
+            },
         }
-        if let Some(criteria) = &self.criteria {
-            if let Some(yes) = &criteria.yes {
-                yes.clone_into(&mut converter.criteria_true);
-            }
-            if let Some(no) = &criteria.no {
-                no.clone_into(&mut converter.criteria_false);
-            }
-        }
-        converter
     }
 }
 
@@ -1515,10 +1523,10 @@ impl Config {
                         upstream_id: m.resolved_upstream_id().to_owned(),
                         capabilities: m.capabilities.clone(),
                         modalities: m.modalities.clone(),
-                        rerank_converter: m
+                        rerank_template: m
                             .rerank
                             .as_ref()
-                            .map(RerankConverterConfig::to_converter),
+                            .map(|c| std::sync::Arc::new(c.to_template())),
                         release_date: m.release_date,
                     })
                     .collect(),
@@ -2026,12 +2034,25 @@ mod tests {
         .expect("valid");
         let specs = config.provider_specs();
         let models = &specs[0].models;
-        assert_eq!(models[0].rerank_converter, None);
-        let custom = models[1].rerank_converter.clone().expect("converter");
-        assert_eq!(custom.criteria_false, "Unrelated.");
+        assert_eq!(models[0].rerank_template, None);
+        let custom = models[1].rerank_template.clone().expect("template");
+        assert_eq!(custom.context, None);
+        let lumen_providers::typesafe::rerank::RerankStrategy::Noul {
+            instructions,
+            criteria_true,
+            criteria_false,
+        } = &custom.strategy
+        else {
+            panic!("legacy rerank blocks map to a noul template");
+        };
+        assert_eq!(criteria_false, "Unrelated.");
         assert_eq!(
-            custom.instructions,
+            instructions,
             lumen_providers::typesafe::rerank::DEFAULT_INSTRUCTIONS
+        );
+        assert_eq!(
+            criteria_true,
+            lumen_providers::typesafe::rerank::DEFAULT_CRITERIA_TRUE
         );
     }
 

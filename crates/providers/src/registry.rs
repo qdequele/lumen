@@ -33,7 +33,7 @@ use crate::openai::OpenAiProvider;
 use crate::pinecone::PineconeProvider;
 use crate::tei::TeiProvider;
 use crate::together::TogetherRerankProvider;
-use crate::typesafe::rerank::{RerankConverter, TypesafeRerankProvider};
+use crate::typesafe::rerank::{RerankTemplate, TypesafeRerankProvider};
 use crate::typesafe::TypesafeProvider;
 use crate::voyage::VoyageProvider;
 
@@ -48,10 +48,10 @@ pub struct ModelSpec {
     pub capabilities: Vec<Capability>,
     /// Declared input modalities (e.g. `["text","image"]`).
     pub modalities: Vec<String>,
-    /// How `/v1/rerank` is converted to SystemOne questions, for a `typesafe`
-    /// model declaring `rerank`; `None` uses the default converter. Ignored
-    /// by every other kind.
-    pub rerank_converter: Option<RerankConverter>,
+    /// Legacy per-model Jev rerank template (removed in Task 15 of the
+    /// virtual-models plan); `None` uses the default. Ignored by every other
+    /// kind.
+    pub rerank_template: Option<Arc<RerankTemplate>>,
     /// Operator-declared release date, surfaced on `GET /v1/models` so
     /// clients can sort by release. Metadata only: never used for routing.
     pub release_date: Option<ReleaseDate>,
@@ -551,7 +551,7 @@ fn build_inner(
 }
 
 /// The rerank provider serving `model`: TypeSafe converts rerank to
-/// SystemOne through a per-model converter (ADR 013 amendment); every other
+/// SystemOne through a per-model template (ADR 013 amendment, ADR 014); every other
 /// kind shares its one rerank instance.
 fn rerank_provider(
     spec: &ProviderSpec,
@@ -563,7 +563,7 @@ fn rerank_provider(
             Arc::new(TypesafeRerankProvider::new(
                 inner.clone(),
                 spec.name.clone(),
-                model.rerank_converter.clone().unwrap_or_default(),
+                model.rerank_template.clone().unwrap_or_default(),
             )) as Arc<dyn RerankProvider>
         })
     } else {
@@ -1151,7 +1151,7 @@ mod tests {
             upstream_id: id.to_owned(),
             capabilities: caps.to_vec(),
             modalities: vec!["text".to_owned()],
-            rerank_converter: None,
+            rerank_template: None,
             release_date: None,
         }
     }
@@ -1486,7 +1486,7 @@ mod tests {
                     upstream_id: "text-embedding-3-small".to_owned(),
                     capabilities: vec![Capability::Embed],
                     modalities: vec!["text".to_owned()],
-                    rerank_converter: None,
+                    rerank_template: None,
                     release_date: None,
                 }],
             )],
