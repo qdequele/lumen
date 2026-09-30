@@ -39,7 +39,8 @@
 //! high-risk and out of scope), `auth.enabled`, `auth.db_path`, the bounded
 //! usage-log channel knobs (`usage_channel_capacity`, `usage_batch_max`,
 //! `usage_flush_ms`) whose capacity is structurally fixed at channel creation,
-//! and `[telemetry]` (its metadata label allowlist becomes the Prometheus
+//! `[usage_events]` (ADR 015: the outbox sender is wired at startup), and
+//! `[telemetry]` (its metadata label allowlist becomes the Prometheus
 //! label set, fixed when the metrics are registered). All of these are
 //! boot-layer (ADR 012), so the admin API refuses to change them.
 //!

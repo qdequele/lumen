@@ -71,7 +71,8 @@ The **boot layer** is read once at startup and needs a restart:
 `[server]` (bind address, body limit, stream timeouts), `log_format`,
 `[telemetry]` (its label allowlist becomes the Prometheus label set),
 `auth.enabled`, `auth.db_path`, the usage-log channel knobs
-(`usage_channel_capacity`, `usage_batch_max`, `usage_flush_ms`), and
+(`usage_channel_capacity`, `usage_batch_max`, `usage_flush_ms`),
+`[usage_events]` (billing usage events, ADR 015), and
 `config_source`. Details in
 [Deployment](../operations/deployment.md#hot-reload).
 

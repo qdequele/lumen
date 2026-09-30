@@ -25,7 +25,8 @@ use std::path::Path;
 ///
 /// Every field belongs to exactly one of two layers (ADR 012): the
 /// restart-only **boot layer** (`[server]`, log format, `[telemetry]`,
-/// `auth.enabled` / `auth.db_path`, the three usage-log channel knobs, and
+/// `auth.enabled` / `auth.db_path`, the three usage-log channel knobs,
+/// `[usage_events]` (ADR 015: the outbox sender is wired at startup) and
 /// `config_source` itself - see [`BootView`]) or the hot-reloadable
 /// **dynamic layer** (everything else). The classification is
 /// exhaustive and pinned by a test (`every_config_field_is_classified_boot_or_dynamic`
@@ -82,6 +83,10 @@ pub struct Config {
     /// anything but the configured providers. Dynamic layer.
     #[serde(default)]
     pub webhooks: Option<WebhooksConfig>,
+    /// Billing usage events for a control plane (ADR 015). Absent by default.
+    /// Boot layer: the outbox sender is wired at startup.
+    #[serde(default)]
+    pub usage_events: Option<UsageEventsConfig>,
     /// Where the dynamic config document lives (ADR 012): the file this
     /// process booted from (`"file"`, the default) or a database-backed
     /// source with a granular admin API (`"db"`, which requires
@@ -124,6 +129,90 @@ pub enum ConfigSourceKind {
 /// and **win** over this block, so a runtime change is not undone by the next
 /// reload (ADR 011 amendment §2). Every field is editable at runtime.
 pub use lumen_auth::events::WebhookSettings as WebhooksConfig;
+
+/// Billing usage events pushed to a control plane (ADR 015). Absent by
+/// default: with no `[usage_events]` block the gateway writes no outbox row
+/// and makes no call to anything but its providers. Boot layer.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct UsageEventsConfig {
+    /// Control-plane base URL; events go to `{url}/internal/events`. `https`,
+    /// or `http` to a loopback or private address only.
+    pub url: String,
+    /// Env var holding the HMAC signing secret (never the secret itself).
+    pub signing_key_env: String,
+    /// Gateway name copied into every event (`[A-Za-z0-9._-]`, 1 to 64 chars).
+    pub source: String,
+    /// Events per delivery request, 1 to 1000.
+    #[serde(default = "default_usage_events_batch_size")]
+    pub batch_size: usize,
+    /// Per-request timeout, 100 to 60000 ms.
+    #[serde(default = "default_usage_events_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+const fn default_usage_events_batch_size() -> usize {
+    500
+}
+
+const fn default_usage_events_timeout_ms() -> u64 {
+    5_000
+}
+
+impl UsageEventsConfig {
+    /// The delivery endpoint.
+    #[must_use]
+    pub fn events_url(&self) -> String {
+        format!("{}/internal/events", self.url.trim_end_matches('/'))
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        let url = reqwest::Url::parse(&self.url)
+            .map_err(|e| format!("usage_events.url is not a valid URL: {e}"))?;
+        let private_host = match url.host_str() {
+            Some("localhost") => true,
+            Some(h) => h
+                .trim_matches(|c| c == '[' || c == ']')
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| match ip {
+                    std::net::IpAddr::V4(v4) => v4.is_loopback() || v4.is_private(),
+                    std::net::IpAddr::V6(v6) => v6.is_loopback(),
+                }),
+            None => false,
+        };
+        match url.scheme() {
+            "https" => {}
+            "http" if private_host => {}
+            _ => {
+                return Err(
+                    "usage_events.url must be https (plain http only to a loopback or \
+                            private address)"
+                        .to_owned(),
+                )
+            }
+        }
+        if self.signing_key_env.trim().is_empty() {
+            return Err("usage_events.signing_key_env must name an env var".to_owned());
+        }
+        let source_ok = (1..=64).contains(&self.source.len())
+            && self
+                .source
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+        if !source_ok {
+            return Err(
+                "usage_events.source must be 1 to 64 characters of [A-Za-z0-9._-]".to_owned(),
+            );
+        }
+        if !(1..=1000).contains(&self.batch_size) {
+            return Err("usage_events.batch_size must be between 1 and 1000".to_owned());
+        }
+        if !(100..=60_000).contains(&self.timeout_ms) {
+            return Err("usage_events.timeout_ms must be between 100 and 60000".to_owned());
+        }
+        Ok(())
+    }
+}
 
 /// Opt-in accurate tokenizer (ADR 003). The estimation fallback (used only when
 /// an upstream reports no usage) defaults to the cheap byte heuristic; set
@@ -911,7 +1000,7 @@ fn describe_figment_error(error: &figment::Error) -> String {
 ///
 /// `Config` denies unknown fields, so a `LUMEN_`-prefixed variable that does
 /// not name a config key makes every load fail - `--check-config` and real
-/// boots alike - with an "unknown field" parse error. Two such variables
+/// boots alike - with an "unknown field" parse error. Three such variables
 /// exist:
 ///
 /// * `LUMEN_MASTER_KEY`, read by `boot_auth_stack`, whose name is fixed.
@@ -921,6 +1010,8 @@ fn describe_figment_error(error: &figment::Error) -> String {
 ///   at the TOML file alone: a permissive parse of that single key, with no
 ///   env overlay and no validation, so a malformed file still produces the
 ///   real error from the full load rather than one from this peek.
+/// * The usage-events signing secret (ADR 015), named by
+///   `usage_events.signing_key_env` and discovered by the same peek.
 ///
 /// Only the exact variable named in config is excluded, so a typo elsewhere in
 /// the `LUMEN_*` namespace is still caught. A name containing `__` is not
@@ -961,17 +1052,22 @@ fn secret_env_keys_from_figment(peek_figment: &Figment) -> Vec<String> {
     /// Just enough of the config to find the signing variable's name.
     #[derive(Deserialize)]
     struct Peek {
-        webhooks: Option<PeekWebhooks>,
+        webhooks: Option<PeekSigning>,
+        usage_events: Option<PeekSigning>,
     }
     #[derive(Deserialize)]
-    struct PeekWebhooks {
+    struct PeekSigning {
         signing_key_env: Option<String>,
     }
 
     let mut keys = vec!["master_key".to_owned()];
     if let Ok(peek) = peek_figment.extract::<Peek>() {
-        if let Some(var) = peek.webhooks.and_then(|w| w.signing_key_env) {
-            if let Some(suffix) = var.strip_prefix("LUMEN_") {
+        for block in [peek.webhooks, peek.usage_events].into_iter().flatten() {
+            if let Some(suffix) = block
+                .signing_key_env
+                .as_deref()
+                .and_then(|var| var.strip_prefix("LUMEN_"))
+            {
                 keys.push(suffix.to_lowercase());
             }
         }
@@ -1008,6 +1104,8 @@ pub struct BootView {
     pub usage_batch_max: usize,
     /// [`AuthConfig::usage_flush_ms`].
     pub usage_flush_ms: u64,
+    /// [`Config::usage_events`].
+    pub usage_events: Option<UsageEventsConfig>,
     /// [`Config::config_source`].
     pub config_source: ConfigSourceKind,
 }
@@ -1035,6 +1133,7 @@ pub fn boot_view(toml_text: &str, label: &str) -> Result<BootView, ConfigError> 
         usage_channel_capacity: config.auth.usage_channel_capacity,
         usage_batch_max: config.auth.usage_batch_max,
         usage_flush_ms: config.auth.usage_flush_ms,
+        usage_events: config.usage_events,
         config_source: config.config_source,
     })
 }
@@ -1070,6 +1169,9 @@ pub fn boot_layer_diff(current: &str, candidate: &str) -> Result<Vec<String>, Co
     if before.usage_flush_ms != after.usage_flush_ms {
         diffs.push("auth.usage_flush_ms".to_owned());
     }
+    if before.usage_events != after.usage_events {
+        diffs.push("usage_events".to_owned());
+    }
     if before.config_source != after.config_source {
         diffs.push("config_source".to_owned());
     }
@@ -1098,7 +1200,13 @@ fn table_field_diffs<T: Serialize + PartialEq>(table: &str, before: &T, after: &
 }
 
 /// Top-level keys that are boot-layer in their entirety (ADR 012 §1).
-const BOOT_TOP_LEVEL_KEYS: [&str; 4] = ["server", "log_format", "telemetry", "config_source"];
+const BOOT_TOP_LEVEL_KEYS: [&str; 5] = [
+    "server",
+    "log_format",
+    "telemetry",
+    "config_source",
+    "usage_events",
+];
 
 /// The boot-layer keys inside `[auth]`, the one table split across both
 /// layers; its other keys (`flush_interval_ms`, `retention_days`) are
@@ -1166,7 +1274,8 @@ fn classify_keys(toml_text: &str, label: &str) -> Result<Vec<(String, Layer)>, C
 /// `config_source = "db"` mode the boot file may hold ONLY `server`,
 /// `log_format`, `telemetry`, `auth.enabled`, `auth.db_path`, the usage-log
 /// channel knobs (`auth.usage_channel_capacity`, `auth.usage_batch_max`,
-/// `auth.usage_flush_ms`) and `config_source` itself -
+/// `auth.usage_flush_ms`), `usage_events` (ADR 015) and `config_source`
+/// itself -
 /// a dynamic key there would be a second, silently-diverging source for a
 /// value the DB is supposed to own exclusively, which is exactly the
 /// drift-prone pattern ADR 012 refuses.
@@ -1295,6 +1404,8 @@ impl Config {
     }
 
     /// Semantic validation, beyond what the type system and serde enforce.
+    // One flat list of independent checks, one block per config section.
+    #[allow(clippy::too_many_lines)]
     fn validate(&self, path_label: &str) -> Result<(), ConfigError> {
         let err = |message: String| ConfigError::Validation {
             path: path_label.to_owned(),
@@ -1346,6 +1457,16 @@ impl Config {
             webhooks
                 .validate(SettingsOrigin::ConfigFile)
                 .map_err(&err)?;
+        }
+
+        if let Some(usage_events) = &self.usage_events {
+            if !self.auth.enabled {
+                return Err(err(
+                    "[usage_events] requires auth.enabled = true: usage events bill virtual keys"
+                        .to_owned(),
+                ));
+            }
+            usage_events.validate().map_err(&err)?;
         }
 
         self.telemetry.validate(path_label)?;
@@ -1891,6 +2012,107 @@ mod tests {
         // the variable NAME and nothing more.
         let serialized = serde_json::to_string(&cfg).expect("config serializes");
         assert!(serialized.contains("LUMEN_WEBHOOK_SECRET"), "{serialized}");
+    }
+
+    // ---- Billing usage events (ADR 015) ------------------------------------
+
+    fn with_usage_events(block: &str) -> Result<Config, ConfigError> {
+        load_str(&format!("{AUTH_ON}\n[usage_events]\n{block}"))
+    }
+
+    const UE_OK: &str =
+        "url = \"https://lab.example\"\nsigning_key_env = \"LUMEN_UE_SECRET\"\nsource = \"eu-1\"\n";
+
+    #[test]
+    fn usage_events_parse_with_defaults() {
+        let cfg = with_usage_events(UE_OK).unwrap();
+        let ue = cfg.usage_events.unwrap();
+        assert_eq!(ue.batch_size, 500);
+        assert_eq!(ue.timeout_ms, 5_000);
+        assert_eq!(ue.events_url(), "https://lab.example/internal/events");
+    }
+
+    #[test]
+    fn no_usage_events_block_means_no_usage_events() {
+        assert!(load_str(VALID).unwrap().usage_events.is_none());
+        assert!(load_str("").unwrap().usage_events.is_none());
+    }
+
+    #[test]
+    fn usage_events_url_trailing_slash_is_not_doubled() {
+        let block = UE_OK.replace("https://lab.example", "https://lab.example/");
+        let ue = with_usage_events(&block).unwrap().usage_events.unwrap();
+        assert_eq!(ue.events_url(), "https://lab.example/internal/events");
+    }
+
+    #[test]
+    fn usage_events_require_auth() {
+        let err = load_str(&format!("[usage_events]\n{UE_OK}")).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("[usage_events] requires auth.enabled = true"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn usage_events_reject_plain_http_to_a_public_host() {
+        for (url, ok) in [
+            ("http://lab.example", false),
+            ("http://127.0.0.1:8091", true),
+            ("http://10.0.0.5", true),
+            ("http://localhost:8091", true),
+            ("ftp://lab.example", false),
+        ] {
+            let block = UE_OK.replace("https://lab.example", url);
+            assert_eq!(with_usage_events(&block).is_ok(), ok, "{url}");
+        }
+    }
+
+    #[test]
+    fn usage_events_bound_their_knobs() {
+        for bad in [
+            "source = \"\"",
+            "source = \"has space\"",
+            "batch_size = 0",
+            "batch_size = 1001",
+            "timeout_ms = 50",
+            "signing_key_env = \"\"",
+        ] {
+            let key = bad.split(" =").next().unwrap();
+            let mut lines: Vec<&str> = UE_OK.lines().filter(|l| !l.starts_with(key)).collect();
+            lines.push(bad);
+            let block = lines.join("\n");
+            assert!(with_usage_events(&block).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn usage_events_are_boot_layer() {
+        let doc = format!("[usage_events]\n{UE_OK}");
+        assert!(ensure_boot_only(&doc, "boot").is_ok());
+        assert!(ensure_dynamic_only(&doc, "dynamic").is_err());
+        let changed = doc.replace("eu-1", "eu-2");
+        assert_eq!(boot_layer_diff(&doc, &changed).unwrap(), ["usage_events"]);
+    }
+
+    #[test]
+    fn a_lumen_prefixed_usage_events_signing_var_is_excluded_from_the_overlay() {
+        // Same contract as the webhook secret: the operator-chosen variable
+        // is a process secret, not a config field, so it must be kept out of
+        // figment's LUMEN_ overlay or `deny_unknown_fields` fails every load.
+        #[allow(clippy::result_large_err)]
+        figment::Jail::expect_with(|jail| {
+            jail.create_file(
+                "config.toml",
+                &format!("{AUTH_ON}\n[usage_events]\n{UE_OK}"),
+            )?;
+            assert_eq!(
+                secret_env_keys(Path::new("config.toml")),
+                ["master_key", "ue_secret"]
+            );
+            Ok(())
+        });
     }
 
     #[test]
@@ -2810,6 +3032,7 @@ mod tests {
                 "server",
                 "telemetry",
                 "tokenizer",
+                "usage_events",
                 "webhooks",
             ]
         );

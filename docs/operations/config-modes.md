@@ -43,8 +43,8 @@ the admin API without a restart.
 | `[telemetry]` (the label allowlist becomes the Prometheus label set, fixed at startup) | `[resilience]` |
 | `auth.enabled`, `auth.db_path` | `[tokenizer]` |
 | `auth.usage_channel_capacity`, `auth.usage_batch_max`, `auth.usage_flush_ms` (the usage-log channel is sized at startup) | `[image_fetch]` |
-| `config_source` itself | `[webhooks]` |
-|  | `auth.flush_interval_ms`, `auth.retention_days` |
+| `[usage_events]` (billing usage events, ADR 015; the outbox sender is wired at startup) | `[webhooks]` |
+| `config_source` itself | `auth.flush_interval_ms`, `auth.retention_days` |
 
 Every dynamic-layer setting takes effect on the next hot reload, which an
 admin write triggers itself - so everything the admin API accepts is live
@@ -53,8 +53,8 @@ as soon as the call returns.
 In **file mode** this split is invisible day to day: the one file holds both
 layers, exactly as before ADR 012. In **db mode** the boot file may hold
 *only* the left-hand column's keys: `[server]`, `log_format`,
-`[telemetry]`, the boot-layer `[auth]` keys, and the top-level
-`config_source` key itself. Any dynamic-layer key in that file - a
+`[telemetry]`, the boot-layer `[auth]` keys, `[usage_events]`, and the
+top-level `config_source` key itself. Any dynamic-layer key in that file - a
 `[[providers]]` block, a `[resilience]` table, `auth.flush_interval_ms` or
 `auth.retention_days` - is a
 **boot error** naming the offending key, never a silently-ignored second
@@ -64,8 +64,8 @@ file, or set `config_source = "file"`.
 The same split is enforced in the other direction on every admin write, and
 just as strictly: in db mode, `PUT /admin/config` and every granular write
 refuse a candidate that carries **any** boot-layer key at all -
-`server.*`, `log_format`, `telemetry.*`, `config_source`, or a boot-layer
-`[auth]` key -
+`server.*`, `log_format`, `telemetry.*`, `usage_events`, `config_source`,
+or a boot-layer `[auth]` key -
 independent of what value it names, even one identical to the field's own
 built-in default. A dynamic document may never carry a boot-layer key; the
 only way to change one is to edit the boot file and restart. See
@@ -149,7 +149,7 @@ curl -s -X PUT http://localhost:8080/admin/config \
   directly) is `412` `LM-1004`. Re-`GET` and re-apply.
 - **A candidate that changes a boot-layer key** (`server.*`, `log_format`,
   `telemetry.*`, `auth.enabled`, `auth.db_path`, the usage-log channel
-  knobs, `config_source` itself) is `400`
+  knobs, `usage_events`, `config_source` itself) is `400`
   `LM-1001`, naming the changed key(s): `"restart-only keys changed:
   server.port; edit the boot config file and restart"`. In file mode an
   *unchanged* boot-layer block still passes, since the candidate there is

@@ -64,7 +64,8 @@
 //!   hash from `GET /admin/config`; a missing header is a 400 (`LM-1001`), a
 //!   stale hash a 412 (`LM-1004`). The candidate's boot-layer fields
 //!   (`server.*`, `log_format`, `telemetry.*`, `auth.enabled`,
-//!   `auth.db_path`, the usage-log channel knobs, `config_source`) are
+//!   `auth.db_path`, the usage-log channel knobs, `usage_events`,
+//!   `config_source`) are
 //!   compared against the current document's first
 //!   ([`boot_layer_diff`](crate::config::boot_layer_diff)): any difference is
 //!   a 400 (`LM-1001`) naming the changed keys, since a boot-layer value only
@@ -1353,7 +1354,7 @@ fn require_if_match(headers: &axum::http::HeaderMap) -> Result<String, ApiError>
 ///    ([`boot_layer_diff`]): any difference is `LM-1001` (400) naming the
 ///    changed keys. A boot-layer value (`server.*`, `log_format`,
 ///    `telemetry.*`, `auth.enabled`, `auth.db_path`, the usage-log channel
-///    knobs, `config_source`) only takes effect on a restart, and this route
+///    knobs, `usage_events`, `config_source`) only takes effect on a restart, and this route
 ///    applies everything it accepts immediately (the hot reload swaps every
 ///    dynamic-layer section).
 ///    File mode: the candidate is the whole document, so an UNCHANGED

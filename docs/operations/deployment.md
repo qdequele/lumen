@@ -174,7 +174,8 @@ The **boot layer** stays boot-time only and needs a real restart:
 `[telemetry]` (its label allowlist becomes the Prometheus label set,
 fixed when the metrics are registered), `auth.enabled`, `auth.db_path`,
 the bounded usage-log channel knobs (`usage_channel_capacity`,
-`usage_batch_max`, `usage_flush_ms`), and `config_source` - rebinding a
+`usage_batch_max`, `usage_flush_ms`), `usage_events` (the billing
+outbox sender is wired at startup) and `config_source` - rebinding a
 live listener, re-registering metrics or resizing a running channel is out
 of scope for a live swap. The admin config API refuses a change to any of
 them (`400` `LM-1001`) rather than accepting a value that would not apply;
