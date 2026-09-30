@@ -862,6 +862,10 @@ impl AuthState {
     /// Collect `(key id, spent USD)` for every key whose spend changed since
     /// the last call, marking them clean. Any spend that lands between the
     /// clean-marking and the read re-dirties the entry, so nothing is lost.
+    ///
+    /// This is NOT a flush path: it bypasses the billing watermark and the
+    /// flush guard. Flushes use [`drain_flush`](Self::drain_flush) under
+    /// [`flush_guard`](Self::flush_guard).
     #[must_use]
     pub fn drain_dirty(&self) -> Vec<(String, f64)> {
         let mut out = Vec::new();
@@ -955,10 +959,16 @@ impl AuthState {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .retain(|entry| {
-                    !committed_retired.contains(&Arc::as_ptr(entry))
+                    if !committed_retired.contains(&Arc::as_ptr(entry))
                         || Arc::strong_count(entry) > 1
-                        || entry.settled_micro.load(Ordering::SeqCst)
-                            != entry.billed_micro.load(Ordering::SeqCst)
+                    {
+                        return true;
+                    }
+                    // Pair with the release of the last outside holder's
+                    // `Arc` (as `Arc::drop` does) before reading its settled cost.
+                    std::sync::atomic::fence(Ordering::Acquire);
+                    entry.settled_micro.load(Ordering::SeqCst)
+                        != entry.billed_micro.load(Ordering::SeqCst)
                 });
         }
     }

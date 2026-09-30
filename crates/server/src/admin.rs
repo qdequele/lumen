@@ -305,7 +305,10 @@ pub async fn delete_key(
         // Flush and bill the final accrued spend now: once the entry is
         // dropped the periodic flusher never sees this id again (ADR 015
         // routes this through the same flush as every other path).
-        crate::budget_flush::retire_and_flush_key(auth, entry, lumen_auth::now_unix_ms()).await;
+        if let Some(shared) = &state.auth {
+            crate::budget_flush::retire_and_flush_key(shared, entry, lumen_auth::now_unix_ms())
+                .await;
+        }
     }
     deleted.ok_or_else(|| GatewayError::InvalidRequest(format!("unknown key id '{id}'")))?;
     Ok(StatusCode::NO_CONTENT)

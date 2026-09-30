@@ -122,11 +122,78 @@ async fn deleting_a_key_bills_its_last_delta() {
 async fn concurrent_flushes_bill_a_delta_once() {
     let (rt, plain, _) = runtime(true, true).await;
     spend(&rt, &plain, 250_000);
-    tokio::join!(flush_budgets(&rt, 5_000), flush_budgets(&rt, 5_001));
+    // A retired key is drained by every flush whether or not it is dirty, so
+    // two unserialized flushes would both bill its delta.
+    let key_id = rt.store.list_keys(false).await.unwrap()[0].id.clone();
+    let evicted = rt.keys.remove(&key_id).unwrap();
+    rt.keys.retire(evicted);
+    let (a, b) = (Arc::clone(&rt), Arc::clone(&rt));
+    let first = tokio::spawn(async move { flush_budgets(&a, 5_000).await });
+    let second = tokio::spawn(async move { flush_budgets(&b, 5_001).await });
+    first.await.unwrap();
+    second.await.unwrap();
     let due = rt.store.outbox_due(i64::MAX, 10).await.unwrap();
     assert_eq!(due.len(), 1, "two overlapping flushes bill one delta");
     let body: serde_json::Value = serde_json::from_str(&due[0].body).unwrap();
     assert_eq!(body["data"]["cost_micro_usd"], 250_000);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dropped_delete_flush_loses_nothing() {
+    let (rt, plain_a, group_id) = runtime(true, true).await;
+    let (plain_b, record_b) = rt
+        .store
+        .create_key(NewKey {
+            name: "b".to_owned(),
+            group_id: Some(group_id),
+            external_ref: Some("lab-key-b".to_owned()),
+            ..NewKey::default()
+        })
+        .await
+        .unwrap();
+    rt.keys.upsert(hash_key(plain_b.reveal()), &record_b);
+    spend(&rt, &plain_a, 250_000);
+    spend(&rt, plain_b.reveal(), 100_000);
+    let key_a = rt.keys.authenticate(&plain_a, 1).unwrap().id().to_owned();
+    let evicted = rt.keys.remove(&key_a).unwrap();
+
+    // Another flusher holds the guard, so the delete's flush parks.
+    let guard = rt.keys.flush_guard().await;
+    let rt2 = Arc::clone(&rt);
+    let delete = tokio::spawn(async move { retire_and_flush_key(&rt2, evicted, 5_000).await });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    // The client goes away: the handler future is dropped mid-flush.
+    delete.abort();
+    let _ = delete.await;
+    drop(guard);
+
+    // The detached flush still runs to completion on its own: both deltas are
+    // billed without any other flusher being needed.
+    let mut due = Vec::new();
+    for _ in 0..100 {
+        due = rt.store.outbox_due(i64::MAX, 10).await.unwrap();
+        if due.len() == 2 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    // A later flush bills nothing again.
+    flush_budgets(&rt, 6_000).await;
+    let again = rt.store.outbox_due(i64::MAX, 10).await.unwrap();
+    assert_eq!(again.len(), due.len(), "nothing is billed twice");
+    let mut costs: Vec<i64> = due
+        .iter()
+        .map(|row| {
+            let body: serde_json::Value = serde_json::from_str(&row.body).unwrap();
+            body["data"]["cost_micro_usd"].as_i64().unwrap()
+        })
+        .collect();
+    costs.sort_unstable();
+    assert_eq!(
+        costs,
+        vec![100_000, 250_000],
+        "each delta billed exactly once"
+    );
 }
 
 #[tokio::test]

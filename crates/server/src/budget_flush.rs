@@ -26,9 +26,19 @@ pub async fn flush_budgets(runtime: &AuthRuntime, now_ms: i64) {
 /// Hand a key just evicted from the live table (admin delete) to the flusher
 /// and flush now, so its last spend is persisted and billed. A failed flush
 /// leaves it retired, and every later flush retries it.
-pub async fn retire_and_flush_key(runtime: &AuthRuntime, entry: Arc<KeyEntry>, now_ms: i64) {
+///
+/// The retire is synchronous; the flush runs in a detached task that this
+/// function awaits. Dropping the caller's future (client disconnect, request
+/// timeout, shutdown deadline) therefore cannot cancel a flush between
+/// `drain_flush` and its commit or rollback, which would lose dirty flags and
+/// units or double-bill a delta.
+pub async fn retire_and_flush_key(runtime: &Arc<AuthRuntime>, entry: Arc<KeyEntry>, now_ms: i64) {
     runtime.keys.retire(entry);
-    flush_budgets(runtime, now_ms).await;
+    let detached = Arc::clone(runtime);
+    let handle = tokio::spawn(async move { flush_budgets(&detached, now_ms).await });
+    if let Err(error) = handle.await {
+        tracing::warn!(%error, "budget flush task failed after a key delete");
+    }
 }
 
 /// Persist one drained batch, then commit it on success or roll it back on
