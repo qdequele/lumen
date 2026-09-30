@@ -456,6 +456,38 @@ pub struct UsageRow {
     pub ts: i64,
 }
 
+/// One key's row in a budget flush (ADR 015): the absolute spend and the
+/// billing watermark to persist together.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FlushRow {
+    /// The key id.
+    pub key_id: String,
+    /// Absolute spend in USD (the `budget_spent` column).
+    pub spent_usd: f64,
+    /// The billing watermark after this flush, micro-USD.
+    pub billed_micro: i64,
+}
+
+/// One usage event to enqueue in the flush transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutboxInsert {
+    /// Event id (UUIDv7).
+    pub id: String,
+    /// Serialized event JSON.
+    pub body: String,
+    /// Creation time, unix ms (also the first attempt time).
+    pub created_ms: i64,
+}
+
+/// One due outbox row, as the sender reads it.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct OutboxRow {
+    /// Event id.
+    pub id: String,
+    /// Serialized event JSON, sent verbatim.
+    pub body: String,
+}
+
 /// Every `virtual_keys` column a [`VirtualKeyRecord`] reads, in one place so
 /// a new column cannot be forgotten in one of the SELECTs.
 macro_rules! key_columns {
@@ -782,6 +814,122 @@ impl KeyStore {
         }
         tx.commit().await?;
         Ok(())
+    }
+
+    /// Persist a budget flush (ADR 015): every key's absolute spend and
+    /// billing watermark, plus the usage events that bill the moved
+    /// watermarks, in ONE transaction. The spend and its bill are committed
+    /// together or not at all.
+    pub async fn persist_flush(
+        &self,
+        rows: &[FlushRow],
+        events: &[OutboxInsert],
+    ) -> Result<(), AuthError> {
+        let mut tx = self.pool.begin().await?;
+        for row in rows {
+            sqlx::query("UPDATE virtual_keys SET budget_spent = ?, billed_micro = ? WHERE id = ?")
+                .bind(row.spent_usd)
+                .bind(row.billed_micro)
+                .bind(&row.key_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        for event in events {
+            sqlx::query(
+                "INSERT INTO usage_outbox (id, body, created_ms, next_attempt_ms) VALUES (?, ?, ?, ?)",
+            )
+            .bind(&event.id)
+            .bind(&event.body)
+            .bind(event.created_ms)
+            .bind(event.created_ms)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Up to `limit` pending events whose next attempt is due, oldest first.
+    pub async fn outbox_due(&self, now_ms: i64, limit: i64) -> Result<Vec<OutboxRow>, AuthError> {
+        let rows = sqlx::query_as::<_, OutboxRow>(
+            "SELECT id, body FROM usage_outbox \
+             WHERE delivered_ms IS NULL AND next_attempt_ms <= ? \
+             ORDER BY created_ms, id LIMIT ?",
+        )
+        .bind(now_ms)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Mark events acknowledged by the control plane. Returns rows changed.
+    pub async fn outbox_mark_delivered(
+        &self,
+        ids: &[String],
+        now_ms: i64,
+    ) -> Result<u64, AuthError> {
+        let mut tx = self.pool.begin().await?;
+        let mut changed = 0;
+        for id in ids {
+            changed += sqlx::query(
+                "UPDATE usage_outbox SET delivered_ms = ? WHERE id = ? AND delivered_ms IS NULL",
+            )
+            .bind(now_ms)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        }
+        tx.commit().await?;
+        Ok(changed)
+    }
+
+    /// Push failed events back: `attempts += 1` and the next attempt at
+    /// `now + min(2^attempts s, 300 s) + jitter_ms`.
+    pub async fn outbox_reschedule(
+        &self,
+        ids: &[String],
+        now_ms: i64,
+        jitter_ms: i64,
+    ) -> Result<(), AuthError> {
+        let mut tx = self.pool.begin().await?;
+        for id in ids {
+            sqlx::query(
+                "UPDATE usage_outbox SET attempts = attempts + 1, \
+                   next_attempt_ms = ? + MIN(300000, 1000 * (1 << MIN(attempts + 1, 9))) + ? \
+                 WHERE id = ? AND delivered_ms IS NULL",
+            )
+            .bind(now_ms)
+            .bind(jitter_ms)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Pending event count and the oldest pending `created_ms`.
+    pub async fn outbox_stats(&self) -> Result<(i64, Option<i64>), AuthError> {
+        let row = sqlx::query(
+            "SELECT COUNT(*) AS n, MIN(created_ms) AS oldest FROM usage_outbox WHERE delivered_ms IS NULL",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok((row.try_get("n")?, row.try_get("oldest")?))
+    }
+
+    /// Delete delivered events acknowledged before `older_than_ms`.
+    pub async fn outbox_purge_delivered(&self, older_than_ms: i64) -> Result<u64, AuthError> {
+        let purged = sqlx::query(
+            "DELETE FROM usage_outbox WHERE delivered_ms IS NOT NULL AND delivered_ms < ?",
+        )
+        .bind(older_than_ms)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(purged)
     }
 
     // ---- Budget groups (ADR 009) --------------------------------------------
