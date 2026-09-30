@@ -1741,6 +1741,169 @@ pub async fn delete_provider(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// One entry of `GET /admin/config/virtual_models`.
+#[derive(Debug, Serialize)]
+pub struct VirtualModelSummary {
+    /// The public id.
+    pub id: String,
+    /// Its capability.
+    pub capability: &'static str,
+    /// Its strategy.
+    pub strategy: &'static str,
+}
+
+/// `GET /admin/config/virtual_models` response.
+#[derive(Debug, Serialize)]
+pub struct VirtualModelsList {
+    /// Every virtual model in the current document, in document order.
+    pub virtual_models: Vec<VirtualModelSummary>,
+    /// See [`ProvidersList::hash`].
+    pub hash: String,
+}
+
+/// List every virtual model (ADR 014).
+pub async fn list_virtual_models(
+    State(state): State<AppState>,
+) -> Result<Json<VirtualModelsList>, ApiError> {
+    let ctx = config_ctx(&state)?;
+    let doc = ctx
+        .source
+        .load()
+        .await
+        .map_err(|e| source_internal_error(&e))?;
+    let cfg = config_from_document(&doc.toml)?;
+    Ok(Json(VirtualModelsList {
+        virtual_models: cfg
+            .virtual_models
+            .iter()
+            .map(|v| VirtualModelSummary {
+                id: v.id.clone(),
+                capability: v.capability.as_str(),
+                strategy: v.strategy.as_str(),
+            })
+            .collect(),
+        hash: doc.hash,
+    }))
+}
+
+/// `GET /admin/config/virtual_models/{id}` response.
+#[derive(Debug, Serialize)]
+pub struct VirtualModelDocument {
+    /// The virtual model's own fields, flattened.
+    #[serde(flatten)]
+    pub virtual_model: lumen_router::virtual_models::VirtualModelConfig,
+    /// See [`ProvidersList::hash`].
+    pub hash: String,
+}
+
+/// Fetch one virtual model. `{id}` is percent-decoded (`acme%2Fchat`).
+///
+/// # Errors
+/// `LM-1003` when absent.
+pub async fn get_virtual_model(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<VirtualModelDocument>, ApiError> {
+    let ctx = config_ctx(&state)?;
+    let doc = ctx
+        .source
+        .load()
+        .await
+        .map_err(|e| source_internal_error(&e))?;
+    let cfg = config_from_document(&doc.toml)?;
+    let virtual_model = cfg
+        .virtual_models
+        .into_iter()
+        .find(|v| v.id == id)
+        .ok_or(GatewayError::RouteNotFound)?;
+    Ok(Json(VirtualModelDocument {
+        virtual_model,
+        hash: doc.hash,
+    }))
+}
+
+/// Insert or replace one virtual model. The path id must equal the body id.
+/// Requires `If-Match`; validated by the shared pipeline (`LM-1001` naming
+/// the virtual model on any rule of ADR 014).
+pub async fn put_virtual_model(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
+    payload: Result<Json<lumen_router::virtual_models::VirtualModelConfig>, JsonRejection>,
+) -> Result<StatusCode, ApiError> {
+    let if_match = require_if_match(&headers)?;
+    let Json(vm) = payload.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
+    if vm.id != id {
+        return Err(GatewayError::InvalidRequest(format!(
+            "path virtual model id '{id}' does not match the request body's 'id' field '{}'",
+            vm.id
+        ))
+        .into());
+    }
+    apply_document(&state, &if_match, move |current| {
+        config_edit::upsert_virtual_model(current, &vm).map_err(|e| edit_internal_error(&e))
+    })
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Remove one virtual model.
+///
+/// # Errors
+/// `LM-1003` when absent; `LM-1001` when another virtual model still
+/// references it (the message names the dependent).
+pub async fn delete_virtual_model(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
+) -> Result<StatusCode, ApiError> {
+    let if_match = require_if_match(&headers)?;
+    apply_document(&state, &if_match, move |current| {
+        config_edit::delete_virtual_model(current, &id)
+            .map_err(|e| edit_internal_error(&e))?
+            .ok_or_else(|| GatewayError::RouteNotFound.into())
+    })
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `GET /admin/config/virtual_models/{id}/plan` response.
+#[derive(Debug, Serialize)]
+pub struct VirtualModelPlan {
+    /// The fully resolved tree (references expanded to foundation leaves).
+    pub plan: serde_json::Value,
+    /// See [`ProvidersList::hash`].
+    pub hash: String,
+}
+
+/// The resolved routing tree of one virtual model, compiled from the
+/// current document (not the running snapshot), so it shows what a save
+/// just stored. The body may carry preset and remap text, so it stays
+/// behind the master-key admin layer and is never logged.
+///
+/// # Errors
+/// `LM-1003` when absent.
+pub async fn get_virtual_model_plan(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<VirtualModelPlan>, ApiError> {
+    let ctx = config_ctx(&state)?;
+    let doc = ctx
+        .source
+        .load()
+        .await
+        .map_err(|e| source_internal_error(&e))?;
+    let cfg = config_from_document(&doc.toml)?;
+    let (table, _) = cfg
+        .routing_table()
+        .map_err(|e| GatewayError::Internal(e.to_string()))?;
+    let plan = table.plan(&id).ok_or(GatewayError::RouteNotFound)?;
+    Ok(Json(VirtualModelPlan {
+        plan,
+        hash: doc.hash,
+    }))
+}
+
 /// Extract the JSON value of one scalar config section from a parsed
 /// [`Config`]. `None` for a name outside the fixed set `GET|PUT
 /// /admin/config/{section}` serves (`resilience`, `tokenizer`,

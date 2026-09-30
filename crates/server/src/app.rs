@@ -148,6 +148,20 @@ pub fn build_app(state: AppState) -> Router {
                     .delete(admin::delete_provider),
             )
             .route(
+                "/admin/config/virtual_models",
+                get(admin::list_virtual_models),
+            )
+            .route(
+                "/admin/config/virtual_models/{id}",
+                get(admin::get_virtual_model)
+                    .put(admin::put_virtual_model)
+                    .delete(admin::delete_virtual_model),
+            )
+            .route(
+                "/admin/config/virtual_models/{id}/plan",
+                get(admin::get_virtual_model_plan),
+            )
+            .route(
                 "/admin/config/{section}",
                 get(admin::get_config_section).put(admin::put_config_section),
             )

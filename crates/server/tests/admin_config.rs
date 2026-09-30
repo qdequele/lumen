@@ -1362,3 +1362,103 @@ async fn get_config_reports_key_sources_in_db_mode() {
         serde_json::json!({ "db-provider": "missing" })
     );
 }
+
+#[tokio::test]
+async fn put_then_get_virtual_model_with_slash_in_id() {
+    let h = spawn_admin(registry()).await;
+    let hash = h.current_hash().await;
+    let body = serde_json::json!({
+        "id": "acme/chat", "capability": "chat", "strategy": "single",
+        "targets": [{ "model": "gpt-4o" }]
+    });
+    let put = h
+        .put_json("/admin/config/virtual_models/acme%2Fchat", &body, &hash)
+        .await;
+    assert_eq!(put.status(), 204, "{}", put.text().await.unwrap());
+
+    let got: Value = h
+        .get("/admin/config/virtual_models/acme%2Fchat")
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(got["id"], "acme/chat");
+    assert!(got["hash"].is_string());
+
+    let plan: Value = h
+        .get("/admin/config/virtual_models/acme%2Fchat/plan")
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(plan["plan"]["targets"][0]["virtual"], false);
+    assert_eq!(plan["plan"]["targets"][0]["model"], "gpt-4o");
+
+    let list: Value = h
+        .get("/admin/config/virtual_models")
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(list["virtual_models"][0]["id"], "acme/chat");
+    assert_eq!(list["virtual_models"][0]["strategy"], "single");
+
+    // The granular edit is format preserving.
+    let doc: Value = h.get("/admin/config").await.json().await.unwrap();
+    assert!(doc["config"].as_str().unwrap().contains("# fleet config"));
+}
+
+#[tokio::test]
+async fn invalid_virtual_models_and_dangling_deletes_are_lm_1001() {
+    let h = spawn_admin(registry()).await;
+    let hash = h.current_hash().await;
+    let bad = serde_json::json!({ "id": "v", "capability": "chat", "strategy": "single", "targets": [{ "model": "ghost" }] });
+    let resp = h
+        .put_json("/admin/config/virtual_models/v", &bad, &hash)
+        .await;
+    assert_eq!(resp.status(), 400);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "LM-1001");
+    assert!(
+        body["error"]["message"].as_str().unwrap().contains("ghost"),
+        "{body}"
+    );
+
+    let good = serde_json::json!({ "id": "v", "capability": "chat", "strategy": "single", "targets": [{ "model": "gpt-4o" }] });
+    assert_eq!(
+        h.put_json("/admin/config/virtual_models/v", &good, &hash)
+            .await
+            .status(),
+        204
+    );
+
+    // Deleting the provider that owns `gpt-4o` would orphan `v`.
+    let hash = h.current_hash().await;
+    let resp = h
+        .delete("/admin/config/providers/test-provider", &hash)
+        .await;
+    assert_eq!(resp.status(), 400);
+    let body: Value = resp.json().await.unwrap();
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("virtual model 'v'"),
+        "{body}"
+    );
+
+    let mismatch = h
+        .put_json("/admin/config/virtual_models/other", &good, &hash)
+        .await;
+    assert_eq!(mismatch.status(), 400);
+    assert_eq!(
+        h.get("/admin/config/virtual_models/nope").await.status(),
+        404
+    );
+    assert_eq!(
+        h.delete("/admin/config/virtual_models/nope", &hash)
+            .await
+            .status(),
+        404
+    );
+}
