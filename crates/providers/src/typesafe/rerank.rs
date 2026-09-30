@@ -248,8 +248,24 @@ struct ChoiceQuestion<'a> {
     #[serde(rename = "type")]
     kind: &'static str,
     instructions: &'a str,
-    /// Option id (`d<index>`) to document text, in document order.
-    criteria: serde_json::Map<String, serde_json::Value>,
+    criteria: OrderedOptions<'a>,
+}
+
+/// Option id (`d<index>`) to document text, serialised as a JSON object in
+/// document order. A `serde_json::Map` would sort the keys lexicographically
+/// (`d10` before `d2`) since `preserve_order` is off, scrambling the listwise
+/// prompt.
+struct OrderedOptions<'a>(Vec<(String, &'a str)>);
+
+impl Serialize for OrderedOptions<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(self.0.len()))?;
+        for (id, text) in &self.0 {
+            map.serialize_entry(id, text)?;
+        }
+        map.end()
+    }
 }
 
 #[derive(Serialize)]
@@ -519,13 +535,13 @@ impl TypesafeRerankProvider {
         if req.documents.is_empty() {
             return Ok(UsageSum::default().into_response(Vec::new()));
         }
-        let mut options = serde_json::Map::with_capacity(req.documents.len());
-        for (i, doc) in req.documents.iter().enumerate() {
-            options.insert(
-                format!("d{i}"),
-                serde_json::Value::String(truncate_doc(doc.text()).to_owned()),
-            );
-        }
+        let options = OrderedOptions(
+            req.documents
+                .iter()
+                .enumerate()
+                .map(|(i, doc)| (format!("d{i}"), truncate_doc(doc.text())))
+                .collect(),
+        );
         let question = raw(&ChoiceQuestion {
             kind: "choice",
             instructions,
@@ -846,6 +862,34 @@ mod tests {
             "{}",
             seen[0]
         );
+    }
+
+    #[tokio::test]
+    async fn choice_options_are_serialised_in_document_order() {
+        let t = RerankTemplate {
+            context: None,
+            strategy: RerankStrategy::Choice {
+                instructions: "best?".into(),
+            },
+        };
+        let (p, fake) = provider(
+            t,
+            |_| serde_json::json!({ "type": "choice", "choice": "d0", "probabilities": {} }),
+        );
+        let docs: Vec<String> = (0..12).map(|i| format!("doc{i}")).collect();
+        let refs: Vec<&str> = docs.iter().map(String::as_str).collect();
+        p.rerank(request(&refs), CancellationToken::new())
+            .await
+            .unwrap();
+        let seen = fake.seen.lock().unwrap()[0].clone();
+        let mut last = 0;
+        for i in 0..12 {
+            let at = seen
+                .find(&format!(r#""d{i}":"doc{i}""#))
+                .unwrap_or_else(|| panic!("d{i} missing in {seen}"));
+            assert!(at >= last, "d{i} out of order in {seen}");
+            last = at;
+        }
     }
 
     #[tokio::test]
