@@ -94,6 +94,14 @@ impl std::fmt::Debug for VirtualModel {
 }
 
 impl VirtualModel {
+    /// The chat preset of this virtual model, when it declares one. It depends
+    /// only on the requested id, so a caller can read it before routing (its
+    /// prompt counts toward the `input_tokens` fact).
+    #[must_use]
+    pub fn preset(&self) -> Option<&Arc<Preset>> {
+        self.preset.as_ref()
+    }
+
     /// The public id.
     #[must_use]
     pub fn id(&self) -> &str {

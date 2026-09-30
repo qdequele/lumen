@@ -375,3 +375,46 @@ async fn streaming_fails_over_before_the_first_byte_and_carries_the_route() {
     let text = resp.text().await.unwrap();
     assert!(text.contains("[DONE]"));
 }
+
+#[tokio::test]
+async fn preset_prompt_counts_toward_input_tokens_when_routing() {
+    let (a, b) = (
+        upstream(200, "model-a").await,
+        upstream(200, "model-b").await,
+    );
+    // ~6000 chars of preset prompt (well under the 32 KiB cap): the tiny user
+    // message alone is far below the threshold, message + preset is above it.
+    let prompt = "lorem ipsum dolor sit amet ".repeat(220);
+    let vm = format!(
+        r#"
+        [[virtual_models]]
+        id = "acme/long"
+        capability = "chat"
+        strategy = "switch"
+        preset = {{ system_prompt = "{prompt}" }}
+        targets = [
+          {{ when = {{ input_tokens = {{ gt = 1000 }} }}, model = "model-b" }},
+          {{ model = "model-a" }},
+        ]
+    "#
+    );
+    let cfg = load(&two_providers(&a.uri(), &b.uri(), &vm));
+    let base = spawn(&cfg, &cfg).await;
+    let resp = post(
+        &base,
+        json!({ "model": "acme/long", "messages": [{ "role": "user", "content": "hi" }] }),
+        &[],
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(header(&resp, "x-lumen-model-used"), Some("model-b"));
+    let sent: Value =
+        serde_json::from_slice(&b.received_requests().await.unwrap()[0].body).unwrap();
+    let systems = sent["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["role"] == "system")
+        .count();
+    assert_eq!(systems, 1, "the preset prompt is applied exactly once");
+}
