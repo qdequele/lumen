@@ -36,6 +36,7 @@ const ALL: [Trigger; 6] = [
     Trigger::ContentFilter,
 ];
 
+/// The single-bit mask of `t` in a [`Triggers`] set.
 const fn bit(t: Trigger) -> u8 {
     1 << (t as u8)
 }

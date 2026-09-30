@@ -242,6 +242,9 @@ struct Compiler<'a> {
 }
 
 impl Compiler<'_> {
+    /// Compile virtual model `id` and, recursively, its virtual targets (memoised in
+    /// `done`); an unknown id, a cycle, a bad shape or a breached nesting or attempt limit
+    /// is an error.
     fn compile(&mut self, id: &str) -> Result<Arc<VirtualModel>, RoutingConfigError> {
         if let Some(done) = self.done.get(id) {
             return Ok(done.clone());
@@ -341,6 +344,9 @@ impl Compiler<'_> {
         Ok(model)
     }
 
+    /// Compile one target of `parent`: a virtual child (compiled recursively, same
+    /// capability required) or a foundation model (must serve the capability, or systemone
+    /// with a remap on a rerank model). Returns it with its input modalities.
     fn target(
         &mut self,
         parent: &VirtualModelConfig,
@@ -446,6 +452,7 @@ fn attempt_count(strategy: StrategyKind, targets: &[Target]) -> usize {
     }
 }
 
+/// Check an id is non-empty and uses only `A-Z a-z 0-9 . _ : / -`.
 fn validate_id(id: &str) -> Result<(), String> {
     let ok = !id.is_empty()
         && id
@@ -458,6 +465,9 @@ fn validate_id(id: &str) -> Result<(), String> {
     }
 }
 
+/// Check a config's shape apart from its targets' contents: target count per strategy,
+/// `weight` only under `split`, `when` on every `switch` target but the last,
+/// `fallback_on`, `preset` (chat only) and `description`.
 fn validate_shape(c: &VirtualModelConfig) -> Result<(), String> {
     let n = c.targets.len();
     let strategy = c.strategy.as_str();
@@ -514,6 +524,7 @@ fn validate_shape(c: &VirtualModelConfig) -> Result<(), String> {
     Ok(())
 }
 
+/// Whether `s` is present but empty or whitespace-only (an absent value is not blank).
 fn is_blank(s: Option<&str>) -> bool {
     s.is_some_and(|t| t.trim().is_empty())
 }
@@ -531,6 +542,8 @@ fn resolve_criteria(c: Option<&CriteriaConfig>) -> Result<(String, String), Stri
     ))
 }
 
+/// Compile a rerank remap into a template: blank fields, fields foreign to its
+/// strategy and out-of-range `levels` or `questions` are errors, defaults fill the rest.
 fn compile_remap(r: &RemapConfig) -> Result<RerankTemplate, String> {
     if is_blank(r.context.as_deref()) || is_blank(r.instructions.as_deref()) {
         return Err("remap fields must not be blank".to_owned());
@@ -628,6 +641,8 @@ fn compile_remap(r: &RemapConfig) -> Result<RerankTemplate, String> {
     })
 }
 
+/// One warning per virtual model whose preset is ignored because another virtual
+/// model reaches it as a target (presets apply only to the requested id).
 fn preset_warnings(order: &[Arc<VirtualModel>]) -> Vec<String> {
     let mut warnings = Vec::new();
     for parent in order {
@@ -647,6 +662,9 @@ fn preset_warnings(order: &[Arc<VirtualModel>]) -> Vec<String> {
     warnings
 }
 
+/// The resolved tree of `model` as JSON: its config with each target marked `virtual`
+/// (and carrying its nested `plan`), plus the effective `fallback_on` for `fallback`
+/// and `split`.
 fn plan_of(model: &VirtualModel) -> Value {
     let mut head = serde_json::to_value(&model.config).unwrap_or(Value::Null);
     let targets: Vec<Value> = model

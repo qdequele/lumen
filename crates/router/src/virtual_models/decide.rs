@@ -217,6 +217,9 @@ impl VirtualModel {
     }
 }
 
+/// Flatten `vm` into its ordered attempts for this request (`single`: the one target,
+/// `switch`: the first matching one, `fallback` and `split`: a chain), extending
+/// `prefix` into each attempt's path and passing `overrides` down.
 fn flatten_model(
     vm: &VirtualModel,
     facts: &dyn FactSource,
@@ -287,6 +290,8 @@ fn split_order(targets: &[Target], r: u64) -> Vec<&Target> {
     order
 }
 
+/// Concatenate the attempts of `targets` in order; every attempt of a target but the
+/// last gets an escape on `on` to the first attempt of the next target.
 fn chain(
     targets: Vec<&Target>,
     on: Triggers,
@@ -314,6 +319,8 @@ fn chain(
     out
 }
 
+/// Flatten one target: a foundation model becomes a single attempt carrying the
+/// accumulated overrides and its remap, a virtual child is flattened recursively.
 fn flatten_target(
     target: &Target,
     facts: &dyn FactSource,

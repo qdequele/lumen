@@ -96,6 +96,8 @@ enum Kind {
 }
 
 impl Attr {
+    /// Parse a `when` key into an attribute (a known name or `metadata.<key>`); anything
+    /// else is an error listing the valid keys.
     fn parse(key: &str) -> Result<Self, String> {
         Ok(match key {
             "group" => Self::Group,
@@ -116,6 +118,7 @@ impl Attr {
         })
     }
 
+    /// The value type this attribute takes, which constrains its operators and operands.
     const fn kind(&self) -> Kind {
         match self {
             Self::Group => Kind::Str,
@@ -125,6 +128,8 @@ impl Attr {
         }
     }
 
+    /// Whether the attribute is meaningful for `capability` (`documents` only for rerank,
+    /// `has_tools` and `stream` only for chat).
     fn applies_to(&self, capability: Capability) -> bool {
         match self {
             Self::Group | Self::Metadata(_) => true,
@@ -190,6 +195,9 @@ impl Condition {
     }
 }
 
+/// Compile a condition value into an [`Op`]: a bare value is equality, a one-entry
+/// table picks `in`, `ne`, a numeric comparison or `regex`. A wrong type or operand
+/// is an error naming `key`.
 fn compile_op(kind: Kind, key: &str, value: &Value) -> Result<Op, String> {
     let Value::Object(table) = value else {
         return Ok(Op::Eq(scalar(kind, key, value)?));
@@ -244,6 +252,8 @@ fn compile_op(kind: Kind, key: &str, value: &Value) -> Result<Op, String> {
     }
 }
 
+/// Convert a JSON value to a [`Scalar`], rejecting a type the attribute `kind` does
+/// not accept.
 fn scalar(kind: Kind, key: &str, value: &Value) -> Result<Scalar, String> {
     let s = match value {
         Value::String(s) => Scalar::Str(s.clone()),
@@ -275,6 +285,8 @@ enum Fact<'a> {
     Missing,
 }
 
+/// Read the fact `attr` names from `facts`; `Fact::Missing` when it is absent or not a
+/// scalar.
 #[allow(clippy::cast_precision_loss)] // token and document counts far below 2^52
 fn fact<'a>(attr: &Attr, facts: &'a dyn FactSource) -> Fact<'a> {
     match attr {
@@ -296,6 +308,8 @@ fn fact<'a>(attr: &Attr, facts: &'a dyn FactSource) -> Fact<'a> {
 }
 
 impl Op {
+    /// Whether `fact` satisfies the operator; a missing fact never does (not even `ne`),
+    /// and a numeric comparison on a non-numeric fact is false.
     fn test(&self, fact: &Fact<'_>) -> bool {
         if matches!(fact, Fact::Missing) {
             return false;
@@ -317,6 +331,8 @@ impl Op {
     }
 }
 
+/// Same-type equality of a fact and a scalar (numbers within `f64::EPSILON`); mixed
+/// types are never equal.
 fn equals(fact: &Fact<'_>, scalar: &Scalar) -> bool {
     match (fact, scalar) {
         (Fact::Str(a), Scalar::Str(b)) => *a == b,

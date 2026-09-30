@@ -27,6 +27,8 @@ pub struct Facts<'a> {
 }
 
 impl<'a> Facts<'a> {
+    /// Facts with the key's group, the headers and the lazy token estimate; the
+    /// per-capability constructors fill in the rest.
     fn new(
         headers: &'a HeaderMap,
         key: Option<&AuthedKey>,

@@ -46,6 +46,8 @@ const CHAT_FIELDS: &[(&str, Ty)] = &[
 const EMBED_FIELDS: &[(&str, Ty)] = &[("dimensions", Ty::UInt), ("encoding_format", Ty::Str)];
 const RERANK_FIELDS: &[(&str, Ty)] = &[("top_n", Ty::UInt)];
 
+/// The overridable request fields (name and type) for `capability`; none for
+/// systemone.
 const fn fields(capability: Capability) -> &'static [(&'static str, Ty)] {
     match capability {
         Capability::Chat => CHAT_FIELDS,
@@ -111,6 +113,7 @@ impl Overrides {
     }
 }
 
+/// Check that `value` has the type `ty` allows, or fail naming the override `key`.
 fn check(ty: Ty, key: &str, value: &Value) -> Result<(), String> {
     let ok = match ty {
         Ty::Num => value.is_number(),

@@ -611,6 +611,8 @@ struct UsageSum {
 }
 
 impl UsageSum {
+    /// Fold in one call's upstream input tokens; a call without usage (or with zero tokens)
+    /// makes the total incomplete.
     fn add(&mut self, response: &lumen_core::SystemOneResponse) {
         match response.usage {
             Some(u) if u.input_tokens > 0 => self.total = self.total.saturating_add(u.input_tokens),
@@ -618,6 +620,8 @@ impl UsageSum {
         }
     }
 
+    /// Build the `RerankResponse`; `total_tokens` is 0 (the gateway estimates) when any
+    /// call lacked usage.
     fn into_response(self, results: Vec<RerankResult>) -> RerankResponse {
         RerankResponse {
             results,
@@ -632,6 +636,8 @@ impl UsageSum {
     }
 }
 
+/// Decode the response's `answers` object into raw values by id (empty when absent);
+/// a malformed payload is a `Translation` error.
 fn parse_answers(
     response: &lumen_core::SystemOneResponse,
 ) -> Result<HashMap<String, Box<RawValue>>, ProviderError> {
@@ -643,6 +649,8 @@ fn parse_answers(
         .map(Option::unwrap_or_default)
 }
 
+/// Deserialize the answer stored under `id`; a missing or mistyped answer is a
+/// `Translation` error.
 fn answer<T: serde::de::DeserializeOwned>(
     answers: &HashMap<String, Box<RawValue>>,
     id: &str,

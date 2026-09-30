@@ -33,10 +33,13 @@ pub struct VirtualModelConfig {
     pub listed: bool,
 }
 
+/// Serde default for `listed`: a virtual model is listed unless the config says
+/// otherwise.
 const fn default_listed() -> bool {
     true
 }
 
+/// Serde `skip_serializing_if` predicate: omit `listed` when it is the default `true`.
 #[allow(clippy::trivially_copy_pass_by_ref)] // serde's skip_serializing_if signature
 const fn is_listed(listed: &bool) -> bool {
     *listed

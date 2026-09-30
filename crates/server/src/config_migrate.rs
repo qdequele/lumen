@@ -61,10 +61,13 @@ struct Plan {
     notes: Vec<String>,
 }
 
+/// Whether the model is a legacy reranker: a `rerank` model on a Typesafe provider.
 fn is_legacy_rerank(provider: &ProviderConfig, model: &ModelConfig) -> bool {
     provider.kind == ProviderKind::Typesafe && model.capabilities.contains(&Capability::Rerank)
 }
 
+/// The remap that reproduces the model's legacy rerank converter (instructions and
+/// criteria; every other field defaulted).
 fn remap_of(model: &ModelConfig) -> RemapConfig {
     let converter = model.rerank.clone().unwrap_or_default();
     RemapConfig {
@@ -77,6 +80,7 @@ fn remap_of(model: &ModelConfig) -> RemapConfig {
     }
 }
 
+/// A target naming `model`, with no weight, condition, overrides or remap.
 fn plain_target(model: String) -> TargetConfig {
     TargetConfig {
         model,
@@ -107,6 +111,8 @@ fn prices_lost(removed: &ModelConfig, target: &ModelConfig) -> bool {
         || differs(removed.cost_per_1k_searches, target.cost_per_1k_searches)
 }
 
+/// Note asking the operator to review the prices of `target_id`, which now serves the
+/// removed reranker `removed`.
 fn price_note(removed: &ModelConfig, target_id: &str) -> String {
     format!(
         "the prices of the removed reranker '{}' differ from those of '{target_id}', which now serves it: \
@@ -208,6 +214,9 @@ fn plan_foundations(
     Ok(remap_targets)
 }
 
+/// Compute the whole migration [`Plan`] without touching the text: the foundation
+/// changes (pass 1), then one virtual model per legacy model plus notes for dropped
+/// capabilities (pass 2). A needed id that already exists is an error.
 fn plan(cfg: &Config) -> Result<Plan, MigrateError> {
     let mut plan = Plan::default();
     let mut ids: HashSet<String> = cfg
@@ -448,9 +457,11 @@ pub fn hint_for(cfg: &Config, model_id: &str) -> Option<String> {
 /// Replace every string of `remap` with [`REMAP_PLACEHOLDER`], keeping its
 /// shape (which fields are set, how many levels and questions).
 fn redact_remap(remap: &mut RemapConfig) {
+    /// Overwrite `s` with [`REMAP_PLACEHOLDER`].
     fn redact(s: &mut String) {
         REMAP_PLACEHOLDER.clone_into(s);
     }
+    /// Redact the `yes` and `no` criteria of `c`, where set.
     fn redact_criteria(c: &mut CriteriaConfig) {
         c.yes.iter_mut().chain(c.no.iter_mut()).for_each(redact);
     }

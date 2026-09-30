@@ -1913,6 +1913,7 @@ pub async fn put_virtual_model(
 fn reject_json_nulls(
     vm: &lumen_router::virtual_models::VirtualModelConfig,
 ) -> Result<(), GatewayError> {
+    /// Path of the first JSON `null` in `value`, searching arrays and objects.
     fn walk(value: &serde_json::Value, path: &mut String) -> Result<(), String> {
         match value {
             serde_json::Value::Null => Err(path.clone()),
@@ -1929,6 +1930,7 @@ fn reject_json_nulls(
             _ => Ok(()),
         }
     }
+    /// Run `walk` over each entry of `map`, extending `path` with `.key`.
     fn walk_map(
         map: &serde_json::Map<String, serde_json::Value>,
         path: &mut String,
@@ -1942,6 +1944,7 @@ fn reject_json_nulls(
             Ok(())
         })
     }
+    /// Look for a null in the `set` and `default` maps of `o`, under `prefix`.
     fn walk_overrides(
         o: &lumen_router::virtual_models::config::OverridesConfig,
         prefix: &str,
@@ -1949,6 +1952,8 @@ fn reject_json_nulls(
         walk_map(&o.set, &mut format!("{prefix}.overrides.set"))?;
         walk_map(&o.default, &mut format!("{prefix}.overrides.default"))
     }
+    /// Path of the first null in the preset overrides, the target `when` tables or the
+    /// target overrides of `vm`.
     fn first_null(vm: &lumen_router::virtual_models::VirtualModelConfig) -> Result<(), String> {
         if let Some(o) = vm.preset.as_ref().and_then(|p| p.overrides.as_ref()) {
             walk_overrides(o, "preset")?;

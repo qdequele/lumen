@@ -219,6 +219,8 @@ pub fn delete_virtual_model(doc: &str, id: &str) -> Result<Option<String>, EditE
     }
 }
 
+/// The document's `[[virtual_models]]` array of tables, created when missing;
+/// [`EditError::VirtualModelsNotArray`] if the key holds something else.
 fn virtual_models_array_mut(document: &mut DocumentMut) -> Result<&mut ArrayOfTables, EditError> {
     let item = document
         .as_table_mut()
@@ -229,6 +231,8 @@ fn virtual_models_array_mut(document: &mut DocumentMut) -> Result<&mut ArrayOfTa
         .ok_or(EditError::VirtualModelsNotArray)
 }
 
+/// The string value of `key` in table `index` of `array`, or `None` when the index,
+/// the key or the string type is missing.
 fn table_str<'a>(array: &'a ArrayOfTables, index: usize, key: &str) -> Option<&'a str> {
     array.get(index)?.get(key)?.as_str()
 }

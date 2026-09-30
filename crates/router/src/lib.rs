@@ -103,6 +103,7 @@ pub struct SystemOneChainLink {
     pub model_id: String,
 }
 
+/// Warn that a configured fallback no longer resolves for `capability` and is skipped.
 pub(crate) fn warn_skipped_fallback(model_id: &str, capability: &str) {
     tracing::warn!(
         model = %model_id,
