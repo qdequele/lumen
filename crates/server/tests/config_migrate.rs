@@ -623,7 +623,51 @@ mod cli {
         assert!(std::fs::read_to_string(&real)
             .unwrap()
             .contains("[[virtual_models]]"));
-        let mode = std::fs::metadata(&real).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600);
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&real), 0o600);
+        // The backup holds the same secrets, so it gets the same mode.
+        assert_eq!(mode(&dir.path().join("config.toml.bak")), 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_planted_staging_symlink_is_refused_not_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, LEGACY).unwrap();
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, "precious").unwrap();
+        std::os::unix::fs::symlink(&victim, dir.path().join("config.toml.migrating")).unwrap();
+
+        let out = migrate(&path, &[]);
+        assert!(!out.status.success());
+        assert!(String::from_utf8_lossy(&out.stderr).contains("remove it and retry"));
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "precious");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), LEGACY);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_planted_backup_symlink_is_replaced_not_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, LEGACY).unwrap();
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, "precious").unwrap();
+        let backup = dir.path().join("config.toml.bak");
+        std::os::unix::fs::symlink(&victim, &backup).unwrap();
+
+        let out = migrate(&path, &[]);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "precious");
+        assert!(!std::fs::symlink_metadata(&backup)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), LEGACY);
     }
 }

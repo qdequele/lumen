@@ -1250,6 +1250,51 @@ fn report_migration_notes(notes: &[String]) {
     }
 }
 
+/// Create `path` exclusively (an existing file or symlink there is refused,
+/// never followed; a planted link cannot redirect a privileged run's write).
+/// The file is born owner-only, then takes `meta`'s permission bits and, on
+/// Unix when this process may set them, its owner and group, all before any
+/// content is written. Returns the open handle.
+fn create_exclusive(path: &Path, meta: &std::fs::Metadata) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let file = options.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // Best effort: only a privileged process may give a file away.
+        let _ = std::os::unix::fs::fchown(&file, Some(meta.uid()), Some(meta.gid()));
+    }
+    if let Err(e) = file.set_permissions(meta.permissions()) {
+        let _ = std::fs::remove_file(path);
+        return Err(e);
+    }
+    Ok(file)
+}
+
+/// Write `text` through `file` and flush it to disk.
+fn write_synced(mut file: std::fs::File, text: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+    file.write_all(text.as_bytes())?;
+    file.sync_all()
+}
+
+/// Write the pre-migration text to `backup`, replacing an earlier backup,
+/// with the config file's permissions (`meta`). Whatever sits at that path is
+/// unlinked first (a symlink is removed, never followed), then the file is
+/// created exclusively, so a link planted in between is refused.
+fn write_backup(text: &str, backup: &Path, meta: &std::fs::Metadata) -> anyhow::Result<()> {
+    match std::fs::remove_file(backup) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).context("failed to remove the previous backup"),
+    }
+    write_synced(create_exclusive(backup, meta)?, text)?;
+    Ok(())
+}
+
 /// Replace the file at `path` with `text` atomically (staging file + rename)
 /// while keeping what the operator set on it: a symlink stays a symlink (its
 /// target is rewritten), and the target's permission bits carry over. On Unix
@@ -1266,14 +1311,15 @@ fn replace_file_in_place(path: &Path, text: &str) -> anyhow::Result<()> {
         .unwrap_or_default();
     staging_name.push(".migrating");
     let staging = target.with_file_name(staging_name);
-    std::fs::write(&staging, text).context("failed to write the migrated config")?;
-    std::fs::set_permissions(&staging, meta.permissions())
-        .context("failed to copy the config file's permissions")?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        // Best effort: only a privileged process may give a file away.
-        let _ = std::os::unix::fs::chown(&staging, Some(meta.uid()), Some(meta.gid()));
+    let file = create_exclusive(&staging, &meta).with_context(|| {
+        format!(
+            "failed to create '{}' (if it is left over from an interrupted run, remove it and retry)",
+            staging.display()
+        )
+    })?;
+    if let Err(err) = write_synced(file, text) {
+        let _ = std::fs::remove_file(&staging);
+        return Err(err).context("failed to write the migrated config");
     }
     std::fs::rename(&staging, &target).context("failed to replace the config file")?;
     Ok(())
@@ -1305,7 +1351,9 @@ fn run_config_migrate_inner(path: &Path, dry_run: bool) -> anyhow::Result<()> {
                 return Ok(());
             }
             let backup = path.with_extension("toml.bak");
-            std::fs::copy(path, &backup)
+            let meta = std::fs::metadata(path)
+                .with_context(|| format!("failed to read the metadata of '{label}'"))?;
+            write_backup(&boot_text, &backup, &meta)
                 .with_context(|| format!("failed to back up to '{}'", backup.display()))?;
             replace_file_in_place(path, &migration.text)?;
             println!("migrated '{label}' (backup: '{}')", backup.display());

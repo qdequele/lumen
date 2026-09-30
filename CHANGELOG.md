@@ -63,10 +63,10 @@ All notable changes to LUMEN are documented here. The format is based on
 - Reading an upstream 400/403/413/422 error body for classification waits at most 500 ms; an upstream that sends the header and stalls the body is classified from the bytes read so far (or its status) instead of holding the request until the first-token timeout and failing over as a timeout.
 - The `Debug` output of the virtual-model config types (presets, overrides, remaps, composite questions, criteria) and of the legacy `[providers.models.rerank]` block prints structure only (lengths, keys, counts, strategy names), never prompt, override or remap text; the admin virtual-model document and plan responses no longer implement `Debug`.
 - The resilience executor follows per-link escapes (typed fallback triggers, ADR 014); plain chains behave exactly as before.
-- Chat admission reserves the largest `max_tokens` any attempt of the decision sends upstream once its overrides apply, so a target whose override raises the cap cannot run past a key or group budget on a small client value, and one that lowers it no longer causes a spurious 402/429.
+- Chat admission reserves the largest output cap (`max_tokens` or `max_completion_tokens`, whichever is larger) any attempt of the decision sends upstream once its overrides apply, so a target whose override raises the cap cannot run past a key or group budget on a small client value, and one that lowers it no longer causes a spurious 402/429.
 - An embed target's `encoding_format` override now decides the response encoding (the serving attempt's effective value, not the client's).
 - Jev remap scores are clamped to `[0, 1]`, and a non-finite score is a translation error (`LM-3002`) instead of a value that breaks sorting.
-- `lumen config migrate` keeps the config file's permission bits (and, when allowed, its owner and group), and rewrites a symlinked config through the link instead of replacing the link with a regular file.
+- `lumen config migrate` keeps the config file's permission bits (and, when allowed, its owner and group), and rewrites a symlinked config through the link instead of replacing the link with a regular file. The staging and backup files are created exclusively with the config file's mode set before any content is written, so a symlink planted at `config.toml.migrating` or `config.toml.bak` can no longer redirect a privileged run into overwriting another file, and the backup of a `0600` config is never world-readable.
 
 ### Removed
 
