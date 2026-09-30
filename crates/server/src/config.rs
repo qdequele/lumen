@@ -525,7 +525,7 @@ pub struct ModelConfig {
     /// The model id clients use (owned entirely by the operator).
     pub id: String,
     /// The upstream model id to send. Defaults to `id` when omitted.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_id: Option<String>,
     /// Capabilities this model serves.
     pub capabilities: Vec<Capability>,
@@ -535,18 +535,18 @@ pub struct ModelConfig {
     #[serde(default = "default_modalities")]
     pub modalities: Vec<String>,
     /// Price per **million input tokens**, USD (M5 cost counting).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_per_1m_input: Option<f64>,
     /// Price per **million output tokens**, USD.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_per_1m_output: Option<f64>,
     /// Price per **thousand rerank searches**, USD.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_per_1k_searches: Option<f64>,
     /// Ordered fallback model ids tried, in turn, after this model's provider
     /// exhausts its retries or its circuit is open (M6 §6.2). Each must exist
     /// and serve every capability this model declares (validated at boot).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fallbacks: Vec<String>,
     /// How `/v1/rerank` is converted to SystemOne questions (Jev as a
     /// reranker, ADR 013 amendment). Only valid on a `kind = "typesafe"`
@@ -560,6 +560,25 @@ pub struct ModelConfig {
     /// Metadata only: it never affects routing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub release_date: Option<ReleaseDate>,
+}
+
+impl ModelConfig {
+    /// A model with only an id and default optional fields (migration helper).
+    #[must_use]
+    pub fn minimal(id: &str) -> Self {
+        Self {
+            id: id.to_owned(),
+            upstream_id: None,
+            capabilities: Vec::new(),
+            modalities: default_modalities(),
+            cost_per_1m_input: None,
+            cost_per_1m_output: None,
+            cost_per_1k_searches: None,
+            fallbacks: Vec::new(),
+            rerank: None,
+            release_date: None,
+        }
+    }
 }
 
 /// The `[providers.models.rerank]` converter block.

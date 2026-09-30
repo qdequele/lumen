@@ -12,6 +12,7 @@ pub mod auth;
 pub mod chat;
 pub mod config;
 pub mod config_edit;
+pub mod config_migrate;
 pub mod config_source;
 pub mod embeddings;
 pub mod error;

@@ -283,7 +283,7 @@ fn normalize_to_table(item: &mut Item) {
 /// empty `providers = []`) as a standard `[[array]]` of tables, so an edit
 /// can address its entries. Both spellings are valid TOML and load
 /// identically; any other item (a non-table array included) is left as is.
-fn normalize_to_array_of_tables(item: &mut Item) {
+pub(crate) fn normalize_to_array_of_tables(item: &mut Item) {
     let Some(array) = item.as_array() else {
         return;
     };
