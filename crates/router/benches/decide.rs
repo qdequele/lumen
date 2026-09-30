@@ -1,5 +1,6 @@
-//! ADR 014: the decide phase must stay well under 1 us for a 3-level plan
-//! with a regex rule.
+//! ADR 014: the decide phase must stay under 1 us for a 3-level plan with a
+//! regex rule, and a foundation id called directly (decide plus the retain
+//! pass every handler runs) must stay close to free.
 
 use criterion::{criterion_group, criterion_main, Criterion};
 use lumen_core::Capability;
@@ -86,5 +87,24 @@ fn bench(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench);
+fn bench_direct(c: &mut Criterion) {
+    let table = table();
+    let mut rng = || 0;
+    c.bench_function("decide_direct_foundation_id", |b| {
+        b.iter(|| {
+            let mut decision = table
+                .decide(
+                    Capability::Chat,
+                    std::hint::black_box("a"),
+                    &Facts,
+                    &mut rng,
+                )
+                .expect("decides");
+            decision.retain_mask(&[true]);
+            std::hint::black_box(decision)
+        });
+    });
+}
+
+criterion_group!(benches, bench, bench_direct);
 criterion_main!(benches);

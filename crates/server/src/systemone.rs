@@ -39,12 +39,12 @@ pub async fn systemone_handler(
     req.validate()?;
 
     let client_model = req.model.clone();
-    let mut decision = {
-        let facts = Facts::systemone(&headers, key.as_deref());
-        state
-            .resilience
-            .decide(Capability::SystemOne, &client_model, &facts)?
-    };
+    // Facts are only built for a virtual model (ADR 014).
+    let mut decision = state
+        .resilience
+        .decide(Capability::SystemOne, &client_model, |_| {
+            Facts::systemone(&headers, key.as_deref())
+        })?;
     let chain = lumen_router::resolve_systemone_decision(&state.registry, &mut decision)?;
     let primary = decision.primary_model().to_owned();
     let links = lumen_router::decision_links(

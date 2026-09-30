@@ -84,12 +84,12 @@ pub async fn embeddings(
     validate_input_type(&req)?;
 
     let client_model = req.model.clone();
-    let mut decision = {
-        let facts = Facts::embed(&headers, key.as_deref(), &req);
-        state
-            .resilience
-            .decide(Capability::Embed, &client_model, &facts)?
-    };
+    // Facts are only built for a virtual model (ADR 014).
+    let mut decision = state
+        .resilience
+        .decide(Capability::Embed, &client_model, |_| {
+            Facts::embed(&headers, key.as_deref(), &req)
+        })?;
     let chain = lumen_router::resolve_embedding_decision(&state.registry, &mut decision)?;
     let primary = decision.primary_model().to_owned();
     let links = lumen_router::decision_links(

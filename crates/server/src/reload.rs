@@ -766,10 +766,11 @@ mod tests {
         );
 
         let headers = axum::http::HeaderMap::new();
-        let facts = crate::facts::Facts::systemone(&headers, None);
         let attempt_ids = |model: &str| -> Vec<String> {
             t.resilience
-                .decide(lumen_core::Capability::Chat, model, &facts)
+                .decide(lumen_core::Capability::Chat, model, |_| {
+                    crate::facts::Facts::systemone(&headers, None)
+                })
                 .unwrap()
                 .attempts
                 .iter()

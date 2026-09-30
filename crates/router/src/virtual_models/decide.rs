@@ -43,9 +43,11 @@ impl std::fmt::Debug for Attempt {
 }
 
 impl Attempt {
+    /// A bare attempt on `model_id`. Its `path` stays empty: a route is only
+    /// reported for a virtual-model request ([`Decision::route_of`]).
     fn plain(model_id: String) -> Self {
         Self {
-            path: model_id.clone(),
+            path: String::new(),
             model_id,
             overrides: Vec::new(),
             remap: None,
@@ -114,6 +116,9 @@ impl Decision {
     /// kept) and rewire escapes to the next surviving attempt.
     pub fn retain_mask(&mut self, keep: &[bool]) {
         let n = self.attempts.len();
+        if (1..n).all(|i| keep.get(i).copied().unwrap_or(true)) {
+            return;
+        }
         let kept: Vec<bool> = (0..n)
             .map(|i| i == 0 || keep.get(i).copied().unwrap_or(true))
             .collect();
@@ -160,25 +165,42 @@ impl RoutingTable {
         facts: &dyn FactSource,
         rng: &mut dyn FnMut() -> u64,
     ) -> Result<Decision, GatewayError> {
-        let Some(vm) = self.models.get(model) else {
-            return Ok(Decision::direct(model));
-        };
-        if vm.capability() != capability {
+        match self.models.get(model) {
+            Some(vm) => vm.decide(capability, facts, rng),
+            None => Ok(Decision::direct(model)),
+        }
+    }
+}
+
+impl VirtualModel {
+    /// Decide the attempts of a request to this virtual model (the lookup
+    /// half of [`RoutingTable::decide`] already done by the caller).
+    ///
+    /// # Errors
+    /// [`GatewayError::UnsupportedCapability`] when it serves another
+    /// capability.
+    pub fn decide(
+        &self,
+        capability: Capability,
+        facts: &dyn FactSource,
+        rng: &mut dyn FnMut() -> u64,
+    ) -> Result<Decision, GatewayError> {
+        if self.capability() != capability {
             return Err(GatewayError::UnsupportedCapability {
-                model: model.to_owned(),
+                model: self.id().to_owned(),
                 capability,
             });
         }
-        let base: Vec<Arc<Overrides>> = vm
+        let base: Vec<Arc<Overrides>> = self
             .preset
             .as_ref()
             .and_then(|p| p.overrides().cloned())
             .into_iter()
             .collect();
-        let attempts = flatten_model(vm, facts, rng, "", &base);
+        let attempts = flatten_model(self, facts, rng, "", &base);
         Ok(Decision {
-            virtual_model: Some(model.to_owned()),
-            preset: vm.preset.clone(),
+            virtual_model: Some(self.id().to_owned()),
+            preset: self.preset.clone(),
             attempts,
         })
     }
@@ -516,6 +538,17 @@ mod tests {
         d.attempts[0].apply(&mut req);
         assert_eq!(req.max_tokens, Some(3));
         assert!(d.preset.is_some());
+    }
+
+    #[test]
+    fn retain_keeping_everything_changes_nothing() {
+        let mut d = Decision::linear(["a", "b", "c"].map(str::to_owned));
+        let before: Vec<Vec<Escape>> = d.attempts.iter().map(|a| a.escapes.clone()).collect();
+        d.retain_mask(&[true, true, true]);
+        d.retain_mask(&[]);
+        assert_eq!(ids(&d), vec!["a", "b", "c"]);
+        let after: Vec<Vec<Escape>> = d.attempts.iter().map(|a| a.escapes.clone()).collect();
+        assert_eq!(after, before);
     }
 
     #[test]

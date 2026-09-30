@@ -78,27 +78,25 @@ pub async fn chat(
         return Err(GatewayError::InvalidRequest("`messages` must not be empty".to_owned()).into());
     }
 
-    // The preset prompt is applied BEFORE routing: it counts toward the
-    // `input_tokens` fact that `switch` conditions read (ADR 014, ADR 003).
-    // It depends only on the requested id, and is applied exactly once.
+    // Decide the attempts (ADR 014): a virtual model's routing tree, or the
+    // foundation model alone (no facts are built for it). The preset prompt
+    // comes from the same routing snapshot as the decision and is applied
+    // BEFORE the facts are computed: it counts toward the `input_tokens` fact
+    // that `switch` conditions read (ADR 014, ADR 003). It depends only on the
+    // requested id, and is applied exactly once. Facts are dropped before any
+    // `.await`.
     let client_model = req.model.clone();
-    if let Some(preset) = state
-        .resilience
-        .routing()
-        .get(&client_model)
-        .and_then(|vm| vm.preset().cloned())
-    {
-        preset.apply_prompt(&mut req);
-    }
-
-    // Decide the attempts (ADR 014): a virtual model's routing tree, a
-    // foundation model's chain, or the model alone. Facts are dropped before
-    // any `.await`.
     let mut decision = {
-        let facts = Facts::chat(&headers, key.as_deref(), &req);
+        let (headers, key, req) = (&headers, key.as_deref(), &mut req);
         state
             .resilience
-            .decide(Capability::Chat, &client_model, &facts)?
+            .decide(Capability::Chat, &client_model, move |preset| {
+                if let Some(preset) = preset {
+                    preset.apply_prompt(req);
+                }
+                let req: &ChatRequest = req;
+                Facts::chat(headers, key, req)
+            })?
     };
     let chain = lumen_router::resolve_chat_decision(&state.registry, &mut decision)?;
     let primary = decision.primary_model().to_owned();

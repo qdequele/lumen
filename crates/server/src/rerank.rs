@@ -44,12 +44,12 @@ pub async fn rerank_handler(
     }
 
     let client_model = req.model.clone();
-    let mut decision = {
-        let facts = Facts::rerank(&headers, key.as_deref(), &req);
-        state
-            .resilience
-            .decide(Capability::Rerank, &client_model, &facts)?
-    };
+    // Facts are only built for a virtual model (ADR 014).
+    let mut decision = state
+        .resilience
+        .decide(Capability::Rerank, &client_model, |_| {
+            Facts::rerank(&headers, key.as_deref(), &req)
+        })?;
     let chain = lumen_router::resolve_rerank_decision(&state.registry, &mut decision)?;
     let primary = decision.primary_model().to_owned();
     let links = lumen_router::decision_links(

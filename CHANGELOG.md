@@ -10,7 +10,7 @@ All notable changes to LUMEN are documented here. The format is based on
 
 - `PUT /admin/config/virtual_models/{id}` refuses a body holding a JSON `null` inside `when`, `overrides.set` or `overrides.default` (nested included), or any other value TOML cannot store, with `LM-1001` naming the field instead of a 500.
 - Virtual-model validation caps a request at 64 flattened attempts (`MAX_ATTEMPTS`: a `fallback` or `split` sums its targets, a `switch` takes its largest branch) and stops descending at the nesting limit, so a DAG listing the same child many times per level, or a chain of thousands of models, is rejected with the model id instead of slowing every request or overflowing the stack.
-- Criterion bench for the virtual-model decide phase (about 0.95 us per call, mean 926 to 962 ns across runs, for a 3-level plan with a regex rule).
+- Criterion benches for the virtual-model decide phase (`cargo bench -p router --bench decide`): about 0.95 us per call (mean 926 to 975 ns across runs) for a 3-level plan with a regex rule, and about 60 ns for a foundation id called directly (decide plus the retain pass every handler runs; 142 ns before the direct-path fast paths).
 - User guide `docs/virtual-models.md` (strategies, triggers, conditions, overrides, presets, Jev remaps, admin API, migration); the error catalogue, examples, README and `monitoring/lumen.toml` use virtual models instead of `fallbacks`.
 - Jev as a reranker through a virtual-model remap: noul, score, composite and choice strategies, static context, and cross-capability fallback to a classic reranker.
 - `lumen config migrate [--dry-run]`: rewrites per-model fallbacks and Jev rerank blocks into virtual models (file mode keeps a .bak; DB mode writes a new config version).
@@ -31,6 +31,7 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ### Changed
 
+- The request path takes one routing snapshot per request: the chat preset and the decision come from the same snapshot (a reload between them can no longer pair one config's preset with another's routing), and a foundation id called directly builds no routing facts and skips the retain pass.
 - `tokenizer.mode = "accurate"` also matches a provider-prefixed model id on its last path segment, so a foundation model renamed by `lumen config migrate` (`openai/gpt-4o`) keeps exact BPE counts instead of falling back to the heuristic.
 - Reading an upstream 400/403/413/422 error body for classification waits at most 500 ms; an upstream that sends the header and stalls the body is classified from the bytes read so far (or its status) instead of holding the request until the first-token timeout and failing over as a timeout.
 - The `Debug` output of the virtual-model config types (presets, overrides, remaps, composite questions, criteria) and of the legacy `[providers.models.rerank]` block prints structure only (lengths, keys, counts, strategy names), never prompt, override or remap text; the admin virtual-model document and plan responses no longer implement `Debug`.

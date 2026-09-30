@@ -37,13 +37,16 @@ fn resolve<R>(
         };
         return Err(crate::miss(registry, &primary.model_id, wanted));
     }
-    let keep: Vec<bool> = routes.iter().map(Option::is_some).collect();
-    for (attempt, ok) in decision.attempts.iter().zip(&keep) {
-        if !ok {
-            crate::warn_skipped_fallback(&attempt.model_id, capability.as_str());
+    // The common case (every route resolved) skips the keep/warn/retain pass.
+    if routes.iter().any(Option::is_none) {
+        let keep: Vec<bool> = routes.iter().map(Option::is_some).collect();
+        for (attempt, ok) in decision.attempts.iter().zip(&keep) {
+            if !ok {
+                crate::warn_skipped_fallback(&attempt.model_id, capability.as_str());
+            }
         }
+        decision.retain_mask(&keep);
     }
-    decision.retain_mask(&keep);
     Ok(routes.into_iter().flatten().collect())
 }
 

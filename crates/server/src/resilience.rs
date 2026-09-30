@@ -17,7 +17,7 @@ use lumen_core::{Capability, GatewayError};
 use lumen_router::circuit::{BreakerConfig, CircuitBreakers};
 use lumen_router::executor::ExecConfig;
 use lumen_router::retry::RetryPolicy;
-use lumen_router::virtual_models::{Decision, FactSource, RoutingTable};
+use lumen_router::virtual_models::{Decision, FactSource, Preset, RoutingTable};
 use lumen_telemetry::ResilienceMetrics;
 
 use crate::config::Config;
@@ -201,22 +201,33 @@ impl ResilienceRuntime {
         self.map_policy(|p| p.retry = retry)
     }
 
-    /// Decide the attempts for `model` (ADR 014): a virtual model's routing
-    /// tree or a direct single attempt on a foundation model. Pure and in-memory: one policy snapshot, one random
-    /// draw per `split`.
+    /// Decide the attempts for `model` (ADR 014) from ONE routing snapshot: a
+    /// virtual model's routing tree or a direct single attempt on a foundation
+    /// model. Pure and in-memory: one hash lookup, one random draw per `split`.
+    ///
+    /// `facts` builds the request facts `switch` conditions read. It is only
+    /// called for a virtual model (a foundation id builds no facts), and it
+    /// receives that virtual model's preset from the same snapshot the decision
+    /// comes from, so a chat caller applies the preset prompt before the facts
+    /// are computed (its prompt counts toward `input_tokens`) and the preset
+    /// and the attempts can never come from two different reloads.
     ///
     /// # Errors
     /// `LM-2002` when `model` is a virtual model serving another capability.
-    pub fn decide(
+    pub fn decide<F: FactSource>(
         &self,
         capability: Capability,
         model: &str,
-        facts: &dyn FactSource,
+        facts: impl FnOnce(Option<&Preset>) -> F,
     ) -> Result<Decision, GatewayError> {
         use rand::Rng as _;
         let policy = self.policy.load();
+        let Some(vm) = policy.routing.get(model) else {
+            return Ok(Decision::direct(model));
+        };
+        let facts = facts(vm.preset().map(AsRef::as_ref));
         let mut draw = || rand::rng().next_u64();
-        policy.routing.decide(capability, model, facts, &mut draw)
+        vm.decide(capability, &facts, &mut draw)
     }
 
     /// The current compiled virtual models (for `GET /v1/models` and the
@@ -334,15 +345,46 @@ mod tests {
             capability = "chat"
             strategy = "fallback"
             targets = [{ model = "claude" }, { model = "gpt" }]
+
+            [[virtual_models]]
+            id = "p"
+            capability = "chat"
+            strategy = "single"
+            preset = { system_prompt = "be brief" }
+            targets = [{ model = "gpt" }]
             "#,
         )
         .unwrap();
         let rt = ResilienceRuntime::from_config(&cfg, None);
-        let d = rt.decide(Capability::Chat, "v", &NoFacts).unwrap();
+        let mut saw_preset = None;
+        let d = rt
+            .decide(Capability::Chat, "v", |preset| {
+                saw_preset = Some(preset.is_some());
+                NoFacts
+            })
+            .unwrap();
         assert_eq!(d.virtual_model.as_deref(), Some("v"));
         assert_eq!(d.primary_model(), "claude");
-        // A foundation id is a direct single attempt, with no virtual model.
-        let direct = rt.decide(Capability::Chat, "gpt", &NoFacts).unwrap();
+        assert_eq!(
+            saw_preset,
+            Some(false),
+            "facts are built for a virtual model"
+        );
+        // The preset handed to the facts builder comes from the same snapshot.
+        let mut saw_preset = false;
+        rt.decide(Capability::Chat, "p", |preset| {
+            saw_preset = preset.is_some();
+            NoFacts
+        })
+        .unwrap();
+        assert!(saw_preset);
+        // A foundation id is a direct single attempt, with no virtual model,
+        // and its facts are never built.
+        let direct = rt
+            .decide(Capability::Chat, "gpt", |_| -> NoFacts {
+                panic!("facts built for a foundation id")
+            })
+            .unwrap();
         assert!(direct.virtual_model.is_none());
         let ids: Vec<&str> = direct
             .attempts
