@@ -264,7 +264,10 @@ mod tests {
             "/../../contracts/lab-events.schema.json"
         )))
         .unwrap();
-        let validator = jsonschema::validator_for(&schema).unwrap();
+        let validator = jsonschema::options()
+            .should_validate_formats(true)
+            .build(&schema)
+            .unwrap();
         let mut unlimited = delta();
         unlimited.group_budget_max_micro = None;
         unlimited.external_ref = None;
@@ -273,5 +276,31 @@ mod tests {
             let errors: Vec<String> = validator.iter_errors(&v).map(|e| e.to_string()).collect();
             assert!(errors.is_empty(), "{errors:?}");
         }
+
+        // Negative assertions: account_id must be a valid UUID
+        let mut invalid_uuid =
+            serde_json::to_value(UsageEvent::from_delta(uuid_v7(5), &delta(), "eu-1")).unwrap();
+        invalid_uuid["account_id"] = serde_json::json!("not-a-uuid");
+        let errors: Vec<String> = validator
+            .iter_errors(&invalid_uuid)
+            .map(|e| e.to_string())
+            .collect();
+        assert!(
+            !errors.is_empty(),
+            "invalid account_id should fail validation"
+        );
+
+        // cost_micro_usd must be >= 1
+        let mut zero_cost =
+            serde_json::to_value(UsageEvent::from_delta(uuid_v7(5), &delta(), "eu-1")).unwrap();
+        zero_cost["data"]["cost_micro_usd"] = serde_json::json!(0);
+        let errors: Vec<String> = validator
+            .iter_errors(&zero_cost)
+            .map(|e| e.to_string())
+            .collect();
+        assert!(
+            !errors.is_empty(),
+            "zero cost_micro_usd should fail validation"
+        );
     }
 }
