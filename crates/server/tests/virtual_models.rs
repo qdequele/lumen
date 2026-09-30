@@ -418,3 +418,17 @@ async fn preset_prompt_counts_toward_input_tokens_when_routing() {
         .count();
     assert_eq!(systems, 1, "the preset prompt is applied exactly once");
 }
+
+#[test]
+fn the_shipped_example_config_has_no_legacy_fields_and_loads() {
+    let text = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../config.example.toml"
+    ))
+    .unwrap();
+    assert!(
+        !text.contains("\nfallbacks ="),
+        "config.example.toml still uses per-model fallbacks"
+    );
+    assert!(!text.contains("[providers.models.rerank]"));
+}

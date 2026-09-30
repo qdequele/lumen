@@ -189,7 +189,6 @@ mod tests {
                         upstream_id: (*id).into(),
                         capabilities: caps.to_vec(),
                         modalities: vec!["text".into()],
-                        rerank_template: None,
                         release_date: None,
                     })
                     .collect(),

@@ -67,194 +67,40 @@ pub fn resolve_rerank(registry: &Registry, model_id: &str) -> Result<RerankRoute
         .ok_or_else(|| miss(registry, model_id, Capability::Rerank))
 }
 
-/// One resolved link of a chat fallback chain (M6).
+/// One resolved attempt of a chat [`Decision`](virtual_models::Decision).
 #[derive(Debug, Clone)]
 pub struct ChatChainLink {
     /// The resolved route (provider instance + upstream model id).
     pub route: ChatRoute,
-    /// The client-facing model id of *this* link (the primary or a fallback).
+    /// The foundation model id of *this* attempt (the primary or a fallback).
     pub model_id: String,
 }
 
-/// One resolved link of an embedding fallback chain (M6).
+/// One resolved attempt of an embedding decision.
 #[derive(Debug, Clone)]
 pub struct EmbeddingChainLink {
     /// The resolved route.
     pub route: EmbeddingRoute,
-    /// The client-facing model id of this link.
+    /// The foundation model id of this attempt.
     pub model_id: String,
 }
 
-/// One resolved link of a rerank fallback chain (M6).
+/// One resolved attempt of a rerank decision.
 #[derive(Debug, Clone)]
 pub struct RerankChainLink {
     /// The resolved route.
     pub route: RerankRoute,
-    /// The client-facing model id of this link.
+    /// The foundation model id of this attempt.
     pub model_id: String,
 }
 
-/// Resolve an ordered list of model ids (primary first, then its fallbacks) to
-/// a chat chain. The **primary** must resolve - its miss is the client-facing
-/// error. A fallback that no longer resolves for chat is skipped with a warning
-/// (boot validation makes this unreachable in practice; this is defence in
-/// depth for a hot-reloaded table).
-///
-/// # Errors
-/// The primary's routing miss ([`GatewayError::ModelNotFound`] /
-/// [`GatewayError::UnsupportedCapability`]).
-pub fn resolve_chat_chain(
-    registry: &Registry,
-    model_ids: &[String],
-) -> Result<Vec<ChatChainLink>, GatewayError> {
-    let mut chain = Vec::with_capacity(model_ids.len());
-    for (position, id) in model_ids.iter().enumerate() {
-        match registry.chat_route(id) {
-            Some(route) => chain.push(ChatChainLink {
-                route,
-                model_id: id.clone(),
-            }),
-            None if position == 0 => return Err(miss(registry, id, Capability::Chat)),
-            None => warn_skipped_fallback(id, "chat"),
-        }
-    }
-    Ok(chain)
-}
-
-/// Resolve a primary + fallbacks to an embedding chain (see [`resolve_chat_chain`]).
-///
-/// # Errors
-/// The primary's routing miss.
-pub fn resolve_embedding_chain(
-    registry: &Registry,
-    model_ids: &[String],
-) -> Result<Vec<EmbeddingChainLink>, GatewayError> {
-    let mut chain = Vec::with_capacity(model_ids.len());
-    for (position, id) in model_ids.iter().enumerate() {
-        match registry.embedding_route(id) {
-            Some(route) => chain.push(EmbeddingChainLink {
-                route,
-                model_id: id.clone(),
-            }),
-            None if position == 0 => return Err(miss(registry, id, Capability::Embed)),
-            None => warn_skipped_fallback(id, "embed"),
-        }
-    }
-    Ok(chain)
-}
-
-/// One resolved link of a SystemOne fallback chain (ADR 013).
+/// One resolved attempt of a SystemOne decision (ADR 013).
 #[derive(Debug, Clone)]
 pub struct SystemOneChainLink {
     /// The resolved route.
     pub route: SystemOneRoute,
-    /// The client-facing model id of this link.
+    /// The foundation model id of this attempt.
     pub model_id: String,
-}
-
-/// Resolve a primary + fallbacks to a rerank chain (see [`resolve_chat_chain`]).
-///
-/// # Errors
-/// The primary's routing miss.
-pub fn resolve_rerank_chain(
-    registry: &Registry,
-    model_ids: &[String],
-) -> Result<Vec<RerankChainLink>, GatewayError> {
-    let mut chain = Vec::with_capacity(model_ids.len());
-    for (position, id) in model_ids.iter().enumerate() {
-        match registry.rerank_route(id) {
-            Some(route) => chain.push(RerankChainLink {
-                route,
-                model_id: id.clone(),
-            }),
-            None if position == 0 => return Err(miss(registry, id, Capability::Rerank)),
-            None => warn_skipped_fallback(id, "rerank"),
-        }
-    }
-    Ok(chain)
-}
-
-/// Resolve a primary + fallbacks to a SystemOne chain (see
-/// [`resolve_chat_chain`]).
-///
-/// # Errors
-/// The primary's routing miss.
-pub fn resolve_systemone_chain(
-    registry: &Registry,
-    model_ids: &[String],
-) -> Result<Vec<SystemOneChainLink>, GatewayError> {
-    let mut chain = Vec::with_capacity(model_ids.len());
-    for (position, id) in model_ids.iter().enumerate() {
-        match registry.systemone_route(id) {
-            Some(route) => chain.push(SystemOneChainLink {
-                route,
-                model_id: id.clone(),
-            }),
-            None if position == 0 => return Err(miss(registry, id, Capability::SystemOne)),
-            None => warn_skipped_fallback(id, "systemone"),
-        }
-    }
-    Ok(chain)
-}
-
-/// Build the executor-facing [`Link`](executor::Link) metadata for a chat chain.
-#[must_use]
-pub fn chat_links(chain: &[ChatChainLink]) -> Vec<executor::Link> {
-    let n = chain.len();
-    chain
-        .iter()
-        .enumerate()
-        .map(|(i, l)| executor::Link {
-            provider_name: l.route.provider_name.clone(),
-            model_id: l.model_id.clone(),
-            escapes: triggers::linear_escapes(i, n),
-        })
-        .collect()
-}
-
-/// Build the executor-facing [`Link`](executor::Link) metadata for an embedding chain.
-#[must_use]
-pub fn embedding_links(chain: &[EmbeddingChainLink]) -> Vec<executor::Link> {
-    let n = chain.len();
-    chain
-        .iter()
-        .enumerate()
-        .map(|(i, l)| executor::Link {
-            provider_name: l.route.provider_name.clone(),
-            model_id: l.model_id.clone(),
-            escapes: triggers::linear_escapes(i, n),
-        })
-        .collect()
-}
-
-/// Build the executor-facing [`Link`](executor::Link) metadata for a rerank chain.
-#[must_use]
-pub fn rerank_links(chain: &[RerankChainLink]) -> Vec<executor::Link> {
-    let n = chain.len();
-    chain
-        .iter()
-        .enumerate()
-        .map(|(i, l)| executor::Link {
-            provider_name: l.route.provider_name.clone(),
-            model_id: l.model_id.clone(),
-            escapes: triggers::linear_escapes(i, n),
-        })
-        .collect()
-}
-
-/// Build the executor-facing [`Link`](executor::Link) metadata for a SystemOne chain.
-#[must_use]
-pub fn systemone_links(chain: &[SystemOneChainLink]) -> Vec<executor::Link> {
-    let n = chain.len();
-    chain
-        .iter()
-        .enumerate()
-        .map(|(i, l)| executor::Link {
-            provider_name: l.route.provider_name.clone(),
-            model_id: l.model_id.clone(),
-            escapes: triggers::linear_escapes(i, n),
-        })
-        .collect()
 }
 
 pub(crate) fn warn_skipped_fallback(model_id: &str, capability: &str) {
@@ -281,6 +127,7 @@ pub(crate) fn miss(registry: &Registry, model_id: &str, capability: Capability) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::virtual_models::Decision;
     use lumen_providers::{ModelSpec, ProviderKind, ProviderSpec};
 
     fn registry_with(models: Vec<ModelSpec>) -> Registry {
@@ -325,7 +172,6 @@ mod tests {
             upstream_id: id.to_owned(),
             capabilities: caps.to_vec(),
             modalities: vec!["text".to_owned()],
-            rerank_template: None,
             release_date: None,
         }
     }
@@ -367,41 +213,41 @@ mod tests {
     }
 
     #[test]
-    fn chat_chain_resolves_primary_and_fallbacks_in_order() {
+    fn chat_decision_resolves_primary_and_fallbacks_in_order() {
         let reg = registry_with(vec![
             model("gpt", &[Capability::Chat]),
             model("gpt-mini", &[Capability::Chat]),
         ]);
-        let ids = vec!["gpt".to_owned(), "gpt-mini".to_owned()];
-        let chain = resolve_chat_chain(&reg, &ids).unwrap();
+        let mut d = Decision::linear(["gpt", "gpt-mini"].map(str::to_owned));
+        let chain = resolve_chat_decision(&reg, &mut d).unwrap();
         assert_eq!(chain.len(), 2);
         assert_eq!(chain[0].model_id, "gpt");
         assert_eq!(chain[1].model_id, "gpt-mini");
-        let links = chat_links(&chain);
+        let links = decision_links(&d, chain.iter().map(|l| l.route.provider_name.as_str()));
         assert_eq!(links[0].provider_name, "openai");
         assert_eq!(links[1].model_id, "gpt-mini");
     }
 
     #[test]
-    fn chat_chain_primary_miss_is_the_client_error() {
+    fn chat_decision_primary_miss_is_the_client_error() {
         let reg = registry_with(vec![model("gpt", &[Capability::Chat])]);
-        let ids = vec!["nope".to_owned()];
-        let err = resolve_chat_chain(&reg, &ids).unwrap_err();
+        let mut d = Decision::linear(["nope".to_owned()]);
+        let err = resolve_chat_decision(&reg, &mut d).unwrap_err();
         assert_eq!(err.code(), "LM-2001");
     }
 
     #[test]
-    fn chat_chain_skips_an_unresolvable_fallback() {
+    fn chat_decision_skips_an_unresolvable_fallback() {
         let reg = registry_with(vec![model("gpt", &[Capability::Chat])]);
         // The fallback "ghost" does not exist; it is skipped, not fatal.
-        let ids = vec!["gpt".to_owned(), "ghost".to_owned()];
-        let chain = resolve_chat_chain(&reg, &ids).unwrap();
+        let mut d = Decision::linear(["gpt", "ghost"].map(str::to_owned));
+        let chain = resolve_chat_decision(&reg, &mut d).unwrap();
         assert_eq!(chain.len(), 1);
         assert_eq!(chain[0].model_id, "gpt");
     }
 
     #[test]
-    fn systemone_chain_resolves_and_rejects_other_capabilities() {
+    fn systemone_decision_resolves_and_rejects_other_capabilities() {
         let reg = Registry::build(
             vec![ProviderSpec {
                 name: "typesafe".to_owned(),
@@ -420,18 +266,18 @@ mod tests {
             std::time::Duration::from_secs(300),
         )
         .expect("registry builds");
-        let ids = vec!["jev-1.13.0".to_owned(), "jev-latest".to_owned()];
-        let chain = resolve_systemone_chain(&reg, &ids).unwrap();
-        let links = systemone_links(&chain);
+        let mut d = Decision::linear(["jev-1.13.0", "jev-latest"].map(str::to_owned));
+        let chain = resolve_systemone_decision(&reg, &mut d).unwrap();
+        let links = decision_links(&d, chain.iter().map(|l| l.route.provider_name.as_str()));
         assert_eq!(links.len(), 2);
         assert_eq!(links[0].provider_name, "typesafe");
         assert_eq!(links[1].model_id, "jev-latest");
 
-        let err = resolve_systemone_chain(&reg, &["nope".to_owned()]).unwrap_err();
+        let err = resolve_systemone_decision(&reg, &mut Decision::direct("nope")).unwrap_err();
         assert_eq!(err.code(), "LM-2001");
 
         let chat = registry_with(vec![model("gpt", &[Capability::Chat])]);
-        let err = resolve_systemone_chain(&chat, &["gpt".to_owned()]).unwrap_err();
+        let err = resolve_systemone_decision(&chat, &mut Decision::direct("gpt")).unwrap_err();
         assert_eq!(err.code(), "LM-2002");
         assert!(err.to_string().contains("systemone"));
     }

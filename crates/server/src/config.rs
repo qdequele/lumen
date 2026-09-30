@@ -543,15 +543,14 @@ pub struct ModelConfig {
     /// Price per **thousand rerank searches**, USD.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_per_1k_searches: Option<f64>,
-    /// Ordered fallback model ids tried, in turn, after this model's provider
-    /// exhausts its retries or its circuit is open (M6 §6.2). Each must exist
-    /// and serve every capability this model declares (validated at boot).
+    /// Legacy per-model fallback chain. Removed by ADR 014; still parsed
+    /// only so validation can point at `lumen config migrate`, and so the
+    /// migrator can read old documents.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fallbacks: Vec<String>,
-    /// How `/v1/rerank` is converted to SystemOne questions (Jev as a
-    /// reranker, ADR 013 amendment). Only valid on a `kind = "typesafe"`
-    /// model that declares `rerank`; every field is optional and defaults to
-    /// a generic relevance question.
+    /// Legacy `[providers.models.rerank]` Jev converter block. Removed by
+    /// ADR 014; still parsed only so validation can point at `lumen config
+    /// migrate`, and so the migrator can read old documents.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rerank: Option<RerankConverterConfig>,
     /// The date the model was released, ISO 8601 `YYYY-MM-DD` (validated at
@@ -581,7 +580,9 @@ impl ModelConfig {
     }
 }
 
-/// The `[providers.models.rerank]` converter block.
+/// The legacy `[providers.models.rerank]` converter block. Removed by ADR
+/// 014; still parsed only so validation can point at `lumen config migrate`,
+/// and so the migrator can read old documents.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RerankConverterConfig {
@@ -594,7 +595,9 @@ pub struct RerankConverterConfig {
     pub criteria: Option<RerankCriteriaConfig>,
 }
 
-/// `criteria.true` / `criteria.false` of a rerank converter.
+/// `criteria.true` / `criteria.false` of a legacy rerank converter. Removed
+/// by ADR 014; still parsed only so validation can point at `lumen config
+/// migrate`, and so the migrator can read old documents.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RerankCriteriaConfig {
@@ -606,70 +609,12 @@ pub struct RerankCriteriaConfig {
     pub no: Option<String>,
 }
 
-impl RerankConverterConfig {
-    /// The template (a `noul` strategy, no context), with defaults for every
-    /// unset field.
-    #[must_use]
-    pub fn to_template(&self) -> lumen_providers::typesafe::rerank::RerankTemplate {
-        use lumen_providers::typesafe::rerank::{
-            RerankStrategy, RerankTemplate, DEFAULT_CRITERIA_FALSE, DEFAULT_CRITERIA_TRUE,
-            DEFAULT_INSTRUCTIONS,
-        };
-        let criteria = self.criteria.as_ref();
-        RerankTemplate {
-            context: None,
-            strategy: RerankStrategy::Noul {
-                instructions: self
-                    .instructions
-                    .clone()
-                    .unwrap_or_else(|| DEFAULT_INSTRUCTIONS.to_owned()),
-                criteria_true: criteria
-                    .and_then(|c| c.yes.clone())
-                    .unwrap_or_else(|| DEFAULT_CRITERIA_TRUE.to_owned()),
-                criteria_false: criteria
-                    .and_then(|c| c.no.clone())
-                    .unwrap_or_else(|| DEFAULT_CRITERIA_FALSE.to_owned()),
-            },
-        }
-    }
-}
-
 impl ModelConfig {
     /// The upstream model id to send to the provider (falls back to `id`).
     #[must_use]
     pub fn resolved_upstream_id(&self) -> &str {
         self.upstream_id.as_deref().unwrap_or(&self.id)
     }
-}
-
-/// A `[providers.models.rerank]` converter is only meaningful on a
-/// `typesafe` model that declares `rerank` (ADR 013 amendment), and its
-/// fields, when set, must not be blank.
-fn validate_rerank_converter(
-    provider: &ProviderConfig,
-    model: &ModelConfig,
-    err: &impl Fn(String) -> ConfigError,
-) -> Result<(), ConfigError> {
-    let Some(converter) = &model.rerank else {
-        return Ok(());
-    };
-    if provider.kind != ProviderKind::Typesafe || !model.capabilities.contains(&Capability::Rerank)
-    {
-        return Err(err(format!(
-            "model '{}': a `rerank` converter block is only valid on a kind = \"typesafe\" \
-             model that declares the rerank capability",
-            model.id
-        )));
-    }
-    let blank = |v: &Option<String>| v.as_deref().is_some_and(|t| t.trim().is_empty());
-    let criteria = converter.criteria.clone().unwrap_or_default();
-    if blank(&converter.instructions) || blank(&criteria.yes) || blank(&criteria.no) {
-        return Err(err(format!(
-            "model '{}': rerank converter fields must not be empty",
-            model.id
-        )));
-    }
-    Ok(())
 }
 
 /// Log output format, mirrored to [`LogFormat`].
@@ -1423,7 +1368,7 @@ impl Config {
                         )));
                     }
                 }
-                validate_rerank_converter(provider, model, &err)?;
+                self.reject_legacy_fields(provider, model, &err)?;
                 if let Some(first_owner) = model_owner.insert(model.id.as_str(), &provider.name) {
                     return Err(err(format!(
                         "duplicate model id '{}': declared by both provider '{}' and provider \
@@ -1435,51 +1380,41 @@ impl Config {
             }
         }
 
-        self.validate_fallbacks(&err)?;
         self.routing_table().map_err(|e| err(e.to_string()))?;
         Ok(())
     }
 
-    /// Validate every model's fallback chain (M6 §6.2): each fallback id must
-    /// exist, differ from the model itself, and serve every capability the
-    /// model declares (so any request routed to the model can fall over to it).
-    fn validate_fallbacks(&self, err: &impl Fn(String) -> ConfigError) -> Result<(), ConfigError> {
-        // model id -> its declared capabilities, across all providers.
-        let mut caps: HashMap<&str, &[Capability]> = HashMap::new();
-        for provider in &self.providers {
-            for model in &provider.models {
-                caps.insert(model.id.as_str(), &model.capabilities);
-            }
-        }
-        for provider in &self.providers {
-            for model in &provider.models {
-                for fallback in &model.fallbacks {
-                    if fallback == &model.id {
-                        return Err(err(format!(
-                            "model '{}' lists itself as a fallback",
-                            model.id
-                        )));
-                    }
-                    let Some(fallback_caps) = caps.get(fallback.as_str()) else {
-                        return Err(err(format!(
-                            "model '{}' has an unknown fallback '{fallback}'",
-                            model.id
-                        )));
-                    };
-                    if let Some(missing) = model
-                        .capabilities
-                        .iter()
-                        .find(|c| !fallback_caps.contains(c))
-                    {
-                        return Err(err(format!(
-                            "fallback '{fallback}' for model '{}' does not serve capability \
-                             '{missing}' (a fallback must serve every capability of the model \
-                             it backs)",
-                            model.id
-                        )));
-                    }
-                }
-            }
+    /// Reject the fields ADR 014 removed (per-model `fallbacks`, the
+    /// `[providers.models.rerank]` block, `rerank` on a typesafe model), leading
+    /// with the `lumen config migrate` instruction and then printing the
+    /// equivalent virtual-model snippet for that model.
+    fn reject_legacy_fields(
+        &self,
+        provider: &ProviderConfig,
+        model: &ModelConfig,
+        err: &impl Fn(String) -> ConfigError,
+    ) -> Result<(), ConfigError> {
+        let legacy = if !model.fallbacks.is_empty() {
+            Some("`fallbacks`")
+        } else if model.rerank.is_some() {
+            Some("`[providers.models.rerank]`")
+        } else if provider.kind == ProviderKind::Typesafe
+            && model.capabilities.contains(&Capability::Rerank)
+        {
+            Some(
+                "the `rerank` capability on a typesafe model (Jev reranks through a \
+                 virtual model `remap`)",
+            )
+        } else {
+            None
+        };
+        if let Some(what) = legacy {
+            let hint = crate::config_migrate::hint_for(self, &model.id).unwrap_or_default();
+            return Err(err(format!(
+                "model '{}' (provider '{}') uses {what}, removed in ADR 014: run `lumen \
+                 config migrate` (add --dry-run to preview). Equivalent:\n{hint}",
+                model.id, provider.name
+            )));
         }
         Ok(())
     }
@@ -1516,21 +1451,6 @@ impl Config {
             &self.virtual_models,
             &self.foundation_index(),
         )
-    }
-
-    /// The ordered fallback chain for each model id (primary first), derived
-    /// from `fallbacks`. Models without fallbacks are omitted.
-    #[must_use]
-    pub fn fallback_map(&self) -> HashMap<String, Vec<String>> {
-        let mut map = HashMap::new();
-        for provider in &self.providers {
-            for model in &provider.models {
-                if !model.fallbacks.is_empty() {
-                    map.insert(model.id.clone(), model.fallbacks.clone());
-                }
-            }
-        }
-        map
     }
 
     /// Per-model timeout overrides (first-token, total) inherited from the
@@ -1582,10 +1502,6 @@ impl Config {
                         upstream_id: m.resolved_upstream_id().to_owned(),
                         capabilities: m.capabilities.clone(),
                         modalities: m.modalities.clone(),
-                        rerank_template: m
-                            .rerank
-                            .as_ref()
-                            .map(|c| std::sync::Arc::new(c.to_template())),
                         release_date: m.release_date,
                     })
                     .collect(),
@@ -2073,49 +1989,6 @@ mod tests {
     }
 
     #[test]
-    fn typesafe_rerank_converter_parses_with_defaults() {
-        let config = load_str(
-            r#"
-            [[providers]]
-            name = "typesafe"
-            kind = "typesafe"
-            api_key_env = "TYPESAFE_API_KEY"
-            [[providers.models]]
-            id = "plain"
-            capabilities = ["rerank"]
-            [[providers.models]]
-            id = "custom"
-            capabilities = ["rerank"]
-            [providers.models.rerank]
-            criteria.false = "Unrelated."
-            "#,
-        )
-        .expect("valid");
-        let specs = config.provider_specs();
-        let models = &specs[0].models;
-        assert_eq!(models[0].rerank_template, None);
-        let custom = models[1].rerank_template.clone().expect("template");
-        assert_eq!(custom.context, None);
-        let lumen_providers::typesafe::rerank::RerankStrategy::Noul {
-            instructions,
-            criteria_true,
-            criteria_false,
-        } = &custom.strategy
-        else {
-            panic!("legacy rerank blocks map to a noul template");
-        };
-        assert_eq!(criteria_false, "Unrelated.");
-        assert_eq!(
-            instructions,
-            lumen_providers::typesafe::rerank::DEFAULT_INSTRUCTIONS
-        );
-        assert_eq!(
-            criteria_true,
-            lumen_providers::typesafe::rerank::DEFAULT_CRITERIA_TRUE
-        );
-    }
-
-    #[test]
     fn release_date_parses_and_reaches_the_registry_spec() {
         let config = load_str(
             r#"
@@ -2198,34 +2071,6 @@ mod tests {
             assert!(
                 msg.contains("release") || msg.contains("date"),
                 "{bad}: {msg}"
-            );
-        }
-    }
-
-    #[test]
-    fn rerank_converter_is_rejected_where_it_cannot_apply() {
-        for (kind, caps, block) in [
-            ("cohere", r#"["rerank"]"#, r#"instructions = "q""#),
-            ("typesafe", r#"["systemone"]"#, r#"instructions = "q""#),
-            ("typesafe", r#"["rerank"]"#, r#"instructions = "  ""#),
-        ] {
-            let result = load_str(&format!(
-                r#"
-                [[providers]]
-                name = "p"
-                kind = "{kind}"
-                api_key_env = "KEY"
-                [[providers.models]]
-                id = "m"
-                capabilities = {caps}
-                [providers.models.rerank]
-                {block}
-                "#
-            ));
-            let err = result.expect_err("rejected");
-            assert!(
-                err.to_string().contains("rerank"),
-                "{kind} {caps} {block}: {err}"
             );
         }
     }
@@ -2419,77 +2264,103 @@ mod tests {
         assert!(err.to_string().contains("total_timeout_ms"));
     }
 
+    const LEGACY_FALLBACK: &str = r#"
+        [[providers]]
+        name = "openai"
+        kind = "openai"
+        [[providers.models]]
+        id = "gpt-4o"
+        capabilities = ["chat"]
+        fallbacks = ["claude"]
+        [[providers.models]]
+        id = "claude"
+        capabilities = ["chat"]
+    "#;
+
     #[test]
-    fn valid_fallback_chain_parses_and_maps() {
-        let toml = r#"
+    fn legacy_fallbacks_are_rejected_with_the_migration_hint() {
+        let err = load_str(LEGACY_FALLBACK).unwrap_err().to_string();
+        assert!(
+            err.contains("`fallbacks`") && err.contains("lumen config migrate"),
+            "{err}"
+        );
+        assert!(
+            err.contains("openai/gpt-4o") && err.contains("[[virtual_models]]"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_typesafe_reranker_is_rejected_with_the_migration_hint() {
+        let err = load_str(
+            r#"
+            [[providers]]
+            name = "typesafe"
+            kind = "typesafe"
+            api_key_env = "TYPESAFE_API_KEY"
+            [[providers.models]]
+            id = "jev-rerank"
+            upstream_id = "jev-latest"
+            capabilities = ["rerank"]
+        "#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("jev-rerank")
+                && err.contains("lumen config migrate")
+                && err.contains("remap"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_legacy_rerank_block_is_rejected_on_any_kind() {
+        for (kind, caps) in [("typesafe", r#"["rerank"]"#), ("cohere", r#"["rerank"]"#)] {
+            let err = load_str(&format!(
+                r#"
+                [[providers]]
+                name = "p"
+                kind = "{kind}"
+                api_key_env = "KEY"
+                [[providers.models]]
+                id = "m"
+                capabilities = {caps}
+                [providers.models.rerank]
+                instructions = "q"
+                "#
+            ))
+            .unwrap_err()
+            .to_string();
+            assert!(
+                err.contains("`[providers.models.rerank]`") && err.contains("lumen config migrate"),
+                "{kind}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_same_routing_expressed_as_a_virtual_model_loads() {
+        let cfg = load_str(
+            r#"
             [[providers]]
             name = "openai"
             kind = "openai"
             [[providers.models]]
-            id = "gpt"
+            id = "openai/gpt-4o"
             capabilities = ["chat"]
-            fallbacks = ["claude"]
-
-            [[providers]]
-            name = "anthropic"
-            kind = "anthropic"
             [[providers.models]]
             id = "claude"
             capabilities = ["chat"]
-        "#;
-        let cfg = load_str(toml).unwrap();
-        let map = cfg.fallback_map();
-        assert_eq!(map.get("gpt"), Some(&vec!["claude".to_owned()]));
-        assert!(!map.contains_key("claude"));
-    }
-
-    #[test]
-    fn fallback_to_unknown_model_is_rejected() {
-        let toml = r#"
-            [[providers]]
-            name = "openai"
-            kind = "openai"
-            [[providers.models]]
-            id = "gpt"
-            capabilities = ["chat"]
-            fallbacks = ["ghost"]
-        "#;
-        let err = load_str(toml).unwrap_err();
-        assert!(err.to_string().contains("ghost"), "{err}");
-    }
-
-    #[test]
-    fn fallback_missing_a_capability_is_rejected() {
-        // The fallback serves only embed, but the model needs chat.
-        let toml = r#"
-            [[providers]]
-            name = "openai"
-            kind = "openai"
-            [[providers.models]]
-            id = "gpt"
-            capabilities = ["chat"]
-            fallbacks = ["embed-only"]
-            [[providers.models]]
-            id = "embed-only"
-            capabilities = ["embed"]
-        "#;
-        let err = load_str(toml).unwrap_err();
-        assert!(err.to_string().contains("capability"), "{err}");
-    }
-
-    #[test]
-    fn self_fallback_is_rejected() {
-        let toml = r#"
-            [[providers]]
-            name = "openai"
-            kind = "openai"
-            [[providers.models]]
-            id = "gpt"
-            capabilities = ["chat"]
-            fallbacks = ["gpt"]
-        "#;
-        let err = load_str(toml).unwrap_err();
-        assert!(err.to_string().contains("itself"), "{err}");
+            [[virtual_models]]
+            id = "gpt-4o"
+            capability = "chat"
+            strategy = "fallback"
+            targets = [{ model = "openai/gpt-4o" }, { model = "claude" }]
+        "#,
+        )
+        .unwrap();
+        assert!(cfg.routing_table().unwrap().0.get("gpt-4o").is_some());
     }
 
     #[test]

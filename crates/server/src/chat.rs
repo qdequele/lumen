@@ -51,8 +51,9 @@ use crate::state::{AppState, StreamGuards};
 
 /// Handle a chat completion request (streaming or not, per `stream`).
 ///
-/// Both modes run through the M6 resilience executor: the requested model plus
-/// its configured fallbacks are tried in turn with retries, circuit breaking
+/// Both modes run through the M6 resilience executor: the attempts decided for
+/// the requested model (a virtual model's targets, ADR 014, or the foundation
+/// model alone) are tried in turn with retries, circuit breaking
 /// and the per-model timeouts (ADR 005). For streaming, retry/fallback happen
 /// while *opening* the upstream byte stream AND while peeking its first frame
 /// (ADR 005, 2026-07-15 amendment) - once the first content frame is forwarded

@@ -45,6 +45,45 @@ capabilities = ["chat"]
 }
 
 #[test]
+fn a_renamed_model_keeps_sending_its_old_upstream_id() {
+    // `gpt-4o` has no `upstream_id`, so it sent `gpt-4o` upstream. Renamed to
+    // `openai/gpt-4o`, it must still send `gpt-4o`, not its new id; an
+    // explicit `upstream_id` is kept as is.
+    let doc = r#"
+[[providers]]
+name = "openai"
+kind = "openai"
+[[providers.models]]
+id = "gpt-4o"
+capabilities = ["chat"]
+fallbacks = ["mini"]
+[[providers.models]]
+id = "mini"
+upstream_id = "gpt-4o-mini-2024-07-18"
+capabilities = ["chat"]
+fallbacks = ["gpt-4o"]
+"#;
+    let cfg = loads(&migrate_document(doc).unwrap().text);
+    let upstream = |id: &str| {
+        cfg.providers[0]
+            .models
+            .iter()
+            .find(|m| m.id == id)
+            .unwrap()
+            .resolved_upstream_id()
+            .to_owned()
+    };
+    assert_eq!(upstream("openai/gpt-4o"), "gpt-4o");
+    assert_eq!(upstream("openai/mini"), "gpt-4o-mini-2024-07-18");
+
+    let legacy: Config = toml::from_str(doc).unwrap();
+    let hint = hint_for(&legacy, "gpt-4o").unwrap();
+    assert!(hint.contains("upstream_id = \"gpt-4o\""), "{hint}");
+    let hint = hint_for(&legacy, "mini").unwrap();
+    assert!(!hint.contains("upstream_id"), "{hint}");
+}
+
+#[test]
 fn mutual_fallbacks_migrate_without_a_cycle() {
     let doc = r#"
 [[providers]]

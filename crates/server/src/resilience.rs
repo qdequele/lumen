@@ -1,10 +1,11 @@
 //! Server-side resilience runtime (M6): the process-wide circuit breakers plus
-//! the resolved retry policy, timeouts and fallback chains derived from config.
+//! the resolved retry policy, timeouts and compiled virtual models (ADR 014)
+//! derived from config.
 //!
 //! This is the glue between [`Config`](crate::config::Config) and the router's
-//! [`executor`](lumen_router::executor): the handlers ask it for a model's
-//! fallback chain ([`chain_ids`](ResilienceRuntime::chain_ids)) and the
-//! per-model execution knobs ([`exec_config`](ResilienceRuntime::exec_config)).
+//! [`executor`](lumen_router::executor): the handlers ask it for a request's
+//! attempts ([`decide`](ResilienceRuntime::decide)) and the per-model
+//! execution knobs ([`exec_config`](ResilienceRuntime::exec_config)).
 //! All state is in-memory; nothing here touches a database.
 
 use std::collections::HashMap;
@@ -69,8 +70,6 @@ struct ResiliencePolicy {
     default_timeouts: Timeouts,
     /// Per-model timeout overrides (inherited from the owning provider).
     model_timeouts: HashMap<String, Timeouts>,
-    /// Per-model ordered fallback chains (excludes the primary).
-    fallbacks: HashMap<String, Vec<String>>,
     /// Compiled virtual models (ADR 014), swapped with the rest of the policy
     /// on reload.
     routing: Arc<RoutingTable>,
@@ -118,7 +117,6 @@ impl ResiliencePolicy {
             },
             default_timeouts,
             model_timeouts,
-            fallbacks: config.fallback_map(),
             routing: Arc::new(routing),
         }
     }
@@ -131,7 +129,6 @@ impl ResiliencePolicy {
                 total: Duration::from_secs(600),
             },
             model_timeouts: HashMap::new(),
-            fallbacks: HashMap::new(),
             routing: Arc::new(RoutingTable::default()),
         }
     }
@@ -164,7 +161,7 @@ impl ResilienceRuntime {
         }
     }
 
-    /// A runtime with library defaults, no fallbacks and no gauge - used by
+    /// A runtime with library defaults, no virtual models and no gauge - used by
     /// tests and as the open-gateway baseline.
     #[must_use]
     pub fn defaults() -> Self {
@@ -174,7 +171,7 @@ impl ResilienceRuntime {
         }
     }
 
-    /// Atomically replace the derived policy (retry, timeouts, fallbacks) from a
+    /// Atomically replace the derived policy (retry, timeouts, virtual models) from a
     /// new config - the hot-reload entry point. Circuit-breaker state is left
     /// untouched, so an open circuit stays open across a reload.
     pub fn reload_policy(&self, config: &Config) {
@@ -204,22 +201,8 @@ impl ResilienceRuntime {
         self.map_policy(|p| p.retry = retry)
     }
 
-    /// The ordered chain of client-facing model ids to try for `model`: the
-    /// model itself first, then its configured fallbacks.
-    #[must_use]
-    pub fn chain_ids(&self, model: &str) -> Vec<String> {
-        let policy = self.policy.load();
-        let mut ids = Vec::with_capacity(1 + policy.fallbacks.get(model).map_or(0, Vec::len));
-        ids.push(model.to_owned());
-        if let Some(fallbacks) = policy.fallbacks.get(model) {
-            ids.extend(fallbacks.iter().cloned());
-        }
-        ids
-    }
-
     /// Decide the attempts for `model` (ADR 014): a virtual model's routing
-    /// tree, a foundation model's legacy `fallbacks` chain, or a direct
-    /// single attempt. Pure and in-memory: one policy snapshot, one random
+    /// tree or a direct single attempt on a foundation model. Pure and in-memory: one policy snapshot, one random
     /// draw per `split`.
     ///
     /// # Errors
@@ -233,15 +216,7 @@ impl ResilienceRuntime {
         use rand::Rng as _;
         let policy = self.policy.load();
         let mut draw = || rand::rng().next_u64();
-        let decision = policy.routing.decide(capability, model, facts, &mut draw)?;
-        if decision.virtual_model.is_none() {
-            if let Some(fallbacks) = policy.fallbacks.get(model) {
-                return Ok(Decision::linear(
-                    std::iter::once(model.to_owned()).chain(fallbacks.iter().cloned()),
-                ));
-            }
-        }
-        Ok(decision)
+        policy.routing.decide(capability, model, facts, &mut draw)
     }
 
     /// The current compiled virtual models (for `GET /v1/models` and the
@@ -280,37 +255,6 @@ mod tests {
     fn load(toml: &str) -> Config {
         let figment = Figment::new().merge(Toml::string(toml));
         figment.extract::<Config>().expect("valid config")
-    }
-
-    #[test]
-    fn chain_ids_is_primary_then_fallbacks() {
-        let cfg = load(
-            r#"
-            [[providers]]
-            name = "openai"
-            kind = "openai"
-            [[providers.models]]
-            id = "gpt"
-            capabilities = ["chat"]
-            fallbacks = ["claude", "mistral"]
-            [[providers]]
-            name = "anthropic"
-            kind = "anthropic"
-            [[providers.models]]
-            id = "claude"
-            capabilities = ["chat"]
-            [[providers]]
-            name = "mistral"
-            kind = "mistral"
-            [[providers.models]]
-            id = "mistral"
-            capabilities = ["chat"]
-        "#,
-        );
-        let rt = ResilienceRuntime::from_config(&cfg, None);
-        assert_eq!(rt.chain_ids("gpt"), vec!["gpt", "claude", "mistral"]);
-        // No fallbacks → just the model itself.
-        assert_eq!(rt.chain_ids("claude"), vec!["claude"]);
     }
 
     #[test]
@@ -372,7 +316,7 @@ mod tests {
     }
 
     #[test]
-    fn decide_routes_virtual_models_and_keeps_legacy_fallbacks() {
+    fn decide_routes_virtual_models_and_direct_ids() {
         let cfg: Config = toml::from_str(
             r#"
             [[providers]]
@@ -381,7 +325,6 @@ mod tests {
             [[providers.models]]
             id = "gpt"
             capabilities = ["chat"]
-            fallbacks = ["claude"]
             [[providers.models]]
             id = "claude"
             capabilities = ["chat"]
@@ -398,15 +341,15 @@ mod tests {
         let d = rt.decide(Capability::Chat, "v", &NoFacts).unwrap();
         assert_eq!(d.virtual_model.as_deref(), Some("v"));
         assert_eq!(d.primary_model(), "claude");
-        let legacy = rt.decide(Capability::Chat, "gpt", &NoFacts).unwrap();
-        let ids: Vec<&str> = legacy
+        // A foundation id is a direct single attempt, with no virtual model.
+        let direct = rt.decide(Capability::Chat, "gpt", &NoFacts).unwrap();
+        assert!(direct.virtual_model.is_none());
+        let ids: Vec<&str> = direct
             .attempts
             .iter()
             .map(|a| a.model_id.as_str())
             .collect();
-        assert_eq!(ids, vec!["gpt", "claude"]);
-        let direct = rt.decide(Capability::Chat, "claude", &NoFacts).unwrap();
-        assert_eq!(direct.attempts.len(), 1);
+        assert_eq!(ids, vec!["gpt"]);
         assert!(rt.routing().get("v").is_some());
     }
 

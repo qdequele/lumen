@@ -1558,9 +1558,9 @@ fn describe_validation_rejection(error: &ConfigLoadError) -> ApiError {
 // validate / persist / hot-reload sequence the whole-document `PUT
 // /admin/config` uses. A granular edit can therefore never produce a
 // document a restart would refuse, and a provider a validation-breaking edit
-// would orphan (e.g. still referenced by another model's fallback chain) is
-// rejected the same way the whole-document PUT would reject it - `LM-1001`
-// naming the dependent model, from `Config::validate_fallbacks`.
+// would orphan (e.g. still a target of a virtual model) is rejected the same
+// way the whole-document PUT would reject it - `LM-1001` naming the dependent
+// virtual model, from the virtual-model compilation in `Config::validate`.
 
 /// Parse the current document's raw text into a [`Config`] - deliberately
 /// WITHOUT the `LUMEN_*` environment overlay `Config::load` applies (see
@@ -1590,7 +1590,7 @@ fn config_from_document(text: &str) -> Result<Config, ApiError> {
 ///
 /// `config_edit`'s own doc comment is explicit that it never validates the
 /// edit it performs - a syntactically sound but semantically invalid result
-/// (e.g. a dangling fallback reference) is caught by `apply_document`'s
+/// (e.g. a dangling virtual-model target) is caught by `apply_document`'s
 /// later `validate_document` call, not here, and surfaces as `LM-1001`
 /// through that path instead. Reaching THIS function at all means the edit
 /// itself failed against a document that was already validated when it was
@@ -1693,7 +1693,7 @@ pub async fn get_provider(
 /// body would be a confusing way to rename a provider (delete the old one
 /// and PUT the new name instead). Every other field is policed by
 /// [`ProviderConfig`]'s own `deny_unknown_fields`. Requires `If-Match`; runs
-/// through the shared [`apply_document`] pipeline, so e.g. a fallback
+/// through the shared [`apply_document`] pipeline, so e.g. a virtual-model target
 /// reference this write would leave dangling is rejected exactly like the
 /// whole-document `PUT` would reject it.
 pub async fn put_provider(
@@ -1724,8 +1724,8 @@ pub async fn put_provider(
 /// # Errors
 /// `LM-1003` (404) when no provider with that name exists in the current
 /// document. `LM-1001` (400), from [`apply_document`]'s validation pass,
-/// when the provider is still referenced by another model's fallback chain
-/// - the rejection names the dependent model (`Config::validate_fallbacks`).
+/// when one of the provider's models is still a virtual-model target - the
+/// rejection names the dependent virtual model.
 pub async fn delete_provider(
     State(state): State<AppState>,
     Path(name): Path<String>,

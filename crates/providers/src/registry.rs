@@ -33,7 +33,6 @@ use crate::openai::OpenAiProvider;
 use crate::pinecone::PineconeProvider;
 use crate::tei::TeiProvider;
 use crate::together::TogetherRerankProvider;
-use crate::typesafe::rerank::{RerankTemplate, TypesafeRerankProvider};
 use crate::typesafe::TypesafeProvider;
 use crate::voyage::VoyageProvider;
 
@@ -48,10 +47,6 @@ pub struct ModelSpec {
     pub capabilities: Vec<Capability>,
     /// Declared input modalities (e.g. `["text","image"]`).
     pub modalities: Vec<String>,
-    /// Legacy per-model Jev rerank template (removed in Task 15 of the
-    /// virtual-models plan); `None` uses the default. Ignored by every other
-    /// kind.
-    pub rerank_template: Option<Arc<RerankTemplate>>,
     /// Operator-declared release date, surfaced on `GET /v1/models` so
     /// clients can sort by release. Metadata only: never used for routing.
     pub release_date: Option<ReleaseDate>,
@@ -516,7 +511,7 @@ fn build_inner(
             }
 
             if model.capabilities.contains(&Capability::Rerank) {
-                if let Some(provider) = rerank_provider(spec, model, &built) {
+                if let Some(provider) = &built.rerank {
                     inner.rerank.insert(
                         model.id.clone(),
                         RerankRoute {
@@ -548,27 +543,6 @@ fn build_inner(
     }
 
     Ok(inner)
-}
-
-/// The rerank provider serving `model`: TypeSafe converts rerank to
-/// SystemOne through a per-model template (ADR 013 amendment, ADR 014); every other
-/// kind shares its one rerank instance.
-fn rerank_provider(
-    spec: &ProviderSpec,
-    model: &ModelSpec,
-    built: &BuiltProviders,
-) -> Option<Arc<dyn RerankProvider>> {
-    if spec.kind == ProviderKind::Typesafe {
-        built.systemone.as_ref().map(|inner| {
-            Arc::new(TypesafeRerankProvider::new(
-                inner.clone(),
-                spec.name.clone(),
-                model.rerank_template.clone().unwrap_or_default(),
-            )) as Arc<dyn RerankProvider>
-        })
-    } else {
-        built.rerank.clone()
-    }
 }
 
 /// Whether an `ollama` base_url mistakenly carries the OpenAI-compatible
@@ -1151,7 +1125,6 @@ mod tests {
             upstream_id: id.to_owned(),
             capabilities: caps.to_vec(),
             modalities: vec!["text".to_owned()],
-            rerank_template: None,
             release_date: None,
         }
     }
@@ -1486,7 +1459,6 @@ mod tests {
                     upstream_id: "text-embedding-3-small".to_owned(),
                     capabilities: vec![Capability::Embed],
                     modalities: vec!["text".to_owned()],
-                    rerank_template: None,
                     release_date: None,
                 }],
             )],
@@ -1816,7 +1788,10 @@ mod tests {
     }
 
     #[test]
-    fn typesafe_serves_systemone_and_rerank_through_the_converter() {
+    fn typesafe_serves_systemone_only() {
+        // Jev reranks only through a virtual model `remap` (ADR 014): a
+        // typesafe model declaring `rerank` builds no rerank route (config
+        // validation rejects it before this point).
         let reg = Registry::build(
             vec![spec(
                 ProviderKind::Typesafe,
@@ -1834,10 +1809,7 @@ mod tests {
         let route = reg.systemone_route("jev").expect("systemone route");
         assert_eq!(route.provider_name, "typesafe");
         assert!(reg.rerank_route("jev").is_none());
-        let rerank = reg
-            .rerank_route("jev-rerank")
-            .expect("rerank via converter");
-        assert_eq!(rerank.provider_name, "typesafe");
+        assert!(reg.rerank_route("jev-rerank").is_none());
         assert!(reg.systemone_route("jev-rerank").is_none());
         assert!(reg.chat_route("jev").is_none());
         assert!(reg.embedding_route("jev").is_none());

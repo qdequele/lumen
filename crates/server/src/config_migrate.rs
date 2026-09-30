@@ -332,6 +332,11 @@ pub fn migrate_document(doc: &str) -> Result<Migration, MigrateError> {
                 continue;
             };
             if let Some(new_id) = plan.renames.get(&id) {
+                // Without an explicit upstream id the old id was sent
+                // upstream; pin it so the rename changes nothing upstream.
+                if !table.contains_key("upstream_id") {
+                    table["upstream_id"] = toml_edit::value(id.as_str());
+                }
                 table["id"] = toml_edit::value(new_id.as_str());
                 table.remove("fallbacks");
             }
@@ -389,19 +394,28 @@ pub fn hint_for(cfg: &Config, model_id: &str) -> Option<String> {
         virtual_models: [vm],
     })
     .ok()?;
-    let legacy_rerank = cfg
+    let owner = cfg
         .providers
         .iter()
         .flat_map(|p| p.models.iter().map(move |m| (p, m)))
-        .any(|(p, m)| m.id == model_id && is_legacy_rerank(p, m));
+        .find(|(_, m)| m.id == model_id);
+    let legacy_rerank = owner.is_some_and(|(p, m)| is_legacy_rerank(p, m));
+    // A rename keeps the upstream id the model sent before (its old id when
+    // it had no explicit `upstream_id`).
+    let pin = if owner.is_some_and(|(_, m)| m.upstream_id.is_none()) {
+        format!(", set `upstream_id = \"{model_id}\"`")
+    } else {
+        String::new()
+    };
     let mut steps = Vec::new();
     match plan.renames.get(model_id) {
         Some(new_id) if legacy_rerank => steps.push(format!(
-            "rename the foundation model to '{new_id}', remove `rerank` from its `capabilities`, \
-             delete its `[providers.models.rerank]` block and remove its `fallbacks`"
+            "rename the foundation model to '{new_id}'{pin}, remove `rerank` from its \
+             `capabilities`, delete its `[providers.models.rerank]` block and remove its \
+             `fallbacks`"
         )),
         Some(new_id) => steps.push(format!(
-            "rename the foundation model to '{new_id}' and remove its `fallbacks`"
+            "rename the foundation model to '{new_id}'{pin} and remove its `fallbacks`"
         )),
         None => steps.push("remove that foundation model entry".to_owned()),
     }

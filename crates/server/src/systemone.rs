@@ -2,7 +2,7 @@
 //!
 //! Flow: validate (the documented question contract, so a malformed question
 //! is a precise `LM-1001` rather than an opaque upstream `422`) → route
-//! (model → provider, with fallbacks) → admit (budget/quota, memory only) →
+//! (model → provider, with virtual-model fallbacks) → admit (budget/quota, memory only) →
 //! evaluate → account (input/output tokens, cost) → response. The body is
 //! TypeSafe's wire shape in both directions, so the TypeSafe SDKs work against
 //! the gateway via `TYPESAFE_BASE_URL`. A per-request [`CancellationToken`]

@@ -888,7 +888,8 @@ async fn put_config_rejects_a_boot_layer_key_in_db_mode_even_at_its_default_valu
 // ---- Task 8: granular admin config endpoints (ADR 012) --------------------
 
 /// A second file-mode fixture, distinct from [`CONFIG_TOML`]: two providers
-/// whose models form a fallback dependency (`primary-model` falls back to
+/// whose models form a fallback dependency (the virtual model
+/// `primary-model` falls back from `primary/primary-model` to
 /// `backup-model`, owned by a different provider), used only by the
 /// delete-still-referenced test below.
 const FALLBACK_CONFIG_TOML: &str = r#"# fleet config
@@ -897,9 +898,9 @@ name = "primary"
 kind = "openai"
 
 [[providers.models]]
-id = "primary-model"
+id = "primary/primary-model"
+upstream_id = "primary-model"
 capabilities = ["chat"]
-fallbacks = ["backup-model"]
 
 [[providers]]
 name = "backup"
@@ -908,6 +909,12 @@ kind = "openai"
 [[providers.models]]
 id = "backup-model"
 capabilities = ["chat"]
+
+[[virtual_models]]
+id = "primary-model"
+capability = "chat"
+strategy = "fallback"
+targets = [{ model = "primary/primary-model" }, { model = "backup-model" }]
 "#;
 
 /// (a) A `PUT` with a fresh hash applies (204); the new provider then shows
@@ -1023,10 +1030,10 @@ async fn put_provider_path_name_must_match_body_name() {
     assert_eq!(body["error"]["code"].as_str().expect("code"), "LM-1001");
 }
 
-/// (c) Deleting a provider whose model is still named as another model's
-/// fallback is refused: full validation runs inside `apply_document` and
-/// rejects with `LM-1001` naming the dependent model, exactly like the
-/// whole-document `PUT` would. Nothing is persisted.
+/// (c) Deleting a provider whose model is still a virtual model's fallback
+/// target is refused: full validation runs inside `apply_document` and
+/// rejects with `LM-1001` naming the dependent virtual model, exactly like
+/// the whole-document `PUT` would. Nothing is persisted.
 #[tokio::test]
 async fn delete_provider_still_referenced_by_a_fallback_is_rejected() {
     let h = spawn_admin_with_config(registry(), FALLBACK_CONFIG_TOML).await;
@@ -1038,8 +1045,8 @@ async fn delete_provider_still_referenced_by_a_fallback_is_rejected() {
     assert_eq!(body["error"]["code"].as_str().expect("code"), "LM-1001");
     let message = body["error"]["message"].as_str().expect("message");
     assert!(
-        message.contains("primary-model"),
-        "the rejection must name the dependent model: {message}"
+        message.contains("virtual model 'primary-model'"),
+        "the rejection must name the dependent virtual model: {message}"
     );
 
     let list: Value = h

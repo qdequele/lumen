@@ -1,7 +1,7 @@
 //! The resilience execution layer (M6, ADR 005).
 //!
 //! [`execute`] runs one capability call across a resolved fallback **chain**
-//! (the requested model followed by its configured fallbacks), applying - per
+//! (the attempts a virtual model decided, ADR 014), applying - per
 //! link - the circuit-breaker gate, a first-token timeout on each attempt, and
 //! the retry loop; and - across links - fallback when a link is exhausted or
 //! its breaker is open. Fallback follows each link's [`Escape`s](crate::triggers::Escape)
