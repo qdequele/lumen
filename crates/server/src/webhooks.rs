@@ -98,7 +98,7 @@ impl SigningKey {
 
     /// Hex HMAC-SHA256 of `body` under this key.
     #[must_use]
-    fn sign(&self, body: &[u8]) -> String {
+    pub(crate) fn sign(&self, body: &[u8]) -> String {
         // `new_from_slice` only rejects invalid key *lengths*, and HMAC
         // accepts any length, so this cannot fail for SHA-256.
         let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(&self.0)

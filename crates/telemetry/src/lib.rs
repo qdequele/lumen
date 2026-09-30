@@ -13,6 +13,7 @@ pub mod metrics;
 pub mod reload;
 pub mod resilience;
 pub mod tokens;
+pub mod usage_events;
 pub mod webhooks;
 
 pub use latency::LatencyMetrics;
@@ -21,4 +22,5 @@ pub use metrics::Metrics;
 pub use reload::ReloadMetrics;
 pub use resilience::ResilienceMetrics;
 pub use tokens::{Direction, TokenMetrics};
+pub use usage_events::UsageEventMetrics;
 pub use webhooks::WebhookMetrics;

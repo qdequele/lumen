@@ -30,6 +30,7 @@ pub mod routes;
 pub mod state;
 pub mod systemone;
 pub mod tokenizer;
+pub mod usage_events;
 pub mod webhooks;
 
 pub use app::build_app;
