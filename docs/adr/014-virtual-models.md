@@ -67,8 +67,9 @@ The goals are:
    hides a virtual model from `GET /v1/models` while it stays callable.
 
 3. **Typed fallback triggers (`fallback_on`).** Names: `provider_error`
-   (upstream 5xx including TypeSafe 529 Overloaded, malformed upstream
-   response, premature stream end before the first byte), `rate_limited`
+   (retryable upstream 5xx including TypeSafe 529 Overloaded, an unreachable
+   upstream, premature stream end before the first byte; a malformed response
+   and non-retryable upstream statuses never trigger a fallback), `rate_limited`
    (upstream 429), `timeout` (connect, first-token and per-attempt timeouts),
    `circuit_open`, plus the opt-in `context_length` and `content_filter`. A
    TypeSafe 529 is a retryable 5xx (ADR 013), so it matches `provider_error`,

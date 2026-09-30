@@ -103,7 +103,7 @@ its next target.
 
 | Trigger | Matches |
 |---|---|
-| `provider_error` | Upstream 5xx (a TypeSafe `529 Overloaded` is a retryable 5xx, so it is this trigger), an unreachable upstream, a malformed upstream response, a stream that ends before its first content frame (`LM-3002`, `LM-3003`, `LM-3010`). |
+| `provider_error` | Retryable upstream 5xx (`LM-3003`, including a TypeSafe `529 Overloaded`), an unreachable upstream, or a stream that ends before its first content frame (`LM-3010`). A malformed response (`LM-3002`) and non-retryable upstream statuses never trigger a fallback. |
 | `rate_limited` | Upstream 429 (`LM-3001`). |
 | `timeout` | Connect, first-token and per-attempt timeouts (`LM-3005`, `LM-3011`, `LM-3012`). |
 | `circuit_open` | The target's circuit breaker is open. |
@@ -118,8 +118,10 @@ its next target.
   plain client error, and nothing fails over. Classification is implemented
   for OpenAI and the OpenAI-compatible hosts, Anthropic, Google/Vertex,
   Bedrock, Mistral and Cohere.
-- **Never triggers:** any other client 4xx, a client cancellation (which never
-  touches a circuit breaker, [ADR 006](adr/006-client-cancellation-error-code.md)),
+- **Never triggers:** a malformed upstream response (`LM-3002`), a
+  non-retryable upstream status (for example a TypeSafe `401` or `422`, which
+  surface as `LM-3003` but are not retried), any other client 4xx, a client
+  cancellation (which never touches a circuit breaker, [ADR 006](adr/006-client-cancellation-error-code.md)),
   and any failure after the first streamed byte. Once a streaming response has
   delivered content the request is committed; a later error becomes an SSE
   error frame, never a fail-over ([Streaming](chat/streaming.md)).

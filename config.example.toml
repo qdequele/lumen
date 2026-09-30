@@ -698,9 +698,11 @@ capabilities = ["chat"]
 #   fallback_on  "fallback" and "split" only. Triggers that move to the next
 #                target. Default:
 #                ["provider_error", "rate_limited", "timeout", "circuit_open"]
-#                  provider_error  upstream 5xx (including a TypeSafe 529
-#                                  overload), malformed response, stream end
-#                                  before the first byte
+#                  provider_error  retryable upstream 5xx (including a
+#                                  TypeSafe 529 overload), unreachable
+#                                  upstream, stream end before the first
+#                                  byte. A malformed response (LM-3002) and
+#                                  non-retryable statuses never fail over
 #                  rate_limited    upstream 429
 #                  timeout         connect, first-token or attempt timeout
 #                  circuit_open    the leaf's circuit breaker is open
