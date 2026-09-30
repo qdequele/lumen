@@ -21,6 +21,7 @@ tokio-util = { workspace = true }
 futures = { workspace = true }
 dashmap = { workspace = true }
 tracing = { workspace = true }
+serde = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }

@@ -19,6 +19,10 @@ All notable changes to LUMEN are documented here. The format is based on
   Both fields are omitted for an undated model rather than reporting a
   misleading epoch 0. Metadata only: it never affects routing.
 
+### Changed
+
+- The resilience executor follows per-link escapes (typed fallback triggers, ADR 014); plain chains behave exactly as before.
+
 ## [0.5.0] - 2026-09-26
 
 ### Added

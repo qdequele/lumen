@@ -2332,6 +2332,7 @@ dependencies = [
  "futures",
  "providers",
  "reqwest",
+ "serde",
  "telemetry",
  "tokio",
  "tokio-util",

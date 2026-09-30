@@ -15,6 +15,7 @@ pub mod circuit;
 pub mod executor;
 pub mod peek;
 pub mod retry;
+pub mod triggers;
 
 use lumen_core::{Capability, GatewayError};
 use lumen_providers::{ChatRoute, EmbeddingRoute, Registry, RerankRoute, SystemOneRoute};
@@ -191,11 +192,14 @@ pub fn resolve_systemone_chain(
 /// Build the executor-facing [`Link`](executor::Link) metadata for a chat chain.
 #[must_use]
 pub fn chat_links(chain: &[ChatChainLink]) -> Vec<executor::Link> {
+    let n = chain.len();
     chain
         .iter()
-        .map(|l| executor::Link {
+        .enumerate()
+        .map(|(i, l)| executor::Link {
             provider_name: l.route.provider_name.clone(),
             model_id: l.model_id.clone(),
+            escapes: triggers::linear_escapes(i, n),
         })
         .collect()
 }
@@ -203,11 +207,14 @@ pub fn chat_links(chain: &[ChatChainLink]) -> Vec<executor::Link> {
 /// Build the executor-facing [`Link`](executor::Link) metadata for an embedding chain.
 #[must_use]
 pub fn embedding_links(chain: &[EmbeddingChainLink]) -> Vec<executor::Link> {
+    let n = chain.len();
     chain
         .iter()
-        .map(|l| executor::Link {
+        .enumerate()
+        .map(|(i, l)| executor::Link {
             provider_name: l.route.provider_name.clone(),
             model_id: l.model_id.clone(),
+            escapes: triggers::linear_escapes(i, n),
         })
         .collect()
 }
@@ -215,11 +222,14 @@ pub fn embedding_links(chain: &[EmbeddingChainLink]) -> Vec<executor::Link> {
 /// Build the executor-facing [`Link`](executor::Link) metadata for a rerank chain.
 #[must_use]
 pub fn rerank_links(chain: &[RerankChainLink]) -> Vec<executor::Link> {
+    let n = chain.len();
     chain
         .iter()
-        .map(|l| executor::Link {
+        .enumerate()
+        .map(|(i, l)| executor::Link {
             provider_name: l.route.provider_name.clone(),
             model_id: l.model_id.clone(),
+            escapes: triggers::linear_escapes(i, n),
         })
         .collect()
 }
@@ -227,11 +237,14 @@ pub fn rerank_links(chain: &[RerankChainLink]) -> Vec<executor::Link> {
 /// Build the executor-facing [`Link`](executor::Link) metadata for a SystemOne chain.
 #[must_use]
 pub fn systemone_links(chain: &[SystemOneChainLink]) -> Vec<executor::Link> {
+    let n = chain.len();
     chain
         .iter()
-        .map(|l| executor::Link {
+        .enumerate()
+        .map(|(i, l)| executor::Link {
             provider_name: l.route.provider_name.clone(),
             model_id: l.model_id.clone(),
+            escapes: triggers::linear_escapes(i, n),
         })
         .collect()
 }
