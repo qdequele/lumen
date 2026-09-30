@@ -22,9 +22,10 @@
 //! settle that already happens per request, and delivery is decoupled through
 //! a bounded queue (see [`events`](crate::events)).
 
+use crate::billing::{uuid_v7, BillingPolicy, UsageDelta, UsageEvent};
 use crate::events::{BudgetSignals, EventKind, EventScope, SignalCell, SignalState, Subject};
 use crate::key::hash_key;
-use crate::store::{GroupRecord, VirtualKeyRecord};
+use crate::store::{FlushRow, GroupRecord, OutboxInsert, VirtualKeyRecord};
 use arc_swap::{ArcSwap, ArcSwapOption};
 use dashmap::DashMap;
 use lumen_core::{BudgetScope, GatewayError, QuotaKind};
@@ -103,6 +104,9 @@ pub struct GroupEntry {
     signals: Arc<SignalCell>,
     /// Edge-trigger state for this pool's budget signals (ADR 011).
     signal_state: SignalState,
+    /// The control-plane account this pool is the lease of (ADR 015); swapped
+    /// by admin PATCH. `None` = the pool's keys are never billed.
+    account_ref: ArcSwapOption<String>,
 }
 
 impl GroupEntry {
@@ -115,6 +119,7 @@ impl GroupEntry {
             dirty: AtomicBool::new(false),
             signals,
             signal_state: SignalState::default(),
+            account_ref: ArcSwapOption::from(record.account_ref.clone().map(Arc::new)),
         }
     }
 
@@ -127,6 +132,8 @@ impl GroupEntry {
             record.budget_max.map_or(UNLIMITED, usd_to_micro),
             Ordering::SeqCst,
         );
+        self.account_ref
+            .store(record.account_ref.clone().map(Arc::new));
         // A changed cap starts a new budget epoch (ADR 011 §1).
         self.rearm_signals();
     }
@@ -214,6 +221,16 @@ pub struct KeyEntry {
     signals: Arc<SignalCell>,
     /// Edge-trigger state for this key's budget signals (ADR 011).
     signal_state: SignalState,
+    /// Control-plane key reference (ADR 015), reported as `api_key_id`.
+    external_ref: ArcSwapOption<String>,
+    /// Billing watermark, micro-USD (ADR 015). Read and written by the flush only.
+    billed_micro: AtomicI64,
+    /// Unix ms of the last flush that billed this key (boot time initially).
+    last_billed_ms: AtomicI64,
+    /// Settled requests since the last billed flush (informational units).
+    requests: AtomicI64,
+    /// Settled tokens since the last billed flush (informational units).
+    tokens: AtomicI64,
 }
 
 impl KeyEntry {
@@ -233,6 +250,11 @@ impl KeyEntry {
             name: ArcSwap::from_pointee(record.name.clone()),
             signals,
             signal_state: SignalState::default(),
+            external_ref: ArcSwapOption::from(record.external_ref.clone().map(Arc::new)),
+            billed_micro: AtomicI64::new(record.billed_micro),
+            last_billed_ms: AtomicI64::new(crate::now_unix_ms()),
+            requests: AtomicI64::new(0),
+            tokens: AtomicI64::new(0),
         };
         entry.apply_limits(record);
         entry
@@ -268,6 +290,9 @@ impl KeyEntry {
         self.expires_at
             .store(record.expires_at.unwrap_or(UNLIMITED), Ordering::SeqCst);
         self.disabled.store(record.disabled, Ordering::SeqCst);
+        // The billing watermark is NOT overwritten, like spend.
+        self.external_ref
+            .store(record.external_ref.clone().map(Arc::new));
         // A changed cap starts a new budget epoch (ADR 011 §1).
         self.rearm_signals();
     }
@@ -509,6 +534,12 @@ impl Reservation {
             adjust_window(&self.entry.tpm_window, self.minute, token_delta);
         }
         self.entry.dirty.store(true, Ordering::SeqCst);
+        // Informational billing units (ADR 015): two relaxed increments on the
+        // entry this settle already touches. Money never comes from these.
+        self.entry.requests.fetch_add(1, Ordering::Relaxed);
+        self.entry
+            .tokens
+            .fetch_add(actual_tokens.max(0), Ordering::Relaxed);
         self.settled = true;
 
         // Budget-threshold detection (ADR 011 §2), on the settle that has just
@@ -556,6 +587,9 @@ pub struct AuthState {
     /// (the default) = no `[webhooks]` block: entries do no detection work at
     /// all. Installed and swapped through [`set_signals`](Self::set_signals).
     signals: Arc<SignalCell>,
+    /// The billing policy (ADR 015); `None` = no `[usage_events]` block, every
+    /// key non-billable.
+    billing: ArcSwapOption<BillingPolicy>,
 }
 
 impl AuthState {
@@ -593,6 +627,24 @@ impl AuthState {
         for entry in &self.by_id {
             entry.rearm_signals();
         }
+    }
+
+    /// Install (or clear) the billing policy. Set once at boot from
+    /// `[usage_events]`; a boot-layer setting, never swapped by reload.
+    pub fn set_billing(&self, policy: Option<Arc<BillingPolicy>>) {
+        self.billing.store(policy);
+    }
+
+    /// The live billing policy, if `[usage_events]` is configured.
+    #[must_use]
+    pub fn billing(&self) -> Option<Arc<BillingPolicy>> {
+        self.billing.load_full()
+    }
+
+    /// Whether `[usage_events]` is configured (admin validation of `account_ref`).
+    #[must_use]
+    pub fn billing_enabled(&self) -> bool {
+        self.billing.load().is_some()
     }
 
     /// The live signalling policy, for callers that emit events of their own
@@ -807,6 +859,29 @@ impl AuthState {
         out
     }
 
+    /// Drain every dirty key into a [`FlushBatch`], marking them clean. Spend
+    /// landing mid-drain re-dirties the entry, exactly like [`drain_dirty`](Self::drain_dirty).
+    #[must_use]
+    pub fn drain_flush(&self, now_ms: i64) -> FlushBatch {
+        let billing_on = self.billing_enabled();
+        let items = self
+            .by_id
+            .iter()
+            .filter(|entry| entry.dirty.swap(false, Ordering::SeqCst))
+            .map(|entry| entry.value().flush_item(billing_on, now_ms))
+            .collect();
+        FlushBatch { items }
+    }
+
+    /// A [`FlushBatch`] for one key already evicted from the table (admin
+    /// delete), so its last spend is persisted and billed.
+    #[must_use]
+    pub fn flush_evicted(&self, entry: &Arc<KeyEntry>, now_ms: i64) -> FlushBatch {
+        FlushBatch {
+            items: vec![entry.flush_item(self.billing_enabled(), now_ms)],
+        }
+    }
+
     /// Collect `(group id, pool spend USD)` for every group whose spend
     /// changed since the last call, marking them clean - the group half of
     /// [`drain_dirty`](Self::drain_dirty), with the same re-dirtying
@@ -823,6 +898,165 @@ impl AuthState {
             }
         }
         out
+    }
+}
+
+/// One key's contribution to a budget flush (ADR 015).
+#[derive(Debug)]
+struct FlushItem {
+    entry: Arc<KeyEntry>,
+    spent_micro: i64,
+    billed_after_micro: i64,
+    delta: Option<UsageDelta>,
+}
+
+/// A drained budget flush: every key's spend and watermark to persist, and
+/// the usage deltas to bill, captured from ONE read of each key's spend.
+/// Persist it, then [`commit`](Self::commit) on success or
+/// [`rollback`](Self::rollback) on failure.
+#[derive(Debug, Default)]
+pub struct FlushBatch {
+    items: Vec<FlushItem>,
+}
+
+impl FlushBatch {
+    /// Nothing to persist.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    /// The rows for [`KeyStore::persist_flush`](crate::store::KeyStore::persist_flush).
+    #[must_use]
+    pub fn rows(&self) -> Vec<FlushRow> {
+        self.items
+            .iter()
+            .map(|item| FlushRow {
+                key_id: item.entry.id.clone(),
+                spent_usd: micro_to_usd(item.spent_micro),
+                billed_micro: item.billed_after_micro,
+            })
+            .collect()
+    }
+
+    /// The billable deltas in this batch.
+    #[must_use]
+    pub fn deltas(&self) -> Vec<&UsageDelta> {
+        self.items
+            .iter()
+            .filter_map(|item| item.delta.as_ref())
+            .collect()
+    }
+
+    /// One serialized outbox row per delta, each with a fresh UUIDv7 id.
+    ///
+    /// # Errors
+    /// Serialization failure (not expected for these plain structs).
+    pub fn outbox_inserts(
+        &self,
+        source: &str,
+        now_ms: i64,
+    ) -> Result<Vec<OutboxInsert>, serde_json::Error> {
+        self.deltas()
+            .into_iter()
+            .map(|delta| {
+                let id = uuid_v7(now_ms);
+                let body =
+                    serde_json::to_string(&UsageEvent::from_delta(id.clone(), delta, source))?;
+                Ok(OutboxInsert {
+                    id,
+                    body,
+                    created_ms: now_ms,
+                })
+            })
+            .collect()
+    }
+
+    /// The flush was persisted: move each watermark, and each billed key's
+    /// window start.
+    pub fn commit(&self) {
+        for item in &self.items {
+            item.entry
+                .billed_micro
+                .store(item.billed_after_micro, Ordering::SeqCst);
+            if let Some(delta) = &item.delta {
+                item.entry
+                    .last_billed_ms
+                    .store(delta.window_end_ms, Ordering::SeqCst);
+            }
+        }
+    }
+
+    /// The flush failed: leave watermarks, re-dirty every key so an idle key
+    /// is retried, and give the swapped-out units back.
+    pub fn rollback(&self) {
+        for item in &self.items {
+            item.entry.dirty.store(true, Ordering::SeqCst);
+            if let Some(delta) = &item.delta {
+                item.entry
+                    .requests
+                    .fetch_add(delta.requests, Ordering::Relaxed);
+                item.entry.tokens.fetch_add(delta.tokens, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+impl KeyEntry {
+    /// Build this key's flush item under the billing rule (ADR 015).
+    fn flush_item(self: &Arc<Self>, billing_on: bool, now_ms: i64) -> FlushItem {
+        let spent = self.spent_micro.load(Ordering::SeqCst);
+        let billed = self.billed_micro.load(Ordering::SeqCst);
+        let billable = billing_on
+            .then(|| self.group.load_full())
+            .flatten()
+            .and_then(|group| {
+                group
+                    .account_ref
+                    .load_full()
+                    .map(|account| (group, account))
+            });
+        let Some((group, account)) = billable else {
+            // Not billed: keep the watermark caught up so the key never bills
+            // this spend if it becomes billable later; units are discarded.
+            self.requests.swap(0, Ordering::Relaxed);
+            self.tokens.swap(0, Ordering::Relaxed);
+            return FlushItem {
+                entry: Arc::clone(self),
+                spent_micro: spent,
+                billed_after_micro: spent,
+                delta: None,
+            };
+        };
+        if spent <= billed {
+            // A refund below the watermark: hold it, the next positive delta absorbs it.
+            return FlushItem {
+                entry: Arc::clone(self),
+                spent_micro: spent,
+                billed_after_micro: billed,
+                delta: None,
+            };
+        }
+        let max = group.budget_max_micro.load(Ordering::SeqCst);
+        let delta = UsageDelta {
+            key_id: self.id.clone(),
+            account_ref: account.as_str().to_owned(),
+            external_ref: self.external_ref.load_full().map(|r| r.as_str().to_owned()),
+            cost_micro: spent - billed,
+            requests: self.requests.swap(0, Ordering::Relaxed),
+            tokens: self.tokens.swap(0, Ordering::Relaxed),
+            window_start_ms: self.last_billed_ms.load(Ordering::SeqCst),
+            window_end_ms: now_ms,
+            group_id: group.id.clone(),
+            group_spent_micro: group.spent_micro.load(Ordering::SeqCst),
+            group_budget_max_micro: (max != UNLIMITED).then_some(max),
+        };
+        FlushItem {
+            entry: Arc::clone(self),
+            spent_micro: spent,
+            billed_after_micro: spent,
+            delta: Some(delta),
+        }
     }
 }
 
