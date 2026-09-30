@@ -213,7 +213,8 @@ const MAX_REF_LEN: usize = 128;
 /// configured (the Lab rejects any other `account_id`).
 fn validate_ref(field: &str, value: Option<&str>, must_be_uuid: bool) -> Result<(), ApiError> {
     let Some(value) = value else { return Ok(()) };
-    if value.is_empty() || value.len() > MAX_REF_LEN {
+    let chars = value.chars().count();
+    if chars == 0 || chars > MAX_REF_LEN {
         return Err(GatewayError::InvalidRequest(format!(
             "`{field}` must be 1 to {MAX_REF_LEN} characters"
         ))
@@ -226,6 +227,26 @@ fn validate_ref(field: &str, value: Option<&str>, must_be_uuid: bool) -> Result<
         .into());
     }
     Ok(())
+}
+
+/// Bill settled spend before a change that alters billability (ADR 015),
+/// failing closed: if the flush did not persist, the change must not apply,
+/// or the next flush would bill the prior spend to the wrong account (or
+/// never). Inert while `[usage_events]` is absent, where billability is moot.
+async fn flush_before_billability_change(
+    runtime: &Arc<crate::auth::AuthRuntime>,
+) -> Result<(), ApiError> {
+    if !runtime.keys.billing_enabled() {
+        return Ok(());
+    }
+    if crate::budget_flush::flush_detached(runtime).await {
+        Ok(())
+    } else {
+        Err(GatewayError::Internal(
+            "could not settle pending usage before the change; retry".to_owned(),
+        )
+        .into())
+    }
 }
 
 /// Create a virtual key.
@@ -307,7 +328,7 @@ pub async fn patch_key(
     // A group move changes which account the key's spend bills to: bill what
     // is already settled under the membership in force when it was spent.
     if patch.group_id.is_some() {
-        crate::budget_flush::flush_detached(shared).await;
+        flush_before_billability_change(shared).await?;
     }
     let updated = auth
         .store
@@ -471,7 +492,7 @@ pub async fn patch_group(
     // to: bill what is already settled under the account in force when it was
     // spent.
     if patch.account_ref.is_some() {
-        crate::budget_flush::flush_detached(shared).await;
+        flush_before_billability_change(shared).await?;
     }
     let updated = auth
         .store

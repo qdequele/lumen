@@ -211,6 +211,19 @@ async fn refs_are_bounded_and_non_empty() {
 async fn patching_refs_validates_them_too() {
     let (base, runtime) = spawn(true).await;
     let gid = create_group(&base, ACCOUNT).await;
+    let other = create_group(&base, OTHER_ACCOUNT).await;
+    let (_, key) = call(
+        &base,
+        reqwest::Method::POST,
+        "/admin/keys",
+        Some(json!({"name":"k","group_id":gid})),
+    )
+    .await;
+    let kid = key["id"].as_str().unwrap();
+    // Settled spend is waiting to be flushed: a rejected patch must not
+    // flush it.
+    spend(&runtime, key["key"].as_str().unwrap(), 250_000);
+
     let (s, err) = call(
         &base,
         reqwest::Method::PATCH,
@@ -220,24 +233,178 @@ async fn patching_refs_validates_them_too() {
     .await;
     assert_eq!(s, 400);
     assert_eq!(err["error"]["code"], "LM-1001");
-    let (_, key) = call(
-        &base,
-        reqwest::Method::POST,
-        "/admin/keys",
-        Some(json!({"name":"k"})),
-    )
-    .await;
-    let kid = key["id"].as_str().unwrap();
     let (s, _) = call(
         &base,
         reqwest::Method::PATCH,
         &format!("/admin/keys/{kid}"),
-        Some(json!({"external_ref":""})),
+        Some(json!({"group_id": other, "external_ref":""})),
     )
     .await;
     assert_eq!(s, 400);
-    // A rejected patch never flushes: nothing was spent, nothing is queued.
+    assert!(
+        events(&runtime).await.is_empty(),
+        "a rejected patch never flushes"
+    );
+
+    flush_budgets(&runtime, 10_000).await;
+    assert_eq!(events(&runtime).await, vec![(ACCOUNT.to_owned(), 250_000)]);
+}
+
+#[tokio::test]
+async fn refs_are_counted_in_characters_not_bytes() {
+    let (base, _) = spawn(false).await;
+    // 128 two-byte characters: 256 bytes, but within the 128-character limit.
+    let (s, _) = call(
+        &base,
+        reqwest::Method::POST,
+        "/admin/keys",
+        Some(json!({"name":"k","external_ref":"é".repeat(128)})),
+    )
+    .await;
+    assert_eq!(s, 201);
+    let (s, _) = call(
+        &base,
+        reqwest::Method::POST,
+        "/admin/keys",
+        Some(json!({"name":"k","external_ref":"é".repeat(129)})),
+    )
+    .await;
+    assert_eq!(s, 400);
+}
+
+#[tokio::test]
+async fn a_patch_that_cannot_change_billability_does_not_flush() {
+    let (base, runtime) = spawn(true).await;
+    let gid = create_group(&base, ACCOUNT).await;
+    let (_, key) = call(
+        &base,
+        reqwest::Method::POST,
+        "/admin/keys",
+        Some(json!({"name":"k","group_id":gid})),
+    )
+    .await;
+    let kid = key["id"].as_str().unwrap();
+    spend(&runtime, key["key"].as_str().unwrap(), 250_000);
+    let (s, _) = call(
+        &base,
+        reqwest::Method::PATCH,
+        &format!("/admin/keys/{kid}"),
+        Some(json!({"budget_max": 9.0})),
+    )
+    .await;
+    assert_eq!(s, 200);
+    let (s, _) = call(
+        &base,
+        reqwest::Method::PATCH,
+        &format!("/admin/groups/{gid}"),
+        Some(json!({"budget_max": 9.0})),
+    )
+    .await;
+    assert_eq!(s, 200);
     assert!(events(&runtime).await.is_empty());
+}
+
+/// Make every outbox insert fail, so a flush with billable spend fails.
+async fn break_outbox(runtime: &AuthRuntime) {
+    sqlx::query(
+        "CREATE TRIGGER fail_outbox BEFORE INSERT ON usage_outbox \
+         BEGIN SELECT RAISE(ABORT, 'test'); END",
+    )
+    .execute(runtime.store.pool())
+    .await
+    .unwrap();
+}
+
+async fn repair_outbox(runtime: &AuthRuntime) {
+    sqlx::query("DROP TRIGGER fail_outbox")
+        .execute(runtime.store.pool())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_failed_pre_change_flush_blocks_the_key_move() {
+    let (base, runtime) = spawn(true).await;
+    let g1 = create_group(&base, ACCOUNT).await;
+    let g2 = create_group(&base, OTHER_ACCOUNT).await;
+    let (_, key) = call(
+        &base,
+        reqwest::Method::POST,
+        "/admin/keys",
+        Some(json!({"name":"k","group_id":g1})),
+    )
+    .await;
+    let plain = key["key"].as_str().unwrap();
+    let kid = key["id"].as_str().unwrap();
+    spend(&runtime, plain, 250_000);
+
+    break_outbox(&runtime).await;
+    let (s, err) = call(
+        &base,
+        reqwest::Method::PATCH,
+        &format!("/admin/keys/{kid}"),
+        Some(json!({"group_id": g2})),
+    )
+    .await;
+    assert_eq!(s, 500);
+    assert_eq!(err["error"]["code"], "LM-5001");
+    let stored = runtime.store.list_keys(false).await.unwrap();
+    assert_eq!(stored[0].group_id.as_deref(), Some(g1.as_str()));
+
+    repair_outbox(&runtime).await;
+    let (s, _) = call(
+        &base,
+        reqwest::Method::PATCH,
+        &format!("/admin/keys/{kid}"),
+        Some(json!({"group_id": g2})),
+    )
+    .await;
+    assert_eq!(s, 200);
+    flush_budgets(&runtime, 10_000).await;
+    assert_eq!(
+        events(&runtime).await,
+        vec![(ACCOUNT.to_owned(), 250_000)],
+        "the retry bills the prior spend to the old account"
+    );
+}
+
+#[tokio::test]
+async fn a_failed_pre_change_flush_blocks_the_account_ref_change() {
+    let (base, runtime) = spawn(true).await;
+    let g1 = create_group(&base, ACCOUNT).await;
+    let (_, key) = call(
+        &base,
+        reqwest::Method::POST,
+        "/admin/keys",
+        Some(json!({"name":"k","group_id":g1})),
+    )
+    .await;
+    spend(&runtime, key["key"].as_str().unwrap(), 250_000);
+
+    break_outbox(&runtime).await;
+    let (s, err) = call(
+        &base,
+        reqwest::Method::PATCH,
+        &format!("/admin/groups/{g1}"),
+        Some(json!({"account_ref": OTHER_ACCOUNT})),
+    )
+    .await;
+    assert_eq!(s, 500);
+    assert_eq!(err["error"]["code"], "LM-5001");
+    let stored = runtime.store.list_groups(false).await.unwrap();
+    assert_eq!(stored[0].account_ref.as_deref(), Some(ACCOUNT));
+
+    repair_outbox(&runtime).await;
+    let (s, _) = call(
+        &base,
+        reqwest::Method::PATCH,
+        &format!("/admin/groups/{g1}"),
+        Some(json!({"account_ref": OTHER_ACCOUNT})),
+    )
+    .await;
+    assert_eq!(s, 200);
+    flush_budgets(&runtime, 10_000).await;
+    assert_eq!(events(&runtime).await, vec![(ACCOUNT.to_owned(), 250_000)]);
 }
 
 #[tokio::test]
