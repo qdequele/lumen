@@ -1250,6 +1250,35 @@ fn report_migration_notes(notes: &[String]) {
     }
 }
 
+/// Replace the file at `path` with `text` atomically (staging file + rename)
+/// while keeping what the operator set on it: a symlink stays a symlink (its
+/// target is rewritten), and the target's permission bits carry over. On Unix
+/// the owner and group are carried over too when this process may set them
+/// (for example when run through `sudo`); otherwise they are left as created.
+fn replace_file_in_place(path: &Path, text: &str) -> anyhow::Result<()> {
+    let target = std::fs::canonicalize(path)
+        .with_context(|| format!("failed to resolve '{}'", path.display()))?;
+    let meta = std::fs::metadata(&target)
+        .with_context(|| format!("failed to read the metadata of '{}'", target.display()))?;
+    let mut staging_name = target
+        .file_name()
+        .map(std::ffi::OsStr::to_os_string)
+        .unwrap_or_default();
+    staging_name.push(".migrating");
+    let staging = target.with_file_name(staging_name);
+    std::fs::write(&staging, text).context("failed to write the migrated config")?;
+    std::fs::set_permissions(&staging, meta.permissions())
+        .context("failed to copy the config file's permissions")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // Best effort: only a privileged process may give a file away.
+        let _ = std::os::unix::fs::chown(&staging, Some(meta.uid()), Some(meta.gid()));
+    }
+    std::fs::rename(&staging, &target).context("failed to replace the config file")?;
+    Ok(())
+}
+
 /// The fallible body of [`run_config_migrate`]: file mode rewrites the boot
 /// file (backup first, then staging file + rename); DB mode rewrites the
 /// stored document through the compare-and-swap `persist`.
@@ -1278,10 +1307,7 @@ fn run_config_migrate_inner(path: &Path, dry_run: bool) -> anyhow::Result<()> {
             let backup = path.with_extension("toml.bak");
             std::fs::copy(path, &backup)
                 .with_context(|| format!("failed to back up to '{}'", backup.display()))?;
-            let staging = path.with_extension("toml.migrating");
-            std::fs::write(&staging, &migration.text)
-                .context("failed to write the migrated config")?;
-            std::fs::rename(&staging, path).context("failed to replace the config file")?;
+            replace_file_in_place(path, &migration.text)?;
             println!("migrated '{label}' (backup: '{}')", backup.display());
             Ok(())
         }
