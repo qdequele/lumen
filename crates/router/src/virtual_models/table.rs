@@ -25,6 +25,13 @@ use crate::triggers::Triggers;
 /// Most virtual models on one path from a requested id to a foundation leaf.
 pub const MAX_DEPTH: usize = 8;
 
+/// Most attempts one request to a virtual model can flatten into. A
+/// `fallback` or `split` counts the attempts of every target, a `switch` only
+/// its largest branch (one branch is taken per request) and a foundation
+/// target counts 1. Bounds the per-request decide work of a DAG that lists
+/// the same child several times per level.
+pub const MAX_ATTEMPTS: usize = 64;
+
 /// What compilation needs to know about the foundation models.
 #[derive(Debug, Clone, Default)]
 pub struct FoundationIndex {
@@ -81,6 +88,9 @@ pub struct VirtualModel {
     /// Most virtual models on any path from this one down to a foundation
     /// leaf, itself included (1 when every target is a foundation model).
     height: usize,
+    /// Most attempts a request to this model flattens into (at most
+    /// [`MAX_ATTEMPTS`]).
+    attempts: usize,
 }
 
 impl std::fmt::Debug for VirtualModel {
@@ -253,6 +263,16 @@ impl Compiler<'_> {
         };
         validate_shape(config).map_err(err)?;
 
+        // Bound the recursion before descending: a chain of thousands of
+        // models would otherwise overflow the stack (an abort, not an error).
+        // Reported on the outermost model of the path, as the height check
+        // below does for memoised children.
+        if self.stack.len() >= MAX_DEPTH {
+            return Err(RoutingConfigError {
+                model: self.stack[0].clone(),
+                message: format!("nesting is deeper than {MAX_DEPTH} virtual models"),
+            });
+        }
         self.stack.push(id.to_owned());
         let mut targets = Vec::with_capacity(config.targets.len());
         let mut modalities: Option<Vec<String>> = None;
@@ -279,6 +299,12 @@ impl Compiler<'_> {
         if height > MAX_DEPTH {
             return Err(err(format!(
                 "nesting is deeper than {MAX_DEPTH} virtual models"
+            )));
+        }
+        let attempts = attempt_count(config.strategy, &targets);
+        if attempts > MAX_ATTEMPTS {
+            return Err(err(format!(
+                "expands to {attempts} attempts per request; the limit is {MAX_ATTEMPTS}"
             )));
         }
 
@@ -309,6 +335,7 @@ impl Compiler<'_> {
             preset,
             modalities: modalities.unwrap_or_default(),
             height,
+            attempts,
         });
         self.done.insert(id.to_owned(), model.clone());
         Ok(model)
@@ -401,6 +428,21 @@ impl Compiler<'_> {
             },
             mods,
         ))
+    }
+}
+
+/// Attempts a request flattens into, from the compiled (memoised) children.
+/// Saturates so a wide DAG cannot overflow before the limit check.
+fn attempt_count(strategy: StrategyKind, targets: &[Target]) -> usize {
+    let each = targets.iter().map(|t| match &t.node {
+        Node::Foundation(_) => 1,
+        Node::Virtual(child) => child.attempts,
+    });
+    match strategy {
+        StrategyKind::Switch => each.max().unwrap_or(0),
+        StrategyKind::Single | StrategyKind::Fallback | StrategyKind::Split => {
+            each.fold(0, usize::saturating_add)
+        }
     }
 }
 
@@ -800,6 +842,60 @@ mod tests {
             assert!(too_deep.contains("deeper than 8"), "{too_deep}");
             assert!(compile(&chain_toml(8, reverse)).is_ok());
         }
+    }
+
+    #[test]
+    fn a_very_long_chain_is_rejected_without_overflowing_the_stack() {
+        for reverse in [false, true] {
+            let too_deep = err(&chain_toml(2_000, reverse));
+            assert!(too_deep.contains("deeper than 8"), "{too_deep}");
+        }
+    }
+
+    /// `depth` levels of `fallback` models, each listing the level below
+    /// `width` times; the bottom level lists `gpt-4o` `width` times.
+    fn fan_out_toml(depth: usize, width: usize) -> String {
+        (0..depth)
+            .map(|i| {
+                let target = if i + 1 == depth {
+                    "gpt-4o".to_owned()
+                } else {
+                    format!("l{}", i + 1)
+                };
+                let targets = vec![format!("{{ model = \"{target}\" }}"); width].join(", ");
+                format!(
+                    "[[virtual_models]]\nid = \"l{i}\"\ncapability = \"chat\"\nstrategy = \"fallback\"\ntargets = [{targets}]\n"
+                )
+            })
+            .collect::<Vec<String>>()
+            .concat()
+    }
+
+    #[test]
+    fn the_flattened_attempt_count_is_capped() {
+        // 4 x 4 x 4 = 64 attempts: exactly the limit.
+        assert!(compile(&fan_out_toml(3, 4)).is_ok());
+        // 4^4 = 256 attempts.
+        let e = err(&fan_out_toml(4, 4));
+        assert!(e.contains("virtual model 'l0'"), "{e}");
+        assert!(
+            e.contains("expands to 256 attempts per request; the limit is 64"),
+            "{e}"
+        );
+        // A switch takes one branch, so it counts its largest branch only.
+        let switch = format!(
+            "{}[[virtual_models]]\nid = \"w\"\ncapability = \"chat\"\nstrategy = \"switch\"\n\
+             targets = [{{ when = {{ group = \"a\" }}, model = \"l0\" }}, {{ when = {{ group = \"b\" }}, model = \"l0\" }}, {{ model = \"l0\" }}]\n",
+            fan_out_toml(3, 4)
+        );
+        assert!(compile(&switch).is_ok());
+        // A fallback over the same 64-attempt child twice is 128.
+        let doubled = format!(
+            "{}[[virtual_models]]\nid = \"f\"\ncapability = \"chat\"\nstrategy = \"fallback\"\n\
+             targets = [{{ model = \"l0\" }}, {{ model = \"l0\" }}]\n",
+            fan_out_toml(3, 4)
+        );
+        assert!(err(&doubled).contains("expands to 128 attempts"));
     }
 
     #[test]

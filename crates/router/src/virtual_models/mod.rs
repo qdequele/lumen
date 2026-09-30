@@ -14,4 +14,6 @@ pub use condition::{Condition, FactSource};
 pub use config::VirtualModelConfig;
 pub use decide::{Attempt, Decision};
 pub use overrides::{Overridable, Overrides, Preset};
-pub use table::{FoundationIndex, RoutingConfigError, RoutingTable, VirtualModel, MAX_DEPTH};
+pub use table::{
+    FoundationIndex, RoutingConfigError, RoutingTable, VirtualModel, MAX_ATTEMPTS, MAX_DEPTH,
+};

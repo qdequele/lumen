@@ -81,7 +81,7 @@ targets = [{ model = "openai/gpt-4o", weight = 80 }, { model = "azure-gpt-4o", w
 
 A target's `model` may be another virtual model, so a fallback can point at a
 split, a switch branch at a fallback, and so on. At load (boot, reload, and
-every admin write) the gateway checks, in this order, and reports the first
+every admin write) the gateway checks the following and reports the first
 failure with the virtual model id and the reason:
 
 1. every `model` reference exists;
@@ -91,7 +91,11 @@ failure with the virtual model id and the reason:
 4. no cycles (the error prints the path, for example `a -> b -> a`);
 5. nesting depth at most **8** virtual models from the requested id down to a
    foundation model;
-6. the contents of `overrides`, `preset` and `remap`.
+6. at most **64** attempts per request: a `fallback` or `split` counts the
+   attempts of every target, a `switch` only its largest branch, and a
+   foundation target counts 1 (a DAG that lists the same child several times
+   per level multiplies quickly; the error names the model and its count);
+7. the contents of `overrides`, `preset` and `remap`.
 
 A `preset` on a virtual model that is only reached through another one is
 ignored at request time (section 6), and loading logs a warning.

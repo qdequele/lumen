@@ -56,13 +56,17 @@ The goals are:
      points at.
 
    Targets are foundation ids or other virtual ids (composition by
-   reference). Load-time validation, in order: references exist; strategy
+   reference). Load-time validation: references exist; strategy
    shape (`single` has 1 target, `fallback` and `split` at least 2, `switch`
    has `when` on every target but the last and none on the last, `when` only
    under `switch`, `weight` only under `split`, `fallback_on` only on
    `fallback`/`split`, `preset` only on `chat`); capability compatibility (or
    a `remap`); no cycles (the error prints the path, e.g. `a -> b -> a`);
-   nesting depth at most 8; contents of `overrides`, `preset` and `remap`.
+   nesting depth at most 8; at most 64 flattened attempts per request
+   (`MAX_ATTEMPTS`: a `fallback` or `split` sums its targets, a `switch`
+   takes its largest branch, a foundation target is 1), so a DAG listing the
+   same child several times per level cannot blow up the decide step;
+   contents of `overrides`, `preset` and `remap`.
    Validation runs at boot, reload and on every admin write. `listed = false`
    hides a virtual model from `GET /v1/models` while it stays callable.
 
