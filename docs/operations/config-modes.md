@@ -252,7 +252,7 @@ requires a restart, since `config_source` is itself boot-layer.
    dynamic layer together, see the admin API table above) - it still needs
    step 4 below before it is a valid db-mode candidate.
 2. Edit the boot TOML: set `config_source = "db"`, and strip every
-   dynamic-layer key (`[[providers]]`, `[resilience]`, `[tokenizer]`,
+   dynamic-layer key (`[[providers]]`, `[[virtual_models]]`, `[resilience]`, `[tokenizer]`,
    `[image_fetch]`, `[webhooks]`, and `auth.flush_interval_ms` /
    `auth.retention_days`) - the boot file must contain only boot-layer keys
    once db mode is selected. Confirm `auth.enabled = true`.

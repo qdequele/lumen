@@ -31,7 +31,13 @@ lumen config migrate -c /etc/lumen/config.toml             # rewrite, keeps a .b
 lumen --check-config --config /etc/lumen/config.toml
 ```
 
-Clients keep sending the same ids, but `usage_log.model_used` and the
+Clients keep sending the same ids, with one exception: a migrated model that
+declared several capabilities keeps only the first one under its old id.
+Calls to that id for the other capabilities return `LM-2002` until you add a
+virtual model for them (or point those clients at `<provider>/<id>`, which
+serves every capability without fallback). The migration prints a note for
+each such model, so read the `--dry-run` output and settle them before
+rolling out. `usage_log.model_used` and the
 Prometheus model labels of renamed foundation models change (for example
 `gpt-4o` becomes `openai/gpt-4o`), so update dashboards and queries that
 filter on them. Migration 0010 adds the nullable `usage_log.route` column.
