@@ -38,14 +38,15 @@ use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
 use bytes::Bytes;
 use futures::stream::{BoxStream, StreamExt};
-use lumen_core::{tokens, ChatRequest, GatewayError, ProviderError, Usage};
+use lumen_core::{tokens, Capability, ChatRequest, GatewayError, ProviderError, Usage};
 use tokio_util::sync::{CancellationToken, DropGuard};
 
 use crate::accounting::{Accounting, Outcome, StreamAccounting, Target, TokenBreakdown};
 use crate::auth::AuthedKey;
 use crate::error::ApiError;
+use crate::facts::Facts;
 use crate::pricing::DEFAULT_RESERVED_OUTPUT_TOKENS;
-use crate::resilience::model_used_headers;
+use crate::resilience::routing_headers;
 use crate::state::{AppState, StreamGuards};
 
 /// Handle a chat completion request (streaming or not, per `stream`).
@@ -70,19 +71,33 @@ pub async fn chat(
     // `PAYLOAD_TOO_LARGE` - verified empirically (a debug probe in this
     // `map_err` never fired for an over-limit request). `app::map_body_limit_response`
     // rewrites that bare 413 into the `LM-1002` envelope instead.
-    let Json(req) = payload.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
+    let Json(mut req) = payload.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
 
     if req.messages.is_empty() {
         return Err(GatewayError::InvalidRequest("`messages` must not be empty".to_owned()).into());
     }
 
-    // Resolve the requested model to a fallback chain (M6 §6.2).
+    // Decide the attempts (ADR 014): a virtual model's routing tree, a
+    // foundation model's chain, or the model alone. Facts are dropped before
+    // any `.await`.
     let client_model = req.model.clone();
-    let chain_ids = state.resilience.chain_ids(&client_model);
-    let chain = lumen_router::resolve_chat_chain(&state.registry, &chain_ids)?;
-    enforce_image_support(&state, &client_model, &chain, &req)?;
-    let links = lumen_router::chat_links(&chain);
-    let exec = state.resilience.exec_config(&client_model);
+    let mut decision = {
+        let facts = Facts::chat(&headers, key.as_deref(), &req);
+        state
+            .resilience
+            .decide(Capability::Chat, &client_model, &facts)?
+    };
+    if let Some(preset) = &decision.preset {
+        preset.apply_prompt(&mut req);
+    }
+    let chain = lumen_router::resolve_chat_decision(&state.registry, &mut decision)?;
+    let primary = decision.primary_model().to_owned();
+    enforce_image_support(&state, &primary, &chain, &req)?;
+    let links = lumen_router::decision_links(
+        &decision,
+        chain.iter().map(|l| l.route.provider_name.as_str()),
+    );
+    let exec = state.resilience.exec_config(&primary);
 
     // Admission BEFORE the upstream call (M5 §5.2): reserve the pre-call
     // estimate (prompt heuristic + `max_tokens`, or a default output
@@ -93,7 +108,7 @@ pub async fn chat(
     let reserved_output = req
         .max_tokens
         .map_or(DEFAULT_RESERVED_OUTPUT_TOKENS, u64::from);
-    let estimated_cost = pricing.token_cost(&client_model, estimated_input, reserved_output);
+    let estimated_cost = pricing.token_cost(&primary, estimated_input, reserved_output);
     let accounting = Accounting::begin(
         &state,
         &headers,
@@ -116,6 +131,7 @@ pub async fn chat(
         state: &state,
         chain: &chain,
         links: &links,
+        decision: &decision,
         exec,
         cancel: &cancel,
         req: &req,
@@ -205,6 +221,7 @@ struct ChatExec<'a> {
     state: &'a AppState,
     chain: &'a [lumen_router::ChatChainLink],
     links: &'a [lumen_router::executor::Link],
+    decision: &'a lumen_router::virtual_models::Decision,
     exec: lumen_router::executor::ExecConfig,
     cancel: &'a CancellationToken,
     req: &'a ChatRequest,
@@ -232,6 +249,7 @@ async fn chat_streaming(
             let provider_name = ctx.chain[i].route.provider_name.clone();
             let cancel = ctx.cancel.clone();
             let mut attempt_req = ctx.req.clone();
+            ctx.decision.attempts[i].apply(&mut attempt_req);
             attempt_req.stream = true;
             ctx.chain[i]
                 .route
@@ -256,6 +274,8 @@ async fn chat_streaming(
     .await?;
     // (an early return above drops `accounting`, refunding the reservation)
     accounting.served_by(&executed.model_used, &executed.provider_used);
+    let route = ctx.decision.route_of(executed.index);
+    accounting.set_route(route);
 
     // A fresh first-frame deadline for the committed stream. The peek already
     // consumed (and re-attached) the first content frame, so this frame is
@@ -277,7 +297,7 @@ async fn chat_streaming(
             (header::CONTENT_TYPE, "text/event-stream"),
             (header::CACHE_CONTROL, "no-cache"),
         ],
-        model_used_headers(&executed.model_used),
+        routing_headers(&executed.model_used, route),
         body,
     )
         .into_response())
@@ -300,6 +320,7 @@ async fn chat_non_streaming(
             let provider = ctx.chain[i].route.provider.clone();
             let cancel = ctx.cancel.clone();
             let mut attempt_req = ctx.req.clone();
+            ctx.decision.attempts[i].apply(&mut attempt_req);
             ctx.chain[i]
                 .route
                 .upstream_id
@@ -310,10 +331,12 @@ async fn chat_non_streaming(
     .await?;
     // (an early return above drops `accounting`, refunding the reservation)
     accounting.served_by(&executed.model_used, &executed.provider_used);
+    let route = ctx.decision.route_of(executed.index);
+    accounting.set_route(route);
     let mut response = executed.value;
     let served_model = executed.model_used.clone();
     settle_non_streaming(ctx, accounting, &served_model, &mut response);
-    Ok((model_used_headers(&served_model), Json(response)).into_response())
+    Ok((routing_headers(&served_model, route), Json(response)).into_response())
 }
 
 /// Close the books on a non-streaming completion (ADR 003): upstream usage

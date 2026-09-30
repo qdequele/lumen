@@ -11,14 +11,15 @@ use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
-use lumen_core::{tokens, GatewayError};
+use lumen_core::{tokens, Capability, GatewayError};
 use lumen_providers::batch;
 use tokio_util::sync::CancellationToken;
 
 use crate::accounting::{Accounting, Outcome, Target, TokenBreakdown};
 use crate::auth::AuthedKey;
 use crate::error::ApiError;
-use crate::resilience::model_used_headers;
+use crate::facts::Facts;
+use crate::resilience::routing_headers;
 use crate::state::AppState;
 
 /// Validate a Cohere `input_type` override (issue #22) up front, regardless of
@@ -41,6 +42,30 @@ fn validate_input_type(req: &lumen_core::EmbedRequest) -> Result<(), GatewayErro
     Ok(())
 }
 
+/// M9 enforcement (fail fast): image input requires EVERY model in the
+/// resolved attempts (primary + fallbacks) to declare the "image" modality,
+/// otherwise a fallback hop could route image content to a text-only model.
+/// Rejected before any upstream call with a clear LM-2003 naming the
+/// offending model. Shares `ImageInputNotSupported` with chat vision (M8).
+fn enforce_image_support(
+    state: &AppState,
+    decision: &lumen_router::virtual_models::Decision,
+    req: &lumen_core::EmbedRequest,
+) -> Result<(), GatewayError> {
+    if !req.input.has_image() {
+        return Ok(());
+    }
+    if let Some(bad) = decision.attempts.iter().map(|a| &a.model_id).find(|id| {
+        !state
+            .registry
+            .modalities(id)
+            .is_some_and(|mods| mods.iter().any(|m| m == "image"))
+    }) {
+        return Err(GatewayError::ImageInputNotSupported { model: bad.clone() });
+    }
+    Ok(())
+}
+
 /// Handle an embeddings request.
 pub async fn embeddings(
     State(state): State<AppState>,
@@ -58,29 +83,21 @@ pub async fn embeddings(
 
     validate_input_type(&req)?;
 
-    // Resolve the requested model to a fallback chain (primary + configured
-    // fallbacks), each re-resolved for the embed capability (M6 §6.2).
     let client_model = req.model.clone();
-    let chain_ids = state.resilience.chain_ids(&client_model);
-    let chain = lumen_router::resolve_embedding_chain(&state.registry, &chain_ids)?;
-    let links = lumen_router::embedding_links(&chain);
-    let exec = state.resilience.exec_config(&client_model);
-
-    // M9 enforcement (fail fast): image input requires EVERY model in the
-    // resolved chain (primary + fallbacks) to declare the "image" modality,
-    // otherwise a fallback hop could route image content to a text-only model.
-    // Rejected before any upstream call with a clear LM-2003 naming the
-    // offending model. Shares `ImageInputNotSupported` with chat vision (M8).
-    if req.input.has_image() {
-        if let Some(bad) = chain_ids.iter().find(|id| {
-            !state
-                .registry
-                .modalities(id)
-                .is_some_and(|mods| mods.iter().any(|m| m == "image"))
-        }) {
-            return Err(GatewayError::ImageInputNotSupported { model: bad.clone() }.into());
-        }
-    }
+    let mut decision = {
+        let facts = Facts::embed(&headers, key.as_deref(), &req);
+        state
+            .resilience
+            .decide(Capability::Embed, &client_model, &facts)?
+    };
+    let chain = lumen_router::resolve_embedding_decision(&state.registry, &mut decision)?;
+    let primary = decision.primary_model().to_owned();
+    let links = lumen_router::decision_links(
+        &decision,
+        chain.iter().map(|l| l.route.provider_name.as_str()),
+    );
+    let exec = state.resilience.exec_config(&primary);
+    enforce_image_support(&state, &decision, &req)?;
 
     // Admission BEFORE the upstream call: the pre-call estimate is reserved
     // atomically against the key's budget and quotas (M5 §5.2). The provider
@@ -89,7 +106,7 @@ pub async fn embeddings(
     // reload can't shift prices between estimate and settlement).
     let pricing = state.pricing();
     let estimated_input = tokens::estimate_embed_input(&req);
-    let estimated_cost = pricing.token_cost(&client_model, estimated_input, 0);
+    let estimated_cost = pricing.token_cost(&primary, estimated_input, 0);
     let mut accounting = Accounting::begin(
         &state,
         &headers,
@@ -131,6 +148,7 @@ pub async fn embeddings(
             let provider = chain[i].route.provider.clone();
             let cancel = cancel.clone();
             let mut attempt_req = req.clone();
+            decision.attempts[i].apply(&mut attempt_req);
             chain[i]
                 .route
                 .upstream_id
@@ -150,6 +168,8 @@ pub async fn embeddings(
 
     let mut response = executed.value;
     accounting.served_by(&executed.model_used, &executed.provider_used);
+    let route = decision.route_of(executed.index);
+    accounting.set_route(route);
 
     // ADR 003: upstream usage when reported, else the local estimate - never
     // a silent zero (e.g. TEI reports nothing). The response envelope always
@@ -186,7 +206,7 @@ pub async fn embeddings(
         }
     }
 
-    Ok((model_used_headers(&executed.model_used), Json(response)).into_response())
+    Ok((routing_headers(&executed.model_used, route), Json(response)).into_response())
 }
 
 /// Close the embed accounting record: inline for upstream-reported or

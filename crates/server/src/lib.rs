@@ -15,6 +15,7 @@ pub mod config_edit;
 pub mod config_source;
 pub mod embeddings;
 pub mod error;
+pub mod facts;
 pub mod health;
 pub mod lifecycle;
 pub mod metadata;

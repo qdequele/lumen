@@ -13,14 +13,15 @@ use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
-use lumen_core::{tokens, GatewayError};
+use lumen_core::{tokens, Capability, GatewayError};
 use lumen_providers::rerank;
 use tokio_util::sync::CancellationToken;
 
 use crate::accounting::{Accounting, Outcome, Target, TokenBreakdown};
 use crate::auth::AuthedKey;
 use crate::error::ApiError;
-use crate::resilience::model_used_headers;
+use crate::facts::Facts;
+use crate::resilience::routing_headers;
 use crate::state::AppState;
 
 /// Cohere's convention: one search unit covers a query over up to 100
@@ -42,13 +43,20 @@ pub async fn rerank_handler(
         return Err(GatewayError::EmptyDocuments.into());
     }
 
-    // Resolve the requested model to a fallback chain (M6 §6.2).
     let client_model = req.model.clone();
-    let chain_ids = state.resilience.chain_ids(&client_model);
-    let chain = lumen_router::resolve_rerank_chain(&state.registry, &chain_ids)?;
-    let links = lumen_router::rerank_links(&chain);
-    let exec = state.resilience.exec_config(&client_model);
-
+    let mut decision = {
+        let facts = Facts::rerank(&headers, key.as_deref(), &req);
+        state
+            .resilience
+            .decide(Capability::Rerank, &client_model, &facts)?
+    };
+    let chain = lumen_router::resolve_rerank_decision(&state.registry, &mut decision)?;
+    let primary = decision.primary_model().to_owned();
+    let links = lumen_router::decision_links(
+        &decision,
+        chain.iter().map(|l| l.route.provider_name.as_str()),
+    );
+    let exec = state.resilience.exec_config(&primary);
     // Admission BEFORE the upstream call (M5 §5.2). Rerank cost is billed in
     // search units; TPM counts the query × documents token estimate.
     let pricing = state.pricing();
@@ -56,8 +64,8 @@ pub async fn rerank_handler(
     let estimated_units = estimate_search_units(req.documents.len());
     // Search-unit price plus, for token-billed rerankers (Jev, and any model
     // pricing `cost_per_1m_input`), the token price.
-    let estimated_cost = pricing.search_cost(&client_model, estimated_units)
-        + pricing.token_cost(&client_model, estimated_tokens, 0);
+    let estimated_cost = pricing.search_cost(&primary, estimated_units)
+        + pricing.token_cost(&primary, estimated_tokens, 0);
     let mut accounting = Accounting::begin(
         &state,
         &headers,
@@ -82,6 +90,7 @@ pub async fn rerank_handler(
             let provider = chain[i].route.provider.clone();
             let cancel = cancel.clone();
             let mut attempt_req = req.clone();
+            decision.attempts[i].apply(&mut attempt_req);
             chain[i]
                 .route
                 .upstream_id
@@ -93,32 +102,11 @@ pub async fn rerank_handler(
 
     let mut response = executed.value;
     accounting.served_by(&executed.model_used, &executed.provider_used);
+    let route = decision.route_of(executed.index);
+    accounting.set_route(route);
 
-    // ADR 003: upstream-billed search units when reported (Cohere), else the
-    // gateway derives them from the batch size - never a silent zero.
-    let (search_units, units_estimated) = if response.usage.search_units > 0 {
-        (u64::from(response.usage.search_units), false)
-    } else {
-        (estimated_units, true)
-    };
-    if units_estimated {
-        response.usage.search_units = u32::try_from(search_units).unwrap_or(u32::MAX);
-        response.usage.estimated = Some(true);
-    }
-
-    // ADR 003 / issue #10: upstream-reported token usage (Jina, Voyage) wins
-    // when present; otherwise the gateway falls back to the query+documents
-    // heuristic estimate - never a silent zero, and honestly flagged either
-    // way.
-    let (tokens_in, tokens_in_estimated) = if response.usage.total_tokens > 0 {
-        (u64::from(response.usage.total_tokens), false)
-    } else {
-        (estimated_tokens, true)
-    };
-    if tokens_in_estimated {
-        response.usage.total_tokens = u32::try_from(tokens_in).unwrap_or(u32::MAX);
-        response.usage.tokens_estimated = Some(true);
-    }
+    let search_units = settle_search_units(&mut response, estimated_units);
+    let (tokens_in, tokens_in_estimated) = settle_tokens(&mut response, estimated_tokens);
 
     // Cost: search units, plus input tokens for models priced per token
     // (`cost_per_1m_input`; zero for the search-unit-only rerankers).
@@ -168,7 +156,31 @@ pub async fn rerank_handler(
         });
     }
 
-    Ok((model_used_headers(&executed.model_used), Json(response)).into_response())
+    Ok((routing_headers(&executed.model_used, route), Json(response)).into_response())
+}
+
+/// ADR 003: upstream-billed search units when reported (Cohere), else the
+/// gateway derives them from the batch size - never a silent zero.
+fn settle_search_units(response: &mut lumen_core::RerankResponse, estimated_units: u64) -> u64 {
+    if response.usage.search_units > 0 {
+        return u64::from(response.usage.search_units);
+    }
+    response.usage.search_units = u32::try_from(estimated_units).unwrap_or(u32::MAX);
+    response.usage.estimated = Some(true);
+    estimated_units
+}
+
+/// ADR 003 / issue #10: upstream-reported token usage (Jina, Voyage) wins
+/// when present; otherwise the gateway falls back to the query+documents
+/// heuristic estimate - never a silent zero, and honestly flagged either way.
+/// Returns the token count to account and whether it is an estimate.
+fn settle_tokens(response: &mut lumen_core::RerankResponse, estimated_tokens: u64) -> (u64, bool) {
+    if response.usage.total_tokens > 0 {
+        return (u64::from(response.usage.total_tokens), false);
+    }
+    response.usage.total_tokens = u32::try_from(estimated_tokens).unwrap_or(u32::MAX);
+    response.usage.tokens_estimated = Some(true);
+    (estimated_tokens, true)
 }
 
 /// One search unit per (query × up-to-100-documents), never zero.
