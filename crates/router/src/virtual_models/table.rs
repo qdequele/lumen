@@ -78,6 +78,9 @@ pub struct VirtualModel {
     pub(crate) targets: Vec<Target>,
     pub(crate) preset: Option<Arc<Preset>>,
     modalities: Vec<String>,
+    /// Most virtual models on any path from this one down to a foundation
+    /// leaf, itself included (1 when every target is a foundation model).
+    height: usize,
 }
 
 impl std::fmt::Debug for VirtualModel {
@@ -185,7 +188,7 @@ impl RoutingTable {
         };
         let mut order = Vec::with_capacity(configs.len());
         for config in configs {
-            order.push(compiler.compile(&config.id, 1)?);
+            order.push(compiler.compile(&config.id)?);
         }
         let warnings = preset_warnings(&order);
         let models = order
@@ -227,7 +230,7 @@ struct Compiler<'a> {
 }
 
 impl Compiler<'_> {
-    fn compile(&mut self, id: &str, depth: usize) -> Result<Arc<VirtualModel>, RoutingConfigError> {
+    fn compile(&mut self, id: &str) -> Result<Arc<VirtualModel>, RoutingConfigError> {
         if let Some(done) = self.done.get(id) {
             return Ok(done.clone());
         }
@@ -246,18 +249,13 @@ impl Compiler<'_> {
         let Some(config) = self.by_id.get(id).copied() else {
             return Err(err("unknown virtual model".to_owned()));
         };
-        if depth > MAX_DEPTH {
-            return Err(err(format!(
-                "nesting is deeper than {MAX_DEPTH} virtual models"
-            )));
-        }
         validate_shape(config).map_err(err)?;
 
         self.stack.push(id.to_owned());
         let mut targets = Vec::with_capacity(config.targets.len());
         let mut modalities: Option<Vec<String>> = None;
         for target in &config.targets {
-            let (compiled, mods) = self.target(config, target, depth)?;
+            let (compiled, mods) = self.target(config, target)?;
             modalities = Some(match modalities {
                 None => mods,
                 Some(acc) => acc.into_iter().filter(|m| mods.contains(m)).collect(),
@@ -265,6 +263,22 @@ impl Compiler<'_> {
             targets.push(compiled);
         }
         self.stack.pop();
+
+        // The height comes from the compiled children, so the depth limit
+        // does not depend on the order the models are declared in.
+        let height = 1 + targets
+            .iter()
+            .filter_map(|t| match &t.node {
+                Node::Virtual(child) => Some(child.height),
+                Node::Foundation(_) => None,
+            })
+            .max()
+            .unwrap_or(0);
+        if height > MAX_DEPTH {
+            return Err(err(format!(
+                "nesting is deeper than {MAX_DEPTH} virtual models"
+            )));
+        }
 
         let triggers = config
             .fallback_on
@@ -292,6 +306,7 @@ impl Compiler<'_> {
             targets,
             preset,
             modalities: modalities.unwrap_or_default(),
+            height,
         });
         self.done.insert(id.to_owned(), model.clone());
         Ok(model)
@@ -301,7 +316,6 @@ impl Compiler<'_> {
         &mut self,
         parent: &VirtualModelConfig,
         t: &TargetConfig,
-        depth: usize,
     ) -> Result<(Target, Vec<String>), RoutingConfigError> {
         let capability = parent.capability;
         let err = |message: String| RoutingConfigError {
@@ -329,7 +343,7 @@ impl Compiler<'_> {
                     "a remap must point directly at a foundation model".to_owned()
                 ));
             }
-            let child = self.compile(&t.model, depth + 1)?;
+            let child = self.compile(&t.model)?;
             if child.capability() != capability {
                 return Err(err(format!(
                     "serves {} but this virtual model serves {capability}",
@@ -626,8 +640,6 @@ fn plan_of(model: &VirtualModel) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use std::fmt::Write as _;
-
     use super::*;
 
     fn foundation() -> FoundationIndex {
@@ -728,6 +740,26 @@ mod tests {
         .contains("only valid under strategy `switch`"));
     }
 
+    /// `len` single-strategy chat models `v0 -> v1 -> ... -> gpt-4o`.
+    fn chain_toml(len: usize, reverse: bool) -> String {
+        let mut blocks: Vec<String> = (0..len)
+            .map(|i| {
+                let target = if i + 1 == len {
+                    "gpt-4o".to_owned()
+                } else {
+                    format!("v{}", i + 1)
+                };
+                format!(
+                    "[[virtual_models]]\nid = \"v{i}\"\ncapability = \"chat\"\nstrategy = \"single\"\ntargets = [{{ model = \"{target}\" }}]\n"
+                )
+            })
+            .collect();
+        if reverse {
+            blocks.reverse();
+        }
+        blocks.concat()
+    }
+
     #[test]
     fn reference_capability_cycle_and_depth_errors() {
         assert!(err(r#"
@@ -760,20 +792,12 @@ mod tests {
         "#);
         assert!(cycle.contains("cycle: a -> b -> a"), "{cycle}");
 
-        let mut chain = String::new();
-        for i in 0..9 {
-            let target = if i == 8 {
-                "gpt-4o".to_owned()
-            } else {
-                format!("v{}", i + 1)
-            };
-            writeln!(
-                chain,
-                "[[virtual_models]]\nid = \"v{i}\"\ncapability = \"chat\"\nstrategy = \"single\"\ntargets = [{{ model = \"{target}\" }}]"
-            )
-            .unwrap();
+        // The limit is on the longest path, whatever the declaration order.
+        for reverse in [false, true] {
+            let too_deep = err(&chain_toml(9, reverse));
+            assert!(too_deep.contains("deeper than 8"), "{too_deep}");
+            assert!(compile(&chain_toml(8, reverse)).is_ok());
         }
-        assert!(err(&chain).contains("deeper than 8"));
     }
 
     #[test]
