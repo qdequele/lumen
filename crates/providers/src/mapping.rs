@@ -94,6 +94,65 @@ pub fn classify_status(
     }
 }
 
+/// Error-body markers of an input longer than the model's context window,
+/// lowercase, per vendor (OpenAI and compatibles, Anthropic, Google/Vertex,
+/// Bedrock, Mistral, Cohere).
+const CONTEXT_LENGTH_MARKERS: &[&str] = &[
+    "context_length_exceeded",
+    "maximum context length",
+    "prompt is too long",
+    "input is too long",
+    "too many tokens",
+    "exceeds the maximum number of tokens",
+    "context window",
+    "too large for model",
+];
+
+/// Error-body markers of a content-policy refusal, lowercase.
+const CONTENT_FILTER_MARKERS: &[&str] = &[
+    "content_filter",
+    "content_policy_violation",
+    "content management policy",
+    "responsibleaipolicyviolation",
+    "blocked by safety",
+];
+
+/// Statuses whose body is worth classifying (client errors that may be a
+/// context-length or content-policy refusal).
+#[must_use]
+pub const fn needs_error_body(status: u16) -> bool {
+    matches!(status, 400 | 403 | 413 | 422)
+}
+
+/// [`classify_status`], refined by the (bounded) error body: a client error
+/// whose body carries a known context-length or content-policy marker maps to
+/// [`ProviderError::ContextLengthExceeded`] / [`ProviderError::ContentFiltered`]
+/// (ADR 014). The body is only searched, never logged or returned.
+#[must_use]
+pub fn classify_error(
+    provider: &str,
+    status: u16,
+    retry_after: Option<Duration>,
+    body: &[u8],
+) -> ProviderError {
+    if needs_error_body(status) && !body.is_empty() {
+        let text = String::from_utf8_lossy(body).to_ascii_lowercase();
+        if CONTEXT_LENGTH_MARKERS.iter().any(|m| text.contains(m)) {
+            return ProviderError::ContextLengthExceeded {
+                provider: provider.to_owned(),
+                status,
+            };
+        }
+        if CONTENT_FILTER_MARKERS.iter().any(|m| text.contains(m)) {
+            return ProviderError::ContentFiltered {
+                provider: provider.to_owned(),
+                status,
+            };
+        }
+    }
+    classify_status(provider, status, retry_after)
+}
+
 /// Parse a `Retry-After` header expressed in delta-seconds. HTTP-date form is
 /// intentionally not handled in v1 (returns `None`).
 #[must_use]
@@ -214,5 +273,85 @@ mod tests {
         let mut extra = serde_json::Map::new();
         extra.insert("seed".to_owned(), serde_json::Value::Null);
         assert!(check_unsupported_chat_fields("p", true, &extra, &["seed", "logprobs"]).is_ok());
+    }
+
+    #[test]
+    fn context_length_bodies_are_classified_per_vendor() {
+        let cases: &[&[u8]] = &[
+            br#"{"error":{"code":"context_length_exceeded","message":"..."}}"#,
+            br#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 250000 tokens > 200000 maximum"}}"#,
+            br#"{"error":{"message":"The input token count (1200000) exceeds the maximum number of tokens allowed (1048576)."}}"#,
+            br#"{"message":"Input is too long for requested model."}"#,
+            br#"{"message":"too many tokens: total number of tokens in the prompt cannot exceed 128000"}"#,
+        ];
+        for body in cases {
+            match classify_error("p", 400, None, body) {
+                ProviderError::ContextLengthExceeded { provider, status } => {
+                    assert_eq!((provider.as_str(), status), ("p", 400));
+                }
+                other => panic!(
+                    "expected context length for {:?}, got {other:?}",
+                    String::from_utf8_lossy(body)
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn content_filter_bodies_are_classified() {
+        let body = br#"{"error":{"code":"content_filter","message":"The response was filtered"}}"#;
+        assert!(matches!(
+            classify_error("azure", 400, None, body),
+            ProviderError::ContentFiltered { status: 400, .. }
+        ));
+        let body = br#"{"error":{"code":"content_policy_violation"}}"#;
+        assert!(matches!(
+            classify_error("openai", 400, None, body),
+            ProviderError::ContentFiltered { .. }
+        ));
+    }
+
+    #[test]
+    fn unrecognised_bodies_and_other_statuses_fall_back_to_classify_status() {
+        assert!(matches!(
+            classify_error("p", 400, None, br#"{"error":"bad field"}"#),
+            ProviderError::Upstream {
+                status: 400,
+                retryable: false,
+                ..
+            }
+        ));
+        // A 5xx is never reclassified, whatever its body says.
+        assert!(matches!(
+            classify_error("p", 503, None, br"context_length_exceeded"),
+            ProviderError::Upstream {
+                status: 503,
+                retryable: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            classify_error("p", 429, None, b""),
+            ProviderError::RateLimited { .. }
+        ));
+    }
+
+    #[test]
+    fn the_new_variants_are_client_errors_not_provider_faults() {
+        let e = ProviderError::ContextLengthExceeded {
+            provider: "p".into(),
+            status: 400,
+        };
+        assert!(!e.is_retryable());
+        assert!(!e.is_provider_fault());
+        let g = lumen_core::GatewayError::from_provider("p", e);
+        assert_eq!(
+            g.http_status(),
+            lumen_core::GatewayError::Upstream {
+                provider: "p".into(),
+                status: 400
+            }
+            .http_status()
+        );
     }
 }

@@ -8,6 +8,7 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ### Added
 
+- Upstream context-length and content-policy refusals are classified from the error body (new internal ProviderError variants; client-facing errors unchanged).
 - ADR 014: virtual models (foundation/virtual split, static routing, presets, SystemOne rerank remap).
 - **Model release dates on `GET /v1/models`.** A model may declare
   `release_date = "YYYY-MM-DD"` (quoted, or as a bare TOML date) in its

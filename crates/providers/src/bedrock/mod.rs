@@ -59,7 +59,7 @@ use self::sigv4::{sign_request, uri_encode_segment, SigningParams};
 use self::stream::{translate_eventstream, BedrockStreamTranslator};
 use crate::chat::{items_to_chunks, items_to_sse_bytes};
 use crate::http::{map_transport, with_cancel};
-use crate::mapping::{classify_status, parse_retry_after};
+use crate::mapping::{classify_error, parse_retry_after};
 
 /// Where a provider's signing credentials come from. Kept private: the public
 /// constructors ([`BedrockProvider::new`] and
@@ -409,7 +409,9 @@ impl BedrockProvider {
                     .map_err(|e| map_transport(provider, &e))
             } else {
                 let retry_after = parse_retry_after(response.headers());
-                Err(classify_status(provider, status.as_u16(), retry_after))
+                let code = status.as_u16();
+                let body = crate::http::error_body_prefix(response).await;
+                Err(classify_error(provider, code, retry_after, &body))
             }
         };
         with_cancel(cancel, call).await
@@ -436,7 +438,9 @@ impl BedrockProvider {
                 Ok(response)
             } else {
                 let retry_after = parse_retry_after(response.headers());
-                Err(classify_status(&provider, status.as_u16(), retry_after))
+                let code = status.as_u16();
+                let body = crate::http::error_body_prefix(response).await;
+                Err(classify_error(&provider, code, retry_after, &body))
             }
         };
         let response = with_cancel(cancel, call).await?;

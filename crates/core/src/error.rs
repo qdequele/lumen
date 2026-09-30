@@ -68,6 +68,29 @@ pub enum ProviderError {
     #[error("provider '{provider}' opened a stream but sent no content frame")]
     EmptyStream { provider: String },
 
+    /// The upstream rejected the input as longer than the model's context
+    /// window, classified from the error body (ADR 014). A client error:
+    /// never retried and never a breaker failure; a virtual model can still
+    /// fail over on it with `fallback_on = ["context_length"]`.
+    #[error("provider '{provider}' rejected the input as too long (HTTP {status})")]
+    ContextLengthExceeded {
+        /// The provider instance name.
+        provider: String,
+        /// The upstream HTTP status.
+        status: u16,
+    },
+
+    /// The upstream refused the request on content policy, classified from
+    /// the error body (ADR 014). A client error, like
+    /// [`ProviderError::ContextLengthExceeded`].
+    #[error("provider '{provider}' refused the request on content policy (HTTP {status})")]
+    ContentFiltered {
+        /// The provider instance name.
+        provider: String,
+        /// The upstream HTTP status.
+        status: u16,
+    },
+
     /// The downstream client disconnected; the upstream call was aborted.
     #[error("request cancelled")]
     Cancelled,
@@ -145,7 +168,9 @@ impl ProviderError {
             | ProviderError::Translation(_)
             | ProviderError::ImageUrlNotSupported { .. }
             | ProviderError::UnsupportedField { .. }
-            | ProviderError::UnsupportedInput { .. } => false,
+            | ProviderError::UnsupportedInput { .. }
+            | ProviderError::ContextLengthExceeded { .. }
+            | ProviderError::ContentFiltered { .. } => false,
         }
     }
 
@@ -167,7 +192,9 @@ impl ProviderError {
             | ProviderError::Translation(_)
             | ProviderError::ImageUrlNotSupported { .. }
             | ProviderError::UnsupportedField { .. }
-            | ProviderError::UnsupportedInput { .. } => false,
+            | ProviderError::UnsupportedInput { .. }
+            | ProviderError::ContextLengthExceeded { .. }
+            | ProviderError::ContentFiltered { .. } => false,
         }
     }
 
@@ -576,10 +603,21 @@ impl GatewayError {
     #[must_use]
     pub fn from_provider(provider: &str, err: ProviderError) -> Self {
         match err {
+            // ADR 014: classified client errors (context length, content
+            // filter) keep today's client-facing shape, the upstream status;
+            // only the fallback layer sees the finer variant.
             ProviderError::Upstream {
                 provider: p,
                 status,
                 ..
+            }
+            | ProviderError::ContextLengthExceeded {
+                provider: p,
+                status,
+            }
+            | ProviderError::ContentFiltered {
+                provider: p,
+                status,
             } => GatewayError::Upstream {
                 provider: p_or(provider, p),
                 status,
