@@ -163,6 +163,35 @@ fn a_retired_key_is_billed_and_retried_after_a_failed_flush() {
     assert!(s.drain_flush(4_000).is_empty(), "committed: nothing left");
 }
 
+#[test]
+fn a_retired_key_with_a_request_in_flight_stays_until_it_settles() {
+    let s = state(Some(ACCOUNT), Some("g"), true);
+    let entry = s.authenticate("sk", NOW).unwrap();
+    let reservation = entry.admit(NOW, 0, 100).unwrap();
+    drop(entry);
+    let evicted = s.remove("k").unwrap();
+    s.retire(evicted);
+    // Committing while the request is in flight must not forget the key.
+    let first = s.drain_flush(2_000);
+    assert!(first.deltas().is_empty());
+    s.commit_flush(first);
+    let still_retired = s.drain_flush(3_000);
+    assert!(
+        !still_retired.is_empty(),
+        "in-flight request keeps it retired"
+    );
+    s.commit_flush(still_retired);
+    // The request settles after the delete: its cost is billed, then the key goes.
+    reservation.settle(100, 1);
+    let settled = s.drain_flush(4_000);
+    assert_eq!(settled.deltas()[0].cost_micro, 100);
+    s.commit_flush(settled);
+    assert!(
+        s.drain_flush(5_000).is_empty(),
+        "settled and billed: forgotten"
+    );
+}
+
 #[tokio::test]
 async fn a_flush_guard_serializes_flushers() {
     let s = state(Some(ACCOUNT), Some("g"), true);

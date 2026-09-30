@@ -881,10 +881,14 @@ impl AuthState {
     /// fails: the periodic flusher never sees the id again once it is gone
     /// from the live table.
     pub fn retire(&self, entry: Arc<KeyEntry>) {
-        self.retired
+        let mut retired = self
+            .retired
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(entry);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Retiring the same entry twice (a retried delete) must not bill it twice.
+        if !retired.iter().any(|known| Arc::ptr_eq(known, &entry)) {
+            retired.push(entry);
+        }
     }
 
     /// Serialize flushers. Every flush (periodic, shutdown, admin) must hold
@@ -924,9 +928,13 @@ impl AuthState {
     }
 
     /// The flush was persisted: move each watermark and each billed key's
-    /// window start, and forget the retired keys this batch carried.
+    /// window start, and forget the retired keys this batch carried - except
+    /// those that can still earn money. A retired key stays listed while a
+    /// request admitted before its delete still holds the entry (an in-flight
+    /// `Reservation`: its settle lands after this commit and must still be
+    /// billed) or while settled cost is not yet billed.
     pub fn commit_flush(&self, batch: FlushBatch) {
-        let mut committed_retired = Vec::new();
+        let mut committed_retired: Vec<*const KeyEntry> = Vec::new();
         for item in batch.items {
             item.entry
                 .billed_micro
@@ -937,17 +945,20 @@ impl AuthState {
                     .store(delta.window_end_ms, Ordering::SeqCst);
             }
             if item.retired {
-                committed_retired.push(item.entry);
+                committed_retired.push(Arc::as_ptr(&item.entry));
             }
+            // `item` (and its `Arc`) is dropped here, so the strong count
+            // below only counts the retired list and real outside holders.
         }
         if !committed_retired.is_empty() {
             self.retired
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .retain(|entry| {
-                    !committed_retired
-                        .iter()
-                        .any(|done| Arc::ptr_eq(done, entry))
+                    !committed_retired.contains(&Arc::as_ptr(entry))
+                        || Arc::strong_count(entry) > 1
+                        || entry.settled_micro.load(Ordering::SeqCst)
+                            != entry.billed_micro.load(Ordering::SeqCst)
                 });
         }
     }
