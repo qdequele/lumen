@@ -1607,9 +1607,9 @@ fn describe_validation_rejection(error: &ConfigLoadError) -> ApiError {
 // validate / persist / hot-reload sequence the whole-document `PUT
 // /admin/config` uses. A granular edit can therefore never produce a
 // document a restart would refuse, and a provider a validation-breaking edit
-// would orphan (e.g. still referenced by another model's fallback chain) is
-// rejected the same way the whole-document PUT would reject it - `LM-1001`
-// naming the dependent model, from `Config::validate_fallbacks`.
+// would orphan (e.g. still a target of a virtual model) is rejected the same
+// way the whole-document PUT would reject it - `LM-1001` naming the dependent
+// virtual model, from the virtual-model compilation in `Config::validate`.
 
 /// Parse the current document's raw text into a [`Config`] - deliberately
 /// WITHOUT the `LUMEN_*` environment overlay `Config::load` applies (see
@@ -1639,7 +1639,7 @@ fn config_from_document(text: &str) -> Result<Config, ApiError> {
 ///
 /// `config_edit`'s own doc comment is explicit that it never validates the
 /// edit it performs - a syntactically sound but semantically invalid result
-/// (e.g. a dangling fallback reference) is caught by `apply_document`'s
+/// (e.g. a dangling virtual-model target) is caught by `apply_document`'s
 /// later `validate_document` call, not here, and surfaces as `LM-1001`
 /// through that path instead. Reaching THIS function at all means the edit
 /// itself failed against a document that was already validated when it was
@@ -1742,7 +1742,7 @@ pub async fn get_provider(
 /// body would be a confusing way to rename a provider (delete the old one
 /// and PUT the new name instead). Every other field is policed by
 /// [`ProviderConfig`]'s own `deny_unknown_fields`. Requires `If-Match`; runs
-/// through the shared [`apply_document`] pipeline, so e.g. a fallback
+/// through the shared [`apply_document`] pipeline, so e.g. a virtual-model target
 /// reference this write would leave dangling is rejected exactly like the
 /// whole-document `PUT` would reject it.
 pub async fn put_provider(
@@ -1773,8 +1773,8 @@ pub async fn put_provider(
 /// # Errors
 /// `LM-1003` (404) when no provider with that name exists in the current
 /// document. `LM-1001` (400), from [`apply_document`]'s validation pass,
-/// when the provider is still referenced by another model's fallback chain
-/// - the rejection names the dependent model (`Config::validate_fallbacks`).
+/// when one of the provider's models is still a virtual-model target - the
+/// rejection names the dependent virtual model.
 pub async fn delete_provider(
     State(state): State<AppState>,
     Path(name): Path<String>,
@@ -1788,6 +1788,251 @@ pub async fn delete_provider(
     })
     .await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// One entry of `GET /admin/config/virtual_models`.
+#[derive(Debug, Serialize)]
+pub struct VirtualModelSummary {
+    /// The public id.
+    pub id: String,
+    /// Its capability.
+    pub capability: &'static str,
+    /// Its strategy.
+    pub strategy: &'static str,
+}
+
+/// `GET /admin/config/virtual_models` response.
+#[derive(Debug, Serialize)]
+pub struct VirtualModelsList {
+    /// Every virtual model in the current document, in document order.
+    pub virtual_models: Vec<VirtualModelSummary>,
+    /// See [`ProvidersList::hash`].
+    pub hash: String,
+}
+
+/// List every virtual model (ADR 014).
+pub async fn list_virtual_models(
+    State(state): State<AppState>,
+) -> Result<Json<VirtualModelsList>, ApiError> {
+    let ctx = config_ctx(&state)?;
+    let doc = ctx
+        .source
+        .load()
+        .await
+        .map_err(|e| source_internal_error(&e))?;
+    let cfg = config_from_document(&doc.toml)?;
+    Ok(Json(VirtualModelsList {
+        virtual_models: cfg
+            .virtual_models
+            .iter()
+            .map(|v| VirtualModelSummary {
+                id: v.id.clone(),
+                capability: v.capability.as_str(),
+                strategy: v.strategy.as_str(),
+            })
+            .collect(),
+        hash: doc.hash,
+    }))
+}
+
+/// `GET /admin/config/virtual_models/{id}` response.
+// No Debug: carries preset and remap text.
+#[derive(Serialize)]
+pub struct VirtualModelDocument {
+    /// The virtual model's own fields, flattened.
+    #[serde(flatten)]
+    pub virtual_model: lumen_router::virtual_models::VirtualModelConfig,
+    /// See [`ProvidersList::hash`].
+    pub hash: String,
+}
+
+/// Fetch one virtual model. `{id}` is percent-decoded (`acme%2Fchat`).
+///
+/// # Errors
+/// `LM-1003` when absent.
+pub async fn get_virtual_model(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<VirtualModelDocument>, ApiError> {
+    let ctx = config_ctx(&state)?;
+    let doc = ctx
+        .source
+        .load()
+        .await
+        .map_err(|e| source_internal_error(&e))?;
+    let cfg = config_from_document(&doc.toml)?;
+    let virtual_model = cfg
+        .virtual_models
+        .into_iter()
+        .find(|v| v.id == id)
+        .ok_or(GatewayError::RouteNotFound)?;
+    Ok(Json(VirtualModelDocument {
+        virtual_model,
+        hash: doc.hash,
+    }))
+}
+
+/// Insert or replace one virtual model. The path id must equal the body id.
+/// Requires `If-Match`; validated by the shared pipeline (`LM-1001` naming
+/// the virtual model on any rule of ADR 014).
+pub async fn put_virtual_model(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
+    payload: Result<Json<lumen_router::virtual_models::VirtualModelConfig>, JsonRejection>,
+) -> Result<StatusCode, ApiError> {
+    let if_match = require_if_match(&headers)?;
+    let Json(vm) = payload.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
+    if vm.id != id {
+        return Err(GatewayError::InvalidRequest(format!(
+            "path virtual model id '{id}' does not match the request body's 'id' field '{}'",
+            vm.id
+        ))
+        .into());
+    }
+    reject_json_nulls(&vm)?;
+    apply_document(&state, &if_match, move |current| {
+        // The only input is the client body, so a value TOML cannot spell
+        // (an integer above i64::MAX, say) is a client error, not a 500.
+        config_edit::upsert_virtual_model(current, &vm).map_err(|e| match e {
+            config_edit::EditError::Serialize(e) => GatewayError::InvalidRequest(format!(
+                "virtual model '{}' cannot be stored as TOML: {e}",
+                vm.id
+            ))
+            .into(),
+            other => edit_internal_error(&other),
+        })
+    })
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// JSON `null` has no TOML spelling, so a body carrying one inside a `when`
+/// condition or an `overrides` map (at any nesting depth) is refused with
+/// `LM-1001` naming the field, before the document is edited.
+fn reject_json_nulls(
+    vm: &lumen_router::virtual_models::VirtualModelConfig,
+) -> Result<(), GatewayError> {
+    /// Path of the first JSON `null` in `value`, searching arrays and objects.
+    fn walk(value: &serde_json::Value, path: &mut String) -> Result<(), String> {
+        match value {
+            serde_json::Value::Null => Err(path.clone()),
+            serde_json::Value::Array(items) => items.iter().enumerate().try_for_each(|(i, v)| {
+                let len = path.len();
+                path.push('[');
+                path.push_str(&i.to_string());
+                path.push(']');
+                walk(v, path)?;
+                path.truncate(len);
+                Ok(())
+            }),
+            serde_json::Value::Object(map) => walk_map(map, path),
+            _ => Ok(()),
+        }
+    }
+    /// Run `walk` over each entry of `map`, extending `path` with `.key`.
+    fn walk_map(
+        map: &serde_json::Map<String, serde_json::Value>,
+        path: &mut String,
+    ) -> Result<(), String> {
+        map.iter().try_for_each(|(k, v)| {
+            let len = path.len();
+            path.push('.');
+            path.push_str(k);
+            walk(v, path)?;
+            path.truncate(len);
+            Ok(())
+        })
+    }
+    /// Look for a null in the `set` and `default` maps of `o`, under `prefix`.
+    fn walk_overrides(
+        o: &lumen_router::virtual_models::config::OverridesConfig,
+        prefix: &str,
+    ) -> Result<(), String> {
+        walk_map(&o.set, &mut format!("{prefix}.overrides.set"))?;
+        walk_map(&o.default, &mut format!("{prefix}.overrides.default"))
+    }
+    /// Path of the first null in the preset overrides, the target `when` tables or the
+    /// target overrides of `vm`.
+    fn first_null(vm: &lumen_router::virtual_models::VirtualModelConfig) -> Result<(), String> {
+        if let Some(o) = vm.preset.as_ref().and_then(|p| p.overrides.as_ref()) {
+            walk_overrides(o, "preset")?;
+        }
+        for (i, t) in vm.targets.iter().enumerate() {
+            let prefix = format!("targets[{i}]");
+            if let Some(when) = &t.when {
+                walk_map(when, &mut format!("{prefix}.when"))?;
+            }
+            if let Some(o) = &t.overrides {
+                walk_overrides(o, &prefix)?;
+            }
+        }
+        Ok(())
+    }
+    first_null(vm).map_err(|field| {
+        GatewayError::InvalidRequest(format!(
+            "virtual model '{}': {field} is null, which is not a valid config value (omit the key instead)",
+            vm.id
+        ))
+    })
+}
+
+/// Remove one virtual model.
+///
+/// # Errors
+/// `LM-1003` when absent; `LM-1001` when another virtual model still
+/// references it (the message names the dependent).
+pub async fn delete_virtual_model(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
+) -> Result<StatusCode, ApiError> {
+    let if_match = require_if_match(&headers)?;
+    apply_document(&state, &if_match, move |current| {
+        config_edit::delete_virtual_model(current, &id)
+            .map_err(|e| edit_internal_error(&e))?
+            .ok_or_else(|| GatewayError::RouteNotFound.into())
+    })
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `GET /admin/config/virtual_models/{id}/plan` response.
+// No Debug: carries preset and remap text.
+#[derive(Serialize)]
+pub struct VirtualModelPlan {
+    /// The fully resolved tree (references expanded to foundation leaves).
+    pub plan: serde_json::Value,
+    /// See [`ProvidersList::hash`].
+    pub hash: String,
+}
+
+/// The resolved routing tree of one virtual model, compiled from the
+/// current document (not the running snapshot), so it shows what a save
+/// just stored. The body may carry preset and remap text, so it stays
+/// behind the master-key admin layer and is never logged.
+///
+/// # Errors
+/// `LM-1003` when absent.
+pub async fn get_virtual_model_plan(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<VirtualModelPlan>, ApiError> {
+    let ctx = config_ctx(&state)?;
+    let doc = ctx
+        .source
+        .load()
+        .await
+        .map_err(|e| source_internal_error(&e))?;
+    let cfg = config_from_document(&doc.toml)?;
+    let (table, _) = cfg
+        .routing_table()
+        .map_err(|e| GatewayError::Internal(e.to_string()))?;
+    let plan = table.plan(&id).ok_or(GatewayError::RouteNotFound)?;
+    Ok(Json(VirtualModelPlan {
+        plan,
+        hash: doc.hash,
+    }))
 }
 
 /// Extract the JSON value of one scalar config section from a parsed

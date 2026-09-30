@@ -39,13 +39,12 @@ kind = "openai"
 api_key_env = "OPENAI_API_KEY"
 
 [[providers.models]]
-id = "gpt-4o-mini"
+id = "openai/gpt-4o-mini"
 capabilities = ["chat"]
 modalities = ["text", "image"]
 cost_per_1m_input = 0.15
 cost_per_1m_output = 0.6
-# Cross-vendor chat fallback chain: OpenAI -> Anthropic -> Mistral.
-fallbacks = ["claude-haiku-4-5", "mistral-small"]
+upstream_id = "gpt-4o-mini"
 
 [[providers.models]]
 id = "text-embedding-3-small"
@@ -126,12 +125,10 @@ modalities = ["text", "image"]
 cost_per_1m_input = 0.12
 
 [[providers.models]]
-id = "cohere-rerank"
+id = "cohere/cohere-rerank"
 upstream_id = "rerank-v3.5"
 capabilities = ["rerank"]
 cost_per_1k_searches = 2.0
-# Three-vendor rerank fallback chain.
-fallbacks = ["jina-rerank", "voyage-rerank"]
 
 # ---------------------------------------------------------------------------
 # Jina: embeddings + reranking.
@@ -192,3 +189,21 @@ capabilities = ["chat"]
 id = "cf-embed"
 upstream_id = "@cf/baai/bge-m3"
 capabilities = ["embed"]
+
+# ---------------------------------------------------------------------------
+# Virtual models (ADR 014): the public ids clients send.
+# ---------------------------------------------------------------------------
+
+# Cross-vendor chat fallback chain: OpenAI -> Anthropic -> Mistral.
+[[virtual_models]]
+id = "gpt-4o-mini"
+capability = "chat"
+strategy = "fallback"
+targets = [{ model = "openai/gpt-4o-mini" }, { model = "claude-haiku-4-5" }, { model = "mistral-small" }]
+
+# Three-vendor rerank fallback chain.
+[[virtual_models]]
+id = "cohere-rerank"
+capability = "rerank"
+strategy = "fallback"
+targets = [{ model = "cohere/cohere-rerank" }, { model = "jina-rerank" }, { model = "voyage-rerank" }]

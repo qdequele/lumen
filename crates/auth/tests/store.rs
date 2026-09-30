@@ -31,6 +31,7 @@ fn usage(key_id: &str, ts: i64) -> UsageRecord {
         group_id: None,
         model: "gpt-test".to_owned(),
         model_used: "gpt-test".to_owned(),
+        route: None,
         provider: "openai".to_owned(),
         capability: "chat".to_owned(),
         tokens_in: 12,
@@ -963,4 +964,24 @@ async fn config_version_cas_survives_concurrent_writers_on_the_same_file() {
     writer.await.unwrap();
     let _ = std::fs::remove_file(&path);
     result.unwrap();
+}
+
+/// ADR 014: the route of a virtual-model request persists; a direct call
+/// stays NULL.
+#[tokio::test]
+async fn usage_log_persists_the_virtual_model_route() {
+    let store = KeyStore::in_memory().await.expect("open store");
+    let mut routed = usage("key-a", 100);
+    routed.route = Some("acme/chat>acme/eu>mistral-large".to_owned());
+    let direct = usage("key-b", 200);
+    store.insert_usage(&[routed, direct]).await.expect("insert");
+    let rows = store
+        .usage_export(0, i64::MAX, None, 10)
+        .await
+        .expect("export");
+    assert_eq!(
+        rows[0].route.as_deref(),
+        Some("acme/chat>acme/eu>mistral-large")
+    );
+    assert_eq!(rows[1].route, None);
 }

@@ -51,6 +51,7 @@ USAGE:
     lumen [--config <PATH>]
     lumen --check-config [--config <PATH>]
     lumen keys <create|list> [OPTIONS]
+    lumen config migrate [--config <PATH>] [--dry-run]
 
 OPTIONS:
     -c, --config <PATH>    Path to the TOML config file [default: config.toml]
@@ -64,6 +65,10 @@ SUBCOMMANDS:
     keys create            Create a virtual key directly in the auth database
                             (offline bootstrap - no running server needed).
     keys list              List virtual keys (records only, never secrets).
+    config migrate         Rewrite a pre-0.6 config (per-model `fallbacks`,
+                            `[providers.models.rerank]`) into virtual models.
+                            File mode backs up to <file>.bak; DB mode writes a
+                            new config version. --dry-run prints the result.
 
 Run `lumen keys --help` for the key-management options.
 ";
@@ -120,6 +125,9 @@ fn main() -> ExitCode {
         Action::Help => return ExitCode::SUCCESS,
         Action::CheckConfig(path) => return run_check_config(&path),
         Action::Keys(keys) => return run_keys(keys),
+        Action::ConfigMigrate { config, dry_run } => {
+            return run_config_migrate(&config, dry_run);
+        }
         Action::Serve(path) => path,
     };
 
@@ -158,6 +166,13 @@ enum Action {
     CheckConfig(PathBuf),
     /// `keys create` / `keys list`: offline key management, then exit.
     Keys(KeysAction),
+    /// `config migrate`: rewrite a pre-virtual-model config, then exit.
+    ConfigMigrate {
+        /// Boot config file (holds the dynamic document in file mode).
+        config: PathBuf,
+        /// Print the migrated document instead of writing it.
+        dry_run: bool,
+    },
     /// `-h`/`--help`: help was already printed.
     Help,
 }
@@ -207,6 +222,9 @@ fn parse_args_from(mut args: impl Iterator<Item = String>) -> Result<Action, Str
         if first && arg == "keys" {
             return parse_keys_args(args);
         }
+        if first && arg == "config" {
+            return parse_config_args(args);
+        }
         first = false;
         match arg.as_str() {
             "-h" | "--help" => {
@@ -236,6 +254,39 @@ fn parse_args_from(mut args: impl Iterator<Item = String>) -> Result<Action, Str
     } else {
         Action::Serve(config_path)
     })
+}
+
+/// Parse everything after `lumen config`: only `migrate` exists.
+fn parse_config_args(mut args: impl Iterator<Item = String>) -> Result<Action, String> {
+    match args.next().as_deref() {
+        Some("migrate") => {}
+        Some(other) => {
+            return Err(format!(
+                "unknown config subcommand '{other}' - expected: migrate"
+            ))
+        }
+        None => return Err("config requires a subcommand: migrate".to_owned()),
+    }
+    let mut config = PathBuf::from("config.toml");
+    let mut dry_run = false;
+    while let Some(arg) = args.next() {
+        let (flag, inline) = match arg.split_once('=') {
+            Some((f, v)) if f.starts_with("--") => (f.to_owned(), Some(v.to_owned())),
+            _ => (arg.clone(), None),
+        };
+        match flag.as_str() {
+            "-c" | "--config" => {
+                config = PathBuf::from(flag_value("--config", inline, &mut args)?);
+            }
+            "--dry-run" => dry_run = true,
+            "-h" | "--help" => {
+                print!("{HELP}");
+                return Ok(Action::Help);
+            }
+            other => return Err(format!("unexpected argument '{other}'")),
+        }
+    }
+    Ok(Action::ConfigMigrate { config, dry_run })
 }
 
 /// The value of a `--flag`: the inline `--flag=value` part when present,
@@ -1180,6 +1231,178 @@ async fn boot_auth_stack(
     })
 }
 
+/// `config migrate`: rewrite the dynamic config document (ADR 014). Errors go
+/// to stderr; nothing here logs config content.
+fn run_config_migrate(path: &Path, dry_run: bool) -> ExitCode {
+    match run_config_migrate_inner(path, dry_run) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("error: {err:#}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Print each migration note on stderr.
+fn report_migration_notes(notes: &[String]) {
+    for note in notes {
+        eprintln!("note: {note}");
+    }
+}
+
+/// Create `path` exclusively (an existing file or symlink there is refused,
+/// never followed; a planted link cannot redirect a privileged run's write).
+/// The file is born owner-only, then takes `meta`'s permission bits and, on
+/// Unix when this process may set them, its owner and group, all before any
+/// content is written. Returns the open handle.
+fn create_exclusive(path: &Path, meta: &std::fs::Metadata) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let file = options.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // Best effort: only a privileged process may give a file away.
+        let _ = std::os::unix::fs::fchown(&file, Some(meta.uid()), Some(meta.gid()));
+    }
+    if let Err(e) = file.set_permissions(meta.permissions()) {
+        let _ = std::fs::remove_file(path);
+        return Err(e);
+    }
+    Ok(file)
+}
+
+/// Write `text` through `file` and flush it to disk.
+fn write_synced(mut file: std::fs::File, text: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+    file.write_all(text.as_bytes())?;
+    file.sync_all()
+}
+
+/// Write the pre-migration text to `backup`, replacing an earlier backup,
+/// with the config file's permissions (`meta`). Whatever sits at that path is
+/// unlinked first (a symlink is removed, never followed), then the file is
+/// created exclusively, so a link planted in between is refused.
+fn write_backup(text: &str, backup: &Path, meta: &std::fs::Metadata) -> anyhow::Result<()> {
+    match std::fs::remove_file(backup) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).context("failed to remove the previous backup"),
+    }
+    write_synced(create_exclusive(backup, meta)?, text)?;
+    Ok(())
+}
+
+/// Replace the file at `path` with `text` atomically (staging file + rename)
+/// while keeping what the operator set on it: a symlink stays a symlink (its
+/// target is rewritten), and the target's permission bits carry over. On Unix
+/// the owner and group are carried over too when this process may set them
+/// (for example when run through `sudo`); otherwise they are left as created.
+fn replace_file_in_place(path: &Path, text: &str) -> anyhow::Result<()> {
+    let target = std::fs::canonicalize(path)
+        .with_context(|| format!("failed to resolve '{}'", path.display()))?;
+    let meta = std::fs::metadata(&target)
+        .with_context(|| format!("failed to read the metadata of '{}'", target.display()))?;
+    let mut staging_name = target
+        .file_name()
+        .map(std::ffi::OsStr::to_os_string)
+        .unwrap_or_default();
+    staging_name.push(".migrating");
+    let staging = target.with_file_name(staging_name);
+    let file = create_exclusive(&staging, &meta).with_context(|| {
+        format!(
+            "failed to create '{}' (if it is left over from an interrupted run, remove it and retry)",
+            staging.display()
+        )
+    })?;
+    if let Err(err) = write_synced(file, text) {
+        let _ = std::fs::remove_file(&staging);
+        return Err(err).context("failed to write the migrated config");
+    }
+    std::fs::rename(&staging, &target).context("failed to replace the config file")?;
+    Ok(())
+}
+
+/// The fallible body of [`run_config_migrate`]: file mode rewrites the boot
+/// file (backup first, then staging file + rename); DB mode rewrites the
+/// stored document through the compare-and-swap `persist`.
+fn run_config_migrate_inner(path: &Path, dry_run: bool) -> anyhow::Result<()> {
+    use lumen_server::config::boot_view;
+    use lumen_server::config_migrate::migrate_document;
+
+    let label = path.display().to_string();
+    let boot_text =
+        std::fs::read_to_string(path).with_context(|| format!("failed to read '{label}'"))?;
+    let boot = boot_view(&boot_text, &label)?;
+    match boot.config_source {
+        ConfigSourceKind::File => {
+            let migration = migrate_document(&boot_text)?;
+            if !migration.changed {
+                println!("nothing to migrate in '{label}'");
+                return Ok(());
+            }
+            report_migration_notes(&migration.notes);
+            Config::load_text(&migration.text, &label)
+                .context("the migrated config does not validate")?;
+            if dry_run {
+                print!("{}", migration.text);
+                return Ok(());
+            }
+            let backup = path.with_extension("toml.bak");
+            let meta = std::fs::metadata(path)
+                .with_context(|| format!("failed to read the metadata of '{label}'"))?;
+            write_backup(&boot_text, &backup, &meta)
+                .with_context(|| format!("failed to back up to '{}'", backup.display()))?;
+            replace_file_in_place(path, &migration.text)?;
+            println!("migrated '{label}' (backup: '{}')", backup.display());
+            Ok(())
+        }
+        ConfigSourceKind::Db => {
+            anyhow::ensure!(
+                boot.auth_enabled,
+                "config_source = \"db\" requires [auth] enabled = true"
+            );
+            let auth = lumen_server::config::AuthConfig {
+                db_path: boot.db_path,
+                ..Default::default()
+            };
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            runtime.block_on(migrate_db_config(path, &auth.db_url(), dry_run))
+        }
+    }
+}
+
+/// DB-mode body of `config migrate`: load the stored document, migrate and
+/// validate it against the boot file, then persist it as a new version.
+async fn migrate_db_config(path: &Path, db_url: &str, dry_run: bool) -> anyhow::Result<()> {
+    use lumen_server::config_migrate::migrate_document;
+
+    let store = KeyStore::connect(db_url)
+        .await
+        .context("failed to open the auth database")?;
+    let source = DbSource::new(store);
+    let current = source.load().await?;
+    let migration = migrate_document(&current.toml)?;
+    if !migration.changed {
+        println!("nothing to migrate in the database config");
+        return Ok(());
+    }
+    report_migration_notes(&migration.notes);
+    Config::load_with_dynamic(path, &migration.text)
+        .context("the migrated config does not validate")?;
+    if dry_run {
+        print!("{}", migration.text);
+        return Ok(());
+    }
+    source.persist(&migration.text, &current.hash).await?;
+    println!("migrated the database config (a new config version was written)");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1503,5 +1726,37 @@ mod tests {
                 config: PathBuf::from("prod.toml"),
             })
         );
+    }
+
+    #[test]
+    fn config_migrate_parses_with_path_and_dry_run() {
+        let action =
+            parse_args_from(args(&["config", "migrate", "-c", "prod.toml", "--dry-run"])).unwrap();
+        assert_eq!(
+            action,
+            Action::ConfigMigrate {
+                config: PathBuf::from("prod.toml"),
+                dry_run: true
+            }
+        );
+        let action = parse_args_from(args(&["config", "migrate"])).unwrap();
+        assert_eq!(
+            action,
+            Action::ConfigMigrate {
+                config: PathBuf::from("config.toml"),
+                dry_run: false
+            }
+        );
+        let action = parse_args_from(args(&["config", "migrate", "--config=x.toml"])).unwrap();
+        assert_eq!(
+            action,
+            Action::ConfigMigrate {
+                config: PathBuf::from("x.toml"),
+                dry_run: false
+            }
+        );
+        assert!(parse_args_from(args(&["config"])).is_err());
+        assert!(parse_args_from(args(&["config", "explode"])).is_err());
+        assert!(parse_args_from(args(&["config", "migrate", "--bogus"])).is_err());
     }
 }

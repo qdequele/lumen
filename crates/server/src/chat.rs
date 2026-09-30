@@ -38,20 +38,22 @@ use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
 use bytes::Bytes;
 use futures::stream::{BoxStream, StreamExt};
-use lumen_core::{tokens, ChatRequest, GatewayError, ProviderError, Usage};
+use lumen_core::{tokens, Capability, ChatRequest, GatewayError, ProviderError, Usage};
 use tokio_util::sync::{CancellationToken, DropGuard};
 
 use crate::accounting::{Accounting, Outcome, StreamAccounting, Target, TokenBreakdown};
 use crate::auth::AuthedKey;
 use crate::error::ApiError;
+use crate::facts::Facts;
 use crate::pricing::DEFAULT_RESERVED_OUTPUT_TOKENS;
-use crate::resilience::model_used_headers;
+use crate::resilience::routing_headers;
 use crate::state::{AppState, StreamGuards};
 
 /// Handle a chat completion request (streaming or not, per `stream`).
 ///
-/// Both modes run through the M6 resilience executor: the requested model plus
-/// its configured fallbacks are tried in turn with retries, circuit breaking
+/// Both modes run through the M6 resilience executor: the attempts decided for
+/// the requested model (a virtual model's targets, ADR 014, or the foundation
+/// model alone) are tried in turn with retries, circuit breaking
 /// and the per-model timeouts (ADR 005). For streaming, retry/fallback happen
 /// while *opening* the upstream byte stream AND while peeking its first frame
 /// (ADR 005, 2026-07-15 amendment) - once the first content frame is forwarded
@@ -70,19 +72,40 @@ pub async fn chat(
     // `PAYLOAD_TOO_LARGE` - verified empirically (a debug probe in this
     // `map_err` never fired for an over-limit request). `app::map_body_limit_response`
     // rewrites that bare 413 into the `LM-1002` envelope instead.
-    let Json(req) = payload.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
+    let Json(mut req) = payload.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
 
     if req.messages.is_empty() {
         return Err(GatewayError::InvalidRequest("`messages` must not be empty".to_owned()).into());
     }
 
-    // Resolve the requested model to a fallback chain (M6 §6.2).
+    // Decide the attempts (ADR 014): a virtual model's routing tree, or the
+    // foundation model alone (no facts are built for it). The preset prompt
+    // comes from the same routing snapshot as the decision and is applied
+    // BEFORE the facts are computed: it counts toward the `input_tokens` fact
+    // that `switch` conditions read (ADR 014, ADR 003). It depends only on the
+    // requested id, and is applied exactly once. Facts are dropped before any
+    // `.await`.
     let client_model = req.model.clone();
-    let chain_ids = state.resilience.chain_ids(&client_model);
-    let chain = lumen_router::resolve_chat_chain(&state.registry, &chain_ids)?;
-    enforce_image_support(&state, &client_model, &chain, &req)?;
-    let links = lumen_router::chat_links(&chain);
-    let exec = state.resilience.exec_config(&client_model);
+    let mut decision = {
+        let (headers, key, req) = (&headers, key.as_deref(), &mut req);
+        state
+            .resilience
+            .decide(Capability::Chat, &client_model, move |preset| {
+                if let Some(preset) = preset {
+                    preset.apply_prompt(req);
+                }
+                let req: &ChatRequest = req;
+                Facts::chat(headers, key, req)
+            })?
+    };
+    let chain = lumen_router::resolve_chat_decision(&state.registry, &mut decision)?;
+    let primary = decision.primary_model().to_owned();
+    enforce_image_support(&state, &primary, &chain, &req)?;
+    let links = lumen_router::decision_links(
+        &decision,
+        chain.iter().map(|l| l.route.provider_name.as_str()),
+    );
+    let exec = state.resilience.exec_config(&primary);
 
     // Admission BEFORE the upstream call (M5 §5.2): reserve the pre-call
     // estimate (prompt heuristic + `max_tokens`, or a default output
@@ -90,10 +113,8 @@ pub async fn chat(
     // The reservation is settled to the real usage afterwards.
     let pricing = state.pricing();
     let estimated_input = tokens::estimate_chat_prompt(&req);
-    let reserved_output = req
-        .max_tokens
-        .map_or(DEFAULT_RESERVED_OUTPUT_TOKENS, u64::from);
-    let estimated_cost = pricing.token_cost(&client_model, estimated_input, reserved_output);
+    let reserved_output = reserved_output_tokens(&decision, &req);
+    let estimated_cost = pricing.token_cost(&primary, estimated_input, reserved_output);
     let accounting = Accounting::begin(
         &state,
         &headers,
@@ -116,6 +137,7 @@ pub async fn chat(
         state: &state,
         chain: &chain,
         links: &links,
+        decision: &decision,
         exec,
         cancel: &cancel,
         req: &req,
@@ -126,6 +148,36 @@ pub async fn chat(
     } else {
         chat_non_streaming(&ctx, guard, accounting).await
     }
+}
+
+/// The output tokens to reserve at admission: the largest output cap any
+/// attempt may send upstream once its overrides apply (ADR 014), so a target
+/// that raises the cap cannot run past the key's budget on a small client
+/// value. An attempt's cap is the larger of `max_tokens` and
+/// `max_completion_tokens` (OpenAI-compatible providers forward the latter
+/// verbatim); an attempt that ends with neither reserves the default.
+fn reserved_output_tokens(
+    decision: &lumen_router::virtual_models::Decision,
+    req: &ChatRequest,
+) -> u64 {
+    let max_tokens = req.max_tokens.map(serde_json::Value::from);
+    let max_completion_tokens = req.extra.get("max_completion_tokens").cloned();
+    let cap = |v: Option<serde_json::Value>| {
+        v.and_then(|v| v.as_u64())
+            .filter(|v| u32::try_from(*v).is_ok())
+    };
+    decision
+        .attempts
+        .iter()
+        .map(|a| {
+            let tokens = cap(a.field("max_tokens", max_tokens.clone()));
+            let completion = cap(a.field("max_completion_tokens", max_completion_tokens.clone()));
+            tokens
+                .max(completion)
+                .unwrap_or(DEFAULT_RESERVED_OUTPUT_TOKENS)
+        })
+        .max()
+        .unwrap_or(DEFAULT_RESERVED_OUTPUT_TOKENS)
 }
 
 /// Reject image inputs the resolved route cannot serve, before any upstream
@@ -205,6 +257,7 @@ struct ChatExec<'a> {
     state: &'a AppState,
     chain: &'a [lumen_router::ChatChainLink],
     links: &'a [lumen_router::executor::Link],
+    decision: &'a lumen_router::virtual_models::Decision,
     exec: lumen_router::executor::ExecConfig,
     cancel: &'a CancellationToken,
     req: &'a ChatRequest,
@@ -232,6 +285,7 @@ async fn chat_streaming(
             let provider_name = ctx.chain[i].route.provider_name.clone();
             let cancel = ctx.cancel.clone();
             let mut attempt_req = ctx.req.clone();
+            ctx.decision.attempts[i].apply(&mut attempt_req);
             attempt_req.stream = true;
             ctx.chain[i]
                 .route
@@ -256,6 +310,8 @@ async fn chat_streaming(
     .await?;
     // (an early return above drops `accounting`, refunding the reservation)
     accounting.served_by(&executed.model_used, &executed.provider_used);
+    let route = ctx.decision.route_of(executed.index);
+    accounting.set_route(route);
 
     // A fresh first-frame deadline for the committed stream. The peek already
     // consumed (and re-attached) the first content frame, so this frame is
@@ -277,7 +333,7 @@ async fn chat_streaming(
             (header::CONTENT_TYPE, "text/event-stream"),
             (header::CACHE_CONTROL, "no-cache"),
         ],
-        model_used_headers(&executed.model_used),
+        routing_headers(&executed.model_used, route),
         body,
     )
         .into_response())
@@ -300,6 +356,7 @@ async fn chat_non_streaming(
             let provider = ctx.chain[i].route.provider.clone();
             let cancel = ctx.cancel.clone();
             let mut attempt_req = ctx.req.clone();
+            ctx.decision.attempts[i].apply(&mut attempt_req);
             ctx.chain[i]
                 .route
                 .upstream_id
@@ -310,10 +367,12 @@ async fn chat_non_streaming(
     .await?;
     // (an early return above drops `accounting`, refunding the reservation)
     accounting.served_by(&executed.model_used, &executed.provider_used);
+    let route = ctx.decision.route_of(executed.index);
+    accounting.set_route(route);
     let mut response = executed.value;
     let served_model = executed.model_used.clone();
     settle_non_streaming(ctx, accounting, &served_model, &mut response);
-    Ok((model_used_headers(&served_model), Json(response)).into_response())
+    Ok((routing_headers(&served_model, route), Json(response)).into_response())
 }
 
 /// Close the books on a non-streaming completion (ADR 003): upstream usage
@@ -664,6 +723,93 @@ mod tests {
 
     fn drop_guard() -> DropGuard {
         CancellationToken::new().drop_guard()
+    }
+
+    fn decision_with(
+        overrides: &[Option<serde_json::Value>],
+    ) -> lumen_router::virtual_models::Decision {
+        use lumen_router::virtual_models::{config::OverridesConfig, Attempt, Decision, Overrides};
+        let attempts = overrides
+            .iter()
+            .enumerate()
+            .map(|(i, o)| Attempt {
+                model_id: format!("m{i}"),
+                path: String::new(),
+                overrides: o
+                    .iter()
+                    .map(|v| {
+                        let cfg: OverridesConfig = serde_json::from_value(v.clone()).unwrap();
+                        std::sync::Arc::new(Overrides::compile(&cfg, Capability::Chat).unwrap())
+                    })
+                    .collect(),
+                remap: None,
+                escapes: Vec::new(),
+            })
+            .collect();
+        Decision {
+            virtual_model: Some("acme/bot".into()),
+            preset: None,
+            attempts,
+        }
+    }
+
+    fn chat_req(max_tokens: Option<u32>, max_completion_tokens: Option<u64>) -> ChatRequest {
+        let mut body = serde_json::json!({
+            "model": "acme/bot",
+            "messages": [{ "role": "user", "content": "hi" }]
+        });
+        if let Some(n) = max_tokens {
+            body["max_tokens"] = n.into();
+        }
+        if let Some(n) = max_completion_tokens {
+            body["max_completion_tokens"] = n.into();
+        }
+        serde_json::from_value(body).unwrap()
+    }
+
+    #[test]
+    fn reservation_follows_the_overrides_of_every_attempt() {
+        use serde_json::json;
+        let r = |d: &lumen_router::virtual_models::Decision, n: Option<u32>| {
+            reserved_output_tokens(d, &chat_req(n, None))
+        };
+        // No override: the client value, or the default.
+        let plain = decision_with(&[None]);
+        assert_eq!(r(&plain, Some(50)), 50);
+        assert_eq!(r(&plain, None), DEFAULT_RESERVED_OUTPUT_TOKENS);
+        // A `set` lowering the cap lowers the reservation.
+        let lowered = decision_with(&[Some(json!({ "set": { "max_tokens": 80 } }))]);
+        assert_eq!(r(&lowered, Some(100_000)), 80);
+        // A fallback target raising the cap is reserved for, whatever the
+        // client sent.
+        let raised = decision_with(&[None, Some(json!({ "set": { "max_tokens": 9000 } }))]);
+        assert_eq!(r(&raised, Some(10)), 9000);
+        // `default` only fills an absent cap.
+        let default = decision_with(&[Some(json!({ "default": { "max_tokens": 3000 } }))]);
+        assert_eq!(r(&default, None), 3000);
+        assert_eq!(r(&default, Some(20)), 20);
+    }
+
+    #[test]
+    fn reservation_counts_max_completion_tokens() {
+        use serde_json::json;
+        // An override that sets only `max_completion_tokens`.
+        let completion =
+            decision_with(&[Some(json!({ "set": { "max_completion_tokens": 9000 } }))]);
+        assert_eq!(
+            reserved_output_tokens(&completion, &chat_req(None, None)),
+            9000
+        );
+        assert_eq!(
+            reserved_output_tokens(&completion, &chat_req(Some(100), None)),
+            9000
+        );
+        // A client `max_completion_tokens` with no override.
+        let plain = decision_with(&[None]);
+        assert_eq!(
+            reserved_output_tokens(&plain, &chat_req(None, Some(4000))),
+            4000
+        );
     }
 
     /// Wrap a stream with guards, deadline = now + first_token_timeout.

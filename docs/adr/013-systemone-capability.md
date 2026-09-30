@@ -108,6 +108,12 @@ fallbacks and metrics in front of it.
 
 ## Amendment (2026-09-26): Jev as a reranker
 
+> Superseded in part by [ADR 014](014-virtual-models.md): the converter is
+> no longer a `[providers.models.rerank]` block on a `typesafe` model. It is
+> the `remap` of a target of a rerank virtual model, which also adds the
+> `score`, `composite` and `choice` strategies. The mapping, packing and
+> accounting below still hold.
+
 A `typesafe` model that declares `rerank` is served by a converter,
 `TypesafeRerankProvider`, which implements `RerankProvider` over the model's
 `SystemOneProvider`, so the whole `/v1/rerank` path (validation, ordering,

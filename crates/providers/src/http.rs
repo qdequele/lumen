@@ -12,7 +12,41 @@ use std::future::Future;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
-use crate::mapping::{classify_status, parse_retry_after};
+use crate::mapping::{classify_error, parse_retry_after};
+
+/// Most bytes of an upstream error body read for classification (ADR 014).
+const MAX_ERROR_BODY: usize = 16 * 1024;
+
+/// Longest wait for an upstream error body. An upstream that sends a 4xx
+/// header and then stalls the body must not hold the request until the
+/// first-token timeout (and turn a client error into a retryable timeout).
+const ERROR_BODY_DEADLINE: Duration = Duration::from_millis(500);
+
+/// Read at most [`MAX_ERROR_BODY`] bytes of an error response, only for
+/// statuses worth classifying, for at most [`ERROR_BODY_DEADLINE`]; on the
+/// deadline the bytes read so far are used (plain status classification
+/// applies when they carry no marker). Cancellation is the caller's: every
+/// call site runs inside [`with_cancel`]. Never logged, never returned to a
+/// client.
+pub(crate) async fn error_body_prefix(response: reqwest::Response) -> Vec<u8> {
+    if !crate::mapping::needs_error_body(response.status().as_u16()) {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut stream = response.bytes_stream();
+    let read = async {
+        while let Some(Ok(chunk)) = stream.next().await {
+            let room = MAX_ERROR_BODY.saturating_sub(out.len());
+            out.extend_from_slice(&chunk[..chunk.len().min(room)]);
+            if out.len() >= MAX_ERROR_BODY {
+                break;
+            }
+        }
+    };
+    // A timeout only means the body stalled; what arrived is still usable.
+    let _ = tokio::time::timeout(ERROR_BODY_DEADLINE, read).await;
+    out
+}
 
 /// Build the process-wide HTTP client with default timeouts (10 s connect,
 /// 300 s overall). Prefer [`build_client_with`] to honour the operator's
@@ -91,7 +125,7 @@ fn base_builder(connect: Duration, overall: Duration) -> reqwest::ClientBuilder 
 /// The whole request/response is subject to cancellation (see [`with_cancel`]),
 /// so a client disconnect aborts the in-flight upstream call. On a success
 /// status the raw response body is returned for the provider to translate; on a
-/// non-success status the shared [`classify_status`] policy applies (429 → rate
+/// non-success status the shared [`classify_error`] policy applies (429 → rate
 /// limited, 5xx → retryable upstream, other → fatal upstream). Transport
 /// failures map to [`ProviderError::Timeout`] or [`ProviderError::Unavailable`].
 ///
@@ -198,7 +232,9 @@ async fn open(
             Ok(response)
         } else {
             let retry_after = parse_retry_after(response.headers());
-            Err(classify_status(provider, status.as_u16(), retry_after))
+            let code = status.as_u16();
+            let body = error_body_prefix(response).await;
+            Err(classify_error(provider, code, retry_after, &body))
         }
     };
 
@@ -212,7 +248,7 @@ async fn open(
 
 /// Send a prepared request, honouring `cancel`, and classify the outcome. On a
 /// success status the raw body is returned; otherwise the shared
-/// [`classify_status`] policy applies.
+/// [`classify_error`] policy applies.
 async fn send(
     builder: reqwest::RequestBuilder,
     provider: &str,
@@ -232,7 +268,9 @@ async fn send(
                 .map_err(|e| map_transport(provider, &e))
         } else {
             let retry_after = parse_retry_after(response.headers());
-            Err(classify_status(provider, status.as_u16(), retry_after))
+            let code = status.as_u16();
+            let body = error_body_prefix(response).await;
+            Err(classify_error(provider, code, retry_after, &body))
         }
     };
 

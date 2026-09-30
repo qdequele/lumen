@@ -238,8 +238,8 @@ mode = "heuristic"                # "heuristic" (default) or "accurate"
 #
 # Every value below is the built-in default - the whole section is optional.
 # Retries and the circuit breaker are always active with these defaults; only
-# per-model `fallbacks` (see the model blocks below) and background health
-# checks are opt-in. None of this ever touches the DB on the request path, and
+# fallback between models (a `[[virtual_models]]` entry, see the end of this
+# file) and background health checks are opt-in. None of this ever touches the DB on the request path, and
 # an upstream 429 storm can never destabilise the gateway itself.
 # ---------------------------------------------------------------------------
 [resilience]
@@ -254,8 +254,9 @@ retry_base_ms = 200               # base backoff wait after the first failure
 retry_max_ms = 5000               # ceiling on the exponential backoff term
 
 # Circuit breaker - per (provider, model). After N consecutive provider-fault
-# failures the circuit opens; while open the model is skipped straight to its
-# next fallback, or answered with 503 LM-3020 (+ Retry-After) when none remains.
+# failures the circuit opens; while open the model is skipped straight to the
+# next target of the virtual model that routed to it (trigger `circuit_open`),
+# or answered with 503 LM-3020 (+ Retry-After) when none remains.
 # After the cooldown, a single half-open probe decides whether to close again.
 # State is exported as lumen_circuit_state{provider,model}
 # (0 = closed, 1 = open, 2 = half-open).
@@ -270,7 +271,7 @@ circuit_cooldown_ms = 30000       # time spent open before a half-open probe
 # shares the pool (ADR 005, 2026-07-15 amendment); the other two overrides do
 # not. Each timeout maps to a distinct 504 for debugging: LM-3012 connect,
 # LM-3011 first-token, LM-3013 total (the whole request - all retries and
-# fallbacks together).
+# every virtual-model fallback together).
 connect_timeout_ms = 5000         # TCP + TLS connection establishment
 total_timeout_ms = 600000         # absolute per-request deadline (10 minutes)
 
@@ -298,13 +299,20 @@ health_check_interval_ms = 30000  # probe cadence (must not be 0 when enabled)
 # full matrix.
 # `name` is your own label and must be unique.
 #
-# Each `[[providers.models]]` block exposes a model to clients:
+# Each `[[providers.models]]` block declares a FOUNDATION model: one upstream
+# model on this provider, callable directly by its id.
 #   id            the id clients send (owned entirely by you)
 #   upstream_id   what LUMEN sends upstream (defaults to `id`)
-#   capabilities  any of: "chat", "embed", "rerank", "systemone"
+#   capabilities  any of: "chat", "embed", "rerank", "systemone" (a typesafe
+#                 model serves "systemone" only; Jev reranks through a virtual
+#                 model `remap`, see below)
 #   modalities    input modalities; defaults to ["text"]. Add "image" to accept
-#                 image content parts on /v1/embeddings (M9). Image input to a
-#                 model without "image" is rejected with LM-2003.
+#                 image content parts on chat (vision) and /v1/embeddings (M9).
+#                 Image input to a model without "image" is rejected with
+#                 LM-2003.
+#   cost_per_1m_input / cost_per_1m_output / cost_per_1k_searches
+#                 optional prices (USD), the source of cost counting and hard
+#                 budgets
 #   release_date  optional ISO date the model was released, quoted
 #                 ("2024-08-06") or as a bare TOML date (2024-08-06).
 #                 GET /v1/models returns it as `release_date` and as the
@@ -312,6 +320,13 @@ health_check_interval_ms = 30000  # probe cadence (must not be 0 when enabled)
 #                 models by release. Metadata only, never used for routing.
 # Model ids must be unique across ALL providers (a collision aborts startup and
 # names both offending providers). Several ids MAY map to the same upstream_id.
+#
+# Fallback chains, weighted splits, conditional routing, chat presets and Jev
+# reranking are NOT declared here: they are virtual models, in the
+# `[[virtual_models]]` section at the end of this file (ADR 014). A config
+# written for an older LUMEN (per-model fallbacks, a per-model Jev rerank
+# block, or `rerank` on a typesafe model) fails validation; run
+# `lumen config migrate` (add --dry-run to preview) to convert it.
 # ---------------------------------------------------------------------------
 
 # OpenAI: chat + embeddings.
@@ -321,8 +336,11 @@ kind = "openai"
 api_key_env = "OPENAI_API_KEY"
 # base_url = "https://api.openai.com/v1"   # optional override
 
+# Clients call `gpt-4o`, the virtual model at the end of this file that falls
+# back to Claude. This foundation id stays callable directly, for a request
+# that must be served by OpenAI or fail.
 [[providers.models]]
-id = "gpt-4o"
+id = "openai/gpt-4o"
 upstream_id = "gpt-4o-2024-08-06"
 capabilities = ["chat"]
 # Input modalities this model accepts. Default is ["text"]; opt a model into
@@ -337,20 +355,14 @@ release_date = "2024-08-06"
 # A model without prices costs 0: budgets then never bite on it.
 cost_per_1m_input = 2.5
 cost_per_1m_output = 10.0
-# Fallback chain: if this provider exhausts its retries or its circuit is open,
-# try these models IN ORDER. Each must exist below and serve every capability
-# declared above (here "chat"), which is validated at boot. Whichever model
-# actually serves the request is reported in the x-lumen-model-used
-# response header and the usage_log.model_used column.
-fallbacks = ["claude-sonnet-4-5"]
 
 [[providers.models]]
 id = "text-embedding-3-small"
 capabilities = ["embed"]
 
-# Anthropic: chat (bidirectional OpenAI <-> Anthropic translation). Configured
-# here as gpt-4o's fallback - the same capability from a different vendor, so a
-# single-vendor outage doesn't take chat down.
+# Anthropic: chat (bidirectional OpenAI <-> Anthropic translation). The second
+# target of the `gpt-4o` virtual model below: the same capability from a
+# different vendor, so a single-vendor outage doesn't take chat down.
 [[providers]]
 name = "anthropic"
 kind = "anthropic"
@@ -477,16 +489,14 @@ name = "cohere"
 kind = "cohere"
 api_key_env = "COHERE_API_KEY"
 
+# Clients call `rerank-english`, the virtual model below that falls back from
+# Cohere to Jina, then Voyage.
 [[providers.models]]
-id = "rerank-english"
+id = "cohere/rerank-english"
 upstream_id = "rerank-v3.5"
 capabilities = ["rerank"]
 # Rerank is billed in search units (1 unit ≈ one query over ≤ 100 documents).
 cost_per_1k_searches = 2.0
-# A multi-hop fallback chain across three rerank vendors: if Cohere is down,
-# try Jina, then Voyage. All three serve "rerank", so a rerank request survives
-# any single vendor outage.
-fallbacks = ["jina-rerank", "voyage-rerank"]
 
 # Versioned aliasing: a stable public id pinned to a specific upstream version.
 # Bump `upstream_id` to roll the model forward without changing client code.
@@ -562,28 +572,13 @@ capabilities = ["systemone"]
 # Jev bills input tokens only: no cost_per_1m_output needed.
 cost_per_1m_input = 0.042
 
-# A pinned version for reproducible answers, falling back to the stable alias
-# when it is overloaded (TypeSafe 529, retryable) or its circuit is open.
+# A pinned version for reproducible answers. Clients call `jev-1.13.0`, the
+# virtual model below that falls back to the stable alias `jev`.
 [[providers.models]]
-id = "jev-1.13.0"
+id = "typesafe/jev-1.13.0"
+upstream_id = "jev-1.13.0"
 capabilities = ["systemone"]
 cost_per_1m_input = 0.042
-fallbacks = ["jev"]
-
-# Jev as a reranker: POST /v1/rerank on this model is converted to one
-# SystemOne call whose state is the query and whose questions are one noul per
-# document; the noul is the relevance_score. The [providers.models.rerank]
-# block is optional (every field defaults to a generic relevance question) and
-# is only valid on a typesafe model declaring "rerank".
-[[providers.models]]
-id = "jev-rerank"
-upstream_id = "jev-latest"
-capabilities = ["rerank"]
-cost_per_1m_input = 0.042   # rerank models priced per token are billed per token
-[providers.models.rerank]
-instructions = "Is `document` relevant to the query in the state, that is, does it answer the query or contain information that directly helps answer it?"
-criteria.true = "The document answers the query or contains information that directly helps answer it."
-criteria.false = "The document is off-topic, or only shares keywords with the query without helping answer it."
 
 # NVIDIA NIM: reranking via `{base}/v1/ranking`. base_url REQUIRED (the NIM
 # root); keyless for self-hosted NIMs (set api_key_env for the hosted API).
@@ -646,6 +641,203 @@ api_version = "2024-10-21"
 id = "azure-gpt-4o"
 upstream_id = "my-gpt4o-deployment"   # the Azure deployment name
 capabilities = ["chat"]
+
+# ---------------------------------------------------------------------------
+# Virtual models (ADR 014)
+#
+# A virtual model is an id clients send that LUMEN resolves, per request, to
+# one or more foundation models (declared above) or other virtual models. It
+# lives in the dynamic config: it hot-reloads, and is editable through
+# /admin/config and /admin/config/virtual_models (ADR 012). Foundation
+# and virtual ids share ONE namespace: a collision is a validation error. Ids
+# are non-empty and use only the characters A-Z a-z 0-9 . _ : / -
+# (`company/model` is a convention, not a rule).
+#
+# Fields of a `[[virtual_models]]` entry:
+#   id           the id clients send, e.g. "acme/legal-rerank" (required)
+#   capability   exactly one of "chat", "embed", "rerank", "systemone"
+#                (required); define two ids to serve two capabilities
+#   strategy     how `targets` are used (required):
+#                  "single"   the one target (exactly 1 target)
+#                  "fallback" targets in order, moving to the next when the
+#                             failure matches `fallback_on` (2 or more)
+#                  "split"    one target picked at random by `weight`; on a
+#                             matching failure, the others in descending
+#                             weight order (2 or more)
+#                  "switch"   the first target whose `when` matches; a chosen
+#                             branch never falls through to the next rule
+#   targets      ordered array of target tables (required), each with:
+#                  model      a foundation or virtual id (required)
+#                  weight     integer > 0, required on "split" and only there
+#                  when       condition, "switch" only: every target but the
+#                             last has one, the last (the default) has none
+#                  overrides  request field overrides:
+#                             { set = {...}, default = {...}, drop = [...] }.
+#                             `set` always applies, `default` only when the
+#                             client did not send the field, `drop` removes
+#                             it. Allowed fields: chat temperature, top_p,
+#                             max_tokens, max_completion_tokens, stop, seed,
+#                             presence_penalty, frequency_penalty,
+#                             response_format, reasoning_effort,
+#                             parallel_tool_calls; embed dimensions,
+#                             encoding_format; rerank top_n; systemone none.
+#                             The level closest to the foundation leaf wins.
+#                  remap      rerank virtual models only, on a target that
+#                             points directly at a foundation model serving
+#                             "systemone": converts /v1/rerank into Jev
+#                             SystemOne calls. `strategy` is "noul" (default:
+#                             `instructions`, `criteria.true`,
+#                             `criteria.false`), "score" (`instructions`,
+#                             `levels`, worst first), "composite" (1 to 8
+#                             `questions`, each with `instructions`,
+#                             `criteria`, `weight`) or "choice"
+#                             (`instructions`; the documents are the options,
+#                             at most 255 in one call). An optional `context`
+#                             is sent in the SystemOne state. Cost is the
+#                             SystemOne model's cost_per_1m_input.
+#   fallback_on  "fallback" and "split" only. Triggers that move to the next
+#                target. Default:
+#                ["provider_error", "rate_limited", "timeout", "circuit_open"]
+#                  provider_error  retryable upstream 5xx (including a
+#                                  TypeSafe 529 overload), unreachable
+#                                  upstream, stream end before the first
+#                                  byte. A malformed response (LM-3002) and
+#                                  non-retryable statuses never fail over
+#                  rate_limited    upstream 429
+#                  timeout         connect, first-token or attempt timeout
+#                  circuit_open    the leaf's circuit breaker is open
+#                  context_length  opt-in: input rejected as too long
+#                  content_filter  opt-in: refused on content policy
+#                A client 4xx, a client cancellation, or a failure after the
+#                first streamed byte never fails over. Retries happen inside
+#                each leaf first; [resilience].total_timeout_ms bounds the
+#                whole tree (LM-3013).
+#   preset       "chat" only: { system_prompt = "...", system_prompt_mode =
+#                "prepend" | "replace" | "if_absent", overrides = {...} }.
+#                Applies only when this virtual model is the requested id; the
+#                prompt (at most 32 KiB) counts in tokens and cost, and is
+#                never logged.
+#   description  optional, shown on GET /v1/models
+#   listed       default true; false hides the model from GET /v1/models (it
+#                stays callable)
+#
+# `when` attributes: group (the key's budget group), "metadata.<key>" (a
+# top-level field of the x-lumen-metadata header; quote the key in TOML),
+# has_images, has_tools, stream, input_tokens, documents. A bare value means
+# equality; operators are in, ne, gt, gte, lt, lte, regex. Several keys in one
+# table are ANDed; `any = [{...}, {...}]` is an OR. A missing attribute is
+# false.
+#
+# Nesting is allowed up to 8 levels, without cycles. The response reports the
+# foundation model that served the request in x-lumen-model-used, and the path
+# taken in x-lumen-route; usage_log records both (`model_used`, `route`).
+#
+# Inline tables `{ ... }` must stay on ONE line (TOML 1.0): for long targets,
+# use `[[virtual_models.targets]]` sub-tables, as `acme/legal-rerank` does.
+# ---------------------------------------------------------------------------
+
+# Fallback: `gpt-4o` is served by OpenAI, and by Claude when OpenAI fails
+# with a default trigger (5xx, 429, timeout, open circuit).
+[[virtual_models]]
+id = "gpt-4o"
+capability = "chat"
+strategy = "fallback"
+targets = [{ model = "openai/gpt-4o" }, { model = "claude-sonnet-4-5" }]
+
+# A multi-hop fallback across three rerank vendors: if Cohere is down, try
+# Jina, then Voyage, so a rerank request survives any single vendor outage.
+[[virtual_models]]
+id = "rerank-english"
+capability = "rerank"
+strategy = "fallback"
+targets = [{ model = "cohere/rerank-english" }, { model = "jina-rerank" }, { model = "voyage-rerank" }]
+
+# The pinned Jev version, falling back to the stable alias when it is
+# overloaded (TypeSafe 529, the `provider_error` trigger) or its circuit is
+# open.
+[[virtual_models]]
+id = "jev-1.13.0"
+capability = "systemone"
+strategy = "fallback"
+targets = [{ model = "typesafe/jev-1.13.0" }, { model = "jev" }]
+
+# Jev as a reranker: POST /v1/rerank on `jev-rerank` is converted to SystemOne
+# calls on `jev` whose state is the query and whose questions are one noul per
+# document; the noul is the relevance_score. Every remap field is optional
+# (the defaults are a generic relevance question).
+[[virtual_models]]
+id = "jev-rerank"
+capability = "rerank"
+strategy = "single"
+description = "Jev relevance reranking"
+
+[[virtual_models.targets]]
+model = "jev"
+[virtual_models.targets.remap]
+strategy = "noul"
+instructions = "Is `document` relevant to the query in the state, that is, does it answer the query or contain information that directly helps answer it?"
+criteria.true = "The document answers the query or contains information that directly helps answer it."
+criteria.false = "The document is off-topic, or only shares keywords with the query without helping answer it."
+
+# Preset: a support bot with its own system prompt and sampling defaults,
+# falling back from GPT-4o to Claude. `gpt-4o` here is itself a virtual model,
+# so this nests two levels.
+[[virtual_models]]
+id = "acme/support-bot"
+capability = "chat"
+strategy = "fallback"
+targets = [{ model = "gpt-4o" }, { model = "claude-sonnet-4-5" }]
+description = "Acme support assistant"
+preset = { system_prompt = "You are Acme's support assistant. Answer briefly and point to the documentation when relevant.", system_prompt_mode = "prepend", overrides = { default = { temperature = 0.2 }, set = { max_tokens = 800 } } }
+
+# Composite remap with a vendor fallback: two weighted Jev questions per
+# document, then Cohere when Jev fails.
+[[virtual_models]]
+id = "acme/legal-rerank"
+capability = "rerank"
+strategy = "fallback"
+
+[[virtual_models.targets]]
+model = "jev"
+[virtual_models.targets.remap]
+strategy = "composite"
+context = "US federal case law. Prefer holdings over dicta."
+[[virtual_models.targets.remap.questions]]
+instructions = "Is `document` on the topic of the query?"
+weight = 0.3
+criteria.true = "It discusses the same legal question."
+criteria.false = "It is about something else."
+[[virtual_models.targets.remap.questions]]
+instructions = "Does `document` state the rule the query cites?"
+weight = 0.7
+criteria.true = "It states the specific rule."
+criteria.false = "It only mentions related topics."
+
+[[virtual_models.targets]]
+model = "rerank-english"
+
+# Split: 80% of `acme/chat-ab` goes to OpenAI and 20% to Azure OpenAI; a
+# failing pick moves to the other one. Uncomment to enable.
+# [[virtual_models]]
+# id = "acme/chat-ab"
+# capability = "chat"
+# strategy = "split"
+# targets = [{ model = "openai/gpt-4o", weight = 80 }, { model = "azure-gpt-4o", weight = 20 }]
+
+# Switch: route by budget group (matches only with auth enabled), by request
+# metadata and by request shape. Needs the `acme/chat-eu` and `gemini-long`
+# models, which this file does not declare. The last target is the mandatory
+# default.
+# [[virtual_models]]
+# id = "acme/chat"
+# capability = "chat"
+# strategy = "switch"
+# targets = [
+#   { when = { group = "eu-customers" }, model = "acme/chat-eu" },
+#   { when = { "metadata.plan" = { in = ["pro"] }, input_tokens = { gt = 32000 } }, model = "gemini-long" },
+#   { when = { any = [{ has_images = true }, { has_tools = true }] }, model = "gpt-4o" },
+#   { model = "local-llama" },
+# ]
 
 # ---------------------------------------------------------------------------
 # Multimodal image fetching (M9) - OFF by default.

@@ -24,6 +24,7 @@ use lumen_providers::{http, ModelSpec, ProviderKind, ProviderSpec, Registry};
 use lumen_server::auth::AuthRuntime;
 use lumen_server::config::Config;
 use lumen_server::pricing::CostTable;
+use lumen_server::resilience::ResilienceRuntime;
 use lumen_server::AppState;
 use lumen_telemetry::{Metrics, TokenMetrics};
 use serde_json::{json, Value};
@@ -55,7 +56,6 @@ fn full_registry(upstream: &str) -> Arc<Registry> {
                     upstream_id: "gpt-4o-2024-08-06".to_owned(),
                     capabilities: vec![Capability::Chat],
                     modalities: vec!["text".to_owned()],
-                    rerank_converter: None,
                     release_date: None,
                 },
                 ModelSpec {
@@ -63,7 +63,6 @@ fn full_registry(upstream: &str) -> Arc<Registry> {
                     upstream_id: "text-embedding-3-small".to_owned(),
                     capabilities: vec![Capability::Embed],
                     modalities: vec!["text".to_owned()],
-                    rerank_converter: None,
                     release_date: None,
                 },
             ],
@@ -81,7 +80,6 @@ fn full_registry(upstream: &str) -> Arc<Registry> {
                 upstream_id: "rerank-v3.5".to_owned(),
                 capabilities: vec![Capability::Rerank],
                 modalities: vec!["text".to_owned()],
-                rerank_converter: None,
                 release_date: None,
             }],
         },
@@ -93,24 +91,13 @@ fn full_registry(upstream: &str) -> Arc<Registry> {
             api_version: None,
             strict: false,
             connect_timeout_ms: None,
-            models: vec![
-                ModelSpec {
-                    id: "jev".to_owned(),
-                    upstream_id: "jev-latest".to_owned(),
-                    capabilities: vec![Capability::SystemOne],
-                    modalities: vec!["text".to_owned()],
-                    rerank_converter: None,
-                    release_date: None,
-                },
-                ModelSpec {
-                    id: "jev-rerank".to_owned(),
-                    upstream_id: "jev-latest".to_owned(),
-                    capabilities: vec![Capability::Rerank],
-                    modalities: vec!["text".to_owned()],
-                    rerank_converter: None,
-                    release_date: None,
-                },
-            ],
+            models: vec![ModelSpec {
+                id: "jev".to_owned(),
+                upstream_id: "jev-latest".to_owned(),
+                capabilities: vec![Capability::SystemOne],
+                modalities: vec!["text".to_owned()],
+                release_date: None,
+            }],
         },
         ProviderSpec {
             name: "tei".to_owned(),
@@ -125,7 +112,6 @@ fn full_registry(upstream: &str) -> Arc<Registry> {
                 upstream_id: "tei-model".to_owned(),
                 capabilities: vec![Capability::Embed],
                 modalities: vec!["text".to_owned()],
-                rerank_converter: None,
                 release_date: None,
             }],
         },
@@ -171,10 +157,6 @@ fn dollar_pricing() -> CostTable {
         id = "jev"
         capabilities = ["systemone"]
         # Input-only pricing, like Jev itself: output tokens are free.
-        cost_per_1m_input = 1000000.0
-        [[providers.models]]
-        id = "jev-rerank"
-        capabilities = ["rerank"]
         cost_per_1m_input = 1000000.0
     "#;
     let config: Config = Figment::new()
@@ -251,6 +233,21 @@ async fn spawn_auth_with_store(
     metadata_labels: &[&str],
     store: KeyStore,
 ) -> Harness {
+    spawn_auth_inner(registry, metadata_labels, store, None).await
+}
+
+/// Same, with a resilience runtime carrying virtual models (ADR 014).
+async fn spawn_auth_routed(registry: Arc<Registry>, resilience: ResilienceRuntime) -> Harness {
+    let store = KeyStore::in_memory().await.expect("open store");
+    spawn_auth_inner(registry, &[], store, Some(Arc::new(resilience))).await
+}
+
+async fn spawn_auth_inner(
+    registry: Arc<Registry>,
+    metadata_labels: &[&str],
+    store: KeyStore,
+    resilience: Option<Arc<ResilienceRuntime>>,
+) -> Harness {
     let groups = store.load_groups().await.expect("load groups");
     let entries = store.load_auth_entries().await.expect("load entries");
     let keys = AuthState::load(groups, entries);
@@ -274,10 +271,13 @@ async fn spawn_auth_with_store(
     let tokens = TokenMetrics::register(&metrics, &labels).expect("register token metrics");
     let latency =
         lumen_telemetry::LatencyMetrics::register(&metrics).expect("register latency metrics");
-    let state = AppState::new(metrics, registry, tokens, latency)
+    let mut state = AppState::new(metrics, registry, tokens, latency)
         .with_pricing(dollar_pricing())
         .with_auth(Arc::clone(&runtime))
         .with_usage(logger);
+    if let Some(resilience) = resilience {
+        state = state.with_resilience(resilience);
+    }
     let base = common::spawn_state(state, LIMIT).await;
 
     Harness {
@@ -596,8 +596,9 @@ async fn systemone_usage_row_records_tokens_and_input_only_cost() {
 
 #[tokio::test]
 async fn jev_rerank_is_billed_per_input_token() {
-    // A token-priced rerank model (Jev through the converter) is charged
-    // `cost_per_1m_input` on the upstream token count, not only per search.
+    // A token-priced reranker (Jev through a virtual model `remap`, ADR 014)
+    // is charged the serving leaf's `cost_per_1m_input` on the upstream token
+    // count, not only per search.
     let upstream = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/systemone"))
@@ -608,7 +609,27 @@ async fn jev_rerank_is_billed_per_input_token() {
         })))
         .mount(&upstream)
         .await;
-    let h = spawn_auth(full_registry(&upstream.uri()), &[]).await;
+    let routing: Config = toml::from_str(
+        r#"
+        [[providers]]
+        name = "typesafe"
+        kind = "typesafe"
+        [[providers.models]]
+        id = "jev"
+        capabilities = ["systemone"]
+        [[virtual_models]]
+        id = "jev-rerank"
+        capability = "rerank"
+        strategy = "single"
+        targets = [{ model = "jev", remap = { instructions = "Relevant?" } }]
+        "#,
+    )
+    .expect("valid routing config");
+    let h = spawn_auth_routed(
+        full_registry(&upstream.uri()),
+        ResilienceRuntime::from_config(&routing, None),
+    )
+    .await;
     let key = h.create_key(Some(100.0), None, None).await;
 
     let resp = h
@@ -625,9 +646,10 @@ async fn jev_rerank_is_billed_per_input_token() {
 
     h.wait_usage_rows(1).await;
     let dump = h.store.debug_dump().await.expect("dump");
-    // tokens_in=5 (upstream), one derived search unit priced at 0, $5 of tokens.
+    // tokens_in=5 (upstream), one derived search unit priced at 0, $5 of
+    // tokens at `jev`'s price (the leaf that served).
     assert!(
-        dump.contains("'jev-rerank'|'jev-rerank'|'rerank'|5|0|1|NULL|NULL|NULL|0|5.0|"),
+        dump.contains("'jev-rerank'|'jev'|'rerank'|5|0|1|NULL|NULL|NULL|0|5.0|"),
         "dump:\n{dump}"
     );
 }

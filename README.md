@@ -40,15 +40,16 @@ reference.
 | `POST /v1/embeddings`          | Embeddings, OpenAI format.                              |
 | `POST /v1/rerank`              | Reranking, Cohere format (`query`, `documents`, `top_n`).|
 | `POST /v1/systemone`           | SystemOne typed decisions (TypeSafe Jev), TypeSafe format (`state`, `questions`); TypeSafe SDKs work via `TYPESAFE_BASE_URL`. See [SystemOne](docs/systemone/systemone.md). |
-| `GET  /v1/models`              | Lists configured models with a `capabilities` array (plus `release_date` / `created` when configured, to sort by release). |
+| `GET  /v1/models`              | Lists configured models with a `capabilities` array and `"virtual": true/false` (virtual models also carry an optional `description`; `listed = false` hides one), plus `release_date` / `created` when configured, to sort by release. |
 | `GET  /v1/models/{id}`         | Retrieves one model (same object as the list entry); unknown id is a 404 (`LM-2001`). |
 | `GET  /health`                 | Liveness. No I/O, never touches the DB or providers.    |
 | `GET  /health/providers`       | Background provider-probe results (opt-in, see below).  |
 | `GET  /metrics`                | Prometheus exposition.                                  |
 | `POST/GET/PUT/PATCH/DELETE /admin/*` | Keys, budgets, budget webhooks, usage reporting & export, provider-key rotation, whole-document and granular (per-provider, per-section) config read/apply. Only mounted when auth is enabled. See [Config source modes](docs/operations/config-modes.md). |
 
-A single model id is owned entirely by you and may serve one or more of the
-four capabilities (`chat`, `embed`, `rerank`, `systemone`). The router resolves each request by `(capability, model)`.
+A foundation model id is owned entirely by you and may serve one or more of the
+four capabilities (`chat`, `embed`, `rerank`, `systemone`); a [virtual
+model](docs/virtual-models.md) serves exactly one. The router resolves each request by `(capability, model)`.
 
 **Vision (image input):** `POST /v1/chat/completions` also accepts OpenAI's
 content-parts message shape (text + `image_url` parts) for any model whose
@@ -244,9 +245,29 @@ win over the file. See
 
 Survives flaky upstreams without becoming flaky itself: **retries** with
 exponential backoff + jitter (retryable failures only, never a client 4xx),
-per-model **fallback chains**, a per-`(provider, model)` **circuit breaker**, and
+**fallback** through [virtual models](docs/virtual-models.md), a per-`(provider, model)` **circuit breaker**, and
 per-phase timeouts. Optional **background health checks** publish
 `GET /health/providers`. See [Resilience tuning](https://qdequele.github.io/lumen/operations/resilience.html).
+
+### Virtual models (ADR 014)
+
+Public ids that carry routing logic on top of your foundation models:
+**fallback**, **weighted split**, **conditional routing** (`switch` on budget
+group, request metadata and request shape), **presets** (a stored system
+prompt and sampling defaults), and **Jev as a reranker**, all declared in
+`[[virtual_models]]` and hot-reloadable. Responses report the path taken in
+`x-lumen-route`. See [`docs/virtual-models.md`](docs/virtual-models.md).
+
+```toml
+[[virtual_models]]
+id = "gpt-4o"
+capability = "chat"
+strategy = "fallback"
+targets = [{ model = "openai/gpt-4o" }, { model = "claude-sonnet-4-5" }]
+```
+
+An older config that uses per-model `fallbacks` is migrated with
+`lumen config migrate` (`--dry-run` previews it).
 
 ### Observability & token accounting (ADR 003)
 

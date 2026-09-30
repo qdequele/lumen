@@ -94,6 +94,101 @@ pub fn classify_status(
     }
 }
 
+/// Structured error codes of an input longer than the model's context window,
+/// lowercase (OpenAI and compatibles). Matched only as the exact string value
+/// of a code-like key (see [`has_error_code`]), never as a substring.
+const CONTEXT_LENGTH_CODES: &[&str] = &["context_length_exceeded"];
+
+/// Error-message phrases of an input longer than the model's context window,
+/// lowercase, per vendor (Anthropic, Google/Vertex, Bedrock, Mistral, Cohere,
+/// OpenAI). Multi-word sentences from rejection messages, never a bare
+/// identifier that a parameter name could also spell.
+const CONTEXT_LENGTH_PHRASES: &[&str] = &[
+    "maximum context length",
+    "prompt is too long",
+    "input is too long",
+    "too many tokens",
+    "exceeds the maximum number of tokens",
+    "context window",
+    "too large for model",
+];
+
+/// Structured error codes of a content-policy refusal, lowercase (Azure
+/// OpenAI `content_filter` and its inner `ResponsibleAIPolicyViolation`,
+/// OpenAI `content_policy_violation`).
+const CONTENT_FILTER_CODES: &[&str] = &[
+    "content_filter",
+    "content_policy_violation",
+    "responsibleaipolicyviolation",
+];
+
+/// Error-message phrases of a content-policy refusal, lowercase.
+const CONTENT_FILTER_PHRASES: &[&str] = &["content management policy", "blocked by safety"];
+
+/// JSON keys whose string value is an error code worth matching.
+const CODE_KEYS: &[&str] = &["code", "type", "reason", "status"];
+
+/// Statuses whose body is worth classifying (client errors that may be a
+/// context-length or content-policy refusal).
+#[must_use]
+pub const fn needs_error_body(status: u16) -> bool {
+    matches!(status, 400 | 403 | 413 | 422)
+}
+
+/// Whether the (lowercase) body carries `code` as the exact string value of a
+/// [`CODE_KEYS`] key, as in `"code": "context_length_exceeded"`. A scan rather
+/// than a JSON parse, so a body cut at the read bound still classifies; the
+/// quotes rule out a longer identifier containing the code, and the key check
+/// rules out the same word used as a parameter name or inside a message.
+fn has_error_code(text: &str, code: &str) -> bool {
+    let quoted = format!("\"{code}\"");
+    text.match_indices(&quoted)
+        .any(|(at, _)| preceding_key(&text[..at]).is_some_and(|k| CODE_KEYS.contains(&k)))
+}
+
+/// The JSON key right before a string value that starts at the end of
+/// `before` (`"key" :` then optional whitespace), if any.
+fn preceding_key(before: &str) -> Option<&str> {
+    let rest = before.trim_end().strip_suffix(':')?.trim_end();
+    let rest = rest.strip_suffix('"')?;
+    let open = rest.rfind('"')?;
+    Some(&rest[open + 1..])
+}
+
+/// [`classify_status`], refined by the (bounded) error body: a client error
+/// whose body carries a known context-length or content-policy error code (as
+/// a structured field) or rejection phrase maps to
+/// [`ProviderError::ContextLengthExceeded`] / [`ProviderError::ContentFiltered`]
+/// (ADR 014). The body is only searched, never logged or returned.
+#[must_use]
+pub fn classify_error(
+    provider: &str,
+    status: u16,
+    retry_after: Option<Duration>,
+    body: &[u8],
+) -> ProviderError {
+    if needs_error_body(status) && !body.is_empty() {
+        let text = String::from_utf8_lossy(body).to_ascii_lowercase();
+        let matches = |codes: &[&str], phrases: &[&str]| {
+            codes.iter().any(|c| has_error_code(&text, c))
+                || phrases.iter().any(|p| text.contains(p))
+        };
+        if matches(CONTEXT_LENGTH_CODES, CONTEXT_LENGTH_PHRASES) {
+            return ProviderError::ContextLengthExceeded {
+                provider: provider.to_owned(),
+                status,
+            };
+        }
+        if matches(CONTENT_FILTER_CODES, CONTENT_FILTER_PHRASES) {
+            return ProviderError::ContentFiltered {
+                provider: provider.to_owned(),
+                status,
+            };
+        }
+    }
+    classify_status(provider, status, retry_after)
+}
+
 /// Parse a `Retry-After` header expressed in delta-seconds. HTTP-date form is
 /// intentionally not handled in v1 (returns `None`).
 #[must_use]
@@ -214,5 +309,122 @@ mod tests {
         let mut extra = serde_json::Map::new();
         extra.insert("seed".to_owned(), serde_json::Value::Null);
         assert!(check_unsupported_chat_fields("p", true, &extra, &["seed", "logprobs"]).is_ok());
+    }
+
+    #[test]
+    fn context_length_bodies_are_classified_per_vendor() {
+        let cases: &[&[u8]] = &[
+            br#"{"error":{"code":"context_length_exceeded","message":"..."}}"#,
+            br#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 250000 tokens > 200000 maximum"}}"#,
+            br#"{"error":{"message":"The input token count (1200000) exceeds the maximum number of tokens allowed (1048576)."}}"#,
+            br#"{"message":"Input is too long for requested model."}"#,
+            br#"{"message":"too many tokens: total number of tokens in the prompt cannot exceed 128000"}"#,
+        ];
+        for body in cases {
+            match classify_error("p", 400, None, body) {
+                ProviderError::ContextLengthExceeded { provider, status } => {
+                    assert_eq!((provider.as_str(), status), ("p", 400));
+                }
+                other => panic!(
+                    "expected context length for {:?}, got {other:?}",
+                    String::from_utf8_lossy(body)
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn content_filter_bodies_are_classified() {
+        let body = br#"{"error":{"code":"content_filter","message":"The response was filtered"}}"#;
+        assert!(matches!(
+            classify_error("azure", 400, None, body),
+            ProviderError::ContentFiltered { status: 400, .. }
+        ));
+        let body = br#"{"error":{"code":"content_policy_violation"}}"#;
+        assert!(matches!(
+            classify_error("openai", 400, None, body),
+            ProviderError::ContentFiltered { .. }
+        ));
+    }
+
+    #[test]
+    fn a_code_word_outside_a_code_field_is_not_a_refusal() {
+        let cases: &[&[u8]] = &[
+            // The marker as a parameter name, in the message and in `param`.
+            br#"{"error":{"code":"invalid_parameter","message":"Unsupported parameter: content_filter"}}"#,
+            br#"{"error":{"code":"invalid_parameter","param":"content_filter"}}"#,
+            // A longer identifier that contains a marker.
+            br#"{"error":{"code":"context_length_exceeded_for_tools_schema"}}"#,
+            br#"{"error":{"code":"not_a_content_filter"}}"#,
+        ];
+        for body in cases {
+            assert!(
+                matches!(
+                    classify_error("p", 400, None, body),
+                    ProviderError::Upstream { status: 400, .. }
+                ),
+                "{:?}",
+                String::from_utf8_lossy(body)
+            );
+        }
+    }
+
+    #[test]
+    fn a_code_is_matched_with_spacing_and_in_a_truncated_body() {
+        assert!(matches!(
+            classify_error(
+                "p",
+                400,
+                None,
+                br#"{"error": {"code" : "Context_Length_Exceeded", "mess"#
+            ),
+            ProviderError::ContextLengthExceeded { .. }
+        ));
+        assert!(matches!(
+            classify_error(
+                "azure",
+                400,
+                None,
+                br#"{"error":{"code":"x","innererror":{"code":"ResponsibleAIPolicyViolation"}}}"#
+            ),
+            ProviderError::ContentFiltered { .. }
+        ));
+    }
+
+    #[test]
+    fn unrecognised_bodies_and_other_statuses_fall_back_to_classify_status() {
+        assert!(matches!(
+            classify_error("p", 400, None, br#"{"error":"bad field"}"#),
+            ProviderError::Upstream {
+                status: 400,
+                retryable: false,
+                ..
+            }
+        ));
+        // A 5xx is never reclassified, whatever its body says.
+        assert!(matches!(
+            classify_error("p", 503, None, br"context_length_exceeded"),
+            ProviderError::Upstream {
+                status: 503,
+                retryable: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            classify_error("p", 429, None, b""),
+            ProviderError::RateLimited { .. }
+        ));
+    }
+
+    #[test]
+    fn the_new_variants_are_client_errors_not_provider_faults() {
+        let e = ProviderError::ContextLengthExceeded {
+            provider: "p".into(),
+            status: 400,
+        };
+        assert!(!e.is_retryable());
+        assert!(!e.is_provider_fault());
+        let g = lumen_core::GatewayError::from_provider("p", e);
+        assert_eq!((g.code(), g.http_status()), ("LM-2012", 400));
     }
 }

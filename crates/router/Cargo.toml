@@ -21,10 +21,20 @@ tokio-util = { workspace = true }
 futures = { workspace = true }
 dashmap = { workspace = true }
 tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+regex = { workspace = true }
+thiserror = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
 reqwest = { workspace = true }
+toml = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "decide"
+harness = false
 
 [lints]
 workspace = true

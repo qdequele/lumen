@@ -81,48 +81,72 @@ capabilities = ["embed", "rerank"]
 
 ## Cross-vendor fallback
 
-Like any capability, a rerank model can list `fallbacks` across different
-provider kinds. A three-hop chain across Cohere, Jina and Voyage survives any
-single vendor outage:
+Like any capability, rerank can fall back across different provider kinds,
+through a [virtual model](../virtual-models.md). A three-hop chain across
+Cohere, Jina and Voyage survives any single vendor outage:
 
 ```toml
 [[providers.models]]
-id = "rerank-english"
+id = "cohere/rerank-english"
 upstream_id = "rerank-v3.5"
 capabilities = ["rerank"]
-fallbacks = ["jina-rerank", "voyage-rerank"]
+
+[[virtual_models]]
+id = "rerank-english"
+capability = "rerank"
+strategy = "fallback"
+targets = [{ model = "cohere/rerank-english" }, { model = "jina-rerank" }, { model = "voyage-rerank" }]
 ```
 
-The model that actually served the request (primary or a fallback) is
-reported in the `x-lumen-model-used` response header. See
-[Resilience](../operations/resilience.md).
+The foundation model that actually served the request (primary or a fallback)
+is reported in the `x-lumen-model-used` response header, and the path taken in
+`x-lumen-route`. See [Resilience](../operations/resilience.md).
 
 ## Jev as a reranker (TypeSafe)
 
-A `typesafe` model that declares `rerank` is served by Jev through a
-converter. Each request becomes SystemOne calls whose `state` is
-`{"query": ...}` and whose questions are one `noul` per document, the
-document carried in structured instructions; Jev's noul (its calibrated
-probability that the document is relevant) is the `relevance_score`.
+A rerank [virtual model](../virtual-models.md#7-jev-as-a-reranker) whose
+target carries a `remap` is served by Jev. The target points at a `typesafe`
+foundation model that declares `systemone` (a `typesafe` model can no longer
+declare `rerank` itself). Each request becomes SystemOne calls whose `state`
+is `{"query": ...}` and whose questions, by default, are one `noul` per
+document, the document carried in structured instructions; Jev's noul (its
+calibrated probability that the document is relevant) is the
+`relevance_score`.
 
 ```toml
+[[providers]]
+name = "typesafe"
+kind = "typesafe"
+api_key_env = "TYPESAFE_API_KEY"
+
 [[providers.models]]
-id = "jev-rerank"
+id = "jev"
 upstream_id = "jev-latest"
-capabilities = ["rerank"]
+capabilities = ["systemone"]
 cost_per_1m_input = 0.042
 
-# Optional: the question asked about every document. Unset fields default
-# to a generic relevance question.
-[providers.models.rerank]
+# Optional remap fields: the question asked about every document. Unset
+# fields default to a generic relevance question.
+[[virtual_models]]
+id = "jev-rerank"
+capability = "rerank"
+strategy = "single"
+
+[[virtual_models.targets]]
+model = "jev"
+[virtual_models.targets.remap]
+strategy = "noul"
 instructions = "Could `document` be the precedent cited in the query?"
 criteria.true = "The document states the specific rule the query cites."
 criteria.false = "The document is only on a similar topic."
 ```
 
+- Besides `noul`, the remap strategies are `score`, `composite` (weighted
+  criteria) and `choice`, and a static `context` can be added; see
+  [Virtual models](../virtual-models.md#7-jev-as-a-reranker).
 - Clients call plain `/v1/rerank`; ordering, `top_n`, `return_documents`,
-  `rank_fields` and fallbacks (e.g. `fallbacks = ["cohere-rerank"]`) work as
-  for any reranker.
+  `rank_fields` and fallbacks (a `fallback` virtual model whose second target
+  is `cohere/rerank-english`, say) work as for any reranker.
 - Documents are packed into as few upstream calls as Jev's context allows (at
   most 100 documents and about 48k estimated tokens per call), run up to 4 at
   a time. A document longer than about 4,096 tokens is truncated first, like
@@ -130,10 +154,11 @@ criteria.false = "The document is only on a similar topic."
 - Because scores are calibrated probabilities, they are comparable across
   requests: a cut-off such as 0.5 means the same thing everywhere.
 - Usage: Jev's upstream `input_tokens` is `usage.total_tokens` (unflagged);
-  search units are derived. A rerank model with `cost_per_1m_input` is billed
-  per input token, on top of any `cost_per_1k_searches`.
-- The converter is per model: one converter per model id. Per-key or
-  per-tenant converters are not supported yet.
+  search units are derived. The SystemOne model's `cost_per_1m_input` bills
+  per input token.
+- The remap belongs to a target of a virtual model. For per-tenant relevance
+  rules, put a `switch` on the budget group in front of several such virtual
+  models.
 
 ## Providers
 

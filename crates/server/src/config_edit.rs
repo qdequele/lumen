@@ -36,6 +36,9 @@ pub enum EditError {
     /// provider entry could be located, inserted or removed.
     #[error("`providers` is not an array of tables")]
     ProvidersNotArray,
+    /// The `virtual_models` key exists but is not an array of tables.
+    #[error("`virtual_models` is not an array of tables")]
+    VirtualModelsNotArray,
     /// The `auth` key exists but is not a table, so the dynamic knobs could
     /// not be grafted into it.
     #[error("`auth` is not a table")]
@@ -178,6 +181,62 @@ pub fn replace_auth_knobs(doc: &str, knobs: &AuthDynamicKnobs) -> Result<String,
     Ok(document.to_string())
 }
 
+/// Insert or replace the `[[virtual_models]]` entry whose `id` matches
+/// (ADR 014). Same guarantees as [`upsert_provider`].
+///
+/// # Errors
+/// [`EditError::Parse`], [`EditError::Serialize`], or
+/// [`EditError::VirtualModelsNotArray`].
+pub fn upsert_virtual_model(
+    doc: &str,
+    vm: &lumen_router::virtual_models::VirtualModelConfig,
+) -> Result<String, EditError> {
+    let mut document = doc.parse::<DocumentMut>()?;
+    let table = toml_edit::ser::to_document(vm)?.as_table().clone();
+    let array = virtual_models_array_mut(&mut document)?;
+    match (0..array.len()).find(|&i| table_str(array, i, "id") == Some(vm.id.as_str())) {
+        Some(i) => {
+            array.replace(i, table);
+        }
+        None => array.push(table),
+    }
+    Ok(document.to_string())
+}
+
+/// Remove the `[[virtual_models]]` entry with this `id`; `Ok(None)` when absent.
+///
+/// # Errors
+/// [`EditError::Parse`] or [`EditError::VirtualModelsNotArray`].
+pub fn delete_virtual_model(doc: &str, id: &str) -> Result<Option<String>, EditError> {
+    let mut document = doc.parse::<DocumentMut>()?;
+    let array = virtual_models_array_mut(&mut document)?;
+    match (0..array.len()).find(|&i| table_str(array, i, "id") == Some(id)) {
+        Some(i) => {
+            array.remove(i);
+            Ok(Some(document.to_string()))
+        }
+        None => Ok(None),
+    }
+}
+
+/// The document's `[[virtual_models]]` array of tables, created when missing;
+/// [`EditError::VirtualModelsNotArray`] if the key holds something else.
+fn virtual_models_array_mut(document: &mut DocumentMut) -> Result<&mut ArrayOfTables, EditError> {
+    let item = document
+        .as_table_mut()
+        .entry("virtual_models")
+        .or_insert_with(|| Item::ArrayOfTables(ArrayOfTables::new()));
+    normalize_to_array_of_tables(item);
+    item.as_array_of_tables_mut()
+        .ok_or(EditError::VirtualModelsNotArray)
+}
+
+/// The string value of `key` in table `index` of `array`, or `None` when the index,
+/// the key or the string type is missing.
+fn table_str<'a>(array: &'a ArrayOfTables, index: usize, key: &str) -> Option<&'a str> {
+    array.get(index)?.get(key)?.as_str()
+}
+
 /// The `name` field of every `[[providers]]` entry, in document order.
 ///
 /// # Errors
@@ -228,7 +287,7 @@ fn normalize_to_table(item: &mut Item) {
 /// empty `providers = []`) as a standard `[[array]]` of tables, so an edit
 /// can address its entries. Both spellings are valid TOML and load
 /// identically; any other item (a non-table array included) is left as is.
-fn normalize_to_array_of_tables(item: &mut Item) {
+pub(crate) fn normalize_to_array_of_tables(item: &mut Item) {
     let Some(array) = item.as_array() else {
         return;
     };
@@ -257,6 +316,28 @@ mod tests {
     const DOC: &str = "# fleet config\n[server]\nport = 8080 # keep\n\n\
 [[providers]]\nname = \"openai\"\nkind = \"openai\"\n\n\
 [[providers]]\nname = \"ollama\"\nkind = \"ollama\"\n";
+
+    #[test]
+    fn upsert_and_delete_virtual_models_keep_the_rest_of_the_document() {
+        let vm: lumen_router::virtual_models::VirtualModelConfig = toml::from_str(
+            "id = \"acme/chat\"\ncapability = \"chat\"\nstrategy = \"single\"\ntargets = [{ model = \"gpt\" }]\n",
+        )
+        .unwrap();
+        let doc = upsert_virtual_model(DOC, &vm).unwrap();
+        assert!(doc.contains("# fleet config"), "comments survive");
+        assert!(doc.contains("[[virtual_models]]"));
+        let mut changed = vm.clone();
+        changed.description = Some("d".into());
+        let doc = upsert_virtual_model(&doc, &changed).unwrap();
+        assert_eq!(
+            doc.matches("[[virtual_models]]").count(),
+            1,
+            "replaced in place"
+        );
+        let doc = delete_virtual_model(&doc, "acme/chat").unwrap().unwrap();
+        assert!(!doc.contains("acme/chat"));
+        assert!(delete_virtual_model(&doc, "acme/chat").unwrap().is_none());
+    }
 
     #[test]
     fn upsert_replaces_matching_provider_and_keeps_comments() {

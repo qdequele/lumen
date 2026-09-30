@@ -9,9 +9,9 @@
 //! and the previous configuration is kept (criterion 3).
 //!
 //! Scope of a reload (all swapped atomically, off the request path):
-//! - the **routing table** (providers, models, aliases, fallbacks);
+//! - the **routing table** (providers, models, aliases);
 //! - the **price table** (DEBT-1);
-//! - the **resilience policy** (retry/timeouts/fallbacks), circuit-breaker
+//! - the **resilience policy** (retry/timeouts/virtual models), circuit-breaker
 //!   state preserved;
 //! - the safe **auth knobs** ([`AuthKnobs`]: budget-flush cadence and usage-log
 //!   retention window), read live by the background tasks on their next tick;
@@ -757,7 +757,7 @@ mod tests {
     fn valid_reload_swaps_pricing_and_resilience_but_keeps_breaker_state() {
         use lumen_router::circuit::CircuitState;
         let dir = tempdir();
-        // Start with no price and no fallback.
+        // Start with no price and no virtual model.
         let path = write_config(&dir, ONE_MODEL);
         let registry = registry_from(&path);
         let t = targets(
@@ -765,9 +765,23 @@ mod tests {
             ReloadMetrics::register(&Metrics::new()).unwrap(),
         );
 
-        // Baseline: model unpriced, no fallback chain.
+        let headers = axum::http::HeaderMap::new();
+        let attempt_ids = |model: &str| -> Vec<String> {
+            t.resilience
+                .decide(lumen_core::Capability::Chat, model, |_| {
+                    crate::facts::Facts::systemone(&headers, None)
+                })
+                .unwrap()
+                .attempts
+                .iter()
+                .map(|a| a.model_id.clone())
+                .collect()
+        };
+
+        // Baseline: model unpriced, no virtual model.
         assert_eq!(t.pricing.load().token_cost("gpt", 1_000_000, 0), 0.0);
-        assert_eq!(t.resilience.chain_ids("gpt"), vec!["gpt"]);
+        assert!(t.resilience.routing().get("chat").is_none());
+        assert_eq!(attempt_ids("gpt"), vec!["gpt"]);
 
         // Trip the breaker for (openai, gpt) so we can prove it survives reload.
         let breaker = t.resilience.breakers.get("openai", "gpt");
@@ -778,7 +792,7 @@ mod tests {
         }
         assert_eq!(breaker.state(), CircuitState::Open);
 
-        // Reload with a price + a fallback for gpt.
+        // Reload with a price for gpt + a virtual model falling back to backup.
         write_config(
             &dir,
             r#"
@@ -789,17 +803,21 @@ mod tests {
             id = "gpt"
             capabilities = ["chat"]
             cost_per_1m_input = 2.5
-            fallbacks = ["backup"]
             [[providers.models]]
             id = "backup"
             capabilities = ["chat"]
+            [[virtual_models]]
+            id = "chat"
+            capability = "chat"
+            strategy = "fallback"
+            targets = [{ model = "gpt" }, { model = "backup" }]
             "#,
         );
         apply_reload(&load(&path), &t).expect("valid reload");
 
         // Pricing + resilience policy swapped...
         assert_eq!(t.pricing.load().token_cost("gpt", 1_000_000, 0), 2.5);
-        assert_eq!(t.resilience.chain_ids("gpt"), vec!["gpt", "backup"]);
+        assert_eq!(attempt_ids("chat"), vec!["gpt", "backup"]);
         // ...but the breaker's live state was preserved across the swap.
         assert_eq!(
             t.resilience.breakers.get("openai", "gpt").state(),

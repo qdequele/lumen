@@ -2,7 +2,7 @@
 //!
 //! Flow: validate (the documented question contract, so a malformed question
 //! is a precise `LM-1001` rather than an opaque upstream `422`) → route
-//! (model → provider, with fallbacks) → admit (budget/quota, memory only) →
+//! (model → provider, with virtual-model fallbacks) → admit (budget/quota, memory only) →
 //! evaluate → account (input/output tokens, cost) → response. The body is
 //! TypeSafe's wire shape in both directions, so the TypeSafe SDKs work against
 //! the gateway via `TYPESAFE_BASE_URL`. A per-request [`CancellationToken`]
@@ -16,13 +16,14 @@ use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
-use lumen_core::{tokens, GatewayError, SystemOneUsage};
+use lumen_core::{tokens, Capability, GatewayError, SystemOneUsage};
 use tokio_util::sync::CancellationToken;
 
 use crate::accounting::{Accounting, Outcome, Target, TokenBreakdown};
 use crate::auth::AuthedKey;
 use crate::error::ApiError;
-use crate::resilience::model_used_headers;
+use crate::facts::Facts;
+use crate::resilience::routing_headers;
 use crate::state::AppState;
 
 /// Handle a SystemOne evaluation request.
@@ -37,19 +38,26 @@ pub async fn systemone_handler(
     // Empty questions → LM-2011; any other contract violation → LM-1001.
     req.validate()?;
 
-    // Resolve the requested model to a fallback chain (M6 §6.2).
     let client_model = req.model.clone();
-    let chain_ids = state.resilience.chain_ids(&client_model);
-    let chain = lumen_router::resolve_systemone_chain(&state.registry, &chain_ids)?;
-    let links = lumen_router::systemone_links(&chain);
-    let exec = state.resilience.exec_config(&client_model);
-
+    // Facts are only built for a virtual model (ADR 014).
+    let mut decision = state
+        .resilience
+        .decide(Capability::SystemOne, &client_model, |_| {
+            Facts::systemone(&headers, key.as_deref())
+        })?;
+    let chain = lumen_router::resolve_systemone_decision(&state.registry, &mut decision)?;
+    let primary = decision.primary_model().to_owned();
+    let links = lumen_router::decision_links(
+        &decision,
+        chain.iter().map(|l| l.route.provider_name.as_str()),
+    );
+    let exec = state.resilience.exec_config(&primary);
     // Admission BEFORE the upstream call (M5 §5.2): reserve the input
     // estimate (state + every question); answers are tiny and Jev bills
     // input only, so no output tokens are reserved.
     let pricing = state.pricing();
     let estimated_input = tokens::estimate_systemone(&req);
-    let estimated_cost = pricing.token_cost(&client_model, estimated_input, 0);
+    let estimated_cost = pricing.token_cost(&primary, estimated_input, 0);
     let mut accounting = Accounting::begin(
         &state,
         &headers,
@@ -85,6 +93,8 @@ pub async fn systemone_handler(
 
     let mut response = executed.value;
     accounting.served_by(&executed.model_used, &executed.provider_used);
+    let route = decision.route_of(executed.index);
+    accounting.set_route(route);
 
     // ADR 003: upstream-reported usage wins; otherwise the gateway's input
     // estimate, flagged - never a silent zero. An upstream output count is
@@ -106,7 +116,7 @@ pub async fn systemone_handler(
         status: 200,
     });
 
-    Ok((model_used_headers(&executed.model_used), Json(response)).into_response())
+    Ok((routing_headers(&executed.model_used, route), Json(response)).into_response())
 }
 
 /// The usage to report and account: upstream counts when the upstream

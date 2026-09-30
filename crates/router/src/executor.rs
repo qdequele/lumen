@@ -1,10 +1,14 @@
 //! The resilience execution layer (M6, ADR 005).
 //!
 //! [`execute`] runs one capability call across a resolved fallback **chain**
-//! (the requested model followed by its configured fallbacks), applying - per
+//! (the attempts a virtual model decided, ADR 014), applying - per
 //! link - the circuit-breaker gate, a first-token timeout on each attempt, and
 //! the retry loop; and - across links - fallback when a link is exhausted or
-//! its breaker is open. The whole call is bounded by the total timeout. It is
+//! its breaker is open. Fallback follows each link's [`Escape`s](crate::triggers::Escape)
+//! (ADR 014): the first escape whose triggers match the failure names the next
+//! link to try, and a failure no escape matches is returned as is. A plain
+//! chain is built with [`linear_escapes`](crate::triggers::linear_escapes),
+//! which reproduces the ADR 005 behaviour. The whole call is bounded by the total timeout. It is
 //! generic over a closure that performs the actual typed call for a given link
 //! index, so one implementation serves chat (streaming *open* and non-streaming),
 //! embeddings and reranking alike.
@@ -36,6 +40,9 @@ pub struct Link {
     pub provider_name: String,
     /// Client-facing model id (breaker key + `x-lumen-model-used`).
     pub model_id: String,
+    /// Where to continue on a failure, innermost first (ADR 014). Empty for
+    /// the last link: a failure there is final.
+    pub escapes: Vec<crate::triggers::Escape>,
 }
 
 /// Resilience knobs for one execution.
@@ -55,6 +62,8 @@ pub struct ExecConfig {
 pub struct Executed<T> {
     /// The successful value.
     pub value: T,
+    /// Index of the link that served, so the caller can report its route.
+    pub index: usize,
     /// The client-facing model id that served the request (may be a fallback).
     pub model_used: String,
     /// The provider that served it.
@@ -115,17 +124,29 @@ where
     Fut: Future<Output = Result<T, ProviderError>>,
 {
     let mut last_error: Option<GatewayError> = None;
+    let mut index = 0;
 
-    for (index, link) in links.iter().enumerate() {
+    while let Some(link) = links.get(index) {
         let breaker = breakers.get(&link.provider_name, &link.model_id);
         if let Admission::Rejected { retry_after } = breaker.admit(Instant::now()) {
-            // Circuit open: skip this link entirely (never touches the upstream)
-            // and fall through to the next fallback.
-            last_error = Some(GatewayError::CircuitOpen {
+            // Circuit open: never touches the upstream. Moves on only through
+            // an escape that lists `circuit_open`.
+            let error = GatewayError::CircuitOpen {
                 provider: link.provider_name.clone(),
                 retry_after: Some(retry_after),
-            });
-            continue;
+            };
+            match link
+                .escapes
+                .iter()
+                .find(|e| e.on.contains(crate::triggers::Trigger::CircuitOpen))
+            {
+                Some(escape) if escape.next > index => {
+                    last_error = Some(error);
+                    index = escape.next;
+                    continue;
+                }
+                _ => return Err(error),
+            }
         }
 
         let first_token = config.first_token;
@@ -149,6 +170,7 @@ where
                 breaker.on_success();
                 return Ok(Executed {
                     value,
+                    index,
                     model_used: link.model_id.clone(),
                     provider_used: link.provider_name.clone(),
                 });
@@ -158,12 +180,16 @@ where
                     breaker.on_failure(Instant::now());
                 }
                 let mapped = GatewayError::from_provider(&link.provider_name, error.clone());
-                // A hard client/deterministic fault (bad request, cancellation,
-                // schema mismatch) is not helped by a fallback → return now.
-                if !error.is_retryable() && !error.is_provider_fault() {
-                    return Err(mapped);
+                match link.escapes.iter().find(|e| e.on.allows(&error)) {
+                    // `next > index` guarantees termination whatever the caller built.
+                    Some(escape) if escape.next > index => {
+                        last_error = Some(mapped);
+                        index = escape.next;
+                    }
+                    // No escape catches it (a hard client fault, cancellation,
+                    // schema mismatch, or a trigger the chain did not opt into).
+                    _ => return Err(mapped),
                 }
-                last_error = Some(mapped);
             }
         }
     }
@@ -184,11 +210,14 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn links(pairs: &[(&str, &str)]) -> Vec<Link> {
+        let n = pairs.len();
         pairs
             .iter()
-            .map(|(p, m)| Link {
+            .enumerate()
+            .map(|(i, (p, m))| Link {
                 provider_name: (*p).to_owned(),
                 model_id: (*m).to_owned(),
+                escapes: crate::triggers::linear_escapes(i, n),
             })
             .collect()
     }
@@ -430,5 +459,111 @@ mod tests {
             cb.get("openai", "gpt-4o").state(),
             crate::circuit::CircuitState::Closed
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn escapes_can_skip_ahead_and_report_the_serving_index() {
+        use crate::triggers::{Escape, Triggers};
+        // a --(any default failure)--> c, skipping b.
+        let chain = vec![
+            Link {
+                provider_name: "pa".into(),
+                model_id: "a".into(),
+                escapes: vec![Escape {
+                    on: Triggers::DEFAULT,
+                    next: 2,
+                }],
+            },
+            Link {
+                provider_name: "pb".into(),
+                model_id: "b".into(),
+                escapes: vec![],
+            },
+            Link {
+                provider_name: "pc".into(),
+                model_id: "c".into(),
+                escapes: vec![],
+            },
+        ];
+        let out = execute(
+            &chain,
+            &breakers(),
+            &config(1),
+            &CancellationToken::new(),
+            |i| async move {
+                if i == 0 {
+                    Err(upstream_500())
+                } else {
+                    Ok::<_, ProviderError>(i)
+                }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!((out.value, out.index, out.model_used.as_str()), (2, 2, "c"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failure_no_escape_allows_is_returned_immediately() {
+        use crate::triggers::{Escape, Trigger, Triggers};
+        let chain = vec![
+            Link {
+                provider_name: "pa".into(),
+                model_id: "a".into(),
+                escapes: vec![Escape {
+                    on: Triggers::from_list(&[Trigger::RateLimited]),
+                    next: 1,
+                }],
+            },
+            Link {
+                provider_name: "pb".into(),
+                model_id: "b".into(),
+                escapes: vec![],
+            },
+        ];
+        let calls = AtomicUsize::new(0);
+        let err = execute(
+            &chain,
+            &breakers(),
+            &config(1),
+            &CancellationToken::new(),
+            |i| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if i == 0 {
+                        Err::<(), _>(upstream_500())
+                    } else {
+                        Ok(())
+                    }
+                }
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), "LM-3003");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "b must not be tried");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_escape_that_does_not_move_forward_is_refused() {
+        use crate::triggers::{Escape, Triggers};
+        let chain = vec![Link {
+            provider_name: "pa".into(),
+            model_id: "a".into(),
+            escapes: vec![Escape {
+                on: Triggers::DEFAULT,
+                next: 0,
+            }],
+        }];
+        let err = execute(
+            &chain,
+            &breakers(),
+            &config(1),
+            &CancellationToken::new(),
+            |_| async { Err::<(), _>(upstream_500()) },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), "LM-3003");
     }
 }

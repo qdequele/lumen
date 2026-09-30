@@ -6,10 +6,9 @@ kind = "openai"
 api_key_env = "OPENAI_API_KEY"
 
 [[providers.models]]
-id = "gpt-4o"
+id = "openai/gpt-4o"
 upstream_id = "gpt-4o-2024-08-06"
 capabilities = ["chat"]
-fallbacks = ["claude-sonnet-4-5"]
 
 [[providers]]
 name = "anthropic"
@@ -20,3 +19,11 @@ api_key_env = "ANTHROPIC_API_KEY"
 id = "claude-sonnet-4-5"
 upstream_id = "claude-sonnet-4-5-20250929"
 capabilities = ["chat"]
+
+# Clients call `gpt-4o`; LUMEN serves it from OpenAI and, when OpenAI fails
+# with a 5xx, a 429, a timeout or an open circuit, from Anthropic (ADR 014).
+[[virtual_models]]
+id = "gpt-4o"
+capability = "chat"
+strategy = "fallback"
+targets = [{ model = "openai/gpt-4o" }, { model = "claude-sonnet-4-5" }]

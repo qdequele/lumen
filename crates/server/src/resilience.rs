@@ -1,10 +1,11 @@
 //! Server-side resilience runtime (M6): the process-wide circuit breakers plus
-//! the resolved retry policy, timeouts and fallback chains derived from config.
+//! the resolved retry policy, timeouts and compiled virtual models (ADR 014)
+//! derived from config.
 //!
 //! This is the glue between [`Config`](crate::config::Config) and the router's
-//! [`executor`](lumen_router::executor): the handlers ask it for a model's
-//! fallback chain ([`chain_ids`](ResilienceRuntime::chain_ids)) and the
-//! per-model execution knobs ([`exec_config`](ResilienceRuntime::exec_config)).
+//! [`executor`](lumen_router::executor): the handlers ask it for a request's
+//! attempts ([`decide`](ResilienceRuntime::decide)) and the per-model
+//! execution knobs ([`exec_config`](ResilienceRuntime::exec_config)).
 //! All state is in-memory; nothing here touches a database.
 
 use std::collections::HashMap;
@@ -12,9 +13,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::http::{HeaderMap, HeaderName, HeaderValue};
+use lumen_core::{Capability, GatewayError};
 use lumen_router::circuit::{BreakerConfig, CircuitBreakers};
 use lumen_router::executor::ExecConfig;
 use lumen_router::retry::RetryPolicy;
+use lumen_router::virtual_models::{Decision, FactSource, Preset, RoutingTable};
 use lumen_telemetry::ResilienceMetrics;
 
 use crate::config::Config;
@@ -30,6 +33,20 @@ pub fn model_used_headers(model_used: &str) -> HeaderMap {
     let mut headers = HeaderMap::new();
     if let Ok(value) = HeaderValue::from_str(model_used) {
         headers.insert(HeaderName::from_static(MODEL_USED_HEADER), value);
+    }
+    headers
+}
+
+/// The `x-lumen-route` response header name (ADR 014).
+const ROUTE_HEADER: &str = "x-lumen-route";
+
+/// [`model_used_headers`] plus, for a virtual-model request, the route it
+/// took (`x-lumen-route`, e.g. `acme/chat>acme/eu>mistral-large`).
+#[must_use]
+pub fn routing_headers(model_used: &str, route: Option<&str>) -> HeaderMap {
+    let mut headers = model_used_headers(model_used);
+    if let Some(value) = route.and_then(|r| HeaderValue::from_str(r).ok()) {
+        headers.insert(HeaderName::from_static(ROUTE_HEADER), value);
     }
     headers
 }
@@ -53,8 +70,9 @@ struct ResiliencePolicy {
     default_timeouts: Timeouts,
     /// Per-model timeout overrides (inherited from the owning provider).
     model_timeouts: HashMap<String, Timeouts>,
-    /// Per-model ordered fallback chains (excludes the primary).
-    fallbacks: HashMap<String, Vec<String>>,
+    /// Compiled virtual models (ADR 014), swapped with the rest of the policy
+    /// on reload.
+    routing: Arc<RoutingTable>,
 }
 
 impl ResiliencePolicy {
@@ -78,6 +96,19 @@ impl ResiliencePolicy {
                 )
             })
             .collect();
+        let routing = match config.routing_table() {
+            Ok((table, warnings)) => {
+                for warning in warnings {
+                    tracing::warn!(%warning, "virtual models");
+                }
+                table
+            }
+            // Unreachable for a validated config; never fail a reload here.
+            Err(error) => {
+                tracing::error!(%error, "virtual models failed to compile after validation; serving without them");
+                RoutingTable::default()
+            }
+        };
         Self {
             retry: RetryPolicy {
                 max_attempts: r.retry_max_attempts,
@@ -86,7 +117,7 @@ impl ResiliencePolicy {
             },
             default_timeouts,
             model_timeouts,
-            fallbacks: config.fallback_map(),
+            routing: Arc::new(routing),
         }
     }
 
@@ -98,7 +129,7 @@ impl ResiliencePolicy {
                 total: Duration::from_secs(600),
             },
             model_timeouts: HashMap::new(),
-            fallbacks: HashMap::new(),
+            routing: Arc::new(RoutingTable::default()),
         }
     }
 }
@@ -130,7 +161,7 @@ impl ResilienceRuntime {
         }
     }
 
-    /// A runtime with library defaults, no fallbacks and no gauge - used by
+    /// A runtime with library defaults, no virtual models and no gauge - used by
     /// tests and as the open-gateway baseline.
     #[must_use]
     pub fn defaults() -> Self {
@@ -140,7 +171,7 @@ impl ResilienceRuntime {
         }
     }
 
-    /// Atomically replace the derived policy (retry, timeouts, fallbacks) from a
+    /// Atomically replace the derived policy (retry, timeouts, virtual models) from a
     /// new config - the hot-reload entry point. Circuit-breaker state is left
     /// untouched, so an open circuit stays open across a reload.
     pub fn reload_policy(&self, config: &Config) {
@@ -170,17 +201,40 @@ impl ResilienceRuntime {
         self.map_policy(|p| p.retry = retry)
     }
 
-    /// The ordered chain of client-facing model ids to try for `model`: the
-    /// model itself first, then its configured fallbacks.
-    #[must_use]
-    pub fn chain_ids(&self, model: &str) -> Vec<String> {
+    /// Decide the attempts for `model` (ADR 014) from ONE routing snapshot: a
+    /// virtual model's routing tree or a direct single attempt on a foundation
+    /// model. Pure and in-memory: one hash lookup, one random draw per `split`.
+    ///
+    /// `facts` builds the request facts `switch` conditions read. It is only
+    /// called for a virtual model (a foundation id builds no facts), and it
+    /// receives that virtual model's preset from the same snapshot the decision
+    /// comes from, so a chat caller applies the preset prompt before the facts
+    /// are computed (its prompt counts toward `input_tokens`) and the preset
+    /// and the attempts can never come from two different reloads.
+    ///
+    /// # Errors
+    /// `LM-2002` when `model` is a virtual model serving another capability.
+    pub fn decide<F: FactSource>(
+        &self,
+        capability: Capability,
+        model: &str,
+        facts: impl FnOnce(Option<&Preset>) -> F,
+    ) -> Result<Decision, GatewayError> {
+        use rand::Rng as _;
         let policy = self.policy.load();
-        let mut ids = Vec::with_capacity(1 + policy.fallbacks.get(model).map_or(0, Vec::len));
-        ids.push(model.to_owned());
-        if let Some(fallbacks) = policy.fallbacks.get(model) {
-            ids.extend(fallbacks.iter().cloned());
-        }
-        ids
+        let Some(vm) = policy.routing.get(model) else {
+            return Ok(Decision::direct(model));
+        };
+        let facts = facts(vm.preset().map(AsRef::as_ref));
+        let mut draw = || rand::rng().next_u64();
+        vm.decide(capability, &facts, &mut draw)
+    }
+
+    /// The current compiled virtual models (for `GET /v1/models` and the
+    /// admin plan route).
+    #[must_use]
+    pub fn routing(&self) -> Arc<RoutingTable> {
+        self.policy.load().routing.clone()
     }
 
     /// The execution knobs (retry + timeouts) for `model`, applying the
@@ -215,37 +269,6 @@ mod tests {
     }
 
     #[test]
-    fn chain_ids_is_primary_then_fallbacks() {
-        let cfg = load(
-            r#"
-            [[providers]]
-            name = "openai"
-            kind = "openai"
-            [[providers.models]]
-            id = "gpt"
-            capabilities = ["chat"]
-            fallbacks = ["claude", "mistral"]
-            [[providers]]
-            name = "anthropic"
-            kind = "anthropic"
-            [[providers.models]]
-            id = "claude"
-            capabilities = ["chat"]
-            [[providers]]
-            name = "mistral"
-            kind = "mistral"
-            [[providers.models]]
-            id = "mistral"
-            capabilities = ["chat"]
-        "#,
-        );
-        let rt = ResilienceRuntime::from_config(&cfg, None);
-        assert_eq!(rt.chain_ids("gpt"), vec!["gpt", "claude", "mistral"]);
-        // No fallbacks → just the model itself.
-        assert_eq!(rt.chain_ids("claude"), vec!["claude"]);
-    }
-
-    #[test]
     fn exec_config_applies_per_provider_timeout_override() {
         let cfg = load(
             r#"
@@ -276,5 +299,109 @@ mod tests {
         // No override → global default.
         let fast = rt.exec_config("claude");
         assert_eq!(fast.first_token, Duration::from_secs(30));
+    }
+
+    struct NoFacts;
+    impl lumen_router::virtual_models::FactSource for NoFacts {
+        fn group(&self) -> Option<&str> {
+            None
+        }
+        fn metadata(&self, _: &str) -> Option<&serde_json::Value> {
+            None
+        }
+        fn has_images(&self) -> bool {
+            false
+        }
+        fn has_tools(&self) -> bool {
+            false
+        }
+        fn stream(&self) -> bool {
+            false
+        }
+        fn input_tokens(&self) -> u64 {
+            0
+        }
+        fn documents(&self) -> Option<u64> {
+            None
+        }
+    }
+
+    #[test]
+    fn decide_routes_virtual_models_and_direct_ids() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [[providers]]
+            name = "a"
+            kind = "openai"
+            [[providers.models]]
+            id = "gpt"
+            capabilities = ["chat"]
+            [[providers.models]]
+            id = "claude"
+            capabilities = ["chat"]
+
+            [[virtual_models]]
+            id = "v"
+            capability = "chat"
+            strategy = "fallback"
+            targets = [{ model = "claude" }, { model = "gpt" }]
+
+            [[virtual_models]]
+            id = "p"
+            capability = "chat"
+            strategy = "single"
+            preset = { system_prompt = "be brief" }
+            targets = [{ model = "gpt" }]
+            "#,
+        )
+        .unwrap();
+        let rt = ResilienceRuntime::from_config(&cfg, None);
+        let mut saw_preset = None;
+        let d = rt
+            .decide(Capability::Chat, "v", |preset| {
+                saw_preset = Some(preset.is_some());
+                NoFacts
+            })
+            .unwrap();
+        assert_eq!(d.virtual_model.as_deref(), Some("v"));
+        assert_eq!(d.primary_model(), "claude");
+        assert_eq!(
+            saw_preset,
+            Some(false),
+            "facts are built for a virtual model"
+        );
+        // The preset handed to the facts builder comes from the same snapshot.
+        let mut saw_preset = false;
+        rt.decide(Capability::Chat, "p", |preset| {
+            saw_preset = preset.is_some();
+            NoFacts
+        })
+        .unwrap();
+        assert!(saw_preset);
+        // A foundation id is a direct single attempt, with no virtual model,
+        // and its facts are never built.
+        let direct = rt
+            .decide(Capability::Chat, "gpt", |_| -> NoFacts {
+                panic!("facts built for a foundation id")
+            })
+            .unwrap();
+        assert!(direct.virtual_model.is_none());
+        let ids: Vec<&str> = direct
+            .attempts
+            .iter()
+            .map(|a| a.model_id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["gpt"]);
+        assert!(rt.routing().get("v").is_some());
+    }
+
+    #[test]
+    fn routing_headers_carry_the_route_only_for_virtual_models() {
+        let h = routing_headers("gpt-4o", Some("acme/chat>gpt-4o"));
+        assert_eq!(h.get("x-lumen-model-used").unwrap(), "gpt-4o");
+        assert_eq!(h.get("x-lumen-route").unwrap(), "acme/chat>gpt-4o");
+        assert!(routing_headers("gpt-4o", None)
+            .get("x-lumen-route")
+            .is_none());
     }
 }

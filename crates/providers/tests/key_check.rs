@@ -34,7 +34,6 @@ fn spec(kind: ProviderKind, base_url: Option<String>, api_key: Option<&str>) -> 
             upstream_id: "m".to_owned(),
             capabilities: vec![Capability::Chat],
             modalities: vec!["text".to_owned()],
-            rerank_converter: None,
             release_date: None,
         }],
     }

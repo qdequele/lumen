@@ -100,6 +100,13 @@ impl RequestMetadata {
         MetadataOutcome::Valid(RequestMetadata { pairs })
     }
 
+    /// The typed value of `key`, when supplied (virtual-model `switch`
+    /// conditions, ADR 014).
+    #[must_use]
+    pub fn get(&self, key: &str) -> Option<&Value> {
+        self.pairs.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+    }
+
     /// True when no pairs were supplied.
     #[must_use]
     pub fn is_empty(&self) -> bool {

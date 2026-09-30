@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use lumen_core::{ProviderError, RerankDocument, RerankProvider, RerankRequest, SystemOneProvider};
-use lumen_providers::typesafe::rerank::{RerankConverter, TypesafeRerankProvider};
+use lumen_providers::typesafe::rerank::{RerankStrategy, RerankTemplate, TypesafeRerankProvider};
 use lumen_providers::TypesafeProvider;
 use serde_json::{json, Map, Value};
 use tokio_util::sync::CancellationToken;
@@ -57,14 +57,14 @@ async fn mock_with(responder: impl Respond + 'static) -> MockServer {
     mock
 }
 
-fn reranker(uri: String, converter: RerankConverter) -> TypesafeRerankProvider {
+fn reranker(uri: String, template: RerankTemplate) -> TypesafeRerankProvider {
     let inner: Arc<dyn SystemOneProvider> = Arc::new(TypesafeProvider::new(
         reqwest::Client::new(),
         "typesafe",
         Some(uri),
         Some("ts-test".to_owned()),
     ));
-    TypesafeRerankProvider::new(inner, "typesafe", converter)
+    TypesafeRerankProvider::new(inner, "typesafe", Arc::new(template))
 }
 
 fn request(docs: &[String]) -> RerankRequest {
@@ -81,16 +81,19 @@ fn request(docs: &[String]) -> RerankRequest {
 #[tokio::test]
 async fn one_noul_per_document_with_the_query_in_the_state() {
     let mock = mock_with(EchoScores).await;
-    let converter = RerankConverter {
-        instructions: "Could `document` be the cited precedent?".to_owned(),
-        criteria_true: "States the cited rule.".to_owned(),
-        criteria_false: "Only a similar topic.".to_owned(),
+    let template = RerankTemplate {
+        context: None,
+        strategy: RerankStrategy::Noul {
+            instructions: "Could `document` be the cited precedent?".to_owned(),
+            criteria_true: "States the cited rule.".to_owned(),
+            criteria_false: "Only a similar topic.".to_owned(),
+        },
     };
     let docs = vec![
         "Paris is the capital #0.9".to_owned(),
         "Berlin #0.1".to_owned(),
     ];
-    let resp = reranker(mock.uri(), converter)
+    let resp = reranker(mock.uri(), template)
         .rerank(request(&docs), CancellationToken::new())
         .await
         .expect("success");
@@ -125,7 +128,7 @@ async fn one_noul_per_document_with_the_query_in_the_state() {
 async fn large_batches_are_split_and_mapped_back_to_original_indices() {
     let mock = mock_with(EchoScores).await;
     let docs: Vec<String> = (0..250).map(|i| format!("doc {i} #0.{i:03}")).collect();
-    let resp = reranker(mock.uri(), RerankConverter::default())
+    let resp = reranker(mock.uri(), RerankTemplate::default())
         .rerank(request(&docs), CancellationToken::new())
         .await
         .expect("success");
@@ -145,7 +148,7 @@ async fn missing_upstream_usage_leaves_tokens_to_the_gateway_estimate() {
         "model": "jev", "answers": {"0": {"type": "noul", "noul": 0.5}}
     })))
     .await;
-    let resp = reranker(mock.uri(), RerankConverter::default())
+    let resp = reranker(mock.uri(), RerankTemplate::default())
         .rerank(request(&["x".to_owned()]), CancellationToken::new())
         .await
         .expect("success");
@@ -157,7 +160,7 @@ async fn a_missing_answer_is_a_translation_error() {
     let mock =
         mock_with(ResponseTemplate::new(200).set_body_json(json!({"model": "jev", "answers": {}})))
             .await;
-    let err = reranker(mock.uri(), RerankConverter::default())
+    let err = reranker(mock.uri(), RerankTemplate::default())
         .rerank(request(&["x".to_owned()]), CancellationToken::new())
         .await
         .expect_err("no answer");
@@ -167,7 +170,7 @@ async fn a_missing_answer_is_a_translation_error() {
 #[tokio::test]
 async fn upstream_errors_keep_their_classification() {
     let mock = mock_with(ResponseTemplate::new(529)).await;
-    let err = reranker(mock.uri(), RerankConverter::default())
+    let err = reranker(mock.uri(), RerankTemplate::default())
         .rerank(request(&["x".to_owned()]), CancellationToken::new())
         .await
         .expect_err("overloaded");
@@ -182,7 +185,7 @@ async fn cancellation_aborts_every_upstream_call() {
             .set_delay(Duration::from_secs(2)),
     )
     .await;
-    let provider = reranker(mock.uri(), RerankConverter::default());
+    let provider = reranker(mock.uri(), RerankTemplate::default());
     let docs: Vec<String> = (0..150).map(|i| format!("d{i}")).collect();
     let cancel = CancellationToken::new();
     let child = cancel.clone();

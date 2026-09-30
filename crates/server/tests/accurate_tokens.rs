@@ -103,7 +103,6 @@ async fn chat_envelope_stays_heuristic_while_metrics_get_the_accurate_count() {
             upstream_id: "gpt-4-0613".to_owned(),
             capabilities: vec![Capability::Chat],
             modalities: vec!["text".to_owned()],
-            rerank_converter: None,
             release_date: None,
         }],
     }];
@@ -172,7 +171,6 @@ async fn embed_envelope_stays_heuristic_while_metrics_get_the_accurate_count() {
             upstream_id: "text-embedding-3-small".to_owned(),
             capabilities: vec![Capability::Embed],
             modalities: vec!["text".to_owned()],
-            rerank_converter: None,
             release_date: None,
         }],
     }];
@@ -235,7 +233,6 @@ async fn rerank_metrics_get_the_accurate_count_via_the_deferred_close() {
             upstream_id: "rerank-v3.5".to_owned(),
             capabilities: vec![Capability::Rerank],
             modalities: vec!["text".to_owned()],
-            rerank_converter: None,
             release_date: None,
         }],
     }];

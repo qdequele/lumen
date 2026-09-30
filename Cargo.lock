@@ -2328,13 +2328,19 @@ name = "router"
 version = "0.5.0"
 dependencies = [
  "core",
+ "criterion",
  "dashmap",
  "futures",
  "providers",
+ "regex",
  "reqwest",
+ "serde",
+ "serde_json",
  "telemetry",
+ "thiserror",
  "tokio",
  "tokio-util",
+ "toml",
  "tracing",
 ]
 
@@ -2574,6 +2580,7 @@ dependencies = [
  "libc",
  "notify",
  "providers",
+ "rand 0.10.2",
  "reqwest",
  "router",
  "serde",

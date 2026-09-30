@@ -137,7 +137,6 @@ async fn key_check_reports_a_redirect_without_following_it() {
             upstream_id: "rr".to_owned(),
             capabilities: vec![Capability::Rerank],
             modalities: vec!["text".to_owned()],
-            rerank_converter: None,
             release_date: None,
         }],
     };

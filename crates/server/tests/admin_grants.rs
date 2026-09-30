@@ -56,7 +56,6 @@ fn chat_registry(upstream: &str) -> Arc<Registry> {
             upstream_id: "gpt-4o-2024-08-06".to_owned(),
             capabilities: vec![Capability::Chat],
             modalities: vec!["text".to_owned()],
-            rerank_converter: None,
             release_date: None,
         }],
     }];

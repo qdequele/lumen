@@ -25,7 +25,7 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use crate::http::{map_transport, with_cancel};
-use crate::mapping::{classify_status, parse_retry_after};
+use crate::mapping::{classify_error, parse_retry_after};
 
 /// The OAuth scope Vertex AI requires.
 const SCOPE: &str = "https://www.googleapis.com/auth/cloud-platform";
@@ -216,7 +216,9 @@ impl TokenSource {
                 // A token-exchange rejection is the upstream's fault, attributed
                 // to this provider - never surfaced as a misleading client 401.
                 let retry_after = parse_retry_after(response.headers());
-                return Err(classify_status(provider, status.as_u16(), retry_after));
+                let code = status.as_u16();
+                let body = crate::http::error_body_prefix(response).await;
+                return Err(classify_error(provider, code, retry_after, &body));
             }
             let bytes = response
                 .bytes()

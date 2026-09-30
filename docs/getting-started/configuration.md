@@ -27,17 +27,29 @@ database at all. See [Keys & budgets](../operations/keys-budgets.md).
 **`[telemetry]`** - which `x-lumen-metadata` keys become Prometheus labels
 on the token counters. See [Usage log](../operations/usage-log.md).
 
-**`[resilience]`** - retries, fallbacks, circuit breaker, timeouts and
+**`[resilience]`** - retries, circuit breaker, timeouts and
 health checks. Every value is the built-in default and the whole section is
 optional; see `config.example.toml` for the full set. Details in
 [Resilience](../operations/resilience.md).
 
 **`[[providers]]` / `[[providers.models]]`** - one `[[providers]]` block per
 upstream (`id`, `upstream_id`, `capabilities`, `modalities`, costs,
-per-model `fallbacks`, and an optional `release_date` ISO date that
+and an optional `release_date` ISO date that
 `GET /v1/models` returns as `release_date` and as the OpenAI integer
 `created`, so clients can sort models by release). See [Providers](../providers.md) for the full
-provider matrix and per-provider notes.
+provider matrix and per-provider notes. These are the **foundation models**:
+plain upstream bindings. Fallback, split and conditional routing no longer
+live on them (the per-model `fallbacks` field was removed).
+
+**`[[virtual_models]]`** - public ids that carry routing logic over your
+foundation models: `single`, `fallback`, `split` and `switch` strategies,
+overrides, chat presets, and Jev as a reranker. A virtual model has an `id`,
+one `capability`, a `strategy`, `targets`, and optionally `fallback_on`,
+`preset`, a `description` shown on `GET /v1/models` (where it appears with
+`"virtual": true`) and `listed = false` to hide it from that list while it
+stays callable. Foundation and virtual ids share one namespace. See
+[Virtual models](../virtual-models.md). An older config with `fallbacks` is
+converted by `lumen config migrate`.
 
 **`[image_fetch]`** - server-side fetching of remote image URLs for
 multimodal input. See [Multimodal input](../embeddings/multimodal.md).

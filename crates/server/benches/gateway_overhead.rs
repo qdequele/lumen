@@ -106,6 +106,7 @@ fn bench_executor(c: &mut Criterion) {
     let links = vec![Link {
         provider_name: "openai".to_owned(),
         model_id: "gpt-4o".to_owned(),
+        escapes: Vec::new(),
     }];
     let breakers = CircuitBreakers::new(BreakerConfig::default(), None);
     let config = ExecConfig {

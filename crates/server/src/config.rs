@@ -44,6 +44,11 @@ pub struct Config {
     /// Configured upstream providers. Dynamic layer.
     #[serde(default)]
     pub providers: Vec<ProviderConfig>,
+    /// Virtual models (ADR 014): public ids carrying routing logic (fallback,
+    /// split, switch, presets, SystemOne rerank remap) over the foundation
+    /// models. Dynamic layer.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub virtual_models: Vec<lumen_router::virtual_models::VirtualModelConfig>,
     /// Log output format. Boot layer.
     #[serde(default)]
     pub log_format: LogFormatConfig,
@@ -520,7 +525,7 @@ pub struct ModelConfig {
     /// The model id clients use (owned entirely by the operator).
     pub id: String,
     /// The upstream model id to send. Defaults to `id` when omitted.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_id: Option<String>,
     /// Capabilities this model serves.
     pub capabilities: Vec<Capability>,
@@ -530,23 +535,22 @@ pub struct ModelConfig {
     #[serde(default = "default_modalities")]
     pub modalities: Vec<String>,
     /// Price per **million input tokens**, USD (M5 cost counting).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_per_1m_input: Option<f64>,
     /// Price per **million output tokens**, USD.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_per_1m_output: Option<f64>,
     /// Price per **thousand rerank searches**, USD.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_per_1k_searches: Option<f64>,
-    /// Ordered fallback model ids tried, in turn, after this model's provider
-    /// exhausts its retries or its circuit is open (M6 §6.2). Each must exist
-    /// and serve every capability this model declares (validated at boot).
-    #[serde(default)]
+    /// Legacy per-model fallback chain. Removed by ADR 014; still parsed
+    /// only so validation can point at `lumen config migrate`, and so the
+    /// migrator can read old documents.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fallbacks: Vec<String>,
-    /// How `/v1/rerank` is converted to SystemOne questions (Jev as a
-    /// reranker, ADR 013 amendment). Only valid on a `kind = "typesafe"`
-    /// model that declares `rerank`; every field is optional and defaults to
-    /// a generic relevance question.
+    /// Legacy `[providers.models.rerank]` Jev converter block. Removed by
+    /// ADR 014; still parsed only so validation can point at `lumen config
+    /// migrate`, and so the migrator can read old documents.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rerank: Option<RerankConverterConfig>,
     /// The date the model was released, ISO 8601 `YYYY-MM-DD` (validated at
@@ -557,8 +561,30 @@ pub struct ModelConfig {
     pub release_date: Option<ReleaseDate>,
 }
 
-/// The `[providers.models.rerank]` converter block.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
+impl ModelConfig {
+    /// A model with only an id and default optional fields (migration helper).
+    #[must_use]
+    pub fn minimal(id: &str) -> Self {
+        Self {
+            id: id.to_owned(),
+            upstream_id: None,
+            capabilities: Vec::new(),
+            modalities: default_modalities(),
+            cost_per_1m_input: None,
+            cost_per_1m_output: None,
+            cost_per_1k_searches: None,
+            fallbacks: Vec::new(),
+            rerank: None,
+            release_date: None,
+        }
+    }
+}
+
+/// The legacy `[providers.models.rerank]` converter block. Removed by ADR
+/// 014; still parsed only so validation can point at `lumen config migrate`,
+/// and so the migrator can read old documents. `Debug` prints lengths only
+/// (remap text is operator prompt text and never logged).
+#[derive(Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RerankConverterConfig {
     /// The yes/no question asked about each `document`, relative to the
@@ -570,8 +596,11 @@ pub struct RerankConverterConfig {
     pub criteria: Option<RerankCriteriaConfig>,
 }
 
-/// `criteria.true` / `criteria.false` of a rerank converter.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
+/// `criteria.true` / `criteria.false` of a legacy rerank converter. Removed
+/// by ADR 014; still parsed only so validation can point at `lumen config
+/// migrate`, and so the migrator can read old documents. `Debug` prints
+/// lengths only.
+#[derive(Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RerankCriteriaConfig {
     /// What a yes (relevant) means.
@@ -582,23 +611,24 @@ pub struct RerankCriteriaConfig {
     pub no: Option<String>,
 }
 
-impl RerankConverterConfig {
-    /// The converter, with defaults for every unset field.
-    #[must_use]
-    pub fn to_converter(&self) -> lumen_providers::typesafe::rerank::RerankConverter {
-        let mut converter = lumen_providers::typesafe::rerank::RerankConverter::default();
-        if let Some(instructions) = &self.instructions {
-            instructions.clone_into(&mut converter.instructions);
-        }
-        if let Some(criteria) = &self.criteria {
-            if let Some(yes) = &criteria.yes {
-                yes.clone_into(&mut converter.criteria_true);
-            }
-            if let Some(no) = &criteria.no {
-                no.clone_into(&mut converter.criteria_false);
-            }
-        }
-        converter
+impl std::fmt::Debug for RerankConverterConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RerankConverterConfig")
+            .field(
+                "instructions_len",
+                &self.instructions.as_ref().map(String::len),
+            )
+            .field("criteria", &self.criteria)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for RerankCriteriaConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RerankCriteriaConfig")
+            .field("true_len", &self.yes.as_ref().map(String::len))
+            .field("false_len", &self.no.as_ref().map(String::len))
+            .finish()
     }
 }
 
@@ -608,36 +638,6 @@ impl ModelConfig {
     pub fn resolved_upstream_id(&self) -> &str {
         self.upstream_id.as_deref().unwrap_or(&self.id)
     }
-}
-
-/// A `[providers.models.rerank]` converter is only meaningful on a
-/// `typesafe` model that declares `rerank` (ADR 013 amendment), and its
-/// fields, when set, must not be blank.
-fn validate_rerank_converter(
-    provider: &ProviderConfig,
-    model: &ModelConfig,
-    err: &impl Fn(String) -> ConfigError,
-) -> Result<(), ConfigError> {
-    let Some(converter) = &model.rerank else {
-        return Ok(());
-    };
-    if provider.kind != ProviderKind::Typesafe || !model.capabilities.contains(&Capability::Rerank)
-    {
-        return Err(err(format!(
-            "model '{}': a `rerank` converter block is only valid on a kind = \"typesafe\" \
-             model that declares the rerank capability",
-            model.id
-        )));
-    }
-    let blank = |v: &Option<String>| v.as_deref().is_some_and(|t| t.trim().is_empty());
-    let criteria = converter.criteria.clone().unwrap_or_default();
-    if blank(&converter.instructions) || blank(&criteria.yes) || blank(&criteria.no) {
-        return Err(err(format!(
-            "model '{}': rerank converter fields must not be empty",
-            model.id
-        )));
-    }
-    Ok(())
 }
 
 /// Log output format, mirrored to [`LogFormat`].
@@ -1391,7 +1391,7 @@ impl Config {
                         )));
                     }
                 }
-                validate_rerank_converter(provider, model, &err)?;
+                self.reject_legacy_fields(provider, model, &err)?;
                 if let Some(first_owner) = model_owner.insert(model.id.as_str(), &provider.name) {
                     return Err(err(format!(
                         "duplicate model id '{}': declared by both provider '{}' and provider \
@@ -1403,67 +1403,79 @@ impl Config {
             }
         }
 
-        self.validate_fallbacks(&err)?;
+        self.routing_table().map_err(|e| err(e.to_string()))?;
         Ok(())
     }
 
-    /// Validate every model's fallback chain (M6 §6.2): each fallback id must
-    /// exist, differ from the model itself, and serve every capability the
-    /// model declares (so any request routed to the model can fall over to it).
-    fn validate_fallbacks(&self, err: &impl Fn(String) -> ConfigError) -> Result<(), ConfigError> {
-        // model id -> its declared capabilities, across all providers.
-        let mut caps: HashMap<&str, &[Capability]> = HashMap::new();
-        for provider in &self.providers {
-            for model in &provider.models {
-                caps.insert(model.id.as_str(), &model.capabilities);
-            }
-        }
-        for provider in &self.providers {
-            for model in &provider.models {
-                for fallback in &model.fallbacks {
-                    if fallback == &model.id {
-                        return Err(err(format!(
-                            "model '{}' lists itself as a fallback",
-                            model.id
-                        )));
-                    }
-                    let Some(fallback_caps) = caps.get(fallback.as_str()) else {
-                        return Err(err(format!(
-                            "model '{}' has an unknown fallback '{fallback}'",
-                            model.id
-                        )));
-                    };
-                    if let Some(missing) = model
-                        .capabilities
-                        .iter()
-                        .find(|c| !fallback_caps.contains(c))
-                    {
-                        return Err(err(format!(
-                            "fallback '{fallback}' for model '{}' does not serve capability \
-                             '{missing}' (a fallback must serve every capability of the model \
-                             it backs)",
-                            model.id
-                        )));
-                    }
-                }
-            }
+    /// Reject the fields ADR 014 removed (per-model `fallbacks`, the
+    /// `[providers.models.rerank]` block, `rerank` on a typesafe model), leading
+    /// with the `lumen config migrate` instruction and then printing the
+    /// equivalent virtual-model snippet for that model.
+    fn reject_legacy_fields(
+        &self,
+        provider: &ProviderConfig,
+        model: &ModelConfig,
+        err: &impl Fn(String) -> ConfigError,
+    ) -> Result<(), ConfigError> {
+        let legacy = if !model.fallbacks.is_empty() {
+            Some("`fallbacks`")
+        } else if model.rerank.is_some() {
+            Some("`[providers.models.rerank]`")
+        } else if provider.kind == ProviderKind::Typesafe
+            && model.capabilities.contains(&Capability::Rerank)
+        {
+            Some(
+                "the `rerank` capability on a typesafe model (Jev reranks through a \
+                 virtual model `remap`)",
+            )
+        } else {
+            None
+        };
+        if let Some(what) = legacy {
+            let equivalent = crate::config_migrate::hint_for(self, &model.id)
+                .map(|hint| format!(" Equivalent:\n{hint}"))
+                .unwrap_or_default();
+            return Err(err(format!(
+                "model '{}' (provider '{}') uses {what}, removed in ADR 014: run `lumen \
+                 config migrate` (add --dry-run to preview).{equivalent}",
+                model.id, provider.name
+            )));
         }
         Ok(())
     }
 
-    /// The ordered fallback chain for each model id (primary first), derived
-    /// from `fallbacks`. Models without fallbacks are omitted.
+    /// What virtual-model compilation needs to know about the foundation
+    /// models: every model id with its capabilities and modalities.
     #[must_use]
-    pub fn fallback_map(&self) -> HashMap<String, Vec<String>> {
-        let mut map = HashMap::new();
+    pub fn foundation_index(&self) -> lumen_router::virtual_models::FoundationIndex {
+        let mut index = lumen_router::virtual_models::FoundationIndex::default();
         for provider in &self.providers {
             for model in &provider.models {
-                if !model.fallbacks.is_empty() {
-                    map.insert(model.id.clone(), model.fallbacks.clone());
-                }
+                index.insert(
+                    model.id.clone(),
+                    model.capabilities.clone(),
+                    model.modalities.clone(),
+                );
             }
         }
-        map
+        index
+    }
+
+    /// Validate and compile `[[virtual_models]]` (ADR 014). Returns the
+    /// table and the load warnings.
+    ///
+    /// # Errors
+    /// The first invalid virtual model.
+    pub fn routing_table(
+        &self,
+    ) -> Result<
+        (lumen_router::virtual_models::RoutingTable, Vec<String>),
+        lumen_router::virtual_models::RoutingConfigError,
+    > {
+        lumen_router::virtual_models::RoutingTable::compile(
+            &self.virtual_models,
+            &self.foundation_index(),
+        )
     }
 
     /// Per-model timeout overrides (first-token, total) inherited from the
@@ -1515,10 +1527,6 @@ impl Config {
                         upstream_id: m.resolved_upstream_id().to_owned(),
                         capabilities: m.capabilities.clone(),
                         modalities: m.modalities.clone(),
-                        rerank_converter: m
-                            .rerank
-                            .as_ref()
-                            .map(RerankConverterConfig::to_converter),
                         release_date: m.release_date,
                     })
                     .collect(),
@@ -2006,36 +2014,6 @@ mod tests {
     }
 
     #[test]
-    fn typesafe_rerank_converter_parses_with_defaults() {
-        let config = load_str(
-            r#"
-            [[providers]]
-            name = "typesafe"
-            kind = "typesafe"
-            api_key_env = "TYPESAFE_API_KEY"
-            [[providers.models]]
-            id = "plain"
-            capabilities = ["rerank"]
-            [[providers.models]]
-            id = "custom"
-            capabilities = ["rerank"]
-            [providers.models.rerank]
-            criteria.false = "Unrelated."
-            "#,
-        )
-        .expect("valid");
-        let specs = config.provider_specs();
-        let models = &specs[0].models;
-        assert_eq!(models[0].rerank_converter, None);
-        let custom = models[1].rerank_converter.clone().expect("converter");
-        assert_eq!(custom.criteria_false, "Unrelated.");
-        assert_eq!(
-            custom.instructions,
-            lumen_providers::typesafe::rerank::DEFAULT_INSTRUCTIONS
-        );
-    }
-
-    #[test]
     fn release_date_parses_and_reaches_the_registry_spec() {
         let config = load_str(
             r#"
@@ -2118,34 +2096,6 @@ mod tests {
             assert!(
                 msg.contains("release") || msg.contains("date"),
                 "{bad}: {msg}"
-            );
-        }
-    }
-
-    #[test]
-    fn rerank_converter_is_rejected_where_it_cannot_apply() {
-        for (kind, caps, block) in [
-            ("cohere", r#"["rerank"]"#, r#"instructions = "q""#),
-            ("typesafe", r#"["systemone"]"#, r#"instructions = "q""#),
-            ("typesafe", r#"["rerank"]"#, r#"instructions = "  ""#),
-        ] {
-            let result = load_str(&format!(
-                r#"
-                [[providers]]
-                name = "p"
-                kind = "{kind}"
-                api_key_env = "KEY"
-                [[providers.models]]
-                id = "m"
-                capabilities = {caps}
-                [providers.models.rerank]
-                {block}
-                "#
-            ));
-            let err = result.expect_err("rejected");
-            assert!(
-                err.to_string().contains("rerank"),
-                "{kind} {caps} {block}: {err}"
             );
         }
     }
@@ -2300,6 +2250,42 @@ mod tests {
     }
 
     #[test]
+    fn config_debug_never_prints_preset_or_remap_text() {
+        // Parsed only (a legacy rerank block would fail validation): Debug is
+        // the leak surface, whatever the load outcome.
+        let cfg: Config = toml::from_str(
+            r#"
+            [[providers]]
+            name = "typesafe"
+            kind = "typesafe"
+            [[providers.models]]
+            id = "jev"
+            capabilities = ["systemone"]
+            [providers.models.rerank]
+            instructions = "SENTINEL-LEGACY"
+            criteria.true = "SENTINEL-LEGACY-YES"
+
+            [[virtual_models]]
+            id = "acme/chat"
+            capability = "chat"
+            strategy = "single"
+            preset = { system_prompt = "SENTINEL-PROMPT" }
+            targets = [{ model = "gpt-4o" }]
+
+            [[virtual_models]]
+            id = "acme/rerank"
+            capability = "rerank"
+            strategy = "single"
+            targets = [{ model = "jev", remap = { context = "SENTINEL-CONTEXT", instructions = "SENTINEL-REMAP" } }]
+            "#,
+        )
+        .unwrap();
+        let dbg = format!("{cfg:?}");
+        assert!(!dbg.contains("SENTINEL"), "{dbg}");
+        assert!(dbg.contains("acme/rerank"), "{dbg}");
+    }
+
+    #[test]
     fn shipped_example_config_is_valid() {
         // Guards against the example rotting (a malformed example bit us before).
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../config.example.toml");
@@ -2339,77 +2325,103 @@ mod tests {
         assert!(err.to_string().contains("total_timeout_ms"));
     }
 
+    const LEGACY_FALLBACK: &str = r#"
+        [[providers]]
+        name = "openai"
+        kind = "openai"
+        [[providers.models]]
+        id = "gpt-4o"
+        capabilities = ["chat"]
+        fallbacks = ["claude"]
+        [[providers.models]]
+        id = "claude"
+        capabilities = ["chat"]
+    "#;
+
     #[test]
-    fn valid_fallback_chain_parses_and_maps() {
-        let toml = r#"
+    fn legacy_fallbacks_are_rejected_with_the_migration_hint() {
+        let err = load_str(LEGACY_FALLBACK).unwrap_err().to_string();
+        assert!(
+            err.contains("`fallbacks`") && err.contains("lumen config migrate"),
+            "{err}"
+        );
+        assert!(
+            err.contains("openai/gpt-4o") && err.contains("[[virtual_models]]"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_typesafe_reranker_is_rejected_with_the_migration_hint() {
+        let err = load_str(
+            r#"
+            [[providers]]
+            name = "typesafe"
+            kind = "typesafe"
+            api_key_env = "TYPESAFE_API_KEY"
+            [[providers.models]]
+            id = "jev-rerank"
+            upstream_id = "jev-latest"
+            capabilities = ["rerank"]
+        "#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("jev-rerank")
+                && err.contains("lumen config migrate")
+                && err.contains("remap"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_legacy_rerank_block_is_rejected_on_any_kind() {
+        for (kind, caps) in [("typesafe", r#"["rerank"]"#), ("cohere", r#"["rerank"]"#)] {
+            let err = load_str(&format!(
+                r#"
+                [[providers]]
+                name = "p"
+                kind = "{kind}"
+                api_key_env = "KEY"
+                [[providers.models]]
+                id = "m"
+                capabilities = {caps}
+                [providers.models.rerank]
+                instructions = "q"
+                "#
+            ))
+            .unwrap_err()
+            .to_string();
+            assert!(
+                err.contains("`[providers.models.rerank]`") && err.contains("lumen config migrate"),
+                "{kind}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_same_routing_expressed_as_a_virtual_model_loads() {
+        let cfg = load_str(
+            r#"
             [[providers]]
             name = "openai"
             kind = "openai"
             [[providers.models]]
-            id = "gpt"
+            id = "openai/gpt-4o"
             capabilities = ["chat"]
-            fallbacks = ["claude"]
-
-            [[providers]]
-            name = "anthropic"
-            kind = "anthropic"
             [[providers.models]]
             id = "claude"
             capabilities = ["chat"]
-        "#;
-        let cfg = load_str(toml).unwrap();
-        let map = cfg.fallback_map();
-        assert_eq!(map.get("gpt"), Some(&vec!["claude".to_owned()]));
-        assert!(!map.contains_key("claude"));
-    }
-
-    #[test]
-    fn fallback_to_unknown_model_is_rejected() {
-        let toml = r#"
-            [[providers]]
-            name = "openai"
-            kind = "openai"
-            [[providers.models]]
-            id = "gpt"
-            capabilities = ["chat"]
-            fallbacks = ["ghost"]
-        "#;
-        let err = load_str(toml).unwrap_err();
-        assert!(err.to_string().contains("ghost"), "{err}");
-    }
-
-    #[test]
-    fn fallback_missing_a_capability_is_rejected() {
-        // The fallback serves only embed, but the model needs chat.
-        let toml = r#"
-            [[providers]]
-            name = "openai"
-            kind = "openai"
-            [[providers.models]]
-            id = "gpt"
-            capabilities = ["chat"]
-            fallbacks = ["embed-only"]
-            [[providers.models]]
-            id = "embed-only"
-            capabilities = ["embed"]
-        "#;
-        let err = load_str(toml).unwrap_err();
-        assert!(err.to_string().contains("capability"), "{err}");
-    }
-
-    #[test]
-    fn self_fallback_is_rejected() {
-        let toml = r#"
-            [[providers]]
-            name = "openai"
-            kind = "openai"
-            [[providers.models]]
-            id = "gpt"
-            capabilities = ["chat"]
-            fallbacks = ["gpt"]
-        "#;
-        let err = load_str(toml).unwrap_err();
-        assert!(err.to_string().contains("itself"), "{err}");
+            [[virtual_models]]
+            id = "gpt-4o"
+            capability = "chat"
+            strategy = "fallback"
+            targets = [{ model = "openai/gpt-4o" }, { model = "claude" }]
+        "#,
+        )
+        .unwrap();
+        assert!(cfg.routing_table().unwrap().0.get("gpt-4o").is_some());
     }
 
     #[test]
@@ -2801,5 +2813,46 @@ mod tests {
                 "webhooks",
             ]
         );
+    }
+
+    const VIRTUAL: &str = r#"
+        [[virtual_models]]
+        id = "acme/chat"
+        capability = "chat"
+        strategy = "fallback"
+        targets = [{ model = "gpt-4o" }, { model = "gpt-4o" }]
+    "#;
+
+    #[test]
+    fn virtual_models_parse_validate_and_compile() {
+        let cfg = load_str(&format!("{VALID}\n{VIRTUAL}")).unwrap();
+        assert_eq!(cfg.virtual_models.len(), 1);
+        let (table, warnings) = cfg.routing_table().unwrap();
+        assert!(warnings.is_empty());
+        assert!(table.get("acme/chat").is_some());
+    }
+
+    #[test]
+    fn an_invalid_virtual_model_fails_validation_naming_it() {
+        let bad = VIRTUAL.replace(
+            "{ model = \"gpt-4o\" }, { model = \"gpt-4o\" }",
+            "{ model = \"ghost\" }, { model = \"gpt-4o\" }",
+        );
+        let err = load_str(&format!("{VALID}\n{bad}"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("virtual model 'acme/chat'") && err.contains("ghost"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_virtual_id_may_not_shadow_a_foundation_id() {
+        let bad = VIRTUAL.replace("acme/chat", "gpt-4o");
+        let err = load_str(&format!("{VALID}\n{bad}"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("collides with a foundation model"), "{err}");
     }
 }

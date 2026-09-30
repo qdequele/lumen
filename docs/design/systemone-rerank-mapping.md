@@ -1,8 +1,8 @@
 # Design proposals: a Jev-backed `/v1/rerank` (SystemOne rerank mapping)
 
-- Status: proposal, for discussion. A minimal form of Proposal A (one
-  converter per model id, noul strategy only) shipped as the ADR 013
-  amendment; the rest is still open
+- Status: decided, see ADR 014 (virtual models). Proposal A became the
+  `remap` target of a rerank virtual model; Proposal B became `switch` on the
+  budget group. C and D are not pursued.
 - Date: 2026-09-26
 - Builds on: ADR 013 (SystemOne capability), ADR 012 (config source and
   granular admin endpoints), ADR 009 (budget groups)
@@ -35,7 +35,7 @@ object:
 
 ```toml
 [systemone.rerank_profiles.legal-precedent]
-target = "jev"               # a SystemOne model id: pricing, fallbacks, breakers come from it
+target = "jev"               # a SystemOne model id: pricing, breakers come from it
 strategy = "noul"            # noul | score | choice | composite
 instructions = "Could `candidate` be the precedent cited in the query?"
 criteria.true = "The candidate states the specific rule the query cites."
@@ -43,6 +43,11 @@ criteria.false = "The candidate is only on a similar topic."
 # optional, static domain context injected into the state for every call
 context = "US federal case law. Prefer holdings over dicta."
 ```
+
+As decided in ADR 014, the profile is not a separate table: it is the `remap`
+of a target of a rerank virtual model (the decided form is shown under
+Proposal A below, and in [Virtual models](../virtual-models.md#7-jev-as-a-reranker)).
+The document is named `document` there rather than `candidate`.
 
 ### Encoding strategies
 
@@ -111,11 +116,29 @@ api_key_env = "TYPESAFE_API_KEY"
   capabilities = ["systemone"]
   cost_per_1m_input = 0.042
 
+[[providers]]
+name = "cohere"
+kind = "cohere"
+api_key_env = "COHERE_API_KEY"
+
   [[providers.models]]
-  id = "legal-rerank"              # what clients send as `model`
+  id = "cohere-rerank"
+  upstream_id = "rerank-v3.5"
   capabilities = ["rerank"]
-  rerank_profile = "legal-precedent"
-  fallbacks = ["cohere-rerank"]    # a Jev-backed rerank can fall back to Cohere
+
+# Decided form (ADR 014): a rerank virtual model whose target carries the
+# mapping as a `remap`, with a classic reranker as its fallback.
+[[virtual_models]]
+id = "legal-rerank"                # what clients send as `model`
+capability = "rerank"
+strategy = "fallback"
+
+  [[virtual_models.targets]]
+  model = "jev"
+  remap = { strategy = "noul", instructions = "Could `document` be the precedent cited in the query?", context = "US federal case law. Prefer holdings over dicta.", criteria = { true = "The document states the specific rule the query cites.", false = "The document is only on a similar topic." } }
+
+  [[virtual_models.targets]]
+  model = "cohere-rerank"          # a Jev-backed rerank can fall back to Cohere
 ```
 
 The client picks the mapping by picking the model. Per-tenant mappings are

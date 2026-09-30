@@ -42,7 +42,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::BedrockProvider;
 use crate::http::{map_transport, with_cancel};
-use crate::mapping::{classify_status, parse_retry_after, reject_pretokenized_input};
+use crate::mapping::{classify_error, parse_retry_after, reject_pretokenized_input};
 
 /// Both Bedrock embedding families have per-call input limits that differ
 /// (Titan: exactly one text; Cohere: 96), and a single `BedrockProvider` serves
@@ -245,7 +245,9 @@ impl BedrockProvider {
                 Ok((bytes, input_tokens))
             } else {
                 let retry_after = parse_retry_after(response.headers());
-                Err(classify_status(provider, status.as_u16(), retry_after))
+                let code = status.as_u16();
+                let body = crate::http::error_body_prefix(response).await;
+                Err(classify_error(provider, code, retry_after, &body))
             }
         };
         with_cancel(cancel, call).await

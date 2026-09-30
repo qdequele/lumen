@@ -888,7 +888,8 @@ async fn put_config_rejects_a_boot_layer_key_in_db_mode_even_at_its_default_valu
 // ---- Task 8: granular admin config endpoints (ADR 012) --------------------
 
 /// A second file-mode fixture, distinct from [`CONFIG_TOML`]: two providers
-/// whose models form a fallback dependency (`primary-model` falls back to
+/// whose models form a fallback dependency (the virtual model
+/// `primary-model` falls back from `primary/primary-model` to
 /// `backup-model`, owned by a different provider), used only by the
 /// delete-still-referenced test below.
 const FALLBACK_CONFIG_TOML: &str = r#"# fleet config
@@ -897,9 +898,9 @@ name = "primary"
 kind = "openai"
 
 [[providers.models]]
-id = "primary-model"
+id = "primary/primary-model"
+upstream_id = "primary-model"
 capabilities = ["chat"]
-fallbacks = ["backup-model"]
 
 [[providers]]
 name = "backup"
@@ -908,6 +909,12 @@ kind = "openai"
 [[providers.models]]
 id = "backup-model"
 capabilities = ["chat"]
+
+[[virtual_models]]
+id = "primary-model"
+capability = "chat"
+strategy = "fallback"
+targets = [{ model = "primary/primary-model" }, { model = "backup-model" }]
 "#;
 
 /// (a) A `PUT` with a fresh hash applies (204); the new provider then shows
@@ -1023,10 +1030,10 @@ async fn put_provider_path_name_must_match_body_name() {
     assert_eq!(body["error"]["code"].as_str().expect("code"), "LM-1001");
 }
 
-/// (c) Deleting a provider whose model is still named as another model's
-/// fallback is refused: full validation runs inside `apply_document` and
-/// rejects with `LM-1001` naming the dependent model, exactly like the
-/// whole-document `PUT` would. Nothing is persisted.
+/// (c) Deleting a provider whose model is still a virtual model's fallback
+/// target is refused: full validation runs inside `apply_document` and
+/// rejects with `LM-1001` naming the dependent virtual model, exactly like
+/// the whole-document `PUT` would. Nothing is persisted.
 #[tokio::test]
 async fn delete_provider_still_referenced_by_a_fallback_is_rejected() {
     let h = spawn_admin_with_config(registry(), FALLBACK_CONFIG_TOML).await;
@@ -1038,8 +1045,8 @@ async fn delete_provider_still_referenced_by_a_fallback_is_rejected() {
     assert_eq!(body["error"]["code"].as_str().expect("code"), "LM-1001");
     let message = body["error"]["message"].as_str().expect("message");
     assert!(
-        message.contains("primary-model"),
-        "the rejection must name the dependent model: {message}"
+        message.contains("virtual model 'primary-model'"),
+        "the rejection must name the dependent virtual model: {message}"
     );
 
     let list: Value = h
@@ -1361,4 +1368,157 @@ async fn get_config_reports_key_sources_in_db_mode() {
         body["key_sources"],
         serde_json::json!({ "db-provider": "missing" })
     );
+}
+
+#[tokio::test]
+async fn put_then_get_virtual_model_with_slash_in_id() {
+    let h = spawn_admin(registry()).await;
+    let hash = h.current_hash().await;
+    let body = serde_json::json!({
+        "id": "acme/chat", "capability": "chat", "strategy": "single",
+        "targets": [{ "model": "gpt-4o" }]
+    });
+    let put = h
+        .put_json("/admin/config/virtual_models/acme%2Fchat", &body, &hash)
+        .await;
+    assert_eq!(put.status(), 204, "{}", put.text().await.unwrap());
+
+    let got: Value = h
+        .get("/admin/config/virtual_models/acme%2Fchat")
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(got["id"], "acme/chat");
+    assert!(got["hash"].is_string());
+
+    let plan: Value = h
+        .get("/admin/config/virtual_models/acme%2Fchat/plan")
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(plan["plan"]["targets"][0]["virtual"], false);
+    assert_eq!(plan["plan"]["targets"][0]["model"], "gpt-4o");
+
+    let list: Value = h
+        .get("/admin/config/virtual_models")
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(list["virtual_models"][0]["id"], "acme/chat");
+    assert_eq!(list["virtual_models"][0]["strategy"], "single");
+
+    // The granular edit is format preserving.
+    let doc: Value = h.get("/admin/config").await.json().await.unwrap();
+    assert!(doc["config"].as_str().unwrap().contains("# fleet config"));
+}
+
+#[tokio::test]
+async fn invalid_virtual_models_and_dangling_deletes_are_lm_1001() {
+    let h = spawn_admin(registry()).await;
+    let hash = h.current_hash().await;
+    let bad = serde_json::json!({ "id": "v", "capability": "chat", "strategy": "single", "targets": [{ "model": "ghost" }] });
+    let resp = h
+        .put_json("/admin/config/virtual_models/v", &bad, &hash)
+        .await;
+    assert_eq!(resp.status(), 400);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "LM-1001");
+    assert!(
+        body["error"]["message"].as_str().unwrap().contains("ghost"),
+        "{body}"
+    );
+
+    let good = serde_json::json!({ "id": "v", "capability": "chat", "strategy": "single", "targets": [{ "model": "gpt-4o" }] });
+    assert_eq!(
+        h.put_json("/admin/config/virtual_models/v", &good, &hash)
+            .await
+            .status(),
+        204
+    );
+
+    // Deleting the provider that owns `gpt-4o` would orphan `v`.
+    let hash = h.current_hash().await;
+    let resp = h
+        .delete("/admin/config/providers/test-provider", &hash)
+        .await;
+    assert_eq!(resp.status(), 400);
+    let body: Value = resp.json().await.unwrap();
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("virtual model 'v'"),
+        "{body}"
+    );
+
+    let mismatch = h
+        .put_json("/admin/config/virtual_models/other", &good, &hash)
+        .await;
+    assert_eq!(mismatch.status(), 400);
+    assert_eq!(
+        h.get("/admin/config/virtual_models/nope").await.status(),
+        404
+    );
+    assert_eq!(
+        h.delete("/admin/config/virtual_models/nope", &hash)
+            .await
+            .status(),
+        404
+    );
+}
+
+/// A JSON `null` has no TOML spelling: a body carrying one inside `when`,
+/// `overrides.set` or `overrides.default` (nested included) is a client
+/// error naming the field, never a 500 (STRICT rule 8).
+#[tokio::test]
+async fn a_json_null_in_a_virtual_model_body_is_lm_1001() {
+    let h = spawn_admin(registry()).await;
+    let hash = h.current_hash().await;
+    let bodies = [
+        (
+            serde_json::json!({ "id": "v", "capability": "chat", "strategy": "switch", "targets": [
+                { "model": "gpt-4o", "when": { "group": null } }, { "model": "gpt-4o" } ] }),
+            "targets[0].when.group",
+        ),
+        (
+            serde_json::json!({ "id": "v", "capability": "chat", "strategy": "single", "targets": [
+                { "model": "gpt-4o", "overrides": { "set": { "temperature": null } } } ] }),
+            "targets[0].overrides.set.temperature",
+        ),
+        (
+            serde_json::json!({ "id": "v", "capability": "chat", "strategy": "single", "targets": [
+                { "model": "gpt-4o", "overrides": { "default": { "stop": ["a", null] } } } ] }),
+            "targets[0].overrides.default.stop[1]",
+        ),
+        (
+            serde_json::json!({ "id": "v", "capability": "chat", "strategy": "single",
+                "preset": { "overrides": { "set": { "response_format": { "type": null } } } },
+                "targets": [{ "model": "gpt-4o" }] }),
+            "preset.overrides.set.response_format.type",
+        ),
+    ];
+    for (body, field) in bodies {
+        let resp = h
+            .put_json("/admin/config/virtual_models/v", &body, &hash)
+            .await;
+        assert_eq!(resp.status(), 400, "{field}");
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(body["error"]["code"], "LM-1001", "{body}");
+        let message = body["error"]["message"].as_str().unwrap();
+        assert!(message.contains(field), "{message}");
+        assert!(message.contains("null"), "{message}");
+    }
+
+    // Any other value TOML cannot hold is a client error too.
+    let too_big = serde_json::json!({ "id": "v", "capability": "chat", "strategy": "single", "targets": [
+        { "model": "gpt-4o", "overrides": { "set": { "max_tokens": u64::MAX } } } ] });
+    let resp = h
+        .put_json("/admin/config/virtual_models/v", &too_big, &hash)
+        .await;
+    assert_eq!(resp.status(), 400);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "LM-1001", "{body}");
 }

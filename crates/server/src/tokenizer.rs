@@ -75,9 +75,20 @@ enum Family {
 /// `None` for a model tiktoken does not describe (the caller then keeps the
 /// heuristic). Matching runs on the gateway-facing model id (the operator's
 /// alias), so an alias that does not carry the upstream family prefix keeps
-/// the heuristic. The GPT-4o family is checked before GPT-4 so `gpt-4o*`
-/// never falls into the `cl100k` branch.
+/// the heuristic. A provider-prefixed id (`openai/gpt-4o`, the shape `lumen
+/// config migrate` gives renamed foundation models) also matches on its last
+/// path segment.
 fn family_for_model(model: &str) -> Option<Family> {
+    family_for_id(model).or_else(|| {
+        model
+            .rsplit_once('/')
+            .and_then(|(_, last)| family_for_id(last))
+    })
+}
+
+/// [`family_for_model`] on one id, by prefix. The GPT-4o family is checked
+/// before GPT-4 so `gpt-4o*` never falls into the `cl100k` branch.
+fn family_for_id(model: &str) -> Option<Family> {
     let m = model.to_ascii_lowercase();
     // o200k_base: GPT-4o, o1/o3/o4 reasoning, GPT-4.1 and GPT-5 families.
     if m.starts_with("gpt-4o")
@@ -271,6 +282,33 @@ mod tests {
         // Non-OpenAI models map to no encoder (heuristic fallback).
         assert_eq!(family_for_model("claude-3-5-sonnet"), None);
         assert_eq!(family_for_model("mistral-large"), None);
+    }
+
+    #[test]
+    fn a_provider_prefixed_id_matches_on_its_last_segment() {
+        // `lumen config migrate` renames foundation models `<provider>/<id>`.
+        assert_eq!(family_for_model("openai/gpt-4o"), Some(Family::O200k));
+        assert_eq!(family_for_model("azure/eu/gpt-4"), Some(Family::Cl100k));
+        assert_eq!(
+            family_for_model("openai/text-embedding-3-small"),
+            Some(Family::Cl100k)
+        );
+        assert_eq!(family_for_model("anthropic/claude-3-5-sonnet"), None);
+        assert!(accurate().refines("openai/gpt-4o"));
+    }
+
+    #[tokio::test]
+    async fn a_provider_prefixed_id_is_refined_like_the_bare_id() {
+        let counter = accurate();
+        let texts = || vec!["hello world, how are you?".to_owned()];
+        let bare = counter
+            .refine_chat("gpt-4o", texts(), "fine".to_owned())
+            .await;
+        assert!(bare.is_some());
+        let prefixed = counter
+            .refine_chat("openai/gpt-4o", texts(), "fine".to_owned())
+            .await;
+        assert_eq!(prefixed, bare);
     }
 
     #[test]

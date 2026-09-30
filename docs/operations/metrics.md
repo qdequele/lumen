@@ -15,6 +15,7 @@ to gate it. See [`SECURITY.md`](https://github.com/qdequele/lumen/blob/main/SECU
 | `lumen_rerank_search_units_total` | `model, provider` | Rerank search units, upstream-reported when available. |
 | `lumen_media_total` | `capability, model, provider, media_type` | Media items (images, ...) processed - a billing dimension alongside tokens (M9). |
 | `lumen_media_bytes_total` | `capability, model, provider, media_type` | Decoded media bytes processed (M9). |
+| `lumen_virtual_model_requests_total` | `virtual_model, model_used` | Requests served through a [virtual model](../virtual-models.md) (ADR 014), by the virtual id the client sent and the foundation model that served it. Counted for served requests; a direct call to a foundation model is not counted. Virtual ids are operator-defined, so cardinality is bounded. |
 | `lumen_http_request_duration_seconds` | `method, path, status` | Wall time of every HTTP request, including `/health` and `/metrics`. `path` is the matched route template, never the raw URI. Streaming responses count time-to-response-headers. |
 | `lumen_request_duration_seconds` | `capability, model, provider, status` | End-to-end latency of one accounted API call. For streaming chat this covers the full stream, recorded when accounting closes. |
 | `lumen_circuit_state` | `provider, model` | Circuit-breaker state: `0` closed, `1` open, `2` half-open. |

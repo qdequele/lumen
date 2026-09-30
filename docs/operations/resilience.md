@@ -1,11 +1,12 @@
 # Resilience tuning
 
 LUMEN survives flaky upstreams without becoming flaky itself. A request goes
-through, in order: **retries**, then **fallback** to the next model in the
-chain, then the **circuit breaker** deciding whether to even try a given
-provider. None of this touches the database on the request path. Retries and
-the circuit breaker are always active with sane defaults; only per-model
-`fallbacks` and background health checks are opt-in. All of it lives under
+through, in order: **retries**, then **fallback** to the next target of a
+[virtual model](../virtual-models.md), then the **circuit breaker** deciding
+whether to even try a given provider. None of this touches the database on the
+request path. Retries and the circuit breaker are always active with sane
+defaults; fallback exists only where you declare a virtual model, and
+background health checks are opt-in. All of it lives under
 `[resilience]` - see [ADR 005](../adr/005-resilience-execution.md) for the
 design.
 
@@ -38,12 +39,26 @@ Set `retry_max_attempts = 1` to disable retries entirely.
 
 ## Fallback chains
 
-Each model can declare `fallbacks`, a list of other model ids to try in
-order if the primary fails. Fallback chains are validated **at boot**: every
-fallback id must exist and serve the same capability as the model it backs,
-so a runtime resolution miss never happens in practice. Whichever model
-actually served a request is reported in the `x-lumen-model-used` response
-header, so a caller (and the usage log) can see when a fallback fired.
+Fallback is declared on a [virtual model](../virtual-models.md), not on the
+foundation model. A `fallback` virtual model lists targets to try in order,
+and `fallback_on` says which failures move on to the next one (default: a
+5xx, a 429, a timeout or an open circuit; opt in to `context_length` and
+`content_filter`). Targets can be other virtual models, so chains compose.
+Chains are validated **at boot and on every reload**: every target must exist
+and serve the same capability, with no cycles, so a runtime resolution miss
+never happens in practice. Whichever foundation model actually served a
+request is reported in the `x-lumen-model-used` response header, and the path
+taken in `x-lumen-route`, so a caller (and the usage log) can see when a
+fallback fired.
+
+```toml
+[[virtual_models]]
+id = "gpt-4o"
+capability = "chat"
+strategy = "fallback"
+fallback_on = ["provider_error", "rate_limited", "timeout", "circuit_open"]
+targets = [{ model = "openai/gpt-4o" }, { model = "claude-sonnet-4-5" }]
+```
 
 ## Circuit breaker
 

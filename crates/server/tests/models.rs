@@ -28,7 +28,6 @@ fn registry() -> Arc<Registry> {
                 // A single Cohere model configured for BOTH embed and rerank.
                 capabilities: vec![Capability::Embed, Capability::Rerank],
                 modalities: vec!["text".to_owned()],
-                rerank_converter: None,
                 release_date: None,
             }],
         },
@@ -46,7 +45,6 @@ fn registry() -> Arc<Registry> {
                     upstream_id: "gpt-4o".to_owned(),
                     capabilities: vec![Capability::Chat],
                     modalities: vec!["text".to_owned()],
-                    rerank_converter: None,
                     release_date: Some("2024-05-13".parse().unwrap()),
                 },
                 ModelSpec {
@@ -56,7 +54,6 @@ fn registry() -> Arc<Registry> {
                     upstream_id: "mistralai/Mistral-7B-Instruct-v0.3".to_owned(),
                     capabilities: vec![Capability::Chat],
                     modalities: vec!["text".to_owned()],
-                    rerank_converter: None,
                     release_date: None,
                 },
             ],
@@ -245,4 +242,77 @@ async fn release_date_is_exposed_for_sorting_and_omitted_when_unset() {
         .await
         .unwrap();
     assert_eq!(retrieved, *gpt);
+}
+
+#[tokio::test]
+async fn virtual_models_are_listed_and_retrievable_unless_hidden() {
+    let cfg = lumen_server::config::Config::load_text(
+        r#"
+        [[providers]]
+        name = "openai"
+        kind = "openai"
+        [[providers.models]]
+        id = "gpt-4o"
+        capabilities = ["chat"]
+        modalities = ["text", "image"]
+
+        [[virtual_models]]
+        id = "acme/chat"
+        capability = "chat"
+        strategy = "single"
+        description = "Acme chat"
+        targets = [{ model = "acme/hidden" }]
+
+        [[virtual_models]]
+        id = "acme/hidden"
+        capability = "chat"
+        strategy = "single"
+        listed = false
+        targets = [{ model = "gpt-4o" }]
+        "#,
+        "test",
+    )
+    .unwrap();
+    let registry = Arc::new(
+        Registry::build(
+            cfg.provider_specs(),
+            http::build_client(),
+            std::time::Duration::from_secs(300),
+        )
+        .unwrap(),
+    );
+    let state = common::base_state(registry).with_resilience(Arc::new(
+        lumen_server::resilience::ResilienceRuntime::from_config(&cfg, None),
+    ));
+    let base = common::spawn_state(state, LIMIT).await;
+
+    let list: Value = reqwest::get(format!("{base}/v1/models"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let ids: Vec<&str> = list["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec!["gpt-4o", "acme/chat"]);
+    let entry = &list["data"][1];
+    assert_eq!(entry["virtual"], true);
+    assert_eq!(entry["capabilities"], serde_json::json!(["chat"]));
+    assert_eq!(entry["description"], "Acme chat");
+    assert_eq!(entry["modalities"], serde_json::json!(["text", "image"]));
+    assert_eq!(entry["owned_by"], "lumen");
+    assert_eq!(list["data"][0]["virtual"], false);
+
+    let one = reqwest::get(format!("{base}/v1/models/acme/chat"))
+        .await
+        .unwrap();
+    assert_eq!(one.status(), 200);
+    let hidden = reqwest::get(format!("{base}/v1/models/acme/hidden"))
+        .await
+        .unwrap();
+    assert_eq!(hidden.status(), 404);
 }

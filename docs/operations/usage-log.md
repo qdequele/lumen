@@ -5,6 +5,15 @@ table: token counts, cost, status, the model that actually served the
 request, and metadata - never message content. Prompts and responses are
 never logged, by default and in the usage log alike.
 
+## The `route` column
+
+`model` is the id the client requested and `model_used` the foundation model
+that served. When the requested id is a [virtual model](../virtual-models.md),
+the nullable `route` column (migration `0010`) also records the path the
+request took, for example `acme/chat>acme/chat-eu>mistral-large`: the same
+value as the `x-lumen-route` response header. It is `NULL` for a direct call
+to a foundation model and for rows written before the column existed.
+
 ## Never on the request path
 
 Usage-log writes never block a request. Each accounted call pushes an entry
@@ -61,7 +70,7 @@ The response shape:
 `since` and `until` are the EFFECTIVE window for this call: either what the
 caller passed, or the resolved default (24 hours before `until`, `until`
 itself defaulting to "now"). Each row has the same columns as the
-`usage_log` table (id, key_id, group_id, model, model_used, provider,
+`usage_log` table (id, key_id, group_id, model, model_used, route, provider,
 capability, token/media/cache counters, cost, latency, status, metadata,
 ts). As with every other usage surface, rows never carry prompt or response
 content, only accounting fields.

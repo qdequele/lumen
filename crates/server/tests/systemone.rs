@@ -26,8 +26,10 @@ const KEY: &str = "ts-test-key-do-not-leak";
 const ANSWERS: &str = r#"{"model":"jev-1.13.0","answers":{"is_urgent":{"type":"noul","noul":0.95},"department":{"type":"choice","choice":"billing","probabilities":{"technical":0.12,"billing":0.88},"confidence":0.81}},"usage":{"input_tokens":318,"output_tokens":34}}"#;
 
 /// A TypeSafe primary exposing `jev` (-> `jev-latest`) and a pinned
-/// `jev-pinned` (-> `jev-1.13.0`) that falls back to a second TypeSafe
-/// provider's `jev-fb`, plus a chat-only model for the capability miss.
+/// `jev-pinned-leaf` (-> `jev-1.13.0`); the virtual model `jev-pinned` falls
+/// back from it to a second TypeSafe provider's `jev-fb`, and the virtual
+/// model `jev-rerank` reranks through `jev` with a remap (ADR 014). Plus a
+/// chat-only model for the capability miss.
 fn config(primary: &str, fallback: &str) -> Config {
     let toml = format!(
         r#"
@@ -47,18 +49,9 @@ fn config(primary: &str, fallback: &str) -> Config {
         capabilities = ["systemone"]
         cost_per_1m_input = 0.042
         [[providers.models]]
-        id = "jev-pinned"
+        id = "jev-pinned-leaf"
         upstream_id = "jev-1.13.0"
         capabilities = ["systemone"]
-        fallbacks = ["jev-fb"]
-        [[providers.models]]
-        id = "jev-rerank"
-        upstream_id = "jev-latest"
-        capabilities = ["rerank"]
-        cost_per_1m_input = 0.042
-        [providers.models.rerank]
-        instructions = "Could `document` be the cited precedent?"
-        criteria.true = "States the cited rule."
 
         [[providers]]
         name = "typesafe-backup"
@@ -78,6 +71,18 @@ fn config(primary: &str, fallback: &str) -> Config {
         [[providers.models]]
         id = "gpt"
         capabilities = ["chat"]
+
+        [[virtual_models]]
+        id = "jev-pinned"
+        capability = "systemone"
+        strategy = "fallback"
+        targets = [{{ model = "jev-pinned-leaf" }}, {{ model = "jev-fb" }}]
+
+        [[virtual_models]]
+        id = "jev-rerank"
+        capability = "rerank"
+        strategy = "single"
+        targets = [{{ model = "jev", remap = {{ instructions = "Could `document` be the cited precedent?", criteria.true = "States the cited rule." }} }}]
         "#
     );
     Figment::new()
@@ -451,7 +456,7 @@ impl Respond for EchoScores {
 }
 
 #[tokio::test]
-async fn jev_serves_v1_rerank_through_the_configured_converter() {
+async fn jev_serves_v1_rerank_through_a_virtual_model_remap() {
     let upstream = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/systemone"))
@@ -477,7 +482,8 @@ async fn jev_serves_v1_rerank_through_the_configured_converter() {
         resp.headers()
             .get("x-lumen-model-used")
             .and_then(|v| v.to_str().ok()),
-        Some("jev-rerank")
+        Some("jev"),
+        "the leaf that served the virtual reranker"
     );
     let body: Value = resp.json().await.expect("json");
     // Sorted by Jev's noul, top_n applied, documents echoed by original index.
@@ -490,7 +496,7 @@ async fn jev_serves_v1_rerank_through_the_configured_converter() {
     assert!(body["usage"].get("tokens_estimated").is_none());
     assert_eq!(body["usage"]["estimated"], true);
 
-    // The configured converter reached Jev: custom question and yes-criterion,
+    // The configured remap reached Jev: custom question and yes-criterion,
     // default no-criterion, the upstream model id, the query in the state.
     let received = upstream.received_requests().await.expect("recorded");
     let sent: Value = serde_json::from_slice(&received[0].body).expect("json");

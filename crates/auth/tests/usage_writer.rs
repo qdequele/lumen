@@ -10,6 +10,7 @@ fn record(model: &str) -> UsageRecord {
         group_id: None,
         model: model.to_owned(),
         model_used: model.to_owned(),
+        route: None,
         provider: "openai".to_owned(),
         capability: "chat".to_owned(),
         tokens_in: 1,
