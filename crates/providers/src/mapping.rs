@@ -94,11 +94,16 @@ pub fn classify_status(
     }
 }
 
-/// Error-body markers of an input longer than the model's context window,
-/// lowercase, per vendor (OpenAI and compatibles, Anthropic, Google/Vertex,
-/// Bedrock, Mistral, Cohere).
-const CONTEXT_LENGTH_MARKERS: &[&str] = &[
-    "context_length_exceeded",
+/// Structured error codes of an input longer than the model's context window,
+/// lowercase (OpenAI and compatibles). Matched only as the exact string value
+/// of a code-like key (see [`has_error_code`]), never as a substring.
+const CONTEXT_LENGTH_CODES: &[&str] = &["context_length_exceeded"];
+
+/// Error-message phrases of an input longer than the model's context window,
+/// lowercase, per vendor (Anthropic, Google/Vertex, Bedrock, Mistral, Cohere,
+/// OpenAI). Multi-word sentences from rejection messages, never a bare
+/// identifier that a parameter name could also spell.
+const CONTEXT_LENGTH_PHRASES: &[&str] = &[
     "maximum context length",
     "prompt is too long",
     "input is too long",
@@ -108,14 +113,20 @@ const CONTEXT_LENGTH_MARKERS: &[&str] = &[
     "too large for model",
 ];
 
-/// Error-body markers of a content-policy refusal, lowercase.
-const CONTENT_FILTER_MARKERS: &[&str] = &[
+/// Structured error codes of a content-policy refusal, lowercase (Azure
+/// OpenAI `content_filter` and its inner `ResponsibleAIPolicyViolation`,
+/// OpenAI `content_policy_violation`).
+const CONTENT_FILTER_CODES: &[&str] = &[
     "content_filter",
     "content_policy_violation",
-    "content management policy",
     "responsibleaipolicyviolation",
-    "blocked by safety",
 ];
+
+/// Error-message phrases of a content-policy refusal, lowercase.
+const CONTENT_FILTER_PHRASES: &[&str] = &["content management policy", "blocked by safety"];
+
+/// JSON keys whose string value is an error code worth matching.
+const CODE_KEYS: &[&str] = &["code", "type", "reason", "status"];
 
 /// Statuses whose body is worth classifying (client errors that may be a
 /// context-length or content-policy refusal).
@@ -124,8 +135,29 @@ pub const fn needs_error_body(status: u16) -> bool {
     matches!(status, 400 | 403 | 413 | 422)
 }
 
+/// Whether the (lowercase) body carries `code` as the exact string value of a
+/// [`CODE_KEYS`] key, as in `"code": "context_length_exceeded"`. A scan rather
+/// than a JSON parse, so a body cut at the read bound still classifies; the
+/// quotes rule out a longer identifier containing the code, and the key check
+/// rules out the same word used as a parameter name or inside a message.
+fn has_error_code(text: &str, code: &str) -> bool {
+    let quoted = format!("\"{code}\"");
+    text.match_indices(&quoted)
+        .any(|(at, _)| preceding_key(&text[..at]).is_some_and(|k| CODE_KEYS.contains(&k)))
+}
+
+/// The JSON key right before a string value that starts at the end of
+/// `before` (`"key" :` then optional whitespace), if any.
+fn preceding_key(before: &str) -> Option<&str> {
+    let rest = before.trim_end().strip_suffix(':')?.trim_end();
+    let rest = rest.strip_suffix('"')?;
+    let open = rest.rfind('"')?;
+    Some(&rest[open + 1..])
+}
+
 /// [`classify_status`], refined by the (bounded) error body: a client error
-/// whose body carries a known context-length or content-policy marker maps to
+/// whose body carries a known context-length or content-policy error code (as
+/// a structured field) or rejection phrase maps to
 /// [`ProviderError::ContextLengthExceeded`] / [`ProviderError::ContentFiltered`]
 /// (ADR 014). The body is only searched, never logged or returned.
 #[must_use]
@@ -137,13 +169,17 @@ pub fn classify_error(
 ) -> ProviderError {
     if needs_error_body(status) && !body.is_empty() {
         let text = String::from_utf8_lossy(body).to_ascii_lowercase();
-        if CONTEXT_LENGTH_MARKERS.iter().any(|m| text.contains(m)) {
+        let matches = |codes: &[&str], phrases: &[&str]| {
+            codes.iter().any(|c| has_error_code(&text, c))
+                || phrases.iter().any(|p| text.contains(p))
+        };
+        if matches(CONTEXT_LENGTH_CODES, CONTEXT_LENGTH_PHRASES) {
             return ProviderError::ContextLengthExceeded {
                 provider: provider.to_owned(),
                 status,
             };
         }
-        if CONTENT_FILTER_MARKERS.iter().any(|m| text.contains(m)) {
+        if matches(CONTENT_FILTER_CODES, CONTENT_FILTER_PHRASES) {
             return ProviderError::ContentFiltered {
                 provider: provider.to_owned(),
                 status,
@@ -307,6 +343,50 @@ mod tests {
         let body = br#"{"error":{"code":"content_policy_violation"}}"#;
         assert!(matches!(
             classify_error("openai", 400, None, body),
+            ProviderError::ContentFiltered { .. }
+        ));
+    }
+
+    #[test]
+    fn a_code_word_outside_a_code_field_is_not_a_refusal() {
+        let cases: &[&[u8]] = &[
+            // The marker as a parameter name, in the message and in `param`.
+            br#"{"error":{"code":"invalid_parameter","message":"Unsupported parameter: content_filter"}}"#,
+            br#"{"error":{"code":"invalid_parameter","param":"content_filter"}}"#,
+            // A longer identifier that contains a marker.
+            br#"{"error":{"code":"context_length_exceeded_for_tools_schema"}}"#,
+            br#"{"error":{"code":"not_a_content_filter"}}"#,
+        ];
+        for body in cases {
+            assert!(
+                matches!(
+                    classify_error("p", 400, None, body),
+                    ProviderError::Upstream { status: 400, .. }
+                ),
+                "{:?}",
+                String::from_utf8_lossy(body)
+            );
+        }
+    }
+
+    #[test]
+    fn a_code_is_matched_with_spacing_and_in_a_truncated_body() {
+        assert!(matches!(
+            classify_error(
+                "p",
+                400,
+                None,
+                br#"{"error": {"code" : "Context_Length_Exceeded", "mess"#
+            ),
+            ProviderError::ContextLengthExceeded { .. }
+        ));
+        assert!(matches!(
+            classify_error(
+                "azure",
+                400,
+                None,
+                br#"{"error":{"code":"x","innererror":{"code":"ResponsibleAIPolicyViolation"}}}"#
+            ),
             ProviderError::ContentFiltered { .. }
         ));
     }
