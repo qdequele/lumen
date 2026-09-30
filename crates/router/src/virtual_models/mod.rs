@@ -12,3 +12,4 @@ pub mod table;
 
 pub use condition::{Condition, FactSource};
 pub use config::VirtualModelConfig;
+pub use overrides::{Overridable, Overrides, Preset};
