@@ -113,7 +113,7 @@ pub async fn chat(
     // The reservation is settled to the real usage afterwards.
     let pricing = state.pricing();
     let estimated_input = tokens::estimate_chat_prompt(&req);
-    let reserved_output = reserved_output_tokens(&decision, req.max_tokens);
+    let reserved_output = reserved_output_tokens(&decision, &req);
     let estimated_cost = pricing.token_cost(&primary, estimated_input, reserved_output);
     let accounting = Accounting::begin(
         &state,
@@ -150,22 +150,30 @@ pub async fn chat(
     }
 }
 
-/// The output tokens to reserve at admission: the largest `max_tokens` any
+/// The output tokens to reserve at admission: the largest output cap any
 /// attempt may send upstream once its overrides apply (ADR 014), so a target
 /// that raises the cap cannot run past the key's budget on a small client
-/// value. An attempt that ends with no cap reserves the default.
+/// value. An attempt's cap is the larger of `max_tokens` and
+/// `max_completion_tokens` (OpenAI-compatible providers forward the latter
+/// verbatim); an attempt that ends with neither reserves the default.
 fn reserved_output_tokens(
     decision: &lumen_router::virtual_models::Decision,
-    client_max_tokens: Option<u32>,
+    req: &ChatRequest,
 ) -> u64 {
-    let current = client_max_tokens.map(serde_json::Value::from);
+    let max_tokens = req.max_tokens.map(serde_json::Value::from);
+    let max_completion_tokens = req.extra.get("max_completion_tokens").cloned();
+    let cap = |v: Option<serde_json::Value>| {
+        v.and_then(|v| v.as_u64())
+            .filter(|v| u32::try_from(*v).is_ok())
+    };
     decision
         .attempts
         .iter()
         .map(|a| {
-            a.field("max_tokens", current.clone())
-                .and_then(|v| v.as_u64())
-                .filter(|v| u32::try_from(*v).is_ok())
+            let tokens = cap(a.field("max_tokens", max_tokens.clone()));
+            let completion = cap(a.field("max_completion_tokens", max_completion_tokens.clone()));
+            tokens
+                .max(completion)
                 .unwrap_or(DEFAULT_RESERVED_OUTPUT_TOKENS)
         })
         .max()
@@ -745,27 +753,63 @@ mod tests {
         }
     }
 
+    fn chat_req(max_tokens: Option<u32>, max_completion_tokens: Option<u64>) -> ChatRequest {
+        let mut body = serde_json::json!({
+            "model": "acme/bot",
+            "messages": [{ "role": "user", "content": "hi" }]
+        });
+        if let Some(n) = max_tokens {
+            body["max_tokens"] = n.into();
+        }
+        if let Some(n) = max_completion_tokens {
+            body["max_completion_tokens"] = n.into();
+        }
+        serde_json::from_value(body).unwrap()
+    }
+
     #[test]
     fn reservation_follows_the_overrides_of_every_attempt() {
         use serde_json::json;
+        let r = |d: &lumen_router::virtual_models::Decision, n: Option<u32>| {
+            reserved_output_tokens(d, &chat_req(n, None))
+        };
         // No override: the client value, or the default.
         let plain = decision_with(&[None]);
-        assert_eq!(reserved_output_tokens(&plain, Some(50)), 50);
-        assert_eq!(
-            reserved_output_tokens(&plain, None),
-            DEFAULT_RESERVED_OUTPUT_TOKENS
-        );
+        assert_eq!(r(&plain, Some(50)), 50);
+        assert_eq!(r(&plain, None), DEFAULT_RESERVED_OUTPUT_TOKENS);
         // A `set` lowering the cap lowers the reservation.
         let lowered = decision_with(&[Some(json!({ "set": { "max_tokens": 80 } }))]);
-        assert_eq!(reserved_output_tokens(&lowered, Some(100_000)), 80);
+        assert_eq!(r(&lowered, Some(100_000)), 80);
         // A fallback target raising the cap is reserved for, whatever the
         // client sent.
         let raised = decision_with(&[None, Some(json!({ "set": { "max_tokens": 9000 } }))]);
-        assert_eq!(reserved_output_tokens(&raised, Some(10)), 9000);
+        assert_eq!(r(&raised, Some(10)), 9000);
         // `default` only fills an absent cap.
         let default = decision_with(&[Some(json!({ "default": { "max_tokens": 3000 } }))]);
-        assert_eq!(reserved_output_tokens(&default, None), 3000);
-        assert_eq!(reserved_output_tokens(&default, Some(20)), 20);
+        assert_eq!(r(&default, None), 3000);
+        assert_eq!(r(&default, Some(20)), 20);
+    }
+
+    #[test]
+    fn reservation_counts_max_completion_tokens() {
+        use serde_json::json;
+        // An override that sets only `max_completion_tokens`.
+        let completion =
+            decision_with(&[Some(json!({ "set": { "max_completion_tokens": 9000 } }))]);
+        assert_eq!(
+            reserved_output_tokens(&completion, &chat_req(None, None)),
+            9000
+        );
+        assert_eq!(
+            reserved_output_tokens(&completion, &chat_req(Some(100), None)),
+            9000
+        );
+        // A client `max_completion_tokens` with no override.
+        let plain = decision_with(&[None]);
+        assert_eq!(
+            reserved_output_tokens(&plain, &chat_req(None, Some(4000))),
+            4000
+        );
     }
 
     /// Wrap a stream with guards, deadline = now + first_token_timeout.
