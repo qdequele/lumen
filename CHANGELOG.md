@@ -12,12 +12,11 @@ All notable changes to LUMEN are documented here. The format is based on
 - Virtual-model validation caps a request at 64 flattened attempts (`MAX_ATTEMPTS`: a `fallback` or `split` sums its targets, a `switch` takes its largest branch) and stops descending at the nesting limit, so a DAG listing the same child many times per level, or a chain of thousands of models, is rejected with the model id instead of slowing every request or overflowing the stack.
 - Criterion benches for the virtual-model decide phase (`cargo bench -p router --bench decide`): about 0.95 us per call (mean 926 to 975 ns across runs) for a 3-level plan with a regex rule, and about 60 ns for a foundation id called directly (decide plus the retain pass every handler runs; 142 ns before the direct-path fast paths).
 - User guide `docs/virtual-models.md` (strategies, triggers, conditions, overrides, presets, Jev remaps, admin API, migration); the error catalogue, examples, README and `monitoring/lumen.toml` use virtual models instead of `fallbacks`.
-- Jev as a reranker through a virtual-model remap: noul, score, composite and choice strategies, static context, and cross-capability fallback to a classic reranker.
+- Jev as a reranker through a virtual-model remap: rerank templates with noul, score, composite and choice strategies plus a static context, and cross-capability fallback to a classic reranker.
 - `lumen config migrate [--dry-run]`: rewrites per-model fallbacks and Jev rerank blocks into virtual models (file mode keeps a .bak; DB mode writes a new config version).
 - Admin API: GET/PUT/DELETE /admin/config/virtual_models/{id} (percent-encode "/" in ids) and GET .../{id}/plan returning the resolved routing tree; deleting anything a virtual model references is rejected with LM-1001 naming the dependent.
 - GET /v1/models lists virtual models ("virtual": true, description, modalities common to every reachable leaf); listed = false hides one.
 - Virtual models (ADR 014): `[[virtual_models]]` with `single`, `fallback`, `split` and `switch` strategies, typed `fallback_on` triggers, `switch` conditions on budget group, metadata and request facts, per-target overrides and chat presets. Responses carry `x-lumen-route`; `usage_log.route` and `lumen_virtual_model_requests_total` record the path.
-- Jev rerank templates: noul, score, composite and choice strategies plus a static context (wired to virtual models in a later change).
 - Upstream context-length and content-policy refusals are classified from the error body (new internal ProviderError variants; client-facing errors unchanged).
 - ADR 014: virtual models (foundation/virtual split, static routing, presets, SystemOne rerank remap).
 - **Model release dates on `GET /v1/models`.** A model may declare
@@ -31,6 +30,7 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ### Changed
 
+- `GET /admin/config/providers/{name}` omits a model's unset `upstream_id` and prices instead of returning them as `null`, and no longer returns an empty `fallbacks` list.
 - The request path takes one routing snapshot per request: the chat preset and the decision come from the same snapshot (a reload between them can no longer pair one config's preset with another's routing), and a foundation id called directly builds no routing facts and skips the retain pass.
 - `tokenizer.mode = "accurate"` also matches a provider-prefixed model id on its last path segment, so a foundation model renamed by `lumen config migrate` (`openai/gpt-4o`) keeps exact BPE counts instead of falling back to the heuristic.
 - Reading an upstream 400/403/413/422 error body for classification waits at most 500 ms; an upstream that sends the header and stalls the body is classified from the bytes read so far (or its status) instead of holding the request until the first-token timeout and failing over as a timeout.
@@ -39,7 +39,7 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ### Removed
 
-- **Breaking (ADR 014):** per-model `fallbacks`, the `[providers.models.rerank]` block and the `rerank` capability on `typesafe` models are removed. A config using them fails validation with the equivalent `[[virtual_models]]` snippet (remap instructions and criteria show as a placeholder, so operator prompt text never reaches the boot error, the reload log or an admin `LM-1001` body; the migration copies the real text); run `lumen config migrate` (or `--dry-run`). Migrated foundation models are renamed `<provider>/<id>`, so `usage_log.model_used` and the Prometheus `model` label of those models change (the public id clients send is unchanged).
+- **Breaking (ADR 014):** per-model `fallbacks`, the `[providers.models.rerank]` block and the `rerank` capability on `typesafe` models are removed. A config using them fails validation with the equivalent `[[virtual_models]]` snippet (remap instructions and criteria show as a placeholder, so operator prompt text never reaches the boot error, the reload log or an admin `LM-1001` body; the migration copies the real text); run `lumen config migrate` (or `--dry-run`). Migrated foundation models are renamed `<provider>/<id>`, so `usage_log.model_used`, the Prometheus `model` label and the `x-lumen-model-used` response header of those models change (for example `gpt-4o` becomes `openai/gpt-4o`; the public id clients send is unchanged).
 
 ## [0.5.0] - 2026-09-26
 

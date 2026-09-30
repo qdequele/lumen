@@ -1,8 +1,9 @@
 //! Jev as a reranker: operator-authored templates from `/v1/rerank` to
 //! SystemOne (ADR 013, 2026-09-26 amendment; ADR 014).
 //!
-//! A `typesafe` model that declares the `rerank` capability is served by
-//! [`TypesafeRerankProvider`], driven by a [`RerankTemplate`]: an optional
+//! A rerank virtual model's target that carries a `remap` onto a SystemOne
+//! (`typesafe`) model is served by [`TypesafeRerankProvider`], driven by the
+//! [`RerankTemplate`] compiled from that remap: an optional
 //! static `context` (added to the SystemOne `state` next to the `query`) and
 //! one of four strategies:
 //!
