@@ -1787,7 +1787,8 @@ pub async fn list_virtual_models(
 }
 
 /// `GET /admin/config/virtual_models/{id}` response.
-#[derive(Debug, Serialize)]
+// No Debug: carries preset and remap text.
+#[derive(Serialize)]
 pub struct VirtualModelDocument {
     /// The virtual model's own fields, flattened.
     #[serde(flatten)]
@@ -1943,7 +1944,8 @@ pub async fn delete_virtual_model(
 }
 
 /// `GET /admin/config/virtual_models/{id}/plan` response.
-#[derive(Debug, Serialize)]
+// No Debug: carries preset and remap text.
+#[derive(Serialize)]
 pub struct VirtualModelPlan {
     /// The fully resolved tree (references expanded to foundation leaves).
     pub plan: serde_json::Value,

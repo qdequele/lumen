@@ -90,7 +90,7 @@ pub struct TargetConfig {
 }
 
 /// `overrides = { set = {...}, default = {...}, drop = [...] }`.
-#[derive(Debug, Clone, PartialEq, Default, Deserialize, Serialize)]
+#[derive(Clone, PartialEq, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct OverridesConfig {
     /// Always applied.
@@ -105,7 +105,7 @@ pub struct OverridesConfig {
 }
 
 /// A chat preset.
-#[derive(Debug, Clone, PartialEq, Default, Deserialize, Serialize)]
+#[derive(Clone, PartialEq, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PresetConfig {
     /// Stored system prompt (at most 32 KiB, non-blank).
@@ -133,7 +133,7 @@ pub enum SystemPromptMode {
 }
 
 /// A SystemOne rerank remap on a target.
-#[derive(Debug, Clone, PartialEq, Default, Deserialize, Serialize)]
+#[derive(Clone, PartialEq, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RemapConfig {
     /// Question strategy.
@@ -172,7 +172,7 @@ pub enum RemapStrategy {
 }
 
 /// `criteria.true` / `criteria.false`.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[derive(Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CriteriaConfig {
     /// What a yes means.
@@ -184,7 +184,7 @@ pub struct CriteriaConfig {
 }
 
 /// One weighted criterion of a `composite` remap.
-#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CompositeQuestionConfig {
     /// The question asked about each `document`.
@@ -194,6 +194,67 @@ pub struct CompositeQuestionConfig {
     pub criteria: Option<CriteriaConfig>,
     /// Weight in the mean, > 0.
     pub weight: f64,
+}
+
+// Manual Debug impls: preset prompts, override values and remap text are
+// operator text and never logged, so these print structure only (field
+// presence, lengths, counts, keys, strategy names).
+
+/// Byte length of an optional string, for redacted Debug output.
+fn len_of(s: Option<&String>) -> Option<usize> {
+    s.map(String::len)
+}
+
+impl std::fmt::Debug for OverridesConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OverridesConfig")
+            .field("set_keys", &self.set.keys().collect::<Vec<_>>())
+            .field("default_keys", &self.default.keys().collect::<Vec<_>>())
+            .field("drop", &self.drop)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for PresetConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PresetConfig")
+            .field("system_prompt_len", &len_of(self.system_prompt.as_ref()))
+            .field("system_prompt_mode", &self.system_prompt_mode)
+            .field("overrides", &self.overrides)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for RemapConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RemapConfig")
+            .field("strategy", &self.strategy)
+            .field("context_len", &len_of(self.context.as_ref()))
+            .field("instructions_len", &len_of(self.instructions.as_ref()))
+            .field("criteria", &self.criteria)
+            .field("levels", &self.levels.as_ref().map(Vec::len))
+            .field("questions", &self.questions)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for CriteriaConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CriteriaConfig")
+            .field("true_len", &len_of(self.yes.as_ref()))
+            .field("false_len", &len_of(self.no.as_ref()))
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for CompositeQuestionConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CompositeQuestionConfig")
+            .field("instructions_len", &self.instructions.len())
+            .field("criteria", &self.criteria)
+            .field("weight", &self.weight)
+            .finish()
+    }
 }
 
 #[cfg(test)]
@@ -237,6 +298,39 @@ mod tests {
                 .as_deref(),
             Some("y")
         );
+    }
+
+    #[test]
+    fn debug_never_prints_preset_or_remap_text() {
+        let doc: Doc = toml::from_str(
+            r#"
+            [[virtual_models]]
+            id = "acme/chat"
+            capability = "chat"
+            strategy = "single"
+            preset = { system_prompt = "SENTINEL-PROMPT", overrides = { set = { stop = "SENTINEL-SET" } } }
+            targets = [{ model = "m", overrides = { default = { user = "SENTINEL-DEFAULT" } } }]
+
+            [[virtual_models]]
+            id = "acme/rerank"
+            capability = "rerank"
+            strategy = "fallback"
+            targets = [
+              { model = "jev", remap = { strategy = "noul", context = "SENTINEL-CONTEXT", instructions = "SENTINEL-INSTRUCTIONS", criteria.true = "SENTINEL-YES", criteria.false = "SENTINEL-NO" } },
+              { model = "jev", remap = { strategy = "score", levels = ["SENTINEL-LEVEL-A", "SENTINEL-LEVEL-B"] } },
+              { model = "jev", remap = { strategy = "composite", questions = [ { instructions = "SENTINEL-QUESTION", weight = 1.0, criteria.true = "SENTINEL-QYES" } ] } },
+            ]
+            "#,
+        )
+        .unwrap();
+        let debug = format!("{doc:?}");
+        assert!(!debug.contains("SENTINEL"), "{debug}");
+        // Structure stays visible.
+        assert!(
+            debug.contains("acme/rerank") && debug.contains("Composite"),
+            "{debug}"
+        );
+        assert!(debug.contains("system_prompt_len: Some(15)"), "{debug}");
     }
 
     #[test]

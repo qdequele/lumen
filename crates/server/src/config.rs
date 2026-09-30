@@ -582,8 +582,9 @@ impl ModelConfig {
 
 /// The legacy `[providers.models.rerank]` converter block. Removed by ADR
 /// 014; still parsed only so validation can point at `lumen config migrate`,
-/// and so the migrator can read old documents.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
+/// and so the migrator can read old documents. `Debug` prints lengths only
+/// (remap text is operator prompt text and never logged).
+#[derive(Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RerankConverterConfig {
     /// The yes/no question asked about each `document`, relative to the
@@ -597,8 +598,9 @@ pub struct RerankConverterConfig {
 
 /// `criteria.true` / `criteria.false` of a legacy rerank converter. Removed
 /// by ADR 014; still parsed only so validation can point at `lumen config
-/// migrate`, and so the migrator can read old documents.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
+/// migrate`, and so the migrator can read old documents. `Debug` prints
+/// lengths only.
+#[derive(Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RerankCriteriaConfig {
     /// What a yes (relevant) means.
@@ -607,6 +609,27 @@ pub struct RerankCriteriaConfig {
     /// What a no (not relevant) means.
     #[serde(default, rename = "false")]
     pub no: Option<String>,
+}
+
+impl std::fmt::Debug for RerankConverterConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RerankConverterConfig")
+            .field(
+                "instructions_len",
+                &self.instructions.as_ref().map(String::len),
+            )
+            .field("criteria", &self.criteria)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for RerankCriteriaConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RerankCriteriaConfig")
+            .field("true_len", &self.yes.as_ref().map(String::len))
+            .field("false_len", &self.no.as_ref().map(String::len))
+            .finish()
+    }
 }
 
 impl ModelConfig {
@@ -2224,6 +2247,42 @@ mod tests {
         // Debug output contains the var name but no key material could exist.
         let dbg = format!("{cfg:?}");
         assert!(dbg.contains("OPENAI_API_KEY"));
+    }
+
+    #[test]
+    fn config_debug_never_prints_preset_or_remap_text() {
+        // Parsed only (a legacy rerank block would fail validation): Debug is
+        // the leak surface, whatever the load outcome.
+        let cfg: Config = toml::from_str(
+            r#"
+            [[providers]]
+            name = "typesafe"
+            kind = "typesafe"
+            [[providers.models]]
+            id = "jev"
+            capabilities = ["systemone"]
+            [providers.models.rerank]
+            instructions = "SENTINEL-LEGACY"
+            criteria.true = "SENTINEL-LEGACY-YES"
+
+            [[virtual_models]]
+            id = "acme/chat"
+            capability = "chat"
+            strategy = "single"
+            preset = { system_prompt = "SENTINEL-PROMPT" }
+            targets = [{ model = "gpt-4o" }]
+
+            [[virtual_models]]
+            id = "acme/rerank"
+            capability = "rerank"
+            strategy = "single"
+            targets = [{ model = "jev", remap = { context = "SENTINEL-CONTEXT", instructions = "SENTINEL-REMAP" } }]
+            "#,
+        )
+        .unwrap();
+        let dbg = format!("{cfg:?}");
+        assert!(!dbg.contains("SENTINEL"), "{dbg}");
+        assert!(dbg.contains("acme/rerank"), "{dbg}");
     }
 
     #[test]
