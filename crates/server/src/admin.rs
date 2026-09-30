@@ -302,21 +302,10 @@ pub async fn delete_key(
         if deleted.is_some() {
             entry.signal_lifecycle(EventKind::KeyDeleted);
         }
-        // Flush the final accrued spend now: once the entry is dropped here
-        // the periodic flusher (`drain_dirty`) will never see this id again,
-        // so the tombstone's `budget_spent` would otherwise freeze at
-        // whatever the last periodic flush happened to catch.
-        let spent = micro_to_usd(entry.spent_micro());
-        if let Err(error) = auth.store.persist_budgets(&[(id.clone(), spent)]).await {
-            // Best-effort: the accounting is already backed by the periodic
-            // flush for every other key, so a failure here must not turn a
-            // successful delete into a 500 - log and continue.
-            tracing::warn!(
-                key_id = %id,
-                %error,
-                "failed to persist final spend while deleting a key"
-            );
-        }
+        // Flush and bill the final accrued spend now: once the entry is
+        // dropped the periodic flusher never sees this id again (ADR 015
+        // routes this through the same flush as every other path).
+        crate::budget_flush::retire_and_flush_key(auth, entry, lumen_auth::now_unix_ms()).await;
     }
     deleted.ok_or_else(|| GatewayError::InvalidRequest(format!("unknown key id '{id}'")))?;
     Ok(StatusCode::NO_CONTENT)

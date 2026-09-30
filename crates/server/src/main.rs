@@ -829,19 +829,8 @@ async fn drain_on_shutdown(
     auth_runtime: Option<Arc<AuthRuntime>>,
     usage_writer: Option<tokio::task::JoinHandle<()>>,
 ) {
-    if let Some(runtime) = auth_runtime {
-        let dirty = runtime.keys.drain_dirty();
-        if !dirty.is_empty() {
-            if let Err(error) = runtime.store.persist_budgets(&dirty).await {
-                tracing::warn!(%error, "final budget flush failed");
-            }
-        }
-        let dirty_groups = runtime.keys.drain_dirty_groups();
-        if !dirty_groups.is_empty() {
-            if let Err(error) = runtime.store.persist_group_budgets(&dirty_groups).await {
-                tracing::warn!(%error, "final group budget flush failed");
-            }
-        }
+    if let Some(runtime) = &auth_runtime {
+        lumen_server::budget_flush::flush_budgets(runtime, lumen_auth::now_unix_ms()).await;
     }
     if let Some(writer) = usage_writer {
         if tokio::time::timeout(Duration::from_secs(5), writer)
@@ -1093,19 +1082,7 @@ fn spawn_budget_flush_task(runtime: Arc<AuthRuntime>, knobs: Arc<AuthKnobs>) {
             // non-zero while auth is enabled, but a disabling reload sets 0).
             let interval = Duration::from_millis(knobs.flush_interval_ms().max(1));
             tokio::time::sleep(interval).await;
-            let dirty = runtime.keys.drain_dirty();
-            if !dirty.is_empty() {
-                if let Err(error) = runtime.store.persist_budgets(&dirty).await {
-                    tracing::warn!(%error, "budget flush failed; will retry next interval");
-                }
-            }
-            let dirty_groups = runtime.keys.drain_dirty_groups();
-            if dirty_groups.is_empty() {
-                continue;
-            }
-            if let Err(error) = runtime.store.persist_group_budgets(&dirty_groups).await {
-                tracing::warn!(%error, "group budget flush failed; will retry next interval");
-            }
+            lumen_server::budget_flush::flush_budgets(&runtime, lumen_auth::now_unix_ms()).await;
         }
     });
 }

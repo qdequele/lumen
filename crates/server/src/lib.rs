@@ -9,6 +9,7 @@ pub mod accounting;
 pub mod admin;
 pub mod app;
 pub mod auth;
+pub mod budget_flush;
 pub mod chat;
 pub mod config;
 pub mod config_edit;
