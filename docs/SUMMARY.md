@@ -71,6 +71,7 @@
 - [012 - Config source abstraction](adr/012-config-source-abstraction.md)
 - [013 - SystemOne capability](adr/013-systemone-capability.md)
 - [014 - Virtual models](adr/014-virtual-models.md)
+- [015 - Lab integration](adr/015-lab-integration.md)
 
 # Project
 
