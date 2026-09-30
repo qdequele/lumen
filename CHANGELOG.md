@@ -31,6 +31,7 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ### Changed
 
+- Reading an upstream 400/403/413/422 error body for classification waits at most 500 ms; an upstream that sends the header and stalls the body is classified from the bytes read so far (or its status) instead of holding the request until the first-token timeout and failing over as a timeout.
 - The `Debug` output of the virtual-model config types (presets, overrides, remaps, composite questions, criteria) and of the legacy `[providers.models.rerank]` block prints structure only (lengths, keys, counts, strategy names), never prompt, override or remap text; the admin virtual-model document and plan responses no longer implement `Debug`.
 - The resilience executor follows per-link escapes (typed fallback triggers, ADR 014); plain chains behave exactly as before.
 

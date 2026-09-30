@@ -17,21 +17,34 @@ use crate::mapping::{classify_error, parse_retry_after};
 /// Most bytes of an upstream error body read for classification (ADR 014).
 const MAX_ERROR_BODY: usize = 16 * 1024;
 
+/// Longest wait for an upstream error body. An upstream that sends a 4xx
+/// header and then stalls the body must not hold the request until the
+/// first-token timeout (and turn a client error into a retryable timeout).
+const ERROR_BODY_DEADLINE: Duration = Duration::from_millis(500);
+
 /// Read at most [`MAX_ERROR_BODY`] bytes of an error response, only for
-/// statuses worth classifying. Never logged, never returned to a client.
+/// statuses worth classifying, for at most [`ERROR_BODY_DEADLINE`]; on the
+/// deadline the bytes read so far are used (plain status classification
+/// applies when they carry no marker). Cancellation is the caller's: every
+/// call site runs inside [`with_cancel`]. Never logged, never returned to a
+/// client.
 pub(crate) async fn error_body_prefix(response: reqwest::Response) -> Vec<u8> {
     if !crate::mapping::needs_error_body(response.status().as_u16()) {
         return Vec::new();
     }
     let mut out = Vec::new();
     let mut stream = response.bytes_stream();
-    while let Some(Ok(chunk)) = stream.next().await {
-        let room = MAX_ERROR_BODY.saturating_sub(out.len());
-        out.extend_from_slice(&chunk[..chunk.len().min(room)]);
-        if out.len() >= MAX_ERROR_BODY {
-            break;
+    let read = async {
+        while let Some(Ok(chunk)) = stream.next().await {
+            let room = MAX_ERROR_BODY.saturating_sub(out.len());
+            out.extend_from_slice(&chunk[..chunk.len().min(room)]);
+            if out.len() >= MAX_ERROR_BODY {
+                break;
+            }
         }
-    }
+    };
+    // A timeout only means the body stalled; what arrived is still usable.
+    let _ = tokio::time::timeout(ERROR_BODY_DEADLINE, read).await;
     out
 }
 
