@@ -1,0 +1,81 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://lab.meilisearch.com/contracts/lab-events.schema.json",
+  "title": "Meilisearch Lab event",
+  "description": "One event a product reports to the Lab at POST /internal/events, delivered in batches as {\"events\": [<event>, ...]}. Owned by the Lab; LUMEN vendors this copy (ADR 015) and tests its serializer against it. This copy adds product \"lumen\" and lumenUsageData, pending adoption by the Lab.",
+  "type": "object",
+  "required": ["id", "type", "occurred_at", "account_id", "api_key_id", "product", "data"],
+  "additionalProperties": false,
+  "properties": {
+    "id": { "$ref": "#/$defs/uuid" },
+    "type": { "enum": ["usage.recorded", "job.completed", "job.failed"] },
+    "occurred_at": { "type": "string", "format": "date-time" },
+    "account_id": { "$ref": "#/$defs/uuid" },
+    "api_key_id": { "type": ["string", "null"] },
+    "product": { "enum": ["scrapix", "lumen"] },
+    "data": { "type": "object" }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "type": { "const": "usage.recorded" }, "product": { "const": "scrapix" } }, "required": ["type", "product"] },
+      "then": { "properties": { "data": { "$ref": "#/$defs/usageData" } } }
+    },
+    {
+      "if": { "properties": { "type": { "const": "usage.recorded" }, "product": { "const": "lumen" } }, "required": ["type", "product"] },
+      "then": { "properties": { "data": { "$ref": "#/$defs/lumenUsageData" } } }
+    },
+    {
+      "if": { "properties": { "product": { "const": "lumen" } }, "required": ["product"] },
+      "then": { "properties": { "type": { "const": "usage.recorded" } } }
+    }
+  ],
+  "$defs": {
+    "uuid": {
+      "type": "string",
+      "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+    },
+    "usageData": {
+      "type": "object",
+      "required": ["operation", "credits", "units", "description"],
+      "additionalProperties": false,
+      "properties": {
+        "operation": { "enum": ["scrape", "map", "search", "parse", "ocr", "extract", "crawl"] },
+        "credits": { "type": "integer", "minimum": 0 },
+        "units": { "type": "object" },
+        "description": { "type": "string" },
+        "job_id": { "type": "string" }
+      }
+    },
+    "lumenUsageData": {
+      "type": "object",
+      "required": ["cost_micro_usd", "requests", "tokens", "window", "source", "key_id", "group"],
+      "additionalProperties": false,
+      "properties": {
+        "cost_micro_usd": { "type": "integer", "minimum": 1 },
+        "requests": { "type": "integer", "minimum": 0 },
+        "tokens": { "type": "integer", "minimum": 0 },
+        "window": {
+          "type": "object",
+          "required": ["start", "end"],
+          "additionalProperties": false,
+          "properties": {
+            "start": { "type": "string", "format": "date-time" },
+            "end": { "type": "string", "format": "date-time" }
+          }
+        },
+        "source": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "key_id": { "type": "string", "minLength": 1 },
+        "group": {
+          "type": "object",
+          "required": ["id", "spent_micro", "budget_max_micro"],
+          "additionalProperties": false,
+          "properties": {
+            "id": { "type": "string", "minLength": 1 },
+            "spent_micro": { "type": "integer" },
+            "budget_max_micro": { "type": ["integer", "null"] }
+          }
+        }
+      }
+    }
+  }
+}

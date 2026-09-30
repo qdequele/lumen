@@ -15,7 +15,9 @@
 //! * [`events`] - budget threshold/exhaustion signals for outbound webhooks
 //!   (ADR 011), detected on the settle that already happens per request and
 //!   queued through a bounded channel.
+//! * [`billing`] - billing usage events for a control plane (ADR 015).
 
+pub mod billing;
 pub mod crypto;
 pub mod error;
 pub mod events;
@@ -34,4 +36,13 @@ pub(crate) fn now_unix() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+}
+
+/// Current unix time in whole milliseconds (event windows, outbox scheduling).
+/// Clamps like [`now_unix`] on a nonsensical clock.
+#[must_use]
+pub fn now_unix_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
