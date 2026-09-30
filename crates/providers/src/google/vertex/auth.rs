@@ -175,6 +175,25 @@ impl TokenSource {
         Ok(value)
     }
 
+    /// Mint a brand-new token, bypassing (and not filling) the cache: a key
+    /// check must prove the service account works NOW, not that a token
+    /// minted before a key revocation is still inside its hour of validity.
+    pub(crate) async fn mint_fresh(&self, cancel: &CancellationToken) -> Result<(), ProviderError> {
+        self.fetch(cancel).await.map(|_| ())
+    }
+
+    /// Whether the private key can sign an assertion at all. A malformed key
+    /// is only detected here (parsing is lazy), and it is a local credential
+    /// failure: no request needs to be sent to know it will be rejected.
+    pub(crate) fn can_sign(&self) -> bool {
+        self.signed_assertion().is_ok()
+    }
+
+    /// The OAuth token endpoint (public, secret-free).
+    pub(crate) fn token_uri(&self) -> &str {
+        &self.token_uri
+    }
+
     /// Perform the JWT-bearer exchange once, honouring cancellation.
     async fn fetch(&self, cancel: &CancellationToken) -> Result<CachedToken, ProviderError> {
         let assertion = self.signed_assertion()?;

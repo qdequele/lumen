@@ -99,77 +99,7 @@ pub fn build_app(state: AppState) -> Router {
         .merge(api);
 
     if state.auth.is_some() {
-        let admin_routes = Router::new()
-            .route("/admin/keys", post(admin::create_key).get(admin::list_keys))
-            .route(
-                "/admin/keys/{id}",
-                patch(admin::patch_key).delete(admin::delete_key),
-            )
-            .route("/admin/keys/{id}/rotate", post(admin::rotate_key))
-            .route("/admin/keys/{id}/grant", post(admin::grant_key))
-            .route(
-                "/admin/groups",
-                post(admin::create_group).get(admin::list_groups),
-            )
-            .route(
-                "/admin/groups/{id}",
-                patch(admin::patch_group).delete(admin::delete_group),
-            )
-            .route("/admin/groups/{id}/grant", post(admin::grant_group))
-            .route("/admin/provider-keys/{name}", put(admin::put_provider_key))
-            .route(
-                "/admin/webhooks",
-                get(admin::get_webhooks)
-                    .put(admin::put_webhooks)
-                    .delete(admin::delete_webhooks),
-            )
-            .route(
-                "/admin/webhooks/signing-key",
-                put(admin::put_webhook_signing_key).delete(admin::delete_webhook_signing_key),
-            )
-            .route("/admin/usage", get(admin::usage_report))
-            .route("/admin/usage/export", get(admin::usage_export))
-            .route(
-                "/admin/config",
-                get(admin::get_config).put(admin::put_config),
-            )
-            // Granular config endpoints (ADR 012 Task 8). The `providers`
-            // routes are registered BEFORE the `{section}` catch-all below:
-            // matchit (axum's router) always prefers a static segment
-            // ("providers") over a same-position parameter ("{section}"), so
-            // this ordering is not load-bearing for correctness, but keeps
-            // the more specific routes visually adjacent to the resource
-            // they specialize.
-            .route("/admin/config/providers", get(admin::list_providers))
-            .route(
-                "/admin/config/providers/{name}",
-                get(admin::get_provider)
-                    .put(admin::put_provider)
-                    .delete(admin::delete_provider),
-            )
-            .route(
-                "/admin/config/virtual_models",
-                get(admin::list_virtual_models),
-            )
-            .route(
-                "/admin/config/virtual_models/{id}",
-                get(admin::get_virtual_model)
-                    .put(admin::put_virtual_model)
-                    .delete(admin::delete_virtual_model),
-            )
-            .route(
-                "/admin/config/virtual_models/{id}/plan",
-                get(admin::get_virtual_model_plan),
-            )
-            .route(
-                "/admin/config/{section}",
-                get(admin::get_config_section).put(admin::put_config_section),
-            )
-            .route_layer(middleware::from_fn_with_state(
-                state.clone(),
-                auth::require_master_key,
-            ));
-        app = app.merge(admin_routes);
+        app = app.merge(admin_routes(&state));
     }
 
     // Every request that matches no route above lands here (trailing-slash,
@@ -320,4 +250,83 @@ fn make_request_span<B>(request: &axum::http::Request<B>) -> tracing::Span {
         path = %request.uri().path(),
         request_id = %request_id,
     )
+}
+
+/// The master-key-protected `/admin` surface (mounted only when auth is
+/// enabled). Split out of [`build_app`] to keep that function readable.
+fn admin_routes(state: &AppState) -> Router<AppState> {
+    Router::new()
+        .route("/admin/keys", post(admin::create_key).get(admin::list_keys))
+        .route(
+            "/admin/keys/{id}",
+            patch(admin::patch_key).delete(admin::delete_key),
+        )
+        .route("/admin/keys/{id}/rotate", post(admin::rotate_key))
+        .route("/admin/keys/{id}/grant", post(admin::grant_key))
+        .route(
+            "/admin/groups",
+            post(admin::create_group).get(admin::list_groups),
+        )
+        .route(
+            "/admin/groups/{id}",
+            patch(admin::patch_group).delete(admin::delete_group),
+        )
+        .route("/admin/groups/{id}/grant", post(admin::grant_group))
+        .route("/admin/provider-keys/{name}", put(admin::put_provider_key))
+        .route(
+            "/admin/providers/{name}/check",
+            post(admin::check_provider_key),
+        )
+        .route(
+            "/admin/webhooks",
+            get(admin::get_webhooks)
+                .put(admin::put_webhooks)
+                .delete(admin::delete_webhooks),
+        )
+        .route(
+            "/admin/webhooks/signing-key",
+            put(admin::put_webhook_signing_key).delete(admin::delete_webhook_signing_key),
+        )
+        .route("/admin/usage", get(admin::usage_report))
+        .route("/admin/usage/export", get(admin::usage_export))
+        .route(
+            "/admin/config",
+            get(admin::get_config).put(admin::put_config),
+        )
+        // Granular config endpoints (ADR 012 Task 8). The `providers`
+        // routes are registered BEFORE the `{section}` catch-all below:
+        // matchit (axum's router) always prefers a static segment
+        // ("providers") over a same-position parameter ("{section}"), so
+        // this ordering is not load-bearing for correctness, but keeps
+        // the more specific routes visually adjacent to the resource
+        // they specialize.
+        .route("/admin/config/providers", get(admin::list_providers))
+        .route(
+            "/admin/config/providers/{name}",
+            get(admin::get_provider)
+                .put(admin::put_provider)
+                .delete(admin::delete_provider),
+        )
+        .route(
+            "/admin/config/virtual_models",
+            get(admin::list_virtual_models),
+        )
+        .route(
+            "/admin/config/virtual_models/{id}",
+            get(admin::get_virtual_model)
+                .put(admin::put_virtual_model)
+                .delete(admin::delete_virtual_model),
+        )
+        .route(
+            "/admin/config/virtual_models/{id}/plan",
+            get(admin::get_virtual_model_plan),
+        )
+        .route(
+            "/admin/config/{section}",
+            get(admin::get_config_section).put(admin::put_config_section),
+        )
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_master_key,
+        ))
 }

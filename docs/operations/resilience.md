@@ -106,6 +106,10 @@ gateway hardcodes no vendor endpoints. Results are published at `GET
 independent of the gateway's own liveness: `GET /health` never depends on
 provider state and does no I/O.
 
+These probes never send provider credentials, so a revoked key still reads
+`up`. To check a key on demand, use
+[`POST /admin/providers/{name}/check`](keys-budgets.md#check-a-provider-key-post-adminprovidersnamecheck).
+
 ```toml
 health_check_enabled = false
 health_check_interval_ms = 30000

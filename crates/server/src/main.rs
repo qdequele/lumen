@@ -930,28 +930,34 @@ fn boot_health(
     health
 }
 
-/// Build the shared HTTP client and the provider routing table over it.
+/// Build the provider routing table over the shared provider HTTP client,
+/// and return the separate client for the health probe and the webhook
+/// sender.
 ///
-/// The shared client sets the default (process-wide) connect timeout and an
-/// overall cap that backstops the executor's total timeout (M6 §6.4). A
-/// provider that sets `connect_timeout_ms` gets its own client with the same
-/// overall backstop (ADR 005, 2026-07-15 amendment); every other provider -
-/// and the webhook sender (ADR 011) - keeps sharing this pooled client.
+/// The shared provider client sets the default (process-wide) connect
+/// timeout and an overall cap that backstops the executor's total timeout
+/// (M6 §6.4), and never follows redirects (a 3xx would forward custom
+/// provider auth headers to another host). A provider that sets
+/// `connect_timeout_ms` gets its own client with the same overall backstop
+/// (ADR 005, 2026-07-15 amendment). The returned client has the same
+/// timeouts but keeps reqwest's default redirect policy: the health probe
+/// and webhook deliveries (ADR 011) carry no provider credential, and a
+/// redirecting liveness endpoint or webhook receiver must keep working.
 fn build_http_stack(
     config: &Config,
     provider_specs: Vec<lumen_providers::ProviderSpec>,
 ) -> anyhow::Result<(reqwest::Client, Arc<lumen_providers::Registry>)> {
     let overall_backstop =
         Duration::from_millis(config.resilience.total_timeout_ms.saturating_add(30_000));
-    let client = lumen_providers::http::build_client_with(
-        Duration::from_millis(config.resilience.connect_timeout_ms),
-        overall_backstop,
-    );
+    let connect = Duration::from_millis(config.resilience.connect_timeout_ms);
+    let provider_client = lumen_providers::http::build_client_with(connect, overall_backstop);
     let registry = Arc::new(
-        lumen_providers::Registry::build(provider_specs, client.clone(), overall_backstop)
+        lumen_providers::Registry::build(provider_specs, provider_client, overall_backstop)
             .context("failed to build provider registry")?,
     );
-    Ok((client, registry))
+    let credential_free =
+        lumen_providers::http::build_credential_free_client_with(connect, overall_backstop);
+    Ok((credential_free, registry))
 }
 
 /// The always-on Prometheus collectors, registered against one registry.
@@ -1326,6 +1332,40 @@ async fn migrate_db_config(path: &Path, db_url: &str, dry_run: bool) -> anyhow::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The client `build_http_stack` hands to the health probe and the
+    /// webhook sender carries no provider credential, so it must keep
+    /// following redirects (the registry's provider client never does).
+    #[tokio::test]
+    async fn http_stack_client_for_probes_and_webhooks_follows_redirects() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let target = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/ok"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&target)
+            .await;
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(301)
+                    .insert_header("location", format!("{}/ok", target.uri()).as_str()),
+            )
+            .mount(&upstream)
+            .await;
+
+        let (client, _registry) =
+            build_http_stack(&Config::default(), Vec::new()).expect("stack builds");
+        let response = client
+            .get(format!("{}/health", upstream.uri()))
+            .send()
+            .await
+            .expect("request succeeds");
+        assert_eq!(response.status(), 200);
+    }
 
     fn args(values: &[&str]) -> impl Iterator<Item = String> {
         values

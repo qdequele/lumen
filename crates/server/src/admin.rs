@@ -28,6 +28,13 @@
 //!   at rest (AES-256-GCM under the master key) and apply it without a restart
 //!   by requesting a hot reload; used for providers whose `api_key_env` is
 //!   unset or empty (env keeps precedence when set).
+//! * `POST /admin/providers/{name}/check` - check a configured provider's
+//!   live credentials without spending tokens: one request to the kind's
+//!   free, authenticated endpoint (a model list, a key-introspection route,
+//!   an OAuth token mint, a Bedrock control-plane listing), never an
+//!   inference call. The verdict is data in a 200 (`key_valid`:
+//!   `true`/`false`/`null`), so a rejected provider key is never confused
+//!   with a rejected master key. Never returns the key.
 //! * `GET /admin/webhooks` - the live outbound-webhook configuration, plus
 //!   which source it came from and whether deliveries are signed. Never the
 //!   signing secret (ADR 011 amendment).
@@ -92,8 +99,10 @@ use lumen_auth::store::{
     UsageFilter, UsageGroupBy, VirtualKeyRecord,
 };
 use lumen_core::GatewayError;
+use lumen_providers::KeyCheck;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 
 /// `POST /admin/keys` response: the record plus the one-time plaintext key.
 #[derive(Serialize)]
@@ -116,6 +125,46 @@ impl std::fmt::Debug for CreatedKey {
             .field("record", &self.record)
             .finish()
     }
+}
+
+/// `POST /admin/providers/{name}/check` response: the provider's identity
+/// plus the check outcome, flattened. Secret-free by construction.
+#[derive(Debug, Serialize)]
+pub struct ProviderKeyCheck {
+    /// The configured provider name.
+    pub provider: String,
+    /// Its kind (e.g. `openai`, `bedrock`).
+    pub kind: &'static str,
+    /// The outcome (`key_valid`, `reachable`, `http_status`, `latency_ms`,
+    /// `endpoint`, `detail`).
+    #[serde(flatten)]
+    pub check: KeyCheck,
+}
+
+/// Check a configured provider's live credentials without spending tokens.
+///
+/// A rejected key is reported as `key_valid: false` in a 200: the admin call
+/// itself succeeded, and answering 401 would read as "wrong master key".
+/// Dropping the request (client disconnect) cancels the upstream check.
+///
+/// # Errors
+/// `LM-1003` (404) when no provider with that name is configured.
+pub async fn check_provider_key(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<Json<ProviderKeyCheck>, ApiError> {
+    let cancel = CancellationToken::new();
+    let _guard = cancel.clone().drop_guard();
+    let (kind, check) = state
+        .registry
+        .check_key(&name, &cancel)
+        .await
+        .ok_or(GatewayError::RouteNotFound)?;
+    Ok(Json(ProviderKeyCheck {
+        provider: name,
+        kind: kind.as_str(),
+        check,
+    }))
 }
 
 /// Map an auth-layer failure to an opaque 500 - never a misleading 401.

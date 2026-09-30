@@ -18,7 +18,7 @@ use crate::chat::{enable_stream_usage, single_shot_stream};
 use crate::http::{open_stream, post_json};
 
 /// Default OpenAI API base (includes the `/v1` prefix).
-const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
+pub(crate) const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 
 /// OpenAI's documented maximum number of inputs per embeddings request.
 const MAX_BATCH_SIZE: usize = 2048;

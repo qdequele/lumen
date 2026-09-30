@@ -17,7 +17,7 @@ use crate::chat::{enable_stream_usage, single_shot_stream};
 use crate::http::{open_stream, post_json};
 
 /// Default Mistral API base (includes the `/v1` prefix).
-const DEFAULT_BASE_URL: &str = "https://api.mistral.ai/v1";
+pub(crate) const DEFAULT_BASE_URL: &str = "https://api.mistral.ai/v1";
 
 /// Conservative batch ceiling for Mistral embeddings.
 const MAX_BATCH_SIZE: usize = 512;

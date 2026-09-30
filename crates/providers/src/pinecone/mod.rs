@@ -27,11 +27,11 @@ use tokio_util::sync::CancellationToken;
 use crate::http::post_json_with_headers;
 
 /// Default Pinecone API base (the inference host; no version in the path).
-const DEFAULT_BASE_URL: &str = "https://api.pinecone.io";
+pub(crate) const DEFAULT_BASE_URL: &str = "https://api.pinecone.io";
 
 /// The inference API version header Pinecone requires on `/rerank`. Pinned to a
 /// known-good dated release; bump deliberately when adopting a newer schema.
-const API_VERSION: &str = "2025-01";
+pub(crate) const API_VERSION: &str = "2025-01";
 
 /// A Pinecone provider serving reranking.
 pub struct PineconeProvider {

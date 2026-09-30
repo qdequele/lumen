@@ -83,6 +83,19 @@ pub(super) fn sign_request(
     body: &[u8],
     timestamp: u64,
 ) -> SignedHeaders {
+    sign_request_with_method(params, "POST", host, wire_path, body, timestamp)
+}
+
+/// [`sign_request`] for an arbitrary HTTP `method` (the key check signs a
+/// body-less control-plane `GET`). Same headers, same empty query string.
+pub(super) fn sign_request_with_method(
+    params: &SigningParams<'_>,
+    method: &str,
+    host: &str,
+    wire_path: &str,
+    body: &[u8],
+    timestamp: u64,
+) -> SignedHeaders {
     let (amz_date, date_stamp) = format_amz_time(timestamp);
     let content_sha256 = hex::encode(Sha256::digest(body));
 
@@ -104,7 +117,7 @@ pub(super) fn sign_request(
     // the wire URL keeps the single-encoded form.
     let canonical_path = canonical_uri(wire_path);
     let (canonical, signed_headers) =
-        canonical_request("POST", &canonical_path, "", &headers, &content_sha256);
+        canonical_request(method, &canonical_path, "", &headers, &content_sha256);
 
     let scope = format!("{date_stamp}/{}/{SERVICE}/aws4_request", params.region);
     let sts = string_to_sign(&amz_date, &scope, &canonical);
