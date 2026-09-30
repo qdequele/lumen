@@ -2331,11 +2331,15 @@ dependencies = [
  "dashmap",
  "futures",
  "providers",
+ "regex",
  "reqwest",
  "serde",
+ "serde_json",
  "telemetry",
+ "thiserror",
  "tokio",
  "tokio-util",
+ "toml",
  "tracing",
 ]
 

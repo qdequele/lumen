@@ -16,6 +16,7 @@ pub mod executor;
 pub mod peek;
 pub mod retry;
 pub mod triggers;
+pub mod virtual_models;
 
 use lumen_core::{Capability, GatewayError};
 use lumen_providers::{ChatRoute, EmbeddingRoute, Registry, RerankRoute, SystemOneRoute};
