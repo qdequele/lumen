@@ -168,10 +168,15 @@ The goals are:
   (for a remap, the SystemOne model). `GET /v1/models` lists virtual models
   with `"virtual": true` and their single capability; foundation entries gain
   `"virtual": false`.
-- **No new request-path error codes.** Unknown id `LM-2001`, wrong capability
+- **Request-path error codes.** Unknown id `LM-2001`, wrong capability
   `LM-2002`, exhausted attempts `LM-3004`/`LM-3020` or the last upstream
   error, invalid config `LM-1001` on an admin write (boot error otherwise).
-  New cases are listed in `docs/errors.md`.
+  Two codes are new (amended 2026-09-30, PR review): a classified
+  context-length refusal that no target absorbed is `LM-2012` and a
+  content-policy refusal is `LM-2013`, both `invalid_request` with the
+  upstream 4xx status and the provider name, instead of the `LM-3003` 502
+  every other upstream 4xx still gets (rule 8: the input is the client's to
+  fix, the provider did not fail). New cases are listed in `docs/errors.md`.
 - **Admin API.** `/admin/config/virtual_models` (list), and per-id `GET`,
   `PUT`, `DELETE` with the ADR 012 `If-Match` rule, plus a read-only
   `/plan` route that shows the fully resolved tree. Deleting a provider,

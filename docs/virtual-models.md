@@ -111,8 +111,8 @@ its next target.
 | `rate_limited` | Upstream 429 (`LM-3001`). |
 | `timeout` | Connect, first-token and per-attempt timeouts (`LM-3005`, `LM-3011`, `LM-3012`). |
 | `circuit_open` | The target's circuit breaker is open. |
-| `context_length` | Opt-in. The upstream rejected the input as too long. |
-| `content_filter` | Opt-in. The upstream refused on content policy. |
+| `context_length` | Opt-in. The upstream rejected the input as too long (surfaces as `LM-2012` when nothing absorbs it). |
+| `content_filter` | Opt-in. The upstream refused on content policy (surfaces as `LM-2013`). |
 
 - **Default** when `fallback_on` is omitted:
   `["provider_error", "rate_limited", "timeout", "circuit_open"]`, exactly the

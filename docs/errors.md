@@ -42,6 +42,8 @@ code prefix groups by cause: `1xxx` request, `2xxx` routing, `3xxx` upstream,
 | `LM-2008` | 400  | A provider-native image source (Anthropic `file_id`, spelled `anthropic-file:<id>`; Gemini `fileUri`, a `gs://` GCS URI or a Gemini Files API URI) was sent to a provider that cannot resolve it - the resolved primary provider must match the reference's own provider. |
 | `LM-2010` | 400  | A rerank request supplied no `documents` to score.             |
 | `LM-2011` | 400  | A SystemOne request (`POST /v1/systemone`) supplied an empty `questions` map. Rejected before any upstream call; other SystemOne contract violations are `LM-1001` ([ADR 013](adr/013-systemone-capability.md)). |
+| `LM-2012` | 4xx  | The upstream rejected the input as longer than the model's context window (classified from its error body, ADR 014). Names the provider; the HTTP status is the upstream's (400, 403, 413 or 422). A virtual model can fail over on it with `fallback_on = ["context_length"]`; this code surfaces when no target absorbed it. |
+| `LM-2013` | 4xx  | The upstream refused the request on content policy (classified from its error body, ADR 014). Names the provider; the HTTP status is the upstream's (400 or 403). A virtual model can fail over on it with `fallback_on = ["content_filter"]`. |
 
 ## Upstream errors - `LM-3xxx` · `type: upstream_error`
 

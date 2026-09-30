@@ -333,6 +333,44 @@ async fn an_encoding_format_override_sets_the_response_encoding() {
 }
 
 #[tokio::test]
+async fn a_classified_refusal_that_no_target_absorbs_is_a_provider_named_4xx() {
+    let refusing = |body: Value| async move {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(body))
+            .mount(&server)
+            .await;
+        server
+    };
+    let a =
+        refusing(json!({ "error": { "code": "context_length_exceeded", "message": "too long" } }))
+            .await;
+    let b = refusing(json!({ "error": { "code": "content_filter", "message": "filtered" } })).await;
+    let cfg = load(&two_providers(&a.uri(), &b.uri(), ""));
+    let base = spawn(&cfg, &cfg).await;
+    for (model, code, provider) in [("model-a", "LM-2012", "'a'"), ("model-b", "LM-2013", "'b'")] {
+        let resp = post(
+            &base,
+            json!({ "model": model, "messages": [{ "role": "user", "content": "hi" }] }),
+            &[],
+        )
+        .await;
+        assert_eq!(resp.status(), 400, "{model}");
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(body["error"]["code"], code);
+        assert_eq!(body["error"]["type"], "invalid_request");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains(provider),
+            "{body}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn a_virtual_model_on_the_wrong_endpoint_is_lm_2002() {
     let (a, b) = (
         upstream(200, "model-a").await,

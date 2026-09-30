@@ -337,6 +337,18 @@ pub enum GatewayError {
         source_kind: &'static str,
     },
 
+    /// The upstream rejected the input as longer than the model's context
+    /// window (ADR 014 classification). A client error naming the provider,
+    /// carrying the upstream 4xx `status` (`LM-2012`).
+    #[error("provider '{provider}' rejected the input as longer than the model's context window (HTTP {status})")]
+    ContextLengthExceeded { provider: String, status: u16 },
+
+    /// The upstream refused the request on content policy (ADR 014
+    /// classification). A client error naming the provider, carrying the
+    /// upstream 4xx `status` (`LM-2013`).
+    #[error("provider '{provider}' refused the request on content policy (HTTP {status})")]
+    ContentFiltered { provider: String, status: u16 },
+
     /// A remote image URL was supplied to `/v1/embeddings` but server-side image
     /// fetching is disabled (M9). The operator must enable `[image_fetch]` or
     /// the client must inline the image as a `data:` URI.
@@ -465,6 +477,8 @@ impl GatewayError {
             GatewayError::ImageFetchFailed => "LM-2007",
             GatewayError::EmptyDocuments => "LM-2010",
             GatewayError::EmptyQuestions => "LM-2011",
+            GatewayError::ContextLengthExceeded { .. } => "LM-2012",
+            GatewayError::ContentFiltered { .. } => "LM-2013",
             GatewayError::UpstreamRateLimited { .. } => "LM-3001",
             GatewayError::UpstreamInvalidResponse { .. } => "LM-3002",
             GatewayError::Upstream { .. } => "LM-3003",
@@ -503,6 +517,10 @@ impl GatewayError {
             | GatewayError::ImageSourceNotSupported { .. }
             | GatewayError::ImageFetchDisabled
             | GatewayError::ImageUrlRejected => 400,
+            // The upstream's own 4xx (classification only reads 400, 403,
+            // 413 and 422 bodies), so the client sees what the provider said.
+            GatewayError::ContextLengthExceeded { status, .. }
+            | GatewayError::ContentFiltered { status, .. } => *status,
             GatewayError::Unauthorized => 401,
             GatewayError::BudgetExceeded { .. } => 402,
             GatewayError::ModelNotFound(_) | GatewayError::RouteNotFound => 404,
@@ -543,6 +561,8 @@ impl GatewayError {
             | GatewayError::ImageUrlRejected
             | GatewayError::EmptyDocuments
             | GatewayError::EmptyQuestions
+            | GatewayError::ContextLengthExceeded { .. }
+            | GatewayError::ContentFiltered { .. }
             | GatewayError::PayloadTooLarge { .. }
             | GatewayError::Unauthorized
             | GatewayError::BudgetExceeded { .. }
@@ -603,24 +623,30 @@ impl GatewayError {
     #[must_use]
     pub fn from_provider(provider: &str, err: ProviderError) -> Self {
         match err {
-            // ADR 014: classified client errors (context length, content
-            // filter) keep today's client-facing shape, the upstream status;
-            // only the fallback layer sees the finer variant.
             ProviderError::Upstream {
                 provider: p,
                 status,
                 ..
-            }
-            | ProviderError::ContextLengthExceeded {
-                provider: p,
-                status,
-            }
-            | ProviderError::ContentFiltered {
-                provider: p,
-                status,
             } => GatewayError::Upstream {
                 provider: p_or(provider, p),
                 status,
+            },
+            // ADR 014: a classified input refusal is the client's to fix, not
+            // a provider failure: a 4xx naming the provider (rule 8), each
+            // with its own code.
+            ProviderError::ContextLengthExceeded {
+                provider: p,
+                status,
+            } => GatewayError::ContextLengthExceeded {
+                provider: p_or(provider, p),
+                status: client_status(status),
+            },
+            ProviderError::ContentFiltered {
+                provider: p,
+                status,
+            } => GatewayError::ContentFiltered {
+                provider: p_or(provider, p),
+                status: client_status(status),
             },
             ProviderError::Timeout { provider: p } => GatewayError::UpstreamTimeout {
                 provider: p_or(provider, p),
@@ -687,6 +713,16 @@ impl GatewayError {
             // alerts the way `GatewayError::Internal` would (issue #11).
             ProviderError::Cancelled => GatewayError::ClientCancelled,
         }
+    }
+}
+
+/// An upstream status as a client-facing 4xx: kept when it already is one,
+/// else 400 (classification only reads 4xx bodies; this guards the mapping).
+const fn client_status(status: u16) -> u16 {
+    if status >= 400 && status < 500 {
+        status
+    } else {
+        400
     }
 }
 
@@ -772,6 +808,23 @@ mod tests {
         assert_eq!(GatewayError::EmptyDocuments.code(), "LM-2010");
         // Empty SystemOne questions (ADR 013).
         assert_eq!(GatewayError::EmptyQuestions.code(), "LM-2011");
+        // Classified upstream input refusals (ADR 014).
+        assert_eq!(
+            GatewayError::ContextLengthExceeded {
+                provider: "p".into(),
+                status: 400
+            }
+            .code(),
+            "LM-2012"
+        );
+        assert_eq!(
+            GatewayError::ContentFiltered {
+                provider: "p".into(),
+                status: 400
+            }
+            .code(),
+            "LM-2013"
+        );
         assert_eq!(GatewayError::EmptyQuestions.http_status(), 400);
         // Vision (M8) + multimodal-embeddings image-fetch (M9) codes.
         assert_eq!(
@@ -1179,6 +1232,43 @@ mod tests {
             }
             other => panic!("expected ImageUrlNotSupported, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn classified_input_refusals_are_provider_named_client_errors() {
+        let ctx = GatewayError::from_provider(
+            "router-name",
+            ProviderError::ContextLengthExceeded {
+                provider: "openai".into(),
+                status: 400,
+            },
+        );
+        assert_eq!(ctx.code(), "LM-2012");
+        assert_eq!(ctx.http_status(), 400);
+        assert_eq!(ctx.error_type(), ErrorType::InvalidRequest);
+        assert!(ctx.public_message().contains("'openai'"));
+
+        let filtered = GatewayError::from_provider(
+            "azure",
+            ProviderError::ContentFiltered {
+                provider: String::new(),
+                status: 403,
+            },
+        );
+        assert_eq!(filtered.code(), "LM-2013");
+        assert_eq!(filtered.http_status(), 403);
+        assert_eq!(filtered.error_type(), ErrorType::InvalidRequest);
+        assert!(filtered.public_message().contains("'azure'"));
+
+        // A non-4xx status never leaks through as the client status.
+        let odd = GatewayError::from_provider(
+            "p",
+            ProviderError::ContentFiltered {
+                provider: "p".into(),
+                status: 500,
+            },
+        );
+        assert_eq!(odd.http_status(), 400);
     }
 
     #[test]

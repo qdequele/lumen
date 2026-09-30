@@ -425,13 +425,6 @@ mod tests {
         assert!(!e.is_retryable());
         assert!(!e.is_provider_fault());
         let g = lumen_core::GatewayError::from_provider("p", e);
-        assert_eq!(
-            g.http_status(),
-            lumen_core::GatewayError::Upstream {
-                provider: "p".into(),
-                status: 400
-            }
-            .http_status()
-        );
+        assert_eq!((g.code(), g.http_status()), ("LM-2012", 400));
     }
 }
