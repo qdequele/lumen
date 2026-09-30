@@ -6,17 +6,24 @@
 //! unknown model (`LM-2001`, 404) from a known model that does not serve the
 //! requested capability (`LM-2002`, 400).
 //!
-//! Fallback chains, circuit breaking and load balancing arrive in M6. The
-//! SystemOne capability (ADR 013) resolves exactly like the other three.
+//! Fallback chains, weighted splits and conditional routing are virtual models
+//! (ADR 014, [`virtual_models`]). The SystemOne capability (ADR 013) resolves
+//! exactly like the other three.
 
 #![forbid(unsafe_code)]
 
+pub mod attempts;
 pub mod circuit;
 pub mod executor;
 pub mod peek;
 pub mod retry;
 pub mod triggers;
 pub mod virtual_models;
+
+pub use attempts::{
+    decision_links, resolve_chat_decision, resolve_embedding_decision, resolve_rerank_decision,
+    resolve_systemone_decision,
+};
 
 use lumen_core::{Capability, GatewayError};
 use lumen_providers::{ChatRoute, EmbeddingRoute, Registry, RerankRoute, SystemOneRoute};
@@ -250,7 +257,7 @@ pub fn systemone_links(chain: &[SystemOneChainLink]) -> Vec<executor::Link> {
         .collect()
 }
 
-fn warn_skipped_fallback(model_id: &str, capability: &str) {
+pub(crate) fn warn_skipped_fallback(model_id: &str, capability: &str) {
     tracing::warn!(
         model = %model_id,
         capability,
@@ -260,7 +267,7 @@ fn warn_skipped_fallback(model_id: &str, capability: &str) {
 
 /// Turn a routing miss into the right client-facing error: a known model that
 /// does not serve `capability` is `LM-2002`; an unknown model is `LM-2001`.
-fn miss(registry: &Registry, model_id: &str, capability: Capability) -> GatewayError {
+pub(crate) fn miss(registry: &Registry, model_id: &str, capability: Capability) -> GatewayError {
     if registry.knows_model(model_id) {
         GatewayError::UnsupportedCapability {
             model: model_id.to_owned(),

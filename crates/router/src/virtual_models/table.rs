@@ -121,8 +121,6 @@ impl VirtualModel {
     }
 }
 
-// Fields are read by the decide step (Task 8); allowed until it lands.
-#[allow(dead_code)]
 pub(crate) enum Strategy {
     Single,
     Fallback(Triggers),
@@ -130,8 +128,6 @@ pub(crate) enum Strategy {
     Switch,
 }
 
-// Fields are read by the decide step (Task 8); allowed until it lands.
-#[allow(dead_code)]
 pub(crate) struct Target {
     pub(crate) node: Node,
     pub(crate) weight: u64,
@@ -140,8 +136,6 @@ pub(crate) struct Target {
     pub(crate) remap: Option<Arc<RerankTemplate>>,
 }
 
-// Fields are read by the decide step (Task 8); allowed until it lands.
-#[allow(dead_code)]
 pub(crate) enum Node {
     Foundation(String),
     Virtual(Arc<VirtualModel>),
