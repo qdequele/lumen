@@ -1840,11 +1840,86 @@ pub async fn put_virtual_model(
         ))
         .into());
     }
+    reject_json_nulls(&vm)?;
     apply_document(&state, &if_match, move |current| {
-        config_edit::upsert_virtual_model(current, &vm).map_err(|e| edit_internal_error(&e))
+        // The only input is the client body, so a value TOML cannot spell
+        // (an integer above i64::MAX, say) is a client error, not a 500.
+        config_edit::upsert_virtual_model(current, &vm).map_err(|e| match e {
+            config_edit::EditError::Serialize(e) => GatewayError::InvalidRequest(format!(
+                "virtual model '{}' cannot be stored as TOML: {e}",
+                vm.id
+            ))
+            .into(),
+            other => edit_internal_error(&other),
+        })
     })
     .await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// JSON `null` has no TOML spelling, so a body carrying one inside a `when`
+/// condition or an `overrides` map (at any nesting depth) is refused with
+/// `LM-1001` naming the field, before the document is edited.
+fn reject_json_nulls(
+    vm: &lumen_router::virtual_models::VirtualModelConfig,
+) -> Result<(), GatewayError> {
+    fn walk(value: &serde_json::Value, path: &mut String) -> Result<(), String> {
+        match value {
+            serde_json::Value::Null => Err(path.clone()),
+            serde_json::Value::Array(items) => items.iter().enumerate().try_for_each(|(i, v)| {
+                let len = path.len();
+                path.push('[');
+                path.push_str(&i.to_string());
+                path.push(']');
+                walk(v, path)?;
+                path.truncate(len);
+                Ok(())
+            }),
+            serde_json::Value::Object(map) => walk_map(map, path),
+            _ => Ok(()),
+        }
+    }
+    fn walk_map(
+        map: &serde_json::Map<String, serde_json::Value>,
+        path: &mut String,
+    ) -> Result<(), String> {
+        map.iter().try_for_each(|(k, v)| {
+            let len = path.len();
+            path.push('.');
+            path.push_str(k);
+            walk(v, path)?;
+            path.truncate(len);
+            Ok(())
+        })
+    }
+    fn walk_overrides(
+        o: &lumen_router::virtual_models::config::OverridesConfig,
+        prefix: &str,
+    ) -> Result<(), String> {
+        walk_map(&o.set, &mut format!("{prefix}.overrides.set"))?;
+        walk_map(&o.default, &mut format!("{prefix}.overrides.default"))
+    }
+    fn first_null(vm: &lumen_router::virtual_models::VirtualModelConfig) -> Result<(), String> {
+        if let Some(o) = vm.preset.as_ref().and_then(|p| p.overrides.as_ref()) {
+            walk_overrides(o, "preset")?;
+        }
+        for (i, t) in vm.targets.iter().enumerate() {
+            let prefix = format!("targets[{i}]");
+            if let Some(when) = &t.when {
+                walk_map(when, &mut format!("{prefix}.when"))?;
+            }
+            if let Some(o) = &t.overrides {
+                walk_overrides(o, &prefix)?;
+            }
+        }
+        Ok(())
+    }
+    first_null(vm).map_err(|field| {
+        GatewayError::InvalidRequest(format!(
+            "virtual model '{}': {field} is null, which is not a valid config value (omit the key instead)",
+            vm.id
+        ))
+    })
 }
 
 /// Remove one virtual model.

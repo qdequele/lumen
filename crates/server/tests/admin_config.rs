@@ -1469,3 +1469,56 @@ async fn invalid_virtual_models_and_dangling_deletes_are_lm_1001() {
         404
     );
 }
+
+/// A JSON `null` has no TOML spelling: a body carrying one inside `when`,
+/// `overrides.set` or `overrides.default` (nested included) is a client
+/// error naming the field, never a 500 (STRICT rule 8).
+#[tokio::test]
+async fn a_json_null_in_a_virtual_model_body_is_lm_1001() {
+    let h = spawn_admin(registry()).await;
+    let hash = h.current_hash().await;
+    let bodies = [
+        (
+            serde_json::json!({ "id": "v", "capability": "chat", "strategy": "switch", "targets": [
+                { "model": "gpt-4o", "when": { "group": null } }, { "model": "gpt-4o" } ] }),
+            "targets[0].when.group",
+        ),
+        (
+            serde_json::json!({ "id": "v", "capability": "chat", "strategy": "single", "targets": [
+                { "model": "gpt-4o", "overrides": { "set": { "temperature": null } } } ] }),
+            "targets[0].overrides.set.temperature",
+        ),
+        (
+            serde_json::json!({ "id": "v", "capability": "chat", "strategy": "single", "targets": [
+                { "model": "gpt-4o", "overrides": { "default": { "stop": ["a", null] } } } ] }),
+            "targets[0].overrides.default.stop[1]",
+        ),
+        (
+            serde_json::json!({ "id": "v", "capability": "chat", "strategy": "single",
+                "preset": { "overrides": { "set": { "response_format": { "type": null } } } },
+                "targets": [{ "model": "gpt-4o" }] }),
+            "preset.overrides.set.response_format.type",
+        ),
+    ];
+    for (body, field) in bodies {
+        let resp = h
+            .put_json("/admin/config/virtual_models/v", &body, &hash)
+            .await;
+        assert_eq!(resp.status(), 400, "{field}");
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(body["error"]["code"], "LM-1001", "{body}");
+        let message = body["error"]["message"].as_str().unwrap();
+        assert!(message.contains(field), "{message}");
+        assert!(message.contains("null"), "{message}");
+    }
+
+    // Any other value TOML cannot hold is a client error too.
+    let too_big = serde_json::json!({ "id": "v", "capability": "chat", "strategy": "single", "targets": [
+        { "model": "gpt-4o", "overrides": { "set": { "max_tokens": u64::MAX } } } ] });
+    let resp = h
+        .put_json("/admin/config/virtual_models/v", &too_big, &hash)
+        .await;
+    assert_eq!(resp.status(), 400);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "LM-1001", "{body}");
+}

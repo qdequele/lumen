@@ -8,6 +8,7 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ### Added
 
+- `PUT /admin/config/virtual_models/{id}` refuses a body holding a JSON `null` inside `when`, `overrides.set` or `overrides.default` (nested included), or any other value TOML cannot store, with `LM-1001` naming the field instead of a 500.
 - Virtual-model validation caps a request at 64 flattened attempts (`MAX_ATTEMPTS`: a `fallback` or `split` sums its targets, a `switch` takes its largest branch) and stops descending at the nesting limit, so a DAG listing the same child many times per level, or a chain of thousands of models, is rejected with the model id instead of slowing every request or overflowing the stack.
 - Criterion bench for the virtual-model decide phase (about 0.95 us per call, mean 926 to 962 ns across runs, for a 3-level plan with a regex rule).
 - User guide `docs/virtual-models.md` (strategies, triggers, conditions, overrides, presets, Jev remaps, admin API, migration); the error catalogue, examples, README and `monitoring/lumen.toml` use virtual models instead of `fallbacks`.
