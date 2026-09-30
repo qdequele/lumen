@@ -5,6 +5,7 @@ use lumen_auth::key::hash_key;
 use lumen_auth::state::AuthState;
 use lumen_auth::store::{GroupRecord, VirtualKeyRecord};
 use std::sync::Arc;
+use std::time::Duration;
 
 const ACCOUNT: &str = "0192f3c1-7c2e-7b1a-9f00-3c9d2e4a5b61";
 const NOW: i64 = 1_000;
@@ -76,7 +77,7 @@ fn a_billable_key_emits_its_positive_delta_with_units() {
     assert_eq!(d.group_spent_micro, 2_000);
     assert_eq!(d.group_budget_max_micro, Some(100_000_000));
     assert_eq!(batch.rows()[0].billed_micro, 2_000);
-    batch.commit();
+    s.commit_flush(batch);
 
     // Only new spend is billed next time, and the window starts at the last flush.
     spend(&s, 300, 1);
@@ -86,24 +87,24 @@ fn a_billable_key_emits_its_positive_delta_with_units() {
 }
 
 #[test]
-fn a_refund_below_the_watermark_is_held_back_then_netted() {
+fn reservations_are_never_billed_only_settled_cost() {
     let s = state(Some(ACCOUNT), Some("g"), true);
     let entry = s.authenticate("sk", NOW).unwrap();
-    // Reserve 1000 and flush while in flight: the reservation is billed.
+    // Reserve 1000 and flush while in flight: the estimate is not billed.
     let reservation = entry.admit(NOW, 0, 1_000).unwrap();
     let first = s.drain_flush(2_000);
-    assert_eq!(first.deltas()[0].cost_micro, 1_000);
-    first.commit();
-    // The call fails: the reservation is refunded, spend drops to 0.
+    assert!(first.deltas().is_empty());
+    assert_eq!(first.rows()[0].billed_micro, 0);
+    s.commit_flush(first);
+    // The call fails: the reservation is refunded, nothing was ever billed.
     drop(reservation);
-    let held = s.drain_flush(3_000);
-    assert!(held.deltas().is_empty());
-    assert_eq!(held.rows()[0].billed_micro, 1_000, "watermark holds");
-    held.commit();
-    // Later spend is measured from the unchanged watermark.
+    let after_refund = s.drain_flush(3_000);
+    assert!(after_refund.deltas().is_empty());
+    s.commit_flush(after_refund);
+    // Later settled spend is billed in full.
     spend(&s, 1_200, 0);
-    let netted = s.drain_flush(4_000);
-    assert_eq!(netted.deltas()[0].cost_micro, 200);
+    let billed = s.drain_flush(4_000);
+    assert_eq!(billed.deltas()[0].cost_micro, 1_200);
 }
 
 #[test]
@@ -126,7 +127,8 @@ fn non_billable_keys_keep_the_watermark_caught_up() {
 fn joining_a_billable_group_does_not_bill_the_past() {
     let s = state(Some(ACCOUNT), None, true);
     spend(&s, 5_000, 0);
-    s.drain_flush(2_000).commit(); // operator key: watermark catches up
+    let caught_up = s.drain_flush(2_000);
+    s.commit_flush(caught_up); // operator key: watermark catches up
     s.apply(&key(Some("g"), 0)); // joins the Lab-linked group
     spend(&s, 100, 0);
     let batch = s.drain_flush(3_000);
@@ -138,7 +140,7 @@ fn rollback_redirties_and_restores_counters() {
     let s = state(Some(ACCOUNT), Some("g"), true);
     spend(&s, 900, 9);
     let failed = s.drain_flush(2_000);
-    failed.rollback();
+    s.rollback_flush(failed);
     // No new spend, yet the key is flushed again with the same money and units.
     let retry = s.drain_flush(3_000);
     let d = retry.deltas()[0];
@@ -146,16 +148,38 @@ fn rollback_redirties_and_restores_counters() {
 }
 
 #[test]
-fn an_evicted_key_is_flushed_and_billed() {
+fn a_retired_key_is_billed_and_retried_after_a_failed_flush() {
     let s = state(Some(ACCOUNT), Some("g"), true);
     spend(&s, 400, 4);
     let entry = s.remove("k").unwrap();
+    s.retire(entry);
+    let failed = s.drain_flush(2_000);
+    assert_eq!(failed.deltas()[0].cost_micro, 400);
+    s.rollback_flush(failed);
+    // The failed flush lost nothing: the same money is offered again.
+    let retry = s.drain_flush(3_000);
+    assert_eq!(retry.deltas()[0].cost_micro, 400);
+    s.commit_flush(retry);
+    assert!(s.drain_flush(4_000).is_empty(), "committed: nothing left");
+}
+
+#[tokio::test]
+async fn a_flush_guard_serializes_flushers() {
+    let s = state(Some(ACCOUNT), Some("g"), true);
+    let first = s.flush_guard().await;
     assert!(
-        s.drain_flush(2_000).is_empty(),
-        "evicted keys leave the table"
+        tokio::time::timeout(Duration::from_millis(50), s.flush_guard())
+            .await
+            .is_err(),
+        "a second flusher must wait while the first holds the guard"
     );
-    let batch = s.flush_evicted(&entry, 2_000);
-    assert_eq!(batch.deltas()[0].cost_micro, 400);
+    drop(first);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), s.flush_guard())
+            .await
+            .is_ok(),
+        "the guard is free again once released"
+    );
 }
 
 #[test]
