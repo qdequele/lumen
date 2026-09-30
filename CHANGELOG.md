@@ -8,6 +8,7 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ### Added
 
+- Jev as a reranker through a virtual-model remap: noul, score, composite and choice strategies, static context, and cross-capability fallback to a classic reranker.
 - `lumen config migrate [--dry-run]`: rewrites per-model fallbacks and Jev rerank blocks into virtual models (file mode keeps a .bak; DB mode writes a new config version).
 - Admin API: GET/PUT/DELETE /admin/config/virtual_models/{id} (percent-encode "/" in ids) and GET .../{id}/plan returning the resolved routing tree; deleting anything a virtual model references is rejected with LM-1001 naming the dependent.
 - GET /v1/models lists virtual models ("virtual": true, description, modalities common to every reachable leaf); listed = false hides one.
