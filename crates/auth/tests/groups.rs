@@ -16,6 +16,7 @@ fn new_group(name: &str) -> NewGroup {
     NewGroup {
         name: name.to_owned(),
         budget_max: Some(25.0),
+        account_ref: None,
     }
 }
 
@@ -54,6 +55,7 @@ async fn a_group_without_a_budget_is_a_pure_attribution_container() {
         .create_group(NewGroup {
             name: "tracking-only".to_owned(),
             budget_max: None,
+            account_ref: None,
         })
         .await
         .expect("create group");
@@ -514,6 +516,7 @@ async fn sequential_grants_accumulate_on_the_same_row() {
         .create_group(NewGroup {
             name: "pool-accumulator".to_owned(),
             budget_max: Some(10.0),
+            account_ref: None,
         })
         .await
         .expect("create group");
@@ -621,6 +624,7 @@ async fn grant_group_budget_to_an_uncapped_group_is_refused_and_writes_nothing()
         .create_group(NewGroup {
             name: "tracking-only".to_owned(),
             budget_max: None,
+            account_ref: None,
         })
         .await
         .expect("create group");

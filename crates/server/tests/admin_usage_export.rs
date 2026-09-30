@@ -63,6 +63,7 @@ impl Harness {
                 rpm_limit: None,
                 tpm_limit: None,
                 expires_at: None,
+                external_ref: None,
             })
             .await
             .expect("create key");

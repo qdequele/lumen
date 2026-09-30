@@ -186,6 +186,7 @@ impl Harness {
                 rpm_limit: rpm,
                 tpm_limit: tpm,
                 expires_at: None,
+                external_ref: None,
             })
             .await
             .expect("create key");
@@ -1694,6 +1695,8 @@ async fn admin_delete_retry_evicts_a_zombie_key_from_memory() {
         disabled: false,
         created_at: 0,
         deleted_at: None,
+        external_ref: None,
+        billed_micro: 0,
     };
     h.runtime.keys.upsert(hash_key(&plaintext), &zombie);
     assert!(

@@ -22,6 +22,7 @@ fn new_key(name: &str) -> NewKey {
         rpm_limit: Some(60),
         tpm_limit: Some(100_000),
         expires_at: None,
+        external_ref: None,
     }
 }
 

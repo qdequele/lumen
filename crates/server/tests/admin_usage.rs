@@ -56,6 +56,7 @@ impl Harness {
                 rpm_limit: None,
                 tpm_limit: None,
                 expires_at: None,
+                external_ref: None,
             })
             .await
             .expect("create key");
@@ -666,6 +667,7 @@ async fn create_live_group(h: &Harness, budget_max: Option<f64>) -> String {
         .create_group(NewGroup {
             name: "pool".to_owned(),
             budget_max,
+            account_ref: None,
         })
         .await
         .expect("create group");

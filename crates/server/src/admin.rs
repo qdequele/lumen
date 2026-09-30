@@ -2215,6 +2215,8 @@ mod tests {
                 disabled: false,
                 created_at: 0,
                 deleted_at: None,
+                external_ref: None,
+                billed_micro: 0,
             },
         };
         let dbg = format!("{created:?}");

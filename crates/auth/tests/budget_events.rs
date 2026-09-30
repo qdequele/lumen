@@ -33,6 +33,8 @@ fn key_record(id: &str, budget_max: Option<f64>) -> VirtualKeyRecord {
         disabled: false,
         created_at: 0,
         deleted_at: None,
+        external_ref: None,
+        billed_micro: 0,
     }
 }
 
@@ -44,6 +46,7 @@ fn group_record(id: &str, budget_max: Option<f64>) -> GroupRecord {
         budget_spent: 0.0,
         created_at: 0,
         deleted_at: None,
+        account_ref: None,
     }
 }
 

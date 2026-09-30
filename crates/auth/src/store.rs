@@ -43,6 +43,14 @@ pub struct VirtualKeyRecord {
     /// never authenticates and rejects further updates, but its row stays so
     /// `usage_log.key_id` attribution survives (issue #66).
     pub deleted_at: Option<i64>,
+    /// Opaque control-plane reference for this key (ADR 015), e.g. the Lab's
+    /// own key id; reported as `api_key_id` on usage events. `None` = unset.
+    pub external_ref: Option<String>,
+    /// Billing watermark in micro-USD (ADR 015): the part of `budget_spent`
+    /// already reported as usage events. Internal bookkeeping, never part of
+    /// the admin API.
+    #[serde(skip_serializing)]
+    pub billed_micro: i64,
 }
 
 /// The stored webhook configuration (ADR 011 amendment §2): the settings plus
@@ -81,6 +89,10 @@ pub struct GroupRecord {
     /// group stops enforcing and cannot gain members, but its row stays so
     /// `usage_log.group_id` attribution survives.
     pub deleted_at: Option<i64>,
+    /// Opaque control-plane account this group is the lease of (ADR 015),
+    /// e.g. the Lab account id. Keys in a group with an `account_ref` are
+    /// billable when `[usage_events]` is configured.
+    pub account_ref: Option<String>,
 }
 
 /// Parameters for creating a budget group.
@@ -90,6 +102,8 @@ pub struct NewGroup {
     pub name: String,
     /// Shared hard budget in USD; `None` = unlimited.
     pub budget_max: Option<f64>,
+    /// Opaque control-plane account reference (ADR 015).
+    pub account_ref: Option<String>,
 }
 
 /// A partial group update: `None` fields are left unchanged.
@@ -99,6 +113,11 @@ pub struct GroupPatch {
     pub name: Option<String>,
     /// New shared hard budget in USD.
     pub budget_max: Option<f64>,
+    /// Control-plane account change (ADR 015): absent = unchanged,
+    /// `null` = clear, string = set.
+    #[allow(clippy::option_option)]
+    #[serde(default, deserialize_with = "double_option")]
+    pub account_ref: Option<Option<String>>,
 }
 
 /// The outcome of a [`KeyStore::delete_group`] call. A group with live
@@ -145,6 +164,8 @@ pub struct NewKey {
     pub tpm_limit: Option<i64>,
     /// Expiry as unix seconds.
     pub expires_at: Option<i64>,
+    /// Opaque control-plane reference (ADR 015).
+    pub external_ref: Option<String>,
 }
 
 /// A partial update: `None` fields are left unchanged (fields cannot be
@@ -175,6 +196,11 @@ pub struct KeyPatch {
     pub expires_at: Option<i64>,
     /// Enable/disable the key.
     pub disabled: Option<bool>,
+    /// Control-plane reference change (ADR 015): absent = unchanged,
+    /// `null` = clear, string = set.
+    #[allow(clippy::option_option)]
+    #[serde(default, deserialize_with = "double_option")]
+    pub external_ref: Option<Option<String>>,
 }
 
 /// Deserialize a field so that *absent* and *null* are distinguishable:
@@ -430,6 +456,22 @@ pub struct UsageRow {
     pub ts: i64,
 }
 
+/// Every `virtual_keys` column a [`VirtualKeyRecord`] reads, in one place so
+/// a new column cannot be forgotten in one of the SELECTs.
+macro_rules! key_columns {
+    () => {
+        "id, name, group_id, budget_max, budget_spent, rpm_limit, tpm_limit, \
+         expires_at, disabled, created_at, deleted_at, external_ref, billed_micro"
+    };
+}
+
+/// Every `budget_groups` column a [`GroupRecord`] reads.
+macro_rules! group_columns {
+    () => {
+        "id, name, budget_max, budget_spent, created_at, deleted_at, account_ref"
+    };
+}
+
 /// Handle to the SQLite database (pooled; cheap to clone).
 #[derive(Debug, Clone)]
 pub struct KeyStore {
@@ -504,11 +546,13 @@ impl KeyStore {
             disabled: false,
             created_at: now_unix(),
             deleted_at: None,
+            external_ref: params.external_ref,
+            billed_micro: 0,
         };
         sqlx::query(
             "INSERT INTO virtual_keys \
-             (id, key_hash, name, group_id, budget_max, budget_spent, rpm_limit, tpm_limit, expires_at, disabled, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             (id, key_hash, name, group_id, budget_max, budget_spent, rpm_limit, tpm_limit, expires_at, disabled, created_at, external_ref) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&record.id)
         .bind(hash_key(plaintext.reveal()))
@@ -521,6 +565,7 @@ impl KeyStore {
         .bind(record.expires_at)
         .bind(record.disabled)
         .bind(record.created_at)
+        .bind(&record.external_ref)
         .execute(&self.pool)
         .await?;
         Ok((plaintext, record))
@@ -544,10 +589,11 @@ impl KeyStore {
     /// Look a key up by the BLAKE3 hash of its plaintext. Deleted keys are
     /// invisible here: a tombstoned hash must never authenticate.
     pub async fn find_by_hash(&self, hash: &str) -> Result<Option<VirtualKeyRecord>, AuthError> {
-        let record = sqlx::query_as::<_, VirtualKeyRecord>(
-            "SELECT id, name, group_id, budget_max, budget_spent, rpm_limit, tpm_limit, expires_at, disabled, created_at, deleted_at \
-             FROM virtual_keys WHERE key_hash = ? AND deleted_at IS NULL",
-        )
+        let record = sqlx::query_as::<_, VirtualKeyRecord>(concat!(
+            "SELECT ",
+            key_columns!(),
+            " FROM virtual_keys WHERE key_hash = ? AND deleted_at IS NULL"
+        ))
         .bind(hash)
         .fetch_optional(&self.pool)
         .await?;
@@ -558,10 +604,11 @@ impl KeyStore {
     /// in-memory [`AuthState`](crate::state::AuthState) at boot. The hash
     /// never leaves the auth layer; deleted keys never load.
     pub async fn load_auth_entries(&self) -> Result<Vec<(String, VirtualKeyRecord)>, AuthError> {
-        let rows = sqlx::query(
-            "SELECT id, key_hash, name, group_id, budget_max, budget_spent, rpm_limit, tpm_limit, expires_at, disabled, created_at, deleted_at \
-             FROM virtual_keys WHERE deleted_at IS NULL",
-        )
+        let rows = sqlx::query(concat!(
+            "SELECT key_hash, ",
+            key_columns!(),
+            " FROM virtual_keys WHERE deleted_at IS NULL"
+        ))
         .fetch_all(&self.pool)
         .await?;
         let mut entries = Vec::with_capacity(rows.len());
@@ -579,6 +626,8 @@ impl KeyStore {
                 disabled: row.try_get("disabled")?,
                 created_at: row.try_get("created_at")?,
                 deleted_at: row.try_get("deleted_at")?,
+                external_ref: row.try_get("external_ref")?,
+                billed_micro: row.try_get("billed_micro")?,
             };
             entries.push((hash, record));
         }
@@ -592,11 +641,17 @@ impl KeyStore {
         include_deleted: bool,
     ) -> Result<Vec<VirtualKeyRecord>, AuthError> {
         let sql = if include_deleted {
-            "SELECT id, name, group_id, budget_max, budget_spent, rpm_limit, tpm_limit, expires_at, disabled, created_at, deleted_at \
-             FROM virtual_keys ORDER BY created_at, id"
+            concat!(
+                "SELECT ",
+                key_columns!(),
+                " FROM virtual_keys ORDER BY created_at, id"
+            )
         } else {
-            "SELECT id, name, group_id, budget_max, budget_spent, rpm_limit, tpm_limit, expires_at, disabled, created_at, deleted_at \
-             FROM virtual_keys WHERE deleted_at IS NULL ORDER BY created_at, id"
+            concat!(
+                "SELECT ",
+                key_columns!(),
+                " FROM virtual_keys WHERE deleted_at IS NULL ORDER BY created_at, id"
+            )
         };
         let records = sqlx::query_as::<_, VirtualKeyRecord>(sql)
             .fetch_all(&self.pool)
@@ -621,6 +676,8 @@ impl KeyStore {
         // (where the set value may itself be NULL) in the same statement.
         let group_change = patch.group_id.is_some();
         let group_value = patch.group_id.flatten();
+        let ref_change = patch.external_ref.is_some();
+        let ref_value = patch.external_ref.flatten();
         let changed = sqlx::query(
             "UPDATE virtual_keys SET \
                name = COALESCE(?, name), \
@@ -629,7 +686,8 @@ impl KeyStore {
                tpm_limit = COALESCE(?, tpm_limit), \
                expires_at = COALESCE(?, expires_at), \
                disabled = COALESCE(?, disabled), \
-               group_id = CASE WHEN ? THEN ? ELSE group_id END \
+               group_id = CASE WHEN ? THEN ? ELSE group_id END, \
+               external_ref = CASE WHEN ? THEN ? ELSE external_ref END \
              WHERE id = ? AND deleted_at IS NULL",
         )
         .bind(patch.name)
@@ -640,6 +698,8 @@ impl KeyStore {
         .bind(patch.disabled)
         .bind(group_change)
         .bind(group_value)
+        .bind(ref_change)
+        .bind(ref_value)
         .bind(id)
         .execute(&self.pool)
         .await?
@@ -698,10 +758,11 @@ impl KeyStore {
     /// Fetch one record by id, tombstoned or not (internal re-read after a
     /// successful write - the caller already checked the row exists).
     async fn fetch_key(&self, id: &str) -> Result<Option<VirtualKeyRecord>, AuthError> {
-        let record = sqlx::query_as::<_, VirtualKeyRecord>(
-            "SELECT id, name, group_id, budget_max, budget_spent, rpm_limit, tpm_limit, expires_at, disabled, created_at, deleted_at \
-             FROM virtual_keys WHERE id = ?",
-        )
+        let record = sqlx::query_as::<_, VirtualKeyRecord>(concat!(
+            "SELECT ",
+            key_columns!(),
+            " FROM virtual_keys WHERE id = ?"
+        ))
         .bind(id)
         .fetch_optional(&self.pool)
         .await?;
@@ -735,16 +796,18 @@ impl KeyStore {
             budget_spent: 0.0,
             created_at: now_unix(),
             deleted_at: None,
+            account_ref: params.account_ref,
         };
         sqlx::query(
-            "INSERT INTO budget_groups (id, name, budget_max, budget_spent, created_at) \
-             VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO budget_groups (id, name, budget_max, budget_spent, created_at, account_ref) \
+             VALUES (?, ?, ?, ?, ?, ?)",
         )
         .bind(&record.id)
         .bind(&record.name)
         .bind(record.budget_max)
         .bind(record.budget_spent)
         .bind(record.created_at)
+        .bind(&record.account_ref)
         .execute(&self.pool)
         .await?;
         Ok(record)
@@ -754,11 +817,17 @@ impl KeyStore {
     /// to also see tombstones (audit view).
     pub async fn list_groups(&self, include_deleted: bool) -> Result<Vec<GroupRecord>, AuthError> {
         let sql = if include_deleted {
-            "SELECT id, name, budget_max, budget_spent, created_at, deleted_at \
-             FROM budget_groups ORDER BY created_at, id"
+            concat!(
+                "SELECT ",
+                group_columns!(),
+                " FROM budget_groups ORDER BY created_at, id"
+            )
         } else {
-            "SELECT id, name, budget_max, budget_spent, created_at, deleted_at \
-             FROM budget_groups WHERE deleted_at IS NULL ORDER BY created_at, id"
+            concat!(
+                "SELECT ",
+                group_columns!(),
+                " FROM budget_groups WHERE deleted_at IS NULL ORDER BY created_at, id"
+            )
         };
         let records = sqlx::query_as::<_, GroupRecord>(sql)
             .fetch_all(&self.pool)
@@ -779,14 +848,19 @@ impl KeyStore {
         id: &str,
         patch: GroupPatch,
     ) -> Result<Option<GroupRecord>, AuthError> {
+        let ref_change = patch.account_ref.is_some();
+        let ref_value = patch.account_ref.flatten();
         let changed = sqlx::query(
             "UPDATE budget_groups SET \
                name = COALESCE(?, name), \
-               budget_max = COALESCE(?, budget_max) \
+               budget_max = COALESCE(?, budget_max), \
+               account_ref = CASE WHEN ? THEN ? ELSE account_ref END \
              WHERE id = ? AND deleted_at IS NULL",
         )
         .bind(patch.name)
         .bind(patch.budget_max)
+        .bind(ref_change)
+        .bind(ref_value)
         .bind(id)
         .execute(&self.pool)
         .await?
@@ -843,10 +917,11 @@ impl KeyStore {
     /// Fetch one group by id, tombstoned or not (internal re-read after a
     /// successful write).
     async fn fetch_group(&self, id: &str) -> Result<Option<GroupRecord>, AuthError> {
-        let record = sqlx::query_as::<_, GroupRecord>(
-            "SELECT id, name, budget_max, budget_spent, created_at, deleted_at \
-             FROM budget_groups WHERE id = ?",
-        )
+        let record = sqlx::query_as::<_, GroupRecord>(concat!(
+            "SELECT ",
+            group_columns!(),
+            " FROM budget_groups WHERE id = ?"
+        ))
         .bind(id)
         .fetch_optional(&self.pool)
         .await?;

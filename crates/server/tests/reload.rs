@@ -226,6 +226,7 @@ async fn reload_makes_an_offline_group_and_member_key_live_and_group_enforced() 
         .create_group(NewGroup {
             name: "offline-pool".to_owned(),
             budget_max: Some(5.0),
+            account_ref: None,
         })
         .await
         .expect("create group offline");

@@ -535,6 +535,7 @@ fn run_keys_inner(action: KeysAction) -> anyhow::Result<()> {
                         rpm_limit,
                         tpm_limit,
                         expires_at,
+                        external_ref: None,
                     })
                     .await
                     .context("failed to create key")?;
