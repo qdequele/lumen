@@ -8,6 +8,7 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ### Added
 
+- GET /v1/models lists virtual models ("virtual": true, description, modalities common to every reachable leaf); listed = false hides one.
 - Virtual models (ADR 014): `[[virtual_models]]` with `single`, `fallback`, `split` and `switch` strategies, typed `fallback_on` triggers, `switch` conditions on budget group, metadata and request facts, per-target overrides and chat presets. Responses carry `x-lumen-route`; `usage_log.route` and `lumen_virtual_model_requests_total` record the path.
 - Jev rerank templates: noul, score, composite and choice strategies plus a static context (wired to virtual models in a later change).
 - Upstream context-length and content-policy refusals are classified from the error body (new internal ProviderError variants; client-facing errors unchanged).
