@@ -74,6 +74,7 @@ impl Harness {
                 group_id: None,
                 model: "gpt-test".to_owned(),
                 model_used: "gpt-test".to_owned(),
+                route: None,
                 provider: "openai".to_owned(),
                 capability: "chat".to_owned(),
                 tokens_in: 10,

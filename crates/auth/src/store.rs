@@ -203,6 +203,9 @@ pub struct UsageRecord {
     /// Model that actually served the request - the same as `model` unless a
     /// fallback fired (M6 §6.2).
     pub model_used: String,
+    /// The route a virtual-model request took (ADR 014), e.g.
+    /// `acme/chat>acme/eu>mistral-large`; `None` for a direct call.
+    pub route: Option<String>,
     /// Provider instance that served the request (issue #64). Empty for rows
     /// written before the column existed.
     pub provider: String,
@@ -390,6 +393,9 @@ pub struct UsageRow {
     pub model: String,
     /// Model that actually served the request (differs when a fallback fired).
     pub model_used: String,
+    /// The route a virtual-model request took (ADR 014); `None` for a direct
+    /// call and for rows written before the column existed.
+    pub route: Option<String>,
     /// Provider instance that served the request.
     pub provider: String,
     /// `chat` | `embed` | `rerank` | `systemone`.
@@ -934,13 +940,14 @@ impl KeyStore {
         for rec in batch {
             sqlx::query(
                 "INSERT INTO usage_log \
-                 (key_id, group_id, model, model_used, provider, capability, tokens_in, tokens_out, search_units, cached_tokens, reasoning_tokens, cache_write_tokens, media_count, media_bytes, estimated, cost, latency_ms, status, metadata, ts) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 (key_id, group_id, model, model_used, route, provider, capability, tokens_in, tokens_out, search_units, cached_tokens, reasoning_tokens, cache_write_tokens, media_count, media_bytes, estimated, cost, latency_ms, status, metadata, ts) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(&rec.key_id)
             .bind(&rec.group_id)
             .bind(&rec.model)
             .bind(&rec.model_used)
+            .bind(&rec.route)
             .bind(&rec.provider)
             .bind(&rec.capability)
             .bind(rec.tokens_in)
@@ -1084,7 +1091,7 @@ impl KeyStore {
         limit: i64,
     ) -> Result<Vec<UsageRow>, AuthError> {
         let rows = sqlx::query_as::<_, UsageRow>(
-            "SELECT id, key_id, group_id, model, model_used, provider, capability, \
+            "SELECT id, key_id, group_id, model, model_used, route, provider, capability, \
              tokens_in, tokens_out, cached_tokens, reasoning_tokens, cache_write_tokens, \
              search_units, media_count, media_bytes, estimated, cost, latency_ms, \
              status, metadata, ts \

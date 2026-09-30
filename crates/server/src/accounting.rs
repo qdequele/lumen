@@ -103,6 +103,9 @@ pub struct Accounting {
     /// [`served_by`](Accounting::served_by) after the executor resolves it;
     /// defaults to the requested model.
     model_used: String,
+    /// The route of a virtual-model request (ADR 014), set by the handler
+    /// after execution; `None` for a foundation model called directly.
+    route: Option<String>,
     provider: String,
     key_id: Option<String>,
     /// The key's budget group at admission (ADR 009), for usage attribution.
@@ -191,6 +194,7 @@ impl Accounting {
             capability: target.capability,
             model: target.model.to_owned(),
             model_used: target.model.to_owned(),
+            route: None,
             provider: target.provider.to_owned(),
             key_id,
             group_id,
@@ -225,6 +229,7 @@ impl Accounting {
             group_id,
             model: target.model.to_owned(),
             model_used: target.model.to_owned(),
+            route: None,
             provider: target.provider.to_owned(),
             capability: target.capability.to_owned(),
             tokens_in: 0,
@@ -269,6 +274,12 @@ impl Accounting {
     pub fn served_by(&mut self, model_used: &str, provider: &str) {
         model_used.clone_into(&mut self.model_used);
         provider.clone_into(&mut self.provider);
+    }
+
+    /// Record the route the request took through a virtual model (ADR 014).
+    /// `None` for a foundation model called directly.
+    pub fn set_route(&mut self, route: Option<&str>) {
+        self.route = route.map(str::to_owned);
     }
 
     /// The model that served the request (for the caller's cost calculation).
@@ -329,6 +340,7 @@ impl Accounting {
             capability = self.capability,
             model = %self.model,
             model_used = %self.model_used,
+            route = self.route.as_deref().unwrap_or("-"),
             provider = %self.provider,
             key_id = self.key_id.as_deref().unwrap_or("-"),
             tokens_in = outcome.tokens_in,
@@ -409,6 +421,10 @@ impl Accounting {
             );
         }
 
+        if self.route.is_some() {
+            self.tokens
+                .inc_virtual_request(&self.model, &self.model_used);
+        }
         self.enqueue_usage(outcome, elapsed, metadata_json);
     }
 
@@ -428,6 +444,7 @@ impl Accounting {
             group_id: self.group_id.clone(),
             model: self.model.clone(),
             model_used: self.model_used.clone(),
+            route: self.route.clone(),
             provider: self.provider.clone(),
             capability: self.capability.to_owned(),
             tokens_in: i64::try_from(outcome.tokens_in).unwrap_or(i64::MAX),
@@ -675,6 +692,7 @@ mod tests {
             capability: "chat",
             model: "gpt".to_owned(),
             model_used: "gpt".to_owned(),
+            route: None,
             provider: "openai".to_owned(),
             key_id: None,
             group_id: None,

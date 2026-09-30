@@ -124,6 +124,7 @@ fn row(ts: i64) -> UsageRecord {
         group_id: None,
         model: "gpt".to_owned(),
         model_used: "gpt".to_owned(),
+        route: None,
         provider: "openai".to_owned(),
         capability: "chat".to_owned(),
         tokens_in: 10,

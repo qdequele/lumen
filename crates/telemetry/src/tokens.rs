@@ -32,6 +32,7 @@ pub struct TokenMetrics {
     tokens_estimated_total: IntCounter,
     usage_log_dropped_total: IntCounter,
     metadata_rejected_total: IntCounter,
+    virtual_requests_total: IntCounterVec,
     /// Allowlisted metadata keys, in registration order. Values passed to the
     /// record methods must align with this order.
     metadata_labels: Vec<String>,
@@ -117,6 +118,14 @@ impl TokenMetrics {
             "lumen_metadata_rejected_total",
             "x-lumen-metadata headers dropped as malformed or out of bounds.",
         )?;
+        let virtual_requests_total = IntCounterVec::new(
+            Opts::new(
+                "lumen_virtual_model_requests_total",
+                "Requests served through a virtual model (ADR 014), by virtual model and the \
+                 foundation model that served.",
+            ),
+            &["virtual_model", "model_used"],
+        )?;
 
         let registry = metrics.registry();
         registry.register(Box::new(tokens_total.clone()))?;
@@ -127,6 +136,7 @@ impl TokenMetrics {
         registry.register(Box::new(tokens_estimated_total.clone()))?;
         registry.register(Box::new(usage_log_dropped_total.clone()))?;
         registry.register(Box::new(metadata_rejected_total.clone()))?;
+        registry.register(Box::new(virtual_requests_total.clone()))?;
 
         Ok(Self {
             tokens_total,
@@ -137,8 +147,17 @@ impl TokenMetrics {
             tokens_estimated_total,
             usage_log_dropped_total,
             metadata_rejected_total,
+            virtual_requests_total,
             metadata_labels: metadata_labels.to_vec(),
         })
+    }
+
+    /// One request served through `virtual_model` by `model_used` (ADR 014).
+    /// Both labels are operator-defined ids, so cardinality is bounded.
+    pub fn inc_virtual_request(&self, virtual_model: &str, model_used: &str) {
+        self.virtual_requests_total
+            .with_label_values(&[virtual_model, model_used])
+            .inc();
     }
 
     /// The allowlisted metadata label names, in the order the record methods
@@ -546,5 +565,20 @@ mod tests {
         let out = metrics.encode_text();
         assert!(out.contains("lumen_usage_log_dropped_total 1"));
         assert!(out.contains("lumen_metadata_rejected_total 2"));
+    }
+
+    #[test]
+    fn virtual_model_requests_are_counted_by_virtual_and_served_model() {
+        let metrics = Metrics::new();
+        let tokens = TokenMetrics::register(&metrics, &[]).unwrap();
+        tokens.inc_virtual_request("acme/chat", "gpt-4o");
+        tokens.inc_virtual_request("acme/chat", "gpt-4o");
+        let text = metrics.encode_text();
+        assert!(
+            text.contains(
+                r#"lumen_virtual_model_requests_total{model_used="gpt-4o",virtual_model="acme/chat"} 2"#
+            ),
+            "{text}"
+        );
     }
 }

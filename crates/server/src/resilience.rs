@@ -36,6 +36,20 @@ pub fn model_used_headers(model_used: &str) -> HeaderMap {
     headers
 }
 
+/// The `x-lumen-route` response header name (ADR 014).
+const ROUTE_HEADER: &str = "x-lumen-route";
+
+/// [`model_used_headers`] plus, for a virtual-model request, the route it
+/// took (`x-lumen-route`, e.g. `acme/chat>acme/eu>mistral-large`).
+#[must_use]
+pub fn routing_headers(model_used: &str, route: Option<&str>) -> HeaderMap {
+    let mut headers = model_used_headers(model_used);
+    if let Some(value) = route.and_then(|r| HeaderValue::from_str(r).ok()) {
+        headers.insert(HeaderName::from_static(ROUTE_HEADER), value);
+    }
+    headers
+}
+
 /// The two request-scoped timeouts the executor enforces (connect is a
 /// client-wide setting, applied when the HTTP client is built).
 #[derive(Debug, Clone, Copy)]
@@ -394,5 +408,15 @@ mod tests {
         let direct = rt.decide(Capability::Chat, "claude", &NoFacts).unwrap();
         assert_eq!(direct.attempts.len(), 1);
         assert!(rt.routing().get("v").is_some());
+    }
+
+    #[test]
+    fn routing_headers_carry_the_route_only_for_virtual_models() {
+        let h = routing_headers("gpt-4o", Some("acme/chat>gpt-4o"));
+        assert_eq!(h.get("x-lumen-model-used").unwrap(), "gpt-4o");
+        assert_eq!(h.get("x-lumen-route").unwrap(), "acme/chat>gpt-4o");
+        assert!(routing_headers("gpt-4o", None)
+            .get("x-lumen-route")
+            .is_none());
     }
 }
