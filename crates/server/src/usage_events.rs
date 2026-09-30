@@ -82,6 +82,7 @@ impl UsageEventsSender {
             Ok(rows) => rows,
             Err(error) => {
                 tracing::warn!(%error, "usage events: could not read the outbox");
+                self.metrics.inc_failed("store", 1);
                 return Delivery::Failed;
             }
         };
@@ -99,20 +100,26 @@ impl UsageEventsSender {
             .body(body)
             .send()
             .await;
-        let reason = match response {
-            Err(error) if error.is_timeout() => "timeout",
-            Err(_) => "connect",
-            Ok(resp) if resp.status() == reqwest::StatusCode::UNAUTHORIZED => "auth",
-            Ok(resp) if !resp.status().is_success() => "status",
+        // `without_url` strips the endpoint from the transport error; the
+        // body and the signing key are never logged.
+        let (reason, detail) = match response {
+            Err(error) if error.is_timeout() => ("timeout", error.without_url().to_string()),
+            Err(error) => ("connect", error.without_url().to_string()),
+            Ok(resp) if resp.status() == reqwest::StatusCode::UNAUTHORIZED => {
+                ("auth", String::new())
+            }
+            Ok(resp) if !resp.status().is_success() => {
+                ("status", format!("HTTP {}", resp.status().as_u16()))
+            }
             Ok(resp) => match resp.json::<Ack>().await {
                 Ok(ack) => return self.settle_ack(&ids, &ack.accepted, now_ms).await,
-                Err(_) => "malformed",
+                Err(error) => ("malformed", error.without_url().to_string()),
             },
         };
         if reason == "auth" {
             tracing::error!(endpoint = %self.endpoint, "usage events rejected with 401: check the signing secret");
         } else {
-            tracing::warn!(endpoint = %self.endpoint, reason, "usage events delivery failed; will retry");
+            tracing::warn!(endpoint = %self.endpoint, reason, error = %detail, "usage events delivery failed; will retry");
         }
         self.metrics
             .inc_failed(reason, u64::try_from(ids.len()).unwrap_or(0));
@@ -358,16 +365,54 @@ mod tests {
 
     #[tokio::test]
     async fn redirects_are_not_followed() {
+        // A second server that must never be contacted: wiremock verifies
+        // `.expect(0)` when it drops.
+        let target = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&target)
+            .await;
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .respond_with(
-                ResponseTemplate::new(307).insert_header("location", "https://evil.example/x"),
+                ResponseTemplate::new(307)
+                    .insert_header("location", format!("{}/x", target.uri()).as_str()),
             )
             .mount(&server)
             .await;
-        let (s, store, _) = sender(&server, &["a"]).await;
+        let (s, store, metrics) = sender(&server, &["a"]).await;
         assert_eq!(s.deliver_once(10).await, Delivery::Failed);
         assert_eq!(store.outbox_stats().await.unwrap().0, 1);
+        assert!(
+            metrics
+                .encode_text()
+                .contains(r#"lumen_usage_events_failed_total{reason="status"} 1"#),
+            "a 307 is a status failure; a followed redirect would be a different reason"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_loop_backs_off_on_failure_and_cancels_promptly() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        let (s, _, _) = sender(&server, &["a"]).await;
+        let cancel = CancellationToken::new();
+        let handle = spawn_usage_events_sender(Arc::new(s), cancel.clone());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("the sender stops promptly on cancel")
+            .unwrap();
+        let requests = server.received_requests().await.unwrap().len();
+        assert!(
+            (1..=2).contains(&requests),
+            "a failing Lab must not be hot-spun: {requests} requests"
+        );
     }
 
     #[tokio::test]
