@@ -130,7 +130,7 @@ Upstream failures follow the usual mapping (see [Error codes](../errors.md)):
 |-----------------------|----------------------------------------------|----------------------|
 | `401`, `422`          | `LM-3003` (502), names the provider; the upstream body is not forwarded | no |
 | `429`                 | `LM-3001` (429), honouring `Retry-After`     | yes                  |
-| `529` Overloaded      | a retryable 5xx                              | yes: retries, then `fallbacks` |
+| `529` Overloaded      | a retryable 5xx                              | yes: retries, then the virtual model's next target |
 
 A TypeSafe `401` means the gateway's upstream key is wrong: it surfaces as a
 `502` naming the provider, never as a misleading `401` to your client.
@@ -185,20 +185,26 @@ upstream rate limits across tenants, set per-key RPM/TPM quotas.
 
 ## Fallbacks
 
-Like any capability, a SystemOne model can list `fallbacks`. A common setup
-pins a version for reproducible answers and falls back to the stable alias
-when that version is overloaded (`529`) or its circuit is open:
+Like any capability, SystemOne can fall back through a [virtual
+model](../virtual-models.md). A common setup pins a version for reproducible
+answers and falls back to the stable alias when that version is overloaded
+(`529`, the `provider_error` trigger) or its circuit is open:
 
 ```toml
 [[providers.models]]
-id = "jev-1.13.0"
+id = "typesafe/jev-1.13.0"
 upstream_id = "jev-1.13.0"
 capabilities = ["systemone"]
 cost_per_1m_input = 0.042
-fallbacks = ["jev"]
+
+[[virtual_models]]
+id = "jev-1.13.0"
+capability = "systemone"
+strategy = "fallback"
+targets = [{ model = "typesafe/jev-1.13.0" }, { model = "jev" }]
 ```
 
-Each fallback must exist and serve `systemone` (validated at boot). See
+Each target must exist and serve `systemone` (validated at boot). See
 [Resilience](../operations/resilience.md).
 
 ## TypeSafe SDK drop-in
@@ -253,9 +259,10 @@ $TYPESAFE_BASE_URL/v1/systemone`.
   `"capabilities": ["systemone"]`), which the TypeSafe SDKs do not parse. Every
   other SDK call goes to `/v1/systemone` and works.
 - **Jev as a reranker** goes through `/v1/rerank`, not this endpoint: declare
-  a `typesafe` model with `capabilities = ["rerank"]`; see
-  [Jev as a reranker](../reranking/reranking.md#jev-as-a-reranker-typesafe).
-  Per-key or per-tenant converters are not supported yet
+  a rerank virtual model whose target carries a `remap` onto a SystemOne
+  model; see [Jev as a reranker](../reranking/reranking.md#jev-as-a-reranker-typesafe)
+  and [Virtual models](../virtual-models.md#7-jev-as-a-reranker). Per-tenant
+  relevance rules use a `switch` on the budget group
   ([design notes](../design/systemone-rerank-mapping.md)).
 - **No streaming.** `/v1/systemone` is request/response only, like TypeSafe's
   endpoint.

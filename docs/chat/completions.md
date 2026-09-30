@@ -65,10 +65,13 @@ Full taxonomy in [Error codes](../errors.md).
 
 ## Fallbacks
 
-If the model has a `fallbacks` list and the primary provider fails, the
-request fails over automatically. The model that actually served the request
+If the requested id is a [virtual model](../virtual-models.md) with a
+`fallback` strategy and the primary target fails, the request fails over
+automatically. The foundation model that actually served the request
 (primary or a fallback) is reported in the `x-lumen-model-used` response
-header. See [Resilience](../operations/resilience.md).
+header, and the path taken in `x-lumen-route`. A virtual model can also carry
+a chat preset (a stored system prompt), which is applied to the request before
+routing. See [Resilience](../operations/resilience.md).
 
 ## Providers
 

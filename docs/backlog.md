@@ -42,9 +42,11 @@ milestone.
   (128 KB state, 300 questions); a typical request is already ~3 us. The same
   applies to the response: forward upstream bytes untouched when no usage
   estimate has to be injected.
-- **Jev-backed `/v1/rerank`.** Design proposals (custom rerank models,
-  per-group model aliasing, profile header) in
-  `docs/design/systemone-rerank-mapping.md`; awaiting a decision.
+- ~~**Jev-backed `/v1/rerank`.**~~ Done (ADR 014): a rerank virtual model
+  whose target carries a `remap` (`noul`, `score`, `composite`, `choice`,
+  static `context`), with per-tenant rules through `switch` on the budget
+  group and a Cohere fallback. Design notes in
+  `docs/design/systemone-rerank-mapping.md`.
 - **`GET /v1/models` in TypeSafe's shape.** The TypeSafe SDKs' `models.list()`
   expects `{"models":[{name, description, release_date}]}`; LUMEN keeps the
   OpenAI list shape, so that one SDK call does not work through the gateway.
@@ -52,6 +54,23 @@ milestone.
   (`mis-aligned LINKEDIT string pool` loading `sqlx-macros`), so `cargo bench`
   fails locally unless `CARGO_PROFILE_RELEASE_STRIP=false`. Consider
   `strip = "debuginfo"` or a separate bench profile.
+
+## Noted while building ADR 014 (virtual models)
+
+- **Model-driven routing (spec 2).** `classify` (one SystemOne `choice` call
+  to Jev whose options are the targets' descriptions; the most probable
+  option wins, below `min_confidence` the default target is used) and
+  `semantic` (target descriptions embedded at load, one embedding call per
+  request, a dot product per target, below `min_similarity` the default). Both
+  add one upstream call before the real one, so they are opt-in per virtual
+  model; a router failure routes to the default, never fails the request; the
+  router call's tokens and cost are recorded separately (ADR 003).
+- **Named, reusable remap templates.** Remaps are inline on a target today,
+  so several tenants sharing one relevance rule repeat it. A named template
+  referenced by id would remove the duplication.
+- **Presets for non-chat capabilities.** `preset` is chat-only. Embed
+  (default `dimensions`) and rerank (default `top_n`) can already use
+  overrides on a target; a stored template for them is not planned yet.
 
 ## Noted while building ADR 012 (config source abstraction)
 

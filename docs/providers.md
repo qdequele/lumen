@@ -531,7 +531,9 @@ capabilities = ["rerank"]
   versioned ids such as `jev-1.13.0`, mapped through `upstream_id`.
 - **Errors**: TypeSafe `401` / `422` surface as `LM-3003` (502, not retried,
   upstream body not forwarded); `429` is `LM-3001` honouring `Retry-After`;
-  `529 Overloaded` is a retryable 5xx, so retries and `fallbacks` apply.
+  `529 Overloaded` is a retryable 5xx, so retries apply, and a virtual model's
+  `provider_error` fallback trigger matches it (not `rate_limited`, which is an
+  upstream 429).
 - **Cost**: Jev bills input tokens only, $0.042 per 1M (TypeSafe pricing,
   2026-09): set `cost_per_1m_input = 0.042` and no output price.
 - **Usage**: upstream `usage.input_tokens` / `output_tokens` when reported;
@@ -553,20 +555,32 @@ upstream_id = "jev-latest"
 capabilities = ["systemone"]
 cost_per_1m_input = 0.042
 
-# A pinned version for reproducible answers, falling back to the stable alias
-# when it is overloaded (529) or its circuit is open.
+# A pinned version for reproducible answers.
 [[providers.models]]
-id = "jev-1.13.0"
+id = "typesafe/jev-1.13.0"
+upstream_id = "jev-1.13.0"
 capabilities = ["systemone"]
 cost_per_1m_input = 0.042
-fallbacks = ["jev"]
 
-# Jev as a reranker: plain /v1/rerank, one noul question per document.
-[[providers.models]]
+# Clients call `jev-1.13.0`; it falls back to the stable alias when the pinned
+# version is overloaded (529) or its circuit is open.
+[[virtual_models]]
+id = "jev-1.13.0"
+capability = "systemone"
+strategy = "fallback"
+targets = [{ model = "typesafe/jev-1.13.0" }, { model = "jev" }]
+
+# Jev as a reranker: plain /v1/rerank, one noul question per document. A
+# `typesafe` model cannot declare `rerank` itself; a virtual model's `remap`
+# does the conversion (see docs/virtual-models.md).
+[[virtual_models]]
 id = "jev-rerank"
-upstream_id = "jev-latest"
-capabilities = ["rerank"]
-cost_per_1m_input = 0.042
+capability = "rerank"
+strategy = "single"
+
+[[virtual_models.targets]]
+model = "jev"
+remap = { strategy = "noul" }
 ```
 
 ## nvidia (NIM)
@@ -989,16 +1003,23 @@ zero, and the response is still flagged `"estimated": true` - see the
 
 ## Fallbacks across providers
 
-Any model can name an ordered list of `fallbacks` - models that back it when its
-provider exhausts retries or its circuit is open. Each fallback must exist and
-serve every capability of the model it backs (validated at boot), which lets you
-survive a single-vendor outage by spanning providers:
+A [virtual model](virtual-models.md) with the `fallback` strategy backs one
+model with others when its provider exhausts retries or its circuit is open
+(or on any other trigger you list in `fallback_on`). Each target must exist and
+serve the virtual model's capability (validated at boot and on every reload),
+which lets you survive a single-vendor outage by spanning providers:
 
 ```toml
 [[providers.models]]
-id = "gpt-4o"
+id = "openai/gpt-4o"
+upstream_id = "gpt-4o"
 capabilities = ["chat"]
-fallbacks = ["claude-sonnet-4-5"]     # different vendor, same capability
+
+[[virtual_models]]
+id = "gpt-4o"
+capability = "chat"
+strategy = "fallback"
+targets = [{ model = "openai/gpt-4o" }, { model = "claude-sonnet-4-5" }]   # different vendor, same capability
 ```
 
 See [`docs/adr/005-resilience-execution.md`](adr/005-resilience-execution.md)

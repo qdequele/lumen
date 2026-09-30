@@ -38,12 +38,13 @@ the admin API without a restart.
 
 | Boot layer (restart-only) | Dynamic layer (hot-reloadable, admin-API editable) |
 |---|---|
-| `[server]`: `host`, `port`, `body_limit`, `first_token_timeout_ms`, `sse_heartbeat_ms` | `[[providers]]` (routing, models, pricing, fallbacks) |
-| `log_format` | `[resilience]` |
-| `[telemetry]` (the label allowlist becomes the Prometheus label set, fixed at startup) | `[tokenizer]` |
-| `auth.enabled`, `auth.db_path` | `[image_fetch]` |
-| `auth.usage_channel_capacity`, `auth.usage_batch_max`, `auth.usage_flush_ms` (the usage-log channel is sized at startup) | `[webhooks]` |
-| `config_source` itself | `auth.flush_interval_ms`, `auth.retention_days` |
+| `[server]`: `host`, `port`, `body_limit`, `first_token_timeout_ms`, `sse_heartbeat_ms` | `[[providers]]` (routing, foundation models, pricing) |
+| `log_format` | `[[virtual_models]]` (fallback, split, switch, presets, Jev remaps; see [Virtual models](../virtual-models.md)) |
+| `[telemetry]` (the label allowlist becomes the Prometheus label set, fixed at startup) | `[resilience]` |
+| `auth.enabled`, `auth.db_path` | `[tokenizer]` |
+| `auth.usage_channel_capacity`, `auth.usage_batch_max`, `auth.usage_flush_ms` (the usage-log channel is sized at startup) | `[image_fetch]` |
+| `config_source` itself | `[webhooks]` |
+|  | `auth.flush_interval_ms`, `auth.retention_days` |
 
 Every dynamic-layer setting takes effect on the next hot reload, which an
 admin write triggers itself - so everything the admin API accepts is live
@@ -109,6 +110,11 @@ identically in both modes, and every mutating one requires `If-Match`.
 | `GET` | `/admin/config/providers/{name}` | One provider's full config (its own fields, flattened) plus the document hash. |
 | `PUT` | `/admin/config/providers/{name}` | Create or replace that provider (including its `models`). The path `{name}` must equal the body's own `name` field. |
 | `DELETE` | `/admin/config/providers/{name}` | Remove the provider. |
+| `GET` | `/admin/config/virtual_models` | List every virtual model (`id`, `capability`, `strategy`) plus the document hash. |
+| `GET` | `/admin/config/virtual_models/{id}` | One virtual model's full config plus the document hash. `{id}` is percent-encoded when it contains `/` (`acme%2Fchat`). |
+| `PUT` | `/admin/config/virtual_models/{id}` | Create or replace that virtual model. The path `{id}` must equal the body's own `id` field. |
+| `DELETE` | `/admin/config/virtual_models/{id}` | Remove the virtual model (refused while another virtual model targets it). |
+| `GET` | `/admin/config/virtual_models/{id}/plan` | The fully resolved routing tree, read-only. See [Virtual models](../virtual-models.md#9-admin-api). |
 | `GET` | `/admin/config/{section}` | One of `resilience`, `tokenizer`, `image_fetch`, `webhooks`, `auth` (the dynamic sections; `telemetry` is boot-layer and has no granular route). Response: `{"<section>": <value>, "hash": "<current hash>"}`. |
 | `PUT` | `/admin/config/{section}` | Replace that section. `auth` is special - see [The `auth` section](#the-auth-section-two-knobs-only) below. `webhooks` also accepts `null`, which removes the `[webhooks]` block. |
 
@@ -166,8 +172,8 @@ curl -s -X PUT http://localhost:8080/admin/config \
   db-mode candidate simply carries no boot-layer keys at all; this check
   does not compare values, it refuses the key outright.
 - **A candidate that fails validation** (bad TOML, an unknown field, a
-  dangling `fallbacks` reference, ...) is `400` `LM-1001`, naming the field
-  or the dependent model.
+  an invalid virtual model such as a cycle or a dangling target, ...) is
+  `400` `LM-1001`, naming the field, the virtual model or the dependent model.
 
 Every write runs under one process-wide lock, so two concurrent applies can
 never interleave and defeat the `If-Match` check. The candidate is fully
@@ -185,10 +191,10 @@ from a parsed struct, so in file mode every comment and formatting choice
 outside the table being touched survives untouched. In db mode the
 document is machine-owned and this is harmless either way.
 
-Deleting a provider that another model's `fallbacks` still references is
-refused - `400` `LM-1001`, naming the dependent model - by the same
+Deleting a provider, a foundation model or a virtual model that a virtual
+model still targets is refused - `400` `LM-1001`, naming the dependent model - by the same
 validation pass every other write goes through. Fetching an unknown
-provider name or an unknown `{section}` is `404` `LM-1003`, the same style
+provider name, virtual model id or `{section}` is `404` `LM-1003`, the same style
 every other per-entity admin lookup in LUMEN uses.
 
 ### The `auth` section: two knobs only

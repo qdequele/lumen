@@ -155,8 +155,8 @@ The goals are:
 - **Observability.** New `x-lumen-route` response header with the path taken
   (e.g. `acme/chat>acme/chat-eu>mistral-large`), a new `usage_log.route`
   column (migration 0010), a new Prometheus counter
-  `lumen_virtual_model_requests_total{virtual_model, model_used, outcome}`
-  (virtual ids are operator-defined, so cardinality is bounded), and
+  `lumen_virtual_model_requests_total{virtual_model, model_used}`, counted for
+  served requests (virtual ids are operator-defined, so cardinality is bounded), and
   `virtual_model` and `route` tracing span fields (never prompts, presets or
   remap text). `x-lumen-model-used` and `usage_log.model_used` stay the
   foundation leaf that served, so tokens and cost are still booked to it
