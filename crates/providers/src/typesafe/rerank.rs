@@ -426,6 +426,19 @@ fn document_questions(
     }
 }
 
+/// An upstream probability or normalised score as a `relevance_score`:
+/// clamped to `[0, 1]` (the module contract), and rejected when not finite so
+/// a NaN can never reach the handler's sort.
+fn unit_score(v: f32) -> Result<f32, ProviderError> {
+    if v.is_finite() {
+        Ok(v.clamp(0.0, 1.0))
+    } else {
+        Err(ProviderError::Translation(
+            "typesafe rerank: a non-finite score in the answer".to_owned(),
+        ))
+    }
+}
+
 /// Document `i`'s relevance score from the answers of its questions.
 fn document_score(
     strategy: &RerankStrategy,
@@ -433,18 +446,20 @@ fn document_score(
     i: usize,
 ) -> Result<f32, ProviderError> {
     match strategy {
-        RerankStrategy::Noul { .. } => Ok(answer::<NoulAnswer>(answers, &i.to_string())?.noul),
+        RerankStrategy::Noul { .. } => {
+            unit_score(answer::<NoulAnswer>(answers, &i.to_string())?.noul)
+        }
         RerankStrategy::Score { levels, .. } => {
             // At most `MAX_SCORE_LEVELS`, so the cast is exact.
             #[allow(clippy::cast_precision_loss)]
             let top = levels.len().saturating_sub(1).max(1) as f32;
-            Ok(answer::<ScoreAnswer>(answers, &i.to_string())?.score / top)
+            unit_score(answer::<ScoreAnswer>(answers, &i.to_string())?.score / top)
         }
         RerankStrategy::Composite { questions } => {
             let mut sum = 0.0_f64;
             let mut weights = 0.0_f64;
             for (c, q) in questions.iter().enumerate() {
-                let noul = answer::<NoulAnswer>(answers, &format!("{i}.{c}"))?.noul;
+                let noul = unit_score(answer::<NoulAnswer>(answers, &format!("{i}.{c}"))?.noul)?;
                 sum += q.weight * f64::from(noul);
                 weights += q.weight;
             }
@@ -569,16 +584,20 @@ impl TypesafeRerankProvider {
         let answers = parse_answers(&response)?;
         let choice = answer::<ChoiceAnswer>(&answers, "rank")?;
         let results = (0..req.documents.len())
-            .map(|i| RerankResult {
-                index: u32::try_from(i).unwrap_or(u32::MAX),
-                relevance_score: choice
-                    .probabilities
-                    .get(&format!("d{i}"))
-                    .copied()
-                    .unwrap_or(0.0),
-                document: None,
+            .map(|i| {
+                Ok(RerankResult {
+                    index: u32::try_from(i).unwrap_or(u32::MAX),
+                    relevance_score: unit_score(
+                        choice
+                            .probabilities
+                            .get(&format!("d{i}"))
+                            .copied()
+                            .unwrap_or(0.0),
+                    )?,
+                    document: None,
+                })
             })
-            .collect();
+            .collect::<Result<_, ProviderError>>()?;
         Ok(usage.into_response(results))
     }
 }
@@ -756,6 +775,46 @@ mod tests {
             .unwrap();
         let seen = fake.seen.lock().unwrap().join("\n");
         assert!(seen.starts_with(r#"state={"query":"q"} "#), "{seen}");
+    }
+
+    #[tokio::test]
+    async fn out_of_range_answers_are_clamped_to_the_unit_interval() {
+        let t = RerankTemplate {
+            context: None,
+            strategy: RerankStrategy::Score {
+                instructions: "rate".into(),
+                levels: vec!["off".into(), "fully".into()],
+            },
+        };
+        let (p, _) = provider(t, |_| serde_json::json!({ "type": "score", "score": 7.0 }));
+        let out = p
+            .rerank(request(&["a"]), CancellationToken::new())
+            .await
+            .unwrap();
+        assert!((out.results[0].relevance_score - 1.0).abs() < f32::EPSILON);
+
+        let (p, _) = provider(
+            RerankTemplate::default(),
+            |_| serde_json::json!({ "type": "noul", "noul": -0.4 }),
+        );
+        let out = p
+            .rerank(request(&["a"]), CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(out.results[0].relevance_score.abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn non_finite_scores_are_a_translation_error() {
+        assert!(matches!(
+            unit_score(f32::NAN),
+            Err(ProviderError::Translation(_))
+        ));
+        assert!(matches!(
+            unit_score(f32::INFINITY),
+            Err(ProviderError::Translation(_))
+        ));
+        assert!((unit_score(0.3).unwrap() - 0.3).abs() < f32::EPSILON);
     }
 
     #[tokio::test]
