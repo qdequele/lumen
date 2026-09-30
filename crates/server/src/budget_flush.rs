@@ -27,17 +27,31 @@ pub async fn flush_budgets(runtime: &AuthRuntime, now_ms: i64) {
 /// and flush now, so its last spend is persisted and billed. A failed flush
 /// leaves it retired, and every later flush retries it.
 ///
-/// The retire is synchronous; the flush runs in a detached task that this
-/// function awaits. Dropping the caller's future (client disconnect, request
-/// timeout, shutdown deadline) therefore cannot cancel a flush between
-/// `drain_flush` and its commit or rollback, which would lose dirty flags and
-/// units or double-bill a delta.
+/// The retire is synchronous; the flush itself is [`flush_detached`].
 pub async fn retire_and_flush_key(runtime: &Arc<AuthRuntime>, entry: Arc<KeyEntry>, now_ms: i64) {
     runtime.keys.retire(entry);
+    flush_detached_at(runtime, now_ms).await;
+}
+
+/// Run one [`flush_budgets`] in a detached task and await it.
+///
+/// The spawn makes the flush uncancellable by a dropped caller (client
+/// disconnect, request timeout, shutdown deadline): dropping the future
+/// cannot cancel a flush between `drain_flush` and its commit or rollback,
+/// which would lose dirty flags and units or double-bill a delta. Admin
+/// handlers call it before a change that alters billability, so spend
+/// already settled is billed under the account in force when it was spent.
+pub async fn flush_detached(runtime: &Arc<AuthRuntime>) {
+    flush_detached_at(runtime, lumen_auth::now_unix_ms()).await;
+}
+
+/// [`flush_detached`] at an explicit clock reading (the single place the
+/// detached spawn lives).
+async fn flush_detached_at(runtime: &Arc<AuthRuntime>, now_ms: i64) {
     let detached = Arc::clone(runtime);
     let handle = tokio::spawn(async move { flush_budgets(&detached, now_ms).await });
     if let Err(error) = handle.await {
-        tracing::warn!(%error, "budget flush task failed after a key delete");
+        tracing::warn!(%error, "budget flush task failed");
     }
 }
 

@@ -197,6 +197,37 @@ fn runtime(state: &AppState) -> Result<&crate::auth::AuthRuntime, ApiError> {
         .ok_or_else(|| GatewayError::Unauthorized.into())
 }
 
+/// The shared auth runtime, for handlers that hand it to a detached flush.
+fn runtime_arc(state: &AppState) -> Result<&Arc<crate::auth::AuthRuntime>, ApiError> {
+    state
+        .auth
+        .as_ref()
+        .ok_or_else(|| GatewayError::Unauthorized.into())
+}
+
+/// Longest accepted control-plane ref (ADR 015).
+const MAX_REF_LEN: usize = 128;
+
+/// Validate an opaque control-plane ref (ADR 015): non-empty, at most 128
+/// characters, and a UUID for `account_ref` while `[usage_events]` is
+/// configured (the Lab rejects any other `account_id`).
+fn validate_ref(field: &str, value: Option<&str>, must_be_uuid: bool) -> Result<(), ApiError> {
+    let Some(value) = value else { return Ok(()) };
+    if value.is_empty() || value.len() > MAX_REF_LEN {
+        return Err(GatewayError::InvalidRequest(format!(
+            "`{field}` must be 1 to {MAX_REF_LEN} characters"
+        ))
+        .into());
+    }
+    if must_be_uuid && !lumen_auth::billing::is_uuid(value) {
+        return Err(GatewayError::InvalidRequest(format!(
+            "`{field}` must be a UUID while [usage_events] is configured"
+        ))
+        .into());
+    }
+    Ok(())
+}
+
 /// Create a virtual key.
 pub async fn create_key(
     State(state): State<AppState>,
@@ -206,6 +237,7 @@ pub async fn create_key(
     if params.name.trim().is_empty() {
         return Err(GatewayError::InvalidRequest("`name` must not be empty".to_owned()).into());
     }
+    validate_ref("external_ref", params.external_ref.as_deref(), false)?;
     let auth = runtime(&state)?;
     let (plaintext, record) = auth.store.create_key(params).await.map_err(store_error)?;
     // Make the key usable immediately, without waiting for a reboot.
@@ -225,6 +257,9 @@ pub struct ListKeysParams {
     /// Also list soft-deleted tombstones (default: active keys only).
     #[serde(default)]
     pub include_deleted: bool,
+    /// Only keys with this `external_ref` (ADR 015).
+    #[serde(default)]
+    pub external_ref: Option<String>,
 }
 
 /// List every active key (no secrets: ids, names, budgets, limits, flags).
@@ -237,11 +272,14 @@ pub async fn list_keys(
 ) -> Result<Json<Vec<VirtualKeyRecord>>, ApiError> {
     let Query(params) = params.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
     let auth = runtime(&state)?;
-    let keys = auth
+    let mut keys = auth
         .store
         .list_keys(params.include_deleted)
         .await
         .map_err(|e| internal(&e))?;
+    if let Some(want) = &params.external_ref {
+        keys.retain(|k| k.external_ref.as_deref() == Some(want.as_str()));
+    }
     Ok(Json(keys))
 }
 
@@ -254,12 +292,23 @@ pub async fn patch_key(
     payload: Result<Json<KeyPatch>, JsonRejection>,
 ) -> Result<Json<VirtualKeyRecord>, ApiError> {
     let Json(patch) = payload.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
-    let auth = runtime(&state)?;
+    validate_ref(
+        "external_ref",
+        patch.external_ref.as_ref().and_then(Option::as_deref),
+        false,
+    )?;
+    let shared = runtime_arc(&state)?;
+    let auth = shared.as_ref();
     // Snapshot the live disabled flag BEFORE the patch so `key.disabled` can
     // be edge-triggered: a PATCH that leaves an already-disabled key disabled
     // is not a state change and must not re-notify the billing backend
     // (ADR 011 §1).
     let was_disabled = auth.keys.key_disabled(&id);
+    // A group move changes which account the key's spend bills to: bill what
+    // is already settled under the membership in force when it was spent.
+    if patch.group_id.is_some() {
+        crate::budget_flush::flush_detached(shared).await;
+    }
     let updated = auth
         .store
         .update_key(&id, patch)
@@ -285,7 +334,8 @@ pub async fn delete_key(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    let auth = runtime(&state)?;
+    let shared = runtime_arc(&state)?;
+    let auth = shared.as_ref();
     let deleted = auth.store.delete_key(&id).await.map_err(|e| internal(&e))?;
     // Evict from the live table UNCONDITIONALLY - whether this call's DB
     // write actually matched a row (`Some`) or the row was already
@@ -306,10 +356,7 @@ pub async fn delete_key(
         // Flush and bill the final accrued spend now: once the entry is
         // dropped the periodic flusher never sees this id again (ADR 015
         // routes this through the same flush as every other path).
-        if let Some(shared) = &state.auth {
-            crate::budget_flush::retire_and_flush_key(shared, entry, lumen_auth::now_unix_ms())
-                .await;
-        }
+        crate::budget_flush::retire_and_flush_key(shared, entry, lumen_auth::now_unix_ms()).await;
     }
     deleted.ok_or_else(|| GatewayError::InvalidRequest(format!("unknown key id '{id}'")))?;
     Ok(StatusCode::NO_CONTENT)
@@ -360,6 +407,11 @@ pub async fn create_group(
         return Err(GatewayError::InvalidRequest("`name` must not be empty".to_owned()).into());
     }
     let auth = runtime(&state)?;
+    validate_ref(
+        "account_ref",
+        params.account_ref.as_deref(),
+        auth.keys.billing_enabled(),
+    )?;
     let record = auth
         .store
         .create_group(params)
@@ -376,6 +428,9 @@ pub struct ListGroupsParams {
     /// Also list soft-deleted tombstones (default: active groups only).
     #[serde(default)]
     pub include_deleted: bool,
+    /// Only groups with this `account_ref` (ADR 015).
+    #[serde(default)]
+    pub account_ref: Option<String>,
 }
 
 /// List every active budget group; `?include_deleted=true` adds tombstones.
@@ -385,11 +440,14 @@ pub async fn list_groups(
 ) -> Result<Json<Vec<GroupRecord>>, ApiError> {
     let Query(params) = params.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
     let auth = runtime(&state)?;
-    let groups = auth
+    let mut groups = auth
         .store
         .list_groups(params.include_deleted)
         .await
         .map_err(|e| internal(&e))?;
+    if let Some(want) = &params.account_ref {
+        groups.retain(|g| g.account_ref.as_deref() == Some(want.as_str()));
+    }
     Ok(Json(groups))
 }
 
@@ -402,7 +460,19 @@ pub async fn patch_group(
     payload: Result<Json<GroupPatch>, JsonRejection>,
 ) -> Result<Json<GroupRecord>, ApiError> {
     let Json(patch) = payload.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
-    let auth = runtime(&state)?;
+    let shared = runtime_arc(&state)?;
+    let auth = shared.as_ref();
+    validate_ref(
+        "account_ref",
+        patch.account_ref.as_ref().and_then(Option::as_deref),
+        auth.keys.billing_enabled(),
+    )?;
+    // Re-pointing the account changes which account the members' spend bills
+    // to: bill what is already settled under the account in force when it was
+    // spent.
+    if patch.account_ref.is_some() {
+        crate::budget_flush::flush_detached(shared).await;
+    }
     let updated = auth
         .store
         .update_group(&id, patch)
