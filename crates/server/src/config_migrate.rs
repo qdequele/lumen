@@ -379,9 +379,17 @@ pub fn migrate_document(doc: &str) -> Result<Migration, MigrateError> {
     })
 }
 
+/// Stands in for every remap string in a [`hint_for`] snippet.
+const REMAP_PLACEHOLDER: &str = "<copy from your [providers.models.rerank] block>";
+
 /// The replacement instructions for one legacy model, for the boot error
 /// (Task 15). Following them yields a config that validates. `None` when
-/// `model_id` needs no migration.
+/// `model_id` needs no migration, or has no virtual-model equivalent.
+///
+/// The hint ends up in the boot error, the reload log line and the admin
+/// `LM-1001` body, so every remap string (instructions, criteria, context,
+/// levels) is replaced by a placeholder: remap text is operator prompt text
+/// and is never logged. `lumen config migrate` carries the real text.
 #[must_use]
 pub fn hint_for(cfg: &Config, model_id: &str) -> Option<String> {
     #[derive(serde::Serialize)]
@@ -389,7 +397,11 @@ pub fn hint_for(cfg: &Config, model_id: &str) -> Option<String> {
         virtual_models: [&'a VirtualModelConfig; 1],
     }
     let plan = plan(cfg).ok()?;
-    let vm = plan.virtuals.iter().find(|v| v.id == model_id)?;
+    let mut vm = plan.virtuals.iter().find(|v| v.id == model_id)?.clone();
+    for remap in vm.targets.iter_mut().filter_map(|t| t.remap.as_mut()) {
+        redact_remap(remap);
+    }
+    let vm = &vm;
     let body = toml::to_string(&Snippet {
         virtual_models: [vm],
     })
@@ -431,4 +443,26 @@ pub fn hint_for(cfg: &Config, model_id: &str) -> Option<String> {
     }
     steps.push(format!("add:\n{body}"));
     Some(steps.join("\nthen "))
+}
+
+/// Replace every string of `remap` with [`REMAP_PLACEHOLDER`], keeping its
+/// shape (which fields are set, how many levels and questions).
+fn redact_remap(remap: &mut RemapConfig) {
+    fn redact(s: &mut String) {
+        REMAP_PLACEHOLDER.clone_into(s);
+    }
+    fn redact_criteria(c: &mut CriteriaConfig) {
+        c.yes.iter_mut().chain(c.no.iter_mut()).for_each(redact);
+    }
+    remap
+        .context
+        .iter_mut()
+        .chain(remap.instructions.iter_mut())
+        .chain(remap.levels.iter_mut().flatten())
+        .for_each(redact);
+    remap.criteria.iter_mut().for_each(redact_criteria);
+    for q in remap.questions.iter_mut().flatten() {
+        redact(&mut q.instructions);
+        q.criteria.iter_mut().for_each(redact_criteria);
+    }
 }

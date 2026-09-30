@@ -35,7 +35,7 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ### Removed
 
-- **Breaking (ADR 014):** per-model `fallbacks`, the `[providers.models.rerank]` block and the `rerank` capability on `typesafe` models are removed. A config using them fails validation with the equivalent `[[virtual_models]]` snippet; run `lumen config migrate` (or `--dry-run`). Migrated foundation models are renamed `<provider>/<id>`, so `usage_log.model_used` and the Prometheus `model` label of those models change (the public id clients send is unchanged).
+- **Breaking (ADR 014):** per-model `fallbacks`, the `[providers.models.rerank]` block and the `rerank` capability on `typesafe` models are removed. A config using them fails validation with the equivalent `[[virtual_models]]` snippet (remap instructions and criteria show as a placeholder, so operator prompt text never reaches the boot error, the reload log or an admin `LM-1001` body; the migration copies the real text); run `lumen config migrate` (or `--dry-run`). Migrated foundation models are renamed `<provider>/<id>`, so `usage_log.model_used` and the Prometheus `model` label of those models change (the public id clients send is unchanged).
 
 ## [0.5.0] - 2026-09-26
 

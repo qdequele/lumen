@@ -1409,10 +1409,12 @@ impl Config {
             None
         };
         if let Some(what) = legacy {
-            let hint = crate::config_migrate::hint_for(self, &model.id).unwrap_or_default();
+            let equivalent = crate::config_migrate::hint_for(self, &model.id)
+                .map(|hint| format!(" Equivalent:\n{hint}"))
+                .unwrap_or_default();
             return Err(err(format!(
                 "model '{}' (provider '{}') uses {what}, removed in ADR 014: run `lumen \
-                 config migrate` (add --dry-run to preview). Equivalent:\n{hint}",
+                 config migrate` (add --dry-run to preview).{equivalent}",
                 model.id, provider.name
             )));
         }

@@ -504,6 +504,61 @@ cost_per_1k_searches = 2.5
     assert!(hint.contains("remove that foundation model"), "{hint}");
 }
 
+/// R10: the boot error, the reload log and the admin `LM-1001` body all carry
+/// the `Config::load_text` error, so the hint must never copy the operator's
+/// remap text. `lumen config migrate` still carries it into the document.
+#[test]
+fn the_legacy_rerank_hint_never_copies_remap_text() {
+    let doc = typesafe_doc(
+        r#"[[providers.models]]
+id = "jev"
+upstream_id = "jev-latest"
+capabilities = ["systemone", "rerank"]
+[providers.models.rerank]
+instructions = "SENTINEL-INSTRUCTIONS"
+criteria.true = "SENTINEL-YES"
+criteria.false = "SENTINEL-NO"
+"#,
+    );
+    let err = Config::load_text(&doc, "legacy").unwrap_err().to_string();
+    for sentinel in ["SENTINEL-INSTRUCTIONS", "SENTINEL-YES", "SENTINEL-NO"] {
+        assert!(!err.contains(sentinel), "{sentinel} leaked: {err}");
+    }
+    assert!(
+        err.contains("<copy from your [providers.models.rerank] block>"),
+        "{err}"
+    );
+    assert!(err.contains("[[virtual_models]]"), "{err}");
+
+    let m = migrate_document(&doc).unwrap();
+    for sentinel in ["SENTINEL-INSTRUCTIONS", "SENTINEL-YES", "SENTINEL-NO"] {
+        assert!(m.text.contains(sentinel), "{sentinel} missing: {}", m.text);
+    }
+}
+
+/// A legacy field with no virtual-model equivalent (a rerank block on a
+/// non-typesafe model) prints no dangling "Equivalent:" clause.
+#[test]
+fn a_legacy_field_without_an_equivalent_has_no_equivalent_clause() {
+    let doc = r#"
+[[providers]]
+name = "p"
+kind = "cohere"
+api_key_env = "KEY"
+[[providers.models]]
+id = "m"
+capabilities = ["rerank"]
+[providers.models.rerank]
+instructions = "SENTINEL-INSTRUCTIONS"
+"#;
+    let cfg: Config = toml::from_str(doc).unwrap();
+    assert!(hint_for(&cfg, "m").is_none());
+    let err = Config::load_text(doc, "legacy").unwrap_err().to_string();
+    assert!(err.contains("lumen config migrate"), "{err}");
+    assert!(!err.contains("Equivalent"), "{err}");
+    assert!(!err.contains("SENTINEL-INSTRUCTIONS"), "{err}");
+}
+
 mod cli {
     use std::process::Command;
 
