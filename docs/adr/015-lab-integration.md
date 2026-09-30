@@ -2,6 +2,8 @@
 
 - Status: accepted
 - Date: 2026-09-30
+- Builds on: ADR 009, ADR 010, ADR 011
+- Amends: ADR 011 §2 (billing events only)
 
 ## Context
 
@@ -47,7 +49,7 @@ has no billing leg that is exact.
 ## Consequences
 
 - Billing is exactly what the budget enforced, with the same crash window
-  (ADR 007): a crash loses at most one flush of spend from both.
+  (ADR 009 §4): a crash loses at most one flush of spend from both.
 - The Lab must accept `product: "lumen"` and `X-Lab-Signature`, convert to
   credits, hold one secret per gateway, and run the lease top-up loop.
 - Per-request detail stays in `usage_log` and the export, best-effort.
