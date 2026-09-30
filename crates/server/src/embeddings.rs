@@ -195,12 +195,16 @@ pub async fn embeddings(
         estimated,
     );
 
-    // Honor the client's requested output encoding (OpenAI `encoding_format`).
-    // Providers always decode to `Vec<f32>` internally; re-encode to base64 on
-    // the way out when asked, so the choice works for EVERY provider (Ollama and
-    // TEI have no upstream encoding_format). Any other value serializes as the
-    // default float array.
-    if req.encoding_format.as_deref() == Some("base64") {
+    // Honor the requested output encoding (OpenAI `encoding_format`), as the
+    // serving attempt's overrides left it (ADR 014). Providers always decode to
+    // `Vec<f32>` internally; re-encode to base64 on the way out when asked, so
+    // the choice works for EVERY provider (Ollama and TEI have no upstream
+    // encoding_format). Any other value serializes as the default float array.
+    let encoding = decision.attempts[executed.index].field(
+        "encoding_format",
+        req.encoding_format.clone().map(serde_json::Value::from),
+    );
+    if encoding.as_ref().and_then(serde_json::Value::as_str) == Some("base64") {
         for item in &mut response.data {
             item.encoding = lumen_core::EmbeddingEncoding::Base64;
         }

@@ -113,9 +113,7 @@ pub async fn chat(
     // The reservation is settled to the real usage afterwards.
     let pricing = state.pricing();
     let estimated_input = tokens::estimate_chat_prompt(&req);
-    let reserved_output = req
-        .max_tokens
-        .map_or(DEFAULT_RESERVED_OUTPUT_TOKENS, u64::from);
+    let reserved_output = reserved_output_tokens(&decision, req.max_tokens);
     let estimated_cost = pricing.token_cost(&primary, estimated_input, reserved_output);
     let accounting = Accounting::begin(
         &state,
@@ -150,6 +148,28 @@ pub async fn chat(
     } else {
         chat_non_streaming(&ctx, guard, accounting).await
     }
+}
+
+/// The output tokens to reserve at admission: the largest `max_tokens` any
+/// attempt may send upstream once its overrides apply (ADR 014), so a target
+/// that raises the cap cannot run past the key's budget on a small client
+/// value. An attempt that ends with no cap reserves the default.
+fn reserved_output_tokens(
+    decision: &lumen_router::virtual_models::Decision,
+    client_max_tokens: Option<u32>,
+) -> u64 {
+    let current = client_max_tokens.map(serde_json::Value::from);
+    decision
+        .attempts
+        .iter()
+        .map(|a| {
+            a.field("max_tokens", current.clone())
+                .and_then(|v| v.as_u64())
+                .filter(|v| u32::try_from(*v).is_ok())
+                .unwrap_or(DEFAULT_RESERVED_OUTPUT_TOKENS)
+        })
+        .max()
+        .unwrap_or(DEFAULT_RESERVED_OUTPUT_TOKENS)
 }
 
 /// Reject image inputs the resolved route cannot serve, before any upstream
@@ -695,6 +715,57 @@ mod tests {
 
     fn drop_guard() -> DropGuard {
         CancellationToken::new().drop_guard()
+    }
+
+    fn decision_with(
+        overrides: &[Option<serde_json::Value>],
+    ) -> lumen_router::virtual_models::Decision {
+        use lumen_router::virtual_models::{config::OverridesConfig, Attempt, Decision, Overrides};
+        let attempts = overrides
+            .iter()
+            .enumerate()
+            .map(|(i, o)| Attempt {
+                model_id: format!("m{i}"),
+                path: String::new(),
+                overrides: o
+                    .iter()
+                    .map(|v| {
+                        let cfg: OverridesConfig = serde_json::from_value(v.clone()).unwrap();
+                        std::sync::Arc::new(Overrides::compile(&cfg, Capability::Chat).unwrap())
+                    })
+                    .collect(),
+                remap: None,
+                escapes: Vec::new(),
+            })
+            .collect();
+        Decision {
+            virtual_model: Some("acme/bot".into()),
+            preset: None,
+            attempts,
+        }
+    }
+
+    #[test]
+    fn reservation_follows_the_overrides_of_every_attempt() {
+        use serde_json::json;
+        // No override: the client value, or the default.
+        let plain = decision_with(&[None]);
+        assert_eq!(reserved_output_tokens(&plain, Some(50)), 50);
+        assert_eq!(
+            reserved_output_tokens(&plain, None),
+            DEFAULT_RESERVED_OUTPUT_TOKENS
+        );
+        // A `set` lowering the cap lowers the reservation.
+        let lowered = decision_with(&[Some(json!({ "set": { "max_tokens": 80 } }))]);
+        assert_eq!(reserved_output_tokens(&lowered, Some(100_000)), 80);
+        // A fallback target raising the cap is reserved for, whatever the
+        // client sent.
+        let raised = decision_with(&[None, Some(json!({ "set": { "max_tokens": 9000 } }))]);
+        assert_eq!(reserved_output_tokens(&raised, Some(10)), 9000);
+        // `default` only fills an absent cap.
+        let default = decision_with(&[Some(json!({ "default": { "max_tokens": 3000 } }))]);
+        assert_eq!(reserved_output_tokens(&default, None), 3000);
+        assert_eq!(reserved_output_tokens(&default, Some(20)), 20);
     }
 
     /// Wrap a stream with guards, deadline = now + first_token_timeout.

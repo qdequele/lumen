@@ -9,7 +9,7 @@ use lumen_core::{Capability, GatewayError};
 use lumen_providers::typesafe::rerank::RerankTemplate;
 
 use super::condition::FactSource;
-use super::overrides::{apply_chain, Overridable, Overrides, Preset};
+use super::overrides::{apply_chain, effective_field, Overridable, Overrides, Preset};
 use super::table::{Node, RoutingTable, Strategy, Target, VirtualModel};
 use crate::triggers::{linear_escapes, Escape, Triggers};
 
@@ -58,6 +58,17 @@ impl Attempt {
     /// Apply this attempt's overrides to its own copy of the request.
     pub fn apply<R: Overridable>(&self, req: &mut R) {
         apply_chain(&self.overrides, req);
+    }
+
+    /// The value field `name` takes in this attempt's request, given its
+    /// `current` value in the client request, without cloning the request.
+    #[must_use]
+    pub fn field(
+        &self,
+        name: &str,
+        current: Option<serde_json::Value>,
+    ) -> Option<serde_json::Value> {
+        effective_field(&self.overrides, name, current)
     }
 }
 

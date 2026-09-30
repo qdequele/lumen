@@ -283,6 +283,56 @@ async fn preset_and_overrides_reach_the_upstream_body() {
 }
 
 #[tokio::test]
+async fn an_encoding_format_override_sets_the_response_encoding() {
+    let b = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/embeddings"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "object": "list", "model": "model-b",
+            "data": [{ "object": "embedding", "index": 0, "embedding": [0.5, 0.25] }],
+            "usage": { "prompt_tokens": 2, "total_tokens": 2 }
+        })))
+        .mount(&b)
+        .await;
+    let a = upstream(200, "model-a").await;
+    let cfg = load(&two_providers(
+        &a.uri(),
+        &b.uri(),
+        r#"
+        [[virtual_models]]
+        id = "acme/b64"
+        capability = "embed"
+        strategy = "single"
+        targets = [{ model = "model-b", overrides = { set = { encoding_format = "base64" } } }]
+
+        [[virtual_models]]
+        id = "acme/float"
+        capability = "embed"
+        strategy = "single"
+        targets = [{ model = "model-b", overrides = { drop = ["encoding_format"] } }]
+    "#,
+    ));
+    let base = spawn(&cfg, &cfg).await;
+    let embed = |model: &'static str, encoding: &'static str| {
+        let base = base.clone();
+        async move {
+            let resp = reqwest::Client::new()
+                .post(format!("{base}/v1/embeddings"))
+                .json(&json!({ "model": model, "input": "hi", "encoding_format": encoding }))
+                .send()
+                .await
+                .expect("send");
+            assert_eq!(resp.status(), 200);
+            resp.json::<Value>().await.unwrap()["data"][0]["embedding"].clone()
+        }
+    };
+    // The client asks for floats; the target's `set` wins.
+    assert!(embed("acme/b64", "float").await.is_string());
+    // The client asks for base64; the target drops the field, so floats.
+    assert!(embed("acme/float", "base64").await.is_array());
+}
+
+#[tokio::test]
 async fn a_virtual_model_on_the_wrong_endpoint_is_lm_2002() {
     let (a, b) = (
         upstream(200, "model-a").await,

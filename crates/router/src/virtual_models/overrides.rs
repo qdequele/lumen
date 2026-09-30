@@ -244,6 +244,48 @@ pub fn apply_chain<R: Overridable>(chain: &[Arc<Overrides>], req: &mut R) {
     }
 }
 
+/// One request field standing in for the whole request, so a single field's
+/// effective value can be read without cloning the request.
+struct FieldProbe<'a> {
+    name: &'a str,
+    value: Option<Value>,
+}
+
+impl Overridable for FieldProbe<'_> {
+    fn has_field(&self, name: &str) -> bool {
+        name == self.name && self.value.is_some()
+    }
+
+    fn set_field(&mut self, name: &str, value: &Value) {
+        if name == self.name {
+            self.value = Some(value.clone());
+        }
+    }
+
+    fn remove_field(&mut self, name: &str) {
+        if name == self.name {
+            self.value = None;
+        }
+    }
+}
+
+/// The value field `name` ends up with once `chain` is applied to a request
+/// where it is `current` (the same `set` / `default` / `drop` rules as
+/// [`apply_chain`]).
+#[must_use]
+pub fn effective_field(
+    chain: &[Arc<Overrides>],
+    name: &str,
+    current: Option<Value>,
+) -> Option<Value> {
+    let mut probe = FieldProbe {
+        name,
+        value: current,
+    };
+    apply_chain(chain, &mut probe);
+    probe.value
+}
+
 /// A compiled chat preset.
 #[derive(Clone)]
 pub struct Preset {
@@ -363,6 +405,33 @@ mod tests {
         );
         assert_eq!(req.top_p, Some(0.5));
         assert!(!req.extra.contains_key("seed"));
+    }
+
+    #[test]
+    fn effective_field_follows_set_default_and_drop() {
+        let outer = ov(json!({ "set": { "max_tokens": 100 } }), Capability::Chat);
+        let inner = ov(
+            json!({ "default": { "max_tokens": 5 }, "drop": ["seed"] }),
+            Capability::Chat,
+        );
+        let chain = [outer, inner];
+        assert_eq!(
+            effective_field(&chain, "max_tokens", Some(json!(9))),
+            Some(json!(100))
+        );
+        assert_eq!(effective_field(&chain, "seed", Some(json!(1))), None);
+        let defaults = [ov(
+            json!({ "default": { "max_tokens": 5 } }),
+            Capability::Chat,
+        )];
+        assert_eq!(
+            effective_field(&defaults, "max_tokens", None),
+            Some(json!(5))
+        );
+        assert_eq!(
+            effective_field(&defaults, "max_tokens", Some(json!(7))),
+            Some(json!(7))
+        );
     }
 
     #[test]
