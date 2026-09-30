@@ -2579,6 +2579,7 @@ dependencies = [
  "libc",
  "notify",
  "providers",
+ "rand 0.10.2",
  "reqwest",
  "router",
  "serde",

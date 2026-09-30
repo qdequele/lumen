@@ -44,6 +44,11 @@ pub struct Config {
     /// Configured upstream providers. Dynamic layer.
     #[serde(default)]
     pub providers: Vec<ProviderConfig>,
+    /// Virtual models (ADR 014): public ids carrying routing logic (fallback,
+    /// split, switch, presets, SystemOne rerank remap) over the foundation
+    /// models. Dynamic layer.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub virtual_models: Vec<lumen_router::virtual_models::VirtualModelConfig>,
     /// Log output format. Boot layer.
     #[serde(default)]
     pub log_format: LogFormatConfig,
@@ -1412,6 +1417,7 @@ impl Config {
         }
 
         self.validate_fallbacks(&err)?;
+        self.routing_table().map_err(|e| err(e.to_string()))?;
         Ok(())
     }
 
@@ -1457,6 +1463,40 @@ impl Config {
             }
         }
         Ok(())
+    }
+
+    /// What virtual-model compilation needs to know about the foundation
+    /// models: every model id with its capabilities and modalities.
+    #[must_use]
+    pub fn foundation_index(&self) -> lumen_router::virtual_models::FoundationIndex {
+        let mut index = lumen_router::virtual_models::FoundationIndex::default();
+        for provider in &self.providers {
+            for model in &provider.models {
+                index.insert(
+                    model.id.clone(),
+                    model.capabilities.clone(),
+                    model.modalities.clone(),
+                );
+            }
+        }
+        index
+    }
+
+    /// Validate and compile `[[virtual_models]]` (ADR 014). Returns the
+    /// table and the load warnings.
+    ///
+    /// # Errors
+    /// The first invalid virtual model.
+    pub fn routing_table(
+        &self,
+    ) -> Result<
+        (lumen_router::virtual_models::RoutingTable, Vec<String>),
+        lumen_router::virtual_models::RoutingConfigError,
+    > {
+        lumen_router::virtual_models::RoutingTable::compile(
+            &self.virtual_models,
+            &self.foundation_index(),
+        )
     }
 
     /// The ordered fallback chain for each model id (primary first), derived
@@ -2822,5 +2862,46 @@ mod tests {
                 "webhooks",
             ]
         );
+    }
+
+    const VIRTUAL: &str = r#"
+        [[virtual_models]]
+        id = "acme/chat"
+        capability = "chat"
+        strategy = "fallback"
+        targets = [{ model = "gpt-4o" }, { model = "gpt-4o" }]
+    "#;
+
+    #[test]
+    fn virtual_models_parse_validate_and_compile() {
+        let cfg = load_str(&format!("{VALID}\n{VIRTUAL}")).unwrap();
+        assert_eq!(cfg.virtual_models.len(), 1);
+        let (table, warnings) = cfg.routing_table().unwrap();
+        assert!(warnings.is_empty());
+        assert!(table.get("acme/chat").is_some());
+    }
+
+    #[test]
+    fn an_invalid_virtual_model_fails_validation_naming_it() {
+        let bad = VIRTUAL.replace(
+            "{ model = \"gpt-4o\" }, { model = \"gpt-4o\" }",
+            "{ model = \"ghost\" }, { model = \"gpt-4o\" }",
+        );
+        let err = load_str(&format!("{VALID}\n{bad}"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("virtual model 'acme/chat'") && err.contains("ghost"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_virtual_id_may_not_shadow_a_foundation_id() {
+        let bad = VIRTUAL.replace("acme/chat", "gpt-4o");
+        let err = load_str(&format!("{VALID}\n{bad}"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("collides with a foundation model"), "{err}");
     }
 }

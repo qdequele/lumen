@@ -12,9 +12,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::http::{HeaderMap, HeaderName, HeaderValue};
+use lumen_core::{Capability, GatewayError};
 use lumen_router::circuit::{BreakerConfig, CircuitBreakers};
 use lumen_router::executor::ExecConfig;
 use lumen_router::retry::RetryPolicy;
+use lumen_router::virtual_models::{Decision, FactSource, RoutingTable};
 use lumen_telemetry::ResilienceMetrics;
 
 use crate::config::Config;
@@ -55,6 +57,9 @@ struct ResiliencePolicy {
     model_timeouts: HashMap<String, Timeouts>,
     /// Per-model ordered fallback chains (excludes the primary).
     fallbacks: HashMap<String, Vec<String>>,
+    /// Compiled virtual models (ADR 014), swapped with the rest of the policy
+    /// on reload.
+    routing: Arc<RoutingTable>,
 }
 
 impl ResiliencePolicy {
@@ -78,6 +83,19 @@ impl ResiliencePolicy {
                 )
             })
             .collect();
+        let routing = match config.routing_table() {
+            Ok((table, warnings)) => {
+                for warning in warnings {
+                    tracing::warn!(%warning, "virtual models");
+                }
+                table
+            }
+            // Unreachable for a validated config; never fail a reload here.
+            Err(error) => {
+                tracing::error!(%error, "virtual models failed to compile after validation; serving without them");
+                RoutingTable::default()
+            }
+        };
         Self {
             retry: RetryPolicy {
                 max_attempts: r.retry_max_attempts,
@@ -87,6 +105,7 @@ impl ResiliencePolicy {
             default_timeouts,
             model_timeouts,
             fallbacks: config.fallback_map(),
+            routing: Arc::new(routing),
         }
     }
 
@@ -99,6 +118,7 @@ impl ResiliencePolicy {
             },
             model_timeouts: HashMap::new(),
             fallbacks: HashMap::new(),
+            routing: Arc::new(RoutingTable::default()),
         }
     }
 }
@@ -181,6 +201,40 @@ impl ResilienceRuntime {
             ids.extend(fallbacks.iter().cloned());
         }
         ids
+    }
+
+    /// Decide the attempts for `model` (ADR 014): a virtual model's routing
+    /// tree, a foundation model's legacy `fallbacks` chain, or a direct
+    /// single attempt. Pure and in-memory: one policy snapshot, one random
+    /// draw per `split`.
+    ///
+    /// # Errors
+    /// `LM-2002` when `model` is a virtual model serving another capability.
+    pub fn decide(
+        &self,
+        capability: Capability,
+        model: &str,
+        facts: &dyn FactSource,
+    ) -> Result<Decision, GatewayError> {
+        use rand::Rng as _;
+        let policy = self.policy.load();
+        let mut draw = || rand::rng().next_u64();
+        let decision = policy.routing.decide(capability, model, facts, &mut draw)?;
+        if decision.virtual_model.is_none() {
+            if let Some(fallbacks) = policy.fallbacks.get(model) {
+                return Ok(Decision::linear(
+                    std::iter::once(model.to_owned()).chain(fallbacks.iter().cloned()),
+                ));
+            }
+        }
+        Ok(decision)
+    }
+
+    /// The current compiled virtual models (for `GET /v1/models` and the
+    /// admin plan route).
+    #[must_use]
+    pub fn routing(&self) -> Arc<RoutingTable> {
+        self.policy.load().routing.clone()
     }
 
     /// The execution knobs (retry + timeouts) for `model`, applying the
@@ -276,5 +330,69 @@ mod tests {
         // No override → global default.
         let fast = rt.exec_config("claude");
         assert_eq!(fast.first_token, Duration::from_secs(30));
+    }
+
+    struct NoFacts;
+    impl lumen_router::virtual_models::FactSource for NoFacts {
+        fn group(&self) -> Option<&str> {
+            None
+        }
+        fn metadata(&self, _: &str) -> Option<&serde_json::Value> {
+            None
+        }
+        fn has_images(&self) -> bool {
+            false
+        }
+        fn has_tools(&self) -> bool {
+            false
+        }
+        fn stream(&self) -> bool {
+            false
+        }
+        fn input_tokens(&self) -> u64 {
+            0
+        }
+        fn documents(&self) -> Option<u64> {
+            None
+        }
+    }
+
+    #[test]
+    fn decide_routes_virtual_models_and_keeps_legacy_fallbacks() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [[providers]]
+            name = "a"
+            kind = "openai"
+            [[providers.models]]
+            id = "gpt"
+            capabilities = ["chat"]
+            fallbacks = ["claude"]
+            [[providers.models]]
+            id = "claude"
+            capabilities = ["chat"]
+
+            [[virtual_models]]
+            id = "v"
+            capability = "chat"
+            strategy = "fallback"
+            targets = [{ model = "claude" }, { model = "gpt" }]
+            "#,
+        )
+        .unwrap();
+        let rt = ResilienceRuntime::from_config(&cfg, None);
+        let d = rt.decide(Capability::Chat, "v", &NoFacts).unwrap();
+        assert_eq!(d.virtual_model.as_deref(), Some("v"));
+        assert_eq!(d.primary_model(), "claude");
+        let legacy = rt.decide(Capability::Chat, "gpt", &NoFacts).unwrap();
+        let ids: Vec<&str> = legacy
+            .attempts
+            .iter()
+            .map(|a| a.model_id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["gpt", "claude"]);
+        let direct = rt.decide(Capability::Chat, "claude", &NoFacts).unwrap();
+        assert_eq!(direct.attempts.len(), 1);
+        assert!(rt.routing().get("v").is_some());
     }
 }
