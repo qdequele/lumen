@@ -98,16 +98,34 @@ fn claim(id: String, ids: &mut HashSet<String>) -> Result<String, MigrateError> 
     }
 }
 
+/// Whether `removed` carries a price that `target` does not: dropping the
+/// removed reranker's table would silently change what is billed.
+fn prices_lost(removed: &ModelConfig, target: &ModelConfig) -> bool {
+    let differs = |a: Option<f64>, b: Option<f64>| a.is_some() && a != b;
+    differs(removed.cost_per_1m_input, target.cost_per_1m_input)
+        || differs(removed.cost_per_1m_output, target.cost_per_1m_output)
+        || differs(removed.cost_per_1k_searches, target.cost_per_1k_searches)
+}
+
+fn price_note(removed: &ModelConfig, target_id: &str) -> String {
+    format!(
+        "the prices of the removed reranker '{}' differ from those of '{target_id}', which now serves it: \
+         review cost_per_1m_input, cost_per_1m_output and cost_per_1k_searches on '{target_id}'",
+        removed.id
+    )
+}
+
 /// Pass 1: which foundation models are renamed, removed or created, and the
-/// remap target of each legacy Jev reranker.
+/// remap target of each legacy Jev reranker. Every rename is computed before
+/// any target is resolved, so a target never points at an id that a later
+/// rename turns into a virtual model.
 fn plan_foundations(
     cfg: &Config,
     ids: &mut HashSet<String>,
     plan: &mut Plan,
 ) -> Result<HashMap<String, TargetConfig>, MigrateError> {
-    let mut remap_targets: HashMap<String, TargetConfig> = HashMap::new();
-    for (pi, p) in cfg.providers.iter().enumerate() {
-        for (mi, m) in p.models.iter().enumerate() {
+    for p in &cfg.providers {
+        for m in &p.models {
             let legacy = is_legacy_rerank(p, m);
             let keeps_foundation = (!m.fallbacks.is_empty() && !legacy)
                 || (legacy && m.capabilities.contains(&Capability::SystemOne));
@@ -115,7 +133,16 @@ fn plan_foundations(
                 let new_id = claim(format!("{}/{}", p.name, m.id), ids)?;
                 plan.renames.insert(m.id.clone(), new_id);
             }
-            if !legacy {
+        }
+    }
+
+    let mut remap_targets: HashMap<String, TargetConfig> = HashMap::new();
+    // (provider index, upstream id) -> index into `plan.created`, so several
+    // rerankers over one Jev model share one created foundation model.
+    let mut created_for: HashMap<(usize, String), usize> = HashMap::new();
+    for (pi, p) in cfg.providers.iter().enumerate() {
+        for (mi, m) in p.models.iter().enumerate() {
+            if !is_legacy_rerank(p, m) {
                 continue;
             }
             let target_id = if let Some(renamed) = plan.renames.get(&m.id) {
@@ -137,9 +164,24 @@ fn plan_foundations(
                         && o.resolved_upstream_id() == upstream
                 });
                 if let Some(sibling) = sibling {
-                    sibling.id.clone()
+                    let id = plan
+                        .renames
+                        .get(&sibling.id)
+                        .cloned()
+                        .unwrap_or_else(|| sibling.id.clone());
+                    if prices_lost(m, sibling) {
+                        plan.notes.push(price_note(m, &id));
+                    }
+                    id
+                } else if let Some(&index) = created_for.get(&(pi, upstream.to_owned())) {
+                    let created = &plan.created[index].model;
+                    let id = created.id.clone();
+                    let note = prices_lost(m, created).then(|| price_note(m, &id));
+                    plan.notes.extend(note);
+                    id
                 } else {
                     let id = claim(format!("{}/{upstream}", p.name), ids)?;
+                    created_for.insert((pi, upstream.to_owned()), plan.created.len());
                     plan.created.push(Created {
                         provider: pi,
                         model: ModelConfig {
@@ -147,6 +189,7 @@ fn plan_foundations(
                             capabilities: vec![Capability::SystemOne],
                             cost_per_1m_input: m.cost_per_1m_input,
                             cost_per_1m_output: m.cost_per_1m_output,
+                            cost_per_1k_searches: m.cost_per_1k_searches,
                             ..ModelConfig::minimal(&id)
                         },
                     });
@@ -175,11 +218,15 @@ fn plan(cfg: &Config) -> Result<Plan, MigrateError> {
         .collect();
     let remap_targets = plan_foundations(cfg, &mut ids, &mut plan)?;
 
-    // Pass 2: one virtual model per legacy model. A target naming a removed
-    // Jev reranker carries its remap inline; one naming a renamed model
-    // points at the new foundation id. Only foundation ids are referenced.
-    let fallback_target = |id: &str| -> TargetConfig {
-        remap_targets.get(id).cloned().unwrap_or_else(|| {
+    // Pass 2: one virtual model per legacy model. A rerank virtual model's
+    // target naming a removed Jev reranker carries its remap inline (a remap
+    // is only valid on rerank); any other reference points at the (possibly
+    // renamed) foundation id. Only foundation ids are referenced.
+    let fallback_target = |id: &str, capability: Capability| -> TargetConfig {
+        let remapped = (capability == Capability::Rerank)
+            .then(|| remap_targets.get(id).cloned())
+            .flatten();
+        remapped.unwrap_or_else(|| {
             plain_target(
                 plan.renames
                     .get(id)
@@ -205,7 +252,7 @@ fn plan(cfg: &Config) -> Result<Plan, MigrateError> {
             let others: Vec<&str> = m
                 .capabilities
                 .iter()
-                .filter(|c| **c != capability && !(legacy && **c == Capability::SystemOne))
+                .filter(|c| **c != capability)
                 .map(|c| c.as_str())
                 .collect();
             if !others.is_empty() {
@@ -223,8 +270,8 @@ fn plan(cfg: &Config) -> Result<Plan, MigrateError> {
                     capability.as_str(),
                 ));
             }
-            let mut targets = vec![fallback_target(&m.id)];
-            targets.extend(m.fallbacks.iter().map(|f| fallback_target(f)));
+            let mut targets = vec![fallback_target(&m.id, capability)];
+            targets.extend(m.fallbacks.iter().map(|f| fallback_target(f, capability)));
             virtuals.push(VirtualModelConfig {
                 id: m.id.clone(),
                 capability,
@@ -242,7 +289,7 @@ fn plan(cfg: &Config) -> Result<Plan, MigrateError> {
         }
     }
     plan.virtuals = virtuals;
-    plan.notes = notes;
+    plan.notes.extend(notes);
     Ok(plan)
 }
 
@@ -327,8 +374,9 @@ pub fn migrate_document(doc: &str) -> Result<Migration, MigrateError> {
     })
 }
 
-/// The replacement snippet for one legacy model, for the boot error
-/// (Task 15). `None` when `model_id` needs no migration.
+/// The replacement instructions for one legacy model, for the boot error
+/// (Task 15). Following them yields a config that validates. `None` when
+/// `model_id` needs no migration.
 #[must_use]
 pub fn hint_for(cfg: &Config, model_id: &str) -> Option<String> {
     #[derive(serde::Serialize)]
@@ -341,8 +389,32 @@ pub fn hint_for(cfg: &Config, model_id: &str) -> Option<String> {
         virtual_models: [vm],
     })
     .ok()?;
-    Some(match plan.renames.get(model_id) {
-        Some(new_id) => format!("rename the foundation model to '{new_id}' and add:\n{body}"),
-        None => format!("remove that foundation model entry and add:\n{body}"),
-    })
+    let legacy_rerank = cfg
+        .providers
+        .iter()
+        .flat_map(|p| p.models.iter().map(move |m| (p, m)))
+        .any(|(p, m)| m.id == model_id && is_legacy_rerank(p, m));
+    let mut steps = Vec::new();
+    match plan.renames.get(model_id) {
+        Some(new_id) if legacy_rerank => steps.push(format!(
+            "rename the foundation model to '{new_id}', remove `rerank` from its `capabilities`, \
+             delete its `[providers.models.rerank]` block and remove its `fallbacks`"
+        )),
+        Some(new_id) => steps.push(format!(
+            "rename the foundation model to '{new_id}' and remove its `fallbacks`"
+        )),
+        None => steps.push("remove that foundation model entry".to_owned()),
+    }
+    for created in &plan.created {
+        if vm.targets.iter().any(|t| t.model == created.model.id) {
+            let provider = &cfg.providers[created.provider].name;
+            let model = toml::to_string(&created.model).ok()?;
+            steps.push(format!(
+                "unless it already exists, add this foundation model to provider '{provider}':\n\
+                 [[providers.models]]\n{model}"
+            ));
+        }
+    }
+    steps.push(format!("add:\n{body}"));
+    Some(steps.join("\nthen "))
 }

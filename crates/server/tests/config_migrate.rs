@@ -257,6 +257,214 @@ capabilities = ["chat"]
     assert!(hint_for(&cfg, "b").is_none());
 }
 
+const TYPESAFE: &str =
+    "[[providers]]\nname = \"typesafe\"\nkind = \"typesafe\"\napi_key_env = \"TYPESAFE_API_KEY\"\n";
+
+fn typesafe_doc(models: &str) -> String {
+    format!("{TYPESAFE}{models}")
+}
+
+#[test]
+fn two_lone_jev_rerankers_over_one_upstream_share_one_created_model() {
+    let doc = typesafe_doc(
+        r#"[[providers.models]]
+id = "rerank-a"
+upstream_id = "jev-latest"
+capabilities = ["rerank"]
+cost_per_1m_input = 0.042
+[providers.models.rerank]
+instructions = "Question A?"
+[[providers.models]]
+id = "rerank-b"
+upstream_id = "jev-latest"
+capabilities = ["rerank"]
+cost_per_1m_input = 0.05
+[providers.models.rerank]
+instructions = "Question B?"
+"#,
+    );
+    let m = migrate_document(&doc).unwrap();
+    let cfg = loads(&m.text);
+    let created: Vec<_> = cfg.providers[0]
+        .models
+        .iter()
+        .filter(|m| m.id == "typesafe/jev-latest")
+        .collect();
+    assert_eq!(created.len(), 1);
+    assert_eq!(cfg.providers[0].models.len(), 1, "both rerankers are gone");
+    for id in ["rerank-a", "rerank-b"] {
+        let vm = cfg.virtual_models.iter().find(|v| v.id == id).unwrap();
+        assert_eq!(vm.targets[0].model, "typesafe/jev-latest");
+    }
+    assert!(
+        m.notes
+            .iter()
+            .any(|n| n.contains("rerank-b") && n.contains("typesafe/jev-latest")),
+        "differing prices are noted: {:?}",
+        m.notes
+    );
+}
+
+#[test]
+fn a_sibling_that_is_itself_renamed_is_targeted_by_its_new_id() {
+    // The reranker comes first so the result cannot depend on document order.
+    let doc = typesafe_doc(
+        r#"[[providers.models]]
+id = "jev-rerank"
+upstream_id = "jev-latest"
+capabilities = ["rerank"]
+[[providers.models]]
+id = "jev"
+upstream_id = "jev-latest"
+capabilities = ["systemone"]
+fallbacks = ["jev-backup"]
+[[providers.models]]
+id = "jev-backup"
+upstream_id = "jev-backup"
+capabilities = ["systemone"]
+"#,
+    );
+    let cfg = loads(&migrate_document(&doc).unwrap().text);
+    let vm = cfg
+        .virtual_models
+        .iter()
+        .find(|v| v.id == "jev-rerank")
+        .unwrap();
+    assert_eq!(vm.targets[0].model, "typesafe/jev");
+    assert!(vm.targets[0].remap.is_some());
+}
+
+#[test]
+fn a_systemone_fallback_naming_a_systemone_rerank_jev_model_has_no_remap() {
+    let doc = typesafe_doc(
+        r#"[[providers.models]]
+id = "s"
+upstream_id = "jev-small"
+capabilities = ["systemone"]
+fallbacks = ["jev"]
+[[providers.models]]
+id = "jev"
+upstream_id = "jev-latest"
+capabilities = ["systemone", "rerank"]
+"#,
+    );
+    let cfg = loads(&migrate_document(&doc).unwrap().text);
+    let s = cfg.virtual_models.iter().find(|v| v.id == "s").unwrap();
+    let targets: Vec<&str> = s.targets.iter().map(|t| t.model.as_str()).collect();
+    assert_eq!(targets, vec!["typesafe/s", "typesafe/jev"]);
+    assert!(s.targets.iter().all(|t| t.remap.is_none()));
+    let jev = cfg.virtual_models.iter().find(|v| v.id == "jev").unwrap();
+    assert_eq!(jev.targets[0].model, "typesafe/jev");
+    assert!(jev.targets[0].remap.is_some());
+}
+
+#[test]
+fn every_price_of_a_lone_reranker_is_carried_including_searches() {
+    let doc = typesafe_doc(
+        r#"[[providers.models]]
+id = "jev-rerank"
+upstream_id = "jev-latest"
+capabilities = ["rerank"]
+cost_per_1m_input = 0.042
+cost_per_1m_output = 0.1
+cost_per_1k_searches = 2.5
+"#,
+    );
+    let m = migrate_document(&doc).unwrap();
+    let cfg = loads(&m.text);
+    let created = &cfg.providers[0].models[0];
+    assert_eq!(created.cost_per_1m_input, Some(0.042));
+    assert_eq!(created.cost_per_1m_output, Some(0.1));
+    assert_eq!(created.cost_per_1k_searches, Some(2.5));
+    assert!(m.notes.is_empty(), "nothing was lost: {:?}", m.notes);
+}
+
+#[test]
+fn a_price_that_cannot_be_carried_to_the_sibling_is_noted() {
+    let doc = typesafe_doc(
+        r#"[[providers.models]]
+id = "jev"
+upstream_id = "jev-latest"
+capabilities = ["systemone"]
+cost_per_1m_input = 0.042
+[[providers.models]]
+id = "jev-rerank"
+upstream_id = "jev-latest"
+capabilities = ["rerank"]
+cost_per_1k_searches = 2.5
+"#,
+    );
+    let m = migrate_document(&doc).unwrap();
+    loads(&m.text);
+    assert!(
+        m.notes
+            .iter()
+            .any(|n| n.contains("jev-rerank") && n.contains("cost_per_1k_searches")),
+        "{:?}",
+        m.notes
+    );
+}
+
+#[test]
+fn a_renamed_systemone_rerank_jev_model_tells_systemone_clients_the_new_id() {
+    let doc = typesafe_doc(
+        r#"[[providers.models]]
+id = "jev"
+upstream_id = "jev-latest"
+capabilities = ["systemone", "rerank"]
+"#,
+    );
+    let m = migrate_document(&doc).unwrap();
+    loads(&m.text);
+    assert!(
+        m.notes.iter().any(|n| n.contains("'jev'")
+            && n.contains("systemone")
+            && n.contains("'typesafe/jev'")),
+        "{:?}",
+        m.notes
+    );
+}
+
+#[test]
+fn hint_for_a_renamed_systemone_rerank_model_says_to_drop_rerank() {
+    let doc = typesafe_doc(
+        r#"[[providers.models]]
+id = "jev"
+upstream_id = "jev-latest"
+capabilities = ["systemone", "rerank"]
+[providers.models.rerank]
+instructions = "Q?"
+"#,
+    );
+    let cfg: Config = toml::from_str(&doc).unwrap();
+    let hint = hint_for(&cfg, "jev").unwrap();
+    assert!(hint.contains("'typesafe/jev'"), "{hint}");
+    assert!(hint.contains("remove `rerank`"), "{hint}");
+    assert!(hint.contains("[providers.models.rerank]"), "{hint}");
+}
+
+#[test]
+fn hint_for_a_lone_reranker_says_to_create_the_systemone_model() {
+    let doc = typesafe_doc(
+        r#"[[providers.models]]
+id = "jev-rerank"
+upstream_id = "jev-latest"
+capabilities = ["rerank"]
+cost_per_1m_input = 0.042
+cost_per_1k_searches = 2.5
+"#,
+    );
+    let cfg: Config = toml::from_str(&doc).unwrap();
+    let hint = hint_for(&cfg, "jev-rerank").unwrap();
+    assert!(hint.contains("[[providers.models]]"), "{hint}");
+    assert!(hint.contains("id = \"typesafe/jev-latest\""), "{hint}");
+    assert!(hint.contains("upstream_id = \"jev-latest\""), "{hint}");
+    assert!(hint.contains("capabilities = [\"systemone\"]"), "{hint}");
+    assert!(hint.contains("cost_per_1m_input = 0.042"), "{hint}");
+    assert!(hint.contains("cost_per_1k_searches = 2.5"), "{hint}");
+    assert!(hint.contains("remove that foundation model"), "{hint}");
+}
+
 mod cli {
     use std::process::Command;
 
