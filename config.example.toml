@@ -189,6 +189,26 @@ retention_days = 30               # purge usage_log rows older than this
 # retry_base_ms = 500       # pre-jitter backoff after the first failure, doubling
 
 # ---------------------------------------------------------------------------
+# Billing usage events for a control plane (ADR 015) - ABSENT by default.
+#
+# Opt-in and restart-only (boot layer). With this block, every budget flush
+# turns each billable key's newly settled cost (keys in a group with an
+# account_ref) into a signed usage.recorded event, stored in the database in
+# the same transaction as the spend and pushed to {url}/internal/events until
+# the control plane acknowledges it. Delivery is retried with capped backoff
+# and never dropped. Enabling this block makes LUMEN call that URL; events
+# carry no prompt, response, metadata or model id. Requires [auth]
+# enabled = true, and the env var named by signing_key_env must be set.
+# See docs/operations/lab-integration.md.
+#
+# [usage_events]
+# url = "https://lab.internal"                 # https, or http to a private IP
+# signing_key_env = "LUMEN_USAGE_EVENTS_SECRET"
+# source = "eu-1"                              # gateway name in every event
+# batch_size = 500                             # 1..=1000
+# timeout_ms = 5000                            # 100..=60000
+
+# ---------------------------------------------------------------------------
 # Telemetry (ADR 002).
 #
 # Clients may send an `x-lumen-metadata` header (alias: `cf-aig-metadata`)

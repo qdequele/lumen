@@ -66,3 +66,14 @@ groups:
         annotations:
           summary: "more than 5% of requests are failing"
           description: "5xx responses exceed 5% of accounted requests over the last 5m."
+
+      # Billing usage events are durable and never dropped, but a control
+      # plane that stays unreachable or rejects them delays every bill.
+      - alert: LumenUsageEventsStuck
+        expr: lumen_usage_events_oldest_pending_seconds > 900
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "billing usage events are not being delivered"
+          description: "The oldest pending usage event is {{ $value }}s old; check lumen_usage_events_failed_total by reason."

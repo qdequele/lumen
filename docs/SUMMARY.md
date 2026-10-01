@@ -40,6 +40,7 @@
 - [Logging](operations/logging.md)
 - [Usage log & multi-tenant metadata](operations/usage-log.md)
 - [Keys, quotas & budgets](operations/keys-budgets.md)
+- [Lab integration](operations/lab-integration.md)
 - [Config source modes](operations/config-modes.md)
 - [Resilience tuning](operations/resilience.md)
 - [Deployment](operations/deployment.md)

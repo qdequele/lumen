@@ -145,3 +145,23 @@ jobs:
             echo "== $cfg"
             ./target/debug/lumen --check-config --config "$cfg"
           done
+
+  lab-contract-drift:
+    name: Lab event contract drift
+    runs-on: ubuntu-latest
+    # Advisory until the Lab publishes product "lumen" (ADR 015, docs/operations/lab-integration.md).
+    continue-on-error: true
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - name: Compare the vendored schema with the Lab's published copy
+        env:
+          LAB_EVENTS_SCHEMA_URL: ${{ vars.LAB_EVENTS_SCHEMA_URL }}
+        run: |
+          if [ -z "$LAB_EVENTS_SCHEMA_URL" ]; then
+            echo "LAB_EVENTS_SCHEMA_URL not set; skipping"
+            exit 0
+          fi
+          curl -fsSL "$LAB_EVENTS_SCHEMA_URL" -o /tmp/lab.json
+          diff <(jq -S . contracts/lab-events.schema.json) <(jq -S . /tmp/lab.json)

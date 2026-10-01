@@ -83,13 +83,13 @@ together, so they take effect immediately with no restart.
 | Method | Path | Purpose |
 |---|---|---|
 | `POST` | `/admin/keys` | Create a virtual key. |
-| `GET` | `/admin/keys` | List active keys (records only - no hashes, no plaintext). `?include_deleted=true` adds tombstones. |
+| `GET` | `/admin/keys` | List active keys (records only - no hashes, no plaintext). `?include_deleted=true` adds tombstones; `?external_ref=...` filters. |
 | `PATCH` | `/admin/keys/{id}` | Adjust budget/limits, or enable/disable a key. |
 | `DELETE` | `/admin/keys/{id}` | Soft-delete a key (tombstone; stops authenticating immediately). |
 | `POST` | `/admin/keys/{id}/rotate` | Mint a new secret for an existing key (one-time plaintext, identity and spend preserved). |
 | `POST` | `/admin/keys/{id}/grant` | Atomically add to a key's budget cap (concurrency-safe top-up). |
 | `POST` | `/admin/groups` | Create a budget group - a shared pool member keys draw from. |
-| `GET` | `/admin/groups` | List active groups. `?include_deleted=true` adds tombstones. |
+| `GET` | `/admin/groups` | List active groups. `?include_deleted=true` adds tombstones; `?account_ref=...` filters. |
 | `PATCH` | `/admin/groups/{id}` | Adjust a group's name or shared budget (pool spend preserved). |
 | `DELETE` | `/admin/groups/{id}` | Soft-delete a group. Refused while it still has active member keys. |
 | `POST` | `/admin/groups/{id}/grant` | Atomically add to a group's shared budget cap (concurrency-safe top-up). |
@@ -204,6 +204,31 @@ rows alike - carries the key's group id (when it has one), so per-customer
 reporting includes the traffic the pool refused. `GET /admin/usage`
 (below) takes a `group_id` filter and `group_by=group_id`; under that
 grouping, rows from ungrouped keys aggregate under an empty group name.
+
+### Lab-linked groups
+
+A control plane such as the Meilisearch Lab marks the groups and keys it owns
+with two opaque fields (ADR 015):
+
+- **`account_ref`** on a group (`POST`/`PATCH /admin/groups`): the control
+  plane's account id. A key in a group that has an `account_ref` is
+  *billable*.
+- **`external_ref`** on a key (`POST`/`PATCH /admin/keys`): the control
+  plane's key id.
+
+Both are 1 to 128 characters when set, `PATCH` with `null` clears them, and
+both are returned by `GET` and filterable on the list routes
+(`GET /admin/groups?account_ref=...`, `GET /admin/keys?external_ref=...`).
+While `[usage_events]` is configured, `account_ref` must also be a UUID
+(`400 LM-1001` otherwise).
+
+With `[usage_events]` on, `PATCH /admin/keys/{id}` with `group_id` and
+`PATCH /admin/groups/{id}` with `account_ref` first flush pending spend, so it
+is billed to the account in force when it was spent. If that flush fails the
+call answers `500 LM-5001` and changes nothing: retry it. A database outage
+therefore blocks key moves and `account_ref` changes while billing is on.
+See [Lab integration](lab-integration.md) for the billing rule, event format
+and delivery.
 
 ### Granting budget (top-ups)
 
