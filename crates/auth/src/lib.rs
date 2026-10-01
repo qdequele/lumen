@@ -39,7 +39,7 @@ pub(crate) fn now_unix() -> i64 {
 }
 
 /// Current unix time in whole milliseconds (event windows, outbox scheduling).
-/// Clamps like [`now_unix`] on a nonsensical clock.
+/// Clamps like `now_unix` on a nonsensical clock.
 #[must_use]
 pub fn now_unix_ms() -> i64 {
     std::time::SystemTime::now()

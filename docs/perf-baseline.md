@@ -104,11 +104,31 @@ I/O; the database is never touched on the request path.
 |---|---|---|
 | `admit_settle_key` (one key with a budget) | **36.4 ns** | 36.37 – 36.45 ns |
 | `admit_settle_key_in_group` (the same key in a budgeted group: the pool is reserved and settled too) | **54.7 ns** | 54.58 – 54.82 ns |
+| `admit_settle_neighbour_keys_parallel` (8 threads on an 8-core Apple M1 Pro, each on its OWN key, keys picked as consecutive allocations; per-thread cost of one pair) | **57.0 ns** | 53.9 – 60.7 ns |
 
 Well under a microsecond either way: budget enforcement and billing
 accounting are noise next to the ~3.2 µs of request CPU above. Like the
 SystemOne bench, it needs `CARGO_PROFILE_RELEASE_STRIP=false` to build on
 macOS 27.
+
+The parallel bench guards against false sharing between tenants. Keys are
+loaded back to back at boot, so before `KeyEntry` and `GroupEntry` were
+aligned to the cache line (128 bytes on x86_64 and aarch64, 64 elsewhere)
+two neighbouring keys' hot atomics, or one key's tail and the next key's
+`Arc` refcount, shared a line: the same bench measured **100.1 ns**
+(96.8 – 103.4 ns), 2.5x the single-thread `admit_settle_key` of that run
+(39.3 ns) for keys that never contend logically. Aligned, it is **57.0 ns**
+(-47 %), and the single-thread benches are unchanged within noise. The
+remaining gap to one thread (about 1.5x) was not investigated; it is not
+sharing between keys (the entries no longer share a line), and the M1 Pro
+runs two of the eight threads on efficiency cores. An interleaved A/B
+(unpadded and padded bench binaries run alternately, 4 rounds, on a heavily
+loaded machine, load average 54 to 59) agreed: the parallel bench was faster
+padded in every round (median about 127 ns to 77 ns), and the best
+single-thread `admit_settle_key` round was the same either way (38.5 ns
+unpadded, 38.4 ns padded). The price is padding, paid once per key at
+load: a key's allocation grows from 184 to 384 bytes (about 2 MB per 10,000
+keys), a group's to 256 bytes.
 
 ### Idle memory & binary size (measured here)
 

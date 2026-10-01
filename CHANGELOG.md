@@ -58,6 +58,7 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ### Changed
 
+- **Virtual keys and budget groups no longer false-share cache lines.** `KeyEntry` and `GroupEntry` are aligned to the destructive interference size (128 bytes on x86_64 and aarch64, 64 elsewhere, pinned by a compile-time assertion), so the request-path atomics of keys loaded back to back at boot, and a key's tail and its neighbour's `Arc` refcount, no longer share a line. Measured with the new `admit_settle_neighbour_keys_parallel` bench (8 threads, each on its own neighbouring key): 100.1 ns to 57.0 ns per admit+settle (-47 %), single-thread unchanged. Costs about 200 bytes of padding per key (184 to 384 bytes per allocation, about 2 MB per 10,000 keys), paid once at load.
 - `GET /admin/config/providers/{name}` omits a model's unset `upstream_id` and prices instead of returning them as `null`, and no longer returns an empty `fallbacks` list.
 - The request path takes one routing snapshot per request: the chat preset and the decision come from the same snapshot (a reload between them can no longer pair one config's preset with another's routing), and a foundation id called directly builds no routing facts and skips the retain pass.
 - `tokenizer.mode = "accurate"` also matches a provider-prefixed model id on its last path segment, so a foundation model renamed by `lumen config migrate` (`openai/gpt-4o`) keeps exact BPE counts instead of falling back to the heuristic.

@@ -36,6 +36,18 @@ use std::time::Duration;
 /// Sentinel meaning "no limit" for the atomic limit fields.
 const UNLIMITED: i64 = i64::MAX;
 
+/// Alignment of [`KeyEntry`] and [`GroupEntry`], in bytes: the destructive
+/// interference size of the target, so no two entries (and no entry and its
+/// neighbour's `Arc` refcount) ever share a cache line. 128 on x86_64 (the
+/// adjacent-line prefetcher pulls 64-byte lines in pairs) and aarch64 (Apple
+/// cores use 128-byte lines), 64 elsewhere; similar to crossbeam's
+/// `CachePadded`. Must match the `repr(align)` on both structs, which a unit
+/// test pins.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+const CACHE_LINE: usize = 128;
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+const CACHE_LINE: usize = 64;
+
 /// Convert USD to integer micro-USD (rounding to the nearest micro).
 #[must_use]
 #[allow(clippy::cast_possible_truncation)] // clamped: budgets are far below i64::MAX micros
@@ -87,7 +99,16 @@ fn reserve_micro(spent: &AtomicI64, max_bound: i64, reserve: i64) -> bool {
 
 /// The live, request-path view of one budget group (ADR 009): the budget
 /// half of a [`KeyEntry`], shared by every member key through an `Arc`.
+///
+/// Aligned to the cache line (`CACHE_LINE`): every member's request writes `spent_micro`,
+/// and groups are allocated back to back at boot, so an unaligned group would
+/// false-share with its neighbour.
 #[derive(Debug)]
+#[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), repr(align(128)))]
+#[cfg_attr(
+    not(any(target_arch = "x86_64", target_arch = "aarch64")),
+    repr(align(64))
+)]
 pub struct GroupEntry {
     id: String,
     /// Human-readable label, carried so a webhook payload can name the pool
@@ -189,7 +210,20 @@ impl GroupEntry {
 }
 
 /// The live, request-path view of one virtual key.
+///
+/// Aligned to the cache line (`CACHE_LINE`): every request writes this entry's atomics
+/// (`spent_micro`, the quota windows, `dirty`, the settled-cost counters) and
+/// its `Arc` refcount, and keys are allocated back to back at boot. Without
+/// the alignment, neighbouring tenants false-share and admit+settle on
+/// distinct keys ran 2.5x slower in parallel than on one thread
+/// (`admit_settle_neighbour_keys_parallel` bench, 2026-10). The cost
+/// is padding: a few hundred bytes per key, not per request.
 #[derive(Debug)]
+#[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), repr(align(128)))]
+#[cfg_attr(
+    not(any(target_arch = "x86_64", target_arch = "aarch64")),
+    repr(align(64))
+)]
 pub struct KeyEntry {
     id: String,
     /// The budget group this key draws from (ADR 009); lock-free load on
@@ -238,6 +272,11 @@ pub struct KeyEntry {
     /// Settled tokens since the last billed flush (informational units).
     tokens: AtomicI64,
 }
+
+// Compile-time guard: the `repr(align)` attributes above must match
+// `CACHE_LINE`, or neighbouring entries could share a cache line again.
+const _: () = assert!(std::mem::align_of::<KeyEntry>() == CACHE_LINE);
+const _: () = assert!(std::mem::align_of::<GroupEntry>() == CACHE_LINE);
 
 impl KeyEntry {
     fn from_record(record: &VirtualKeyRecord, signals: Arc<SignalCell>) -> Self {
@@ -1237,6 +1276,42 @@ mod tests {
         assert!(bump_window(&w, 101, 2, 1));
         // …and an old-minute bump also starts fresh rather than underflowing.
         assert!(bump_window(&w, 99, 2, 1));
+    }
+
+    #[test]
+    fn hot_entries_start_on_their_own_cache_line() {
+        // Request-path atomics of two keys (or a key's tail and the next
+        // key's `Arc` refcount) must never share a cache line: the entries
+        // are allocated back to back at boot, and false sharing between
+        // neighbouring tenants measured 2.5x slower admit+settle. Checked on
+        // real allocations: the type's alignment is pinned at compile time,
+        // this pins what the allocator actually hands out.
+        let record = VirtualKeyRecord {
+            id: "k".to_owned(),
+            name: "k".to_owned(),
+            group_id: None,
+            budget_max: None,
+            budget_spent: 0.0,
+            rpm_limit: None,
+            tpm_limit: None,
+            expires_at: None,
+            disabled: false,
+            created_at: 0,
+            deleted_at: None,
+            external_ref: None,
+            billed_micro: 0,
+        };
+        let signals = Arc::new(SignalCell::default());
+        let a = Arc::new(KeyEntry::from_record(&record, Arc::clone(&signals)));
+        let b = Arc::new(KeyEntry::from_record(&record, signals));
+        let (pa, pb) = (Arc::as_ptr(&a) as usize, Arc::as_ptr(&b) as usize);
+        assert_eq!(pa % CACHE_LINE, 0, "entry starts on a line boundary");
+        assert_eq!(pb % CACHE_LINE, 0, "entry starts on a line boundary");
+        // Each allocation is the refcount line followed by the entry, so two
+        // entries are at least one entry plus one refcount line apart: no
+        // line holds data of both, nor one's data and the other's refcount.
+        let (lo, hi) = (pa.min(pb), pa.max(pb));
+        assert!(hi - lo >= std::mem::size_of::<KeyEntry>() + CACHE_LINE);
     }
 
     #[test]
