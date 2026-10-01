@@ -15,6 +15,9 @@ use tokio_util::sync::CancellationToken;
 pub const SIGNATURE_HEADER: &str = "X-Lab-Signature";
 /// How often the sender polls the outbox when it is not draining a backlog.
 const POLL: Duration = Duration::from_secs(2);
+/// The pending and oldest-age gauges are re-read at most this often (ms):
+/// a scrape interval is coarser, and a backlog drain loops without waiting.
+const GAUGE_REFRESH_MS: i64 = 10_000;
 /// Delivered rows are kept this long, then purged.
 pub const DELIVERED_RETENTION_MS: i64 = 7 * 86_400_000;
 
@@ -201,13 +204,14 @@ fn jitter_ms() -> i64 {
 }
 
 /// Run the sender until `cancel`: poll every 2 s, drain a backlog without
-/// waiting, refresh gauges, purge hourly.
+/// waiting, refresh gauges at once and then at most every 10 s, purge hourly.
 pub fn spawn_usage_events_sender(
     sender: Arc<UsageEventsSender>,
     cancel: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut last_purge = 0_i64;
+        let mut last_gauges = i64::MIN;
         loop {
             let now = lumen_auth::now_unix_ms();
             let outcome = tokio::select! {
@@ -215,7 +219,10 @@ pub fn spawn_usage_events_sender(
                 () = cancel.cancelled() => break,
                 outcome = sender.deliver_once(now) => outcome,
             };
-            sender.refresh_gauges(now).await;
+            if now.saturating_sub(last_gauges) >= GAUGE_REFRESH_MS {
+                sender.refresh_gauges(now).await;
+                last_gauges = now;
+            }
             if now - last_purge > 3_600_000 {
                 sender.purge(now).await;
                 last_purge = now;
@@ -413,6 +420,48 @@ mod tests {
             (1..=2).contains(&requests),
             "a failing Lab must not be hot-spun: {requests} requests"
         );
+    }
+
+    #[tokio::test]
+    async fn the_loop_refreshes_gauges_at_once_then_at_most_every_10s() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        let (s, store, metrics) = sender(&server, &["a"]).await;
+        let cancel = CancellationToken::new();
+        let handle = spawn_usage_events_sender(Arc::new(s), cancel.clone());
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            metrics
+                .encode_text()
+                .contains("lumen_usage_events_pending 1"),
+            "the first refresh is immediate"
+        );
+        // A second pending row, then one more loop iteration (2 s poll): the
+        // gauges are not re-read before 10 s have passed.
+        store
+            .persist_flush(
+                &[],
+                &[OutboxInsert {
+                    id: "b".to_owned(),
+                    body: r#"{"id":"b"}"#.to_owned(),
+                    created_ms: 1,
+                }],
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(2_500)).await;
+        assert!(server.received_requests().await.unwrap().len() >= 2);
+        assert!(
+            metrics
+                .encode_text()
+                .contains("lumen_usage_events_pending 1"),
+            "no gauge refresh within 10 s of the last one"
+        );
+        cancel.cancel();
+        handle.await.unwrap();
     }
 
     #[tokio::test]

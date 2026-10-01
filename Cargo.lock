@@ -161,6 +161,7 @@ dependencies = [
  "arc-swap",
  "blake3",
  "core",
+ "criterion",
  "dashmap",
  "jsonschema",
  "rand 0.10.2",

@@ -479,6 +479,9 @@ pub struct OutboxInsert {
     pub created_ms: i64,
 }
 
+/// Rows deleted per statement by [`KeyStore::outbox_purge_delivered`].
+pub const OUTBOX_PURGE_CHUNK: i64 = 5000;
+
 /// One due outbox row, as the sender reads it.
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
 pub struct OutboxRow {
@@ -920,16 +923,29 @@ impl KeyStore {
         Ok((row.try_get("n")?, row.try_get("oldest")?))
     }
 
-    /// Delete delivered events acknowledged before `older_than_ms`.
+    /// Delete delivered events acknowledged before `older_than_ms`; returns
+    /// the total deleted. Deletes in chunks of [`OUTBOX_PURGE_CHUNK`] rows,
+    /// yielding between chunks, so a large backlog never holds the SQLite
+    /// write lock (shared with the budget flush) for one long statement.
     pub async fn outbox_purge_delivered(&self, older_than_ms: i64) -> Result<u64, AuthError> {
-        let purged = sqlx::query(
-            "DELETE FROM usage_outbox WHERE delivered_ms IS NOT NULL AND delivered_ms < ?",
-        )
-        .bind(older_than_ms)
-        .execute(&self.pool)
-        .await?
-        .rows_affected();
-        Ok(purged)
+        let mut total = 0;
+        loop {
+            let purged = sqlx::query(
+                "DELETE FROM usage_outbox WHERE rowid IN (\
+                   SELECT rowid FROM usage_outbox \
+                   WHERE delivered_ms IS NOT NULL AND delivered_ms < ? LIMIT ?)",
+            )
+            .bind(older_than_ms)
+            .bind(OUTBOX_PURGE_CHUNK)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+            total += purged;
+            if purged < OUTBOX_PURGE_CHUNK.unsigned_abs() {
+                return Ok(total);
+            }
+            tokio::task::yield_now().await;
+        }
     }
 
     // ---- Budget groups (ADR 009) --------------------------------------------

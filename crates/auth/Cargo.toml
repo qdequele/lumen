@@ -31,6 +31,11 @@ tokio = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 serde_json = { workspace = true }
 jsonschema = { version = "0.45", default-features = false }
+criterion = { workspace = true }
+
+[[bench]]
+name = "admit_settle"
+harness = false
 
 [lints]
 workspace = true
