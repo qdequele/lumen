@@ -12,14 +12,20 @@ use std::sync::Arc;
 
 /// Flush every dirty and retired key, then every dirty group.
 ///
+/// The clock is read after the flush guard is acquired, so a flush that
+/// waited behind another one stamps its events with the time it actually
+/// ran, and the stamps of successive flushes never go backwards.
+///
 /// Returns `true` when the key batch was persisted and committed (or there
 /// was nothing to flush), `false` when serialization or the store failed (the
 /// batch is rolled back first, so the next flush retries it). The group flush
 /// does not affect billing, so its failure is logged but never changes the
 /// return value. Callers that must not proceed with unbilled spend (admin
 /// changes of billability) fail closed on `false`.
-pub async fn flush_budgets(runtime: &AuthRuntime, now_ms: i64) -> bool {
+#[must_use]
+pub async fn flush_budgets(runtime: &AuthRuntime) -> bool {
     let _guard = runtime.keys.flush_guard().await;
+    let now_ms = lumen_auth::now_unix_ms();
     let batch = runtime.keys.drain_flush(now_ms);
     let persisted = persist(runtime, batch, now_ms).await;
     let groups = runtime.keys.drain_dirty_groups();
@@ -36,11 +42,11 @@ pub async fn flush_budgets(runtime: &AuthRuntime, now_ms: i64) -> bool {
 /// leaves it retired, and every later flush retries it.
 ///
 /// The retire is synchronous; the flush itself is [`flush_detached`].
-pub async fn retire_and_flush_key(runtime: &Arc<AuthRuntime>, entry: Arc<KeyEntry>, now_ms: i64) {
+pub async fn retire_and_flush_key(runtime: &Arc<AuthRuntime>, entry: Arc<KeyEntry>) {
     runtime.keys.retire(entry);
     // A failed flush is not fatal here: the key stays retired and the next
     // flush retries it, so the result is deliberately discarded.
-    let _ = flush_detached_at(runtime, now_ms).await;
+    let _ = flush_detached(runtime).await;
 }
 
 /// Run one [`flush_budgets`] in a detached task and await it.
@@ -54,15 +60,10 @@ pub async fn retire_and_flush_key(runtime: &Arc<AuthRuntime>, entry: Arc<KeyEntr
 ///
 /// Returns the flush result (see [`flush_budgets`]), or `false` when the task
 /// panicked or was cancelled.
+#[must_use]
 pub async fn flush_detached(runtime: &Arc<AuthRuntime>) -> bool {
-    flush_detached_at(runtime, lumen_auth::now_unix_ms()).await
-}
-
-/// [`flush_detached`] at an explicit clock reading (the single place the
-/// detached spawn lives).
-async fn flush_detached_at(runtime: &Arc<AuthRuntime>, now_ms: i64) -> bool {
     let detached = Arc::clone(runtime);
-    let handle = tokio::spawn(async move { flush_budgets(&detached, now_ms).await });
+    let handle = tokio::spawn(async move { flush_budgets(&detached).await });
     match handle.await {
         Ok(persisted) => persisted,
         Err(error) => {

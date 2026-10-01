@@ -1,12 +1,16 @@
 //! ADR 015 end to end on the real binary: a key in a Lab-linked lease spends,
-//! usage events reach a mock Lab, a grant from the event's group snapshot
-//! keeps the key serving, and SIGTERM delivers the final flush.
+//! usage events reach a mock Lab (after one rejected delivery), a grant from
+//! the event's group snapshot keeps the key serving, SIGTERM delivers the
+//! final flush, and the signing secret never reaches the logs. Boot refuses a
+//! missing or blank secret and a non-UUID `account_ref` on a live group.
 #![cfg(unix)]
 
 use serde_json::{json, Value};
 use std::io::Read;
 use std::net::TcpListener as StdTcpListener;
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
@@ -77,51 +81,64 @@ async fn wait_for_exit(child: &mut Child, timeout: Duration) -> std::process::Ex
     }
 }
 
-/// On failure, drain and print the child's stdout/stderr so a CI log shows
-/// *why* startup or shutdown didn't behave - a bare "assertion failed" here
-/// gives no signal about a config or port problem.
-fn dump_output(mut child: Child, label: &str) {
-    let mut out = String::new();
-    let mut err = String::new();
-    if let Some(mut stdout) = child.stdout.take() {
-        let _ = stdout.read_to_string(&mut out);
-    }
-    if let Some(mut stderr) = child.stderr.take() {
-        let _ = stderr.read_to_string(&mut err);
-    }
-    eprintln!("--- {label} stdout ---\n{out}\n--- {label} stderr ---\n{err}");
+/// Read a child pipe to the end on its own thread, so a verbose child
+/// (`RUST_LOG=debug`) never blocks on a full pipe while the test runs.
+fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> JoinHandle<String> {
+    std::thread::spawn(move || {
+        let mut text = String::new();
+        if let Some(mut pipe) = pipe {
+            let _ = pipe.read_to_string(&mut text);
+        }
+        text
+    })
+}
+
+/// Join both drain threads: the child's stdout and stderr, concatenated.
+/// `main` reports boot errors through `tracing::error!`, whose subscriber
+/// writes to stdout, so callers look things up on both streams.
+fn collect(stdout: JoinHandle<String>, stderr: JoinHandle<String>) -> String {
+    let out = stdout.join().expect("stdout drain thread");
+    let err = stderr.join().expect("stderr drain thread");
+    format!("--- stdout ---\n{out}\n--- stderr ---\n{err}")
 }
 
 const MASTER: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const ACCOUNT: &str = "0192f3c1-7c2e-7b1a-9f00-3c9d2e4a5b61";
+/// The events signing secret: distinctive, so a leak into any log is found.
+const SECRET: &str = "e2e-signing-secret-7f3a9c";
 
-/// The mock Lab accepts every event id it receives.
-struct AcceptAll;
+/// The mock Lab accepts every event id it receives and records the events it
+/// acknowledged, so a rejected batch is never counted as billed.
+#[derive(Clone, Default)]
+struct AcceptAll {
+    accepted: Arc<Mutex<Vec<Value>>>,
+}
 impl Respond for AcceptAll {
     fn respond(&self, req: &Request) -> ResponseTemplate {
         let body: Value = serde_json::from_slice(&req.body).expect("events body is JSON");
-        let ids: Vec<Value> = body["events"]
-            .as_array()
-            .expect("events array")
-            .iter()
-            .map(|e| e["id"].clone())
-            .collect();
+        let events = body["events"].as_array().expect("events array").clone();
+        let ids: Vec<Value> = events.iter().map(|e| e["id"].clone()).collect();
+        self.accepted
+            .lock()
+            .expect("accepted events lock")
+            .extend(events);
         ResponseTemplate::new(200).set_body_json(json!({ "accepted": ids }))
     }
 }
 
-async fn lab_events(lab: &MockServer) -> Vec<Value> {
-    lab.received_requests()
-        .await
-        .expect("request recording is on")
-        .iter()
-        .flat_map(|r| {
-            serde_json::from_slice::<Value>(&r.body).expect("events body is JSON")["events"]
-                .as_array()
-                .expect("events array")
-                .clone()
-        })
-        .collect()
+impl AcceptAll {
+    /// Every distinct event the Lab acknowledged, first sighting first. The
+    /// Lab deduplicates on `id`, so a re-sent event is billed once.
+    fn events(&self) -> Vec<Value> {
+        let mut seen = std::collections::HashSet::new();
+        self.accepted
+            .lock()
+            .expect("accepted events lock")
+            .iter()
+            .filter(|e| seen.insert(e["id"].as_str().expect("event id").to_owned()))
+            .cloned()
+            .collect()
+    }
 }
 
 /// Remove a SQLite file and its WAL sidecars: a stale `-wal` next to a fresh
@@ -160,9 +177,20 @@ async fn a_lease_is_billed_topped_up_and_flushed_on_shutdown() {
         .mount(&upstream)
         .await;
     let lab = MockServer::start().await;
+    // The first delivery is rejected with 401, so the sender's error-log
+    // branch runs under `RUST_LOG=debug` before the happy path.
     Mock::given(method("POST"))
         .and(path("/internal/events"))
-        .respond_with(AcceptAll)
+        .respond_with(ResponseTemplate::new(401))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .expect(1)
+        .mount(&lab)
+        .await;
+    let accept = AcceptAll::default();
+    Mock::given(method("POST"))
+        .and(path("/internal/events"))
+        .respond_with(accept.clone())
         .mount(&lab)
         .await;
 
@@ -209,12 +237,15 @@ cost_per_1m_output = 1000.0
         .arg("--config")
         .arg(&config)
         .env("LUMEN_MASTER_KEY", MASTER)
-        .env("E2E_USAGE_EVENTS_SECRET", "e2e-secret")
+        .env("E2E_USAGE_EVENTS_SECRET", SECRET)
         .env("E2E_UPSTREAM_KEY", "sk-test")
+        .env("RUST_LOG", "debug")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn lumen binary");
+    let stdout = drain(child.stdout.take());
+    let stderr = drain(child.stderr.take());
     let base = format!("http://127.0.0.1:{port}");
     wait_until_ready(&base, Duration::from_secs(10)).await;
     let http = reqwest::Client::new();
@@ -252,10 +283,11 @@ cost_per_1m_output = 1000.0
     assert_eq!(chat().await.expect("first call").status(), 200);
     assert_eq!(chat().await.expect("second call").status(), 200);
 
-    // Wait for the flush (200 ms) and the sender poll (2 s).
-    let deadline = Instant::now() + Duration::from_secs(10);
+    // Wait for the flush (200 ms), the rejected first delivery, its 2 s
+    // backoff and the sender poll (2 s).
+    let deadline = Instant::now() + Duration::from_secs(20);
     let events = loop {
-        let events = lab_events(&lab).await;
+        let events = accept.events();
         if billed(&events) >= 4_000_000 {
             break events;
         }
@@ -298,21 +330,76 @@ cost_per_1m_output = 1000.0
     // SIGTERM: the final flush bills the third call and the sender delivers it.
     send_signal(&child, libc::SIGTERM);
     let status = wait_for_exit(&mut child, Duration::from_secs(15)).await;
-    if !status.success() {
-        dump_output(child, "usage-events-e2e");
-        panic!("{status:?}");
+    // Always drain both streams: they are checked for the secret below.
+    let output = collect(stdout, stderr);
+    assert!(status.success(), "{status:?}\n{output}");
+    assert_eq!(billed(&accept.events()), 6_000_000);
+
+    // The 401 branch ran (it is the one that names the signing secret) and
+    // no log line at debug level carries the secret's value.
+    assert!(
+        output.contains("usage events rejected with 401"),
+        "the 401 path did not run:\n{output}"
+    );
+    assert!(
+        !output.contains(SECRET),
+        "the signing secret leaked into the logs"
+    );
+}
+
+/// Spawn the binary on `toml` with `env`, expect it to exit non-zero within
+/// 10 s (a binary that boots anyway is killed so a regression fails instead
+/// of hanging), and return its combined output.
+async fn boot_failure_output(unique: &str, toml: &str, env: &[(&str, &str)]) -> String {
+    let config = write_temp_config(unique, toml);
+    let mut command = Command::new(env!("CARGO_BIN_EXE_lumen"));
+    command
+        .arg("--config")
+        .arg(&config)
+        .env("LUMEN_MASTER_KEY", MASTER)
+        .env_remove("E2E_UNSET_USAGE_EVENTS_SECRET")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (name, value) in env {
+        command.env(name, value);
     }
-    assert_eq!(billed(&lab_events(&lab).await), 6_000_000);
+    let mut child = command.spawn().expect("spawn lumen binary");
+    let stdout = drain(child.stdout.take());
+    let stderr = drain(child.stderr.take());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll child status") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "lumen booted when it must refuse:\n{}",
+                collect(stdout, stderr)
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    let output = collect(stdout, stderr);
+    assert!(!status.success(), "{output}");
+    output
 }
 
 #[tokio::test]
-async fn a_missing_signing_secret_refuses_to_boot() {
-    let port = free_port();
-    let db = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("usage-events-nosecret.db");
-    remove_db_files(&db);
-    let config = write_temp_config(
-        "nosecret",
-        &format!(
+async fn a_missing_or_blank_signing_secret_refuses_to_boot() {
+    for (unique, env) in [
+        ("nosecret", &[][..]),
+        (
+            "blanksecret",
+            &[("E2E_UNSET_USAGE_EVENTS_SECRET", " \t ")][..],
+        ),
+    ] {
+        let port = free_port();
+        let db = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("usage-events-{unique}.db"));
+        remove_db_files(&db);
+        let toml = format!(
             r#"
 [server]
 host = "127.0.0.1"
@@ -328,42 +415,60 @@ signing_key_env = "E2E_UNSET_USAGE_EVENTS_SECRET"
 source = "e2e"
 "#,
             db = db.display()
-        ),
+        );
+        let output = boot_failure_output(unique, &toml, env).await;
+        assert!(
+            output.contains("E2E_UNSET_USAGE_EVENTS_SECRET"),
+            "{unique}: {output}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_non_uuid_account_ref_refuses_to_boot_with_usage_events() {
+    let db = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("usage-events-badref.db");
+    remove_db_files(&db);
+    // A group written while billing was off, when any opaque ref is valid.
+    let store = lumen_auth::store::KeyStore::connect(&format!("sqlite://{}", db.display()))
+        .await
+        .expect("open auth db");
+    let group = store
+        .create_group(lumen_auth::store::NewGroup {
+            name: "legacy".to_owned(),
+            budget_max: None,
+            account_ref: Some("acme".to_owned()),
+        })
+        .await
+        .expect("create group");
+    store.pool().close().await;
+
+    let port = free_port();
+    let toml = format!(
+        r#"
+[server]
+host = "127.0.0.1"
+port = {port}
+
+[auth]
+enabled = true
+db_path = "{db}"
+
+[usage_events]
+url = "https://lab.example"
+signing_key_env = "E2E_BADREF_USAGE_EVENTS_SECRET"
+source = "e2e"
+"#,
+        db = db.display()
     );
-    let mut child = Command::new(env!("CARGO_BIN_EXE_lumen"))
-        .arg("--config")
-        .arg(&config)
-        .env("LUMEN_MASTER_KEY", MASTER)
-        .env_remove("E2E_UNSET_USAGE_EVENTS_SECRET")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn lumen binary");
-    // A binary that boots anyway would serve forever: bound the wait and kill
-    // it so a regression fails the test instead of hanging it.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let status = loop {
-        if let Some(status) = child.try_wait().expect("poll child status") {
-            break status;
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!("lumen booted without its signing secret");
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    };
-    assert!(!status.success());
-    let mut stdout = String::new();
-    let mut stderr = String::new();
-    if let Some(mut pipe) = child.stdout.take() {
-        let _ = pipe.read_to_string(&mut stdout);
-    }
-    if let Some(mut pipe) = child.stderr.take() {
-        let _ = pipe.read_to_string(&mut stderr);
-    }
-    // `main` reports boot errors through `tracing::error!`, whose subscriber
-    // writes to stdout, so the diagnostic is looked up on both streams.
-    let text = format!("{stdout}{stderr}");
-    assert!(text.contains("E2E_UNSET_USAGE_EVENTS_SECRET"), "{text}");
+    let output = boot_failure_output(
+        "badref",
+        &toml,
+        &[("E2E_BADREF_USAGE_EVENTS_SECRET", SECRET)],
+    )
+    .await;
+    assert!(output.contains(&group.id), "names the group: {output}");
+    assert!(
+        !output.contains("acme"),
+        "names only group ids, never the ref: {output}"
+    );
 }

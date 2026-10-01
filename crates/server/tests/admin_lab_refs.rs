@@ -246,7 +246,7 @@ async fn patching_refs_validates_them_too() {
         "a rejected patch never flushes"
     );
 
-    flush_budgets(&runtime, 10_000).await;
+    assert!(flush_budgets(&runtime).await);
     assert_eq!(events(&runtime).await, vec![(ACCOUNT.to_owned(), 250_000)]);
 }
 
@@ -360,7 +360,7 @@ async fn a_failed_pre_change_flush_blocks_the_key_move() {
     )
     .await;
     assert_eq!(s, 200);
-    flush_budgets(&runtime, 10_000).await;
+    assert!(flush_budgets(&runtime).await);
     assert_eq!(
         events(&runtime).await,
         vec![(ACCOUNT.to_owned(), 250_000)],
@@ -403,7 +403,7 @@ async fn a_failed_pre_change_flush_blocks_the_account_ref_change() {
     )
     .await;
     assert_eq!(s, 200);
-    flush_budgets(&runtime, 10_000).await;
+    assert!(flush_budgets(&runtime).await);
     assert_eq!(events(&runtime).await, vec![(ACCOUNT.to_owned(), 250_000)]);
 }
 
@@ -431,7 +431,7 @@ async fn moving_a_key_bills_prior_spend_to_the_old_account() {
     )
     .await;
     assert_eq!(s, 200);
-    flush_budgets(&runtime, 10_000).await;
+    assert!(flush_budgets(&runtime).await);
     assert_eq!(
         events(&runtime).await,
         vec![(ACCOUNT.to_owned(), 250_000)],
@@ -439,7 +439,7 @@ async fn moving_a_key_bills_prior_spend_to_the_old_account() {
     );
 
     spend(&runtime, plain, 100_000);
-    flush_budgets(&runtime, 20_000).await;
+    assert!(flush_budgets(&runtime).await);
     assert_eq!(
         events(&runtime).await,
         vec![
@@ -471,11 +471,11 @@ async fn changing_a_group_account_ref_bills_prior_spend_to_the_old_account() {
     )
     .await;
     assert_eq!(s, 200);
-    flush_budgets(&runtime, 10_000).await;
+    assert!(flush_budgets(&runtime).await);
     assert_eq!(events(&runtime).await, vec![(ACCOUNT.to_owned(), 250_000)]);
 
     spend(&runtime, plain, 100_000);
-    flush_budgets(&runtime, 20_000).await;
+    assert!(flush_budgets(&runtime).await);
     assert_eq!(
         events(&runtime).await,
         vec![

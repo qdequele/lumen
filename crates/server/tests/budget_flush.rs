@@ -69,7 +69,7 @@ async fn watermark(runtime: &AuthRuntime) -> (f64, i64) {
 async fn a_flush_persists_spend_and_enqueues_one_event() {
     let (rt, plain, _) = runtime(true, true).await;
     spend(&rt, &plain, 250_000);
-    flush_budgets(&rt, 5_000).await;
+    assert!(flush_budgets(&rt).await);
     assert_eq!(watermark(&rt).await, (0.25, 250_000));
     let due = rt.store.outbox_due(i64::MAX, 10).await.unwrap();
     assert_eq!(due.len(), 1);
@@ -77,7 +77,7 @@ async fn a_flush_persists_spend_and_enqueues_one_event() {
     assert_eq!(body["account_id"], ACCOUNT);
     assert_eq!(body["data"]["cost_micro_usd"], 250_000);
     // Nothing new spent: the next flush writes nothing.
-    flush_budgets(&rt, 6_000).await;
+    assert!(flush_budgets(&rt).await);
     assert_eq!(rt.store.outbox_due(i64::MAX, 10).await.unwrap().len(), 1);
 }
 
@@ -85,7 +85,7 @@ async fn a_flush_persists_spend_and_enqueues_one_event() {
 async fn without_usage_events_no_event_is_written() {
     let (rt, plain, _) = runtime(false, true).await;
     spend(&rt, &plain, 250_000);
-    flush_budgets(&rt, 5_000).await;
+    assert!(flush_budgets(&rt).await);
     assert_eq!(watermark(&rt).await, (0.25, 250_000));
     assert!(rt.store.outbox_due(i64::MAX, 10).await.unwrap().is_empty());
 }
@@ -94,14 +94,14 @@ async fn without_usage_events_no_event_is_written() {
 async fn joining_a_billable_group_bills_only_new_spend() {
     let (rt, plain, group_id) = runtime(true, false).await;
     spend(&rt, &plain, 900_000);
-    flush_budgets(&rt, 5_000).await; // operator key: watermark catches up
+    assert!(flush_budgets(&rt).await); // operator key: watermark catches up
     let key_id = rt.store.list_keys(false).await.unwrap()[0].id.clone();
     let patch: lumen_auth::store::KeyPatch =
         serde_json::from_str(&format!(r#"{{"group_id":"{group_id}"}}"#)).unwrap();
     let updated = rt.store.update_key(&key_id, patch).await.unwrap().unwrap();
     rt.keys.apply(&updated);
     spend(&rt, &plain, 100_000);
-    flush_budgets(&rt, 6_000).await;
+    assert!(flush_budgets(&rt).await);
     let due = rt.store.outbox_due(i64::MAX, 10).await.unwrap();
     assert_eq!(due.len(), 1);
     let body: serde_json::Value = serde_json::from_str(&due[0].body).unwrap();
@@ -114,7 +114,7 @@ async fn deleting_a_key_bills_its_last_delta() {
     spend(&rt, &plain, 70_000);
     let key_id = rt.store.list_keys(false).await.unwrap()[0].id.clone();
     let entry = rt.keys.remove(&key_id).unwrap();
-    retire_and_flush_key(&rt, entry, 5_000).await;
+    retire_and_flush_key(&rt, entry).await;
     assert_eq!(rt.store.outbox_due(i64::MAX, 10).await.unwrap().len(), 1);
 }
 
@@ -128,8 +128,8 @@ async fn concurrent_flushes_bill_a_delta_once() {
     let evicted = rt.keys.remove(&key_id).unwrap();
     rt.keys.retire(evicted);
     let (a, b) = (Arc::clone(&rt), Arc::clone(&rt));
-    let first = tokio::spawn(async move { flush_budgets(&a, 5_000).await });
-    let second = tokio::spawn(async move { flush_budgets(&b, 5_001).await });
+    let first = tokio::spawn(async move { flush_budgets(&a).await });
+    let second = tokio::spawn(async move { flush_budgets(&b).await });
     first.await.unwrap();
     second.await.unwrap();
     let due = rt.store.outbox_due(i64::MAX, 10).await.unwrap();
@@ -160,7 +160,7 @@ async fn a_dropped_delete_flush_loses_nothing() {
     // Another flusher holds the guard, so the delete's flush parks.
     let guard = rt.keys.flush_guard().await;
     let rt2 = Arc::clone(&rt);
-    let delete = tokio::spawn(async move { retire_and_flush_key(&rt2, evicted, 5_000).await });
+    let delete = tokio::spawn(async move { retire_and_flush_key(&rt2, evicted).await });
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     // The client goes away: the handler future is dropped mid-flush.
     delete.abort();
@@ -178,7 +178,7 @@ async fn a_dropped_delete_flush_loses_nothing() {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
     // A later flush bills nothing again.
-    flush_budgets(&rt, 6_000).await;
+    assert!(flush_budgets(&rt).await);
     let again = rt.store.outbox_due(i64::MAX, 10).await.unwrap();
     assert_eq!(again.len(), due.len(), "nothing is billed twice");
     let mut costs: Vec<i64> = due
@@ -203,14 +203,38 @@ async fn a_request_in_flight_on_a_deleted_key_is_still_billed() {
     let reservation = entry.admit(1, 0, 100_000).unwrap();
     let key_id = rt.store.list_keys(false).await.unwrap()[0].id.clone();
     let evicted = rt.keys.remove(&key_id).unwrap();
-    retire_and_flush_key(&rt, evicted, 5_000).await;
+    retire_and_flush_key(&rt, evicted).await;
     assert!(rt.store.outbox_due(i64::MAX, 10).await.unwrap().is_empty());
     // The request finishes after the delete; its settled cost is billed.
     reservation.settle(40_000, 3);
     drop(entry);
-    flush_budgets(&rt, 6_000).await;
+    assert!(flush_budgets(&rt).await);
     let due = rt.store.outbox_due(i64::MAX, 10).await.unwrap();
     assert_eq!(due.len(), 1);
     let body: serde_json::Value = serde_json::from_str(&due[0].body).unwrap();
     assert_eq!(body["data"]["cost_micro_usd"], 40_000);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_flush_that_waited_for_the_guard_stamps_the_time_it_ran() {
+    let (rt, plain, _) = runtime(true, true).await;
+    spend(&rt, &plain, 250_000);
+    // Another flusher holds the guard: this flush parks behind it.
+    let guard = rt.keys.flush_guard().await;
+    let rt2 = Arc::clone(&rt);
+    let flush = tokio::spawn(async move { flush_budgets(&rt2).await });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let released_ms = lumen_auth::now_unix_ms();
+    drop(guard);
+    assert!(flush.await.unwrap());
+    let created_ms: i64 = sqlx::query("SELECT created_ms FROM usage_outbox")
+        .fetch_one(rt.store.pool())
+        .await
+        .unwrap()
+        .get("created_ms");
+    assert!(
+        created_ms >= released_ms,
+        "the event is stamped {}ms before the flush could run",
+        released_ms - created_ms
+    );
 }

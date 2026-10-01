@@ -13,7 +13,7 @@ use arc_swap::ArcSwap;
 use lumen_auth::crypto::MasterKey;
 use lumen_auth::key::hash_key;
 use lumen_auth::state::AuthState;
-use lumen_auth::store::KeyStore;
+use lumen_auth::store::{GroupRecord, KeyStore};
 use lumen_auth::usage::{spawn_usage_writer, UsageWriterConfig};
 use lumen_server::{
     auth::{now_unix, AuthRuntime},
@@ -843,7 +843,7 @@ fn attach_optional(
 }
 
 /// Build and spawn the usage-event sender (ADR 015). The signing secret must
-/// be set and non-empty: billing without authenticity is refused at boot.
+/// be set and not blank: billing without authenticity is refused at boot.
 /// The error names only the variable, never its value.
 fn boot_usage_events(
     config: &lumen_server::config::UsageEventsConfig,
@@ -853,7 +853,7 @@ fn boot_usage_events(
 ) -> anyhow::Result<UsageEventsHandle> {
     let secret = std::env::var(&config.signing_key_env)
         .ok()
-        .filter(|s| !s.is_empty())
+        .filter(|s| !s.trim().is_empty())
         .with_context(|| {
             format!(
                 "[usage_events] requires the {} env var (the events signing secret)",
@@ -893,7 +893,7 @@ async fn drain_on_shutdown(
     if let Some(runtime) = &auth_runtime {
         // The flush outcome only matters to the admin pre-change path; at
         // shutdown there is nothing left to do with a failure.
-        let _ = lumen_server::budget_flush::flush_budgets(runtime, lumen_auth::now_unix_ms()).await;
+        let _ = lumen_server::budget_flush::flush_budgets(runtime).await;
     }
     if let Some((sender, handle)) = usage_events {
         // The final flush above may have written events: one bounded
@@ -1169,9 +1169,36 @@ fn spawn_budget_flush_task(runtime: Arc<AuthRuntime>, knobs: Arc<AuthKnobs>) {
             // non-zero while auth is enabled, but a disabling reload sets 0).
             let interval = Duration::from_millis(knobs.flush_interval_ms().max(1));
             tokio::time::sleep(interval).await;
-            lumen_server::budget_flush::flush_budgets(&runtime, lumen_auth::now_unix_ms()).await;
+            // A failure is logged inside and retried by the next interval.
+            let _ = lumen_server::budget_flush::flush_budgets(&runtime).await;
         }
     });
+}
+
+/// Refuse to bill with a live group whose `account_ref` is not a UUID (ADR
+/// 015): the admin API only enforces the shape while `[usage_events]` is on,
+/// so a ref written before it was enabled would be sent as an `account_id`
+/// the Lab rejects forever. The error names only the group ids.
+fn ensure_account_refs_are_uuids(groups: &[GroupRecord]) -> anyhow::Result<()> {
+    let offending: Vec<&str> = groups
+        .iter()
+        .filter(|g| {
+            g.account_ref
+                .as_deref()
+                .is_some_and(|r| !lumen_auth::billing::is_uuid(r))
+        })
+        .map(|g| g.id.as_str())
+        .collect();
+    if offending.is_empty() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "[usage_events] requires every group's account_ref to be a Lab account UUID; \
+         these groups have one that is not: {}. Boot without [usage_events], \
+         PATCH /admin/groups/{{id}} each of them with the account UUID (or null), \
+         then re-enable the block",
+        offending.join(", ")
+    )
 }
 
 /// Boot the M5 auth stack: master key, SQLite store, provider-key back-fill,
@@ -1229,6 +1256,9 @@ async fn boot_auth_stack(
         .await
         .context("failed to load budget groups")?;
     let group_count = groups.len();
+    if config.usage_events.is_some() {
+        ensure_account_refs_are_uuids(&groups)?;
+    }
     let entries = store
         .load_auth_entries()
         .await

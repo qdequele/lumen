@@ -132,7 +132,7 @@ pub use lumen_auth::events::WebhookSettings as WebhooksConfig;
 
 /// Billing usage events pushed to a control plane (ADR 015). Absent by
 /// default: with no `[usage_events]` block the gateway writes no outbox row
-/// and makes no call to anything but its providers. Boot layer.
+/// and this block adds no outbound call. Boot layer.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct UsageEventsConfig {
@@ -169,6 +169,19 @@ impl UsageEventsConfig {
     fn validate(&self) -> Result<(), String> {
         let url = reqwest::Url::parse(&self.url)
             .map_err(|e| format!("usage_events.url is not a valid URL: {e}"))?;
+        // Credentials in the URL would reach logs and `Debug` (the URL is
+        // logged on a failed delivery), and a query or a fragment would end
+        // up before the `/internal/events` suffix. The URL is never echoed.
+        if !url.username().is_empty() || url.password().is_some() {
+            return Err(
+                "usage_events.url must not carry credentials (user or password); \
+                 authenticity comes from the signing secret"
+                    .to_owned(),
+            );
+        }
+        if url.query().is_some() || url.fragment().is_some() {
+            return Err("usage_events.url must not have a query or a fragment".to_owned());
+        }
         let private_host = match url.host_str() {
             Some("localhost") => true,
             Some(h) => h
@@ -1020,9 +1033,9 @@ fn describe_figment_error(error: &figment::Error) -> String {
 ///   `usage_events.signing_key_env` and discovered by the same peek.
 ///
 /// Only the exact variable named in config is excluded, so a typo elsewhere in
-/// the `LUMEN_*` namespace is still caught. A name containing `__` is not
-/// excluded (figment would read it as a nested key); config validation rejects
-/// that shape outright.
+/// the `LUMEN_*` namespace is still caught. A name containing `__` is
+/// excluded too: figment applies `ignore` to the whole lowercased key before
+/// `split("__")` nests it, so no validation needs to reject that shape.
 fn secret_env_keys(path: &Path) -> Vec<String> {
     secret_env_keys_with_dynamic(path, "")
 }
@@ -2076,6 +2089,26 @@ mod tests {
             let block = UE_OK.replace("https://lab.example", url);
             assert_eq!(with_usage_events(&block).is_ok(), ok, "{url}");
         }
+    }
+
+    #[test]
+    fn usage_events_url_rejects_userinfo_query_and_fragment() {
+        // Credentials in the URL would reach logs and Debug; a query or a
+        // fragment would be mangled by the `/internal/events` suffix.
+        for url in [
+            "https://admin:s3cr3t@lab.example",
+            "https://admin@lab.example",
+            "https://lab.example?token=x",
+            "https://lab.example/?a=1",
+            "https://lab.example#frag",
+        ] {
+            let block = UE_OK.replace("https://lab.example", url);
+            let err = with_usage_events(&block).unwrap_err().to_string();
+            assert!(err.contains("usage_events.url"), "{url}: {err}");
+            assert!(!err.contains("s3cr3t"), "the URL is never echoed: {err}");
+        }
+        let block = UE_OK.replace("https://lab.example", "https://lab.example/base/");
+        assert!(with_usage_events(&block).is_ok(), "a path stays allowed");
     }
 
     #[test]
