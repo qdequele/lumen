@@ -92,6 +92,24 @@ companion integration test (methodology point 3 above) guarantees the number
 means what it says: the first frame is forwarded while the upstream is still
 mid-stream, never buffered until end-of-stream.
 
+### Budget accounting per request (measured here)
+
+Recorded 2026-10 with `cargo bench -p auth --bench admit_settle` (rustc
+1.97.0, same machine): one `admit` plus its `settle` on a single thread, the
+in-memory budget accounting every authenticated request pays (ADR 009, and
+the ADR 015 settled-cost counter that billing reads). Lock-free atomics, no
+I/O; the database is never touched on the request path.
+
+| Bench | Median | 95 % CI |
+|---|---|---|
+| `admit_settle_key` (one key with a budget) | **36.4 ns** | 36.37 – 36.45 ns |
+| `admit_settle_key_in_group` (the same key in a budgeted group: the pool is reserved and settled too) | **54.7 ns** | 54.58 – 54.82 ns |
+
+Well under a microsecond either way: budget enforcement and billing
+accounting are noise next to the ~3.2 µs of request CPU above. Like the
+SystemOne bench, it needs `CARGO_PROFILE_RELEASE_STRIP=false` to build on
+macOS 27.
+
 ### Idle memory & binary size (measured here)
 
 | | |
@@ -179,6 +197,9 @@ cargo bench -p server --bench gateway_overhead
 
 # Streaming time to first bit, direct vs via-gateway (no Docker needed):
 cargo bench -p server --bench stream_ttfb
+
+# Budget admit + settle per request (no Docker needed):
+cargo bench -p auth --bench admit_settle
 
 # Idle RAM + binary size:
 cargo build --release -p server --bin lumen

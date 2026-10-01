@@ -51,7 +51,7 @@ timeout_ms = 5000                            # 100..=60000
 
 | Field | Required | Default | Bounds and meaning |
 |---|---|---|---|
-| `url` | yes | none | Control-plane base URL; a trailing slash is ignored. `https`, or plain `http` only to `localhost`, a loopback address (IPv4 or IPv6) or a private IPv4 address. |
+| `url` | yes | none | Control-plane base URL; a trailing slash is ignored. `https`, or plain `http` only to `localhost`, a loopback address (IPv4 or IPv6) or a private IPv4 address. No user or password, no query, no fragment. |
 | `signing_key_env` | yes | none | Name of the environment variable holding the HMAC signing secret, never the secret itself. Non-blank, no surrounding whitespace. |
 | `source` | yes | none | Gateway name copied into every event. 1 to 64 characters of `A-Z a-z 0-9 . _ -`. |
 | `batch_size` | no | `500` | Events per delivery request, 1 to 1000. |
@@ -62,11 +62,26 @@ timeout_ms = 5000                            # 100..=60000
   refused, like any boot-layer key.
 - **Requires `[auth] enabled = true`.** Otherwise the gateway refuses to boot.
 - **The secret must be set.** The gateway refuses to boot when the variable
-  named by `signing_key_env` is unset or empty. The error names only the
-  variable. The secret is never logged, never in an error and never in
-  `Debug` output.
-- With no block there are no outbox rows, no sender task, no outbound call and
-  no `lumen_usage_events_*` metric.
+  named by `signing_key_env` is unset, empty or only whitespace. The error
+  names only the variable. The secret is never logged, never in an error and
+  never in `Debug` output.
+- **Every live group's `account_ref` must already be a UUID.** The admin API
+  only enforces the UUID shape while the block is on, so a group given some
+  other ref before billing was enabled would produce events the Lab rejects
+  forever. With the block configured, the gateway checks every live group at
+  boot and refuses to start if one has a non-UUID `account_ref`; the error
+  lists the offending group ids and nothing else. To fix it: boot without
+  `[usage_events]`, `PATCH /admin/groups/{id}` each listed group with its Lab
+  account UUID (or `null` if it is not a Lab account), then restore the block
+  and restart.
+- With no block there are no outbox rows, no sender task and no
+  `lumen_usage_events_*` metric, and this block adds no outbound call.
+- **Removing the block strands pending events.** Rows still in the outbox
+  stay there unsent while the block is absent (they go out once it is back).
+  Drain first: wait for `lumen_usage_events_pending` to reach 0 (stop billable
+  traffic if new events keep arriving), stop the gateway, confirm
+  `SELECT COUNT(*) FROM usage_outbox WHERE delivered_ms IS NULL` is 0 (the
+  shutdown flush may have written a last event), then remove the block.
 
 ## The billing rule
 
@@ -123,6 +138,11 @@ Residual: spend from a request admitted before the change but settled after
 it follows the new membership. Clear a group's `account_ref` only after the
 account is closed.
 
+A `PATCH /admin/keys/{id}` that changes only `external_ref` does not flush
+first: it cannot change billability or the account. Spend settled before the
+change but not yet flushed is reported under the new `api_key_id`, on the
+same account, with no effect on the money billed.
+
 ## The event
 
 One `usage.recorded` event per billable key per flush that has new settled
@@ -148,8 +168,9 @@ cost:
 }
 ```
 
-- `id` is a UUIDv7 minted once, inside the transaction, so every retry carries
-  the same id and the Lab can deduplicate on it.
+- `id` is a UUIDv7 minted once, when the outbox row is built just before the
+  flush transaction writes it, so every retry carries the same id and the
+  Lab can deduplicate on it.
 - `occurred_at` and `window.end` are the flush time. `window.start` is the
   previous flush that billed this key (for its first event, the moment the
   key was loaded into memory at boot or created).
@@ -172,9 +193,9 @@ One sender task per process, only when `[usage_events]` is set.
 - Headers: `Content-Type: application/json` and
   `X-Lab-Signature: sha256=<hex>`, where `<hex>` is the HMAC-SHA256 of the
   exact request body under the signing secret.
-- A `200` response carries `{"accepted":["<id>", ...]}`. **Only ids listed in
+- A `2xx` response carries `{"accepted":["<id>", ...]}`. **Only ids listed in
   `accepted` are marked delivered.** Ids not listed stay pending.
-- Anything else (connect error, timeout, `401`, any other non-success status,
+- Anything else (connect error, timeout, `401`, any other non-2xx status,
   a body that is not the expected JSON) leaves every row of the batch
   pending. Each failed row waits `min(2^attempts, 300)` seconds before its
   next try, starting at 2 seconds and doubling, **capped at 5 minutes**, plus
@@ -202,7 +223,7 @@ One sender task per process, only when `[usage_events]` is set.
 | `lumen_usage_events_delivered_total` | Events acknowledged by the control plane. |
 | `lumen_usage_events_failed_total{reason}` | Events whose delivery attempt failed, one increment per event. `reason` is `connect`, `timeout`, `auth`, `status`, `malformed`, `not_accepted` or `store`. |
 
-`not_accepted` means the Lab answered `200` but left that id out of
+`not_accepted` means the Lab answered `2xx` but left that id out of
 `accepted`; `store` means the outbox itself could not be read or updated.
 
 The starter alert `LumenUsageEventsStuck` in
@@ -213,6 +234,36 @@ Serving is unaffected while it fires, but every bill is delayed. Look at
 `connect` and `timeout` are reachability, `status` is a Lab-side error, and
 `not_accepted` is the Lab skipping events.
 
+### Runbook: an event the Lab never accepts
+
+If delivery works for new events but the alert stays on, one row is probably
+being refused forever (typically `not_accepted` keeps rising by the same small
+count), and it pins `lumen_usage_events_oldest_pending_seconds`. The outbox
+is the `usage_outbox` table of the auth database (`[auth] db_path`). Inspect
+the oldest pending rows read-only:
+
+```bash
+sqlite3 -readonly lumen.db "SELECT id, attempts, created_ms, next_attempt_ms, body \
+  FROM usage_outbox WHERE delivered_ms IS NULL ORDER BY created_ms, id LIMIT 5"
+```
+
+Look at `body` (the exact event sent) and at the Lab's logs for that `id` to
+learn why it is refused. Then either:
+
+- **fix the cause on the Lab side** (its schema, an account it does not know
+  yet): the row is retried unchanged and clears on its own; or
+- **settle it by hand** when the Lab must never take it, for example because
+  the body itself is wrong (a row's body never changes once written):
+  reconcile the amount with the Lab first (charge or waive it there), then
+  mark that one row delivered, so it is purged after 7 days like any other:
+
+```bash
+sqlite3 lumen.db "UPDATE usage_outbox SET delivered_ms = CAST(strftime('%s','now') AS INTEGER) * 1000 \
+  WHERE id = '<event id>' AND delivered_ms IS NULL"
+```
+
+Never delete a pending row: it is the only record of that bill.
+
 ## Sovereignty
 
 Enabling this block makes the gateway call the configured URL. Events carry
@@ -220,7 +271,7 @@ no prompt, no response, no request metadata and no model id: only the account
 and key refs, counts, micro-USD cost, the lease snapshot and the gateway
 name. Per-model detail stays in `usage_log` and `GET /admin/usage/export`,
 which remain best-effort and are not the billing source. Without the block,
-LUMEN makes no call to anything but its providers.
+this block adds no outbound call (webhooks, if configured, are separate).
 
 ## What the Lab must provide
 
