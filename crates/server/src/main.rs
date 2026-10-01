@@ -661,6 +661,8 @@ async fn boot_config_context(
     }
 }
 
+// Linear boot sequence: each step depends on the previous one's output.
+#[allow(clippy::too_many_lines)]
 fn run(config_path: PathBuf) -> anyhow::Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -717,6 +719,19 @@ fn run(config_path: PathBuf) -> anyhow::Result<()> {
             };
 
         let (client, registry) = build_http_stack(&config, provider_specs)?;
+
+        // Billing usage events (ADR 015). Strictly opt-in: with no
+        // [usage_events] block nothing below runs and no metric is registered.
+        let usage_events_cancel = CancellationToken::new();
+        let usage_events = match (&config.usage_events, &auth_runtime) {
+            (Some(ue), Some(runtime)) => Some(boot_usage_events(
+                ue,
+                runtime,
+                &metrics,
+                &usage_events_cancel,
+            )?),
+            _ => None,
+        };
 
         // Shared cell so the hot reloader swaps the very cell handlers read.
         let pricing = Arc::new(ArcSwap::from_pointee(CostTable::from_config(&config)));
@@ -789,7 +804,13 @@ fn run(config_path: PathBuf) -> anyhow::Result<()> {
         // shutdown must never wait on a sick receiver (ADR 011 §2).
         webhook_cancel.cancel();
 
-        drain_on_shutdown(auth_runtime, usage_writer).await;
+        drain_on_shutdown(
+            auth_runtime,
+            usage_writer,
+            usage_events,
+            usage_events_cancel,
+        )
+        .await;
 
         tracing::info!("shutdown complete");
         Ok(())
@@ -821,16 +842,75 @@ fn attach_optional(
     state
 }
 
+/// Build and spawn the usage-event sender (ADR 015). The signing secret must
+/// be set and non-empty: billing without authenticity is refused at boot.
+/// The error names only the variable, never its value.
+fn boot_usage_events(
+    config: &lumen_server::config::UsageEventsConfig,
+    runtime: &Arc<AuthRuntime>,
+    metrics: &Metrics,
+    cancel: &CancellationToken,
+) -> anyhow::Result<UsageEventsHandle> {
+    let secret = std::env::var(&config.signing_key_env)
+        .ok()
+        .filter(|s| !s.is_empty())
+        .with_context(|| {
+            format!(
+                "[usage_events] requires the {} env var (the events signing secret)",
+                config.signing_key_env
+            )
+        })?;
+    let metrics = lumen_telemetry::UsageEventMetrics::register(metrics)
+        .context("could not register the usage-event metrics")?;
+    // No redirects: the body is a signed bill and must reach this endpoint only.
+    let timeout = Duration::from_millis(config.timeout_ms);
+    let client = lumen_providers::http::build_client_with(timeout, timeout);
+    let sender = Arc::new(lumen_server::usage_events::UsageEventsSender::new(
+        runtime.store.clone(),
+        client,
+        config.events_url(),
+        lumen_server::webhooks::SigningKey::new(secret.into_bytes()),
+        config.batch_size,
+        metrics,
+    ));
+    let handle =
+        lumen_server::usage_events::spawn_usage_events_sender(Arc::clone(&sender), cancel.clone());
+    Ok((sender, handle))
+}
+
 /// Clean-shutdown drain: a final budget flush (so a clean shutdown loses zero
-/// accounting) then a bounded wait for the usage writer to flush and exit.
+/// accounting), one bounded delivery of the usage events that flush may have
+/// written, then a bounded wait for the usage writer to flush and exit.
 /// `serve` returning dropped the app (and every `UsageLogger` clone), closing
-/// the channel; the wait is bounded so shutdown never hangs on a sick database.
+/// the channel; the waits are bounded so shutdown never hangs on a sick
+/// database or receiver.
 async fn drain_on_shutdown(
     auth_runtime: Option<Arc<AuthRuntime>>,
     usage_writer: Option<tokio::task::JoinHandle<()>>,
+    usage_events: Option<UsageEventsHandle>,
+    usage_events_cancel: CancellationToken,
 ) {
     if let Some(runtime) = &auth_runtime {
-        lumen_server::budget_flush::flush_budgets(runtime, lumen_auth::now_unix_ms()).await;
+        // The flush outcome only matters to the admin pre-change path; at
+        // shutdown there is nothing left to do with a failure.
+        let _ = lumen_server::budget_flush::flush_budgets(runtime, lumen_auth::now_unix_ms()).await;
+    }
+    if let Some((sender, handle)) = usage_events {
+        // The final flush above may have written events: one bounded
+        // delivery attempt now, the rest is durable and goes out next boot.
+        usage_events_cancel.cancel();
+        let _ = handle.await;
+        if tokio::time::timeout(
+            Duration::from_secs(5),
+            sender.deliver_once(lumen_auth::now_unix_ms()),
+        )
+        .await
+        .is_err()
+        {
+            tracing::warn!(
+                "usage events: final delivery did not finish within 5s; pending events go out next boot"
+            );
+        }
     }
     if let Some(writer) = usage_writer {
         if tokio::time::timeout(Duration::from_secs(5), writer)
@@ -1053,6 +1133,13 @@ async fn boot_webhooks(
     Ok(Some(controller))
 }
 
+/// The running usage-event sender and its task handle (ADR 015), kept so
+/// shutdown can stop the loop and deliver once more.
+type UsageEventsHandle = (
+    Arc<lumen_server::usage_events::UsageEventsSender>,
+    tokio::task::JoinHandle<()>,
+);
+
 /// Everything [`boot_auth_stack`] hands back to [`run`].
 struct AuthBoot {
     /// The virtual-key auth runtime (in-memory table, store, admin token).
@@ -1147,6 +1234,12 @@ async fn boot_auth_stack(
         .await
         .context("failed to load virtual keys")?;
     let keys = AuthState::load(groups, entries);
+    if let Some(usage_events) = &config.usage_events {
+        keys.set_billing(Some(Arc::new(lumen_auth::billing::BillingPolicy {
+            source: usage_events.source.clone(),
+        })));
+        tracing::info!(source = %usage_events.source, "billing usage events enabled");
+    }
     tracing::info!(key_count = keys.len(), group_count, "virtual keys loaded");
 
     let (logger, writer) = spawn_usage_writer(
