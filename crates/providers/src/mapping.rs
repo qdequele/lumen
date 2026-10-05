@@ -160,6 +160,30 @@ const SECRET_PREFIXES: &[&str] = &[
     "sk-", "sk_", "pk-", "rk-", "AIza", "ya29.", "AKIA", "ASIA", "gsk_", "xai-", "hf_", "pcsk_",
 ];
 
+/// Words that name a credential (matched case-insensitively, whole token):
+/// the value an upstream prints after one is redacted even without a known
+/// prefix (see [`redact_secrets`]).
+const CREDENTIAL_WORDS: &[&str] = &[
+    "key",
+    "apikey",
+    "api_key",
+    "api-key",
+    "x-api-key",
+    "token",
+    "access_token",
+    "bearer",
+    "secret",
+    "password",
+    "passwd",
+    "authorization",
+    "credential",
+    "credentials",
+];
+
+/// Words that may sit between a credential word and its value
+/// (`API key provided: ...`, `password is ...`).
+const CREDENTIAL_CONNECTIVES: &[&str] = &["provided", "is", "was", "value"];
+
 /// Where a validation error starts echoing the request back (pydantic-based
 /// hosts such as vLLM, FastAPI servers and Mistral quote the offending
 /// `input`). The message is cut there, so request content never reaches the
@@ -223,6 +247,12 @@ fn json_error_message(value: &serde_json::Value) -> Option<&str> {
 /// and digits. Model ids (`anthropic.claude-3-5-sonnet-20240620-v1`,
 /// `meta-llama/Llama-3.1-8B-Instruct`), vendor request ids (`req_...`) and
 /// docs URLs stay readable; an API key, even partly masked, does not.
+///
+/// A token right after a [`CREDENTIAL_WORDS`] word (past any
+/// [`CREDENTIAL_CONNECTIVES`]) is a credential value whatever its shape when
+/// a `:`, `=`, quote or `Bearer` introduces it, or when it is not a plain
+/// lowercase word: `API key provided: local-secret` and `password is
+/// hunter2` are redacted, `token count` and `API key format` are not.
 #[must_use]
 pub fn redact_secrets(text: &str) -> String {
     let is_token_char =
@@ -242,6 +272,10 @@ pub fn redact_secrets(text: &str) -> String {
             || t.split(|c: char| !c.is_ascii_alphanumeric())
                 .any(opaque_segment)
     };
+    let is_one_of = |words: &[&str], t: &str| words.iter().any(|w| w.eq_ignore_ascii_case(t));
+    // `armed`: the last word named a credential; `introduced`: a `:`, `=`,
+    // quote or `Bearer` has since announced its value.
+    let (mut armed, mut introduced) = (false, false);
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while !rest.is_empty() {
@@ -250,17 +284,30 @@ pub fn redact_secrets(text: &str) -> String {
         let end = rest[..run].trim_end_matches('.').len();
         if end == 0 {
             // One separator character (may be multi-byte).
-            let len = rest.chars().next().map_or(1, char::len_utf8);
+            let c = rest.chars().next().unwrap_or(' ');
+            match c {
+                ':' | '=' | '\'' | '"' if armed => introduced = true,
+                c if c.is_whitespace() => {}
+                _ => (armed, introduced) = (false, false),
+            }
+            let len = c.len_utf8();
             out.push_str(&rest[..len]);
             rest = &rest[len..];
             continue;
         }
         let token = &rest[..end];
-        out.push_str(if looks_secret(token) {
-            "<redacted>"
+        let redact = if is_one_of(CREDENTIAL_WORDS, token) {
+            armed = true;
+            introduced = token.eq_ignore_ascii_case("bearer");
+            false
+        } else if armed && is_one_of(CREDENTIAL_CONNECTIVES, token) {
+            false
         } else {
-            token
-        });
+            let value = armed && (introduced || !token.bytes().all(|b| b.is_ascii_lowercase()));
+            (armed, introduced) = (false, false);
+            value || looks_secret(token)
+        };
+        out.push_str(if redact { "<redacted>" } else { token });
         rest = &rest[end..];
     }
     out
@@ -484,6 +531,48 @@ mod tests {
         assert_eq!(
             redact_secrets("bearer 9f8e7d6c5b4a39281706f5e4d3c2b1a0ffee"),
             "bearer <redacted>"
+        );
+    }
+
+    /// A credential an upstream echoes after naming it is redacted even
+    /// without a known prefix (an operator-chosen `local-secret`), while the
+    /// same words in ordinary prose (`token count`, `API key format`) stay.
+    #[test]
+    fn values_after_a_credential_word_are_redacted() {
+        for (input, expected) in [
+            (
+                "Incorrect API key provided: local-secret",
+                "Incorrect API key provided: <redacted>",
+            ),
+            ("invalid api_key=hunter", "invalid api_key=<redacted>"),
+            (
+                "API key 'plain' is invalid",
+                "API key '<redacted>' is invalid",
+            ),
+            (
+                "Authorization: Bearer opaque",
+                "Authorization: Bearer <redacted>",
+            ),
+            ("password is hunter2", "password is <redacted>"),
+            ("token=abc, model=gpt-5", "token=<redacted>, model=gpt-5"),
+            ("Secret LocalValue rejected", "Secret <redacted> rejected"),
+        ] {
+            assert_eq!(redact_secrets(input), expected, "{input}");
+        }
+        for kept in [
+            "The input token count (1200000) exceeds the limit",
+            "Invalid API key format",
+            "x-api-key header is missing",
+            "max_tokens: 4096 is too large",
+            "key-value pairs only",
+        ] {
+            assert_eq!(redact_secrets(kept), kept);
+        }
+        // Through the full detail path, as in the review example.
+        let body = br#"{"message":"Incorrect API key provided: local-secret"}"#;
+        assert_eq!(
+            upstream_error_detail(body).as_deref(),
+            Some("Incorrect API key provided: <redacted>")
         );
     }
 

@@ -51,8 +51,10 @@ context-length and content-policy refusals, but never logs it.
    `detail` lists carry an `input` field). The string is cut at the first
    request echo (`'input'`, `"input"`, `input_value`, `input=`), whitespace
    collapsed, probable credentials replaced by `<redacted>` (known key
-   prefixes such as `sk-`, `AIza`, `AKIA`, `gsk_`, or a 20+ character
-   segment mixing letters and digits), then cut to 512 characters. It sits
+   prefixes such as `sk-`, `AIza`, `AKIA`, `gsk_`, a 20+ character segment
+   mixing letters and digits, or the value an upstream prints after a
+   credential word such as `key`, `token` or `password`), then cut to 512
+   characters. It sits
    under the request span, so it shares the `request_id` of the
    `request failed` line. The body is still never returned to a client.
 

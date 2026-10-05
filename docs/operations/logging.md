@@ -29,11 +29,13 @@ table.
 
 ### Upstream error messages
 
-When an upstream answers a client error (4xx other than 429), the gateway
-logs one `warn` line, `upstream returned an error`, with `provider`,
-`status` and `upstream_error`, under the request span (same `request_id`
-as the `request failed` line that follows). For example, a 400 from
-Anthropic carries Anthropic's `error.message`. The rules (ADR 016):
+When an upstream answers a client error (4xx other than 429) whose JSON
+body carries a message string, the gateway logs one `warn` line,
+`upstream returned an error`, with `provider`, `status` and
+`upstream_error`, under the request span (same `request_id` as the
+`request failed` line that follows). For example, a 400 from Anthropic
+carries Anthropic's `error.message`. Without such a string there is no
+line, only the status in `request failed`. The rules (ADR 016):
 
 - Only the vendor's message **string** is logged (`error.message`,
   `message`, `error_description`, `error`, `detail`). A body without one, a
@@ -42,9 +44,12 @@ Anthropic carries Anthropic's `error.message`. The rules (ADR 016):
 - The message is cut where a validation error starts echoing the request
   (`'input'`, `"input"`, `input_value`, `input=`, as pydantic-based hosts
   such as vLLM do), so request content does not reach the log.
-- Probable credentials are replaced by `<redacted>`, then the message is cut
-  to 512 characters.
-- It never reaches the client, whose body stays the `LM-3003` envelope.
+- Probable credentials are replaced by `<redacted>` (known key prefixes,
+  long opaque tokens, and the value printed after a word such as `key`,
+  `token` or `password`), then the message is cut to 512 characters.
+- It never reaches the client. The client gets the usual error envelope:
+  `LM-2012` or `LM-2013` when the body classifies as a context-length or
+  content-policy refusal, `LM-3003` otherwise.
 
 To drop the line entirely, filter its target at the subscriber, for example
 `RUST_LOG=info,lumen_providers::mapping=error`.
