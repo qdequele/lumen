@@ -833,6 +833,21 @@ upstream_id = "meta-llama/Llama-3.1-8B-Instruct"
 capabilities = ["chat", "embed"]
 ```
 
+## The `developer` role
+
+OpenAI's `developer` role is its newer name for `system` (Meilisearch chat
+sends its system prompt that way). Only the `openai` kind receives it
+verbatim; everywhere else it is handled as `system`, in message order with
+any `system` messages (ADR 016):
+
+| Kind | What the upstream receives |
+|------|----------------------------|
+| `openai` (built-in URL or `api.openai.com`) | `developer`, unchanged |
+| `anthropic`, `bedrock` | hoisted into the top-level `system` |
+| `google`, `vertex_ai` | a `systemInstruction` part |
+| `cohere` | an inline `system` message |
+| `mistral`, `azure`, `ollama`, every OpenAI-compatible host, and `openai` with any other `base_url` (LiteLLM, llama.cpp, a proxy) | rewritten to `system` in place |
+
 ## OpenAI chat extras on translated providers
 
 OpenAI-compatible kinds forward every unmodeled request field verbatim, so

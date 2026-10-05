@@ -413,12 +413,15 @@ fn translate_request(
             .as_ref()
             .map(|c| c.text().into_owned())
             .unwrap_or_default();
-        match m.role.as_str() {
-            "system" => {
-                if !text.is_empty() {
-                    system_parts.push(GeminiPart::text(text));
-                }
+        // `developer` is OpenAI's newer name for `system`; both become
+        // `systemInstruction` parts, in order.
+        if m.is_system_role() {
+            if !text.is_empty() {
+                system_parts.push(GeminiPart::text(text));
             }
+            continue;
+        }
+        match m.role.as_str() {
             "tool" => push_tool_result(&mut contents, &tool_names, m, &text),
             "assistant"
                 if m.extra
@@ -997,6 +1000,30 @@ mod tests {
             stream: false,
             extra: serde_json::Map::new(),
         }
+    }
+
+    #[test]
+    fn developer_messages_join_system_instruction_in_order() {
+        let out = translate_request(
+            &request(vec![
+                msg("system", "one"),
+                msg("developer", "two"),
+                msg("user", "hi"),
+            ]),
+            "google",
+        )
+        .unwrap();
+        let parts: Vec<Option<&str>> = out
+            .system_instruction
+            .as_ref()
+            .unwrap()
+            .parts
+            .iter()
+            .map(|p| p.text.as_deref())
+            .collect();
+        assert_eq!(parts, [Some("one"), Some("two")]);
+        assert_eq!(out.contents.len(), 1);
+        assert_eq!(out.contents[0].role, "user");
     }
 
     #[test]

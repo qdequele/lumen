@@ -129,9 +129,10 @@ pub enum SystemPromptMode {
     /// Insert before any client system message.
     #[default]
     Prepend,
-    /// Remove client system messages, then insert.
+    /// Remove client system messages (`system` or `developer`), then insert.
     Replace,
-    /// Insert only when the client sent no system message.
+    /// Insert only when the client sent no system message (`system` or
+    /// `developer`).
     IfAbsent,
 }
 

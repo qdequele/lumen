@@ -357,9 +357,10 @@ impl Preset {
         };
         match self.mode {
             SystemPromptMode::Prepend => {}
-            SystemPromptMode::Replace => req.messages.retain(|m| m.role != "system"),
+            // `developer` is OpenAI's newer name for a client system prompt.
+            SystemPromptMode::Replace => req.messages.retain(|m| !m.is_system_role()),
             SystemPromptMode::IfAbsent => {
-                if req.messages.iter().any(|m| m.role == "system") {
+                if req.messages.iter().any(ChatMessage::is_system_role) {
                     return;
                 }
             }
@@ -562,6 +563,33 @@ mod tests {
             chat(json!({ "model": "m", "messages": [{ "role": "user", "content": "hi" }] }));
         preset("P", SystemPromptMode::IfAbsent).apply_prompt(&mut r);
         assert_eq!(r.messages[0].role, "system");
+    }
+
+    /// A client `developer` message is a client system prompt (OpenAI's
+    /// newer name for it): `replace` drops it and `if_absent` sees it.
+    #[test]
+    fn preset_modes_treat_developer_as_a_client_system_prompt() {
+        let base = || {
+            chat(json!({ "model": "m", "messages": [
+            { "role": "developer", "content": "client dev" }, { "role": "user", "content": "hi" } ] }))
+        };
+
+        let mut r = base();
+        preset("P", SystemPromptMode::Replace).apply_prompt(&mut r);
+        assert_eq!(
+            roles_and_text(&r),
+            vec![("system".into(), "P".into()), ("user".into(), "hi".into())]
+        );
+
+        let mut r = base();
+        preset("P", SystemPromptMode::IfAbsent).apply_prompt(&mut r);
+        assert_eq!(
+            roles_and_text(&r),
+            vec![
+                ("developer".into(), "client dev".into()),
+                ("user".into(), "hi".into())
+            ]
+        );
     }
 
     #[test]

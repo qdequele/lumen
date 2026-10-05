@@ -682,12 +682,15 @@ fn translate_request(req: &ChatRequest) -> ConverseRequest {
             .as_ref()
             .map(|c| c.text().into_owned())
             .unwrap_or_default();
-        match m.role.as_str() {
-            "system" => {
-                if !text.is_empty() {
-                    system.push(json!({ "text": text }));
-                }
+        // `developer` is OpenAI's newer name for `system`; both become
+        // top-level `system` blocks, in order.
+        if m.is_system_role() {
+            if !text.is_empty() {
+                system.push(json!({ "text": text }));
             }
+            continue;
+        }
+        match m.role.as_str() {
             "tool" => {
                 let block = json!({
                     "toolResult": {
@@ -1184,6 +1187,21 @@ mod tests {
         assert_eq!(out["inferenceConfig"]["maxTokens"], 256);
         assert_eq!(out["inferenceConfig"]["temperature"], 0.5);
         assert_eq!(out["inferenceConfig"]["stopSequences"], json!(["STOP"]));
+    }
+
+    #[test]
+    fn developer_messages_are_hoisted_into_system_in_order() {
+        let req = request(vec![
+            msg("developer", "one"),
+            msg("user", "hi"),
+            msg("system", "two"),
+        ]);
+        let out = serde_json::to_value(translate_request(&req)).unwrap();
+        assert_eq!(out["system"], json!([{ "text": "one" }, { "text": "two" }]));
+        assert_eq!(
+            out["messages"],
+            json!([{ "role": "user", "content": [{ "text": "hi" }] }])
+        );
     }
 
     #[test]

@@ -135,6 +135,137 @@ pub const fn needs_error_body(status: u16) -> bool {
     matches!(status, 400 | 403 | 413 | 422)
 }
 
+/// Statuses whose (bounded) error body is read at all: every client error but
+/// 429, so the upstream's own explanation of a 400/401/404/422 reaches the
+/// log. 429 carries `Retry-After` instead, and 5xx bodies are skipped so a
+/// stalled body never delays a retry or failover. Only
+/// [`needs_error_body`] statuses are classified from it.
+#[must_use]
+pub const fn reads_error_body(status: u16) -> bool {
+    status >= 400 && status < 500 && status != 429
+}
+
+/// Longest upstream error message written to the log, in characters.
+const MAX_ERROR_DETAIL_CHARS: usize = 512;
+
+/// Shortest letters-and-digits segment redacted as a probable credential
+/// (see [`redact_secrets`]).
+const MIN_SECRET_SEGMENT: usize = 20;
+
+/// Prefixes of provider credentials an upstream may echo, masked or not
+/// (OpenAI `sk-`/`sk-proj-`, Anthropic `sk-ant-`, Google `AIza` and OAuth
+/// `ya29.`, AWS access key ids `AKIA`/`ASIA`, Groq `gsk_`, xAI `xai-`,
+/// Hugging Face `hf_`, Pinecone `pcsk_`).
+const SECRET_PREFIXES: &[&str] = &[
+    "sk-", "sk_", "pk-", "rk-", "AIza", "ya29.", "AKIA", "ASIA", "gsk_", "xai-", "hf_", "pcsk_",
+];
+
+/// Where a validation error starts echoing the request back (pydantic-based
+/// hosts such as vLLM, FastAPI servers and Mistral quote the offending
+/// `input`). The message is cut there, so request content never reaches the
+/// log.
+const REQUEST_ECHO_MARKERS: &[&str] = &["'input'", "\"input\"", "input_value", "input="];
+
+/// The upstream's own error message, made safe for the log: the vendor's
+/// message string (`error.message`, `message`, `error_description`, a string
+/// `error`, `detail`, or the same inside the first element of a JSON array,
+/// as Gemini sends), cut before any echo of the request
+/// ([`REQUEST_ECHO_MARKERS`]), whitespace collapsed, probable credentials
+/// redacted, then cut to [`MAX_ERROR_DETAIL_CHARS`]. `None` when the body is
+/// not JSON or carries no message string: the body itself is never logged,
+/// because a raw or structured error body can quote the request. Never
+/// returned to a client.
+#[must_use]
+pub fn upstream_error_detail(body: &[u8]) -> Option<String> {
+    let value = serde_json::from_slice::<serde_json::Value>(body).ok()?;
+    let message = json_error_message(&value)?;
+    let message = REQUEST_ECHO_MARKERS
+        .iter()
+        .filter_map(|m| message.find(m))
+        .min()
+        .map_or(message, |at| &message[..at]);
+    let collapsed = message.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        return None;
+    }
+    // Redact before cutting, so a key crossing the cut is still recognised.
+    let redacted = redact_secrets(&collapsed);
+    Some(match redacted.char_indices().nth(MAX_ERROR_DETAIL_CHARS) {
+        Some((at, _)) => format!("{}...", &redacted[..at]),
+        None => redacted,
+    })
+}
+
+/// The human-readable message string of a vendor error body, if it has one.
+/// Only a JSON string counts: an object or array (a structured validation
+/// report) can carry the request and is never used.
+fn json_error_message(value: &serde_json::Value) -> Option<&str> {
+    let value = match value {
+        serde_json::Value::Array(items) => items.first()?,
+        other => other,
+    };
+    [
+        "/error/message",
+        "/message",
+        "/error_description",
+        "/error",
+        "/detail",
+    ]
+    .iter()
+    .find_map(|ptr| value.pointer(ptr).and_then(serde_json::Value::as_str))
+}
+
+/// Replace probable credentials in `text` with `<redacted>`. A token (a run
+/// of `[A-Za-z0-9_.+/*-]`, `*` so a partly masked key stays one token,
+/// without its sentence-ending periods) is redacted when it starts with a
+/// known key prefix, or when one of its segments (split on `-`, `_`, `.`,
+/// `/`, `+`, `*`) is at least [`MIN_SECRET_SEGMENT`] long and mixes letters
+/// and digits. Model ids (`anthropic.claude-3-5-sonnet-20240620-v1`,
+/// `meta-llama/Llama-3.1-8B-Instruct`), vendor request ids (`req_...`) and
+/// docs URLs stay readable; an API key, even partly masked, does not.
+#[must_use]
+pub fn redact_secrets(text: &str) -> String {
+    let is_token_char =
+        |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '+' | '/' | '*');
+    let opaque_segment = |s: &str| {
+        s.len() >= MIN_SECRET_SEGMENT
+            && s.bytes().any(|b| b.is_ascii_digit())
+            && s.bytes().any(|b| b.is_ascii_alphabetic())
+    };
+    let looks_secret = |t: &str| {
+        // Vendor request ids (`req_011C...`, `req-...`) are what vendor
+        // support asks for, and grant nothing: keep them.
+        if t.starts_with("req_") || t.starts_with("req-") {
+            return false;
+        }
+        SECRET_PREFIXES.iter().any(|p| t.starts_with(p))
+            || t.split(|c: char| !c.is_ascii_alphanumeric())
+                .any(opaque_segment)
+    };
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while !rest.is_empty() {
+        let run = rest.find(|c| !is_token_char(c)).unwrap_or(rest.len());
+        // A trailing `.` ends the sentence, not the token.
+        let end = rest[..run].trim_end_matches('.').len();
+        if end == 0 {
+            // One separator character (may be multi-byte).
+            let len = rest.chars().next().map_or(1, char::len_utf8);
+            out.push_str(&rest[..len]);
+            rest = &rest[len..];
+            continue;
+        }
+        let token = &rest[..end];
+        out.push_str(if looks_secret(token) {
+            "<redacted>"
+        } else {
+            token
+        });
+        rest = &rest[end..];
+    }
+    out
+}
+
 /// Whether the (lowercase) body carries `code` as the exact string value of a
 /// [`CODE_KEYS`] key, as in `"code": "context_length_exceeded"`. A scan rather
 /// than a JSON parse, so a body cut at the read bound still classifies; the
@@ -159,7 +290,9 @@ fn preceding_key(before: &str) -> Option<&str> {
 /// whose body carries a known context-length or content-policy error code (as
 /// a structured field) or rejection phrase maps to
 /// [`ProviderError::ContextLengthExceeded`] / [`ProviderError::ContentFiltered`]
-/// (ADR 014). The body is only searched, never logged or returned.
+/// (ADR 014). The body is never returned to a client; its message, bounded
+/// and with credentials redacted ([`upstream_error_detail`]), is logged at
+/// `warn` under the request span so an upstream 4xx can be diagnosed.
 #[must_use]
 pub fn classify_error(
     provider: &str,
@@ -167,6 +300,14 @@ pub fn classify_error(
     retry_after: Option<Duration>,
     body: &[u8],
 ) -> ProviderError {
+    if let Some(detail) = upstream_error_detail(body) {
+        tracing::warn!(
+            provider,
+            status,
+            upstream_error = %detail,
+            "upstream returned an error"
+        );
+    }
     if needs_error_body(status) && !body.is_empty() {
         let text = String::from_utf8_lossy(body).to_ascii_lowercase();
         let matches = |codes: &[&str], phrases: &[&str]| {
@@ -216,6 +357,145 @@ pub fn unix_timestamp() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn error_detail_extracts_the_vendor_message() {
+        // Anthropic.
+        let anthropic = br#"{"type":"error","error":{"type":"invalid_request_error","message":"messages.0.role: Input should be 'user' or 'assistant'"}}"#;
+        assert_eq!(
+            upstream_error_detail(anthropic).as_deref(),
+            Some("messages.0.role: Input should be 'user' or 'assistant'")
+        );
+        // Gemini wraps its error in an array.
+        let gemini = br#"[{"error":{"code":400,"message":"Invalid value at 'contents'","status":"INVALID_ARGUMENT"}}]"#;
+        assert_eq!(
+            upstream_error_detail(gemini).as_deref(),
+            Some("Invalid value at 'contents'")
+        );
+        // Google OAuth: the description beats the bare error code.
+        let oauth = br#"{"error":"invalid_grant","error_description":"Invalid JWT Signature."}"#;
+        assert_eq!(
+            upstream_error_detail(oauth).as_deref(),
+            Some("Invalid JWT Signature.")
+        );
+        // Bare `message`, string `error`, string `detail`; whitespace collapsed.
+        assert_eq!(
+            upstream_error_detail(br#"{"message":"bad\n  model "}"#).as_deref(),
+            Some("bad model")
+        );
+        assert_eq!(
+            upstream_error_detail(br#"{"error":"e"}"#).as_deref(),
+            Some("e")
+        );
+        assert_eq!(
+            upstream_error_detail(br#"{"detail":"d"}"#).as_deref(),
+            Some("d")
+        );
+    }
+
+    /// The body itself is never logged: without a vendor message string
+    /// there is no detail, since raw text or a structured validation report
+    /// can quote the request.
+    #[test]
+    fn error_detail_never_falls_back_to_the_body() {
+        for body in [
+            &b""[..],
+            b"  \n",
+            b"Bad Request: a private prompt",
+            br#"{"code":7,"prompt":"a private prompt"}"#,
+            // FastAPI / pydantic: `detail` is a list echoing the input.
+            br#"{"detail":[{"loc":["body","messages",0],"msg":"bad","input":{"content":"a private prompt"}}]}"#,
+            // Mistral-style: `message` is an object.
+            br#"{"message":{"detail":[{"input":"a private prompt"}]}}"#,
+            // Truncated JSON (cut at the read bound).
+            br#"{"error":{"message":"a private pro"#,
+        ] {
+            assert_eq!(upstream_error_detail(body), None, "{body:?}");
+        }
+    }
+
+    /// vLLM-style hosts put `str(errors)` inside the message string itself:
+    /// the message is cut where the request echo starts.
+    #[test]
+    fn error_detail_cuts_request_echoes_out_of_the_message() {
+        let vllm = br#"{"object":"error","message":"1 validation error: messages.0.role: Input tag 'developer' found, {'type': 'union_tag_invalid', 'input': {'role': 'developer', 'content': 'a private prompt'}}","code":400}"#;
+        let detail = upstream_error_detail(vllm).unwrap();
+        assert!(!detail.contains("a private prompt"), "{detail}");
+        assert!(
+            detail.starts_with("1 validation error: messages.0.role: Input tag 'developer' found"),
+            "{detail}"
+        );
+        let pydantic_v1 =
+            br#"{"message":"value is not a valid enum; input_value='a private prompt'"}"#;
+        let detail = upstream_error_detail(pydantic_v1).unwrap();
+        assert_eq!(detail, "value is not a valid enum;");
+    }
+
+    #[test]
+    fn error_detail_is_bounded_on_a_char_boundary() {
+        let body = json!({ "message": "é".repeat(MAX_ERROR_DETAIL_CHARS + 100) }).to_string();
+        let detail = upstream_error_detail(body.as_bytes()).unwrap();
+        assert_eq!(detail.chars().count(), MAX_ERROR_DETAIL_CHARS + 3);
+        assert!(detail.ends_with("..."));
+    }
+
+    /// A bare key crossing the cut is still redacted (redaction runs first).
+    #[test]
+    fn error_detail_redacts_a_key_crossing_the_cut() {
+        let key = "a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6";
+        let message = format!("{} {key}", "x".repeat(MAX_ERROR_DETAIL_CHARS - 10));
+        let body = json!({ "message": message }).to_string();
+        let detail = upstream_error_detail(body.as_bytes()).unwrap();
+        assert!(!detail.contains("a1b2c3d4"), "{detail}");
+    }
+
+    #[test]
+    fn error_detail_redacts_echoed_credentials() {
+        let body = br#"{"error":{"message":"Incorrect API key provided: sk-proj-****abcd. You can find your API key at https://platform.openai.com/account/api-keys."}}"#;
+        let detail = upstream_error_detail(body).unwrap();
+        assert!(!detail.contains("sk-proj"), "{detail}");
+        assert!(
+            detail.contains("Incorrect API key provided: <redacted>."),
+            "{detail}"
+        );
+        // A docs URL and model ids stay readable.
+        assert!(
+            detail.contains("https://platform.openai.com/account/api-keys"),
+            "{detail}"
+        );
+        for kept in [
+            "model claude-sonnet-5-5-20260101 not found",
+            "model anthropic.claude-3-5-sonnet-20240620-v1:0 is not enabled",
+            "unknown model meta-llama/Llama-3.1-8B-Instruct",
+            "unknown model accounts/fireworks/models/llama-v3p1-70b-instruct",
+            "a key-value pair",
+            "request 3f2c1a9e-8b7d-4c6e-9f0a-1b2c3d4e5f60 failed",
+            "request_id req_011CVRHzAoXKMgZ6yW7Qm2Ab",
+            "id req-9f8e7d6c5b4a39281706f5e4d3c2b1a0",
+        ] {
+            assert_eq!(redact_secrets(kept), kept);
+        }
+        // Prefixed keys and opaque tokens are masked.
+        assert_eq!(
+            redact_secrets("key=AIzaSyA1b2C3 token sk-ant-api03-xyz id AKIAIOSFODNN7EXAMPLE"),
+            "key=<redacted> token <redacted> id <redacted>"
+        );
+        assert_eq!(
+            redact_secrets("bearer 9f8e7d6c5b4a39281706f5e4d3c2b1a0ffee"),
+            "bearer <redacted>"
+        );
+    }
+
+    #[test]
+    fn every_client_error_but_429_has_its_body_read() {
+        for status in [400, 401, 403, 404, 413, 422, 451] {
+            assert!(reads_error_body(status), "{status}");
+        }
+        for status in [200, 302, 429, 500, 503, 529] {
+            assert!(!reads_error_body(status), "{status}");
+        }
+    }
 
     #[test]
     fn status_429_is_rate_limited_with_retry_after() {

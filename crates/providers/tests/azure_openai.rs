@@ -143,6 +143,55 @@ async fn chat_nominal_hits_deployment_url_with_api_version_and_api_key_header() 
     );
 }
 
+/// The GA `api-version` default predates Azure's `developer` role, so it is
+/// sent as `system` (OpenAI's equivalent), in place, on both chat paths.
+#[tokio::test]
+async fn developer_role_is_sent_as_system() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/openai/deployments/{DEPLOYMENT}/chat/completions"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(chat_response_body()))
+        .mount(&mock)
+        .await;
+    let provider = AzureProvider::new(
+        reqwest::Client::new(),
+        "azure-test",
+        &mock.uri(),
+        None,
+        Some(API_KEY.to_owned()),
+    );
+    let mut req = chat_request();
+    req.messages.insert(
+        0,
+        ChatMessage {
+            role: "developer".to_owned(),
+            content: Some(MessageContent::Text("be brief".to_owned())),
+            name: None,
+            extra: serde_json::Map::new(),
+        },
+    );
+
+    provider
+        .chat(req.clone(), CancellationToken::new())
+        .await
+        .unwrap();
+    let _ = provider
+        .chat_stream_bytes(req, CancellationToken::new())
+        .await
+        .unwrap();
+
+    let requests = mock.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    for r in &requests {
+        let sent: Value = serde_json::from_slice(&r.body).unwrap();
+        assert_eq!(sent["messages"][0]["role"], "system");
+        assert_eq!(sent["messages"][0]["content"], "be brief");
+        assert_eq!(sent["messages"][1]["role"], "user");
+    }
+}
+
 #[tokio::test]
 async fn chat_without_an_explicit_api_version_uses_the_built_in_default() {
     let mock = MockServer::start().await;

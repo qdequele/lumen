@@ -567,6 +567,18 @@ fn build_inner(
     Ok(inner)
 }
 
+/// Whether an `openai`-kind provider talks to OpenAI itself, the only
+/// upstream with the `developer` role: no `base_url` (the built-in default)
+/// or one whose host is `api.openai.com`. A `kind = "openai"` provider
+/// pointed elsewhere (LiteLLM, llama.cpp, LM Studio, a proxy) gets
+/// `developer` rewritten to `system`, like every compatible kind (ADR 016).
+fn has_native_developer_role(kind: ProviderKind, base_url: Option<&str>) -> bool {
+    kind == ProviderKind::Openai
+        && base_url.is_none_or(|url| {
+            reqwest::Url::parse(url).is_ok_and(|u| u.host_str() == Some("api.openai.com"))
+        })
+}
+
 /// Whether an `ollama` base_url mistakenly carries the OpenAI-compatible
 /// `/v1` suffix. The documented shape for this kind is the server ROOT
 /// (`http://localhost:11434`): the registry appends `/v1` itself for chat,
@@ -721,12 +733,20 @@ fn build_providers(
                     kind: spec.kind.as_str(),
                 });
             }
-            let chat: Arc<dyn ChatProvider> = Arc::new(OpenAiProvider::new(
-                client.clone(),
-                spec.name.clone(),
-                base_url.clone(),
-                spec.api_key.clone(),
-            ));
+            // Only OpenAI itself has the `developer` role; the compatible
+            // hosts (and `openai` pointed elsewhere) get it as `system`.
+            let chat: Arc<dyn ChatProvider> = Arc::new(
+                OpenAiProvider::new(
+                    client.clone(),
+                    spec.name.clone(),
+                    base_url.clone(),
+                    spec.api_key.clone(),
+                )
+                .with_native_developer_role(has_native_developer_role(
+                    spec.kind,
+                    spec.base_url.as_deref(),
+                )),
+            );
             // Same instance shape behind the embedding trait object.
             let embed: Arc<dyn EmbeddingProvider> = Arc::new(OpenAiProvider::new(
                 client.clone(),
@@ -1092,6 +1112,33 @@ fn build_providers(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_openai_itself_has_the_native_developer_role() {
+        assert!(has_native_developer_role(ProviderKind::Openai, None));
+        assert!(has_native_developer_role(
+            ProviderKind::Openai,
+            Some("https://api.openai.com/v1")
+        ));
+        for url in [
+            "http://localhost:4000/v1",
+            "https://litellm.internal/v1",
+            "https://api.openai.com.evil.example/v1",
+            "not a url",
+        ] {
+            assert!(
+                !has_native_developer_role(ProviderKind::Openai, Some(url)),
+                "{url}"
+            );
+        }
+        for kind in [
+            ProviderKind::Vllm,
+            ProviderKind::Groq,
+            ProviderKind::Openrouter,
+        ] {
+            assert!(!has_native_developer_role(kind, None), "{kind:?}");
+        }
+    }
 
     #[test]
     fn provider_spec_debug_never_shows_the_key() {

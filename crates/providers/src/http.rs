@@ -23,13 +23,14 @@ const MAX_ERROR_BODY: usize = 16 * 1024;
 const ERROR_BODY_DEADLINE: Duration = Duration::from_millis(500);
 
 /// Read at most [`MAX_ERROR_BODY`] bytes of an error response, only for
-/// statuses worth classifying, for at most [`ERROR_BODY_DEADLINE`]; on the
-/// deadline the bytes read so far are used (plain status classification
-/// applies when they carry no marker). Cancellation is the caller's: every
-/// call site runs inside [`with_cancel`]. Never logged, never returned to a
-/// client.
+/// client-error statuses ([`crate::mapping::reads_error_body`]), for at most
+/// [`ERROR_BODY_DEADLINE`]; on the deadline the bytes read so far are used
+/// (plain status classification applies when they carry no marker).
+/// Cancellation is the caller's: every call site runs inside [`with_cancel`].
+/// Never returned to a client; only its bounded, redacted message is logged
+/// (see [`crate::mapping::upstream_error_detail`]).
 pub(crate) async fn error_body_prefix(response: reqwest::Response) -> Vec<u8> {
-    if !crate::mapping::needs_error_body(response.status().as_u16()) {
+    if !crate::mapping::reads_error_body(response.status().as_u16()) {
         return Vec::new();
     }
     let mut out = Vec::new();

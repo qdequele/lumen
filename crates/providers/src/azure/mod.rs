@@ -31,8 +31,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::BoxStream;
 use lumen_core::{
-    ChatChunk, ChatProvider, ChatRequest, ChatResponse, EmbedRequest, EmbedResponse,
-    EmbeddingProvider, ProviderError,
+    developer_role_as_system, ChatChunk, ChatProvider, ChatRequest, ChatResponse, EmbedRequest,
+    EmbedResponse, EmbeddingProvider, ProviderError,
 };
 use std::fmt;
 use tokio_util::sync::CancellationToken;
@@ -203,6 +203,9 @@ impl ChatProvider for AzureProvider {
     ) -> Result<ChatResponse, ProviderError> {
         // This entry point is non-streaming; never ask the upstream to stream.
         req.stream = false;
+        // `developer` needs api-version 2024-12-01-preview or later, and the
+        // GA default predates it; `system` is equivalent on every version.
+        developer_role_as_system(&mut req.messages);
         let url = self.deployment_url(&req.model, "chat/completions");
         let bytes = post_json_with_headers(
             &self.client,
@@ -236,6 +239,7 @@ impl ChatProvider for AzureProvider {
         // forward the upstream body bytes as-is (framing + `[DONE]`), no
         // per-chunk serde round trip. See ADR 004.
         enable_stream_usage(&mut req);
+        developer_role_as_system(&mut req.messages);
         let url = self.deployment_url(&req.model, "chat/completions");
         open_stream_with_headers(
             &self.client,

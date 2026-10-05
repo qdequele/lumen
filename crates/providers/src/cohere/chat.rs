@@ -154,6 +154,13 @@ fn cohere_content(m: &ChatMessage) -> Value {
 /// Translate one OpenAI-shaped message to Cohere v2's shape.
 fn translate_message(m: &ChatMessage) -> CohereMessage {
     match m.role.as_str() {
+        // Cohere v2 has no `developer` role; it keeps `system` inline.
+        lumen_core::DEVELOPER_ROLE => CohereMessage {
+            role: "system".to_owned(),
+            content: Some(cohere_content(m)),
+            tool_call_id: None,
+            tool_calls: Vec::new(),
+        },
         "tool" => CohereMessage {
             role: "tool".to_owned(),
             content: Some(json!(text_of(m))),
@@ -485,6 +492,20 @@ mod tests {
         assert_eq!(out.messages.len(), 2);
         assert_eq!(out.messages[0].role, "system");
         assert_eq!(out.messages[0].content, Some(json!("be terse")));
+    }
+
+    /// Cohere v2 has no `developer` role: it is sent as `system`, in place.
+    #[test]
+    fn developer_role_is_sent_as_system_inline() {
+        let req = base_request(vec![
+            msg("system", "one"),
+            msg("developer", "two"),
+            msg("user", "hi"),
+        ]);
+        let out = translate_request(&req, false);
+        let roles: Vec<&str> = out.messages.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(roles, ["system", "system", "user"]);
+        assert_eq!(out.messages[1].content, Some(json!("two")));
     }
 
     #[test]

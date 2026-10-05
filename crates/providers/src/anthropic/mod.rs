@@ -228,8 +228,9 @@ fn map_finish_reason(stop_reason: Option<&str>) -> Option<String> {
 /// `stream` is set explicitly by the calling path, never taken from the
 /// client's request (the gateway decides which upstream mode it needs).
 fn translate_request(req: &ChatRequest, stream: bool) -> AnthropicRequest {
-    // System messages are hoisted into the top-level `system` field, joined by
-    // blank lines; every other message keeps its role. Tool traffic maps to
+    // System messages (and OpenAI `developer` ones, which Anthropic has no
+    // role for) are hoisted into the top-level `system` field, in order,
+    // joined by blank lines; every other message keeps its role. Tool traffic maps to
     // content blocks: assistant `tool_calls` → `tool_use`, role `tool` →
     // `tool_result` (consecutive tool results merge into one user message,
     // matching Anthropic's role-alternation expectations).
@@ -241,12 +242,13 @@ fn translate_request(req: &ChatRequest, stream: bool) -> AnthropicRequest {
             .as_ref()
             .map(|c| c.text().into_owned())
             .unwrap_or_default();
-        match m.role.as_str() {
-            "system" => {
-                if !text.is_empty() {
-                    system_parts.push(text);
-                }
+        if m.is_system_role() {
+            if !text.is_empty() {
+                system_parts.push(text);
             }
+            continue;
+        }
+        match m.role.as_str() {
             "tool" => {
                 let block = json!({
                     "type": "tool_result",
@@ -712,6 +714,53 @@ mod tests {
         assert_eq!(out.messages[0].role, "user");
         assert_eq!(out.stop_sequences, vec!["STOP".to_owned()]);
         assert_eq!(out.temperature, Some(0.5));
+    }
+
+    /// OpenAI's `developer` role (sent by Meilisearch chat for non-legacy
+    /// models) is instructions: it must reach Anthropic's top-level `system`,
+    /// never `messages`, where Anthropic rejects it with a 400.
+    #[test]
+    fn developer_message_is_hoisted_into_system() {
+        let req = ChatRequest {
+            model: "claude-x".to_owned(),
+            messages: vec![msg("developer", "answer in French"), msg("user", "hi")],
+            temperature: None,
+            top_p: None,
+            max_tokens: None,
+            n: None,
+            stop: None,
+            stream: false,
+            extra: serde_json::Map::new(),
+        };
+        let out = translate_request(&req, false);
+        assert_eq!(out.system.as_deref(), Some("answer in French"));
+        assert_eq!(out.messages.len(), 1);
+        assert_eq!(out.messages[0].role, "user");
+    }
+
+    #[test]
+    fn mixed_system_and_developer_messages_join_in_order() {
+        let req = ChatRequest {
+            model: "claude-x".to_owned(),
+            messages: vec![
+                msg("system", "one"),
+                msg("developer", "two"),
+                msg("user", "hi"),
+                msg("developer", "three"),
+                msg("system", "four"),
+            ],
+            temperature: None,
+            top_p: None,
+            max_tokens: None,
+            n: None,
+            stop: None,
+            stream: false,
+            extra: serde_json::Map::new(),
+        };
+        let out = translate_request(&req, false);
+        assert_eq!(out.system.as_deref(), Some("one\n\ntwo\n\nthree\n\nfour"));
+        let roles: Vec<&str> = out.messages.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(roles, ["user"]);
     }
 
     #[test]

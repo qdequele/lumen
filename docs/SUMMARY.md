@@ -73,6 +73,7 @@
 - [013 - SystemOne capability](adr/013-systemone-capability.md)
 - [014 - Virtual models](adr/014-virtual-models.md)
 - [015 - Lab integration](adr/015-lab-integration.md)
+- [016 - The developer role and upstream error detail](adr/016-developer-role-and-upstream-error-detail.md)
 
 # Project
 

@@ -7,8 +7,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::BoxStream;
 use lumen_core::{
-    ChatChunk, ChatProvider, ChatRequest, ChatResponse, EmbedRequest, EmbedResponse,
-    EmbeddingProvider, ProviderError,
+    developer_role_as_system, ChatChunk, ChatProvider, ChatRequest, ChatResponse, EmbedRequest,
+    EmbedResponse, EmbeddingProvider, ProviderError,
 };
 use std::fmt;
 use tokio_util::sync::CancellationToken;
@@ -72,6 +72,8 @@ impl ChatProvider for MistralProvider {
         cancel: CancellationToken,
     ) -> Result<ChatResponse, ProviderError> {
         req.stream = false;
+        // Mistral has no `developer` role (OpenAI's alias for `system`).
+        developer_role_as_system(&mut req.messages);
         let url = format!("{}/chat/completions", self.base_url);
         let bytes = post_json(
             &self.client,
@@ -102,6 +104,7 @@ impl ChatProvider for MistralProvider {
     ) -> Result<BoxStream<'static, Result<Bytes, ProviderError>>, ProviderError> {
         // Zero-copy passthrough (Mistral speaks OpenAI SSE). See ADR 004.
         enable_stream_usage(&mut req);
+        developer_role_as_system(&mut req.messages);
         let url = format!("{}/chat/completions", self.base_url);
         open_stream(
             &self.client,

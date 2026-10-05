@@ -2024,3 +2024,237 @@ async fn malformed_json_body_is_still_lm_1001() {
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["error"]["code"], "LM-1001");
 }
+
+// ---- OpenAI `developer` role ----------------------------------------------
+
+/// One chat-only provider of `kind` pointed at `upstream`, serving model `m`.
+fn single_chat_registry(kind: ProviderKind, upstream: &str) -> Arc<Registry> {
+    let specs = vec![ProviderSpec {
+        name: kind.as_str().to_owned(),
+        kind,
+        api_key: Some("test-key".to_owned()),
+        base_url: Some(upstream.to_owned()),
+        api_version: None,
+        strict: false,
+        connect_timeout_ms: None,
+        models: vec![ModelSpec {
+            id: "m".to_owned(),
+            upstream_id: "upstream-m".to_owned(),
+            capabilities: vec![Capability::Chat],
+            modalities: vec!["text".to_owned()],
+            release_date: None,
+        }],
+    }];
+    Arc::new(
+        Registry::build(
+            specs,
+            http::build_client(),
+            std::time::Duration::from_secs(300),
+        )
+        .expect("registry builds"),
+    )
+}
+
+/// The request Meilisearch chat sends for the `openAi` source with a modern
+/// model: its system prompt as a `developer` message, plus a `system` one.
+fn developer_role_request(model: &str, stream: bool) -> Value {
+    json!({
+        "model": model,
+        "stream": stream,
+        "messages": [
+            { "role": "developer", "content": "You are a search assistant." },
+            { "role": "system", "content": "Answer in French." },
+            { "role": "user", "content": "bonjour" }
+        ]
+    })
+}
+
+async fn sent_body(upstream: &MockServer) -> Value {
+    let requests = upstream.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    serde_json::from_slice(&requests[0].body).unwrap()
+}
+
+fn sent_roles(sent: &Value) -> Vec<String> {
+    sent["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["role"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+/// Regression (2026-10-05, lumen.meilisearch.com): a `developer` message was
+/// forwarded to Anthropic as a message role, which Anthropic rejects with a
+/// 400 surfaced as LM-3003. It must be hoisted into `system`, in order.
+#[tokio::test]
+async fn anthropic_hoists_developer_role_into_system() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "msg_1",
+            "type": "message",
+            "role": "assistant",
+            "model": "upstream-m",
+            "content": [{ "type": "text", "text": "salut" }],
+            "stop_reason": "end_turn",
+            "usage": { "input_tokens": 12, "output_tokens": 3 }
+        })))
+        .mount(&upstream)
+        .await;
+    let base = common::spawn_with(
+        single_chat_registry(ProviderKind::Anthropic, &upstream.uri()),
+        LIMIT,
+    )
+    .await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&developer_role_request("m", false))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let sent = sent_body(&upstream).await;
+    assert_eq!(
+        sent["system"],
+        "You are a search assistant.\n\nAnswer in French."
+    );
+    assert_eq!(sent_roles(&sent), ["user"]);
+}
+
+#[tokio::test]
+async fn anthropic_streaming_hoists_developer_role_into_system() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(anthropic_sse_body()),
+        )
+        .mount(&upstream)
+        .await;
+    let base = common::spawn_with(
+        single_chat_registry(ProviderKind::Anthropic, &upstream.uri()),
+        LIMIT,
+    )
+    .await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&developer_role_request("m", true))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let _ = resp.text().await.unwrap();
+
+    let sent = sent_body(&upstream).await;
+    assert_eq!(sent["stream"], true);
+    assert_eq!(
+        sent["system"],
+        "You are a search assistant.\n\nAnswer in French."
+    );
+    assert_eq!(sent_roles(&sent), ["user"]);
+}
+
+#[tokio::test]
+async fn google_puts_developer_role_in_system_instruction() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1beta/models/upstream-m:generateContent"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "candidates": [{
+                "content": { "role": "model", "parts": [{ "text": "salut" }] },
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": { "promptTokenCount": 5, "candidatesTokenCount": 2, "totalTokenCount": 7 }
+        })))
+        .mount(&upstream)
+        .await;
+    let base = common::spawn_with(
+        single_chat_registry(ProviderKind::Google, &upstream.uri()),
+        LIMIT,
+    )
+    .await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&developer_role_request("m", false))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let sent = sent_body(&upstream).await;
+    assert_eq!(
+        sent["systemInstruction"]["parts"],
+        json!([{ "text": "You are a search assistant." }, { "text": "Answer in French." }])
+    );
+    assert_eq!(sent["contents"].as_array().unwrap().len(), 1);
+    assert_eq!(sent["contents"][0]["role"], "user");
+}
+
+/// OpenAI-compatible hosts without a `developer` role (vLLM chat templates,
+/// Mistral, Groq, Ollama, ...) get it as `system`, in place, streaming or
+/// not. So does `kind = "openai"` pointed at a `base_url` other than
+/// api.openai.com (LiteLLM, llama.cpp, a proxy): only OpenAI itself gets
+/// `developer` verbatim (covered in the providers crate).
+#[tokio::test]
+async fn openai_compatible_kinds_send_developer_role_as_system() {
+    for kind in [
+        ProviderKind::Openai,
+        ProviderKind::Vllm,
+        ProviderKind::Mistral,
+        ProviderKind::Groq,
+        ProviderKind::Together,
+        ProviderKind::Cloudflare,
+        ProviderKind::Ollama,
+    ] {
+        for stream in [false, true] {
+            let upstream = MockServer::start().await;
+            let template = if stream {
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string("data: [DONE]\n\n")
+            } else {
+                ResponseTemplate::new(200).set_body_json(openai_chat_body("upstream-m"))
+            };
+            // Ollama's chat lives under `{root}/v1`; the others at the base.
+            let chat_path = if kind == ProviderKind::Ollama {
+                "/v1/chat/completions"
+            } else {
+                "/chat/completions"
+            };
+            Mock::given(method("POST"))
+                .and(path(chat_path))
+                .respond_with(template)
+                .mount(&upstream)
+                .await;
+            let base = common::spawn_with(single_chat_registry(kind, &upstream.uri()), LIMIT).await;
+
+            let resp = reqwest::Client::new()
+                .post(format!("{base}/v1/chat/completions"))
+                .json(&developer_role_request("m", stream))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200, "{kind:?} stream={stream}");
+            let _ = resp.text().await.unwrap();
+
+            let sent = sent_body(&upstream).await;
+            assert_eq!(
+                sent_roles(&sent),
+                ["system", "system", "user"],
+                "{kind:?} stream={stream}"
+            );
+            assert_eq!(
+                sent["messages"][0]["content"],
+                "You are a search assistant."
+            );
+        }
+    }
+}

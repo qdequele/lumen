@@ -11,18 +11,43 @@ Prompts, responses and provider secrets are treated as radioactive:
 
 - **Request and response content is never logged**, at any level,
   including `debug` and `trace`. This is the sovereignty pillar, not a
-  default you can toggle.
+  default you can toggle. The nearest thing is an upstream's own error
+  message, which is logged only after request echoes are cut out of it
+  (see [Upstream error messages](#upstream-error-messages)).
 - **Provider API keys and the master key never appear** in logs or errors;
   the redacting `Debug` implementations keep them out of debug output, and
   tests enforce it.
 
 What is logged is metadata: request ids, models, providers, HTTP status,
 latency, operational events (boot, config reloads, circuit-breaker
-transitions, flush failures), and the client-supplied `x-lumen-metadata`
+transitions, flush failures), the upstream's own error message on a failed
+call (below), and the client-supplied `x-lumen-metadata`
 header when present (a bounded JSON object of up to 16 keys, whole header
 capped at 4 KiB). **Operators must not include secrets or prompt content in
 the metadata header**, as it is logged in full and stored in the `usage_log`
 table.
+
+### Upstream error messages
+
+When an upstream answers a client error (4xx other than 429), the gateway
+logs one `warn` line, `upstream returned an error`, with `provider`,
+`status` and `upstream_error`, under the request span (same `request_id`
+as the `request failed` line that follows). For example, a 400 from
+Anthropic carries Anthropic's `error.message`. The rules (ADR 016):
+
+- Only the vendor's message **string** is logged (`error.message`,
+  `message`, `error_description`, `error`, `detail`). A body without one, a
+  non-JSON body, or a structured validation report is never logged, since
+  it can quote the request.
+- The message is cut where a validation error starts echoing the request
+  (`'input'`, `"input"`, `input_value`, `input=`, as pydantic-based hosts
+  such as vLLM do), so request content does not reach the log.
+- Probable credentials are replaced by `<redacted>`, then the message is cut
+  to 512 characters.
+- It never reaches the client, whose body stays the `LM-3003` envelope.
+
+To drop the line entirely, filter its target at the subscriber, for example
+`RUST_LOG=info,lumen_providers::mapping=error`.
 
 ## Format
 
