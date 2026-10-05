@@ -377,7 +377,7 @@ mod tests {
                 "candidates": [{ "content": { "parts": [{ "text": "late" }] } }]
             })))
             .expect("ok");
-        assert!(late.is_empty());
+        assert!(late.is_empty(), "{late:?}");
     }
 
     #[test]
@@ -399,6 +399,6 @@ mod tests {
         // Only the initial role chunk, no content.
         assert_eq!(first.len(), 1);
         let again = t.translate(&event(serde_json::json!({}))).expect("ok");
-        assert!(again.is_empty());
+        assert!(again.is_empty(), "{again:?}");
     }
 }

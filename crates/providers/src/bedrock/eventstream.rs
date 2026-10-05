@@ -293,9 +293,11 @@ mod tests {
         let mut decoder = EventStreamDecoder::new();
         // Split at an arbitrary interior byte: nothing until the frame completes.
         let (a, b) = bytes.split_at(7);
-        assert!(decoder.push(a).expect("partial ok").is_empty());
+        let got = decoder.push(a).expect("partial ok");
+        assert!(got.is_empty(), "{got:?}");
         let (b1, b2) = b.split_at(5);
-        assert!(decoder.push(b1).expect("partial ok").is_empty());
+        let got = decoder.push(b1).expect("partial ok");
+        assert!(got.is_empty(), "{got:?}");
         let msgs = decoder.push(b2).expect("completes");
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].event_type(), Some("contentBlockDelta"));

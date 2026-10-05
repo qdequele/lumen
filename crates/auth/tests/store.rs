@@ -168,7 +168,10 @@ async fn delete_key_tombstones_without_touching_usage_history() {
         .expect("lookup")
         .is_none());
     // ...and a restarted gateway would not load the key either.
-    assert!(store.load_auth_entries().await.expect("entries").is_empty());
+    assert_eq!(
+        store.load_auth_entries().await.expect("entries"),
+        [] as [(std::string::String, lumen_auth::store::VirtualKeyRecord); 0]
+    );
 }
 
 #[tokio::test]

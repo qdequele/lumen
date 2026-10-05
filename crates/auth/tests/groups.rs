@@ -257,7 +257,10 @@ async fn create_key_with_unknown_or_deleted_group_is_refused_before_any_write() 
     assert!(matches!(err, AuthError::UnknownGroup(id) if id == group.id));
 
     // Refused BEFORE any write: no key row landed.
-    assert!(store.list_keys(false).await.expect("list").is_empty());
+    assert_eq!(
+        store.list_keys(false).await.expect("list"),
+        [] as [lumen_auth::store::VirtualKeyRecord; 0]
+    );
 }
 
 #[tokio::test]

@@ -332,7 +332,8 @@ async fn admin_group_create_with_a_blank_name_is_400_lm1001() {
 
     // Nothing was created.
     let list = h.list_groups("").await;
-    assert!(list.as_array().expect("array").is_empty());
+    let got = list.as_array().expect("array");
+    assert!(got.is_empty(), "{got:?}");
 }
 
 #[tokio::test]
@@ -458,7 +459,8 @@ async fn admin_key_create_with_an_unknown_group_is_400_lm1001() {
     assert_eq!(body["error"]["code"], "LM-1001");
 
     // Refused before any write: no key row landed.
-    assert!(h.store.list_keys(false).await.expect("list").is_empty());
+    let got = h.store.list_keys(false).await.expect("list");
+    assert!(got.is_empty(), "{got:?}");
 }
 
 #[tokio::test]

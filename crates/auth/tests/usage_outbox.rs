@@ -68,7 +68,10 @@ async fn persist_flush_is_atomic() {
         .await;
     assert!(err.is_err());
     assert_eq!(spend_and_watermark(&store, &key).await, (0.0, 0));
-    assert!(store.outbox_due(i64::MAX, 100).await.unwrap().is_empty());
+    assert_eq!(
+        store.outbox_due(i64::MAX, 100).await.unwrap(),
+        [] as [lumen_auth::store::OutboxRow; 0]
+    );
 }
 
 #[tokio::test]
@@ -114,13 +117,19 @@ async fn reschedule_backs_off_exponentially_and_caps_at_five_minutes() {
     let ids = ["a".to_owned()];
     // First failure: 2 s (+ jitter).
     store.outbox_reschedule(&ids, 1_000, 7).await.unwrap();
-    assert!(store.outbox_due(3_006, 10).await.unwrap().is_empty());
+    assert_eq!(
+        store.outbox_due(3_006, 10).await.unwrap(),
+        [] as [lumen_auth::store::OutboxRow; 0]
+    );
     assert_eq!(store.outbox_due(3_007, 10).await.unwrap().len(), 1);
     // Many failures later the delay is capped at 300 s.
     for _ in 0..20 {
         store.outbox_reschedule(&ids, 1_000, 0).await.unwrap();
     }
-    assert!(store.outbox_due(300_999, 10).await.unwrap().is_empty());
+    assert_eq!(
+        store.outbox_due(300_999, 10).await.unwrap(),
+        [] as [lumen_auth::store::OutboxRow; 0]
+    );
     assert_eq!(store.outbox_due(301_000, 10).await.unwrap().len(), 1);
 }
 

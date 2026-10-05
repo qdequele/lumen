@@ -93,13 +93,16 @@ fn reservations_are_never_billed_only_settled_cost() {
     // Reserve 1000 and flush while in flight: the estimate is not billed.
     let reservation = entry.admit(NOW, 0, 1_000).unwrap();
     let first = s.drain_flush(2_000);
-    assert!(first.deltas().is_empty());
+    assert_eq!(first.deltas(), [] as [&lumen_auth::billing::UsageDelta; 0]);
     assert_eq!(first.rows()[0].billed_micro, 0);
     s.commit_flush(first);
     // The call fails: the reservation is refunded, nothing was ever billed.
     drop(reservation);
     let after_refund = s.drain_flush(3_000);
-    assert!(after_refund.deltas().is_empty());
+    assert_eq!(
+        after_refund.deltas(),
+        [] as [&lumen_auth::billing::UsageDelta; 0]
+    );
     s.commit_flush(after_refund);
     // Later settled spend is billed in full.
     spend(&s, 1_200, 0);
@@ -117,9 +120,12 @@ fn non_billable_keys_keep_the_watermark_caught_up() {
         let s = state(account, group, billing);
         spend(&s, 700, 5);
         let batch = s.drain_flush(2_000);
-        assert!(batch.deltas().is_empty());
+        assert_eq!(batch.deltas(), [] as [&lumen_auth::billing::UsageDelta; 0]);
         assert_eq!(batch.rows()[0].billed_micro, 700);
-        assert!(batch.outbox_inserts("eu-1", 2_000).unwrap().is_empty());
+        assert_eq!(
+            batch.outbox_inserts("eu-1", 2_000).unwrap(),
+            [] as [lumen_auth::store::OutboxInsert; 0]
+        );
     }
 }
 
@@ -173,7 +179,7 @@ fn a_retired_key_with_a_request_in_flight_stays_until_it_settles() {
     s.retire(evicted);
     // Committing while the request is in flight must not forget the key.
     let first = s.drain_flush(2_000);
-    assert!(first.deltas().is_empty());
+    assert_eq!(first.deltas(), [] as [&lumen_auth::billing::UsageDelta; 0]);
     s.commit_flush(first);
     let still_retired = s.drain_flush(3_000);
     assert!(

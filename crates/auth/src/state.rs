@@ -1184,7 +1184,9 @@ impl KeyEntry {
 ///   sentinel value.
 fn grant_cap(cap: &AtomicI64, amount_micro: i64) {
     // fetch_update never panics: the closure returning `None` (unlimited
-    // case) simply leaves the value untouched.
+    // case) simply leaves the value untouched. Rust 1.99 renamed it
+    // `try_update`, which the 1.94 MSRV does not have yet.
+    #[allow(deprecated)]
     let _ = cap.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |max| {
         (max != UNLIMITED).then(|| max.saturating_add(amount_micro).min(UNLIMITED - 1))
     });

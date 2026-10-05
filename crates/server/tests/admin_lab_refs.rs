@@ -301,7 +301,10 @@ async fn a_patch_that_cannot_change_billability_does_not_flush() {
     )
     .await;
     assert_eq!(s, 200);
-    assert!(events(&runtime).await.is_empty());
+    assert_eq!(
+        events(&runtime).await,
+        [] as [(std::string::String, i64); 0]
+    );
 }
 
 /// Make every outbox insert fail, so a flush with billable spend fails.

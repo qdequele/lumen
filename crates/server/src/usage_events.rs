@@ -292,7 +292,8 @@ mod tests {
             .await;
         let (s, store, metrics) = sender(&server, &["a", "b"]).await;
         assert_eq!(s.deliver_once(10).await, Delivery::Delivered(2));
-        assert!(store.outbox_due(i64::MAX, 10).await.unwrap().is_empty());
+        let got = store.outbox_due(i64::MAX, 10).await.unwrap();
+        assert!(got.is_empty(), "{got:?}");
 
         let req = &server.received_requests().await.unwrap()[0];
         let body = std::str::from_utf8(&req.body).unwrap();
