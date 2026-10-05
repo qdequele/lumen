@@ -203,6 +203,7 @@ mod tests {
                 next: 1
             }]
         );
-        assert!(linear_escapes(2, 3).is_empty());
+        let got = linear_escapes(2, 3);
+        assert!(got.is_empty(), "{got:?}");
     }
 }

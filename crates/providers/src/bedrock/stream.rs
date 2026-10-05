@@ -480,7 +480,7 @@ mod tests {
                 r#"{"delta":{"text":"late"},"contentBlockIndex":0}"#,
             )))
             .expect("ignored after exception");
-        assert!(late.is_empty());
+        assert!(late.is_empty(), "{late:?}");
     }
 
     #[test]
@@ -499,6 +499,6 @@ mod tests {
                 r#"{"delta":{"text":"late"},"contentBlockIndex":0}"#,
             )))
             .expect("ignored");
-        assert!(late.is_empty());
+        assert!(late.is_empty(), "{late:?}");
     }
 }

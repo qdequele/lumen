@@ -1411,7 +1411,7 @@ mod tests {
         assert_eq!(usage.prompt_tokens, 10);
         assert_eq!(usage.completion_tokens, 5);
         assert_eq!(usage.total_tokens, 15);
-        assert!(!out.id.is_empty());
+        assert!(!out.id.is_empty(), "{:?}", out.id);
     }
 
     #[test]

@@ -676,7 +676,8 @@ mod tests {
         assert_eq!(plan_calls(5, &big), vec![0..2, 2..4, 4..5]);
         // A single document always gets its own call, even if oversized.
         assert_eq!(plan_calls(5, &[60_000]), vec![0..1]);
-        assert!(plan_calls(5, &[]).is_empty());
+        let got = plan_calls(5, &[]);
+        assert!(got.is_empty(), "{got:?}");
     }
 
     #[test]

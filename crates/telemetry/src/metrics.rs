@@ -66,7 +66,7 @@ mod tests {
     #[test]
     fn empty_registry_encodes_to_empty_body() {
         let m = Metrics::new();
-        assert!(m.encode_text().is_empty());
+        assert_eq!(m.encode_text(), "");
     }
 
     #[test]

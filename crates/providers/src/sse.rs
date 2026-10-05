@@ -148,9 +148,12 @@ mod tests {
     fn reassembles_an_event_fragmented_across_chunks() {
         let mut p = SseParser::new();
         // Split in the middle of the field name, the payload, and the terminator.
-        assert!(push_str(&mut p, "eve").is_empty());
-        assert!(push_str(&mut p, "nt: delta\nda").is_empty());
-        assert!(push_str(&mut p, "ta: {\"text\":\"hi\"}\n").is_empty());
+        let got = push_str(&mut p, "eve");
+        assert!(got.is_empty(), "{got:?}");
+        let got = push_str(&mut p, "nt: delta\nda");
+        assert!(got.is_empty(), "{got:?}");
+        let got = push_str(&mut p, "ta: {\"text\":\"hi\"}\n");
+        assert!(got.is_empty(), "{got:?}");
         let events = push_str(&mut p, "\n");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event.as_deref(), Some("delta"));
@@ -177,7 +180,8 @@ mod tests {
     #[test]
     fn ignores_comment_only_blocks() {
         let mut p = SseParser::new();
-        assert!(push_str(&mut p, ": keep-alive\n\n").is_empty());
+        let got = push_str(&mut p, ": keep-alive\n\n");
+        assert!(got.is_empty(), "{got:?}");
         // A comment before a real event does not pollute it.
         let events = push_str(&mut p, ": ping\ndata: real\n\n");
         assert_eq!(events.len(), 1);
@@ -194,9 +198,11 @@ mod tests {
     #[test]
     fn incomplete_event_stays_buffered() {
         let mut p = SseParser::new();
-        assert!(push_str(&mut p, "data: pending\n").is_empty());
+        let got = push_str(&mut p, "data: pending\n");
+        assert!(got.is_empty(), "{got:?}");
         // Still nothing after another partial line.
-        assert!(push_str(&mut p, "data: more").is_empty());
+        let got = push_str(&mut p, "data: more");
+        assert!(got.is_empty(), "{got:?}");
         let events = push_str(&mut p, "\n\n");
         assert_eq!(events[0].data, "pending\nmore");
     }

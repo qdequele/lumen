@@ -1473,9 +1473,7 @@ impl Config {
                         .to_owned(),
                 ));
             }
-            webhooks
-                .validate(SettingsOrigin::ConfigFile)
-                .map_err(&err)?;
+            webhooks.validate(SettingsOrigin::ConfigFile).map_err(err)?;
         }
 
         if let Some(usage_events) = &self.usage_events {
@@ -1485,7 +1483,7 @@ impl Config {
                         .to_owned(),
                 ));
             }
-            usage_events.validate().map_err(&err)?;
+            usage_events.validate().map_err(err)?;
         }
 
         self.telemetry.validate(path_label)?;
@@ -2176,7 +2174,7 @@ mod tests {
         let cfg = load_str("").unwrap();
         assert_eq!(cfg.server.host, "127.0.0.1");
         assert_eq!(cfg.server.port, 8080);
-        assert!(cfg.providers.is_empty());
+        assert!(cfg.providers.is_empty(), "{:?}", cfg.providers);
     }
 
     #[test]
@@ -2411,7 +2409,11 @@ mod tests {
         assert_eq!(cfg.auth.usage_batch_max, 500);
         assert_eq!(cfg.auth.usage_flush_ms, 2_000);
         assert_eq!(cfg.auth.retention_days, 30);
-        assert!(cfg.telemetry.metadata_labels.is_empty());
+        assert!(
+            cfg.telemetry.metadata_labels.is_empty(),
+            "{:?}",
+            cfg.telemetry.metadata_labels
+        );
     }
 
     #[test]
@@ -2896,10 +2898,12 @@ mod tests {
             boot_layer_diff(a, b).unwrap(),
             vec!["server.port".to_owned()]
         );
-        assert!(boot_layer_diff(a, a).unwrap().is_empty());
+        let got = boot_layer_diff(a, a).unwrap();
+        assert!(got.is_empty(), "{got:?}");
         // Dynamic-only change: no boot diff.
         let c = "[server]\nport = 8080\n[tokenizer]\nmode = \"accurate\"\n";
-        assert!(boot_layer_diff(a, c).unwrap().is_empty());
+        let got = boot_layer_diff(a, c).unwrap();
+        assert!(got.is_empty(), "{got:?}");
     }
 
     #[test]
@@ -3038,7 +3042,7 @@ mod tests {
         figment::Jail::expect_with(|jail| {
             jail.create_file("boot.toml", "[auth]\nenabled = true\ndb_path = \"x.db\"\n")?;
             let cfg = Config::load_with_dynamic(std::path::Path::new("boot.toml"), "").unwrap();
-            assert!(cfg.providers.is_empty());
+            assert!(cfg.providers.is_empty(), "{:?}", cfg.providers);
             Ok(())
         });
     }
@@ -3095,7 +3099,7 @@ mod tests {
         let cfg = load_str(&format!("{VALID}\n{VIRTUAL}")).unwrap();
         assert_eq!(cfg.virtual_models.len(), 1);
         let (table, warnings) = cfg.routing_table().unwrap();
-        assert!(warnings.is_empty());
+        assert!(warnings.is_empty(), "{warnings:?}");
         assert!(table.get("acme/chat").is_some());
     }
 

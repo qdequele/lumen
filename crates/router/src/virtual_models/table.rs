@@ -753,7 +753,7 @@ mod tests {
         "#,
         )
         .unwrap();
-        assert!(warnings.is_empty());
+        assert!(warnings.is_empty(), "{warnings:?}");
         assert_eq!(
             table.get("acme/chat").unwrap().capability(),
             Capability::Chat

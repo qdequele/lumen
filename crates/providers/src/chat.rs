@@ -125,7 +125,6 @@ pub fn enable_stream_usage(req: &mut ChatRequest) {
 /// Each choice's complete message becomes one delta carrying the whole content
 /// (and any `extra` fields such as `tool_calls`), preserving `finish_reason`
 /// and `usage`. Valid OpenAI streaming shape, just not incremental.
-#[must_use]
 pub fn single_shot_stream(
     resp: ChatResponse,
 ) -> BoxStream<'static, Result<ChatChunk, ProviderError>> {

@@ -208,7 +208,8 @@ async fn empty_config_lists_no_models() {
     assert_eq!(resp.status(), 200);
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["object"], "list");
-    assert!(body["data"].as_array().unwrap().is_empty());
+    let got = body["data"].as_array().unwrap();
+    assert!(got.is_empty(), "{got:?}");
 }
 
 #[tokio::test]
