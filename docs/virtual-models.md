@@ -235,8 +235,8 @@ preset = { system_prompt = "You are Acme's support assistant. Answer briefly and
 | `system_prompt_mode` | Effect |
 |---|---|
 | `prepend` (default) | The preset becomes the first message, before any client system message. |
-| `replace` | Client system messages are removed; the preset takes their place. |
-| `if_absent` | Applied only when the client sent no system message. |
+| `replace` | Client system messages (role `system` or `developer`) are removed; the preset takes their place. |
+| `if_absent` | Applied only when the client sent no system message (role `system` or `developer`). |
 
 - `system_prompt` is at most **32 KiB** and must not be blank. `overrides` uses
   the syntax and allow-list of section 5.

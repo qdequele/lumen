@@ -430,7 +430,8 @@ mod tests {
                 next: 1
             }]
         );
-        assert!(d.attempts[1].escapes.is_empty());
+        let got = &d.attempts[1].escapes;
+        assert!(got.is_empty(), "{got:?}");
         assert_eq!(d.route_of(1), Some("v>b"));
     }
 

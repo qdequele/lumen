@@ -28,7 +28,10 @@ The design makes a few guarantees relevant to security:
   Keys are never logged, never placed in an error returned to a client, and the
   redacting `Debug` impls keep them out of debug output (enforced by tests).
 - **Prompts and responses are never logged by default.** The usage log records
-  token counts, cost and metadata labels - never message content.
+  token counts, cost and metadata labels - never message content. On an
+  upstream 4xx the vendor's own error message string is logged (never the
+  body), cut before any echo of the request and with probable credentials
+  redacted; see `docs/operations/logging.md` (ADR 016).
 - **Virtual keys** are stored only as BLAKE3 hashes; the plaintext is shown once
   at creation and never again. Unknown, disabled and expired keys are
   indistinguishable to the caller (`LM-4004`) so key state cannot be probed.

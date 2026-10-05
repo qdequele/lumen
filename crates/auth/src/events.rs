@@ -652,7 +652,8 @@ mod tests {
 
         // More spend, still under 80 %: nothing new.
         state.on_settle(&s, &subject(70_000_000, Some(100_000_000)));
-        assert!(drain(&mut rx).is_empty());
+        let got = drain(&mut rx);
+        assert!(got.is_empty(), "{got:?}");
 
         // Past 80 %: exactly the one new crossing.
         state.on_settle(&s, &subject(81_000_000, Some(100_000_000)));
@@ -672,7 +673,8 @@ mod tests {
         assert_eq!(fired, [Some(50), Some(80), Some(95)]);
 
         state.on_settle(&s, &subject(100_000_000, Some(100_000_000)));
-        assert!(drain(&mut rx).is_empty());
+        let got = drain(&mut rx);
+        assert!(got.is_empty(), "{got:?}");
     }
 
     #[test]
@@ -698,7 +700,8 @@ mod tests {
         let s = signals(&q);
         let state = SignalState::default();
         state.on_settle(&s, &subject(999_000_000, None));
-        assert!(drain(&mut rx).is_empty());
+        let got = drain(&mut rx);
+        assert!(got.is_empty(), "{got:?}");
     }
 
     #[test]
@@ -730,7 +733,8 @@ mod tests {
         // A PATCH that lowers the cap further buys no headroom.
         state.rearm(s.thresholds(), &subject(100_000_000, Some(50_000_000)));
         state.on_refusal(&s, &subject(100_000_000, Some(50_000_000)));
-        assert!(drain(&mut rx).is_empty());
+        let got = drain(&mut rx);
+        assert!(got.is_empty(), "{got:?}");
     }
 
     #[test]
@@ -741,7 +745,8 @@ mod tests {
         let state = SignalState::default();
         state.on_settle(&s, &subject(90_000_000, Some(100_000_000)));
         state.on_refusal(&s, &subject(100_000_000, Some(100_000_000)));
-        assert!(drain(&mut rx).is_empty());
+        let got = drain(&mut rx);
+        assert!(got.is_empty(), "{got:?}");
 
         s.emit(
             EventKind::KeyDeleted,

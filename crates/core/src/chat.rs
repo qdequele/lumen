@@ -12,7 +12,7 @@ use serde_json::{Map, Value};
 /// A single chat message (request or response side).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChatMessage {
-    /// `system`, `user`, `assistant`, `tool`, ...
+    /// `system`, `developer`, `user`, `assistant`, `tool`, ...
     pub role: String,
     /// Textual content. `None` for e.g. assistant messages that only carry
     /// `tool_calls` (which live in `extra`).
@@ -24,6 +24,33 @@ pub struct ChatMessage {
     /// Any additional fields (`tool_calls`, `tool_call_id`, ...) preserved verbatim.
     #[serde(flatten)]
     pub extra: Map<String, Value>,
+}
+
+/// OpenAI's newer name for instructions. OpenAI treats `developer` and
+/// `system` the same way (each is mapped to the other depending on the
+/// model), and no other upstream has a `developer` role, so every translated
+/// provider handles it as `system`.
+pub const DEVELOPER_ROLE: &str = "developer";
+
+impl ChatMessage {
+    /// Whether this message carries instructions: role `system` or OpenAI's
+    /// `developer`. Translators that hoist instructions out of the turn list
+    /// (Anthropic, Gemini, Bedrock) or drop client instructions (virtual-model
+    /// presets) must test this, never `role == "system"` alone.
+    #[must_use]
+    pub fn is_system_role(&self) -> bool {
+        matches!(self.role.as_str(), "system" | DEVELOPER_ROLE)
+    }
+}
+
+/// Rewrite every `developer` message to `system`, in place, for an
+/// OpenAI-compatible upstream that has no `developer` role (Mistral, Azure
+/// API versions before it, vLLM chat templates, ...). Position and content
+/// are untouched, so the instructions keep their order.
+pub fn developer_role_as_system(messages: &mut [ChatMessage]) {
+    for m in messages.iter_mut().filter(|m| m.role == DEVELOPER_ROLE) {
+        "system".clone_into(&mut m.role);
+    }
 }
 
 /// Message content: OpenAI overloads this as either a bare string or an array
@@ -353,6 +380,48 @@ pub struct ChatChunk {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn msg(role: &str) -> ChatMessage {
+        ChatMessage {
+            role: role.to_owned(),
+            content: Some(MessageContent::Text(role.to_owned())),
+            name: None,
+            extra: Map::new(),
+        }
+    }
+
+    #[test]
+    fn developer_and_system_are_system_roles_and_nothing_else_is() {
+        assert!(msg("system").is_system_role());
+        assert!(msg("developer").is_system_role());
+        for role in ["user", "assistant", "tool", "Developer", ""] {
+            assert!(!msg(role).is_system_role(), "{role}");
+        }
+    }
+
+    #[test]
+    fn developer_role_as_system_rewrites_only_developer_in_place() {
+        let mut messages = vec![
+            msg("system"),
+            msg("developer"),
+            msg("user"),
+            msg("developer"),
+        ];
+        developer_role_as_system(&mut messages);
+        let roles: Vec<&str> = messages.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(roles, ["system", "system", "user", "system"]);
+        // Content and order are preserved.
+        let texts: Vec<String> = messages
+            .iter()
+            .map(|m| {
+                m.content
+                    .as_ref()
+                    .map(|c| c.text().into_owned())
+                    .unwrap_or_default()
+            })
+            .collect();
+        assert_eq!(texts, ["system", "developer", "user", "developer"]);
+    }
 
     #[test]
     fn string_content_round_trips() {

@@ -8,8 +8,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::BoxStream;
 use lumen_core::{
-    ChatChunk, ChatProvider, ChatRequest, ChatResponse, EmbedRequest, EmbedResponse,
-    EmbeddingProvider, ProviderError,
+    developer_role_as_system, ChatChunk, ChatProvider, ChatRequest, ChatResponse, EmbedRequest,
+    EmbedResponse, EmbeddingProvider, ProviderError,
 };
 use std::fmt;
 use tokio_util::sync::CancellationToken;
@@ -34,6 +34,10 @@ pub struct OpenAiProvider {
     base_url: String,
     /// Bearer token. Redacted from `Debug`; never logged.
     api_key: Option<String>,
+    /// Whether the upstream understands OpenAI's `developer` role. Only the
+    /// `openai` kind does; every other OpenAI-compatible host gets those
+    /// messages as `system` (see [`OpenAiProvider::with_native_developer_role`]).
+    native_developer_role: bool,
 }
 
 impl OpenAiProvider {
@@ -54,6 +58,24 @@ impl OpenAiProvider {
             provider_name: provider_name.into(),
             base_url,
             api_key,
+            native_developer_role: false,
+        }
+    }
+
+    /// Declare whether the upstream has OpenAI's `developer` role (default
+    /// `false`). When it does not, `developer` messages are rewritten to
+    /// `system` in place before sending: OpenAI defines the two as
+    /// equivalent, and hosts such as vLLM chat templates reject the role.
+    #[must_use]
+    pub fn with_native_developer_role(mut self, native: bool) -> Self {
+        self.native_developer_role = native;
+        self
+    }
+
+    /// Apply the `developer` role policy to an outgoing request.
+    fn prepare_roles(&self, req: &mut ChatRequest) {
+        if !self.native_developer_role {
+            developer_role_as_system(&mut req.messages);
         }
     }
 }
@@ -111,6 +133,7 @@ impl ChatProvider for OpenAiProvider {
     ) -> Result<ChatResponse, ProviderError> {
         // This entry point is non-streaming; never ask the upstream to stream.
         req.stream = false;
+        self.prepare_roles(&mut req);
         let url = format!("{}/chat/completions", self.base_url);
         let bytes = post_json(
             &self.client,
@@ -144,6 +167,7 @@ impl ChatProvider for OpenAiProvider {
         // the upstream body bytes verbatim (framing + `[DONE]`), no per-chunk
         // serde round trip. See ADR 004.
         enable_stream_usage(&mut req);
+        self.prepare_roles(&mut req);
         let url = format!("{}/chat/completions", self.base_url);
         open_stream(
             &self.client,

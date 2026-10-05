@@ -500,7 +500,7 @@ async fn the_payload_never_carries_a_key_secret_or_any_content() {
 
     assert_eq!(h.chat(&key).await.status(), 200);
     let events = wait_for_events(&receiver, 1).await;
-    assert!(!events.is_empty());
+    assert_ne!(events, [] as [serde_json::Value; 0]);
 
     for request in received_requests(&receiver).await {
         let body = String::from_utf8_lossy(&request.body).to_string();
@@ -671,7 +671,7 @@ async fn a_receiver_5xx_is_retried_with_backoff_until_it_succeeds() {
         .collect();
     assert_eq!(ids[0], ids[1], "a retry keeps the event id");
     assert_eq!(ids[1], ids[2], "a retry keeps the event id");
-    assert!(!ids[0].is_empty());
+    assert_ne!(ids[0], "");
 
     assert!(metrics.contains("lumen_webhook_sent_total 1"), "{metrics}");
     assert!(

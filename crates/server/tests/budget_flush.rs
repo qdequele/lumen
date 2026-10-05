@@ -87,7 +87,10 @@ async fn without_usage_events_no_event_is_written() {
     spend(&rt, &plain, 250_000);
     assert!(flush_budgets(&rt).await);
     assert_eq!(watermark(&rt).await, (0.25, 250_000));
-    assert!(rt.store.outbox_due(i64::MAX, 10).await.unwrap().is_empty());
+    assert_eq!(
+        rt.store.outbox_due(i64::MAX, 10).await.unwrap(),
+        [] as [lumen_auth::store::OutboxRow; 0]
+    );
 }
 
 #[tokio::test]
@@ -204,7 +207,10 @@ async fn a_request_in_flight_on_a_deleted_key_is_still_billed() {
     let key_id = rt.store.list_keys(false).await.unwrap()[0].id.clone();
     let evicted = rt.keys.remove(&key_id).unwrap();
     retire_and_flush_key(&rt, evicted).await;
-    assert!(rt.store.outbox_due(i64::MAX, 10).await.unwrap().is_empty());
+    assert_eq!(
+        rt.store.outbox_due(i64::MAX, 10).await.unwrap(),
+        [] as [lumen_auth::store::OutboxRow; 0]
+    );
     // The request finishes after the delete; its settled cost is billed.
     reservation.settle(40_000, 3);
     drop(entry);

@@ -442,7 +442,7 @@ fn drain_dirty_reports_spend_once_until_it_changes_again() {
     let entry = state.authenticate("fg-flush", NOW).expect("key valid");
 
     // Nothing spent yet → nothing to flush.
-    assert!(state.drain_dirty().is_empty());
+    assert_eq!(state.drain_dirty(), [] as [(std::string::String, f64); 0]);
 
     entry
         .admit(NOW, 1, usd_to_micro(3.0))
@@ -455,7 +455,7 @@ fn drain_dirty_reports_spend_once_until_it_changes_again() {
     assert!((first[0].1 - 3.0).abs() < 1e-9);
 
     // Unchanged since the flush → clean.
-    assert!(state.drain_dirty().is_empty());
+    assert_eq!(state.drain_dirty(), [] as [(std::string::String, f64); 0]);
 
     entry
         .admit(NOW, 1, usd_to_micro(1.0))
@@ -844,7 +844,10 @@ fn drain_dirty_groups_reports_group_spend_once_until_it_changes_again() {
         .expect("key valid");
 
     // Nothing spent yet -> nothing to flush.
-    assert!(state.drain_dirty_groups().is_empty());
+    assert_eq!(
+        state.drain_dirty_groups(),
+        [] as [(std::string::String, f64); 0]
+    );
 
     entry
         .admit(NOW, 1, usd_to_micro(3.0))
@@ -856,7 +859,10 @@ fn drain_dirty_groups_reports_group_spend_once_until_it_changes_again() {
     assert!((first[0].1 - 3.0).abs() < 1e-9);
 
     // Unchanged since the flush -> clean.
-    assert!(state.drain_dirty_groups().is_empty());
+    assert_eq!(
+        state.drain_dirty_groups(),
+        [] as [(std::string::String, f64); 0]
+    );
 
     // New spend re-arms the dirty flag.
     entry

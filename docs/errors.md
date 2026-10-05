@@ -54,7 +54,7 @@ retried on a fallback before surfacing.
 |-----------|------|----------------------------------------------------------------|
 | `LM-3001` | 429  | An upstream provider rate limited the request.                 |
 | `LM-3002` | 502  | An upstream provider returned an unparseable/malformed response.|
-| `LM-3003` | 502  | An upstream provider returned an error status.                 |
+| `LM-3003` | 502  | An upstream provider returned an error status. For an upstream 4xx, the provider's own message is usually in the preceding `upstream returned an error` log line (field `upstream_error`, same `request_id`; bounded, credentials redacted, never sent to the client). That line is absent when the upstream body carries no JSON message string. |
 | `LM-3004` | 503  | No healthy upstream available (circuit open / fallbacks spent).|
 | `LM-3005` | 504  | An upstream provider timed out.                                |
 | `LM-3010` | 502  | An upstream stream ended prematurely (no terminator).          |

@@ -110,7 +110,7 @@ async fn a_settle_that_crosses_a_threshold_fires_exactly_one_event() {
     for _ in 0..5 {
         spend(&entry, 1.0);
     }
-    assert!(drain(&mut rx).is_empty());
+    assert_eq!(drain(&mut rx), [] as [lumen_auth::events::BudgetEvent; 0]);
 }
 
 #[tokio::test]
@@ -220,7 +220,7 @@ async fn installing_a_policy_does_not_replay_thresholds_already_crossed() {
     let entry = state.authenticate("fg-b", NOW).expect("key valid");
 
     spend(&entry, 1.0); // 91 %
-    assert!(drain(&mut rx).is_empty());
+    assert_eq!(drain(&mut rx), [] as [lumen_auth::events::BudgetEvent; 0]);
 
     // Crossing 95 % after the restart still signals.
     spend(&entry, 5.0);
@@ -247,11 +247,11 @@ async fn an_unsettled_reservation_refund_does_not_flap_a_threshold() {
     {
         let _reservation = entry.admit(NOW, 0, usd_to_micro(20.0)).expect("admitted");
     }
-    assert!(drain(&mut rx).is_empty());
+    assert_eq!(drain(&mut rx), [] as [lumen_auth::events::BudgetEvent; 0]);
 
     // Back over 50 % again: still no second event for the same threshold.
     spend(&entry, 5.0);
-    assert!(drain(&mut rx).is_empty());
+    assert_eq!(drain(&mut rx), [] as [lumen_auth::events::BudgetEvent; 0]);
 }
 
 #[tokio::test]
@@ -268,7 +268,7 @@ async fn no_policy_means_no_events_at_all() {
 
     // Arming afterwards must not deliver the events that were never queued.
     let mut rx = arm(&state, &[50]);
-    assert!(drain(&mut rx).is_empty());
+    assert_eq!(drain(&mut rx), [] as [lumen_auth::events::BudgetEvent; 0]);
 }
 
 #[tokio::test]
@@ -282,7 +282,7 @@ async fn clearing_the_policy_stops_detection() {
 
     state.set_signals(None);
     spend(&entry, 60.0);
-    assert!(drain(&mut rx).is_empty());
+    assert_eq!(drain(&mut rx), [] as [lumen_auth::events::BudgetEvent; 0]);
 }
 
 #[tokio::test]

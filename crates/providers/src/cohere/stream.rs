@@ -496,7 +496,7 @@ mod tests {
                 ),
             ],
         );
-        assert!(items.is_empty());
+        assert!(items.is_empty(), "{items:?}");
     }
 
     #[test]
@@ -554,7 +554,7 @@ mod tests {
                 }),
             ))
             .expect("ignored");
-        assert!(items.is_empty());
+        assert!(items.is_empty(), "{items:?}");
     }
 
     #[test]
