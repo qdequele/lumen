@@ -14,9 +14,15 @@ use axum::{
 };
 use serde_json::json;
 
-/// Liveness/readiness probe. Always 200 `{"status":"ok"}` if the process runs.
+/// Liveness/readiness probe. Always 200 `{"status":"ok","version":"x.y.z"}`
+/// if the process runs. The version is a compile-time constant (no I/O) so a
+/// control plane can show which gateway build it talks to without
+/// credentials; `status` is unchanged for existing probes.
 pub async fn health() -> impl IntoResponse {
-    (StatusCode::OK, Json(json!({ "status": "ok" })))
+    (
+        StatusCode::OK,
+        Json(json!({ "status": "ok", "version": env!("CARGO_PKG_VERSION") })),
+    )
 }
 
 /// Prometheus metrics in the text exposition format.

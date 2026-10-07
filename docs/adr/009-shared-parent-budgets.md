@@ -185,3 +185,8 @@ and a client disconnect between the DB write and the memory increment.
 Grants are also not idempotent: a timed-out grant may have landed - verify
 with a `GET` before retrying (an `Idempotency-Key` header is in the
 backlog).
+
+Amendment (2026-10-07, Lab QA): an unknown or deleted id on the grant routes
+(and on every other key and group route) is now `404` `LM-1003` naming the
+id, no longer `400` `LM-1001`; the amount and capless-target refusals stay
+`400` `LM-1001`.

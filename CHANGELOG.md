@@ -8,6 +8,22 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ### Security
 
+- **Webhook receivers set through the admin API must be publicly
+  routable.** `PUT /admin/webhooks` accepted any `http(s)` URL, including the
+  `169.254.169.254` cloud metadata endpoint, so an admin caller (for example
+  a control plane acting for a team admin) could aim the gateway's POSTs at
+  internal services. A receiver whose host is a loopback, private,
+  link-local, unique-local or otherwise reserved address, a `localhost` name,
+  or a hostname that resolves to any such address (or does not resolve) is
+  now refused with `400 LM-1001`. The new `LUMEN_WEBHOOK_ALLOWED_HOSTS`
+  environment variable (comma-separated hosts, `.suffix` for a domain and its
+  subdomains, read at boot) lists internal receivers an operator allows. The
+  check reuses the image-fetch SSRF classifier and runs when the URL is set,
+  through `PUT /admin/webhooks` and through `PUT /admin/config` /
+  `PUT /admin/config/webhooks` when they introduce or change the receiver. A
+  receiver already in the config file, or stored before this release, is not
+  re-checked; nor are redirects or a hostname re-pointed after the check.
+
 - **The provider HTTP client no longer follows redirects.** reqwest strips
   `Authorization` on a cross-host redirect, but not the custom auth headers
   Anthropic (`x-api-key`), Azure (`api-key`), Gemini (`x-goog-api-key`) and
@@ -22,6 +38,7 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ### Added
 
+- `GET /health` reports the gateway version: `{"status": "ok", "version": "x.y.z"}`, still unauthenticated and I/O-free, so a control plane can display it (Lab QA F9).
 - Meilisearch Lab integration (ADR 015, `docs/operations/lab-integration.md`): opaque `account_ref` on budget groups and `external_ref` on keys (set on create/PATCH, `null` clears, filterable on the list routes; `account_ref` must be a UUID while `[usage_events]` is set), and opt-in, restart-only `[usage_events]` billing events. Each budget flush turns a billable key's newly settled cost (never in-flight reservations, never negative) into a signed `usage.recorded` event (`X-Lab-Signature: sha256=<hex>`), stored in the same SQLite transaction as the spend and pushed to `{url}/internal/events` until the control plane lists it in `accepted`: batched, retried with capped exponential backoff (2 s to 5 min), never dropped, delivered rows purged after 7 days, one bounded delivery attempt on shutdown. Periodic, shutdown and key-delete flushes share one function and one lock; deleted keys are retired until their last spend is billed. With billing on, `PATCH /admin/keys/{id}` with `group_id` and `PATCH /admin/groups/{id}` with `account_ref` flush first and answer `500 LM-5001` without changing anything if that flush fails. New metrics `lumen_usage_events_pending`, `lumen_usage_events_oldest_pending_seconds`, `lumen_usage_events_delivered_total` and `lumen_usage_events_failed_total{reason}`, alert `LumenUsageEventsStuck`, vendored contract `contracts/lab-events.schema.json` with an advisory CI drift job. Migrations 0011 and 0012. With the block set, boot refuses a blank signing secret and any live group whose `account_ref` is not a UUID (the error lists the group ids), and `url` must carry no credentials, query or fragment. The delivered-row purge deletes in chunks of 5000, and gauges refresh at most every 10 s. New criterion bench `cargo bench -p auth --bench admit_settle` (admit + settle per request, recorded in `docs/perf-baseline.md`). Without the block nothing changes: no outbox rows, no sender, no outbound call.
 - `PUT /admin/config/virtual_models/{id}` refuses a body holding a JSON `null` inside `when`, `overrides.set` or `overrides.default` (nested included), or any other value TOML cannot store, with `LM-1001` naming the field instead of a 500.
 - Virtual-model validation caps a request at 64 flattened attempts (`MAX_ATTEMPTS`: a `fallback` or `split` sums its targets, a `switch` takes its largest branch) and stops descending at the nesting limit, so a DAG listing the same child many times per level, or a chain of thousands of models, is rejected with the model id instead of slowing every request or overflowing the stack.
@@ -58,6 +75,9 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ### Changed
 
+- **Breaking (admin API):** an unknown or soft-deleted key or group id on `PATCH`/`DELETE /admin/keys/{id}`, `POST /admin/keys/{id}/rotate`, `POST /admin/keys/{id}/grant`, `PATCH`/`DELETE /admin/groups/{id}` and `POST /admin/groups/{id}/grant` is now `404 LM-1003` naming the id (was `400 LM-1001`), like every other admin lookup. `PUT /admin/provider-keys/{name}` for a provider the config document does not define is `404 LM-1003` and stores nothing (was `204`) (Lab QA F11).
+- Key and group writes (create and `PATCH`, API and `lumen keys create`) refuse a blank `name`, a negative `budget_max`, `rpm_limit`, `tpm_limit` or `expires_at`, and a `budget_max` above `1e12` USD with `400 LM-1001` naming the field; they were stored as given (Lab QA F11).
+- `DELETE /admin/config/providers/{name}` also forgets the provider's stored key, so a provider recreated under the same name no longer silently inherits it (Lab QA F11).
 - **Virtual keys and budget groups no longer false-share cache lines.** `KeyEntry` and `GroupEntry` are aligned to the destructive interference size (128 bytes on x86_64 and aarch64, 64 elsewhere, pinned by a compile-time assertion), so the request-path atomics of keys loaded back to back at boot, and a key's tail and its neighbour's `Arc` refcount, no longer share a line. Measured with the new `admit_settle_neighbour_keys_parallel` bench (8 threads, each on its own neighbouring key): 100.1 ns to 57.0 ns per admit+settle (-47 %), single-thread unchanged. Costs about 200 bytes of padding per key (184 to 384 bytes per allocation, about 2 MB per 10,000 keys), paid once at load.
 - `GET /admin/config/providers/{name}` omits a model's unset `upstream_id` and prices instead of returning them as `null`, and no longer returns an empty `fallbacks` list.
 - The request path takes one routing snapshot per request: the chat preset and the decision come from the same snapshot (a reload between them can no longer pair one config's preset with another's routing), and a foundation id called directly builds no routing facts and skips the retain pass.
@@ -73,6 +93,11 @@ All notable changes to LUMEN are documented here. The format is based on
 ### Removed
 
 - **Breaking (ADR 014):** per-model `fallbacks`, the `[providers.models.rerank]` block and the `rerank` capability on `typesafe` models are removed. A config using them fails validation with the equivalent `[[virtual_models]]` snippet (remap instructions and criteria show as a placeholder, so operator prompt text never reaches the boot error, the reload log or an admin `LM-1001` body; the migration copies the real text); run `lumen config migrate` (or `--dry-run`). Migrated foundation models are renamed `<provider>/<id>`, so `usage_log.model_used`, the Prometheus `model` label and the `x-lumen-model-used` response header of those models change (for example `gpt-4o` becomes `openai/gpt-4o`; the public id clients send is unchanged). A migrated model that declared several capabilities keeps only the first one under its old id; the others return `LM-2002` there until you add a virtual model for them (the migration prints each one; they still work through `<provider>/<id>`).
+
+### Fixed
+
+- `/health/providers` follows hot reloads: a provider added through `PUT /admin/config/providers/{name}` (or any reload) is listed as `unknown` and, with health checks on, probed from the next interval; a removed one disappears. The registry was only filled at boot (Lab QA F2).
+- A provider added after boot gets its key from `PUT /admin/provider-keys/{name}` on the next reload. The reloader only re-read stored keys for the providers present at boot, so such a key applied only after a restart.
 
 ## [0.5.0] - 2026-09-26
 

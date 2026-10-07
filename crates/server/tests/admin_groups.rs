@@ -336,7 +336,7 @@ async fn admin_group_create_with_a_blank_name_is_400_lm1001() {
 }
 
 #[tokio::test]
-async fn admin_group_patch_and_delete_of_unknown_or_deleted_id_is_400_lm1001() {
+async fn admin_group_patch_and_delete_of_unknown_or_deleted_id_is_404_lm1003() {
     let upstream = MockServer::start().await;
     let h = spawn_groups(chat_registry(&upstream.uri())).await;
 
@@ -349,9 +349,9 @@ async fn admin_group_patch_and_delete_of_unknown_or_deleted_id_is_400_lm1001() {
         .send()
         .await
         .expect("patch");
-    assert_eq!(patch.status(), 400);
+    assert_eq!(patch.status(), 404);
     let patch_body: Value = patch.json().await.expect("json");
-    assert_eq!(patch_body["error"]["code"], "LM-1001");
+    assert_eq!(patch_body["error"]["code"], "LM-1003");
 
     let del = h
         .client
@@ -360,9 +360,9 @@ async fn admin_group_patch_and_delete_of_unknown_or_deleted_id_is_400_lm1001() {
         .send()
         .await
         .expect("delete");
-    assert_eq!(del.status(), 400);
+    assert_eq!(del.status(), 404);
     let del_body: Value = del.json().await.expect("json");
-    assert_eq!(del_body["error"]["code"], "LM-1001");
+    assert_eq!(del_body["error"]["code"], "LM-1003");
 
     // Tombstones behave like unknown ids.
     let created = h.create_group(&json!({ "name": "ghost" })).await;
@@ -388,9 +388,9 @@ async fn admin_group_patch_and_delete_of_unknown_or_deleted_id_is_400_lm1001() {
         .send()
         .await
         .expect("patch tombstone");
-    assert_eq!(patch_tombstone.status(), 400);
+    assert_eq!(patch_tombstone.status(), 404);
     let body: Value = patch_tombstone.json().await.expect("json");
-    assert_eq!(body["error"]["code"], "LM-1001");
+    assert_eq!(body["error"]["code"], "LM-1003");
 
     let delete_again = h
         .client
@@ -399,9 +399,9 @@ async fn admin_group_patch_and_delete_of_unknown_or_deleted_id_is_400_lm1001() {
         .send()
         .await
         .expect("delete again");
-    assert_eq!(delete_again.status(), 400);
+    assert_eq!(delete_again.status(), 404);
     let body: Value = delete_again.json().await.expect("json");
-    assert_eq!(body["error"]["code"], "LM-1001");
+    assert_eq!(body["error"]["code"], "LM-1003");
 }
 
 #[tokio::test]
@@ -609,4 +609,102 @@ async fn group_pool_exhaustion_is_402_group_scoped_on_either_key_and_a_patch_reo
 
     assert_eq!(h.chat(&keys[0]).await.status(), 200);
     assert_eq!(upstream.received_requests().await.expect("reqs").len(), 3);
+}
+
+// ---- Input validation on key and group writes -------------------------------
+
+/// A negative budget, a negative quota, a negative expiry or a blank name is
+/// nonsense the store used to accept (a negative `budget_max` reads as an
+/// already-exhausted cap, a negative RPM as "never admit"). Every key and
+/// group write refuses them with a 400 `LM-1001` naming the field, and
+/// nothing is written. Zero stays legal: it is a real "spend nothing" cap.
+#[tokio::test]
+async fn admin_key_and_group_writes_reject_negative_limits_and_blank_names() {
+    let upstream = MockServer::start().await;
+    let h = spawn_groups(chat_registry(&upstream.uri())).await;
+
+    for (body, field) in [
+        (json!({ "name": "k", "budget_max": -5.0 }), "budget_max"),
+        (json!({ "name": "k", "budget_max": 1e13 }), "budget_max"),
+        (json!({ "name": "k", "rpm_limit": -1 }), "rpm_limit"),
+        (json!({ "name": "k", "tpm_limit": -1 }), "tpm_limit"),
+        (json!({ "name": "k", "expires_at": -1 }), "expires_at"),
+    ] {
+        let resp = h.create_key(&body).await;
+        assert_eq!(resp.status(), 400, "create key {body} must be refused");
+        let err: Value = resp.json().await.expect("json");
+        assert_eq!(err["error"]["code"], "LM-1001", "{body}");
+        let message = err["error"]["message"].as_str().expect("message");
+        assert!(message.contains(field), "{body}: {message}");
+    }
+    assert!(
+        h.store.list_keys(true).await.expect("list keys").is_empty(),
+        "no refused key may be written"
+    );
+
+    let refused_group = h
+        .create_group(&json!({ "name": "g", "budget_max": -5.0 }))
+        .await;
+    assert_eq!(refused_group.status(), 400);
+    let err: Value = refused_group.json().await.expect("json");
+    assert_eq!(err["error"]["code"], "LM-1001");
+    assert_eq!(h.list_groups("?include_deleted=true").await, json!([]));
+
+    // Zero is a legitimate cap on both.
+    let key = h
+        .create_key(&json!({ "name": "zero", "budget_max": 0.0, "rpm_limit": 0 }))
+        .await;
+    assert_eq!(key.status(), 201);
+    let key_id = key.json::<Value>().await.expect("json")["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+    let group = h
+        .create_group(&json!({ "name": "zero", "budget_max": 0.0 }))
+        .await;
+    assert_eq!(group.status(), 201);
+    let group_id = group.json::<Value>().await.expect("json")["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+
+    // Patches are held to the same rules, and leave the record untouched.
+    for (body, field) in [
+        (json!({ "budget_max": -1.0 }), "budget_max"),
+        (json!({ "rpm_limit": -1 }), "rpm_limit"),
+        (json!({ "tpm_limit": -1 }), "tpm_limit"),
+        (json!({ "expires_at": -1 }), "expires_at"),
+        (json!({ "name": "  " }), "name"),
+    ] {
+        let resp = h.patch_key(&key_id, &body).await;
+        assert_eq!(resp.status(), 400, "patch key {body} must be refused");
+        let err: Value = resp.json().await.expect("json");
+        assert_eq!(err["error"]["code"], "LM-1001", "{body}");
+        let message = err["error"]["message"].as_str().expect("message");
+        assert!(message.contains(field), "{body}: {message}");
+    }
+    for (body, field) in [
+        (json!({ "budget_max": -1.0 }), "budget_max"),
+        (json!({ "name": "" }), "name"),
+    ] {
+        let resp = h
+            .client
+            .patch(format!("{}/admin/groups/{group_id}", h.base))
+            .bearer_auth(master())
+            .json(&body)
+            .send()
+            .await
+            .expect("patch group");
+        assert_eq!(resp.status(), 400, "patch group {body} must be refused");
+        let err: Value = resp.json().await.expect("json");
+        assert_eq!(err["error"]["code"], "LM-1001", "{body}");
+        let message = err["error"]["message"].as_str().expect("message");
+        assert!(message.contains(field), "{body}: {message}");
+    }
+    let stored_key = &h.store.list_keys(false).await.expect("list keys")[0];
+    assert_eq!(stored_key.budget_max, Some(0.0));
+    assert_eq!(stored_key.name, "zero");
+    let stored_group = &h.store.list_groups(false).await.expect("list groups")[0];
+    assert_eq!(stored_group.budget_max, Some(0.0));
+    assert_eq!(stored_group.name, "zero");
 }

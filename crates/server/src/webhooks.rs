@@ -54,6 +54,7 @@
 //!   body was signed with, which is what makes a retry verifiable.
 
 use std::fmt;
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -67,11 +68,111 @@ use lumen_auth::events::{
 };
 use lumen_auth::state::AuthState;
 use lumen_auth::store::{KeyStore, StoredWebhookConfig};
+use lumen_providers::image_fetch::{host_allowed, is_public_ip};
 use lumen_telemetry::{Metrics, WebhookMetrics};
 use sha2::Sha256;
 use tokio::sync::mpsc::Receiver;
 use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
+
+/// Environment variable listing the internal hosts an admin-supplied webhook
+/// receiver may name (comma-separated; `.suffix` entries match subdomains).
+/// Read once at boot; see [`WebhookController::check_receiver_url`].
+pub const ALLOWED_HOSTS_ENV: &str = "LUMEN_WEBHOOK_ALLOWED_HOSTS";
+
+/// How long the receiver guard waits for a hostname to resolve.
+const RESOLVE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Parse an [`ALLOWED_HOSTS_ENV`] value: comma-separated, each entry trimmed
+/// and normalised like the hosts it is compared with (IPv6 brackets and a
+/// trailing dot dropped, lowercased); empty entries are skipped.
+#[must_use]
+pub fn parse_receiver_allowlist(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(normalise_host)
+        .filter(|h| !h.is_empty() && h != ".")
+        .collect()
+}
+
+/// The comparable form of a host: no IPv6 brackets, no trailing dot,
+/// lowercase.
+fn normalise_host(host: &str) -> String {
+    host.trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim_end_matches('.')
+        .to_ascii_lowercase()
+}
+
+/// Resolve `host:port` without blocking the runtime, bounded by
+/// [`RESOLVE_TIMEOUT`].
+async fn resolve_host(host: String, port: u16) -> Result<Vec<IpAddr>, String> {
+    match tokio::time::timeout(RESOLVE_TIMEOUT, tokio::net::lookup_host((host, port))).await {
+        Ok(Ok(addrs)) => Ok(addrs.map(|a| a.ip()).collect()),
+        Ok(Err(_)) => Err("could not be resolved".to_owned()),
+        Err(_) => Err("did not resolve in time".to_owned()),
+    }
+}
+
+/// [`WebhookController::check_receiver_url`], with the resolver injected so
+/// the decision is testable without DNS.
+async fn check_receiver_url<F, Fut>(
+    url: &str,
+    allowlist: &[String],
+    resolve: F,
+) -> Result<(), String>
+where
+    F: FnOnce(String, u16) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<IpAddr>, String>>,
+{
+    let refuse = |host: &str, why: &str| {
+        format!(
+            "webhooks.url host '{host}' {why}; receivers set through the admin API must be \
+             publicly routable unless the operator lists the host in {ALLOWED_HOSTS_ENV}"
+        )
+    };
+    let parsed =
+        reqwest::Url::parse(url).map_err(|e| format!("webhooks.url is not a valid URL: {e}"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err("webhooks.url must be an http:// or https:// URL".to_owned());
+    }
+    // The WHATWG parser already canonicalises every IPv4 spelling
+    // (`2130706433`, `0x7f.0.0.1`) to dotted form and lowercases names;
+    // IPv6 literals keep their brackets in `host_str`. `raw` is what delivery
+    // will resolve; `host` is the comparable form for the checks.
+    let raw = parsed
+        .host_str()
+        .ok_or_else(|| "webhooks.url must name a host".to_owned())?;
+    let host = normalise_host(raw);
+    if !allowlist.is_empty() && host_allowed(&host, allowlist) {
+        return Ok(());
+    }
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return if is_public_ip(&ip) {
+            Ok(())
+        } else {
+            Err(refuse(
+                &host,
+                "is a loopback, private, link-local or otherwise internal address",
+            ))
+        };
+    }
+    if host == "localhost" || host.ends_with(".localhost") {
+        return Err(refuse(&host, "is a loopback name"));
+    }
+    let port = parsed.port_or_known_default().unwrap_or(443);
+    let addrs = resolve(raw.to_owned(), port)
+        .await
+        .map_err(|why| refuse(&host, &why))?;
+    if addrs.is_empty() {
+        return Err(refuse(&host, "could not be resolved"));
+    }
+    if addrs.iter().any(|ip| !is_public_ip(ip)) {
+        return Err(refuse(&host, "resolves to an internal address"));
+    }
+    Ok(())
+}
 
 /// Header carrying the hex HMAC-SHA256 of the request body.
 const SIGNATURE_HEADER: &str = "x-lumen-signature";
@@ -184,6 +285,9 @@ pub struct WebhookController {
     /// interleave a queue rebuild with a metrics registration and leave the
     /// live cell pointing at a pipeline whose task was never spawned.
     apply_lock: std::sync::Mutex<()>,
+    /// Hosts an admin-supplied receiver URL may name even though they are
+    /// internal ([`ALLOWED_HOSTS_ENV`]); empty means public receivers only.
+    receiver_allowlist: Vec<String>,
 }
 
 impl fmt::Debug for WebhookController {
@@ -210,7 +314,41 @@ impl WebhookController {
             stored: ArcSwapOption::empty(),
             stored_secret: ArcSwapOption::empty(),
             apply_lock: std::sync::Mutex::new(()),
+            receiver_allowlist: Vec::new(),
         }
+    }
+
+    /// Let admin-supplied receiver URLs name these internal hosts (builder
+    /// style). Entries match like `image_fetch.allowed_hosts`: exactly, or as
+    /// a domain and its subdomains when written `.suffix`; case-insensitive.
+    /// `main.rs` fills it from [`ALLOWED_HOSTS_ENV`].
+    #[must_use]
+    pub fn with_receiver_allowlist(mut self, hosts: Vec<String>) -> Self {
+        self.receiver_allowlist = hosts;
+        self
+    }
+
+    /// The SSRF guard for a receiver URL set through `PUT /admin/webhooks`.
+    ///
+    /// The admin API decides where the gateway POSTs, so a receiver must be
+    /// an `http(s)` URL whose host is publicly routable: loopback, private,
+    /// link-local (cloud metadata), unique-local, shared and other reserved
+    /// addresses are refused, as is any `localhost` name, and a hostname is
+    /// resolved and refused when *any* of its addresses is internal. A host
+    /// on the operator allowlist skips the address checks (and is never
+    /// resolved). Also run by the `/admin/config*` writes when they introduce
+    /// or change the `[webhooks]` receiver; a receiver already in the document
+    /// (the operator's own file) and stored rows written before this check
+    /// existed are not re-checked.
+    ///
+    /// This is an admission check: it does not pin the address used at
+    /// delivery time, so a hostname re-pointed afterwards (DNS rebinding) or
+    /// a receiver answering with a redirect is outside its reach.
+    ///
+    /// # Errors
+    /// A message naming `webhooks.url` and the allowlist variable.
+    pub async fn check_receiver_url(&self, url: &str) -> Result<(), String> {
+        check_receiver_url(url, &self.receiver_allowlist, resolve_host).await
     }
 
     /// Refresh the cached database view: the stored settings row and the
@@ -748,6 +886,105 @@ mod tests {
             let r = jitter01();
             assert!((0.0..1.0).contains(&r), "jitter out of range: {r}");
         }
+    }
+
+    // ---- Receiver SSRF guard ------------------------------------------------
+
+    /// A resolver answering `addrs` for any host.
+    fn resolves_to(
+        addrs: &[&str],
+    ) -> impl FnOnce(String, u16) -> std::future::Ready<Result<Vec<IpAddr>, String>> {
+        let ips: Vec<IpAddr> = addrs
+            .iter()
+            .map(|a| a.parse().expect("test address"))
+            .collect();
+        move |_, _| std::future::ready(Ok(ips))
+    }
+
+    /// A resolver that must never be consulted.
+    fn never_resolves(_: String, _: u16) -> std::future::Ready<Result<Vec<IpAddr>, String>> {
+        std::future::ready(Err(
+            "the guard resolved a host it should not have".to_owned()
+        ))
+    }
+
+    #[tokio::test]
+    async fn a_hostname_is_refused_when_any_of_its_addresses_is_internal() {
+        let url = "https://hooks.example.com/events";
+        assert!(
+            check_receiver_url(url, &[], resolves_to(&["93.184.215.14"]))
+                .await
+                .is_ok()
+        );
+        for addrs in [
+            &["169.254.169.254"][..],
+            &["10.1.2.3"][..],
+            &["93.184.215.14", "127.0.0.1"][..],
+            &["::1"][..],
+        ] {
+            let err = check_receiver_url(url, &[], resolves_to(addrs))
+                .await
+                .expect_err("an internal address must be refused");
+            assert!(err.contains("resolves to an internal address"), "{err}");
+            assert!(err.contains(ALLOWED_HOSTS_ENV), "{err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unresolvable_hostname_is_refused() {
+        let unresolvable = |_: String, _: u16| {
+            std::future::ready(Err::<Vec<IpAddr>, _>("could not be resolved".to_owned()))
+        };
+        let err = check_receiver_url("https://nowhere.invalid/e", &[], unresolvable)
+            .await
+            .expect_err("fail closed");
+        assert!(err.contains("could not be resolved"), "{err}");
+        let err = check_receiver_url("https://nowhere.invalid/e", &[], resolves_to(&[]))
+            .await
+            .expect_err("no address at all");
+        assert!(err.contains("could not be resolved"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn literals_localhost_and_allowlisted_hosts_are_decided_without_dns() {
+        for url in [
+            "http://169.254.169.254/latest",
+            "http://[fe80::1]/e",
+            "http://localhost:8080/e",
+            "http://lab.localhost/e",
+        ] {
+            assert!(
+                check_receiver_url(url, &[], never_resolves).await.is_err(),
+                "{url}"
+            );
+        }
+        assert!(
+            check_receiver_url("https://[2606:4700::1111]/e", &[], never_resolves)
+                .await
+                .is_ok()
+        );
+        let allow = parse_receiver_allowlist(" Lab. , .corp.internal,,[::1]");
+        assert_eq!(allow, ["lab", ".corp.internal", "::1"]);
+        assert!(
+            check_receiver_url("http://[::1]:9/e", &allow, never_resolves)
+                .await
+                .is_ok()
+        );
+        for url in [
+            "http://lab:3000/lumen/events",
+            "http://LAB./e",
+            "http://hooks.corp.internal/e",
+        ] {
+            assert!(
+                check_receiver_url(url, &allow, never_resolves)
+                    .await
+                    .is_ok(),
+                "{url}"
+            );
+        }
+        assert!(check_receiver_url("ftp://lab/e", &allow, never_resolves)
+            .await
+            .is_err());
     }
 
     /// An inert controller with no HTTP client work to do - enough to

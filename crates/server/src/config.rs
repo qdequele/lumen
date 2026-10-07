@@ -1014,15 +1014,18 @@ fn describe_figment_error(error: &figment::Error) -> String {
         .join("\n")
 }
 
-/// The `LUMEN_`-prefixed environment variables that are process **secrets**,
-/// not config fields, and so must be excluded from figment's env overlay.
+/// The `LUMEN_`-prefixed environment variables that are process **secrets**
+/// (or other boot-time process settings), not config fields, and so must be
+/// excluded from figment's env overlay.
 ///
 /// `Config` denies unknown fields, so a `LUMEN_`-prefixed variable that does
 /// not name a config key makes every load fail - `--check-config` and real
-/// boots alike - with an "unknown field" parse error. Three such variables
+/// boots alike - with an "unknown field" parse error. Four such variables
 /// exist:
 ///
 /// * `LUMEN_MASTER_KEY`, read by `boot_auth_stack`, whose name is fixed.
+/// * `LUMEN_WEBHOOK_ALLOWED_HOSTS`, the webhook receiver allowlist read by
+///   `boot_webhooks`, whose name is fixed too.
 /// * The webhook signing secret (ADR 011), whose name is **not** fixed: the
 ///   operator chooses it in `webhooks.signing_key_env`, and the ADR's own
 ///   example names it `LUMEN_WEBHOOK_SECRET`. It is discovered here by peeking
@@ -1079,7 +1082,7 @@ fn secret_env_keys_from_figment(peek_figment: &Figment) -> Vec<String> {
         signing_key_env: Option<String>,
     }
 
-    let mut keys = vec!["master_key".to_owned()];
+    let mut keys = vec!["master_key".to_owned(), "webhook_allowed_hosts".to_owned()];
     if let Ok(peek) = peek_figment.extract::<Peek>() {
         for block in [peek.webhooks, peek.usage_events].into_iter().flatten() {
             if let Some(suffix) = block
@@ -1794,7 +1797,10 @@ mod tests {
                 ),
             )?;
             let excluded = secret_env_keys(Path::new("config.toml"));
-            assert_eq!(excluded, ["master_key", "webhook_secret"]);
+            assert_eq!(
+                excluded,
+                ["master_key", "webhook_allowed_hosts", "webhook_secret"]
+            );
             Ok(())
         });
     }
@@ -1812,7 +1818,10 @@ mod tests {
                      signing_key_env = \"BILLING_WEBHOOK_SECRET\"\n"
                 ),
             )?;
-            assert_eq!(secret_env_keys(Path::new("config.toml")), ["master_key"]);
+            assert_eq!(
+                secret_env_keys(Path::new("config.toml")),
+                ["master_key", "webhook_allowed_hosts"]
+            );
             Ok(())
         });
     }
@@ -2153,7 +2162,7 @@ mod tests {
             )?;
             assert_eq!(
                 secret_env_keys(Path::new("config.toml")),
-                ["master_key", "ue_secret"]
+                ["master_key", "webhook_allowed_hosts", "ue_secret"]
             );
             Ok(())
         });
@@ -2497,6 +2506,21 @@ mod tests {
             );
             let cfg = Config::load(Path::new("config.toml")).unwrap();
             // Sanity: the rest of the env-override mechanism still works.
+            assert_eq!(cfg.server.port, 8080);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn webhook_allowed_hosts_env_var_is_never_folded_into_the_config() {
+        // LUMEN_WEBHOOK_ALLOWED_HOSTS is read once at boot by `main.rs`, not a
+        // config field; like LUMEN_MASTER_KEY it must not trip the
+        // deny-unknown-fields env overlay.
+        #[allow(clippy::result_large_err)]
+        figment::Jail::expect_with(|jail| {
+            jail.create_file("config.toml", VALID)?;
+            jail.set_env("LUMEN_WEBHOOK_ALLOWED_HOSTS", "lab.internal,.corp");
+            let cfg = Config::load(Path::new("config.toml")).unwrap();
             assert_eq!(cfg.server.port, 8080);
             Ok(())
         });

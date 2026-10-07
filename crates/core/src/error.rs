@@ -292,6 +292,14 @@ pub enum GatewayError {
     #[error("no route matches the request method and path")]
     RouteNotFound,
 
+    /// The route matched but the admin resource it names (a virtual key, a
+    /// budget group, a provider) does not exist. Same `LM-1003` 404 as
+    /// [`RouteNotFound`](Self::RouteNotFound), with a message naming the
+    /// resource the caller asked for (their own input, so echoing it back
+    /// discloses nothing).
+    #[error("{0}")]
+    NotFound(String),
+
     // ---- Routing errors (LM-2xxx) -------------------------------------------
     /// No model matched the requested id.
     #[error("model '{0}' not found")]
@@ -466,7 +474,7 @@ impl GatewayError {
             GatewayError::InvalidRequest(_) => "LM-1001",
             GatewayError::ConfigStale(_) => "LM-1004",
             GatewayError::PayloadTooLarge { .. } => "LM-1002",
-            GatewayError::RouteNotFound => "LM-1003",
+            GatewayError::RouteNotFound | GatewayError::NotFound(_) => "LM-1003",
             GatewayError::ModelNotFound(_) => "LM-2001",
             GatewayError::UnsupportedCapability { .. } => "LM-2002",
             GatewayError::ImageInputNotSupported { .. } => "LM-2003",
@@ -523,7 +531,9 @@ impl GatewayError {
             | GatewayError::ContentFiltered { status, .. } => *status,
             GatewayError::Unauthorized => 401,
             GatewayError::BudgetExceeded { .. } => 402,
-            GatewayError::ModelNotFound(_) | GatewayError::RouteNotFound => 404,
+            GatewayError::ModelNotFound(_)
+            | GatewayError::RouteNotFound
+            | GatewayError::NotFound(_) => 404,
             GatewayError::PayloadTooLarge { .. } => 413,
             GatewayError::ConfigStale(_) => 412,
             GatewayError::QuotaExceeded { .. } | GatewayError::UpstreamRateLimited { .. } => 429,
@@ -552,6 +562,7 @@ impl GatewayError {
             GatewayError::InvalidRequest(_)
             | GatewayError::ConfigStale(_)
             | GatewayError::RouteNotFound
+            | GatewayError::NotFound(_)
             | GatewayError::ModelNotFound(_)
             | GatewayError::UnsupportedCapability { .. }
             | GatewayError::ImageInputNotSupported { .. }
@@ -1073,6 +1084,16 @@ mod tests {
         assert!(
             matches!(err, GatewayError::InvalidRequest(ref m) if m.contains("pre-tokenized") && m.contains("cohere"))
         );
+    }
+
+    #[test]
+    fn not_found_is_an_lm1003_404_carrying_its_message() {
+        let err = GatewayError::NotFound("unknown key id 'k1'".to_owned());
+        assert_eq!(err.code(), "LM-1003");
+        assert_eq!(err.http_status(), 404);
+        assert_eq!(err.error_type(), ErrorType::InvalidRequest);
+        assert_eq!(err.to_string(), "unknown key id 'k1'");
+        assert_eq!(err.retry_after(), None);
     }
 
     #[test]

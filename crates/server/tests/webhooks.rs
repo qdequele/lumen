@@ -249,11 +249,12 @@ async fn spawn_gateway(
             .expect("seal the signing secret");
     }
     let cancel = CancellationToken::new();
-    let controller = Arc::new(WebhookController::new(
-        metrics.clone(),
-        http::build_client(),
-        cancel.clone(),
-    ));
+    // Receivers here are wiremock servers on loopback, which the admin
+    // API's SSRF guard refuses unless the operator allowlists the host.
+    let controller = Arc::new(
+        WebhookController::new(metrics.clone(), http::build_client(), cancel.clone())
+            .with_receiver_allowlist(vec![LOOPBACK.to_owned()]),
+    );
     controller
         .refresh_from_store(&store, runtime.master.as_ref())
         .await;
@@ -279,10 +280,24 @@ async fn spawn_gateway(
     }
 }
 
+/// The host every wiremock receiver binds.
+const LOOPBACK: &str = "127.0.0.1";
+
 /// The same gateway assembly with an inert controller: auth on, no
 /// `[webhooks]` block, nothing ever applied. This is what every other
 /// integration test builds, and the shape a control plane provisions into.
+/// The loopback receivers are allowlisted, as an operator running the
+/// receiver next to the gateway would.
 async fn spawn_gateway_without_webhooks(registry: Arc<Registry>) -> Harness {
+    spawn_gateway_without_webhooks_allowing(registry, &[LOOPBACK]).await
+}
+
+/// [`spawn_gateway_without_webhooks`] with an explicit receiver allowlist
+/// (`LUMEN_WEBHOOK_ALLOWED_HOSTS` in production).
+async fn spawn_gateway_without_webhooks_allowing(
+    registry: Arc<Registry>,
+    allowed_hosts: &[&str],
+) -> Harness {
     let store = KeyStore::in_memory().await.expect("open store");
     let runtime = Arc::new(AuthRuntime {
         keys: AuthState::load(Vec::new(), Vec::new()),
@@ -294,11 +309,10 @@ async fn spawn_gateway_without_webhooks(registry: Arc<Registry>) -> Harness {
     let tokens = TokenMetrics::register(&metrics, &[]).expect("register token metrics");
     let latency = LatencyMetrics::register(&metrics).expect("register latency metrics");
     let cancel = CancellationToken::new();
-    let controller = Arc::new(WebhookController::new(
-        metrics.clone(),
-        http::build_client(),
-        cancel.clone(),
-    ));
+    let controller = Arc::new(
+        WebhookController::new(metrics.clone(), http::build_client(), cancel.clone())
+            .with_receiver_allowlist(allowed_hosts.iter().map(|h| (*h).to_owned()).collect()),
+    );
     let state = AppState::new(metrics.clone(), registry, tokens, latency)
         .with_pricing(dollar_pricing())
         .with_auth(Arc::clone(&runtime))
@@ -1414,4 +1428,85 @@ async fn delete_disables_an_enabled_row_whose_pipeline_never_started() {
         .resolve_and_apply(None, &h.auth.keys)
         .expect("a disabled row resolves to off, not to an error");
     assert!(h.controller.live_settings().is_none());
+}
+
+// ---- SSRF guard on admin-supplied receiver URLs (Lab QA F13) ---------------
+
+/// `PUT /admin/webhooks` makes the gateway POST to whatever URL it is given,
+/// so a receiver on a loopback, private, link-local (cloud metadata) or
+/// otherwise internal address is refused with a 400 `LM-1001` naming the
+/// allowlist variable, unless the operator listed the host there. Nothing is
+/// persisted for a refused URL.
+#[tokio::test]
+async fn put_webhooks_refuses_receivers_on_internal_addresses() {
+    let upstream = MockServer::start().await;
+    let h = spawn_gateway_without_webhooks_allowing(chat_registry(&upstream.uri()), &[]).await;
+
+    for url in [
+        "http://169.254.169.254/latest",
+        "http://127.0.0.1:9/events",
+        "http://localhost/events",
+        "http://LOCALHOST./events",
+        "http://api.localhost/events",
+        "http://10.0.0.5/events",
+        "http://172.16.3.4/events",
+        "http://192.168.1.1/events",
+        "http://100.64.0.1/events",
+        "http://0.0.0.0/events",
+        "http://[::1]/events",
+        "http://[fe80::1]/events",
+        "http://[fd00::1]/events",
+        "http://[::ffff:169.254.169.254]/events",
+        "http://2130706433/events",
+        "http://0x7f.0.0.1/events",
+    ] {
+        let mut body = put_body("http://unused");
+        body["url"] = json!(url);
+        let response = h.put_webhooks(&body).await;
+        assert_eq!(response.status(), 400, "{url} must be refused");
+        let error: Value = response.json().await.expect("error json");
+        assert_eq!(error["error"]["code"], "LM-1001", "{url}");
+        let message = error["error"]["message"].as_str().expect("message");
+        assert!(
+            message.contains("webhooks.url") && message.contains("LUMEN_WEBHOOK_ALLOWED_HOSTS"),
+            "{url}: {message}"
+        );
+    }
+    assert!(
+        h.store.load_webhook_config().await.expect("load").is_none(),
+        "a refused receiver must not be persisted"
+    );
+    let status: Value = h.get_webhooks().await.json().await.expect("status json");
+    assert_eq!(status["enabled"], false);
+}
+
+/// A public receiver is accepted without any allowlist, and an internal one
+/// is accepted once its host is listed (exactly, or by a `.suffix` entry).
+#[tokio::test]
+async fn put_webhooks_accepts_public_and_allowlisted_receivers() {
+    let upstream = MockServer::start().await;
+    let open = spawn_gateway_without_webhooks_allowing(chat_registry(&upstream.uri()), &[]).await;
+    let mut body = put_body("http://unused");
+    // A public IP literal: no DNS lookup involved, so this stays hermetic.
+    body["url"] = json!("https://93.184.215.14/lumen/events");
+    let response = open.put_webhooks(&body).await;
+    assert_eq!(response.status(), 200, "a public receiver is accepted");
+
+    let receiver = MockServer::start().await;
+    mount_receiver(&receiver).await;
+    let allowing = spawn_gateway_without_webhooks_allowing(
+        chat_registry(&upstream.uri()),
+        &[LOOPBACK, ".lab.internal"],
+    )
+    .await;
+    let response = allowing.put_webhooks(&put_body(&receiver.uri())).await;
+    assert_eq!(response.status(), 200, "an allowlisted loopback receiver");
+    // The suffix entry covers subdomains; the host is never resolved.
+    let mut body = put_body("http://unused");
+    body["url"] = json!("http://hooks.lab.internal:3000/lumen/events");
+    let response = allowing.put_webhooks(&body).await;
+    assert_eq!(response.status(), 200, "an allowlisted internal hostname");
+    // Listing one internal host does not open the others.
+    body["url"] = json!("http://169.254.169.254/latest");
+    assert_eq!(allowing.put_webhooks(&body).await.status(), 400);
 }

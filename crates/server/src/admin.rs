@@ -190,6 +190,16 @@ fn store_error(error: lumen_auth::AuthError) -> ApiError {
     }
 }
 
+/// The 404 `LM-1003` for a key id that does not exist (or is a tombstone).
+fn unknown_key(id: &str) -> ApiError {
+    GatewayError::NotFound(format!("unknown key id '{id}'")).into()
+}
+
+/// The 404 `LM-1003` for a group id that does not exist (or is a tombstone).
+fn unknown_group(id: &str) -> ApiError {
+    GatewayError::NotFound(format!("unknown group id '{id}'")).into()
+}
+
 fn runtime(state: &AppState) -> Result<&crate::auth::AuthRuntime, ApiError> {
     state
         .auth
@@ -255,9 +265,7 @@ pub async fn create_key(
     payload: Result<Json<NewKey>, JsonRejection>,
 ) -> Result<(StatusCode, Json<CreatedKey>), ApiError> {
     let Json(params) = payload.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
-    if params.name.trim().is_empty() {
-        return Err(GatewayError::InvalidRequest("`name` must not be empty".to_owned()).into());
-    }
+    params.validate().map_err(GatewayError::InvalidRequest)?;
     validate_ref("external_ref", params.external_ref.as_deref(), false)?;
     let auth = runtime(&state)?;
     let (plaintext, record) = auth.store.create_key(params).await.map_err(store_error)?;
@@ -305,14 +313,15 @@ pub async fn list_keys(
 }
 
 /// Patch a key: adjust budgets/limits, enable/disable. An unknown id is a
-/// 400 `LM-1001` naming the id - the public taxonomy reserves 404 for
-/// unknown *models* (`LM-2001`) and has no admin-resource code.
+/// 404 `LM-1003` naming the id, like every other admin lookup; a negative
+/// limit or a blank name is a 400 `LM-1001` naming the field.
 pub async fn patch_key(
     State(state): State<AppState>,
     Path(id): Path<String>,
     payload: Result<Json<KeyPatch>, JsonRejection>,
 ) -> Result<Json<VirtualKeyRecord>, ApiError> {
     let Json(patch) = payload.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
+    patch.validate().map_err(GatewayError::InvalidRequest)?;
     validate_ref(
         "external_ref",
         patch.external_ref.as_ref().and_then(Option::as_deref),
@@ -335,7 +344,7 @@ pub async fn patch_key(
         .update_key(&id, patch)
         .await
         .map_err(store_error)?
-        .ok_or_else(|| GatewayError::InvalidRequest(format!("unknown key id '{id}'")))?;
+        .ok_or_else(|| unknown_key(&id))?;
     // Reflect the change in the live table (spend is preserved).
     auth.keys.apply(&updated);
     if updated.disabled && was_disabled == Some(false) {
@@ -350,7 +359,7 @@ pub async fn patch_key(
 /// The key stops authenticating on the very next request (the live table is
 /// updated like `patch_key`), disappears from the default list, and any
 /// further PATCH/DELETE/rotate on the id behaves like an unknown id
-/// (400 `LM-1001`) - it can never be resurrected by accident.
+/// (404 `LM-1003`) - it can never be resurrected by accident.
 pub async fn delete_key(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -379,7 +388,7 @@ pub async fn delete_key(
         // routes this through the same flush as every other path).
         crate::budget_flush::retire_and_flush_key(shared, entry).await;
     }
-    deleted.ok_or_else(|| GatewayError::InvalidRequest(format!("unknown key id '{id}'")))?;
+    deleted.ok_or_else(|| unknown_key(&id))?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -389,7 +398,7 @@ pub async fn delete_key(
 /// name, budgets, accrued spend and quotas are all preserved (the live entry
 /// is kept, only its hash alias changes), so `usage_log` attribution is
 /// unbroken. The old plaintext stops authenticating immediately; an unknown
-/// or deleted id is a 400 `LM-1001`, like `patch_key`.
+/// or deleted id is a 404 `LM-1003`, like `patch_key`.
 pub async fn rotate_key(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -400,7 +409,7 @@ pub async fn rotate_key(
         .rotate_key(&id)
         .await
         .map_err(|e| internal(&e))?
-        .ok_or_else(|| GatewayError::InvalidRequest(format!("unknown key id '{id}'")))?;
+        .ok_or_else(|| unknown_key(&id))?;
     // Swap the live alias: the old plaintext dies and the new one works
     // right away, with spend and quota windows carried over.
     auth.keys.rotate(hash_key(plaintext.reveal()), &record);
@@ -424,9 +433,7 @@ pub async fn create_group(
     payload: Result<Json<NewGroup>, JsonRejection>,
 ) -> Result<(StatusCode, Json<GroupRecord>), ApiError> {
     let Json(params) = payload.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
-    if params.name.trim().is_empty() {
-        return Err(GatewayError::InvalidRequest("`name` must not be empty".to_owned()).into());
-    }
+    params.validate().map_err(GatewayError::InvalidRequest)?;
     let auth = runtime(&state)?;
     validate_ref(
         "account_ref",
@@ -474,13 +481,14 @@ pub async fn list_groups(
 
 /// Patch a group: adjust the shared budget or the label. Pool spend is
 /// preserved, and the new cap binds every member key on its very next
-/// request. An unknown or deleted id is a 400 `LM-1001`, like `patch_key`.
+/// request. An unknown or deleted id is a 404 `LM-1003`, like `patch_key`.
 pub async fn patch_group(
     State(state): State<AppState>,
     Path(id): Path<String>,
     payload: Result<Json<GroupPatch>, JsonRejection>,
 ) -> Result<Json<GroupRecord>, ApiError> {
     let Json(patch) = payload.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
+    patch.validate().map_err(GatewayError::InvalidRequest)?;
     let shared = runtime_arc(&state)?;
     let auth = shared.as_ref();
     validate_ref(
@@ -499,7 +507,7 @@ pub async fn patch_group(
         .update_group(&id, patch)
         .await
         .map_err(|e| internal(&e))?
-        .ok_or_else(|| GatewayError::InvalidRequest(format!("unknown group id '{id}'")))?;
+        .ok_or_else(|| unknown_group(&id))?;
     auth.keys.apply_group(&updated);
     Ok(Json(updated))
 }
@@ -543,9 +551,7 @@ pub async fn delete_group(
             "group '{id}' still has {count} active member key(s); move or delete them first"
         ))
         .into()),
-        DeleteGroupOutcome::NotFound => {
-            Err(GatewayError::InvalidRequest(format!("unknown group id '{id}'")).into())
-        }
+        DeleteGroupOutcome::NotFound => Err(unknown_group(&id)),
     }
 }
 
@@ -561,7 +567,7 @@ pub struct GrantBody {
 /// serializes as `null` and reloads as *unlimited*) and the in-memory
 /// micro-USD clamp at ~9.2e12 - either would silently mint the unlimited
 /// sentinel the grant path promises never to produce.
-const MAX_GRANT_USD: f64 = 1e12;
+const MAX_GRANT_USD: f64 = lumen_auth::store::MAX_BUDGET_USD;
 
 /// Validate a grant amount: positive, finite and at most [`MAX_GRANT_USD`],
 /// or 400 `LM-1001`. serde_json rejects overflowing literals like `1e999`
@@ -589,7 +595,8 @@ fn validated_grant_amount(
 /// entry (its own `fetch_add`) - two concurrent grants both land on both
 /// sides, which is the whole point over a read-modify-write PATCH. Takes
 /// effect on the very next request, no restart. An unknown or deleted id is
-/// a 400 `LM-1001`; so is a capless key (there is no cap to raise).
+/// a 404 `LM-1003`; a capless key is a 400 `LM-1001` (there is no cap to
+/// raise).
 pub async fn grant_key(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -602,7 +609,7 @@ pub async fn grant_key(
         .grant_key_budget(&id, amount)
         .await
         .map_err(store_error)?
-        .ok_or_else(|| GatewayError::InvalidRequest(format!("unknown key id '{id}'")))?;
+        .ok_or_else(|| unknown_key(&id))?;
     // The live entry increments independently (never re-read from the DB
     // record, which could interleave with a concurrent grant's re-read).
     // A dead id here means a racing delete: the tombstoned row never
@@ -632,7 +639,7 @@ pub async fn grant_group(
         .grant_group_budget(&id, amount)
         .await
         .map_err(store_error)?
-        .ok_or_else(|| GatewayError::InvalidRequest(format!("unknown group id '{id}'")))?;
+        .ok_or_else(|| unknown_group(&id))?;
     auth.keys
         .grant_group(&id, lumen_auth::state::usd_to_micro(amount));
     Ok(Json(record))
@@ -735,6 +742,13 @@ pub async fn put_webhooks(
     let controller = webhooks(&state)?;
     settings
         .validate(SettingsOrigin::AdminApi)
+        .map_err(GatewayError::InvalidRequest)?;
+    // The admin API decides where the gateway sends POSTs: refuse internal
+    // receivers (SSRF) unless the operator allowlisted the host. The
+    // `/admin/config*` writes run the same check (`apply_document`).
+    controller
+        .check_receiver_url(&settings.url)
+        .await
         .map_err(GatewayError::InvalidRequest)?;
 
     // Persist, refresh the cache, then apply. Applying first would leave the
@@ -873,6 +887,10 @@ pub struct ProviderKeyBody {
 /// the encrypted store and rebuilds the provider registry (M7). Providers whose
 /// `api_key_env` resolves keep using the env value (env stays the primary
 /// source); rotation via this route only affects env-keyless providers.
+///
+/// # Errors
+/// `LM-1001` (400) for an empty key; `LM-1003` (404) when the current config
+/// document defines no provider with that name.
 pub async fn put_provider_key(
     State(state): State<AppState>,
     Path(name): Path<String>,
@@ -886,6 +904,32 @@ pub async fn put_provider_key(
     let Some(master) = auth.master.as_ref() else {
         return Err(GatewayError::Internal("master key unavailable".to_owned()).into());
     };
+    // A key for a provider the document does not define would sit in the
+    // store and silently attach to whichever provider is later created under
+    // that name. Checked against the persisted document rather than the
+    // routing table: a provider `PUT` a moment ago is in the document before
+    // the hot reload it requested has rebuilt the table. (No config context
+    // exists only in tests; `main.rs` always sets one.) Held under the config
+    // apply lock, so a provider delete cannot slip between the check and the
+    // store and leave an orphaned key behind.
+    let _guard = state.config_apply_lock.lock().await;
+    if let Some(ctx) = &state.config {
+        let doc = ctx
+            .source
+            .load()
+            .await
+            .map_err(|e| source_internal_error(&e))?;
+        if !config_from_document(&doc.toml)?
+            .providers
+            .iter()
+            .any(|p| p.name == name)
+        {
+            return Err(GatewayError::NotFound(format!(
+                "unknown provider '{name}': add it under /admin/config/providers first"
+            ))
+            .into());
+        }
+    }
     auth.store
         .store_provider_key(&name, &body.key, master)
         .await
@@ -1476,9 +1520,18 @@ async fn apply_document<F>(state: &AppState, if_match: &str, edit: F) -> Result<
 where
     F: FnOnce(&str) -> Result<String, ApiError>,
 {
-    let ctx = config_ctx(state)?;
     let _guard = state.config_apply_lock.lock().await;
+    apply_document_locked(state, if_match, edit).await
+}
 
+/// [`apply_document`] for a caller that already holds
+/// `state.config_apply_lock`, so it can do more work in the same critical
+/// section (e.g. `delete_provider` dropping the stored key).
+async fn apply_document_locked<F>(state: &AppState, if_match: &str, edit: F) -> Result<(), ApiError>
+where
+    F: FnOnce(&str) -> Result<String, ApiError>,
+{
+    let ctx = config_ctx(state)?;
     let current = ctx
         .source
         .load()
@@ -1542,6 +1595,7 @@ where
     ctx.validate_document(&candidate)
         .await
         .map_err(|error| describe_validation_rejection(&error))?;
+    check_document_webhook_receiver(state, &current.toml, &candidate).await?;
 
     let new_hash = match ctx.source.persist(&candidate, &current.hash).await {
         Ok(hash) => hash,
@@ -1585,6 +1639,37 @@ where
         );
     }
     Ok(())
+}
+
+/// Run the `PUT /admin/webhooks` SSRF guard on a `[webhooks]` receiver an
+/// admin config write introduces or changes (`PUT /admin/config`,
+/// `PUT /admin/config/webhooks`): without it, the document route would be a
+/// way around the guard, since a document block applies on reload whenever no
+/// stored row overrides it. An unchanged URL is not re-checked, so a receiver
+/// the operator put in the file keeps working across unrelated edits.
+async fn check_document_webhook_receiver(
+    state: &AppState,
+    current: &str,
+    candidate: &str,
+) -> Result<(), ApiError> {
+    let Some(controller) = state.webhooks.as_ref() else {
+        // No auth, so no webhooks: `Config::validate` refuses the block.
+        return Ok(());
+    };
+    let Some(new) = config_from_document(candidate)?.webhooks else {
+        return Ok(());
+    };
+    let old_url = toml::from_str::<Config>(current)
+        .ok()
+        .and_then(|c| c.webhooks)
+        .map(|w| w.url);
+    if old_url.as_deref() == Some(new.url.as_str()) {
+        return Ok(());
+    }
+    controller
+        .check_receiver_url(&new.url)
+        .await
+        .map_err(|message| GatewayError::InvalidRequest(message).into())
 }
 
 /// `LM-1004` (412), the same message on every path that produces it (the
@@ -1852,7 +1937,10 @@ pub async fn put_provider(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Remove a single provider by name.
+/// Remove a single provider by name, and forget any provider key stored for
+/// it (`PUT /admin/provider-keys/{name}`): a provider recreated later under
+/// the same name starts without a key rather than silently inheriting the
+/// deleted one's.
 ///
 /// # Errors
 /// `LM-1003` (404) when no provider with that name exists in the current
@@ -1865,12 +1953,29 @@ pub async fn delete_provider(
     headers: axum::http::HeaderMap,
 ) -> Result<StatusCode, ApiError> {
     let if_match = require_if_match(&headers)?;
-    apply_document(&state, &if_match, move |current| {
-        config_edit::delete_provider(current, &name)
+    let target = name.clone();
+    // One critical section for the document delete and the key delete, so a
+    // concurrent re-create plus `PUT /admin/provider-keys` cannot land in
+    // between and have its fresh key deleted.
+    let _guard = state.config_apply_lock.lock().await;
+    apply_document_locked(&state, &if_match, move |current| {
+        config_edit::delete_provider(current, &target)
             .map_err(|e| edit_internal_error(&e))?
             .ok_or_else(|| GatewayError::RouteNotFound.into())
     })
     .await?;
+    // Only once the provider is really gone: a refused delete keeps its key.
+    // A failure here leaves an orphaned sealed key behind, which is logged
+    // rather than turned into an error for a delete that did apply.
+    if let Some(auth) = state.auth.as_deref() {
+        if let Err(error) = auth.store.delete_provider_key(&name).await {
+            tracing::warn!(
+                provider = %name,
+                %error,
+                "provider deleted but its stored key could not be removed"
+            );
+        }
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2270,8 +2375,8 @@ pub async fn put_config_section(
 ///
 /// `None` only in tests: `main.rs` always sets it. A 500 is therefore the
 /// honest answer, not a client error, because nothing the caller sent caused
-/// it. `GatewayError` has no `NotFound(String)` variant, and inventing one
-/// for a condition that cannot occur in production would be noise.
+/// it; a 404 (`GatewayError::NotFound`) would blame the caller for a server
+/// that was simply built without one.
 fn config_ctx(state: &AppState) -> Result<Arc<ConfigContext>, ApiError> {
     state
         .config

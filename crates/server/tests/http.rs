@@ -16,6 +16,20 @@ async fn health_returns_ok_json_even_without_any_api_keys() {
 }
 
 #[tokio::test]
+async fn health_reports_the_gateway_version() {
+    // A control plane (the Lab) shows the instance version from /health, so
+    // it must be there without credentials, next to the unchanged `status`.
+    let base = common::spawn().await;
+
+    let resp = reqwest::get(format!("{base}/health")).await.unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["status"], "ok");
+    assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
+}
+
+#[tokio::test]
 async fn responses_carry_default_security_headers() {
     let base = common::spawn().await;
     let resp = reqwest::get(format!("{base}/health")).await.unwrap();

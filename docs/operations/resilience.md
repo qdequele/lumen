@@ -102,7 +102,14 @@ probes, on `health_check_interval_ms`, every provider that has an explicit
 `base_url` (self-hosted TEI/Ollama, or any explicit override) - providers on
 a built-in vendor URL are never probed and report `unknown`, since the
 gateway hardcodes no vendor endpoints. Results are published at `GET
-/health/providers` and the `lumen_provider_up{provider}` gauge. This is
+/health/providers` and the `lumen_provider_up{provider}` gauge. The list
+follows the live config: a provider added or removed by a hot reload
+(including one requested by `PUT`/`DELETE /admin/config/providers/{name}`)
+appears as `unknown` or disappears once that reload has run, and, when
+health checks were enabled at boot, a new provider with a `base_url` is
+probed from the next interval on (`health_check_enabled` and
+`health_check_interval_ms` themselves are read at boot: changing them takes
+a restart). This is
 independent of the gateway's own liveness: `GET /health` never depends on
 provider state and does no I/O.
 

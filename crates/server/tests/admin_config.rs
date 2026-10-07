@@ -5,21 +5,32 @@
 
 mod common;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
+
+use arc_swap::ArcSwap;
 
 use lumen_auth::crypto::MasterKey;
 use lumen_auth::key::hash_key;
 use lumen_auth::state::AuthState;
 use lumen_auth::store::KeyStore;
 use lumen_auth::usage::{spawn_usage_writer, UsageWriterConfig};
-use lumen_providers::Registry;
+use lumen_providers::{http, Registry};
 use lumen_server::auth::AuthRuntime;
+use lumen_server::config::Config;
 use lumen_server::config_source::{ConfigContext, DbSource};
+use lumen_server::health::ProviderHealth;
+use lumen_server::pricing::CostTable;
+use lumen_server::reload::{spawn_config_reloader, ReloadTargets};
+use lumen_server::resilience::ResilienceRuntime;
+use lumen_server::webhooks::WebhookController;
 use lumen_server::AppState;
-use lumen_telemetry::{LatencyMetrics, Metrics, TokenMetrics};
+use lumen_telemetry::{LatencyMetrics, Metrics, ReloadMetrics, TokenMetrics};
 use serde_json::Value;
 use tempfile::TempDir;
+use tokio::sync::Notify;
+use tokio_util::sync::CancellationToken;
 
 const LIMIT: usize = 10 * 1024 * 1024;
 
@@ -163,13 +174,88 @@ async fn spawn_admin(registry: Arc<Registry>) -> Harness {
 /// `CONFIG_TOML` does not provide (e.g. two providers with a fallback
 /// between their models).
 async fn spawn_admin_with_config(registry: Arc<Registry>, config_toml: &str) -> Harness {
-    // Written exactly once per process, before any server in this file can
-    // start. `set_var` is not merely "racy with other tests that also write":
-    // `PUT /admin/config` calls `Config::load` on a blocking worker, which
-    // READS the environment, so a concurrent test entering `spawn_admin` and
-    // writing it is the classic setenv/getenv data race. Setting the same
-    // value twice does not make that safe, because the race is write-vs-read,
-    // not write-vs-write. `Once` removes the writes after the first.
+    init_env();
+    let dir = TempDir::new().expect("create temp dir");
+    let config_path = dir.path().join("lumen.toml");
+    std::fs::write(&config_path, config_toml).expect("write config file");
+
+    let state = admin_state(registry)
+        .await
+        .with_config_context(Arc::new(ConfigContext::file(config_path.clone())));
+    let base = common::spawn_state(state, LIMIT).await;
+
+    Harness {
+        base,
+        client: reqwest::Client::new(),
+        config_path,
+        _dir: dir,
+    }
+}
+
+/// Like [`spawn_admin`], but with the real hot reloader armed over the config
+/// file, sharing the provider-health registry with the served state: what
+/// `main.rs` wires, minus the parts these tests do not observe.
+async fn spawn_admin_with_reloader() -> Harness {
+    init_env();
+    let dir = TempDir::new().expect("create temp dir");
+    let config_path = dir.path().join("lumen.toml");
+    std::fs::write(&config_path, CONFIG_TOML).expect("write config file");
+
+    let config = Config::load(&config_path).expect("boot config loads");
+    let registry = Arc::new(
+        Registry::build(
+            config.provider_specs(),
+            http::build_client(),
+            Duration::from_secs(300),
+        )
+        .expect("registry"),
+    );
+    let names: Vec<String> = config.providers.iter().map(|p| p.name.clone()).collect();
+    let health = Arc::new(ProviderHealth::with_providers(&names));
+    let ctx = Arc::new(ConfigContext::file(config_path.clone()));
+    let trigger = Arc::new(Notify::new());
+    let targets = ReloadTargets {
+        registry: Arc::clone(&registry),
+        pricing: Arc::new(ArcSwap::from_pointee(CostTable::default())),
+        resilience: Arc::new(ResilienceRuntime::defaults()),
+        metrics: ReloadMetrics::register(&Metrics::new()).expect("reload metrics"),
+        key_backfill: Arc::new(ArcSwap::from_pointee(HashMap::new())),
+        key_source: None,
+        auth_knobs: None,
+        webhooks: None,
+        auth_runtime: None,
+        image_fetch: None,
+        token_counter: None,
+        health: Some(Arc::clone(&health)),
+    };
+    spawn_config_reloader(Arc::clone(&ctx), targets, Arc::clone(&trigger))
+        .expect("arm the reloader");
+
+    let state = admin_state(registry)
+        .await
+        .with_config_context(ctx)
+        .with_health(health)
+        .with_reload_trigger(trigger);
+    let base = common::spawn_state(state, LIMIT).await;
+
+    Harness {
+        base,
+        client: reqwest::Client::new(),
+        config_path,
+        _dir: dir,
+    }
+}
+
+/// Export the env vars the harness config references.
+///
+/// Written exactly once per process, before any server in this file can
+/// start. `set_var` is not merely "racy with other tests that also write":
+/// `PUT /admin/config` calls `Config::load` on a blocking worker, which
+/// READS the environment, so a concurrent test entering `spawn_admin` and
+/// writing it is the classic setenv/getenv data race. Setting the same
+/// value twice does not make that safe, because the race is write-vs-read,
+/// not write-vs-write. `Once` removes the writes after the first.
+fn init_env() {
     static ENV_ONCE: std::sync::Once = std::sync::Once::new();
     ENV_ONCE.call_once(|| {
         // Distinctive var name (see `PROVIDER_KEY_ENV` doc comment) so setting
@@ -179,11 +265,10 @@ async fn spawn_admin_with_config(registry: Arc<Registry>, config_toml: &str) -> 
         // `ENV_OVERRIDE_PORT` doc comment).
         std::env::set_var(ENV_OVERRIDE_PORT, ENV_OVERRIDE_PORT_VALUE);
     });
+}
 
-    let dir = TempDir::new().expect("create temp dir");
-    let config_path = dir.path().join("lumen.toml");
-    std::fs::write(&config_path, config_toml).expect("write config file");
-
+/// An auth-enabled state over an in-memory store, with no config context yet.
+async fn admin_state(registry: Arc<Registry>) -> AppState {
     let store = KeyStore::in_memory().await.expect("open store");
     let groups = store.load_groups().await.expect("load groups");
     let entries = store.load_auth_entries().await.expect("load entries");
@@ -206,18 +291,9 @@ async fn spawn_admin_with_config(registry: Arc<Registry>, config_toml: &str) -> 
     let metrics = Metrics::new();
     let tokens = TokenMetrics::register(&metrics, &[]).expect("register token metrics");
     let latency = LatencyMetrics::register(&metrics).expect("register latency metrics");
-    let state = AppState::new(metrics, registry, tokens, latency)
+    AppState::new(metrics, registry, tokens, latency)
         .with_auth(Arc::clone(&runtime))
         .with_usage(logger)
-        .with_config_context(Arc::new(ConfigContext::file(config_path.clone())));
-    let base = common::spawn_state(state, LIMIT).await;
-
-    Harness {
-        base,
-        client: reqwest::Client::new(),
-        config_path,
-        _dir: dir,
-    }
 }
 
 #[tokio::test]
@@ -1521,4 +1597,266 @@ async fn a_json_null_in_a_virtual_model_body_is_lm_1001() {
     assert_eq!(resp.status(), 400);
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["error"]["code"], "LM-1001", "{body}");
+}
+
+// ---- Stored provider keys follow the provider's lifecycle (Lab QA F11) -----
+
+/// A provider whose key can only come from the encrypted store (its env var
+/// is never set in this suite).
+const DB_KEYED_PROVIDER: &str = r#"
+[[providers]]
+name = "from-db"
+kind = "cohere"
+api_key_env = "LUMEN_TEST_UNSET_KEY_VAR"
+"#;
+
+/// PUT a provider key with the master key.
+async fn put_provider_key(h: &Harness, name: &str, key: &str) -> reqwest::Response {
+    h.client
+        .put(format!("{}/admin/provider-keys/{name}", h.base))
+        .bearer_auth(master())
+        .json(&serde_json::json!({ "key": key }))
+        .send()
+        .await
+        .expect("send")
+}
+
+/// Where `name`'s key comes from, per `GET /admin/config`.
+async fn key_source(h: &Harness, name: &str) -> Value {
+    let body: Value = h.get("/admin/config").await.json().await.expect("json");
+    body["key_sources"][name].clone()
+}
+
+/// A key for a provider the config document does not define is refused with
+/// a 404 `LM-1003` and stored nowhere: it would otherwise sit in the database
+/// and silently attach to any provider created later under that name.
+#[tokio::test]
+async fn put_provider_key_for_an_unknown_provider_is_404_and_stores_nothing() {
+    let h = spawn_admin(registry()).await;
+
+    let refused = put_provider_key(&h, "ghost", "sk-ghost").await;
+    assert_eq!(refused.status(), 404);
+    let body: Value = refused.json().await.expect("json");
+    assert_eq!(body["error"]["code"], "LM-1003");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("ghost")),
+        "the 404 names the provider: {body}"
+    );
+    assert!(!body.to_string().contains("sk-ghost"));
+
+    // Creating the provider afterwards finds no key waiting for it...
+    let hash = h.current_hash().await;
+    let provider = serde_json::json!({
+        "name": "ghost",
+        "kind": "cohere",
+        "api_key_env": "LUMEN_TEST_UNSET_KEY_VAR"
+    });
+    assert_eq!(
+        h.put_json("/admin/config/providers/ghost", &provider, &hash)
+            .await
+            .status(),
+        204
+    );
+    assert_eq!(key_source(&h, "ghost").await, "missing");
+
+    // ...and a key PUT right after the provider PUT is accepted: the check
+    // reads the persisted document, not the (asynchronously reloaded)
+    // routing table.
+    assert_eq!(
+        put_provider_key(&h, "ghost", "sk-ghost").await.status(),
+        204
+    );
+    assert_eq!(key_source(&h, "ghost").await, "stored");
+}
+
+/// Deleting a provider through the admin API also forgets its stored key, so
+/// a provider recreated later under the same name starts without one.
+#[tokio::test]
+async fn deleting_a_provider_forgets_its_stored_key() {
+    let h = spawn_admin_with_config(registry(), DB_KEYED_PROVIDER).await;
+    assert_eq!(
+        put_provider_key(&h, "from-db", "sk-old").await.status(),
+        204
+    );
+    assert_eq!(key_source(&h, "from-db").await, "stored");
+
+    let hash = h.current_hash().await;
+    assert_eq!(
+        h.delete("/admin/config/providers/from-db", &hash)
+            .await
+            .status(),
+        204
+    );
+
+    let hash = h.current_hash().await;
+    let provider = serde_json::json!({
+        "name": "from-db",
+        "kind": "cohere",
+        "api_key_env": "LUMEN_TEST_UNSET_KEY_VAR"
+    });
+    assert_eq!(
+        h.put_json("/admin/config/providers/from-db", &provider, &hash)
+            .await
+            .status(),
+        204
+    );
+    assert_eq!(
+        key_source(&h, "from-db").await,
+        "missing",
+        "a recreated provider must not inherit the deleted one's key"
+    );
+}
+
+// ---- /health/providers follows runtime provider edits (Lab QA F2) ----------
+
+/// Poll `/health/providers` until `done` holds for its body, or panic.
+async fn wait_for_health(h: &Harness, done: impl Fn(&Value) -> bool) -> Value {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let body: Value = h
+            .client
+            .get(format!("{}/health/providers", h.base))
+            .send()
+            .await
+            .expect("send")
+            .json()
+            .await
+            .expect("json");
+        if done(&body) {
+            return body;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "/health/providers never converged: {body}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// A provider added through `PUT /admin/config/providers/{name}` shows up in
+/// `/health/providers` (as `unknown`, never probed yet) once the hot reload
+/// the write requests has run, and a deleted one disappears. Before, the
+/// registry was filled once at boot and never touched again.
+#[tokio::test]
+async fn health_providers_follows_providers_added_and_removed_at_runtime() {
+    let h = spawn_admin_with_reloader().await;
+    let boot = wait_for_health(&h, |b| b.get("test-provider").is_some()).await;
+    assert!(boot.get("second").is_none(), "{boot}");
+
+    let hash = h.current_hash().await;
+    let provider = serde_json::json!({ "name": "second", "kind": "openai" });
+    assert_eq!(
+        h.put_json("/admin/config/providers/second", &provider, &hash)
+            .await
+            .status(),
+        204
+    );
+    let added = wait_for_health(&h, |b| b.get("second").is_some()).await;
+    assert_eq!(added["second"]["status"], "unknown");
+    assert!(added.get("test-provider").is_some(), "{added}");
+
+    let hash = h.current_hash().await;
+    assert_eq!(
+        h.delete("/admin/config/providers/test-provider", &hash)
+            .await
+            .status(),
+        204
+    );
+    let removed = wait_for_health(&h, |b| b.get("test-provider").is_none()).await;
+    assert!(removed.get("second").is_some(), "{removed}");
+}
+
+// ---- The webhook receiver guard covers config-document writes (F13) --------
+
+/// [`spawn_admin_with_config`] plus a webhook controller with no receiver
+/// allowlist, so admin writes go through the SSRF guard.
+async fn spawn_admin_with_webhook_guard(config_toml: &str) -> Harness {
+    init_env();
+    let dir = TempDir::new().expect("create temp dir");
+    let config_path = dir.path().join("lumen.toml");
+    std::fs::write(&config_path, config_toml).expect("write config file");
+    let controller = Arc::new(WebhookController::new(
+        Metrics::new(),
+        http::build_client(),
+        CancellationToken::new(),
+    ));
+    let state = admin_state(registry())
+        .await
+        .with_config_context(Arc::new(ConfigContext::file(config_path.clone())))
+        .with_webhooks(controller);
+    let base = common::spawn_state(state, LIMIT).await;
+    Harness {
+        base,
+        client: reqwest::Client::new(),
+        config_path,
+        _dir: dir,
+    }
+}
+
+/// `PUT /admin/config/webhooks` and a whole-document `PUT /admin/config`
+/// would otherwise be a way around the `PUT /admin/webhooks` guard: a document
+/// block applies on reload whenever no stored row overrides it. A receiver the
+/// document already had is not re-checked on an unrelated edit.
+#[tokio::test]
+async fn config_document_writes_cannot_point_webhooks_at_internal_hosts() {
+    let operator_doc = format!(
+        "{CONFIG_TOML}\n[auth]\nenabled = true\n\n[webhooks]\nurl = \"http://127.0.0.1:9/events\"\n"
+    );
+    let h = spawn_admin_with_webhook_guard(&operator_doc).await;
+
+    // An unrelated granular edit keeps the operator's internal receiver.
+    let hash = h.current_hash().await;
+    let tokenizer = serde_json::json!({"mode": "accurate"});
+    assert_eq!(
+        h.put_json("/admin/config/tokenizer", &tokenizer, &hash)
+            .await
+            .status(),
+        204
+    );
+
+    // Changing it to an internal host through the section route is refused.
+    let hash = h.current_hash().await;
+    let response = h
+        .put_json(
+            "/admin/config/webhooks",
+            &serde_json::json!({"url": "http://169.254.169.254/latest"}),
+            &hash,
+        )
+        .await;
+    assert_eq!(response.status(), 400);
+    let body: Value = response.json().await.expect("json");
+    assert_eq!(body["error"]["code"], "LM-1001");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("LUMEN_WEBHOOK_ALLOWED_HOSTS")),
+        "{body}"
+    );
+
+    // So is the same change through the whole-document route.
+    let hash = h.current_hash().await;
+    let doc = h
+        .valid_config()
+        .replace("http://127.0.0.1:9/events", "http://10.0.0.5/events");
+    let response = h.put_config(&doc, &hash).await;
+    assert_eq!(response.status(), 400);
+    let body: Value = response.json().await.expect("json");
+    assert_eq!(body["error"]["code"], "LM-1001");
+    assert!(
+        h.valid_config().contains("http://127.0.0.1:9/events"),
+        "a refused write must leave the document untouched"
+    );
+
+    // A public receiver is accepted.
+    let hash = h.current_hash().await;
+    let response = h
+        .put_json(
+            "/admin/config/webhooks",
+            &serde_json::json!({"url": "https://93.184.215.14/lumen/events"}),
+            &hash,
+        )
+        .await;
+    assert_eq!(response.status(), 204);
 }
