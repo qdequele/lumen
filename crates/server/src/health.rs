@@ -142,10 +142,30 @@ impl ProviderHealth {
     /// probe was in flight is discarded (`false`), so it cannot reappear after
     /// the reload that dropped it.
     pub fn record(&self, provider: &str, status: ProviderStatus) -> bool {
-        self.statuses
-            .get_mut(provider)
-            .map(|mut entry| *entry = status)
-            .is_some()
+        self.record_with_gauge(provider, status, None)
+    }
+
+    /// [`record`](Self::record), also setting `lumen_provider_up` when the
+    /// result is recorded. The gauge is written while the entry guard is
+    /// held: `sync_with`'s `retain` takes the same shard write lock, so a
+    /// reload cannot drop the provider (and its series) between the status
+    /// write and the gauge write, which would recreate the series for a
+    /// provider no longer in the config.
+    fn record_with_gauge(
+        &self,
+        provider: &str,
+        status: ProviderStatus,
+        gauge: Option<&ResilienceMetrics>,
+    ) -> bool {
+        let Some(mut entry) = self.statuses.get_mut(provider) else {
+            return false;
+        };
+        let up = status.status == HealthState::Up;
+        *entry = status;
+        if let Some(gauge) = gauge {
+            gauge.set_provider_up(provider, up);
+        }
+        true
     }
 
     /// A snapshot of every provider's status, provider name → status.
@@ -295,12 +315,7 @@ pub async fn probe_once(
                 detail: Some("unreachable".to_owned()),
             },
         };
-        let up = status.status == HealthState::Up;
-        if health.record(&target.name, status) {
-            if let Some(metrics) = metrics {
-                metrics.set_provider_up(&target.name, up);
-            }
-        }
+        health.record_with_gauge(&target.name, status, metrics);
     }
 }
 
