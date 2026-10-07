@@ -70,6 +70,13 @@ impl ResilienceMetrics {
             .with_label_values(&[provider])
             .set(i64::from(up));
     }
+
+    /// Drop a provider's `lumen_provider_up` series (the provider was removed
+    /// from the config), so `/metrics` stops reporting it. A no-op when the
+    /// series never existed.
+    pub fn remove_provider_up(&self, provider: &str) {
+        let _ = self.provider_up.remove_label_values(&[provider]);
+    }
 }
 
 #[cfg(test)]

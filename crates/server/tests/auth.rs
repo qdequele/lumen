@@ -1485,7 +1485,7 @@ async fn admin_delete_stops_authentication_immediately_and_hides_the_key() {
         .expect("tombstone listed");
     assert!(tombstone["deleted_at"].is_i64());
 
-    // Further PATCH or DELETE behaves like an unknown id: 400 LM-1001.
+    // Further PATCH or DELETE behaves like an unknown id: 404 LM-1003.
     let patch = h
         .client
         .patch(format!("{}/admin/keys/{id}", h.base))
@@ -1494,9 +1494,9 @@ async fn admin_delete_stops_authentication_immediately_and_hides_the_key() {
         .send()
         .await
         .expect("patch");
-    assert_eq!(patch.status(), 400);
+    assert_eq!(patch.status(), 404);
     let patch_body: Value = patch.json().await.expect("json");
-    assert_eq!(patch_body["error"]["code"], "LM-1001");
+    assert_eq!(patch_body["error"]["code"], "LM-1003");
 
     let again = h
         .client
@@ -1505,7 +1505,7 @@ async fn admin_delete_stops_authentication_immediately_and_hides_the_key() {
         .send()
         .await
         .expect("delete again");
-    assert_eq!(again.status(), 400);
+    assert_eq!(again.status(), 404);
 }
 
 #[tokio::test]
@@ -1705,7 +1705,7 @@ async fn admin_delete_retry_evicts_a_zombie_key_from_memory() {
     );
 
     // Retry: the DB row no longer matches (already tombstoned by the first
-    // call) -> the same 400 LM-1001 as any unknown id, but the live table
+    // call) -> the same 404 LM-1003 as any unknown id, but the live table
     // must STILL be pruned.
     let retry = h
         .client
@@ -1714,9 +1714,9 @@ async fn admin_delete_retry_evicts_a_zombie_key_from_memory() {
         .send()
         .await
         .expect("retry delete");
-    assert_eq!(retry.status(), 400);
+    assert_eq!(retry.status(), 404);
     let retry_body: Value = retry.json().await.expect("json");
-    assert_eq!(retry_body["error"]["code"], "LM-1001");
+    assert_eq!(retry_body["error"]["code"], "LM-1003");
 
     assert!(
         h.runtime.keys.authenticate(&plaintext, 0).is_none(),
@@ -1738,9 +1738,27 @@ async fn admin_delete_retry_evicts_a_zombie_key_from_memory() {
 }
 
 #[tokio::test]
-async fn admin_delete_and_rotate_unknown_id_is_400_lm1001() {
+async fn admin_delete_and_rotate_unknown_id_is_404_lm1003() {
     let upstream = MockServer::start().await;
     let h = spawn_auth(full_registry(&upstream.uri()), &[]).await;
+
+    let patch = h
+        .client
+        .patch(format!("{}/admin/keys/nope", h.base))
+        .bearer_auth(master())
+        .json(&json!({ "disabled": true }))
+        .send()
+        .await
+        .expect("patch");
+    assert_eq!(patch.status(), 404);
+    let patch_body: Value = patch.json().await.expect("json");
+    assert_eq!(patch_body["error"]["code"], "LM-1003");
+    assert!(
+        patch_body["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("nope")),
+        "the 404 names the unknown id: {patch_body}"
+    );
 
     let del = h
         .client
@@ -1749,9 +1767,9 @@ async fn admin_delete_and_rotate_unknown_id_is_400_lm1001() {
         .send()
         .await
         .expect("delete");
-    assert_eq!(del.status(), 400);
+    assert_eq!(del.status(), 404);
     let del_body: Value = del.json().await.expect("json");
-    assert_eq!(del_body["error"]["code"], "LM-1001");
+    assert_eq!(del_body["error"]["code"], "LM-1003");
 
     let rot = h
         .client
@@ -1760,9 +1778,9 @@ async fn admin_delete_and_rotate_unknown_id_is_400_lm1001() {
         .send()
         .await
         .expect("rotate");
-    assert_eq!(rot.status(), 400);
+    assert_eq!(rot.status(), 404);
     let rot_body: Value = rot.json().await.expect("json");
-    assert_eq!(rot_body["error"]["code"], "LM-1001");
+    assert_eq!(rot_body["error"]["code"], "LM-1003");
 }
 
 #[tokio::test]

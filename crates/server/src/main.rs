@@ -20,7 +20,7 @@ use lumen_server::{
     build_app,
     config::{ensure_boot_only, Config, ConfigSourceKind},
     config_source::{ConfigContext, ConfigSource, DbSource},
-    health::{spawn_health_checks, ProbeTarget, ProviderHealth},
+    health::{spawn_health_checks, ProviderHealth},
     lifecycle, log_startup,
     pricing::CostTable,
     reload::{spawn_config_reloader, AuthKnobs, ProviderKeySource, ReloadTargets},
@@ -527,16 +527,18 @@ fn run_keys_inner(action: KeysAction) -> anyhow::Result<()> {
                 expires_at,
                 ..
             } => {
+                let new_key = lumen_auth::store::NewKey {
+                    name,
+                    group_id,
+                    budget_max,
+                    rpm_limit,
+                    tpm_limit,
+                    expires_at,
+                    external_ref: None,
+                };
+                new_key.validate().map_err(anyhow::Error::msg)?;
                 let (plaintext, record) = store
-                    .create_key(lumen_auth::store::NewKey {
-                        name,
-                        group_id,
-                        budget_max,
-                        rpm_limit,
-                        tpm_limit,
-                        expires_at,
-                        external_ref: None,
-                    })
+                    .create_key(new_key)
                     .await
                     .context("failed to create key")?;
                 let created = lumen_server::admin::CreatedKey {
@@ -754,6 +756,7 @@ fn run(config_path: PathBuf) -> anyhow::Result<()> {
         let image_fetch = Arc::new(ArcSwap::new(build_image_fetch_policy(&config)));
         let token_counter = Arc::new(ArcSwap::new(build_token_counter(&config)));
         let reload_trigger = Arc::new(tokio::sync::Notify::new());
+        let health = boot_health(&config, &client, &resilience_metrics);
         let reload_targets = ReloadTargets {
             registry: Arc::clone(&registry),
             pricing: Arc::clone(&pricing),
@@ -766,6 +769,7 @@ fn run(config_path: PathBuf) -> anyhow::Result<()> {
             auth_runtime: auth_runtime.clone(),
             image_fetch: Some(Arc::clone(&image_fetch)),
             token_counter: Some(Arc::clone(&token_counter)),
+            health: Some(Arc::clone(&health)),
         };
         // Cloned before the move into `arm_config_reload`: the admin config
         // routes read and write through the same context the reloader
@@ -773,8 +777,6 @@ fn run(config_path: PathBuf) -> anyhow::Result<()> {
         // what a SIGHUP or file-watch reload would re-read.
         let ctx_for_state = Arc::clone(&ctx);
         let reload_armed = arm_config_reload(ctx, reload_targets, &reload_trigger);
-
-        let health = boot_health(&config, &client, &resilience_metrics);
 
         let state = AppState::new(metrics, registry, tokens, latency)
             .with_guards(guards)
@@ -960,43 +962,32 @@ fn arm_config_reload(
 
 /// Seed the provider-health registry (every provider `unknown`) and, when
 /// enabled, spawn the background probe task (M6 §6.5). Only providers with a
-/// configured `base_url` are probed; vendor-default URLs stay `unknown`.
+/// configured `base_url` are probed; vendor-default URLs stay `unknown`. The
+/// registry is shared with the reloader, which re-syncs it on every reload,
+/// so the task is spawned even when no provider is probeable yet: one added
+/// at runtime is picked up on the next tick.
 fn boot_health(
     config: &Config,
     client: &reqwest::Client,
     resilience_metrics: &ResilienceMetrics,
 ) -> Arc<ProviderHealth> {
-    let provider_names: Vec<String> = config.providers.iter().map(|p| p.name.clone()).collect();
-    let health = Arc::new(ProviderHealth::with_providers(&provider_names));
+    let health = Arc::new(ProviderHealth::from_config(config));
     if !config.resilience.health_check_enabled {
         return health;
     }
-    let targets: Vec<ProbeTarget> = config
-        .providers
-        .iter()
-        .filter_map(|p| {
-            p.base_url.clone().map(|url| ProbeTarget {
-                name: p.name.clone(),
-                url,
-                kind: p.kind,
-            })
-        })
-        .collect();
-    if targets.is_empty() {
+    if health.targets().is_empty() {
         tracing::warn!(
             "health checks enabled but no provider has a configured base_url; providers on \
              built-in vendor URLs report 'unknown' (never probed)"
         );
-    } else {
-        spawn_health_checks(
-            client.clone(),
-            targets,
-            Arc::clone(&health),
-            Some(resilience_metrics.clone()),
-            Duration::from_millis(config.resilience.health_check_interval_ms),
-            Duration::from_millis(config.resilience.connect_timeout_ms),
-        );
     }
+    spawn_health_checks(
+        client.clone(),
+        Arc::clone(&health),
+        Some(resilience_metrics.clone()),
+        Duration::from_millis(config.resilience.health_check_interval_ms),
+        Duration::from_millis(config.resilience.connect_timeout_ms),
+    );
     health
 }
 
@@ -1091,11 +1082,21 @@ async fn boot_webhooks(
         // here would already have failed to load.
         return Ok(None);
     };
-    let controller = Arc::new(WebhookController::new(
-        metrics.clone(),
-        client.clone(),
-        cancel.clone(),
-    ));
+    // Internal hosts an admin-supplied receiver may name (SSRF guard on
+    // `PUT /admin/webhooks`). Read once: env does not change at runtime.
+    let receiver_allowlist = std::env::var(lumen_server::webhooks::ALLOWED_HOSTS_ENV)
+        .map(|v| lumen_server::webhooks::parse_receiver_allowlist(&v))
+        .unwrap_or_default();
+    if !receiver_allowlist.is_empty() {
+        tracing::info!(
+            hosts = ?receiver_allowlist,
+            "webhook receivers set through the admin API may name these internal hosts"
+        );
+    }
+    let controller = Arc::new(
+        WebhookController::new(metrics.clone(), client.clone(), cancel.clone())
+            .with_receiver_allowlist(receiver_allowlist),
+    );
     controller
         .refresh_from_store(&auth_runtime.store, auth_runtime.master.as_ref())
         .await;
@@ -1284,14 +1285,9 @@ async fn boot_auth_stack(
     // The reloader re-reads DB provider keys on each reload (rotation without a
     // restart). It needs its own master handle (the runtime's is moved in
     // below), built here before the clear master string is wiped.
-    let provider_names: Vec<String> = config.providers.iter().map(|p| p.name.clone()).collect();
     let source_master = MasterKey::from_env_value(&master_value)
         .with_context(|| format!("invalid {MASTER_KEY_ENV}"))?;
-    let key_source = Arc::new(ProviderKeySource::new(
-        store.clone(),
-        source_master,
-        provider_names,
-    ));
+    let key_source = Arc::new(ProviderKeySource::new(store.clone(), source_master));
 
     let runtime = Arc::new(AuthRuntime {
         keys,

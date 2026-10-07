@@ -178,7 +178,7 @@ moved retroactively.
 
 To top up a customer, raise the cap - pool spend is preserved, and the new
 cap binds every member key on its next request, no restart (`name` can be
-patched the same way; an unknown or deleted id returns 400 `LM-1001`):
+patched the same way; an unknown or deleted id returns 404 `LM-1003`):
 
 ```bash
 curl -s -X PATCH http://localhost:8080/admin/groups/<id> \
@@ -258,14 +258,14 @@ and one customer payment vanishes. A grant is an atomic increment on
 Like every admin change it takes effect on the very next request, no
 restart.
 
-Three refusals, all `400` `LM-1001`:
+Three refusals:
 
-- **A non-positive, non-finite or oversized `amount`.** Zero and negatives
+- **A non-positive, non-finite or oversized `amount`** (`400` `LM-1001`). Zero and negatives
   are rejected; overflowing literals like `1e999` never even parse; and a
   single grant is capped at `1e12` USD so repeated grants can never sum
   the stored cap toward infinity (which would read back as *unlimited*).
-- **Unknown or deleted id**, like every other admin write.
-- **A capless target** (`budget_max` null): there is no cap to raise, and
+- **Unknown or deleted id** (`404` `LM-1003`), like every other admin write.
+- **A capless target** (`budget_max` null, `400` `LM-1001`): there is no cap to raise, and
   silently doing nothing would be worse than the error. Set a cap first
   (`PATCH {"budget_max": ...}`), then grant.
 
@@ -289,7 +289,11 @@ curl -s http://localhost:8080/admin/keys \
 ```
 
 `name` is required; `budget_max`, `rpm_limit`, `tpm_limit` and `expires_at`
-(unix seconds) are all optional - omit any of them for "unlimited". The
+(unix seconds) are all optional - omit any of them for "unlimited". A blank
+`name`, a negative value, or a `budget_max` above `1e12` USD is refused with
+400 `LM-1001` naming the field (`0` is accepted: a key that may spend or send
+nothing). Group budgets follow the same rule. Names are labels, not
+identifiers: two keys may share one, so look keys up by `id`. The
 response is the **only place the plaintext key ever appears**:
 
 ```json
@@ -311,8 +315,8 @@ response is the **only place the plaintext key ever appears**:
 
 Store `key` now - it is never shown again. `PATCH /admin/keys/{id}` takes
 the same budget/quota fields (plus `disabled`) to adjust an existing key;
-fields left out of the patch are unchanged, and an unknown id returns 400
-`LM-1001`.
+fields left out of the patch are unchanged, the same value rules as on
+creation apply, and an unknown id returns 404 `LM-1003`.
 
 ### Rotate a key (`POST /admin/keys/{id}/rotate`)
 
@@ -329,8 +333,8 @@ The response has the exact same shape as creation - the new plaintext in
 the `id` (so `usage_log` attribution is unbroken), the name, budgets,
 accrued spend and quotas. The swap is applied to the in-memory table too,
 so the old plaintext stops authenticating on the very next request and the
-new one works without a restart. An unknown or deleted id returns 400
-`LM-1001`.
+new one works without a restart. An unknown or deleted id returns 404
+`LM-1003`.
 
 ### Delete a key (`DELETE /admin/keys/{id}`)
 
@@ -348,7 +352,7 @@ kept for attribution and audit. A deleted key:
   restart needed), and never loads again at boot;
 - disappears from `GET /admin/keys`; pass `?include_deleted=true` to list
   tombstones (the audit view);
-- rejects any further `PATCH`, `DELETE` or rotate with 400 `LM-1001`, like
+- rejects any further `PATCH`, `DELETE` or rotate with 404 `LM-1003`, like
   an unknown id - it cannot be resurrected by accident.
 
 Retention of the tombstoned rows follows your usage-log retention policy:
@@ -374,6 +378,13 @@ re-reads provider keys from the encrypted store (off the request path) and
 rebuilds the provider registry - a rotated key takes effect without a
 restart. Environment-sourced keys keep precedence over a stored key. See
 [Deployment - Hot reload](deployment.md#hot-reload).
+
+`{name}` must be a provider the current config document defines; any other
+name is refused with 404 `LM-1003` and nothing is stored (a provider added
+with `PUT /admin/config/providers/{name}` can take its key right after that
+call returns). `DELETE /admin/config/providers/{name}` also forgets the
+provider's stored key, so a provider recreated later under the same name
+starts without one.
 
 ### Check a provider key (`POST /admin/providers/{name}/check`)
 
@@ -589,7 +600,24 @@ curl -s -X PUT http://localhost:8080/admin/webhooks \
 ```
 
 `url` is the only required field; every other one has the default shown
-above. The `200` response is the new state:
+above. Because this route decides where the gateway sends requests, the
+receiver must be publicly routable: a `url` whose host is a loopback,
+private, link-local (for example the `169.254.169.254` cloud metadata
+endpoint), unique-local or other reserved address, a `localhost` name, or a
+hostname that resolves to any such address (or does not resolve) is refused
+with 400 `LM-1001`. To deliver to an internal receiver, list its host in the
+`LUMEN_WEBHOOK_ALLOWED_HOSTS` environment variable (comma-separated; an
+entry matches exactly, or as a domain and its subdomains when written
+`.suffix`, for example `LUMEN_WEBHOOK_ALLOWED_HOSTS=billing.internal,.corp.example`),
+read once at boot. A listed host is accepted without resolving it. The check
+runs when the URL is set, not on every delivery, so it does not cover a
+hostname re-pointed afterwards or a receiver that answers with a redirect.
+The same check applies when `PUT /admin/config/webhooks` or a whole-document
+`PUT /admin/config` introduces or changes the `[webhooks]` receiver; a
+receiver already in the document (written by the operator on disk) is not
+re-checked on unrelated edits. Note that `/admin/config*` remains the most
+privileged surface: a provider's `base_url` is not restricted the same way,
+so expose it only to callers you would trust with the host. The `200` response is the new state:
 
 ```json
 {

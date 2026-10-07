@@ -8,10 +8,17 @@
 //! the request path (the executor's live circuit breaker is the request-path
 //! signal). Providers that rely on a built-in vendor URL report `unknown`; the
 //! gateway never hardcodes vendor endpoints to probe.
+//!
+//! The registry follows the live config: every hot reload (including one an
+//! admin-API provider edit requests) re-syncs it through
+//! [`ProviderHealth::sync_with`], so a provider added at runtime is listed
+//! (as `unknown` until probed, then probed like any other) and a removed one
+//! disappears.
 
 use std::sync::Arc;
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
 use axum::extract::State;
 use axum::Json;
 use dashmap::DashMap;
@@ -19,6 +26,7 @@ use lumen_telemetry::ResilienceMetrics;
 use serde::Serialize;
 
 use crate::auth::now_unix;
+use crate::config::Config;
 use crate::state::AppState;
 
 /// One provider's last observed health.
@@ -60,29 +68,104 @@ pub enum HealthState {
     Unknown,
 }
 
-/// In-memory registry of provider health, shared across the probe task and the
-/// `/health/providers` handler. Reads are a lock-free map lookup - safe to hit
-/// often, and never on the request hot path anyway.
+/// In-memory registry of provider health, shared across the probe task, the
+/// config reloader and the `/health/providers` handler. Reads are a lock-free
+/// map lookup - safe to hit often, and never on the request hot path anyway.
 #[derive(Debug, Default)]
 pub struct ProviderHealth {
     statuses: DashMap<String, ProviderStatus>,
+    /// What the probe task checks on its next tick; swapped on reload.
+    targets: ArcSwap<Vec<ProbeTarget>>,
+    /// The `lumen_provider_up` gauge, once the probe task runs: a provider
+    /// dropped by a reload loses its series too.
+    gauge: std::sync::OnceLock<ResilienceMetrics>,
 }
 
 impl ProviderHealth {
     /// Pre-populate every provider as `unknown` so `/health/providers` lists
-    /// them all from the first scrape.
+    /// them all from the first scrape. No probe targets.
     #[must_use]
     pub fn with_providers(names: &[String]) -> Self {
         let statuses = DashMap::new();
         for name in names {
             statuses.insert(name.clone(), ProviderStatus::unknown());
         }
-        Self { statuses }
+        Self {
+            statuses,
+            targets: ArcSwap::default(),
+            gauge: std::sync::OnceLock::new(),
+        }
     }
 
-    /// Record a probe result.
-    pub fn record(&self, provider: &str, status: ProviderStatus) {
-        self.statuses.insert(provider.to_owned(), status);
+    /// Seed from a loaded config: every provider `unknown`, and every
+    /// provider with a configured `base_url` as a probe target.
+    #[must_use]
+    pub fn from_config(config: &Config) -> Self {
+        let health = Self::default();
+        health.sync_with(config);
+        health
+    }
+
+    /// Re-sync with a (re)loaded config: providers new to the config are
+    /// listed as `unknown`, removed ones are dropped, and the ones that stay
+    /// keep their last observed status. The probe targets are replaced, so
+    /// the next probe round covers exactly the current providers.
+    pub fn sync_with(&self, config: &Config) {
+        let names: std::collections::HashSet<&str> =
+            config.providers.iter().map(|p| p.name.as_str()).collect();
+        self.statuses.retain(|name, _| {
+            let keep = names.contains(name.as_str());
+            if !keep {
+                if let Some(gauge) = self.gauge.get() {
+                    gauge.remove_provider_up(name);
+                }
+            }
+            keep
+        });
+        for name in names {
+            if !self.statuses.contains_key(name) {
+                self.statuses
+                    .insert(name.to_owned(), ProviderStatus::unknown());
+            }
+        }
+        self.targets.store(Arc::new(probe_targets(config)));
+    }
+
+    /// The providers the probe task should check now.
+    #[must_use]
+    pub fn targets(&self) -> Arc<Vec<ProbeTarget>> {
+        self.targets.load_full()
+    }
+
+    /// Record a probe result for a provider the registry lists, returning
+    /// whether it was recorded. A result for a provider removed while its
+    /// probe was in flight is discarded (`false`), so it cannot reappear after
+    /// the reload that dropped it.
+    pub fn record(&self, provider: &str, status: ProviderStatus) -> bool {
+        self.record_with_gauge(provider, status, None)
+    }
+
+    /// [`record`](Self::record), also setting `lumen_provider_up` when the
+    /// result is recorded. The gauge is written while the entry guard is
+    /// held: `sync_with`'s `retain` takes the same shard write lock, so a
+    /// reload cannot drop the provider (and its series) between the status
+    /// write and the gauge write, which would recreate the series for a
+    /// provider no longer in the config.
+    fn record_with_gauge(
+        &self,
+        provider: &str,
+        status: ProviderStatus,
+        gauge: Option<&ResilienceMetrics>,
+    ) -> bool {
+        let Some(mut entry) = self.statuses.get_mut(provider) else {
+            return false;
+        };
+        let up = status.status == HealthState::Up;
+        *entry = status;
+        if let Some(gauge) = gauge {
+            gauge.set_provider_up(provider, up);
+        }
+        true
     }
 
     /// A snapshot of every provider's status, provider name → status.
@@ -115,6 +198,23 @@ pub struct ProbeTarget {
     pub url: String,
     /// The provider kind, selecting the liveness endpoint.
     pub kind: lumen_providers::ProviderKind,
+}
+
+/// Every provider in `config` with a configured `base_url`: the only ones
+/// probed (vendor-default URLs stay `unknown`).
+#[must_use]
+pub fn probe_targets(config: &Config) -> Vec<ProbeTarget> {
+    config
+        .providers
+        .iter()
+        .filter_map(|p| {
+            p.base_url.clone().map(|url| ProbeTarget {
+                name: p.name.clone(),
+                url,
+                kind: p.kind,
+            })
+        })
+        .collect()
 }
 
 impl ProbeTarget {
@@ -215,29 +315,32 @@ pub async fn probe_once(
                 detail: Some("unreachable".to_owned()),
             },
         };
-        if let Some(metrics) = metrics {
-            metrics.set_provider_up(&target.name, status.status == HealthState::Up);
-        }
-        health.record(&target.name, status);
+        health.record_with_gauge(&target.name, status, metrics);
     }
 }
 
-/// Spawn the periodic health-check task. No-op-friendly: the caller only calls
-/// this when `resilience.health_check_enabled` is set and there is at least one
-/// probe target. The task ticks forever; it is aborted when the process exits.
+/// Spawn the periodic health-check task. The caller only calls this when
+/// `resilience.health_check_enabled` is set. Each tick probes the registry's
+/// *current* targets ([`ProviderHealth::targets`]), so providers added or
+/// removed by a reload are picked up without restarting the task; a tick
+/// with no target does nothing. The task ticks forever; it is aborted when
+/// the process exits.
 pub fn spawn_health_checks(
     client: reqwest::Client,
-    targets: Vec<ProbeTarget>,
     health: Arc<ProviderHealth>,
     metrics: Option<ResilienceMetrics>,
     interval: Duration,
     probe_timeout: Duration,
 ) -> tokio::task::JoinHandle<()> {
+    if let Some(metrics) = &metrics {
+        let _ = health.gauge.set(metrics.clone());
+    }
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
+            let targets = health.targets();
             probe_once(&client, &targets, &health, metrics.as_ref(), probe_timeout).await;
         }
     })
@@ -268,6 +371,71 @@ mod tests {
         assert_eq!(snap["a"].latency_ms, Some(7));
         // Untouched provider stays unknown.
         assert_eq!(snap["b"].status, HealthState::Unknown);
+    }
+
+    #[test]
+    fn sync_with_follows_the_config_and_keeps_known_statuses() {
+        let load = |toml: &str| Config::load_text(toml, "test").expect("config");
+        let boot = load(
+            r#"
+            [[providers]]
+            name = "a"
+            kind = "openai"
+            [[providers]]
+            name = "b"
+            kind = "tei"
+            base_url = "http://tei:8080"
+            "#,
+        );
+        let health = ProviderHealth::from_config(&boot);
+        assert_eq!(
+            health.snapshot().keys().collect::<Vec<_>>(),
+            ["a", "b"],
+            "every provider is listed from boot"
+        );
+        assert_eq!(
+            health.targets().len(),
+            1,
+            "only base_url providers are probed"
+        );
+        health.record(
+            "b",
+            ProviderStatus {
+                status: HealthState::Up,
+                checked_at: Some(1),
+                latency_ms: Some(2),
+                detail: None,
+            },
+        );
+
+        // A reload drops `a`, keeps `b` (and its status), and adds `c`.
+        let reloaded = load(
+            r#"
+            [[providers]]
+            name = "b"
+            kind = "tei"
+            base_url = "http://tei:8080"
+            [[providers]]
+            name = "c"
+            kind = "ollama"
+            base_url = "http://ollama:11434"
+            "#,
+        );
+        health.sync_with(&reloaded);
+        let snap = health.snapshot();
+        assert_eq!(snap.keys().collect::<Vec<_>>(), ["b", "c"]);
+        assert_eq!(
+            snap["b"].status,
+            HealthState::Up,
+            "a kept provider keeps its status"
+        );
+        assert_eq!(snap["c"].status, HealthState::Unknown);
+        let probed: Vec<String> = health.targets().iter().map(|t| t.name.clone()).collect();
+        assert_eq!(probed, ["b", "c"], "the new provider is probed too");
+
+        // A late result for the removed provider does not resurrect it.
+        health.record("a", ProviderStatus::unknown());
+        assert!(!health.snapshot().contains_key("a"));
     }
 
     #[test]
@@ -481,6 +649,54 @@ mod tests {
         let snap = health.snapshot();
         assert_eq!(snap["ollama"].status, HealthState::Up);
         assert_eq!(snap["ollama"].detail.as_deref(), Some("liveness ok"));
+    }
+
+    #[tokio::test]
+    async fn a_provider_dropped_by_a_reload_loses_its_gauge_series() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/health"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&upstream)
+            .await;
+        let with_tei = format!(
+            "[[providers]]\nname = \"tei\"\nkind = \"tei\"\nbase_url = \"{}\"\n",
+            upstream.uri()
+        );
+        let registry = lumen_telemetry::Metrics::new();
+        let gauge = ResilienceMetrics::register(&registry).expect("register");
+        let health = ProviderHealth::from_config(&Config::load_text(&with_tei, "t").expect("cfg"));
+        health.gauge.set(gauge.clone()).expect("unset");
+
+        probe_once(
+            &reqwest::Client::new(),
+            &health.targets(),
+            &health,
+            Some(&gauge),
+            Duration::from_secs(5),
+        )
+        .await;
+        assert!(registry
+            .encode_text()
+            .contains("lumen_provider_up{provider=\"tei\"} 1"));
+
+        health.sync_with(&Config::load_text("", "t").expect("empty cfg"));
+        assert!(!registry.encode_text().contains("provider=\"tei\""));
+        // A probe that was still in flight for it does not bring it back.
+        probe_once(
+            &reqwest::Client::new(),
+            &[ProbeTarget {
+                name: "tei".to_owned(),
+                url: upstream.uri(),
+                kind: lumen_providers::ProviderKind::Tei,
+            }],
+            &health,
+            Some(&gauge),
+            Duration::from_secs(5),
+        )
+        .await;
+        assert!(!registry.encode_text().contains("provider=\"tei\""));
+        assert!(health.snapshot().is_empty());
     }
 
     #[tokio::test]

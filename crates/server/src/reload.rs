@@ -78,6 +78,7 @@ use tokio::sync::Notify;
 
 use crate::config::{Config, ConfigError, TokenizerMode};
 use crate::config_source::ConfigContext;
+use crate::health::ProviderHealth;
 use crate::pricing::CostTable;
 use crate::resilience::ResilienceRuntime;
 use crate::tokenizer::TokenCounter;
@@ -150,19 +151,16 @@ impl AuthKnobs {
 pub struct ProviderKeySource {
     store: KeyStore,
     master: MasterKey,
-    provider_names: Vec<String>,
 }
 
 impl ProviderKeySource {
-    /// Build a source over `store`, decrypting with `master`, for exactly the
-    /// configured `provider_names` (bounded by config, never client input).
+    /// Build a source over `store`, decrypting with `master`. Which providers
+    /// it reads is decided per reload, from the config being applied (bounded
+    /// by config, never client input), so a provider added at runtime gets
+    /// its stored key too.
     #[must_use]
-    pub fn new(store: KeyStore, master: MasterKey, provider_names: Vec<String>) -> Self {
-        Self {
-            store,
-            master,
-            provider_names,
-        }
+    pub fn new(store: KeyStore, master: MasterKey) -> Self {
+        Self { store, master }
     }
 }
 
@@ -211,6 +209,11 @@ pub struct ReloadTargets {
     /// reload rebuilds it only when `[tokenizer] mode` changed, since
     /// `accurate` mode loads BPE encoders.
     pub token_counter: Option<Arc<ArcSwap<TokenCounter>>>,
+    /// The provider-health registry `/health/providers` reads
+    /// ([`AppState::health`](crate::AppState::health)); a reload re-syncs it
+    /// with the new provider list (added ones listed, removed ones dropped)
+    /// and swaps the background probe's targets.
+    pub health: Option<Arc<ProviderHealth>>,
 }
 
 /// Atomically swap the routing table, price table, resilience policy, auth
@@ -264,12 +267,15 @@ pub fn apply_reload(config: &Config, targets: &ReloadTargets) -> Result<(), Relo
             cell.store(Arc::new(TokenCounter::from_config(&config.tokenizer)));
         }
     }
+    if let Some(health) = &targets.health {
+        health.sync_with(config);
+    }
     targets.metrics.inc_success();
     tracing::info!(
         model_count = config.loaded_models().len(),
         provider_count = config.providers.len(),
         "configuration reloaded; routing table, pricing, resilience policy, auth knobs, \
-         image-fetch policy and tokenizer swapped"
+         image-fetch policy, tokenizer and provider-health registry swapped"
     );
     Ok(())
 }
@@ -308,19 +314,21 @@ fn apply_webhook_reload(config: &Config, targets: &ReloadTargets) {
     }
 }
 
-/// Re-read every configured provider's key from the encrypted DB store. A
-/// provider with no stored key is simply absent from the map (env stays the
-/// primary source; [`merge_key_backfill`] only fills env-keyless specs). Runs in
-/// the reload task, never on the request path.
+/// Re-read the key of every provider in `provider_names` (the config being
+/// applied) from the encrypted DB store. A provider with no stored key is
+/// simply absent from the map (env stays the primary source;
+/// [`merge_key_backfill`] only fills env-keyless specs). Runs in the reload
+/// task, never on the request path.
 ///
 /// # Errors
 /// Propagates the first DB/decryption error; the caller keeps the previous
 /// snapshot on failure so a sick DB never strips a working key.
 pub async fn refresh_provider_keys(
     source: &ProviderKeySource,
+    provider_names: &[String],
 ) -> Result<HashMap<String, String>, lumen_auth::AuthError> {
     let mut fresh = HashMap::new();
-    for name in &source.provider_names {
+    for name in provider_names {
         if let Some(key) = source.store.load_provider_key(name, &source.master).await? {
             fresh.insert(name.clone(), key);
         }
@@ -498,9 +506,10 @@ pub fn spawn_config_reloader(
     Ok(handle)
 }
 
-/// Run one reload: refresh the DB provider-key snapshot (async, in this task,
-/// off the request path), load and validate the current document via
-/// `ctx.load_config()`, then apply it on a blocking thread (the registry
+/// Run one reload: load and validate the current document via
+/// `ctx.load_config()`, refresh the DB provider-key snapshot for its providers
+/// (async, in this task, off the request path), then apply it on a blocking
+/// thread (the registry
 /// rebuild's HTTP-client construction, kept off the runtime worker - CLAUDE.md
 /// rule 2 in spirit; the actual figment/file work already ran inside
 /// `load_config`). A DB refresh error keeps the previous snapshot; a load or
@@ -508,17 +517,6 @@ pub fn spawn_config_reloader(
 /// extended to the whole document). Public so the boot path and the tests
 /// share exactly one reload entry point.
 pub async fn reload_once(ctx: &Arc<ConfigContext>, targets: &Arc<ReloadTargets>) {
-    // Rotation without restart: re-read provider keys from the encrypted DB.
-    // Keep the previous snapshot on any error so a sick DB never strips a key.
-    if let Some(source) = &targets.key_source {
-        match refresh_provider_keys(source).await {
-            Ok(fresh) => targets.key_backfill.store(Arc::new(fresh)),
-            Err(error) => tracing::warn!(
-                %error,
-                "provider-key refresh failed; keeping the previous DB-key snapshot"
-            ),
-        }
-    }
     // Virtual keys and budget groups created offline (e.g. `lumen keys
     // create` straight against the DB) become live here: re-read the tables
     // and upsert into the in-memory state. Groups refresh FIRST so the key
@@ -571,6 +569,20 @@ pub async fn reload_once(ctx: &Arc<ConfigContext>, targets: &Arc<ReloadTargets>)
             return;
         }
     };
+    // Rotation without restart: re-read provider keys from the encrypted DB,
+    // for the providers of the config about to apply (so a provider added
+    // since boot gets its stored key). Keep the previous snapshot on any
+    // error so a sick DB never strips a key.
+    if let Some(source) = &targets.key_source {
+        let names: Vec<String> = config.providers.iter().map(|p| p.name.clone()).collect();
+        match refresh_provider_keys(source, &names).await {
+            Ok(fresh) => targets.key_backfill.store(Arc::new(fresh)),
+            Err(error) => tracing::warn!(
+                %error,
+                "provider-key refresh failed; keeping the previous DB-key snapshot"
+            ),
+        }
+    }
     let targets = Arc::clone(targets);
     let joined = tokio::task::spawn_blocking(move || {
         let _ = apply_reload(&config, &targets);
@@ -690,6 +702,7 @@ mod tests {
             auth_runtime: None,
             image_fetch: None,
             token_counter: None,
+            health: None,
         }
     }
 
@@ -907,12 +920,10 @@ mod tests {
             .expect("store old key");
 
         // Boot the registry with the boot snapshot (old key).
-        let source = Arc::new(ProviderKeySource::new(
-            store.clone(),
-            source_master,
-            vec!["cohere".to_owned()],
-        ));
-        let boot_backfill = refresh_provider_keys(&source).await.expect("boot backfill");
+        let source = Arc::new(ProviderKeySource::new(store.clone(), source_master));
+        let boot_backfill = refresh_provider_keys(&source, &["cohere".to_owned()])
+            .await
+            .expect("boot backfill");
         assert_eq!(
             boot_backfill.get("cohere").map(String::as_str),
             Some("old-key")
@@ -931,6 +942,7 @@ mod tests {
             auth_runtime: None,
             image_fetch: None,
             token_counter: None,
+            health: None,
         });
 
         // Rotate the DB key, then run one reload through the real entry point.
@@ -951,6 +963,86 @@ mod tests {
             registry.rerank_route("rr").is_some(),
             "registry still routes"
         );
+    }
+
+    #[tokio::test]
+    async fn reload_loads_the_stored_key_of_a_provider_added_after_boot() {
+        use lumen_auth::store::KeyStore;
+
+        // Boot with one provider; a second one (keyed only from the DB) is
+        // added to the document later, as `PUT /admin/config/providers`
+        // followed by `PUT /admin/provider-keys` would do.
+        let dir = tempdir();
+        let path = write_config(&dir, ONE_MODEL);
+        let store = KeyStore::in_memory().await.expect("store");
+        let master = MasterKey::from_env_value(&"a".repeat(64)).expect("master");
+        store
+            .store_provider_key("late", "late-key", &master)
+            .await
+            .expect("store key");
+        let registry = registry_from(&path);
+        let mut t = targets(
+            Arc::clone(&registry),
+            ReloadMetrics::register(&Metrics::new()).unwrap(),
+        );
+        t.key_source = Some(Arc::new(ProviderKeySource::new(
+            store.clone(),
+            MasterKey::from_env_value(&"a".repeat(64)).expect("master"),
+        )));
+        let t = Arc::new(t);
+
+        reload_once(&ctx(&path), &t).await;
+        assert!(
+            t.key_backfill.load().get("late").is_none(),
+            "a provider the config does not define gets no key"
+        );
+
+        let body = format!(
+            "{ONE_MODEL}
+            [[providers]]
+            name = \"late\"
+            kind = \"cohere\"
+            [[providers.models]]
+            id = \"rr\"
+            capabilities = [\"rerank\"]
+            "
+        );
+        std::fs::write(&path, body).expect("rewrite config");
+        reload_once(&ctx(&path), &t).await;
+        assert_eq!(
+            t.key_backfill.load().get("late").map(String::as_str),
+            Some("late-key"),
+            "a provider added after boot must get its stored key on reload"
+        );
+        assert!(registry.rerank_route("rr").is_some());
+    }
+
+    #[tokio::test]
+    async fn reload_resyncs_the_provider_health_registry() {
+        let dir = tempdir();
+        let path = write_config(&dir, ONE_MODEL);
+        let registry = registry_from(&path);
+        let health = Arc::new(ProviderHealth::from_config(&load(&path)));
+        let mut t = targets(registry, ReloadMetrics::register(&Metrics::new()).unwrap());
+        t.health = Some(Arc::clone(&health));
+
+        std::fs::write(
+            &path,
+            r#"
+            [[providers]]
+            name = "tei"
+            kind = "tei"
+            base_url = "http://tei:8080"
+            [[providers.models]]
+            id = "embed"
+            capabilities = ["embed"]
+            "#,
+        )
+        .expect("rewrite config");
+        apply_reload(&load(&path), &t).expect("reload applies");
+        let snap = health.snapshot();
+        assert_eq!(snap.keys().collect::<Vec<_>>(), ["tei"], "{snap:?}");
+        assert_eq!(health.targets().len(), 1, "the new provider is probed");
     }
 
     #[tokio::test]

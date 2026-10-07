@@ -111,7 +111,17 @@ Every response does carry a conservative set of default security headers:
   `/admin/*` requires the master key, but `/metrics` is unauthenticated by
   design - see [`SECURITY.md`](https://github.com/qdequele/lumen/blob/main/SECURITY.md).
 - **`GET /health`** is safe to point a liveness probe at: it never depends
-  on provider state and does no I/O.
+  on provider state and does no I/O. It answers
+  `{"status": "ok", "version": "<gateway version>"}`, unauthenticated, so a
+  control plane can show which build it talks to.
+- **Webhook receivers set through `PUT /admin/webhooks` must be public.**
+  Internal hosts (loopback, private, link-local, `localhost`, or names that
+  resolve to them) are refused unless listed in
+  `LUMEN_WEBHOOK_ALLOWED_HOSTS` (comma-separated hosts, `.suffix` for a
+  domain and its subdomains, read at boot). Set it when the receiver runs
+  next to the gateway, for example `LUMEN_WEBHOOK_ALLOWED_HOSTS=lab` in a
+  Compose network. See
+  [Outbound webhooks](keys-budgets.md#outbound-webhooks-for-budget-events).
 
 ## Scaling and high availability
 

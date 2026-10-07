@@ -215,6 +215,106 @@ where
     serde::Deserialize::deserialize(deserializer).map(Some)
 }
 
+/// Largest accepted `budget_max`, in USD. The same bound the grant routes
+/// enforce: far below the in-memory micro-USD clamp (~9.2e12), so a stored cap
+/// can never round onto the unlimited sentinel.
+pub const MAX_BUDGET_USD: f64 = 1e12;
+
+/// The limit checks shared by key and group writes: a budget must be a finite
+/// number in `0..=MAX_BUDGET_USD`, and quotas and the expiry non-negative.
+/// Zero is legal everywhere (a real "spend nothing" / "admit nothing" cap).
+fn validate_limits(
+    budget_max: Option<f64>,
+    rpm_limit: Option<i64>,
+    tpm_limit: Option<i64>,
+    expires_at: Option<i64>,
+) -> Result<(), String> {
+    if let Some(budget) = budget_max {
+        if !(budget.is_finite() && (0.0..=MAX_BUDGET_USD).contains(&budget)) {
+            return Err(format!(
+                "`budget_max` must be a number between 0 and {MAX_BUDGET_USD:e} USD, got {budget}"
+            ));
+        }
+    }
+    for (field, value) in [
+        ("rpm_limit", rpm_limit),
+        ("tpm_limit", tpm_limit),
+        ("expires_at", expires_at),
+    ] {
+        if let Some(value) = value.filter(|v| *v < 0) {
+            return Err(format!("`{field}` must not be negative, got {value}"));
+        }
+    }
+    Ok(())
+}
+
+/// A label must carry at least one non-whitespace character.
+fn validate_name(name: &str) -> Result<(), String> {
+    if name.trim().is_empty() {
+        Err("`name` must not be empty".to_owned())
+    } else {
+        Ok(())
+    }
+}
+
+impl NewKey {
+    /// Check the fields a caller supplies, before anything is written.
+    ///
+    /// # Errors
+    /// A message naming the offending field.
+    pub fn validate(&self) -> Result<(), String> {
+        validate_name(&self.name)?;
+        validate_limits(
+            self.budget_max,
+            self.rpm_limit,
+            self.tpm_limit,
+            self.expires_at,
+        )
+    }
+}
+
+impl KeyPatch {
+    /// The [`NewKey::validate`] rules, for the fields this patch sets.
+    ///
+    /// # Errors
+    /// A message naming the offending field.
+    pub fn validate(&self) -> Result<(), String> {
+        if let Some(name) = &self.name {
+            validate_name(name)?;
+        }
+        validate_limits(
+            self.budget_max,
+            self.rpm_limit,
+            self.tpm_limit,
+            self.expires_at,
+        )
+    }
+}
+
+impl NewGroup {
+    /// Check the fields a caller supplies, before anything is written.
+    ///
+    /// # Errors
+    /// A message naming the offending field.
+    pub fn validate(&self) -> Result<(), String> {
+        validate_name(&self.name)?;
+        validate_limits(self.budget_max, None, None, None)
+    }
+}
+
+impl GroupPatch {
+    /// The [`NewGroup::validate`] rules, for the fields this patch sets.
+    ///
+    /// # Errors
+    /// A message naming the offending field.
+    pub fn validate(&self) -> Result<(), String> {
+        if let Some(name) = &self.name {
+            validate_name(name)?;
+        }
+        validate_limits(self.budget_max, None, None, None)
+    }
+}
+
 /// One usage-log entry (M5 §5.3 / ADR 003). No prompt or response content -
 /// counts, cost and labels only.
 #[derive(Debug, Clone)]
@@ -1398,6 +1498,20 @@ impl KeyStore {
         Ok(())
     }
 
+    /// Forget a stored provider key, so a provider later created under the
+    /// same name does not silently inherit it. Returns whether a key existed.
+    ///
+    /// # Errors
+    ///
+    /// A database error.
+    pub async fn delete_provider_key(&self, name: &str) -> Result<bool, AuthError> {
+        let done = sqlx::query("DELETE FROM provider_keys WHERE name = ?")
+            .bind(name)
+            .execute(&self.pool)
+            .await?;
+        Ok(done.rows_affected() > 0)
+    }
+
     /// Load and decrypt a provider key. `Ok(None)` when absent; an error when
     /// present but undecryptable (wrong master key / corruption) - that must
     /// fail loudly, not silently behave like a missing key.
@@ -1751,5 +1865,70 @@ mod rfc3339_tests {
         assert_eq!(format_rfc3339(1_000_000_000), "2001-09-09T01:46:40Z");
         // 2020 is a leap year: 2020-02-29 exists.
         assert_eq!(format_rfc3339(1_582_934_400), "2020-02-29T00:00:00Z");
+    }
+}
+
+#[cfg(test)]
+mod input_validation_tests {
+    use super::{GroupPatch, KeyPatch, NewGroup, NewKey, MAX_BUDGET_USD};
+
+    #[test]
+    fn key_and_group_inputs_reject_negative_limits_and_blank_names() {
+        let key = |f: fn(&mut NewKey)| {
+            let mut k = NewKey {
+                name: "k".to_owned(),
+                ..NewKey::default()
+            };
+            f(&mut k);
+            k.validate()
+        };
+        assert!(key(|_| {}).is_ok());
+        assert!(key(|k| k.budget_max = Some(0.0)).is_ok());
+        assert!(key(|k| k.budget_max = Some(MAX_BUDGET_USD)).is_ok());
+        assert!(key(|k| k.rpm_limit = Some(0)).is_ok());
+        for (bad, field) in [
+            (key(|k| k.name = " ".to_owned()), "name"),
+            (key(|k| k.budget_max = Some(-0.01)), "budget_max"),
+            (key(|k| k.budget_max = Some(f64::NAN)), "budget_max"),
+            (key(|k| k.budget_max = Some(f64::INFINITY)), "budget_max"),
+            (
+                key(|k| k.budget_max = Some(MAX_BUDGET_USD * 2.0)),
+                "budget_max",
+            ),
+            (key(|k| k.rpm_limit = Some(-1)), "rpm_limit"),
+            (key(|k| k.tpm_limit = Some(-1)), "tpm_limit"),
+            (key(|k| k.expires_at = Some(-1)), "expires_at"),
+        ] {
+            let message = bad.expect_err(field);
+            assert!(message.contains(field), "{message}");
+        }
+
+        assert!(
+            KeyPatch::default().validate().is_ok(),
+            "an empty patch is fine"
+        );
+        let patch = KeyPatch {
+            budget_max: Some(-1.0),
+            ..KeyPatch::default()
+        };
+        assert!(patch.validate().is_err());
+        let patch = KeyPatch {
+            name: Some(String::new()),
+            ..KeyPatch::default()
+        };
+        assert!(patch.validate().is_err());
+
+        let group = NewGroup {
+            name: "g".to_owned(),
+            budget_max: Some(-5.0),
+            account_ref: None,
+        };
+        assert!(group.validate().is_err());
+        let patch = GroupPatch {
+            budget_max: Some(-5.0),
+            ..GroupPatch::default()
+        };
+        assert!(patch.validate().is_err());
+        assert!(GroupPatch::default().validate().is_ok());
     }
 }

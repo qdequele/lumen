@@ -481,20 +481,20 @@ async fn admin_grant_with_a_non_positive_non_finite_or_missing_amount_is_400_lm1
 }
 
 #[tokio::test]
-async fn admin_grant_to_an_unknown_or_deleted_id_is_400_lm1001() {
+async fn admin_grant_to_an_unknown_or_deleted_id_is_404_lm1003() {
     let upstream = MockServer::start().await;
     let h = spawn_gateway(chat_registry(&upstream.uri())).await;
 
     // Unknown ids.
     let unknown_key = h.grant_key("nope", &json!({ "amount": 5.0 })).await;
-    assert_eq!(unknown_key.status(), 400);
+    assert_eq!(unknown_key.status(), 404);
     let unknown_key_err: Value = unknown_key.json().await.expect("json");
-    assert_eq!(unknown_key_err["error"]["code"], "LM-1001");
+    assert_eq!(unknown_key_err["error"]["code"], "LM-1003");
 
     let unknown_group = h.grant_group("nope", &json!({ "amount": 5.0 })).await;
-    assert_eq!(unknown_group.status(), 400);
+    assert_eq!(unknown_group.status(), 404);
     let unknown_group_err: Value = unknown_group.json().await.expect("json");
-    assert_eq!(unknown_group_err["error"]["code"], "LM-1001");
+    assert_eq!(unknown_group_err["error"]["code"], "LM-1003");
 
     // Tombstones behave like unknown ids: a deleted key...
     let key = h
@@ -507,9 +507,9 @@ async fn admin_grant_to_an_unknown_or_deleted_id_is_400_lm1001() {
         .to_owned();
     assert_eq!(h.delete_key(&kid).await.status(), 204);
     let deleted_key = h.grant_key(&kid, &json!({ "amount": 5.0 })).await;
-    assert_eq!(deleted_key.status(), 400);
+    assert_eq!(deleted_key.status(), 404);
     let deleted_key_err: Value = deleted_key.json().await.expect("json");
-    assert_eq!(deleted_key_err["error"]["code"], "LM-1001");
+    assert_eq!(deleted_key_err["error"]["code"], "LM-1003");
 
     // ...and a deleted (member-less) group.
     let group = h
@@ -522,9 +522,9 @@ async fn admin_grant_to_an_unknown_or_deleted_id_is_400_lm1001() {
         .to_owned();
     assert_eq!(h.delete_group(&gid).await.status(), 204);
     let deleted_group = h.grant_group(&gid, &json!({ "amount": 5.0 })).await;
-    assert_eq!(deleted_group.status(), 400);
+    assert_eq!(deleted_group.status(), 404);
     let deleted_group_err: Value = deleted_group.json().await.expect("json");
-    assert_eq!(deleted_group_err["error"]["code"], "LM-1001");
+    assert_eq!(deleted_group_err["error"]["code"], "LM-1003");
 }
 
 #[tokio::test]

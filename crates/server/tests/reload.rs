@@ -166,16 +166,13 @@ async fn rotating_a_db_provider_key_takes_effect_on_reload_without_restart() {
         resilience: Arc::new(ResilienceRuntime::defaults()),
         metrics: ReloadMetrics::register(&Metrics::new()).expect("reload metrics"),
         key_backfill: Arc::new(ArcSwap::from_pointee(single("cohere", "old-key"))),
-        key_source: Some(Arc::new(ProviderKeySource::new(
-            store.clone(),
-            master(),
-            vec!["cohere".to_owned()],
-        ))),
+        key_source: Some(Arc::new(ProviderKeySource::new(store.clone(), master()))),
         auth_knobs: None,
         webhooks: None,
         auth_runtime: None,
         image_fetch: None,
         token_counter: None,
+        health: None,
     });
     reload_once(&ctx(&path), &targets).await;
 
@@ -255,6 +252,7 @@ async fn reload_makes_an_offline_group_and_member_key_live_and_group_enforced() 
         auth_runtime: Some(Arc::clone(&runtime)),
         image_fetch: None,
         token_counter: None,
+        health: None,
     });
     reload_once(&ctx(&path), &targets).await;
 
@@ -324,6 +322,7 @@ fn reload_targets(registry: Arc<Registry>, metrics: ReloadMetrics) -> ReloadTarg
         auth_runtime: None,
         image_fetch: None,
         token_counter: None,
+        health: None,
     }
 }
 
@@ -541,6 +540,7 @@ async fn reload_retargets_and_retunes_webhooks_without_dropping_the_queue() {
         auth_runtime: Some(Arc::clone(&runtime)),
         image_fetch: None,
         token_counter: None,
+        health: None,
     });
 
     // Reload with a new URL and a new event/threshold set.
@@ -638,6 +638,7 @@ async fn a_stored_webhook_row_wins_over_the_config_block_across_reloads() {
         auth_runtime: Some(Arc::clone(&runtime)),
         image_fetch: None,
         token_counter: None,
+        health: None,
     });
 
     // With no stored row, the file wins.

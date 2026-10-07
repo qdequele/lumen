@@ -357,7 +357,7 @@ async fn read_capped(
 /// link-local, unique-local, unspecified, shared, documentation, or multicast
 /// address returns `false` - the SSRF block that cannot be disabled.
 #[must_use]
-pub(crate) fn is_public_ip(ip: &IpAddr) -> bool {
+pub fn is_public_ip(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
             let o = v4.octets();
@@ -408,7 +408,7 @@ pub(crate) fn is_public_ip(ip: &IpAddr) -> bool {
 /// host. A `.suffix` entry matches the domain and its subdomains; other entries
 /// match exactly. Comparison is case-insensitive.
 #[must_use]
-pub(crate) fn host_allowed(host: &str, allowed: &[String]) -> bool {
+pub fn host_allowed(host: &str, allowed: &[String]) -> bool {
     if allowed.is_empty() {
         return true;
     }
