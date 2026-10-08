@@ -1,6 +1,6 @@
 # ADR 013 - SystemOne (typed decision) capability and the TypeSafe provider
 
-- Status: accepted
+- Status: superseded in part by ADR 016 (public format, capability name)
 - Date: 2026-09-26 (amended 2026-09-26: Jev as a reranker)
 
 ## Context
