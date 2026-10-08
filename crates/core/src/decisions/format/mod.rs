@@ -4,6 +4,7 @@
 //! entries; detection reads only the keys and the first byte of
 //! `questions`, then the chosen parser works on the same entries.
 
+pub mod openai;
 pub mod typesafe;
 
 use std::collections::HashSet;
@@ -55,11 +56,7 @@ pub fn parse(
     };
     let req = match format {
         Format::TypeSafe => typesafe::parse(entries)?,
-        Format::OpenAi => {
-            return Err(GatewayError::InvalidRequest(
-                "the OpenAI format is not supported yet".to_owned(),
-            ))
-        }
+        Format::OpenAi => openai::parse(entries)?,
     };
     Ok((format, req))
 }
@@ -76,9 +73,7 @@ pub fn render(
 ) -> Result<Vec<u8>, GatewayError> {
     match format {
         Format::TypeSafe => typesafe::render(resp, req),
-        Format::OpenAi => Err(GatewayError::Internal(
-            "OpenAI render not implemented".to_owned(),
-        )),
+        Format::OpenAi => openai::render(resp, req),
     }
 }
 
@@ -171,6 +166,15 @@ mod tests {
             let m = err(bad, None);
             assert!(m.contains("either OpenAI format"), "{bad}: {m}");
         }
+    }
+
+    #[test]
+    fn openai_bodies_detect_and_parse() {
+        let body = r#"{"model":"gpt-6-luna","input":"x","questions":[{"type":"predicate","instructions":"i"}]}"#;
+        assert!(matches!(
+            parse(body.as_bytes(), None),
+            Ok((Format::OpenAi, _))
+        ));
     }
 
     #[test]
