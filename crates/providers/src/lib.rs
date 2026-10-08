@@ -36,7 +36,6 @@ pub mod rerank;
 pub mod sse;
 pub mod tei;
 pub mod together;
-pub mod typesafe;
 pub mod voyage;
 
 pub use anthropic::AnthropicProvider;
@@ -60,9 +59,8 @@ pub use openai::OpenAiProvider;
 pub use pinecone::PineconeProvider;
 pub use registry::{
     ChatRoute, DecisionRoute, EmbeddingRoute, LoadedModelSummary, ModelSpec, ProviderSpec,
-    Registry, RegistryError, RerankRoute, SystemOneRoute,
+    Registry, RegistryError, RerankRoute,
 };
 pub use tei::TeiProvider;
 pub use together::TogetherRerankProvider;
-pub use typesafe::TypesafeProvider;
 pub use voyage::VoyageProvider;

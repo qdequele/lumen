@@ -265,3 +265,69 @@ fn debug_never_leaks_the_key() {
     let printed = format!("{p:?}");
     assert!(!printed.contains(KEY) && printed.contains("<redacted>"));
 }
+
+fn typesafe_at(uri: String) -> FamilyDecisionProvider {
+    FamilyDecisionProvider::typesafe(
+        build_client(),
+        "typesafe",
+        Some(uri),
+        None,
+        true,
+        Some(KEY.into()),
+    )
+}
+
+#[tokio::test]
+async fn missing_usage_is_none_not_zero() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            json!({"model": "jev", "answers": {"q": {"type": "noul", "noul": 0.7}}}),
+        ))
+        .mount(&mock)
+        .await;
+    let resp = typesafe_at(mock.uri())
+        .decide(ts_req(), CancellationToken::new())
+        .await
+        .unwrap();
+    assert!(resp.usage.is_none());
+}
+
+#[tokio::test]
+async fn malformed_usage_does_not_fail_a_billed_answer() {
+    // A billed answer must never become a 502 over its usage block: the
+    // counts are parsed leniently and the gateway estimates instead.
+    for usage in [
+        json!({"input_tokens": null}),
+        json!({"input_tokens": 318.0}),
+        json!("n/a"),
+    ] {
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"model": "jev", "answers": {"q": {"type": "noul", "noul": 0.7}}, "usage": usage})),
+            )
+            .mount(&mock)
+            .await;
+        let resp = typesafe_at(mock.uri())
+            .decide(ts_req(), CancellationToken::new())
+            .await
+            .unwrap_or_else(|e| panic!("{usage}: {e:?}"));
+        assert!(resp.usage.is_none(), "{usage}");
+    }
+}
+
+#[tokio::test]
+async fn typesafe_malformed_body_is_a_translation_error() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"answers": {}})))
+        .mount(&mock)
+        .await;
+    let err = typesafe_at(mock.uri())
+        .decide(ts_req(), CancellationToken::new())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ProviderError::Translation(_)), "{err:?}");
+}

@@ -46,7 +46,7 @@ pub struct Config {
     #[serde(default)]
     pub providers: Vec<ProviderConfig>,
     /// Virtual models (ADR 014): public ids carrying routing logic (fallback,
-    /// split, switch, presets, SystemOne rerank remap) over the foundation
+    /// split, switch, presets, decisions rerank remap) over the foundation
     /// models. Dynamic layer.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub virtual_models: Vec<lumen_router::virtual_models::VirtualModelConfig>,

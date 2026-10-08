@@ -11,7 +11,6 @@ use crate::decisions::{DecisionLimits, DecisionRequest, DecisionResponse};
 use crate::embed::{EmbedRequest, EmbedResponse};
 use crate::error::{GatewayError, ProviderError};
 use crate::rerank::{RerankRequest, RerankResponse};
-use crate::systemone::{SystemOneRequest, SystemOneResponse};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::{self, BoxStream, StreamExt};
@@ -116,18 +115,6 @@ pub trait RerankProvider: Send + Sync {
         req: RerankRequest,
         cancel: CancellationToken,
     ) -> Result<RerankResponse, ProviderError>;
-}
-
-/// A provider that can answer typed SystemOne questions about a state
-/// (ADR 013).
-#[async_trait]
-pub trait SystemOneProvider: Send + Sync {
-    /// Evaluate every question in `req` against its `state`.
-    async fn evaluate(
-        &self,
-        req: SystemOneRequest,
-        cancel: CancellationToken,
-    ) -> Result<SystemOneResponse, ProviderError>;
 }
 
 /// A provider that answers typed decision questions (ADR 016).

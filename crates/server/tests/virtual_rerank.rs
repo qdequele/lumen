@@ -73,7 +73,7 @@ fn config(jev: &str, cohere: &str, remap: &str) -> Config {
     .unwrap()
 }
 
-/// Answers every question of a SystemOne request with `answer(id)`.
+/// Answers every question of a decisions request with `answer(id)`.
 struct Jev(fn(&str) -> Value);
 
 impl Respond for Jev {

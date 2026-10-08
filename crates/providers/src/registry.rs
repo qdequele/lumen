@@ -11,7 +11,6 @@
 use arc_swap::ArcSwap;
 use lumen_core::{
     Capability, ChatProvider, DecisionProvider, EmbeddingProvider, ReleaseDate, RerankProvider,
-    SystemOneProvider,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -38,7 +37,6 @@ use crate::openai::OpenAiProvider;
 use crate::pinecone::PineconeProvider;
 use crate::tei::TeiProvider;
 use crate::together::TogetherRerankProvider;
-use crate::typesafe::TypesafeProvider;
 use crate::voyage::VoyageProvider;
 
 /// A model exposed by a provider, with its upstream id and capabilities.
@@ -257,28 +255,6 @@ impl std::fmt::Debug for DecisionRoute {
     }
 }
 
-/// A resolved SystemOne route: the provider to call and the upstream model id
-/// (ADR 013).
-#[derive(Clone)]
-pub struct SystemOneRoute {
-    /// The provider serving the model.
-    pub provider: Arc<dyn SystemOneProvider>,
-    /// The configured provider name (for attributing upstream errors).
-    pub provider_name: String,
-    /// The upstream model id to send (already alias-resolved).
-    pub upstream_id: String,
-}
-
-impl std::fmt::Debug for SystemOneRoute {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SystemOneRoute")
-            .field("provider_name", &self.provider_name)
-            .field("upstream_id", &self.upstream_id)
-            .field("provider", &"<dyn SystemOneProvider>")
-            .finish()
-    }
-}
-
 /// A resolved chat route: the provider to call and the upstream model id.
 #[derive(Clone)]
 pub struct ChatRoute {
@@ -323,8 +299,6 @@ struct Inner {
     embedding: HashMap<String, EmbeddingRoute>,
     /// model id -> rerank route.
     rerank: HashMap<String, RerankRoute>,
-    /// model id -> SystemOne route.
-    systemone: HashMap<String, SystemOneRoute>,
     /// model id -> decision route (ADR 016).
     decisions: HashMap<String, DecisionRoute>,
     /// model id -> declared capabilities (all of them, even not-yet-served
@@ -347,7 +321,6 @@ struct BuiltProviders {
     chat: Option<Arc<dyn ChatProvider>>,
     embed: Option<Arc<dyn EmbeddingProvider>>,
     rerank: Option<Arc<dyn RerankProvider>>,
-    systemone: Option<Arc<dyn SystemOneProvider>>,
     decisions: Option<Arc<dyn DecisionProvider>>,
 }
 
@@ -416,12 +389,6 @@ impl Registry {
     #[must_use]
     pub fn decision_route(&self, model_id: &str) -> Option<DecisionRoute> {
         self.inner.load().decisions.get(model_id).cloned()
-    }
-
-    /// Resolve a model id to a SystemOne route, if one serves it.
-    #[must_use]
-    pub fn systemone_route(&self, model_id: &str) -> Option<SystemOneRoute> {
-        self.inner.load().systemone.get(model_id).cloned()
     }
 
     /// Whether any provider declares this model id (for any capability).
@@ -603,17 +570,7 @@ fn build_inner(
                         },
                     );
                 }
-                if let Some(provider) = &built.systemone {
-                    inner.systemone.insert(
-                        model.id.clone(),
-                        SystemOneRoute {
-                            provider: provider.clone(),
-                            provider_name: spec.name.clone(),
-                            upstream_id: model.upstream_id.clone(),
-                        },
-                    );
-                }
-                if built.decisions.is_none() && built.systemone.is_none() {
+                if built.decisions.is_none() {
                     warn_unsupported(spec, &model.id, "decisions");
                 }
             }
@@ -833,7 +790,6 @@ fn build_providers(
                 chat: Some(chat),
                 embed: Some(embed),
                 rerank: None,
-                systemone: None,
                 decisions,
             })
         }
@@ -873,7 +829,6 @@ fn build_providers(
                 chat: Some(chat),
                 embed: Some(embed),
                 rerank: Some(rerank),
-                systemone: None,
                 decisions: Some(decisions),
             })
         }
@@ -908,7 +863,6 @@ fn build_providers(
                 chat: Some(chat),
                 embed: Some(embed),
                 rerank: Some(rerank),
-                systemone: None,
                 decisions: None,
             })
         }
@@ -923,7 +877,6 @@ fn build_providers(
                 chat: None,
                 embed: None,
                 rerank: Some(rerank),
-                systemone: None,
                 decisions: None,
             })
         }
@@ -938,7 +891,6 @@ fn build_providers(
                 chat: None,
                 embed: None,
                 rerank: Some(rerank),
-                systemone: None,
                 decisions: None,
             })
         }
@@ -956,19 +908,12 @@ fn build_providers(
                 chat: None,
                 embed: None,
                 rerank: Some(rerank),
-                systemone: None,
                 decisions: None,
             })
         }
-        // TypeSafe: SystemOne typed decisions only (ADR 013). `base_url`
+        // TypeSafe: typed decisions only (ADR 013, 016). `base_url`
         // defaults to the public API and is overridable.
         ProviderKind::Typesafe => {
-            let systemone: Arc<dyn SystemOneProvider> = Arc::new(TypesafeProvider::new(
-                client.clone(),
-                spec.name.clone(),
-                spec.base_url.clone(),
-                spec.api_key.clone(),
-            ));
             let decisions: Arc<dyn DecisionProvider> = Arc::new(FamilyDecisionProvider::typesafe(
                 client.clone(),
                 spec.name.clone(),
@@ -981,7 +926,6 @@ fn build_providers(
                 chat: None,
                 embed: None,
                 rerank: None,
-                systemone: Some(systemone),
                 decisions: Some(decisions),
             })
         }
@@ -998,7 +942,6 @@ fn build_providers(
                 chat: Some(chat),
                 embed: Some(embed),
                 rerank: None,
-                systemone: None,
                 decisions: None,
             })
         }
@@ -1016,7 +959,6 @@ fn build_providers(
                 chat: Some(chat),
                 embed: None,
                 rerank: None,
-                systemone: None,
                 decisions: None,
             })
         }
@@ -1070,7 +1012,6 @@ fn build_providers(
                 chat: Some(chat),
                 embed: Some(embed),
                 rerank: None,
-                systemone: None,
                 decisions: Some(decisions),
             })
         }
@@ -1091,7 +1032,6 @@ fn build_providers(
                 chat: Some(chat),
                 embed: Some(embed),
                 rerank: Some(rerank),
-                systemone: None,
                 decisions: None,
             })
         }
@@ -1108,7 +1048,6 @@ fn build_providers(
                 chat: None,
                 embed: Some(embed),
                 rerank: Some(rerank),
-                systemone: None,
                 decisions: None,
             })
         }
@@ -1126,7 +1065,6 @@ fn build_providers(
                 chat: None,
                 embed: Some(embed),
                 rerank: Some(rerank),
-                systemone: None,
                 decisions: None,
             })
         }
@@ -1143,7 +1081,6 @@ fn build_providers(
                 chat: None,
                 embed: Some(embed),
                 rerank: Some(rerank),
-                systemone: None,
                 decisions: None,
             })
         }
@@ -1165,7 +1102,6 @@ fn build_providers(
                 chat: Some(chat),
                 embed: Some(embed),
                 rerank: None,
-                systemone: None,
                 decisions: None,
             })
         }
@@ -1186,7 +1122,6 @@ fn build_providers(
                 chat: Some(chat),
                 embed: Some(embed),
                 rerank: None,
-                systemone: None,
                 decisions: None,
             })
         }
@@ -1201,7 +1136,6 @@ fn build_providers(
                 chat: Some(chat),
                 embed: Some(embed),
                 rerank: None,
-                systemone: None,
                 decisions: None,
             })
         }
@@ -1216,7 +1150,6 @@ fn build_providers(
                 chat: Some(chat),
                 embed: Some(embed),
                 rerank: None,
-                systemone: None,
                 decisions: None,
             })
         }
@@ -2098,7 +2031,7 @@ mod tests {
     }
 
     #[test]
-    fn typesafe_serves_systemone_only() {
+    fn typesafe_serves_decisions_only() {
         // Jev reranks only through a virtual model `remap` (ADR 014): a
         // typesafe model declaring `rerank` builds no rerank route (config
         // validation rejects it before this point).
@@ -2116,17 +2049,17 @@ mod tests {
             Duration::from_secs(300),
         )
         .expect("typesafe builds with the default base URL");
-        let route = reg.systemone_route("jev").expect("systemone route");
+        let route = reg.decision_route("jev").expect("decisions route");
         assert_eq!(route.provider_name, "typesafe");
         assert!(reg.rerank_route("jev").is_none());
         assert!(reg.rerank_route("jev-rerank").is_none());
-        assert!(reg.systemone_route("jev-rerank").is_none());
+        assert!(reg.decision_route("jev-rerank").is_none());
         assert!(reg.chat_route("jev").is_none());
         assert!(reg.embedding_route("jev").is_none());
     }
 
     #[test]
-    fn systemone_is_not_served_by_non_systemone_kinds() {
+    fn decisions_are_not_served_by_non_decisions_kinds() {
         let reg = Registry::build(
             vec![spec(
                 ProviderKind::Cohere,
@@ -2138,7 +2071,7 @@ mod tests {
             Duration::from_secs(300),
         )
         .expect("builds");
-        assert!(reg.systemone_route("rr").is_none());
+        assert!(reg.decision_route("rr").is_none());
         assert!(reg.knows_model("rr"));
     }
 

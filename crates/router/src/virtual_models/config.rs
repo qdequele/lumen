@@ -87,7 +87,7 @@ pub struct TargetConfig {
     /// Request field overrides applied when this target is attempted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub overrides: Option<OverridesConfig>,
-    /// Rerank virtual models only: answer through a SystemOne model.
+    /// Rerank virtual models only: answer through a decisions model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remap: Option<RemapConfig>,
 }

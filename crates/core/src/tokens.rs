@@ -20,7 +20,6 @@
 use crate::chat::{ChatRequest, MessageContent};
 use crate::embed::EmbedRequest;
 use crate::rerank::RerankRequest;
-use crate::systemone::SystemOneRequest;
 
 /// The heuristic's byte-per-token ratio.
 const BYTES_PER_TOKEN: u64 = 4;
@@ -120,24 +119,11 @@ pub fn estimate_rerank(req: &RerankRequest) -> u64 {
         .sum()
 }
 
-/// Estimate the input tokens of a SystemOne request: the state is ingested
-/// once and every question is evaluated against it, so the estimate is the
-/// state's JSON plus each question body's JSON (ADR 013).
-#[must_use]
-pub fn estimate_systemone(req: &SystemOneRequest) -> u64 {
-    let questions: u64 = req
-        .questions()
-        .iter()
-        .map(|(_, body)| estimate_text(body.get()))
-        .sum();
-    estimate_text(req.state().get()).saturating_add(questions)
-}
-
 /// Estimate the input tokens of a decision request (ADR 003, 016): the
 /// input once (text, raw state, and the flat per-image estimate per
 /// `detail`), plus every question as sent. A question that carries its
 /// client TypeSafe body counts that body, so TypeSafe-format requests
-/// estimate exactly as `estimate_systemone` did.
+/// estimate as the state once plus each question body.
 #[must_use]
 pub fn estimate_decisions(req: &crate::decisions::DecisionRequest) -> u64 {
     use crate::decisions::{Input, Part, QuestionKind};
@@ -310,19 +296,6 @@ mod tests {
     }
 
     #[test]
-    fn systemone_counts_state_once_plus_every_question() {
-        // state `"abcdef"` is 8 bytes (2 tokens); each question body below is
-        // 36 bytes (9 tokens).
-        let req: SystemOneRequest = serde_json::from_str(
-            r#"{"model":"m","state":"abcdef","questions":{
-                "a":{"type":"noul","instructions":"?!"},
-                "b":{"type":"noul","instructions":"!?"}}}"#,
-        )
-        .expect("valid request");
-        assert_eq!(estimate_systemone(&req), 2 + 9 + 9);
-    }
-
-    #[test]
     fn image_part_adds_strictly_more_tokens_than_text_only() {
         let text_only = request(vec![parts_msg(vec![text_part("hello")])]);
         let with_image = request(vec![parts_msg(vec![text_part("hello"), image_part(None)])]);
@@ -379,27 +352,15 @@ mod tests {
     }
 
     #[test]
-    fn decisions_estimate_matches_the_systemone_estimate_for_typesafe_bodies() {
-        let body = r#"{"model":"jev","state":"hello world","questions":{"q":{"type":"noul","instructions":"Is it?"}}}"#;
-        let old: SystemOneRequest = serde_json::from_str(body).unwrap();
-        let new = crate::decisions::DecisionRequest::new(
-            "jev".into(),
-            crate::decisions::Input::Structured(
-                serde_json::value::RawValue::from_string("\"hello world\"".into()).unwrap(),
-            ),
-            vec![crate::decisions::Question {
-                name: Some("q".into()),
-                instructions: Some(crate::decisions::Text::Plain("Is it?".into())),
-                kind: crate::decisions::QuestionKind::Predicate { criteria: None },
-                raw: Some(
-                    serde_json::value::RawValue::from_string(
-                        r#"{"type":"noul","instructions":"Is it?"}"#.into(),
-                    )
-                    .unwrap(),
-                ),
-            }],
-        );
-        assert_eq!(estimate_decisions(&new), estimate_systemone(&old));
+    fn decisions_counts_state_once_plus_every_question() {
+        use crate::decisions::format::{parse, Format};
+        // state `"abcdef"` is 8 bytes (2 tokens); each question body below is
+        // 36 bytes (9 tokens).
+        let body = r#"{"model":"m","state":"abcdef","questions":{
+                "a":{"type":"noul","instructions":"?!"},
+                "b":{"type":"noul","instructions":"!?"}}}"#;
+        let (_, req) = parse(body.as_bytes(), Some(Format::TypeSafe)).expect("valid request");
+        assert_eq!(estimate_decisions(&req), 2 + 9 + 9);
     }
 
     #[test]

@@ -12,9 +12,7 @@ use lumen_telemetry::DecisionMetrics;
 
 use crate::executor::Link;
 use crate::virtual_models::decide::{Attempt, Decision};
-use crate::{
-    ChatChainLink, DecisionChainLink, EmbeddingChainLink, RerankChainLink, SystemOneChainLink,
-};
+use crate::{ChatChainLink, DecisionChainLink, EmbeddingChainLink, RerankChainLink};
 
 /// Resolve every attempt; a missing primary is the routing error, a missing
 /// later attempt (a hot-reload race) is skipped with a warning.
@@ -89,27 +87,6 @@ pub fn resolve_embedding_decision(
         .into_iter()
         .zip(&decision.attempts)
         .map(|(route, a)| EmbeddingChainLink {
-            route,
-            model_id: a.model_id.clone(),
-        })
-        .collect())
-}
-
-/// Resolve a SystemOne decision.
-///
-/// # Errors
-/// The primary's routing miss.
-pub fn resolve_systemone_decision(
-    registry: &Registry,
-    decision: &mut Decision,
-) -> Result<Vec<SystemOneChainLink>, GatewayError> {
-    let routes = resolve(registry, decision, Capability::Decisions, |r, a| {
-        r.systemone_route(&a.model_id)
-    })?;
-    Ok(routes
-        .into_iter()
-        .zip(&decision.attempts)
-        .map(|(route, a)| SystemOneChainLink {
             route,
             model_id: a.model_id.clone(),
         })
@@ -327,7 +304,7 @@ mod tests {
         let chain = resolve_rerank_decision(&reg, &mut d, None).unwrap();
         assert_eq!(chain[0].model_id, "jev");
         assert_eq!(chain[0].route.provider_name, "p");
-        // Without the remap, a SystemOne-only model is not a reranker.
+        // Without the remap, a decisions-only model is not a reranker.
         let mut plain = Decision::direct("jev");
         assert_eq!(
             resolve_rerank_decision(&reg, &mut plain, None)
