@@ -21,12 +21,14 @@ pub mod triggers;
 pub mod virtual_models;
 
 pub use attempts::{
-    decision_links, resolve_chat_decision, resolve_embedding_decision, resolve_rerank_decision,
-    resolve_systemone_decision,
+    decision_links, resolve_chat_decision, resolve_decisions, resolve_embedding_decision,
+    resolve_rerank_decision, resolve_systemone_decision,
 };
 
 use lumen_core::{Capability, GatewayError};
-use lumen_providers::{ChatRoute, EmbeddingRoute, Registry, RerankRoute, SystemOneRoute};
+use lumen_providers::{
+    ChatRoute, DecisionRoute, EmbeddingRoute, Registry, RerankRoute, SystemOneRoute,
+};
 
 /// Resolve a model id to a chat route, or the appropriate routing error.
 ///
@@ -90,6 +92,15 @@ pub struct EmbeddingChainLink {
 pub struct RerankChainLink {
     /// The resolved route.
     pub route: RerankRoute,
+    /// The foundation model id of this attempt.
+    pub model_id: String,
+}
+
+/// One resolved attempt of a decisions request (ADR 016).
+#[derive(Debug, Clone)]
+pub struct DecisionChainLink {
+    /// The resolved route.
+    pub route: DecisionRoute,
     /// The foundation model id of this attempt.
     pub model_id: String,
 }

@@ -11,7 +11,9 @@ use lumen_providers::{Registry, RerankRoute};
 
 use crate::executor::Link;
 use crate::virtual_models::decide::{Attempt, Decision};
-use crate::{ChatChainLink, EmbeddingChainLink, RerankChainLink, SystemOneChainLink};
+use crate::{
+    ChatChainLink, DecisionChainLink, EmbeddingChainLink, RerankChainLink, SystemOneChainLink,
+};
 
 /// Resolve every attempt; a missing primary is the routing error, a missing
 /// later attempt (a hot-reload race) is skipped with a warning.
@@ -111,6 +113,83 @@ pub fn resolve_systemone_decision(
             model_id: a.model_id.clone(),
         })
         .collect())
+}
+
+/// Resolve a decision request (ADR 016): every attempt must serve
+/// `decisions`, then attempts that cannot take this request (an image to a
+/// text-only model, a choice of one option to OpenAI, ...) are skipped
+/// before any upstream call. A skipped attempt is not an attempt: it never
+/// reaches the executor, `usage_log` or a circuit breaker.
+///
+/// # Errors
+/// The primary's routing miss (`LM-2001` / `LM-2002`), or, when every
+/// attempt is incompatible, the first incompatibility (`LM-2003` / `LM-1001`).
+pub fn resolve_decisions(
+    registry: &Registry,
+    decision: &mut Decision,
+    req: &lumen_core::DecisionRequest,
+) -> Result<Vec<DecisionChainLink>, GatewayError> {
+    let routes = resolve(registry, decision, Capability::Decisions, |r, a| {
+        r.decision_route(&a.model_id)
+    })?;
+    let has_images = req.has_images();
+    let verdicts: Vec<Result<(), GatewayError>> = routes
+        .iter()
+        .zip(&decision.attempts)
+        .map(|(route, a)| {
+            if has_images
+                && !registry
+                    .modalities(&a.model_id)
+                    .is_some_and(|m| m.iter().any(|x| x == "image"))
+            {
+                return Err(GatewayError::ImageInputNotSupported {
+                    model: a.model_id.clone(),
+                });
+            }
+            route.provider.check(req)
+        })
+        .collect();
+    if verdicts.iter().all(Result::is_err) {
+        let first = verdicts.into_iter().find_map(Result::err);
+        return Err(
+            first.unwrap_or_else(|| GatewayError::Internal("empty routing decision".to_owned()))
+        );
+    }
+    // The common case (every attempt compatible) skips the keep/log/retain pass.
+    if verdicts.iter().all(Result::is_ok) {
+        return Ok(routes
+            .into_iter()
+            .zip(&decision.attempts)
+            .map(|(route, a)| DecisionChainLink {
+                route,
+                model_id: a.model_id.clone(),
+            })
+            .collect());
+    }
+    for ((verdict, a), route) in verdicts.iter().zip(&decision.attempts).zip(&routes) {
+        if let Err(e) = verdict {
+            // The code only: the message can name a question (request content).
+            tracing::debug!(
+                model = %a.model_id,
+                provider = %route.provider_name,
+                code = e.code(),
+                "skipping an incompatible decisions target"
+            );
+        }
+    }
+    let keep: Vec<bool> = verdicts.iter().map(Result::is_ok).collect();
+    let links: Vec<DecisionChainLink> = routes
+        .into_iter()
+        .zip(&decision.attempts)
+        .zip(&keep)
+        .filter(|(_, k)| **k)
+        .map(|((route, a), _)| DecisionChainLink {
+            route,
+            model_id: a.model_id.clone(),
+        })
+        .collect();
+    decision.retain_compatible(&keep);
+    Ok(links)
 }
 
 /// Resolve a rerank decision; remap attempts go through the SystemOne route.
@@ -244,5 +323,89 @@ mod tests {
                 .code(),
             "LM-2002"
         );
+    }
+
+    fn decision_registry() -> Registry {
+        let model = |id: &str, modalities: &[&str]| ModelSpec {
+            id: id.into(),
+            upstream_id: id.into(),
+            capabilities: vec![Capability::Decisions],
+            modalities: modalities.iter().map(|m| (*m).to_owned()).collect(),
+            release_date: None,
+        };
+        let provider = |name: &str, kind: ProviderKind, models: Vec<ModelSpec>| ProviderSpec {
+            name: name.into(),
+            kind,
+            api_key: Some("k".into()),
+            base_url: Some("http://127.0.0.1:9".into()),
+            api_version: None,
+            strict: false,
+            connect_timeout_ms: None,
+            decisions_path: None,
+            forward_unknown_fields: None,
+            models,
+        };
+        Registry::build(
+            vec![
+                provider(
+                    "typesafe",
+                    ProviderKind::Typesafe,
+                    vec![model("jev", &["text"])],
+                ),
+                provider(
+                    "openai",
+                    ProviderKind::Openai,
+                    vec![model("luna", &["text", "image"])],
+                ),
+            ],
+            reqwest::Client::new(),
+            std::time::Duration::from_secs(300),
+        )
+        .unwrap()
+    }
+
+    fn parse_req(body: &str) -> lumen_core::DecisionRequest {
+        lumen_core::decisions::format::parse(body.as_bytes(), None)
+            .unwrap()
+            .1
+    }
+
+    const IMAGE_BODY: &str = r#"{"model":"vm","input":[{"role":"user","content":[{"type":"input_image","image_url":"data:image/png;base64,AA"}]}],"questions":[{"type":"predicate","instructions":"i"}]}"#;
+
+    #[test]
+    fn an_image_request_skips_the_text_only_target() {
+        let reg = decision_registry();
+        let mut d = Decision::linear(["jev", "luna"].map(str::to_owned));
+        let chain = resolve_decisions(&reg, &mut d, &parse_req(IMAGE_BODY)).unwrap();
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0].model_id, "luna");
+        assert_eq!(
+            d.attempts.len(),
+            1,
+            "the skipped attempt leaves the decision too"
+        );
+        let links = decision_links(&d, chain.iter().map(|l| l.route.provider_name.as_str()));
+        assert_eq!(links.len(), 1);
+    }
+
+    #[test]
+    fn when_nothing_is_left_the_first_incompatibility_is_returned() {
+        let reg = decision_registry();
+        let mut d = Decision::direct("jev");
+        assert!(matches!(
+            resolve_decisions(&reg, &mut d, &parse_req(IMAGE_BODY)),
+            Err(GatewayError::ImageInputNotSupported { model }) if model == "jev"
+        ));
+    }
+
+    #[test]
+    fn a_choice_of_one_skips_openai() {
+        let reg = decision_registry();
+        let mut d = Decision::linear(["luna", "jev"].map(str::to_owned));
+        let req = parse_req(
+            r#"{"model":"vm","state":"s","questions":{"c":{"type":"choice","instructions":"i","criteria":{"only":null}}}}"#,
+        );
+        let chain = resolve_decisions(&reg, &mut d, &req).unwrap();
+        assert_eq!(chain[0].model_id, "jev");
     }
 }

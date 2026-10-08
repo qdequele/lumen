@@ -10,7 +10,7 @@ use arc_swap::ArcSwap;
 use lumen_auth::usage::UsageLogger;
 use lumen_providers::image_fetch::ImageFetchPolicy;
 use lumen_providers::Registry;
-use lumen_telemetry::{LatencyMetrics, Metrics, TokenMetrics};
+use lumen_telemetry::{DecisionMetrics, LatencyMetrics, Metrics, TokenMetrics};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -54,6 +54,8 @@ pub struct AppState {
     pub tokens: TokenMetrics,
     /// Request-latency histograms (HTTP + per-capability) - always on.
     pub latency: LatencyMetrics,
+    /// Decisions counters (ADR 016) - always on.
+    pub decision_metrics: DecisionMetrics,
     /// Virtual-key auth runtime; `None` = auth disabled (open gateway).
     pub auth: Option<Arc<AuthRuntime>>,
     /// Usage-log channel; `None` = no usage database.
@@ -127,12 +129,16 @@ impl AppState {
         tokens: TokenMetrics,
         latency: LatencyMetrics,
     ) -> Self {
+        // A second state on the same registry keeps counting, unexported.
+        let decision_metrics =
+            DecisionMetrics::register(&metrics).unwrap_or_else(|_| DecisionMetrics::detached());
         Self {
             metrics,
             registry,
             guards: StreamGuards::default(),
             tokens,
             latency,
+            decision_metrics,
             auth: None,
             usage: None,
             pricing: Arc::new(ArcSwap::from_pointee(CostTable::default())),
