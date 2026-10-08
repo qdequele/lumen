@@ -154,5 +154,80 @@ fn bench_json_roundtrip(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_executor, bench_json_roundtrip);
+fn typesafe_body(questions: usize, state_bytes: usize) -> Vec<u8> {
+    let state = "x".repeat(state_bytes);
+    let qs: Vec<String> = (0..questions)
+        .map(|i| format!(r#""q{i}":{{"type":"noul","instructions":"Is item {i} relevant?","criteria":{{"true":"yes","false":"no"}}}}"#))
+        .collect();
+    format!(
+        r#"{{"model":"jev","state":"{state}","questions":{{{}}}}}"#,
+        qs.join(",")
+    )
+    .into_bytes()
+}
+
+fn openai_body(questions: usize, input_bytes: usize) -> Vec<u8> {
+    let input = "x".repeat(input_bytes);
+    let qs: Vec<String> = (0..questions)
+        .map(|i| {
+            format!(
+                r#"{{"type":"predicate","name":"q{i}","instructions":"Is item {i} relevant?"}}"#
+            )
+        })
+        .collect();
+    format!(
+        r#"{{"model":"luna","input":"{input}","questions":[{}]}}"#,
+        qs.join(",")
+    )
+    .into_bytes()
+}
+
+/// `/v1/decisions` pipeline: parse + estimate + one attempt's encode
+/// (passthrough), and parse + cross-vendor encode (translation). ADR 016.
+fn bench_decisions(c: &mut Criterion) {
+    use lumen_core::decisions::format::parse;
+    use lumen_providers::decisions::{family, openai};
+    let ts = family::FamilyProfile::typesafe(true);
+    for (name, body) in [
+        ("typesafe_small", typesafe_body(3, 1024)),
+        ("typesafe_large", typesafe_body(128, 128 * 1024)),
+        ("openai_small", openai_body(3, 1024)),
+        ("openai_large", openai_body(128, 128 * 1024)),
+    ] {
+        c.bench_function(&format!("decisions_passthrough_{name}"), |b| {
+            b.iter(|| {
+                let (_, req) = parse(black_box(&body), None).expect("parse");
+                black_box(lumen_core::tokens::estimate_decisions(&req));
+                let mut attempt = req.clone();
+                "upstream".clone_into(&mut attempt.model);
+                let bytes = if name.starts_with("typesafe") {
+                    let ids = family::wire_ids(attempt.questions());
+                    family::encode(&attempt, "upstream", &ts, &ids).expect("encode")
+                } else {
+                    openai::encode(&attempt, "upstream").expect("encode")
+                };
+                black_box(bytes.len());
+            });
+        });
+        c.bench_function(&format!("decisions_cross_vendor_{name}"), |b| {
+            b.iter(|| {
+                let (_, req) = parse(black_box(&body), None).expect("parse");
+                let bytes = if name.starts_with("typesafe") {
+                    openai::encode(&req, "gpt-6-luna").expect("encode")
+                } else {
+                    let ids = family::wire_ids(req.questions());
+                    family::encode(&req, "jev-latest", &ts, &ids).expect("encode")
+                };
+                black_box(bytes.len());
+            });
+        });
+    }
+}
+
+criterion_group!(
+    benches,
+    bench_executor,
+    bench_json_roundtrip,
+    bench_decisions
+);
 criterion_main!(benches);

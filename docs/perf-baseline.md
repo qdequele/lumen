@@ -71,6 +71,32 @@ passthrough that would roughly halve the large case is in `docs/backlog.md`.
 The large case needs `CARGO_PROFILE_RELEASE_STRIP=false` to build on macOS
 27, where `strip = true` corrupts proc-macro dylibs (pre-existing, unrelated).
 
+### Decisions (ADR 016)
+
+Same machine and toolchain as above (Apple Silicon arm64, macOS, rustc 1.97.0,
+release profile). Command: `cargo bench -p server --bench gateway_overhead -- decisions`
+(add `CARGO_PROFILE_RELEASE_STRIP=false` on macOS 27). Passthrough is parse +
+token estimate + one attempt's clone and encode to the same vendor; cross-vendor
+is parse + encode to the other vendor's wire format. "Large" is the parser
+maximum: 128 questions, 128 KB of state or input (the old SystemOne large case
+used 300 questions; the decisions parser caps a request at 128).
+
+| Bench | Median | 95 % CI |
+|---|---|---|
+| `decisions_passthrough_typesafe_small` (1 KB, 3 questions) | **3.49 µs** | 3.48 – 3.49 µs |
+| `decisions_passthrough_typesafe_large` (128 KB, 128 questions) | **144.5 µs** | 144.1 – 145.1 µs |
+| `decisions_passthrough_openai_small` | **2.95 µs** | 2.94 – 2.96 µs |
+| `decisions_passthrough_openai_large` | **153.9 µs** | 153.7 – 154.1 µs |
+| `decisions_cross_vendor_typesafe_small` (TypeSafe in, OpenAI out) | **4.62 µs** | 4.62 – 4.63 µs |
+| `decisions_cross_vendor_typesafe_large` | **224.9 µs** | 223.1 – 228.0 µs |
+| `decisions_cross_vendor_openai_small` (OpenAI in, TypeSafe out) | **3.06 µs** | 3.05 – 3.07 µs |
+| `decisions_cross_vendor_openai_large` | **165.9 µs** | 165.8 – 166.1 µs |
+
+Every case is far below the 1 ms budget. The TypeSafe small passthrough (3.49 µs)
+is within 6 % of the old `systemone_request_pipeline_small` (3.3 µs). The large
+cases are not directly comparable to the old 300-question reference (~280 µs)
+because the cap is now 128 questions.
+
 ### Streaming time to first bit (measured here)
 
 Recorded with `cargo bench -p server --bench stream_ttfb` in the same
