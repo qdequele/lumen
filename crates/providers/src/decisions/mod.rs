@@ -4,3 +4,4 @@
 //! any decision model into a reranker.
 
 pub mod family;
+pub mod openai;
