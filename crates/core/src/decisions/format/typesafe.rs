@@ -14,9 +14,6 @@ use crate::decisions::{
 };
 use crate::error::GatewayError;
 
-/// Most questions in one TypeSafe-format request (Perplexity's cap, the
-/// smallest of the family).
-pub const MAX_QUESTIONS: usize = 128;
 /// Most options of a `choice`.
 pub const MAX_CHOICE_OPTIONS: usize = 255;
 /// Most levels of a `score`.
@@ -61,12 +58,6 @@ pub fn parse(entries: RawEntries) -> Result<DecisionRequest, GatewayError> {
     let questions = object_entries(questions.get().as_bytes(), "`questions`").map_err(invalid)?;
     if questions.is_empty() {
         return Err(GatewayError::EmptyQuestions);
-    }
-    if questions.len() > MAX_QUESTIONS {
-        return Err(invalid(format!(
-            "`questions` holds {} questions; at most {MAX_QUESTIONS} are allowed",
-            questions.len()
-        )));
     }
     let questions = questions
         .into_iter()
@@ -519,8 +510,10 @@ mod tests {
     }
 
     #[test]
-    fn more_than_128_questions_is_lm_1001() {
-        let qs: Vec<String> = (0..129)
+    fn three_hundred_questions_parse_at_the_edge() {
+        // No question-count cap at the edge: Jev accepts more than 128 and
+        // per-target limits (Perplexity) are enforced by `DecisionLimits`.
+        let qs: Vec<String> = (0..300)
             .map(|i| format!(r#""q{i}":{{"type":"noul","instructions":"i"}}"#))
             .collect();
         let body = format!(
@@ -528,9 +521,7 @@ mod tests {
             qs.join(",")
         );
         let entries = object_entries(body.as_bytes(), "request body").unwrap();
-        assert!(
-            matches!(parse(entries), Err(GatewayError::InvalidRequest(m)) if m.contains("128"))
-        );
+        assert_eq!(parse(entries).unwrap().questions().len(), 300);
     }
 
     #[test]

@@ -848,6 +848,27 @@ mod tests {
     }
 
     #[test]
+    fn perplexity_profile_rejects_129_questions_but_typesafe_accepts() {
+        let qs: Vec<String> = (0..129)
+            .map(|i| format!(r#""q{i}":{{"type":"noul","instructions":"i"}}"#))
+            .collect();
+        let req = ts(&format!(
+            r#"{{"model":"p","state":"s","questions":{{{}}}}}"#,
+            qs.join(",")
+        ));
+        match FamilyProfile::perplexity().limits.check(&req, "pplx") {
+            Err(lumen_core::error::GatewayError::InvalidRequest(m)) => {
+                assert!(m.contains("pplx") && m.contains("129"), "{m}");
+            }
+            other => panic!("expected LM-1001, got {other:?}"),
+        }
+        assert!(FamilyProfile::typesafe(true)
+            .limits
+            .check(&req, "jev")
+            .is_ok());
+    }
+
+    #[test]
     fn perplexity_state_parts_pass_through_raw() {
         let req = ts(
             r#"{"model":"p","state":["café",{"type":"image_url","image_url":{"url":"data:image/png;base64,AA"}}],"questions":{"q":{"type":"noul","instructions":"i"}}}"#,
