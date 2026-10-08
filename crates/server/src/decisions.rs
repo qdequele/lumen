@@ -12,8 +12,9 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use axum::body::Bytes;
-use axum::extract::State;
+use axum::extract::{Request, State};
 use axum::http::{header, HeaderMap, HeaderValue};
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::Extension;
 use lumen_core::decisions::format::{self, Format};
@@ -49,17 +50,16 @@ pub async fn decisions_handler(
 }
 
 /// `POST /v1/systemone` (deprecated in 0.6.0, removed in 0.7.0): the
-/// TypeSafe format only, on the same pipeline; every response, errors
-/// included, carries `Deprecation` and `Link`.
+/// TypeSafe format only, on the same pipeline. The `Deprecation` / `Link`
+/// headers and the counter are applied by [`systemone_deprecation`], outside
+/// auth and the body limit, so rejected requests carry them too.
 pub async fn systemone_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
     key: Option<Extension<AuthedKey>>,
     body: Bytes,
-) -> Response {
-    state.decision_metrics.inc_deprecated("/v1/systemone");
-    warn_deprecated_use();
-    let mut response = match handle(
+) -> Result<Response, ApiError> {
+    handle(
         state,
         &headers,
         key.as_deref(),
@@ -67,10 +67,27 @@ pub async fn systemone_handler(
         Some(Format::TypeSafe),
     )
     .await
-    {
-        Ok(r) => r,
-        Err(e) => e.into_response(),
-    };
+}
+
+/// The deprecated route's path.
+pub const SYSTEMONE_PATH: &str = "/v1/systemone";
+
+/// Outer middleware for [`SYSTEMONE_PATH`] (spec 6.4): counts each request
+/// once, logs the rate-limited warning, and puts `Deprecation` and `Link` on
+/// every response, including auth (`LM-4004`, 429) and body-limit
+/// (`LM-1002`) rejections that never reach the handler. Other paths pass
+/// through untouched.
+pub async fn systemone_deprecation(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if request.uri().path() != SYSTEMONE_PATH {
+        return next.run(request).await;
+    }
+    state.decision_metrics.inc_deprecated(SYSTEMONE_PATH);
+    warn_deprecated_use();
+    let mut response = next.run(request).await;
     let h = response.headers_mut();
     h.insert(
         header::HeaderName::from_static("deprecation"),

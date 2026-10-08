@@ -1065,3 +1065,84 @@ async fn refusals_are_counted() {
         "{metrics}"
     );
 }
+
+/// Spawn with virtual-key auth enabled (no key issued) and a small body
+/// limit, around the standard config.
+async fn spawn_auth_small_limit(upstream: &str, body_limit: usize) -> String {
+    use lumen_auth::key::hash_key;
+    use lumen_auth::state::AuthState;
+    use lumen_auth::store::KeyStore;
+    use lumen_server::auth::AuthRuntime;
+
+    let config = config(&Upstreams::one(upstream));
+    let registry = Arc::new(
+        Registry::build(
+            config.provider_specs(),
+            http::build_client(),
+            Duration::from_secs(300),
+        )
+        .expect("registry builds"),
+    );
+    let store = KeyStore::in_memory().await.expect("open store");
+    let runtime = Arc::new(AuthRuntime {
+        keys: AuthState::load(Vec::new(), Vec::new()),
+        store,
+        admin_token_hash: hash_key(&"a".repeat(64)),
+        master: None,
+    });
+    let state = common::base_state(registry)
+        .with_resilience(Arc::new(ResilienceRuntime::from_config(&config, None)))
+        .with_auth(runtime);
+    common::spawn_state(state, body_limit).await
+}
+
+fn assert_deprecation_headers(resp: &reqwest::Response) {
+    assert_eq!(resp.headers()["deprecation"], "@1791417600");
+    assert_eq!(
+        resp.headers()["link"],
+        r#"</docs/decisions#migrating-from-v1systemone>; rel="deprecation""#
+    );
+}
+
+#[tokio::test]
+async fn systemone_rejections_before_the_handler_still_carry_deprecation_headers() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(ANSWERS, "application/json"))
+        .expect(0)
+        .mount(&upstream)
+        .await;
+    let base = spawn_auth_small_limit(&upstream.uri(), 1024).await;
+
+    // Auth enabled, no key: 401 LM-4004 from the auth layer.
+    let resp = post_to(&base, "/v1/systemone", REQUEST).await;
+    assert_eq!(resp.status(), 401);
+    assert_deprecation_headers(&resp);
+    let err: Value = resp.json().await.expect("json");
+    assert_eq!(err["error"]["code"], "LM-4004");
+
+    // Over the body limit: 413 LM-1002 from the body-limit layer.
+    let big = format!(
+        r#"{{"model":"jev","state":"{}","questions":{{"q":{{"type":"noul","instructions":"i"}}}}}}"#,
+        "x".repeat(4096)
+    );
+    let resp = post_to(&base, "/v1/systemone", &big).await;
+    assert_eq!(resp.status(), 413);
+    assert_deprecation_headers(&resp);
+    let err: Value = resp.json().await.expect("json");
+    assert_eq!(err["error"]["code"], "LM-1002");
+
+    // Other routes are untouched: 401 without the deprecation headers.
+    let resp = post(&base, REQUEST).await;
+    assert_eq!(resp.status(), 401);
+    assert!(!resp.headers().contains_key("deprecation"));
+    assert!(!resp.headers().contains_key("link"));
+
+    // Counted once per request, rejected or not.
+    let metrics = scrape(&base).await;
+    assert!(
+        metrics.contains(r#"lumen_deprecated_requests_total{route="/v1/systemone"} 2"#),
+        "{metrics}"
+    );
+    upstream.verify().await;
+}

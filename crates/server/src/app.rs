@@ -58,6 +58,13 @@ pub fn build_app(state: AppState) -> Router {
         .layer(middleware::from_fn_with_state(state.clone(), track_latency))
         // Conservative default security headers on every response (M7 §7.4).
         .layer(middleware::from_fn(security_headers))
+        // Deprecated `/v1/systemone` (spec 6.4): count once and add the
+        // `Deprecation` / `Link` headers on every response, including the
+        // auth and body-limit rejections produced further in.
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            decisions::systemone_deprecation,
+        ))
         // `RequestBodyLimitLayer` short-circuits an over-limit body with a bare
         // `413 Payload Too Large` plain-text response *before* axum routing or
         // any handler runs (verified empirically: it fires on `Content-Length`
@@ -85,7 +92,10 @@ pub fn build_app(state: AppState) -> Router {
         .route("/v1/embeddings", post(embeddings::embeddings))
         .route("/v1/rerank", post(rerank::rerank_handler))
         .route("/v1/decisions", post(decisions::decisions_handler))
-        .route("/v1/systemone", post(decisions::systemone_handler))
+        .route(
+            decisions::SYSTEMONE_PATH,
+            post(decisions::systemone_handler),
+        )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth::require_virtual_key,
