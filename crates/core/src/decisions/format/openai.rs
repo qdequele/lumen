@@ -219,8 +219,13 @@ fn convert_input(input: WireInput) -> Result<Input, GatewayError> {
 }
 
 fn convert_question(i: usize, raw: &serde_json::value::RawValue) -> Result<Question, GatewayError> {
-    let wq: WireQuestion = serde_json::from_str(raw.get())
-        .map_err(|e| invalid(format!("question #{i} is malformed: {e}")))?;
+    let wq: WireQuestion = serde_json::from_str(raw.get()).map_err(|_| {
+        // Fixed text: a serde error could quote the client's values.
+        invalid(format!(
+            "question #{i} is malformed: expected an object with string `type` and \
+             `instructions` and only the fields of its type"
+        ))
+    })?;
     let label = wq
         .name
         .as_ref()
@@ -229,6 +234,18 @@ fn convert_question(i: usize, raw: &serde_json::value::RawValue) -> Result<Quest
     let instructions = wq
         .instructions
         .ok_or_else(|| fail("is missing string `instructions`"))?;
+    let type_name = wq.kind.as_deref().unwrap_or_default();
+    for (field, present, allowed) in [
+        ("choices", wq.choices.is_some(), "choice"),
+        ("levels", wq.levels.is_some(), "score"),
+    ] {
+        if present && type_name != allowed && matches!(type_name, "predicate" | "choice" | "score")
+        {
+            return Err(fail(&format!(
+                "has `{field}`, which is not valid for type '{type_name}'"
+            )));
+        }
+    }
     let kind = match wq.kind.as_deref() {
         Some("predicate") => QuestionKind::Predicate { criteria: None },
         Some("choice") => {
@@ -271,15 +288,13 @@ fn convert_question(i: usize, raw: &serde_json::value::RawValue) -> Result<Quest
                     .collect(),
             }
         }
-        Some(other) => {
-            return Err(fail(&format!(
-                "has unknown type '{other}': expected predicate, choice or score"
-            )))
+        Some(_) => {
+            return Err(fail(
+                "has an unknown `type`: expected predicate, choice or score",
+            ))
         }
         None => return Err(fail("is missing `type`")),
     };
-    // A field foreign to the type (e.g. `choices` on a predicate) is ignored
-    // by OpenAI's typed SDK; reject it like an unknown parameter.
     Ok(Question {
         name: wq.name,
         instructions: Some(Text::Plain(instructions)),
@@ -562,7 +577,7 @@ mod tests {
         assert!(msg(parse_err(&format!(
             r#"{{"model":"m","input":[{{"role":"system","content":"x"}}],{q}}}"#
         )))
-        .contains("user"));
+        .contains("role \"user\", got \"system\""));
         assert!(matches!(
             parse_err(&format!(
                 r#"{{"model":"m","input":[{{"role":"user","content":[{{"type":"input_image","image_url":"https://x/y.png"}}]}}],{q}}}"#
@@ -590,6 +605,37 @@ mod tests {
             r#"{{"model":"m","input":"x",{q},"safety_identifier":"{long}"}}"#
         )))
         .contains("128"));
+    }
+
+    #[test]
+    fn foreign_and_malformed_question_fields_are_rejected_without_echoing_values() {
+        let foreign = |body: &str| msg(parse_err(body));
+        let m = foreign(
+            r#"{"model":"m","input":"x","questions":[{"type":"predicate","name":"p","instructions":"i","choices":[{"value":"a"},{"value":"b"}]}]}"#,
+        );
+        assert!(
+            m.contains("`p`") && m.contains("`choices`") && m.contains("'predicate'"),
+            "{m}"
+        );
+        let m = foreign(
+            r#"{"model":"m","input":"x","questions":[{"type":"choice","instructions":"i","levels":[{"label":"a"}],"choices":[{"value":"a"},{"value":"b"}]}]}"#,
+        );
+        assert!(
+            m.contains("#0") && m.contains("`levels`") && m.contains("'choice'"),
+            "{m}"
+        );
+        let m = foreign(
+            r#"{"model":"m","input":"x","questions":[{"type":"score","instructions":"i","levels":[{"label":"a"}],"choices":[{"value":"a"},{"value":"b"}]}]}"#,
+        );
+        assert!(m.contains("`choices`") && m.contains("'score'"), "{m}");
+        let m = foreign(
+            r#"{"model":"m","input":"x","questions":[{"type":"predicate","instructions":"SECRET-VALUE"},{"type":7,"instructions":"SECRET-VALUE"}]}"#,
+        );
+        assert!(m.contains("#1") && !m.contains("SECRET-VALUE"), "{m}");
+        let m = foreign(
+            r#"{"model":"m","input":"x","questions":[{"type":"SECRET-TYPE","instructions":"i"}]}"#,
+        );
+        assert!(m.contains("type") && !m.contains("SECRET-TYPE"), "{m}");
     }
 
     #[test]
