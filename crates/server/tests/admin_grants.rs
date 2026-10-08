@@ -58,6 +58,8 @@ fn chat_registry(upstream: &str) -> Arc<Registry> {
             modalities: vec!["text".to_owned()],
             release_date: None,
         }],
+        decisions_path: None,
+        forward_unknown_fields: None,
     }];
     Arc::new(
         Registry::build(specs, http::build_client(), Duration::from_secs(300))

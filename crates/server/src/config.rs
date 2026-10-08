@@ -595,6 +595,15 @@ pub struct ProviderConfig {
     /// which takes precedence over the built-in default (issue #65).
     #[serde(default)]
     pub api_version: Option<String>,
+    /// `typesafe` kind only: the decisions endpoint path appended to
+    /// `base_url` (default `/v1/systemone`), for TypeSafe-format vendors
+    /// (ADR 016). Must start with `/`.
+    #[serde(default)]
+    pub decisions_path: Option<String>,
+    /// `typesafe` kind only: forward unknown top-level request fields
+    /// (default `true`); set `false` for vendors that reject them.
+    #[serde(default)]
+    pub forward_unknown_fields: Option<bool>,
     /// Per-provider first-token timeout override in ms (else the global
     /// [`ServerConfig::first_token_timeout_ms`]).
     #[serde(default)]
@@ -805,6 +814,29 @@ fn validate_provider_knobs(
                  (kind '{}' would ignore it)",
                 provider.name,
                 provider.kind.as_str()
+            )));
+        }
+    }
+    for (field, set) in [
+        ("decisions_path", provider.decisions_path.is_some()),
+        (
+            "forward_unknown_fields",
+            provider.forward_unknown_fields.is_some(),
+        ),
+    ] {
+        if set && provider.kind != ProviderKind::Typesafe {
+            return Err(err(format!(
+                "provider '{}': {field} is only supported by kind 'typesafe' (kind '{}' would ignore it)",
+                provider.name,
+                provider.kind.as_str()
+            )));
+        }
+    }
+    if let Some(path) = &provider.decisions_path {
+        if !path.starts_with('/') || path.trim() != path {
+            return Err(err(format!(
+                "provider '{}': decisions_path must start with '/' and carry no whitespace",
+                provider.name
             )));
         }
     }
@@ -1664,6 +1696,8 @@ impl Config {
                     .and_then(|var| std::env::var(var).ok()),
                 base_url: p.base_url.clone(),
                 api_version: p.api_version.clone(),
+                decisions_path: p.decisions_path.clone(),
+                forward_unknown_fields: p.forward_unknown_fields,
                 strict: p.strict,
                 connect_timeout_ms: p.connect_timeout_ms,
                 models: p
@@ -2923,6 +2957,41 @@ mod tests {
             specs[0].base_url.as_deref(),
             Some("https://my-resource.openai.azure.com?api-version=2023-05-15")
         );
+    }
+
+    #[test]
+    fn decisions_path_and_forward_unknown_fields_are_typesafe_only() {
+        let ok = r#"
+            [[providers]]
+            name = "liquid"
+            kind = "typesafe"
+            base_url = "https://api.liquid.ai"
+            decisions_path = "/decisions/v1/systemone"
+            forward_unknown_fields = false
+            [[providers.models]]
+            id = "d1"
+            capabilities = ["decisions"]
+        "#;
+        let cfg = load_str(ok).unwrap();
+        let spec = &cfg.provider_specs()[0];
+        assert_eq!(
+            spec.decisions_path.as_deref(),
+            Some("/decisions/v1/systemone")
+        );
+        assert_eq!(spec.forward_unknown_fields, Some(false));
+
+        let wrong_kind = ok.replace(r#"kind = "typesafe""#, r#"kind = "perplexity""#);
+        let e = load_str(&wrong_kind).unwrap_err().to_string();
+        assert!(
+            e.contains("decisions_path") && e.contains("typesafe"),
+            "{e}"
+        );
+
+        let no_slash = ok.replace(r#""/decisions/v1/systemone""#, r#""decisions""#);
+        assert!(load_str(&no_slash)
+            .unwrap_err()
+            .to_string()
+            .contains("start with '/'"));
     }
 
     #[test]

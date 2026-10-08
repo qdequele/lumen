@@ -74,6 +74,8 @@ fn openai_registry(upstream: &str) -> Arc<Registry> {
                 release_date: None,
             },
         ],
+        decisions_path: None,
+        forward_unknown_fields: None,
     }];
     Arc::new(
         Registry::build(
@@ -101,6 +103,8 @@ fn anthropic_registry(upstream: &str) -> Arc<Registry> {
             modalities: vec!["text".to_owned()],
             release_date: None,
         }],
+        decisions_path: None,
+        forward_unknown_fields: None,
     }];
     Arc::new(
         Registry::build(
@@ -128,6 +132,8 @@ fn google_registry(upstream: &str) -> Arc<Registry> {
             modalities: vec!["text".to_owned()],
             release_date: None,
         }],
+        decisions_path: None,
+        forward_unknown_fields: None,
     }];
     Arc::new(
         Registry::build(
@@ -156,6 +162,8 @@ fn anthropic_vision_registry(upstream: &str) -> Arc<Registry> {
             modalities: vec!["text".to_owned(), "image".to_owned()],
             release_date: None,
         }],
+        decisions_path: None,
+        forward_unknown_fields: None,
     }];
     Arc::new(
         Registry::build(
@@ -184,6 +192,8 @@ fn google_vision_registry(upstream: &str) -> Arc<Registry> {
             modalities: vec!["text".to_owned(), "image".to_owned()],
             release_date: None,
         }],
+        decisions_path: None,
+        forward_unknown_fields: None,
     }];
     Arc::new(
         Registry::build(
@@ -213,6 +223,8 @@ fn cohere_vision_registry(upstream: &str) -> Arc<Registry> {
             modalities: vec!["text".to_owned(), "image".to_owned()],
             release_date: None,
         }],
+        decisions_path: None,
+        forward_unknown_fields: None,
     }];
     Arc::new(
         Registry::build(
@@ -242,6 +254,8 @@ fn ollama_registry(upstream: &str) -> Arc<Registry> {
             modalities: vec!["text".to_owned()],
             release_date: None,
         }],
+        decisions_path: None,
+        forward_unknown_fields: None,
     }];
     Arc::new(
         Registry::build(
@@ -294,6 +308,8 @@ async fn openai_compatible_kind_routes_through_the_openai_path() {
             modalities: vec!["text".to_owned()],
             release_date: None,
         }],
+        decisions_path: None,
+        forward_unknown_fields: None,
     }];
     let registry = Arc::new(
         Registry::build(

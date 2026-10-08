@@ -10,7 +10,8 @@
 
 use arc_swap::ArcSwap;
 use lumen_core::{
-    Capability, ChatProvider, EmbeddingProvider, ReleaseDate, RerankProvider, SystemOneProvider,
+    Capability, ChatProvider, DecisionProvider, EmbeddingProvider, ReleaseDate, RerankProvider,
+    SystemOneProvider,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -22,6 +23,8 @@ use crate::azure::AzureProvider;
 use crate::bedrock::{self, BedrockProvider};
 use crate::cloudflare::CloudflareRerankProvider;
 use crate::cohere::CohereProvider;
+use crate::decisions::family::FamilyDecisionProvider;
+use crate::decisions::openai::OpenAiDecisionProvider;
 use crate::google::vertex::VertexProvider;
 use crate::google::GoogleProvider;
 use crate::jina::JinaProvider;
@@ -72,6 +75,13 @@ pub struct ProviderSpec {
     /// string on `base_url` (kept for back-compat), which wins over the
     /// provider's built-in default (issue #65).
     pub api_version: Option<String>,
+    /// `typesafe` kind only: the decisions endpoint path appended to
+    /// `base_url` (default `/v1/systemone`), for TypeSafe-format vendors
+    /// (Liquid, Inception, Upstage, Kev). ADR 016.
+    pub decisions_path: Option<String>,
+    /// `typesafe` kind only: forward unknown top-level request fields
+    /// (default `true`; `false` for vendors that reject them).
+    pub forward_unknown_fields: Option<bool>,
     /// Reject requests that set an unsupported-but-meaningful field (rather than
     /// silently dropping it). Honored by Ollama for `dimensions` (issue #25) and
     /// by the translated chat providers (Anthropic, Google/Vertex, Bedrock,
@@ -99,6 +109,8 @@ impl std::fmt::Debug for ProviderSpec {
             .field("api_key", &self.api_key.as_ref().map(|_| "REDACTED"))
             .field("base_url", &self.base_url)
             .field("api_version", &self.api_version)
+            .field("decisions_path", &self.decisions_path)
+            .field("forward_unknown_fields", &self.forward_unknown_fields)
             .field("strict", &self.strict)
             .field("connect_timeout_ms", &self.connect_timeout_ms)
             .field("models", &self.models)
@@ -223,6 +235,28 @@ impl std::fmt::Debug for RerankRoute {
     }
 }
 
+/// A resolved decision route: the provider to call and the upstream model id
+/// (ADR 016).
+#[derive(Clone)]
+pub struct DecisionRoute {
+    /// The provider serving the model.
+    pub provider: Arc<dyn DecisionProvider>,
+    /// The configured provider name (for attributing upstream errors).
+    pub provider_name: String,
+    /// The upstream model id to send (already alias-resolved).
+    pub upstream_id: String,
+}
+
+impl std::fmt::Debug for DecisionRoute {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DecisionRoute")
+            .field("provider_name", &self.provider_name)
+            .field("upstream_id", &self.upstream_id)
+            .field("provider", &"<dyn DecisionProvider>")
+            .finish()
+    }
+}
+
 /// A resolved SystemOne route: the provider to call and the upstream model id
 /// (ADR 013).
 #[derive(Clone)]
@@ -291,6 +325,8 @@ struct Inner {
     rerank: HashMap<String, RerankRoute>,
     /// model id -> SystemOne route.
     systemone: HashMap<String, SystemOneRoute>,
+    /// model id -> decision route (ADR 016).
+    decisions: HashMap<String, DecisionRoute>,
     /// model id -> declared capabilities (all of them, even not-yet-served
     /// ones like chat). Lets the router tell "unknown model" apart from
     /// "known model, wrong capability".
@@ -312,6 +348,7 @@ struct BuiltProviders {
     embed: Option<Arc<dyn EmbeddingProvider>>,
     rerank: Option<Arc<dyn RerankProvider>>,
     systemone: Option<Arc<dyn SystemOneProvider>>,
+    decisions: Option<Arc<dyn DecisionProvider>>,
 }
 
 /// The process-wide provider registry.
@@ -375,6 +412,12 @@ impl Registry {
         self.inner.load().rerank.get(model_id).cloned()
     }
 
+    /// Resolve a decision model to its route (ADR 016).
+    #[must_use]
+    pub fn decision_route(&self, model_id: &str) -> Option<DecisionRoute> {
+        self.inner.load().decisions.get(model_id).cloned()
+    }
+
     /// Resolve a model id to a SystemOne route, if one serves it.
     #[must_use]
     pub fn systemone_route(&self, model_id: &str) -> Option<SystemOneRoute> {
@@ -435,6 +478,8 @@ impl Registry {
     }
 }
 
+// One flat per-capability route loop; grows with each capability.
+#[allow(clippy::too_many_lines)]
 fn build_inner(
     specs: &[ProviderSpec],
     client: &reqwest::Client,
@@ -548,6 +593,16 @@ fn build_inner(
             }
 
             if model.capabilities.contains(&Capability::Decisions) {
+                if let Some(provider) = &built.decisions {
+                    inner.decisions.insert(
+                        model.id.clone(),
+                        DecisionRoute {
+                            provider: provider.clone(),
+                            provider_name: spec.name.clone(),
+                            upstream_id: model.upstream_id.clone(),
+                        },
+                    );
+                }
                 if let Some(provider) = &built.systemone {
                     inner.systemone.insert(
                         model.id.clone(),
@@ -557,8 +612,9 @@ fn build_inner(
                             upstream_id: model.upstream_id.clone(),
                         },
                     );
-                } else {
-                    warn_unsupported(spec, &model.id, "systemone");
+                }
+                if built.decisions.is_none() && built.systemone.is_none() {
+                    warn_unsupported(spec, &model.id, "decisions");
                 }
             }
         }
@@ -747,6 +803,25 @@ fn build_providers(
                     spec.base_url.as_deref(),
                 )),
             );
+            // Decisions (ADR 016): OpenAI Responses-style for `openai`, the
+            // family codec for `perplexity`; every other kind has none.
+            let decisions: Option<Arc<dyn DecisionProvider>> = match spec.kind {
+                ProviderKind::Openai => Some(Arc::new(OpenAiDecisionProvider::new(
+                    client.clone(),
+                    spec.name.clone(),
+                    base_url.clone(),
+                    spec.api_key.clone(),
+                ))),
+                ProviderKind::Perplexity => base_url.clone().map(|base| {
+                    Arc::new(FamilyDecisionProvider::perplexity(
+                        client.clone(),
+                        spec.name.clone(),
+                        base,
+                        spec.api_key.clone(),
+                    )) as Arc<dyn DecisionProvider>
+                }),
+                _ => None,
+            };
             // Same instance shape behind the embedding trait object.
             let embed: Arc<dyn EmbeddingProvider> = Arc::new(OpenAiProvider::new(
                 client.clone(),
@@ -759,6 +834,7 @@ fn build_providers(
                 embed: Some(embed),
                 rerank: None,
                 systemone: None,
+                decisions,
             })
         }
         // Cloudflare Workers AI: chat + embed via the same OpenAI-compatible
@@ -780,6 +856,13 @@ fn build_providers(
                 Some(base_url.clone()),
                 spec.api_key.clone(),
             ));
+            let decisions: Arc<dyn DecisionProvider> =
+                Arc::new(FamilyDecisionProvider::cloudflare(
+                    client.clone(),
+                    spec.name.clone(),
+                    base_url.clone(),
+                    spec.api_key.clone(),
+                ));
             let rerank: Arc<dyn RerankProvider> = Arc::new(CloudflareRerankProvider::new(
                 client.clone(),
                 spec.name.clone(),
@@ -791,6 +874,7 @@ fn build_providers(
                 embed: Some(embed),
                 rerank: Some(rerank),
                 systemone: None,
+                decisions: Some(decisions),
             })
         }
         // Together AI: chat + embed via the same OpenAI-compatible wiring as
@@ -825,6 +909,7 @@ fn build_providers(
                 embed: Some(embed),
                 rerank: Some(rerank),
                 systemone: None,
+                decisions: None,
             })
         }
         ProviderKind::Mixedbread => {
@@ -839,6 +924,7 @@ fn build_providers(
                 embed: None,
                 rerank: Some(rerank),
                 systemone: None,
+                decisions: None,
             })
         }
         ProviderKind::Pinecone => {
@@ -853,6 +939,7 @@ fn build_providers(
                 embed: None,
                 rerank: Some(rerank),
                 systemone: None,
+                decisions: None,
             })
         }
         // NVIDIA NIM: rerank via `/v1/ranking`. `base_url` is required (the NIM
@@ -870,6 +957,7 @@ fn build_providers(
                 embed: None,
                 rerank: Some(rerank),
                 systemone: None,
+                decisions: None,
             })
         }
         // TypeSafe: SystemOne typed decisions only (ADR 013). `base_url`
@@ -881,11 +969,20 @@ fn build_providers(
                 spec.base_url.clone(),
                 spec.api_key.clone(),
             ));
+            let decisions: Arc<dyn DecisionProvider> = Arc::new(FamilyDecisionProvider::typesafe(
+                client.clone(),
+                spec.name.clone(),
+                spec.base_url.clone(),
+                spec.decisions_path.clone(),
+                spec.forward_unknown_fields.unwrap_or(true),
+                spec.api_key.clone(),
+            ));
             Ok(BuiltProviders {
                 chat: None,
                 embed: None,
                 rerank: None,
                 systemone: Some(systemone),
+                decisions: Some(decisions),
             })
         }
         ProviderKind::Mistral => {
@@ -902,6 +999,7 @@ fn build_providers(
                 embed: Some(embed),
                 rerank: None,
                 systemone: None,
+                decisions: None,
             })
         }
         ProviderKind::Anthropic => {
@@ -919,6 +1017,7 @@ fn build_providers(
                 embed: None,
                 rerank: None,
                 systemone: None,
+                decisions: None,
             })
         }
         // Ollama: native embeddings via `{root}/api/embed`, chat via its
@@ -955,6 +1054,12 @@ fn build_providers(
                 Some(chat_base_url),
                 spec.api_key.clone(), // keyless in practice; forwarded if set
             ));
+            let decisions: Arc<dyn DecisionProvider> = Arc::new(FamilyDecisionProvider::ollama(
+                client.clone(),
+                spec.name.clone(),
+                base_url.clone(),
+                spec.api_key.clone(),
+            ));
             let embed: Arc<dyn EmbeddingProvider> = Arc::new(OllamaProvider::new(
                 client.clone(),
                 spec.name.clone(),
@@ -966,6 +1071,7 @@ fn build_providers(
                 embed: Some(embed),
                 rerank: None,
                 systemone: None,
+                decisions: Some(decisions),
             })
         }
         ProviderKind::Cohere => {
@@ -986,6 +1092,7 @@ fn build_providers(
                 embed: Some(embed),
                 rerank: Some(rerank),
                 systemone: None,
+                decisions: None,
             })
         }
         ProviderKind::Jina => {
@@ -1002,6 +1109,7 @@ fn build_providers(
                 embed: Some(embed),
                 rerank: Some(rerank),
                 systemone: None,
+                decisions: None,
             })
         }
         ProviderKind::Tei => {
@@ -1019,6 +1127,7 @@ fn build_providers(
                 embed: Some(embed),
                 rerank: Some(rerank),
                 systemone: None,
+                decisions: None,
             })
         }
         ProviderKind::Voyage => {
@@ -1035,6 +1144,7 @@ fn build_providers(
                 embed: Some(embed),
                 rerank: Some(rerank),
                 systemone: None,
+                decisions: None,
             })
         }
         // Gemini Developer API: chat via `generateContent`, embeddings via
@@ -1056,6 +1166,7 @@ fn build_providers(
                 embed: Some(embed),
                 rerank: None,
                 systemone: None,
+                decisions: None,
             })
         }
         ProviderKind::Azure => {
@@ -1076,6 +1187,7 @@ fn build_providers(
                 embed: Some(embed),
                 rerank: None,
                 systemone: None,
+                decisions: None,
             })
         }
         ProviderKind::VertexAi => {
@@ -1090,6 +1202,7 @@ fn build_providers(
                 embed: Some(embed),
                 rerank: None,
                 systemone: None,
+                decisions: None,
             })
         }
         ProviderKind::Bedrock => {
@@ -1104,6 +1217,7 @@ fn build_providers(
                 embed: Some(embed),
                 rerank: None,
                 systemone: None,
+                decisions: None,
             })
         }
     }
@@ -1148,6 +1262,82 @@ mod tests {
         assert!(dbg.contains("REDACTED"));
     }
 
+    #[test]
+    fn decisions_are_served_by_the_five_kinds_only() {
+        for (kind, base) in [
+            (ProviderKind::Typesafe, None),
+            (ProviderKind::Openai, None),
+            (ProviderKind::Perplexity, None),
+            (ProviderKind::Ollama, Some("http://localhost:11434")),
+            (
+                ProviderKind::Cloudflare,
+                Some("https://api.cloudflare.com/client/v4/accounts/a/ai/v1"),
+            ),
+        ] {
+            let s = spec(kind, "p", base, vec![model("d", &[Capability::Decisions])]);
+            let reg =
+                Registry::build(vec![s], reqwest::Client::new(), Duration::from_secs(5)).unwrap();
+            let route = reg
+                .decision_route("d")
+                .unwrap_or_else(|| panic!("{kind:?} serves decisions"));
+            assert_eq!(route.provider.provider_name(), "p");
+        }
+        let groq = spec(
+            ProviderKind::Groq,
+            "g",
+            None,
+            vec![model("d", &[Capability::Decisions])],
+        );
+        let reg =
+            Registry::build(vec![groq], reqwest::Client::new(), Duration::from_secs(5)).unwrap();
+        assert!(reg.decision_route("d").is_none());
+    }
+
+    #[test]
+    fn perplexity_mixes_chat_and_decision_models_on_one_provider() {
+        let s = spec(
+            ProviderKind::Perplexity,
+            "pplx",
+            None,
+            vec![
+                model("sonar", &[Capability::Chat]),
+                model("decider", &[Capability::Decisions]),
+            ],
+        );
+        let reg = Registry::build(vec![s], reqwest::Client::new(), Duration::from_secs(5)).unwrap();
+        assert!(reg.chat_route("sonar").is_some());
+        assert!(reg.decision_route("decider").is_some());
+        assert!(reg.decision_route("sonar").is_none());
+    }
+
+    #[test]
+    fn the_profile_limits_reach_the_route() {
+        let mut s = spec(
+            ProviderKind::Typesafe,
+            "ts",
+            None,
+            vec![model("jev", &[Capability::Decisions])],
+        );
+        s.decisions_path = Some("/v1/decisions".into());
+        s.forward_unknown_fields = Some(false);
+        let reg = Registry::build(vec![s], reqwest::Client::new(), Duration::from_secs(5)).unwrap();
+        assert!(
+            reg.decision_route("jev")
+                .unwrap()
+                .provider
+                .limits()
+                .predicate_needs_instructions
+        );
+    }
+
+    #[test]
+    fn spec_debug_shows_decision_fields() {
+        let mut s = spec(ProviderKind::Typesafe, "ts", None, Vec::new());
+        s.decisions_path = Some("/v1/decisions".into());
+        let dbg = format!("{s:?}");
+        assert!(dbg.contains("/v1/decisions") && dbg.contains("forward_unknown_fields"));
+    }
+
     fn spec(
         kind: ProviderKind,
         name: &str,
@@ -1160,6 +1350,8 @@ mod tests {
             api_key: Some("sk-test-xxx".to_owned()),
             base_url: base_url.map(str::to_owned),
             api_version: None,
+            decisions_path: None,
+            forward_unknown_fields: None,
             strict: false,
             connect_timeout_ms: None,
             models,
@@ -1602,6 +1794,8 @@ mod tests {
                 strict: false,
                 connect_timeout_ms: None,
                 models: vec![model("gemini-flash", &[Capability::Chat])],
+                decisions_path: None,
+                forward_unknown_fields: None,
             }],
             reqwest::Client::new(),
             Duration::from_secs(300),
@@ -1620,6 +1814,8 @@ mod tests {
                 strict: false,
                 connect_timeout_ms: None,
                 models: vec![model("m", &[Capability::Chat])],
+                decisions_path: None,
+                forward_unknown_fields: None,
             }],
             reqwest::Client::new(),
             Duration::from_secs(300),
@@ -1641,6 +1837,8 @@ mod tests {
                 strict: false,
                 connect_timeout_ms: None,
                 models: vec![model("m", &[Capability::Chat])],
+                decisions_path: None,
+                forward_unknown_fields: None,
             }],
             reqwest::Client::new(),
             Duration::from_secs(300),
@@ -1658,6 +1856,8 @@ mod tests {
                 strict: false,
                 connect_timeout_ms: None,
                 models: vec![model("m", &[Capability::Chat])],
+                decisions_path: None,
+                forward_unknown_fields: None,
             }],
             reqwest::Client::new(),
             Duration::from_secs(300),
@@ -1709,6 +1909,8 @@ mod tests {
                 connect_timeout_ms: None,
                 api_version: None,
                 models: vec![model("gemini-embedding-001", &[Capability::Embed])],
+                decisions_path: None,
+                forward_unknown_fields: None,
             }],
             reqwest::Client::new(),
             Duration::from_secs(300),

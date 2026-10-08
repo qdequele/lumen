@@ -66,6 +66,8 @@ fn full_registry(upstream: &str) -> Arc<Registry> {
                     release_date: None,
                 },
             ],
+            decisions_path: None,
+            forward_unknown_fields: None,
         },
         ProviderSpec {
             name: "cohere".to_owned(),
@@ -82,6 +84,8 @@ fn full_registry(upstream: &str) -> Arc<Registry> {
                 modalities: vec!["text".to_owned()],
                 release_date: None,
             }],
+            decisions_path: None,
+            forward_unknown_fields: None,
         },
         ProviderSpec {
             name: "typesafe".to_owned(),
@@ -98,6 +102,8 @@ fn full_registry(upstream: &str) -> Arc<Registry> {
                 modalities: vec!["text".to_owned()],
                 release_date: None,
             }],
+            decisions_path: None,
+            forward_unknown_fields: None,
         },
         ProviderSpec {
             name: "tei".to_owned(),
@@ -114,6 +120,8 @@ fn full_registry(upstream: &str) -> Arc<Registry> {
                 modalities: vec!["text".to_owned()],
                 release_date: None,
             }],
+            decisions_path: None,
+            forward_unknown_fields: None,
         },
     ];
     Arc::new(

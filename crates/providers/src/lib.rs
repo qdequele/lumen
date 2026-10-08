@@ -59,8 +59,8 @@ pub use ollama::OllamaProvider;
 pub use openai::OpenAiProvider;
 pub use pinecone::PineconeProvider;
 pub use registry::{
-    ChatRoute, EmbeddingRoute, LoadedModelSummary, ModelSpec, ProviderSpec, Registry,
-    RegistryError, RerankRoute, SystemOneRoute,
+    ChatRoute, DecisionRoute, EmbeddingRoute, LoadedModelSummary, ModelSpec, ProviderSpec,
+    Registry, RegistryError, RerankRoute, SystemOneRoute,
 };
 pub use tei::TeiProvider;
 pub use together::TogetherRerankProvider;

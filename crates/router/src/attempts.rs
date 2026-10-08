@@ -195,6 +195,8 @@ mod tests {
                         release_date: None,
                     })
                     .collect(),
+                decisions_path: None,
+                forward_unknown_fields: None,
             }],
             reqwest::Client::new(),
             std::time::Duration::from_secs(300),
