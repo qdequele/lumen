@@ -315,6 +315,16 @@ impl Serialize for Questions<'_> {
     }
 }
 
+/// The TypeSafe wire body of one synthesized question (without its id), as
+/// [`encode`] sends it. The rerank remap packs calls by its estimated
+/// tokens, exactly as Jev's rerank always did (D7).
+///
+/// # Errors
+/// [`ProviderError::Translation`] if serialization fails.
+pub fn question_body(q: &Question) -> Result<Vec<u8>, ProviderError> {
+    serde_json::to_vec(&QuestionOut(q)).map_err(|e| translation(format!("decisions question: {e}")))
+}
+
 /// A synthesized question, keys in TypeSafe order: `type`, `instructions`,
 /// `criteria` (the order today's Jev rerank sends, D7).
 struct QuestionOut<'a>(&'a Question);

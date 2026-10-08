@@ -50,7 +50,8 @@ pub async fn rerank_handler(
         .decide(Capability::Rerank, &client_model, |_| {
             Facts::rerank(&headers, key.as_deref(), &req)
         })?;
-    let chain = lumen_router::resolve_rerank_decision(&state.registry, &mut decision)?;
+    let refusals = Some(&state.decision_metrics); // refused remap attempts (ADR 016)
+    let chain = lumen_router::resolve_rerank_decision(&state.registry, &mut decision, refusals)?;
     let primary = decision.primary_model().to_owned();
     let links = lumen_router::decision_links(
         &decision,
@@ -102,8 +103,7 @@ pub async fn rerank_handler(
 
     let mut response = executed.value;
     accounting.served_by(&executed.model_used, &executed.provider_used);
-    // Questions a decision model refused under a remap (ADR 016); 0 for
-    // every native reranker.
+    // Refusals in a served remap response (ADR 016); 0 for native rerankers.
     state
         .decision_metrics
         .add_refusals(&executed.model_used, u64::from(response.usage.refusals));

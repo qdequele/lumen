@@ -604,3 +604,72 @@ async fn refusals_score_zero_and_a_refused_choice_is_content_filtered() {
         other => panic!("expected ContentFiltered, got {other:?}"),
     }
 }
+
+/// Question count of each recorded call, largest first (calls run
+/// concurrently, so arrival order is not call order).
+async fn questions_per_call(mock: &MockServer) -> Vec<usize> {
+    let mut counts: Vec<usize> = mock
+        .received_requests()
+        .await
+        .expect("recorded")
+        .iter()
+        .map(|r| {
+            let sent: Value = serde_json::from_slice(&r.body).expect("json");
+            sent["questions"].as_object().expect("object").len()
+        })
+        .collect();
+    counts.sort_unstable_by(|a, b| b.cmp(a));
+    counts
+}
+
+#[tokio::test]
+async fn token_bound_jev_batching_matches_the_pre_refactor_split() {
+    // 60 documents of 3,000 bytes under the default template: the 48k token
+    // budget (not the 100-document cap) decides. Pre-refactor Jev rerank
+    // (estimate_text of each question body, no id) split [0..56), [56..60).
+    let mock = mock_with(EchoScores).await;
+    let docs: Vec<String> = (0..60)
+        .map(|_| format!("{} #0.5", "x".repeat(2_995)))
+        .collect();
+    assert_eq!(docs[0].len(), 3_000);
+    reranker(mock.uri(), RerankTemplate::default())
+        .rerank(request(&docs), CancellationToken::new())
+        .await
+        .expect("success");
+    assert_eq!(questions_per_call(&mock).await, vec![56, 4]);
+}
+
+#[tokio::test]
+async fn composite_jev_batching_rounds_each_question_like_the_pre_refactor_code() {
+    // Each question is rounded up to whole tokens on its own: the
+    // pre-refactor split is 29 + 29 + 2 documents (rounding a document's
+    // questions once would give 30 + 30).
+    let mock = mock_with(EchoScores).await;
+    let docs: Vec<String> = (0..60)
+        .map(|_| format!("{} #0.5", "x".repeat(3_087)))
+        .collect();
+    let template = RerankTemplate {
+        context: None,
+        strategy: RerankStrategy::Composite {
+            questions: vec![
+                CompositeQuestion {
+                    instructions: "on topic?".into(),
+                    criteria_true: "y".into(),
+                    criteria_false: "n".into(),
+                    weight: 1.0,
+                },
+                CompositeQuestion {
+                    instructions: "recent?".into(),
+                    criteria_true: "y2".into(),
+                    criteria_false: "n2".into(),
+                    weight: 1.0,
+                },
+            ],
+        },
+    };
+    reranker(mock.uri(), template)
+        .rerank(request(&docs), CancellationToken::new())
+        .await
+        .expect("success");
+    assert_eq!(questions_per_call(&mock).await, vec![58, 58, 4]);
+}

@@ -8,6 +8,7 @@ use std::sync::Arc;
 use lumen_core::{Capability, GatewayError};
 use lumen_providers::decisions::rerank::DecisionRerankProvider;
 use lumen_providers::{Registry, RerankRoute};
+use lumen_telemetry::DecisionMetrics;
 
 use crate::executor::Link;
 use crate::virtual_models::decide::{Attempt, Decision};
@@ -193,23 +194,34 @@ pub fn resolve_decisions(
 }
 
 /// Resolve a rerank decision; remap attempts go through the decision route.
+/// With `refusals`, a remap attempt that fails on a refusal (a refused
+/// listwise `choice`) counts it against the attempt's model, even when a
+/// later target serves the request.
 ///
 /// # Errors
 /// The primary's routing miss.
 pub fn resolve_rerank_decision(
     registry: &Registry,
     decision: &mut Decision,
+    refusals: Option<&DecisionMetrics>,
 ) -> Result<Vec<RerankChainLink>, GatewayError> {
     let routes = resolve(registry, decision, Capability::Rerank, |r, a| {
         match &a.remap {
             Some(template) => r.decision_route(&a.model_id).map(|route| {
                 let provider_name = route.provider_name.clone();
+                let mut provider = DecisionRerankProvider::new(
+                    route.provider,
+                    provider_name.clone(),
+                    template.clone(),
+                );
+                if let Some(metrics) = refusals {
+                    let metrics = metrics.clone();
+                    let model = a.model_id.clone();
+                    provider = provider
+                        .with_refusal_hook(Arc::new(move |n| metrics.add_refusals(&model, n)));
+                }
                 RerankRoute {
-                    provider: Arc::new(DecisionRerankProvider::new(
-                        route.provider,
-                        provider_name.clone(),
-                        template.clone(),
-                    )),
+                    provider: Arc::new(provider),
                     provider_name,
                     upstream_id: route.upstream_id,
                 }
@@ -312,13 +324,13 @@ mod tests {
         let reg = registry(&[("jev", &[Capability::Decisions])], ProviderKind::Typesafe);
         let mut d = Decision::direct("jev");
         d.attempts[0].remap = Some(Arc::new(RerankTemplate::default()));
-        let chain = resolve_rerank_decision(&reg, &mut d).unwrap();
+        let chain = resolve_rerank_decision(&reg, &mut d, None).unwrap();
         assert_eq!(chain[0].model_id, "jev");
         assert_eq!(chain[0].route.provider_name, "p");
         // Without the remap, a SystemOne-only model is not a reranker.
         let mut plain = Decision::direct("jev");
         assert_eq!(
-            resolve_rerank_decision(&reg, &mut plain)
+            resolve_rerank_decision(&reg, &mut plain, None)
                 .unwrap_err()
                 .code(),
             "LM-2002"

@@ -49,6 +49,8 @@ use lumen_core::{
     RerankResult, RerankUsage,
 };
 use serde::Serialize;
+
+use super::family::question_body;
 use serde_json::value::{to_raw_value, RawValue};
 use tokio_util::sync::CancellationToken;
 
@@ -79,8 +81,6 @@ pub const MAX_COMPOSITE_QUESTIONS: usize = 8;
 
 /// Bytes per estimated token, the heuristic of [`tokens::estimate_text`].
 const BYTES_PER_TOKEN: u64 = 4;
-/// Wire bytes a question adds beyond its texts (id, keys, punctuation).
-const QUESTION_OVERHEAD_BYTES: usize = 64;
 
 /// One weighted yes/no criterion of a `composite` template.
 #[derive(Clone, PartialEq)]
@@ -198,11 +198,17 @@ impl Default for RerankTemplate {
     }
 }
 
+/// Called with the number of questions refused in an attempt that fails
+/// because of them (a refused listwise `choice`), which never reaches
+/// [`RerankUsage::refusals`]. Feeds `lumen_decision_refusals_total`.
+pub type RefusalHook = Arc<dyn Fn(u64) + Send + Sync>;
+
 /// Serves `/v1/rerank` through any decision model.
 pub struct DecisionRerankProvider {
     inner: Arc<dyn DecisionProvider>,
     provider_name: String,
     template: Arc<RerankTemplate>,
+    on_refusal: Option<RefusalHook>,
 }
 
 impl DecisionRerankProvider {
@@ -217,7 +223,16 @@ impl DecisionRerankProvider {
             inner,
             provider_name: provider_name.into(),
             template,
+            on_refusal: None,
         }
+    }
+
+    /// Report refusals that fail an attempt (a refused `choice`) to `hook`;
+    /// refusals in a served response travel in [`RerankUsage::refusals`].
+    #[must_use]
+    pub fn with_refusal_hook(mut self, hook: RefusalHook) -> Self {
+        self.on_refusal = Some(hook);
+        self
     }
 }
 
@@ -226,6 +241,7 @@ impl std::fmt::Debug for DecisionRerankProvider {
         f.debug_struct("DecisionRerankProvider")
             .field("provider_name", &self.provider_name)
             .field("strategy", &self.template.strategy.name())
+            .field("refusal_hook", &self.on_refusal.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -298,34 +314,11 @@ fn bytes_to_tokens(bytes: usize) -> u64 {
         .div_ceil(BYTES_PER_TOKEN)
 }
 
-/// Estimated wire bytes of a synthesized question: its texts plus a fixed
-/// allowance for the id, keys and punctuation.
-fn question_bytes(q: &Question) -> usize {
-    let text = |t: &Text| t.byte_len() + QUESTION_OVERHEAD_BYTES / 8;
-    let mut bytes = QUESTION_OVERHEAD_BYTES
-        + q.name.as_ref().map_or(0, String::len)
-        + q.instructions.as_ref().map_or(0, text);
-    match &q.kind {
-        QuestionKind::Predicate { criteria } => {
-            if let Some(c) = criteria {
-                bytes += [&c.when_true, &c.when_false]
-                    .into_iter()
-                    .flatten()
-                    .map(text)
-                    .sum::<usize>();
-            }
-        }
-        QuestionKind::Choice { choices } => {
-            bytes += choices
-                .iter()
-                .map(|c| c.value.wire_key().len() + c.description.as_ref().map_or(0, text))
-                .sum::<usize>();
-        }
-        QuestionKind::Score { levels } => {
-            bytes += levels.iter().map(|l| text(&l.label)).sum::<usize>();
-        }
-    }
-    bytes
+/// Estimated tokens of a question: [`tokens::estimate_text`] of its
+/// TypeSafe wire body without the id, per question, exactly as Jev's rerank
+/// always packed (D7). Every target packs by this one measure.
+fn question_tokens(q: &Question) -> Result<u64, ProviderError> {
+    question_body(q).map(|body| bytes_to_tokens(body.len()))
 }
 
 /// Documents per call: the profile's cap, lowered so a call never exceeds
@@ -542,9 +535,12 @@ impl DecisionRerankProvider {
         let mut costs = Vec::with_capacity(req.documents.len());
         for (i, doc) in req.documents.iter().enumerate() {
             let questions = document_questions(strategy, i, truncate_doc(doc.text()))?;
-            costs.push(bytes_to_tokens(
-                questions.iter().map(question_bytes).sum::<usize>(),
-            ));
+            costs.push(
+                questions
+                    .iter()
+                    .map(question_tokens)
+                    .sum::<Result<u64, ProviderError>>()?,
+            );
             per_doc.push(questions);
         }
 
@@ -652,7 +648,7 @@ impl DecisionRerankProvider {
             },
             raw: None,
         };
-        if tokens::estimate_text(state.get()) + bytes_to_tokens(question_bytes(&question))
+        if tokens::estimate_text(state.get()) + question_tokens(&question)?
             > limits.pack.max_call_tokens
         {
             return Err(ProviderError::UnsupportedInput {
@@ -669,10 +665,13 @@ impl DecisionRerankProvider {
         let probabilities = match response.answers.first() {
             Some(Answer::Choice { probabilities, .. }) => probabilities,
             Some(Answer::Refusal) => {
+                if let Some(hook) = &self.on_refusal {
+                    hook(1);
+                }
                 return Err(ProviderError::ContentFiltered {
                     provider: self.provider_name.clone(),
                     status: 200,
-                })
+                });
             }
             Some(_) => return Err(translation("expected a choice answer")),
             None => return Err(translation("no answer for the choice")),
@@ -950,6 +949,45 @@ mod tests {
             seen.contains(r#""criteria":["off","partly","fully"]"#),
             "{seen}"
         );
+    }
+
+    fn hooked(
+        template: RerankTemplate,
+        answer: fn(&str) -> Answer,
+    ) -> (DecisionRerankProvider, Arc<std::sync::atomic::AtomicU64>) {
+        let (p, _) = provider(template, answer);
+        let count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let seen = count.clone();
+        let p = p.with_refusal_hook(Arc::new(move |n| {
+            seen.fetch_add(n, std::sync::atomic::Ordering::SeqCst);
+        }));
+        (p, count)
+    }
+
+    #[tokio::test]
+    async fn a_refused_choice_reports_to_the_hook_and_is_content_filtered() {
+        let (p, count) = hooked(choice_template(), |_| Answer::Refusal);
+        let err = p
+            .rerank(request(&["a", "b"]), CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ProviderError::ContentFiltered { status: 200, .. }),
+            "{err:?}"
+        );
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn served_refusals_travel_in_usage_not_the_hook() {
+        // Counted once, by the handler from `usage.refusals`.
+        let (p, count) = hooked(RerankTemplate::default(), |_| Answer::Refusal);
+        let out = p
+            .rerank(request(&["a", "b"]), CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(out.usage.refusals, 2);
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

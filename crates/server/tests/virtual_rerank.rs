@@ -422,4 +422,21 @@ async fn a_refused_choice_falls_back_on_content_filter() {
     assert_eq!(resp.status(), 200);
     assert_eq!(resp.headers()["x-lumen-model-used"], "rerank-english");
     assert_eq!(luna.received_requests().await.unwrap().len(), 1);
+
+    // The refused attempt is counted against the model that refused, even
+    // though another target served the request.
+    let metrics = reqwest::get(format!("{base}/metrics"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        metrics.contains(r#"lumen_decision_refusals_total{model="luna"} 1"#),
+        "{metrics}"
+    );
+    assert!(
+        !metrics.contains(r#"lumen_decision_refusals_total{model="rerank-english"}"#),
+        "{metrics}"
+    );
 }
