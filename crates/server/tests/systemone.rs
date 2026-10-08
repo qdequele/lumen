@@ -515,3 +515,25 @@ async fn jev_serves_v1_rerank_through_a_virtual_model_remap() {
         lumen_providers::typesafe::rerank::DEFAULT_CRITERIA_FALSE
     );
 }
+
+const UPSTREAM_OUT: &str = r#"{"model":"jev-1.13.0","answers":{"is_urgent":{"type":"noul","noul":0.95},"mood":{"type":"score","score":1.2,"legend":{"0":"calm","1":"angry"},"probabilities":{"0":0.4,"1":0.6},"confidence":0.7,"future_answer_field":1}},"usage":{"input_tokens":318,"output_tokens":34},"request_id":"abc"}"#;
+
+#[tokio::test]
+async fn golden_passthrough_response_bytes() {
+    let upstream = wiremock::MockServer::start().await;
+    mount_answers(&upstream, UPSTREAM_OUT).await;
+    let base = spawn(&upstream.uri(), &upstream.uri()).await;
+    let body = r#"{"model":"jev","state":"s","questions":{"is_urgent":{"type":"noul","instructions":"u?"},"mood":{"type":"score","instructions":"m?","criteria":["calm","angry"]}}}"#;
+    let bytes = post(&base, body).await.bytes().await.unwrap();
+    let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../providers/tests/fixtures/decisions");
+    if std::env::var_os("LUMEN_BLESS").is_some() {
+        std::fs::write(dir.join("passthrough_response_in.json"), UPSTREAM_OUT).unwrap();
+        std::fs::write(dir.join("passthrough_response_out.json"), &bytes).unwrap();
+    } else {
+        assert_eq!(
+            bytes.as_ref(),
+            std::fs::read(dir.join("passthrough_response_out.json")).unwrap()
+        );
+    }
+}
