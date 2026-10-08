@@ -1,7 +1,7 @@
 //! Assembly of the axum application and its middleware stack.
 
 use crate::{
-    admin, auth, chat, embeddings, health, models, rerank, routes, state::AppState, systemone,
+    admin, auth, chat, decisions, embeddings, health, models, rerank, routes, state::AppState,
 };
 use axum::extract::{MatchedPath, Request, State};
 use axum::http::{header, HeaderValue, StatusCode};
@@ -84,7 +84,8 @@ pub fn build_app(state: AppState) -> Router {
         .route("/v1/chat/completions", post(chat::chat))
         .route("/v1/embeddings", post(embeddings::embeddings))
         .route("/v1/rerank", post(rerank::rerank_handler))
-        .route("/v1/systemone", post(systemone::systemone_handler))
+        .route("/v1/decisions", post(decisions::decisions_handler))
+        .route("/v1/systemone", post(decisions::systemone_handler))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth::require_virtual_key,
