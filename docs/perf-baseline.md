@@ -78,24 +78,25 @@ release profile). Command: `cargo bench -p server --bench gateway_overhead -- de
 (add `CARGO_PROFILE_RELEASE_STRIP=false` on macOS 27). Passthrough is parse +
 token estimate + one attempt's clone and encode to the same vendor; cross-vendor
 is parse + encode to the other vendor's wire format. "Large" is the parser
-maximum: 128 questions, 128 KB of state or input (the old SystemOne large case
-used 300 questions; the decisions parser caps a request at 128).
+maximum: 300 questions and 128 KB of state for TypeSafe (same shape as the old
+SystemOne large case), 128 questions and 128 KB of input for OpenAI.
 
 | Bench | Median | 95 % CI |
 |---|---|---|
-| `decisions_passthrough_typesafe_small` (1 KB, 3 questions) | **3.49 µs** | 3.48 – 3.49 µs |
-| `decisions_passthrough_typesafe_large` (128 KB, 128 questions) | **144.5 µs** | 144.1 – 145.1 µs |
-| `decisions_passthrough_openai_small` | **2.95 µs** | 2.94 – 2.96 µs |
-| `decisions_passthrough_openai_large` | **153.9 µs** | 153.7 – 154.1 µs |
-| `decisions_cross_vendor_typesafe_small` (TypeSafe in, OpenAI out) | **4.62 µs** | 4.62 – 4.63 µs |
-| `decisions_cross_vendor_typesafe_large` | **224.9 µs** | 223.1 – 228.0 µs |
-| `decisions_cross_vendor_openai_small` (OpenAI in, TypeSafe out) | **3.06 µs** | 3.05 – 3.07 µs |
-| `decisions_cross_vendor_openai_large` | **165.9 µs** | 165.8 – 166.1 µs |
+| `decisions_passthrough_typesafe_small` (1 KB, 3 questions) | **3.48 µs** | 3.48 – 3.49 µs |
+| `decisions_passthrough_typesafe_large` (128 KB, 300 questions) | **307.1 µs** | 306.9 – 307.4 µs |
+| `decisions_passthrough_openai_small` | **3.00 µs** | 2.99 – 3.00 µs |
+| `decisions_passthrough_openai_large` | **155.8 µs** | 155.4 – 156.2 µs |
+| `decisions_cross_vendor_typesafe_small` (TypeSafe in, OpenAI out) | **4.62 µs** | 4.61 – 4.66 µs |
+| `decisions_cross_vendor_typesafe_large` | **414.3 µs** | 413.8 – 414.9 µs |
+| `decisions_cross_vendor_openai_small` (OpenAI in, TypeSafe out) | **3.10 µs** | 3.10 – 3.11 µs |
+| `decisions_cross_vendor_openai_large` | **169.8 µs** | 167.8 – 172.7 µs |
 
-Every case is far below the 1 ms budget. The TypeSafe small passthrough (3.49 µs)
-is within 6 % of the old `systemone_request_pipeline_small` (3.3 µs). The large
-cases are not directly comparable to the old 300-question reference (~280 µs)
-because the cap is now 128 questions.
+Every case is below the 1 ms budget; the worst (TypeSafe to OpenAI translation
+at 300 questions) is 414 us. The TypeSafe small passthrough (3.48 µs) is within
+6 % of the old `systemone_request_pipeline_small` (3.3 µs), and the large one
+(307 µs) within 10 % of the old `systemone_request_pipeline_large` (~280 µs,
+noisy host).
 
 ### Streaming time to first bit (measured here)
 

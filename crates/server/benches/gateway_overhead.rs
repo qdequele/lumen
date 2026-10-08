@@ -190,7 +190,7 @@ fn bench_decisions(c: &mut Criterion) {
     let ts = family::FamilyProfile::typesafe(true);
     for (name, body) in [
         ("typesafe_small", typesafe_body(3, 1024)),
-        ("typesafe_large", typesafe_body(128, 128 * 1024)),
+        ("typesafe_large", typesafe_body(300, 128 * 1024)),
         ("openai_small", openai_body(3, 1024)),
         ("openai_large", openai_body(128, 128 * 1024)),
     ] {
