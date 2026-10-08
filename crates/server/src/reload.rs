@@ -783,7 +783,7 @@ mod tests {
         let attempt_ids = |model: &str| -> Vec<String> {
             t.resilience
                 .decide(lumen_core::Capability::Chat, model, |_| {
-                    crate::facts::Facts::systemone(&headers, None)
+                    crate::facts::Facts::decisions(&headers, None)
                 })
                 .unwrap()
                 .attempts

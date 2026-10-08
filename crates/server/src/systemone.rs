@@ -42,8 +42,8 @@ pub async fn systemone_handler(
     // Facts are only built for a virtual model (ADR 014).
     let mut decision = state
         .resilience
-        .decide(Capability::SystemOne, &client_model, |_| {
-            Facts::systemone(&headers, key.as_deref())
+        .decide(Capability::Decisions, &client_model, |_| {
+            Facts::decisions(&headers, key.as_deref())
         })?;
     let chain = lumen_router::resolve_systemone_decision(&state.registry, &mut decision)?;
     let primary = decision.primary_model().to_owned();
@@ -63,7 +63,7 @@ pub async fn systemone_handler(
         &headers,
         key.as_deref(),
         Target {
-            capability: "systemone",
+            capability: "decisions",
             model: &client_model,
             provider: &chain[0].route.provider_name,
         },

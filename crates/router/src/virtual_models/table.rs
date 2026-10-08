@@ -413,8 +413,8 @@ impl Compiler<'_> {
                     "`remap` is only valid on a rerank virtual model".to_owned()
                 ));
             }
-            if !found.capabilities.contains(&Capability::SystemOne) {
-                return Err(err("a remap target must serve systemone".to_owned()));
+            if !found.capabilities.contains(&Capability::Decisions) {
+                return Err(err("a remap target must serve decisions".to_owned()));
             }
             let template = compile_remap(remap).map_err(err)?;
             (Some(Arc::new(template)), vec!["text".to_owned()])
@@ -717,7 +717,7 @@ mod tests {
             vec![Capability::Rerank],
             vec!["text".into()],
         );
-        f.insert("jev", vec![Capability::SystemOne], vec!["text".into()]);
+        f.insert("jev", vec![Capability::Decisions], vec!["text".into()]);
         f
     }
 
@@ -976,7 +976,7 @@ mod tests {
             strategy = "single"
             targets = [{ model = "rerank-english", remap = {} }]
         "#)
-        .contains("must serve systemone"));
+        .contains("must serve decisions"));
         assert!(err(r#"
             [[virtual_models]]
             id = "c"

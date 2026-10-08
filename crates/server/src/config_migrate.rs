@@ -134,7 +134,7 @@ fn plan_foundations(
         for m in &p.models {
             let legacy = is_legacy_rerank(p, m);
             let keeps_foundation = (!m.fallbacks.is_empty() && !legacy)
-                || (legacy && m.capabilities.contains(&Capability::SystemOne));
+                || (legacy && m.capabilities.contains(&Capability::Decisions));
             if keeps_foundation {
                 let new_id = claim(format!("{}/{}", p.name, m.id), ids)?;
                 plan.renames.insert(m.id.clone(), new_id);
@@ -166,7 +166,7 @@ fn plan_foundations(
                 let upstream = m.resolved_upstream_id();
                 let sibling = p.models.iter().find(|o| {
                     o.id != m.id
-                        && o.capabilities.contains(&Capability::SystemOne)
+                        && o.capabilities.contains(&Capability::Decisions)
                         && o.resolved_upstream_id() == upstream
                 });
                 if let Some(sibling) = sibling {
@@ -192,7 +192,7 @@ fn plan_foundations(
                         provider: pi,
                         model: ModelConfig {
                             upstream_id: Some(upstream.to_owned()),
-                            capabilities: vec![Capability::SystemOne],
+                            capabilities: vec![Capability::Decisions],
                             cost_per_1m_input: m.cost_per_1m_input,
                             cost_per_1m_output: m.cost_per_1m_output,
                             cost_per_1k_searches: m.cost_per_1k_searches,

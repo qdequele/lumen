@@ -31,7 +31,7 @@ fn resolve<R>(
     };
     if routes.first().is_none_or(Option::is_none) {
         let wanted = if primary.remap.is_some() {
-            Capability::SystemOne
+            Capability::Decisions
         } else {
             capability
         };
@@ -100,7 +100,7 @@ pub fn resolve_systemone_decision(
     registry: &Registry,
     decision: &mut Decision,
 ) -> Result<Vec<SystemOneChainLink>, GatewayError> {
-    let routes = resolve(registry, decision, Capability::SystemOne, |r, a| {
+    let routes = resolve(registry, decision, Capability::Decisions, |r, a| {
         r.systemone_route(&a.model_id)
     })?;
     Ok(routes
@@ -228,7 +228,7 @@ mod tests {
 
     #[test]
     fn a_remap_attempt_resolves_through_the_systemone_route() {
-        let reg = registry(&[("jev", &[Capability::SystemOne])], ProviderKind::Typesafe);
+        let reg = registry(&[("jev", &[Capability::Decisions])], ProviderKind::Typesafe);
         let mut d = Decision::direct("jev");
         d.attempts[0].remap = Some(Arc::new(RerankTemplate::default()));
         let chain = resolve_rerank_decision(&reg, &mut d).unwrap();

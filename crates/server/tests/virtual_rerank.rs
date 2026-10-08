@@ -48,7 +48,7 @@ fn config(jev: &str, cohere: &str, remap: &str) -> Config {
             [[providers.models]]
             id = "jev"
             upstream_id = "jev-latest"
-            capabilities = ["systemone"]
+            capabilities = ["decisions"]
             cost_per_1m_input = 0.042
 
             [[providers]]

@@ -172,7 +172,7 @@ cost_per_1m_input = 0.042
         .unwrap();
     assert_eq!(
         created.capabilities,
-        vec![lumen_core::Capability::SystemOne]
+        vec![lumen_core::Capability::Decisions]
     );
     assert_eq!(created.cost_per_1m_input, Some(0.042));
     assert_eq!(
@@ -457,7 +457,7 @@ capabilities = ["systemone", "rerank"]
     loads(&m.text);
     assert!(
         m.notes.iter().any(|n| n.contains("'jev'")
-            && n.contains("systemone")
+            && n.contains("decisions")
             && n.contains("'typesafe/jev'")),
         "{:?}",
         m.notes
@@ -498,7 +498,7 @@ cost_per_1k_searches = 2.5
     assert!(hint.contains("[[providers.models]]"), "{hint}");
     assert!(hint.contains("id = \"typesafe/jev-latest\""), "{hint}");
     assert!(hint.contains("upstream_id = \"jev-latest\""), "{hint}");
-    assert!(hint.contains("capabilities = [\"systemone\"]"), "{hint}");
+    assert!(hint.contains("capabilities = [\"decisions\"]"), "{hint}");
     assert!(hint.contains("cost_per_1m_input = 0.042"), "{hint}");
     assert!(hint.contains("cost_per_1k_searches = 2.5"), "{hint}");
     assert!(hint.contains("remove that foundation model"), "{hint}");

@@ -259,8 +259,8 @@ mod tests {
                 strict: false,
                 connect_timeout_ms: None,
                 models: vec![
-                    model("jev-latest", &[Capability::SystemOne]),
-                    model("jev-1.13.0", &[Capability::SystemOne]),
+                    model("jev-latest", &[Capability::Decisions]),
+                    model("jev-1.13.0", &[Capability::Decisions]),
                 ],
             }],
             reqwest::Client::new(),
@@ -280,7 +280,7 @@ mod tests {
         let chat = registry_with(vec![model("gpt", &[Capability::Chat])]);
         let err = resolve_systemone_decision(&chat, &mut Decision::direct("gpt")).unwrap_err();
         assert_eq!(err.code(), "LM-2002");
-        assert!(err.to_string().contains("systemone"));
+        assert!(err.to_string().contains("decisions"));
     }
 
     #[test]

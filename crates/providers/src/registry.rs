@@ -547,7 +547,7 @@ fn build_inner(
                 }
             }
 
-            if model.capabilities.contains(&Capability::SystemOne) {
+            if model.capabilities.contains(&Capability::Decisions) {
                 if let Some(provider) = &built.systemone {
                     inner.systemone.insert(
                         model.id.clone(),
@@ -1906,7 +1906,7 @@ mod tests {
                 "typesafe",
                 None,
                 vec![
-                    model("jev", &[Capability::SystemOne]),
+                    model("jev", &[Capability::Decisions]),
                     model("jev-rerank", &[Capability::Rerank]),
                 ],
             )],
@@ -1930,7 +1930,7 @@ mod tests {
                 ProviderKind::Cohere,
                 "cohere",
                 None,
-                vec![model("rr", &[Capability::SystemOne])],
+                vec![model("rr", &[Capability::Decisions])],
             )],
             reqwest::Client::new(),
             Duration::from_secs(300),

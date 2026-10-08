@@ -46,12 +46,12 @@ fn config(primary: &str, fallback: &str) -> Config {
         [[providers.models]]
         id = "jev"
         upstream_id = "jev-latest"
-        capabilities = ["systemone"]
+        capabilities = ["decisions"]
         cost_per_1m_input = 0.042
         [[providers.models]]
         id = "jev-pinned-leaf"
         upstream_id = "jev-1.13.0"
-        capabilities = ["systemone"]
+        capabilities = ["decisions"]
 
         [[providers]]
         name = "typesafe-backup"
@@ -61,7 +61,7 @@ fn config(primary: &str, fallback: &str) -> Config {
         [[providers.models]]
         id = "jev-fb"
         upstream_id = "jev-latest"
-        capabilities = ["systemone"]
+        capabilities = ["decisions"]
 
         [[providers]]
         name = "openai"
@@ -74,7 +74,7 @@ fn config(primary: &str, fallback: &str) -> Config {
 
         [[virtual_models]]
         id = "jev-pinned"
-        capability = "systemone"
+        capability = "decisions"
         strategy = "fallback"
         targets = [{{ model = "jev-pinned-leaf" }}, {{ model = "jev-fb" }}]
 
@@ -186,7 +186,7 @@ async fn missing_upstream_usage_is_estimated_and_flagged() {
         .expect("text");
     assert!(
         metrics.lines().any(|l| l.starts_with("lumen_tokens_total{")
-            && l.contains(r#"capability="systemone""#)
+            && l.contains(r#"capability="decisions""#)
             && l.contains(r#"direction="input""#)
             && l.contains(r#"estimated="true""#)),
         "{metrics}"
@@ -211,7 +211,7 @@ async fn upstream_usage_feeds_the_token_counters() {
             .lines()
             .find(|l| {
                 l.starts_with("lumen_tokens_total{")
-                    && l.contains(r#"capability="systemone""#)
+                    && l.contains(r#"capability="decisions""#)
                     && l.contains(&format!(r#"direction="{direction}""#))
             })
             .map(str::to_owned)
@@ -297,7 +297,7 @@ async fn routing_misses_use_the_standard_codes() {
     assert_eq!(err["error"]["code"], "LM-2002");
     assert!(err["error"]["message"]
         .as_str()
-        .is_some_and(|m| m.contains("systemone")));
+        .is_some_and(|m| m.contains("decisions")));
 }
 
 #[tokio::test]
@@ -372,7 +372,7 @@ async fn overloaded_529_falls_back_and_the_header_names_the_fallback() {
 }
 
 #[tokio::test]
-async fn models_list_advertises_the_systemone_capability() {
+async fn models_list_advertises_the_decisions_capability() {
     let upstream = MockServer::start().await;
     let base = spawn(&upstream.uri(), &upstream.uri()).await;
     let body: Value = reqwest::get(format!("{base}/v1/models"))
@@ -387,7 +387,7 @@ async fn models_list_advertises_the_systemone_capability() {
         .iter()
         .find(|m| m["id"] == "jev")
         .expect("jev listed");
-    assert_eq!(jev["capabilities"], json!(["systemone"]));
+    assert_eq!(jev["capabilities"], json!(["decisions"]));
     assert_eq!(jev["owned_by"], "typesafe");
 }
 

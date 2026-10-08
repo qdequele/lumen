@@ -1422,6 +1422,12 @@ impl Config {
             message: describe_figment_error(&e),
         })?;
         config.validate(path_label)?;
+        for message in legacy_spellings(figment) {
+            tracing::warn!(
+                config = %path_label,
+                "{message} (ADR 016); run `lumen config migrate` to rewrite it"
+            );
+        }
         Ok(config)
     }
 
@@ -1689,6 +1695,83 @@ impl Config {
             })
             .collect()
     }
+}
+
+/// Spellings ADR 016 renamed, read from the raw document (the typed config
+/// already accepted them through serde aliases, so it cannot tell).
+#[derive(Deserialize, Default)]
+struct LegacyDoc {
+    #[serde(default)]
+    providers: Vec<LegacyProvider>,
+    #[serde(default)]
+    virtual_models: Vec<LegacyVirtual>,
+}
+#[derive(Deserialize, Default)]
+struct LegacyProvider {
+    #[serde(default)]
+    models: Vec<LegacyModel>,
+}
+#[derive(Deserialize, Default)]
+struct LegacyModel {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    capabilities: Vec<String>,
+}
+#[derive(Deserialize, Default)]
+struct LegacyVirtual {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    capability: String,
+    #[serde(default)]
+    targets: Vec<LegacyTarget>,
+}
+#[derive(Deserialize, Default)]
+struct LegacyTarget {
+    #[serde(default)]
+    remap: Option<LegacyRemap>,
+}
+#[derive(Deserialize, Default)]
+struct LegacyRemap {
+    #[serde(default)]
+    strategy: Option<String>,
+}
+
+/// One message per renamed spelling still in the document (ADR 016): the
+/// `systemone` capability and the `noul` remap strategy.
+pub(crate) fn legacy_spellings(figment: &Figment) -> Vec<String> {
+    let Ok(doc) = figment.extract::<LegacyDoc>() else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    for model in doc.providers.iter().flat_map(|p| &p.models) {
+        if model.capabilities.iter().any(|c| c == "systemone") {
+            found.push(format!(
+                "model '{}' uses capability \"systemone\", renamed \"decisions\"",
+                model.id
+            ));
+        }
+    }
+    for vm in &doc.virtual_models {
+        if vm.capability == "systemone" {
+            found.push(format!(
+                "virtual model '{}' uses capability \"systemone\", renamed \"decisions\"",
+                vm.id
+            ));
+        }
+        if vm
+            .targets
+            .iter()
+            .any(|t| t.remap.as_ref().and_then(|r| r.strategy.as_deref()) == Some("noul"))
+        {
+            found.push(format!(
+                "virtual model '{}' uses remap strategy \"noul\", renamed \"predicate\"",
+                vm.id
+            ));
+        }
+    }
+    found
 }
 
 #[cfg(test)]
@@ -2542,6 +2625,39 @@ mod tests {
     }
 
     #[test]
+    fn the_systemone_spellings_are_reported_for_a_boot_warning() {
+        let figment = Figment::new().merge(Toml::string(
+            r#"
+            [[providers]]
+            name = "typesafe"
+            kind = "typesafe"
+            [[providers.models]]
+            id = "jev"
+            capabilities = ["systemone"]
+            [[virtual_models]]
+            id = "jev-vm"
+            capability = "systemone"
+            strategy = "single"
+            targets = [{ model = "jev" }]
+            [[virtual_models]]
+            id = "rr"
+            capability = "rerank"
+            strategy = "single"
+            targets = [{ model = "jev", remap = { strategy = "noul" } }]
+        "#,
+        ));
+        let found = legacy_spellings(&figment);
+        assert_eq!(found.len(), 3, "{found:?}");
+        assert!(found
+            .iter()
+            .any(|s| s.contains("model 'jev'") && s.contains("\"decisions\"")));
+        assert!(found.iter().any(|s| s.contains("virtual model 'jev-vm'")));
+        assert!(found
+            .iter()
+            .any(|s| s.contains("virtual model 'rr'") && s.contains("\"predicate\"")));
+    }
+
+    #[test]
     fn config_debug_never_prints_preset_or_remap_text() {
         // Parsed only (a legacy rerank block would fail validation): Debug is
         // the leak surface, whatever the load outcome.
@@ -2552,7 +2668,7 @@ mod tests {
             kind = "typesafe"
             [[providers.models]]
             id = "jev"
-            capabilities = ["systemone"]
+            capabilities = ["decisions"]
             [providers.models.rerank]
             instructions = "SENTINEL-LEGACY"
             criteria.true = "SENTINEL-LEGACY-YES"
