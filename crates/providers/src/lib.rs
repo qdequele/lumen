@@ -17,6 +17,7 @@ pub mod bedrock;
 pub mod chat;
 pub mod cloudflare;
 pub mod cohere;
+pub mod decisions;
 pub mod google;
 pub mod http;
 pub mod image_fetch;
