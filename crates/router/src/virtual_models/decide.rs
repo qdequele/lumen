@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use lumen_core::{Capability, GatewayError};
-use lumen_providers::typesafe::rerank::RerankTemplate;
+use lumen_providers::decisions::rerank::RerankTemplate;
 
 use super::condition::FactSource;
 use super::overrides::{apply_chain, effective_field, Overridable, Overrides, Preset};
@@ -23,7 +23,7 @@ pub struct Attempt {
     pub path: String,
     /// Override levels, outermost first.
     pub overrides: Vec<Arc<Overrides>>,
-    /// Rerank remap through a SystemOne model, if any.
+    /// Rerank remap through a decision model, if any.
     pub remap: Option<Arc<RerankTemplate>>,
     /// Where to continue on failure, innermost first.
     pub escapes: Vec<Escape>,

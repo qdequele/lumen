@@ -628,7 +628,7 @@ async fn jev_serves_v1_rerank_through_a_virtual_model_remap() {
     assert_eq!(q["criteria"]["true"], "States the cited rule.");
     assert_eq!(
         q["criteria"]["false"],
-        lumen_providers::typesafe::rerank::DEFAULT_CRITERIA_FALSE
+        lumen_providers::decisions::rerank::DEFAULT_CRITERIA_FALSE
     );
 }
 

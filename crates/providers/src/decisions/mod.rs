@@ -5,3 +5,4 @@
 
 pub mod family;
 pub mod openai;
+pub mod rerank;

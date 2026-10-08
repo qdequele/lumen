@@ -98,30 +98,38 @@ const PASSTHROUGH: &str = r#"{"model":"jev","state":{"zeta":"café\n","alpha":[1
 #[tokio::test]
 async fn passthrough_request_bytes() {
     let (mock, rec) = recorder().await;
-    let provider = lumen_providers::TypesafeProvider::new(
+    let provider = lumen_providers::FamilyDecisionProvider::typesafe(
         lumen_providers::http::build_client(),
         "typesafe",
         Some(mock.uri()),
+        None,
+        true,
         Some("k".into()),
     );
-    let mut req: lumen_core::SystemOneRequest = serde_json::from_str(PASSTHROUGH).unwrap();
+    let (_, mut req) = lumen_core::decisions::format::parse(
+        PASSTHROUGH.as_bytes(),
+        Some(lumen_core::decisions::format::Format::TypeSafe),
+    )
+    .unwrap();
     "jev-latest".clone_into(&mut req.model);
-    lumen_core::SystemOneProvider::evaluate(&provider, req, CancellationToken::new())
+    lumen_core::DecisionProvider::decide(&provider, req, CancellationToken::new())
         .await
         .unwrap();
     golden("passthrough_request.json", &rec.0.lock().unwrap()[0]);
 }
 
-async fn rerank_bytes(strategy: lumen_providers::typesafe::rerank::RerankStrategy, name: &str) {
-    use lumen_providers::typesafe::rerank::{RerankTemplate, TypesafeRerankProvider};
+async fn rerank_bytes(strategy: lumen_providers::decisions::rerank::RerankStrategy, name: &str) {
+    use lumen_providers::decisions::rerank::{DecisionRerankProvider, RerankTemplate};
     let (mock, rec) = recorder().await;
-    let inner = Arc::new(lumen_providers::TypesafeProvider::new(
+    let inner = Arc::new(lumen_providers::FamilyDecisionProvider::typesafe(
         lumen_providers::http::build_client(),
         "typesafe",
         Some(mock.uri()),
+        None,
+        true,
         Some("k".into()),
     ));
-    let provider = TypesafeRerankProvider::new(
+    let provider = DecisionRerankProvider::new(
         inner,
         "typesafe",
         Arc::new(RerankTemplate {
@@ -139,7 +147,7 @@ async fn rerank_bytes(strategy: lumen_providers::typesafe::rerank::RerankStrateg
 #[tokio::test]
 async fn rerank_noul_request_bytes() {
     rerank_bytes(
-        lumen_providers::typesafe::rerank::RerankTemplate::default().strategy,
+        lumen_providers::decisions::rerank::RerankTemplate::default().strategy,
         "rerank_noul_request.json",
     )
     .await;
@@ -148,7 +156,7 @@ async fn rerank_noul_request_bytes() {
 #[tokio::test]
 async fn rerank_score_request_bytes() {
     rerank_bytes(
-        lumen_providers::typesafe::rerank::RerankStrategy::Score {
+        lumen_providers::decisions::rerank::RerankStrategy::Score {
             instructions: "How relevant?".to_owned(),
             levels: vec!["none".to_owned(), "some".to_owned(), "exact".to_owned()],
         },
@@ -159,7 +167,7 @@ async fn rerank_score_request_bytes() {
 
 #[tokio::test]
 async fn rerank_composite_request_bytes() {
-    use lumen_providers::typesafe::rerank::{CompositeQuestion, RerankStrategy};
+    use lumen_providers::decisions::rerank::{CompositeQuestion, RerankStrategy};
     rerank_bytes(
         RerankStrategy::Composite {
             questions: vec![
@@ -185,7 +193,7 @@ async fn rerank_composite_request_bytes() {
 #[tokio::test]
 async fn rerank_choice_request_bytes() {
     rerank_bytes(
-        lumen_providers::typesafe::rerank::RerankStrategy::Choice {
+        lumen_providers::decisions::rerank::RerankStrategy::Choice {
             instructions: "Which document best answers?".to_owned(),
         },
         "rerank_choice_request.json",

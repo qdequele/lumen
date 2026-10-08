@@ -6,9 +6,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use lumen_core::systemone::MAX_SCORE_LEVELS;
+use lumen_core::decisions::format::typesafe::MAX_SCORE_LEVELS;
 use lumen_core::Capability;
-use lumen_providers::typesafe::rerank::{
+use lumen_providers::decisions::rerank::{
     CompositeQuestion, RerankStrategy, RerankTemplate, DEFAULT_CHOICE_INSTRUCTIONS,
     DEFAULT_CRITERIA_FALSE, DEFAULT_CRITERIA_TRUE, DEFAULT_INSTRUCTIONS,
     DEFAULT_SCORE_INSTRUCTIONS, MAX_COMPOSITE_QUESTIONS,
@@ -549,7 +549,7 @@ fn compile_remap(r: &RemapConfig) -> Result<RerankTemplate, String> {
         return Err("remap fields must not be blank".to_owned());
     }
     let strategy_name = match r.strategy {
-        RemapStrategy::Noul => "noul",
+        RemapStrategy::Predicate => "predicate",
         RemapStrategy::Score => "score",
         RemapStrategy::Composite => "composite",
         RemapStrategy::Choice => "choice",
@@ -566,11 +566,11 @@ fn compile_remap(r: &RemapConfig) -> Result<RerankTemplate, String> {
     let instructions = |default: &str| r.instructions.clone().unwrap_or_else(|| default.to_owned());
 
     let strategy = match r.strategy {
-        RemapStrategy::Noul => {
+        RemapStrategy::Predicate => {
             reject(r.levels.is_some(), "levels")?;
             reject(r.questions.is_some(), "questions")?;
             let (criteria_true, criteria_false) = resolve_criteria(r.criteria.as_ref())?;
-            RerankStrategy::Noul {
+            RerankStrategy::Predicate {
                 instructions: instructions(DEFAULT_INSTRUCTIONS),
                 criteria_true,
                 criteria_false,
@@ -961,8 +961,11 @@ mod tests {
         };
         assert!(e(r#"{ strategy = "score" }"#).contains("levels"));
         assert!(e(r#"{ strategy = "score", levels = ["only"] }"#).contains("2 to 10"));
+        assert!(e(r#"{ strategy = "predicate", levels = ["a","b"] }"#)
+            .contains("not valid for strategy `predicate`"));
+        // The ADR 013 name is an alias.
         assert!(e(r#"{ strategy = "noul", levels = ["a","b"] }"#)
-            .contains("not valid for strategy `noul`"));
+            .contains("not valid for strategy `predicate`"));
         assert!(e(r#"{ strategy = "composite" }"#).contains("questions"));
         assert!(e(
             r#"{ strategy = "composite", questions = [{ instructions = "q", weight = 0.0 }] }"#
@@ -985,6 +988,29 @@ mod tests {
             targets = [{ model = "gpt-4o", remap = {} }]
         "#)
         .contains("only valid on a rerank"));
+    }
+
+    #[test]
+    fn a_noul_remap_compiles_to_a_predicate() {
+        for name in ["noul", "predicate"] {
+            let (table, _) = compile(&format!(
+                r#"
+            [[virtual_models]]
+            id = "r"
+            capability = "rerank"
+            strategy = "single"
+            targets = [{{ model = "jev", remap = {{ strategy = "{name}" }} }}]
+        "#
+            ))
+            .unwrap();
+            let vm = table.get("r").unwrap();
+            let template = vm.targets[0].remap.as_ref().unwrap();
+            assert_eq!(template.strategy.name(), "predicate", "{name}");
+            assert!(matches!(
+                &template.strategy,
+                RerankStrategy::Predicate { instructions, .. } if instructions == DEFAULT_INSTRUCTIONS
+            ));
+        }
     }
 
     #[test]

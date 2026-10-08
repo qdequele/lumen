@@ -102,6 +102,11 @@ pub async fn rerank_handler(
 
     let mut response = executed.value;
     accounting.served_by(&executed.model_used, &executed.provider_used);
+    // Questions a decision model refused under a remap (ADR 016); 0 for
+    // every native reranker.
+    state
+        .decision_metrics
+        .add_refusals(&executed.model_used, u64::from(response.usage.refusals));
     let route = decision.route_of(executed.index);
     accounting.set_route(route);
 

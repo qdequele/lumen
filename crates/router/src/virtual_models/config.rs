@@ -136,7 +136,7 @@ pub enum SystemPromptMode {
     IfAbsent,
 }
 
-/// A SystemOne rerank remap on a target.
+/// A rerank remap onto a decision model on a target (ADR 014, ADR 016).
 #[derive(Clone, PartialEq, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RemapConfig {
@@ -146,10 +146,10 @@ pub struct RemapConfig {
     /// Static context added to the state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<String>,
-    /// `noul`, `score`, `choice`: the question.
+    /// `predicate`, `score`, `choice`: the question.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
-    /// `noul`: what yes and no mean.
+    /// `predicate`: what yes and no mean.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub criteria: Option<CriteriaConfig>,
     /// `score`: levels, worst first.
@@ -164,12 +164,14 @@ pub struct RemapConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RemapStrategy {
-    /// One noul per document.
+    /// One predicate (yes/no) per document. `noul` (ADR 013) is accepted as
+    /// an alias.
     #[default]
-    Noul,
+    #[serde(alias = "noul")]
+    Predicate,
     /// One graded score per document.
     Score,
-    /// Several weighted nouls per document.
+    /// Several weighted predicates per document.
     Composite,
     /// One choice over all documents.
     Choice,
@@ -302,6 +304,23 @@ mod tests {
                 .as_deref(),
             Some("y")
         );
+    }
+
+    #[test]
+    fn remap_strategy_noul_is_an_alias_of_predicate() {
+        #[derive(serde::Deserialize, serde::Serialize)]
+        struct R {
+            remap: RemapConfig,
+        }
+        for name in ["noul", "predicate"] {
+            let r: R = toml::from_str(&format!("remap = {{ strategy = \"{name}\" }}")).unwrap();
+            assert_eq!(r.remap.strategy, RemapStrategy::Predicate, "{name}");
+        }
+        assert_eq!(RemapConfig::default().strategy, RemapStrategy::Predicate);
+        // Written back under the new name.
+        let r: R = toml::from_str(r#"remap = { strategy = "noul" }"#).unwrap();
+        let text = toml::to_string(&r).unwrap();
+        assert!(text.contains(r#"strategy = "predicate""#), "{text}");
     }
 
     #[test]

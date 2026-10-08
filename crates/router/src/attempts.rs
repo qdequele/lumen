@@ -1,12 +1,12 @@
 //! Resolving a [`Decision`] against the provider [`Registry`] (ADR 014).
 //! Leaves resolve by foundation id at request time, exactly as fallback
-//! chains always have; a remap leaf wraps the SystemOne route in a
-//! [`TypesafeRerankProvider`] carrying the compiled template.
+//! chains always have; a remap leaf wraps the decision route in a
+//! [`DecisionRerankProvider`] carrying the compiled template.
 
 use std::sync::Arc;
 
 use lumen_core::{Capability, GatewayError};
-use lumen_providers::typesafe::rerank::TypesafeRerankProvider;
+use lumen_providers::decisions::rerank::DecisionRerankProvider;
 use lumen_providers::{Registry, RerankRoute};
 
 use crate::executor::Link;
@@ -192,7 +192,7 @@ pub fn resolve_decisions(
     Ok(links)
 }
 
-/// Resolve a rerank decision; remap attempts go through the SystemOne route.
+/// Resolve a rerank decision; remap attempts go through the decision route.
 ///
 /// # Errors
 /// The primary's routing miss.
@@ -202,16 +202,16 @@ pub fn resolve_rerank_decision(
 ) -> Result<Vec<RerankChainLink>, GatewayError> {
     let routes = resolve(registry, decision, Capability::Rerank, |r, a| {
         match &a.remap {
-            Some(template) => r.systemone_route(&a.model_id).map(|so| {
-                let provider_name = so.provider_name.clone();
+            Some(template) => r.decision_route(&a.model_id).map(|route| {
+                let provider_name = route.provider_name.clone();
                 RerankRoute {
-                    provider: Arc::new(TypesafeRerankProvider::new(
-                        so.provider,
+                    provider: Arc::new(DecisionRerankProvider::new(
+                        route.provider,
                         provider_name.clone(),
                         template.clone(),
                     )),
                     provider_name,
-                    upstream_id: so.upstream_id,
+                    upstream_id: route.upstream_id,
                 }
             }),
             None => r.rerank_route(&a.model_id),
@@ -251,7 +251,7 @@ pub fn decision_links<'a>(
 mod tests {
     use super::*;
     use lumen_core::Capability;
-    use lumen_providers::typesafe::rerank::RerankTemplate;
+    use lumen_providers::decisions::rerank::RerankTemplate;
     use lumen_providers::{ModelSpec, ProviderKind, ProviderSpec};
 
     fn registry(models: &[(&str, &[Capability])], kind: ProviderKind) -> Registry {
@@ -308,7 +308,7 @@ mod tests {
     }
 
     #[test]
-    fn a_remap_attempt_resolves_through_the_systemone_route() {
+    fn a_remap_attempt_resolves_through_the_decision_route() {
         let reg = registry(&[("jev", &[Capability::Decisions])], ProviderKind::Typesafe);
         let mut d = Decision::direct("jev");
         d.attempts[0].remap = Some(Arc::new(RerankTemplate::default()));

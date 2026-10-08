@@ -305,3 +305,121 @@ async fn dropping_the_client_aborts_the_in_flight_jev_call() {
         "the Jev connection was not aborted after the client left"
     );
 }
+
+/// A rerank virtual model whose remap targets OpenAI's decision model, with
+/// a Cohere fallback on `content_filter`.
+fn openai_config(luna: &str, cohere: &str, remap: &str) -> Config {
+    Config::load_text(
+        &format!(
+            r#"
+            [resilience]
+            retry_max_attempts = 1
+            retry_base_ms = 10
+            retry_max_ms = 20
+
+            [[providers]]
+            name = "openai"
+            kind = "openai"
+            base_url = "{luna}/v1"
+            api_key_env = "LUMEN_TEST_OPENAI_KEY_UNUSED"
+            [[providers.models]]
+            id = "luna"
+            upstream_id = "gpt-6-luna"
+            capabilities = ["decisions"]
+
+            [[providers]]
+            name = "cohere"
+            kind = "cohere"
+            base_url = "{cohere}"
+            api_key_env = "LUMEN_TEST_COHERE_KEY_UNUSED"
+            [[providers.models]]
+            id = "rerank-english"
+            upstream_id = "rerank-v3.5"
+            capabilities = ["rerank"]
+
+            [[virtual_models]]
+            id = "acme/rerank"
+            capability = "rerank"
+            strategy = "fallback"
+            fallback_on = ["content_filter"]
+            targets = [{{ model = "luna", remap = {remap} }}, {{ model = "rerank-english" }}]
+            "#
+        ),
+        "test",
+    )
+    .unwrap()
+}
+
+async fn mount_luna(answers: Value) -> MockServer {
+    let luna = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/decisions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "model": "gpt-6-luna", "answers": answers,
+            "usage": { "input_tokens": 50, "output_tokens": 2 }
+        })))
+        .mount(&luna)
+        .await;
+    luna
+}
+
+#[tokio::test]
+async fn an_openai_remap_counts_refusals_and_never_returns_them() {
+    let luna = mount_luna(json!([
+        { "type": "refusal", "name": "0" },
+        { "type": "predicate", "name": "1", "probability": 0.7 }
+    ]))
+    .await;
+    let cohere = MockServer::start().await;
+    let base = spawn(&openai_config(&luna.uri(), &cohere.uri(), "{}")).await;
+
+    let resp = rerank(&base, &["a", "b"]).await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers()["x-lumen-model-used"], "luna");
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["results"][0]["index"], 1);
+    assert_eq!(body["results"][1]["relevance_score"], 0.0);
+    assert_eq!(body["usage"]["total_tokens"], 50);
+    assert!(body["usage"].get("refusals").is_none(), "{body}");
+    let sent: Value =
+        serde_json::from_slice(&luna.received_requests().await.unwrap()[0].body).unwrap();
+    assert_eq!(sent["model"], "gpt-6-luna");
+    assert_eq!(sent["input"], r#"{"query":"q"}"#);
+    assert!(cohere.received_requests().await.unwrap().is_empty());
+
+    let metrics = reqwest::get(format!("{base}/metrics"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        metrics.contains(r#"lumen_decision_refusals_total{model="luna"} 1"#),
+        "{metrics}"
+    );
+}
+
+#[tokio::test]
+async fn a_refused_choice_falls_back_on_content_filter() {
+    let luna = mount_luna(json!([{ "type": "refusal", "name": "rank" }])).await;
+    let cohere = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v2/rerank"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "results": [{ "index": 1, "relevance_score": 0.8 }, { "index": 0, "relevance_score": 0.1 }],
+            "meta": { "billed_units": { "search_units": 1 } }
+        })))
+        .mount(&cohere)
+        .await;
+    let base = spawn(&openai_config(
+        &luna.uri(),
+        &cohere.uri(),
+        r#"{ strategy = "choice" }"#,
+    ))
+    .await;
+
+    let resp = rerank(&base, &["a", "b"]).await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers()["x-lumen-model-used"], "rerank-english");
+    assert_eq!(luna.received_requests().await.unwrap().len(), 1);
+}
