@@ -4,12 +4,16 @@
 
 use std::collections::HashSet;
 
+use async_trait::async_trait;
 use lumen_core::decisions::format::object_entries;
 use lumen_core::decisions::{
     Answer, DecisionLimits, DecisionRequest, DecisionResponse, DecisionUsage, Input, PackLimits,
     Part, Question, QuestionKind, Text,
 };
-use lumen_core::ProviderError;
+use lumen_core::{DecisionProvider, ProviderError};
+use tokio_util::sync::CancellationToken;
+
+use crate::http::post_json_bytes;
 use serde::ser::{SerializeMap, SerializeSeq};
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::value::RawValue;
@@ -571,6 +575,181 @@ fn decode_answer(
             })
         }
         _ => Err(bad("type does not match the question")),
+    }
+}
+
+/// Default TypeSafe API base.
+pub const TYPESAFE_DEFAULT_BASE_URL: &str = "https://api.typesafe.ai";
+
+/// Where a family provider POSTs.
+#[derive(Clone)]
+enum Endpoint {
+    /// One URL for every model.
+    Fixed(String),
+    /// `{prefix}{upstream_id}` (Cloudflare `/ai/run/@cf/cloudflare/{id}`).
+    PerModel(String),
+}
+
+/// A TypeSafe-format decision provider (TypeSafe, Perplexity, Ollama,
+/// Cloudflare, Liquid, Inception, Upstage, Kev).
+pub struct FamilyDecisionProvider {
+    client: reqwest::Client,
+    provider_name: String,
+    endpoint: Endpoint,
+    /// Bearer key; redacted from `Debug`, never logged.
+    api_key: Option<String>,
+    profile: FamilyProfile,
+}
+
+// The constructors take the owned config values the registry holds, per the
+// task interface; the by-value `base_url` is only read.
+#[allow(clippy::needless_pass_by_value)]
+impl FamilyDecisionProvider {
+    /// The `typesafe` kind. `base_url` defaults to the public TypeSafe API.
+    /// Without `decisions_path` the URL is `{base}/v1/systemone` (a trailing
+    /// `/v1` on `base_url` is tolerated, as before); with it,
+    /// `{base}{decisions_path}` verbatim (generic TypeSafe-format vendors).
+    #[must_use]
+    pub fn typesafe(
+        client: reqwest::Client,
+        name: impl Into<String>,
+        base_url: Option<String>,
+        decisions_path: Option<String>,
+        forward_unknown_fields: bool,
+        api_key: Option<String>,
+    ) -> Self {
+        let base = base_url.unwrap_or_else(|| TYPESAFE_DEFAULT_BASE_URL.to_owned());
+        let base = base.trim_end_matches('/');
+        let url = match decisions_path {
+            Some(path) => format!("{base}{path}"),
+            None => format!("{}/v1/systemone", base.strip_suffix("/v1").unwrap_or(base)),
+        };
+        Self::build(
+            client,
+            name,
+            Endpoint::Fixed(url),
+            api_key,
+            FamilyProfile::typesafe(forward_unknown_fields),
+        )
+    }
+
+    /// The `perplexity` kind: `{base}/v1/decisions`.
+    #[must_use]
+    pub fn perplexity(
+        client: reqwest::Client,
+        name: impl Into<String>,
+        base_url: String,
+        api_key: Option<String>,
+    ) -> Self {
+        let base = base_url.trim_end_matches('/');
+        let base = base.strip_suffix("/v1").unwrap_or(base);
+        Self::build(
+            client,
+            name,
+            Endpoint::Fixed(format!("{base}/v1/decisions")),
+            api_key,
+            FamilyProfile::perplexity(),
+        )
+    }
+
+    /// The `ollama` kind: `{root}/v1/systemone` (Ollama 0.35+).
+    #[must_use]
+    pub fn ollama(
+        client: reqwest::Client,
+        name: impl Into<String>,
+        base_url: String,
+        api_key: Option<String>,
+    ) -> Self {
+        let root = base_url.trim_end_matches('/');
+        Self::build(
+            client,
+            name,
+            Endpoint::Fixed(format!("{root}/v1/systemone")),
+            api_key,
+            FamilyProfile::ollama(),
+        )
+    }
+
+    /// The `cloudflare` kind: `{account root}/ai/run/@cf/cloudflare/{model}`.
+    #[must_use]
+    pub fn cloudflare(
+        client: reqwest::Client,
+        name: impl Into<String>,
+        base_url: String,
+        api_key: Option<String>,
+    ) -> Self {
+        let root = crate::cloudflare::account_root(base_url.trim_end_matches('/')).to_owned();
+        Self::build(
+            client,
+            name,
+            Endpoint::PerModel(format!("{root}/ai/run/@cf/cloudflare/")),
+            api_key,
+            FamilyProfile::cloudflare(),
+        )
+    }
+
+    fn build(
+        client: reqwest::Client,
+        name: impl Into<String>,
+        endpoint: Endpoint,
+        api_key: Option<String>,
+        profile: FamilyProfile,
+    ) -> Self {
+        Self {
+            client,
+            provider_name: name.into(),
+            endpoint,
+            api_key,
+            profile,
+        }
+    }
+
+    fn url(&self, upstream_id: &str) -> String {
+        match &self.endpoint {
+            Endpoint::Fixed(url) => url.clone(),
+            Endpoint::PerModel(prefix) => format!("{prefix}{upstream_id}"),
+        }
+    }
+}
+
+/// Redacted so the API key can never reach a log line via `{:?}`.
+impl std::fmt::Debug for FamilyDecisionProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FamilyDecisionProvider")
+            .field("provider_name", &self.provider_name)
+            .field("kind", &self.profile.kind)
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .finish_non_exhaustive()
+    }
+}
+
+#[async_trait]
+impl DecisionProvider for FamilyDecisionProvider {
+    async fn decide(
+        &self,
+        req: DecisionRequest,
+        cancel: CancellationToken,
+    ) -> Result<DecisionResponse, ProviderError> {
+        let ids = wire_ids(req.questions());
+        let body = encode(&req, &req.model, &self.profile, &ids)?;
+        let bytes = post_json_bytes(
+            &self.client,
+            &self.url(&req.model),
+            body,
+            self.api_key.as_deref(),
+            &self.provider_name,
+            &cancel,
+        )
+        .await?;
+        decode(&bytes, &req, &ids, &self.profile, &self.provider_name)
+    }
+
+    fn limits(&self) -> &DecisionLimits {
+        &self.profile.limits
+    }
+
+    fn provider_name(&self) -> &str {
+        &self.provider_name
     }
 }
 

@@ -51,7 +51,9 @@ pub use error::{
     BudgetScope, ErrorBody, ErrorEnvelope, ErrorType, GatewayError, ProviderError, QuotaKind,
 };
 pub use media::{measure_media, MediaTypeUsage, MediaUsage};
-pub use provider::{ChatProvider, EmbeddingProvider, RerankProvider, SystemOneProvider};
+pub use provider::{
+    ChatProvider, DecisionProvider, EmbeddingProvider, RerankProvider, SystemOneProvider,
+};
 pub use release::{ReleaseDate, ReleaseDateError};
 pub use rerank::{
     RerankDocument, RerankRequest, RerankResponse, RerankResult, RerankResultDocument, RerankUsage,

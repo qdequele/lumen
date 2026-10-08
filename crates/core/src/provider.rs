@@ -7,8 +7,9 @@
 //! issue #22805).
 
 use crate::chat::{ChatChunk, ChatRequest, ChatResponse};
+use crate::decisions::{DecisionLimits, DecisionRequest, DecisionResponse};
 use crate::embed::{EmbedRequest, EmbedResponse};
-use crate::error::ProviderError;
+use crate::error::{GatewayError, ProviderError};
 use crate::rerank::{RerankRequest, RerankResponse};
 use crate::systemone::{SystemOneRequest, SystemOneResponse};
 use async_trait::async_trait;
@@ -127,4 +128,31 @@ pub trait SystemOneProvider: Send + Sync {
         req: SystemOneRequest,
         cancel: CancellationToken,
     ) -> Result<SystemOneResponse, ProviderError>;
+}
+
+/// A provider that answers typed decision questions (ADR 016).
+#[async_trait]
+pub trait DecisionProvider: Send + Sync {
+    /// Answer every question of `req` (with `req.model` already the
+    /// upstream id); the call is aborted when `cancel` fires.
+    async fn decide(
+        &self,
+        req: DecisionRequest,
+        cancel: CancellationToken,
+    ) -> Result<DecisionResponse, ProviderError>;
+
+    /// What this target accepts and how a rerank remap packs calls for it.
+    fn limits(&self) -> &DecisionLimits;
+
+    /// The configured provider name (for errors).
+    fn provider_name(&self) -> &str;
+
+    /// Whether `req` fits this target, checked before any upstream call so
+    /// an incompatible fallback is skipped (spec 7.3).
+    ///
+    /// # Errors
+    /// `LM-1001` naming the question and provider.
+    fn check(&self, req: &DecisionRequest) -> Result<(), GatewayError> {
+        self.limits().check(req, self.provider_name())
+    }
 }

@@ -1,10 +1,14 @@
 //! OpenAI's `/v1/decisions` wire codec and provider (spec 7.2, 8).
 
+use async_trait::async_trait;
 use lumen_core::decisions::{
     Answer, ChoiceValue, DecisionLimits, DecisionRequest, DecisionResponse, DecisionUsage, Input,
     PackLimits, Part, PredicateCriteria, Question, QuestionKind, Text,
 };
-use lumen_core::ProviderError;
+use lumen_core::{DecisionProvider, ProviderError};
+use tokio_util::sync::CancellationToken;
+
+use crate::http::post_json_bytes;
 use serde::ser::{SerializeMap, SerializeSeq};
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::value::RawValue;
@@ -443,9 +447,86 @@ fn convert(a: WireAnswer, q: &Question, i: usize) -> Result<Answer, ProviderErro
     }
 }
 
+/// OpenAI's decision models (`gpt-6-luna`).
+pub struct OpenAiDecisionProvider {
+    client: reqwest::Client,
+    provider_name: String,
+    /// `{base}/decisions`, `base` defaulting to `https://api.openai.com/v1`.
+    url: String,
+    /// Bearer key; redacted from `Debug`, never logged.
+    api_key: Option<String>,
+}
+
+impl OpenAiDecisionProvider {
+    /// Construct; `base_url` is the OpenAI API base including `/v1`.
+    #[must_use]
+    pub fn new(
+        client: reqwest::Client,
+        name: impl Into<String>,
+        base_url: Option<String>,
+        api_key: Option<String>,
+    ) -> Self {
+        let base = base_url.unwrap_or_else(|| crate::openai::DEFAULT_BASE_URL.to_owned());
+        Self {
+            client,
+            provider_name: name.into(),
+            url: format!("{}/decisions", base.trim_end_matches('/')),
+            api_key,
+        }
+    }
+}
+
+impl std::fmt::Debug for OpenAiDecisionProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpenAiDecisionProvider")
+            .field("provider_name", &self.provider_name)
+            .field("url", &self.url)
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .finish_non_exhaustive()
+    }
+}
+
+#[async_trait]
+impl DecisionProvider for OpenAiDecisionProvider {
+    async fn decide(
+        &self,
+        req: DecisionRequest,
+        cancel: CancellationToken,
+    ) -> Result<DecisionResponse, ProviderError> {
+        let body = encode(&req, &req.model)?;
+        let bytes = post_json_bytes(
+            &self.client,
+            &self.url,
+            body,
+            self.api_key.as_deref(),
+            &self.provider_name,
+            &cancel,
+        )
+        .await?;
+        decode(&bytes, &req)
+    }
+
+    fn limits(&self) -> &DecisionLimits {
+        &LIMITS
+    }
+
+    fn provider_name(&self) -> &str {
+        &self.provider_name
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn url_defaults_to_openai_and_trims_trailing_slash() {
+        let c = reqwest::Client::new();
+        let d = OpenAiDecisionProvider::new(c.clone(), "o", None, None);
+        assert_eq!(d.url, "https://api.openai.com/v1/decisions");
+        let p = OpenAiDecisionProvider::new(c, "o", Some("https://proxy/v1/".into()), None);
+        assert_eq!(p.url, "https://proxy/v1/decisions");
+    }
     use lumen_core::decisions::format::{parse, Format};
 
     fn enc(body: &str, forced: Option<Format>) -> String {

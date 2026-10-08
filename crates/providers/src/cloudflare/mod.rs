@@ -73,13 +73,17 @@ impl CloudflareRerankProvider {
     /// A `base_url` that already IS the account root (no such suffix) is used
     /// as-is.
     fn run_url(&self, model: &str) -> String {
-        let root = self
-            .base_url
-            .strip_suffix("/ai/v1")
-            .or_else(|| self.base_url.strip_suffix("/v1"))
-            .unwrap_or(&self.base_url);
-        format!("{root}/ai/run/{model}")
+        format!("{}/ai/run/{model}", account_root(&self.base_url))
     }
+}
+
+/// The account root of a Workers AI `base_url`: a trailing `/ai/v1` (the
+/// OpenAI-compatible path) or `/v1` is stripped; an account root is kept.
+pub(crate) fn account_root(base_url: &str) -> &str {
+    base_url
+        .strip_suffix("/ai/v1")
+        .or_else(|| base_url.strip_suffix("/v1"))
+        .unwrap_or(base_url)
 }
 
 /// Redacted so the API token can never reach a log line via `{:?}`.

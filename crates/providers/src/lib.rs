@@ -45,6 +45,8 @@ pub use batch::embed_batched;
 pub use bedrock::BedrockProvider;
 pub use cloudflare::CloudflareRerankProvider;
 pub use cohere::CohereProvider;
+pub use decisions::family::FamilyDecisionProvider;
+pub use decisions::openai::OpenAiDecisionProvider;
 pub use google::vertex::VertexProvider;
 pub use google::GoogleProvider;
 pub use jina::JinaProvider;
