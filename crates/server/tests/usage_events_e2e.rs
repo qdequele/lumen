@@ -212,6 +212,7 @@ flush_interval_ms = 200
 
 [usage_events]
 url = "{lab}"
+instance_id = "0192f3c1-7c2e-7b1a-9f00-3c9d2e4a5b71"
 signing_key_env = "E2E_USAGE_EVENTS_SECRET"
 source = "e2e"
 
@@ -416,6 +417,7 @@ db_path = "{db}"
 
 [usage_events]
 url = "https://lab.example"
+instance_id = "0192f3c1-7c2e-7b1a-9f00-3c9d2e4a5b71"
 signing_key_env = "E2E_UNSET_USAGE_EVENTS_SECRET"
 source = "e2e"
 "#,
@@ -460,6 +462,7 @@ db_path = "{db}"
 
 [usage_events]
 url = "https://lab.example"
+instance_id = "0192f3c1-7c2e-7b1a-9f00-3c9d2e4a5b71"
 signing_key_env = "E2E_BADREF_USAGE_EVENTS_SECRET"
 source = "e2e"
 "#,

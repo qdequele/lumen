@@ -130,25 +130,47 @@ pub enum ConfigSourceKind {
 /// reload (ADR 011 amendment §2). Every field is editable at runtime.
 pub use lumen_auth::events::WebhookSettings as WebhooksConfig;
 
-/// Billing usage events pushed to a control plane (ADR 015). Absent by
-/// default: with no `[usage_events]` block the gateway writes no outbox row
-/// and this block adds no outbound call. Boot layer.
+/// Billing usage events pushed to the Meilisearch Lab (ADR 015, platform
+/// contract v2). Absent by default: with no `[usage_events]` block and no
+/// `LAB_URL` / `LAB_INSTANCE_ID` in the environment the gateway writes no
+/// outbox row and makes no call to the Lab. Boot layer.
+///
+/// The three env vars `LAB_URL`, `LAB_INSTANCE_ID` and `LAB_INSTANCE_SECRET`
+/// (the same names Scrapix and glutony read) are first class: `LAB_URL` and
+/// `LAB_INSTANCE_ID` overlay `url` and `instance_id` (see [`apply_lab_env`]),
+/// and `LAB_INSTANCE_SECRET` is the default `secret_env`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct UsageEventsConfig {
-    /// Control-plane base URL; events go to `{url}/internal/events`. `https`,
-    /// or `http` to a loopback or private address only.
+    /// The Lab's base URL (`LAB_URL`); events go to `{url}/internal/events`.
+    /// `https`, or `http` to a loopback or private address only.
     pub url: String,
-    /// Env var holding the HMAC signing secret (never the secret itself).
-    pub signing_key_env: String,
-    /// Gateway name copied into every event (`[A-Za-z0-9._-]`, 1 to 64 chars).
-    pub source: String,
+    /// This deployment's Lab instance id (`LAB_INSTANCE_ID`), a UUID minted
+    /// by the Lab. Required once the environment overlay has run.
+    #[serde(default)]
+    pub instance_id: Option<String>,
+    /// Env var holding the instance secret (never the secret itself).
+    #[serde(default = "default_secret_env")]
+    pub secret_env: String,
+    /// Deprecated alias of `secret_env` (the ADR 015 name). When set it
+    /// wins, and boot logs a warning naming the replacement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signing_key_env: Option<String>,
+    /// Optional gateway label for the boot log (`[A-Za-z0-9._-]`, 1 to 64
+    /// chars). Events no longer carry it: the Lab knows the instance from
+    /// `X-Lab-Instance-Id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
     /// Events per delivery request, 1 to 1000.
     #[serde(default = "default_usage_events_batch_size")]
     pub batch_size: usize,
     /// Per-request timeout, 100 to 60000 ms.
     #[serde(default = "default_usage_events_timeout_ms")]
     pub timeout_ms: u64,
+}
+
+fn default_secret_env() -> String {
+    "LAB_INSTANCE_SECRET".to_owned()
 }
 
 const fn default_usage_events_batch_size() -> usize {
@@ -164,6 +186,28 @@ impl UsageEventsConfig {
     #[must_use]
     pub fn events_url(&self) -> String {
         format!("{}/internal/events", self.url.trim_end_matches('/'))
+    }
+
+    /// The self-description endpoint (spec section 3.6).
+    #[must_use]
+    pub fn instances_me_url(&self) -> String {
+        format!("{}/internal/instances/me", self.url.trim_end_matches('/'))
+    }
+
+    /// The env var that holds the instance secret: the deprecated
+    /// `signing_key_env` when set, else `secret_env`.
+    #[must_use]
+    pub fn secret_env_name(&self) -> &str {
+        self.signing_key_env.as_deref().unwrap_or(&self.secret_env)
+    }
+
+    /// The label for log lines: `source`, else the instance id.
+    #[must_use]
+    pub fn source_label(&self) -> &str {
+        self.source
+            .as_deref()
+            .or(self.instance_id.as_deref())
+            .unwrap_or_default()
     }
 
     fn validate(&self) -> Result<(), String> {
@@ -204,24 +248,48 @@ impl UsageEventsConfig {
                 )
             }
         }
-        if self.signing_key_env.trim().is_empty()
-            || self.signing_key_env.trim() != self.signing_key_env
-        {
+        let Some(instance_id) = self.instance_id.as_deref() else {
             return Err(
-                "usage_events.signing_key_env must be a non-blank env var name with no \
+                "usage_events.instance_id (or the LAB_INSTANCE_ID env var) is required: the \
+                 Lab instance UUID this gateway reports as"
+                    .to_owned(),
+            );
+        };
+        if !lumen_auth::billing::is_uuid(instance_id) {
+            return Err(
+                "usage_events.instance_id (LAB_INSTANCE_ID) must be the Lab instance UUID"
+                    .to_owned(),
+            );
+        }
+        let env_name_ok = |name: &str| !name.trim().is_empty() && name.trim() == name;
+        if !env_name_ok(&self.secret_env) {
+            return Err(
+                "usage_events.secret_env must be a non-blank env var name with no \
                  surrounding whitespace"
                     .to_owned(),
             );
         }
-        let source_ok = (1..=64).contains(&self.source.len())
-            && self
-                .source
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
-        if !source_ok {
+        if self
+            .signing_key_env
+            .as_deref()
+            .is_some_and(|n| !env_name_ok(n))
+        {
             return Err(
-                "usage_events.source must be 1 to 64 characters of [A-Za-z0-9._-]".to_owned(),
+                "usage_events.signing_key_env (deprecated alias of secret_env) must be a \
+                 non-blank env var name with no surrounding whitespace"
+                    .to_owned(),
             );
+        }
+        if let Some(source) = &self.source {
+            let source_ok = (1..=64).contains(&source.len())
+                && source
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+            if !source_ok {
+                return Err(
+                    "usage_events.source must be 1 to 64 characters of [A-Za-z0-9._-]".to_owned(),
+                );
+            }
         }
         if !(1..=1000).contains(&self.batch_size) {
             return Err("usage_events.batch_size must be between 1 and 1000".to_owned());
@@ -1020,8 +1088,8 @@ fn describe_figment_error(error: &figment::Error) -> String {
 ///
 /// `Config` denies unknown fields, so a `LUMEN_`-prefixed variable that does
 /// not name a config key makes every load fail - `--check-config` and real
-/// boots alike - with an "unknown field" parse error. Four such variables
-/// exist:
+/// boots alike - with an "unknown field" parse error. The variables kept out
+/// of the overlay are:
 ///
 /// * `LUMEN_MASTER_KEY`, read by `boot_auth_stack`, whose name is fixed.
 /// * `LUMEN_WEBHOOK_ALLOWED_HOSTS`, the webhook receiver allowlist read by
@@ -1032,8 +1100,10 @@ fn describe_figment_error(error: &figment::Error) -> String {
 ///   at the TOML file alone: a permissive parse of that single key, with no
 ///   env overlay and no validation, so a malformed file still produces the
 ///   real error from the full load rather than one from this peek.
-/// * The usage-events signing secret (ADR 015), named by
-///   `usage_events.signing_key_env` and discovered by the same peek.
+/// * The Lab instance secret (ADR 015, platform contract v2), named by
+///   `usage_events.secret_env` (default `LAB_INSTANCE_SECRET`, which has no
+///   `LUMEN_` prefix) or its deprecated alias `usage_events.signing_key_env`,
+///   both discovered by the same peek.
 ///
 /// Only the exact variable named in config is excluded, so a typo elsewhere in
 /// the `LUMEN_*` namespace is still caught. A name containing `__` is
@@ -1080,21 +1150,55 @@ fn secret_env_keys_from_figment(peek_figment: &Figment) -> Vec<String> {
     #[derive(Deserialize)]
     struct PeekSigning {
         signing_key_env: Option<String>,
+        secret_env: Option<String>,
     }
 
     let mut keys = vec!["master_key".to_owned(), "webhook_allowed_hosts".to_owned()];
     if let Ok(peek) = peek_figment.extract::<Peek>() {
         for block in [peek.webhooks, peek.usage_events].into_iter().flatten() {
-            if let Some(suffix) = block
-                .signing_key_env
-                .as_deref()
-                .and_then(|var| var.strip_prefix("LUMEN_"))
+            for var in [block.secret_env, block.signing_key_env]
+                .into_iter()
+                .flatten()
             {
-                keys.push(suffix.to_lowercase());
+                if let Some(suffix) = var.strip_prefix("LUMEN_") {
+                    keys.push(suffix.to_lowercase());
+                }
             }
         }
     }
     keys
+}
+
+/// Overlay the first-class Lab variables onto `[usage_events]` (platform
+/// contract v2 section 3.3): `LAB_URL` sets `url` and `LAB_INSTANCE_ID` sets
+/// `instance_id`, creating the block when the TOML has none, so a gateway
+/// can be pointed at the Lab with the same three variables Scrapix and
+/// glutony read. Blank values are ignored. `lookup` is the environment
+/// (`std::env::var` at boot; a closure in tests).
+pub(crate) fn apply_lab_env(config: &mut Config, lookup: impl Fn(&str) -> Option<String>) {
+    let var = |name: &str| lookup(name).filter(|v| !v.trim().is_empty());
+    let url = var("LAB_URL");
+    let instance_id = var("LAB_INSTANCE_ID");
+    if url.is_none() && instance_id.is_none() {
+        return;
+    }
+    let block = config
+        .usage_events
+        .get_or_insert_with(|| UsageEventsConfig {
+            url: String::new(),
+            instance_id: None,
+            secret_env: default_secret_env(),
+            signing_key_env: None,
+            source: None,
+            batch_size: default_usage_events_batch_size(),
+            timeout_ms: default_usage_events_timeout_ms(),
+        });
+    if let Some(url) = url {
+        block.url = url;
+    }
+    if let Some(id) = instance_id {
+        block.instance_id = Some(id);
+    }
 }
 
 /// The boot-layer fields of [`Config`] (ADR 012 §1), snapshotted from a TOML
@@ -1415,12 +1519,25 @@ impl Config {
         Self::from_figment(&figment, label)
     }
 
-    /// Build a config from an arbitrary figment (used by tests) and validate it.
+    /// Build a config from an arbitrary figment, overlay the process's
+    /// `LAB_URL` / `LAB_INSTANCE_ID` (see [`apply_lab_env`]) and validate it.
     fn from_figment(figment: &Figment, path_label: &str) -> Result<Self, ConfigError> {
-        let config: Config = figment.extract().map_err(|e| ConfigError::Parse {
+        Self::from_figment_with_env(figment, path_label, |name| std::env::var(name).ok())
+    }
+
+    /// [`Self::from_figment`] with the Lab-variable lookup injected, so unit
+    /// tests can build a config that a developer's exported `LAB_URL` /
+    /// `LAB_INSTANCE_ID` cannot perturb.
+    fn from_figment_with_env(
+        figment: &Figment,
+        path_label: &str,
+        lookup: impl Fn(&str) -> Option<String>,
+    ) -> Result<Self, ConfigError> {
+        let mut config: Config = figment.extract().map_err(|e| ConfigError::Parse {
             path: path_label.to_owned(),
             message: describe_figment_error(&e),
         })?;
+        apply_lab_env(&mut config, lookup);
         config.validate(path_label)?;
         Ok(config)
     }
@@ -1716,9 +1833,12 @@ mod tests {
         capabilities = ["embed"]
     "#;
 
+    /// Parse and validate `s` with NO `LAB_*` overlay: a developer who
+    /// exports `LAB_URL` / `LAB_INSTANCE_ID` must not perturb these tests.
+    /// [`apply_lab_env`] is exercised directly with a closure instead.
     fn load_str(s: &str) -> Result<Config, ConfigError> {
         let figment = Figment::new().merge(Toml::string(s));
-        Config::from_figment(&figment, "test.toml")
+        Config::from_figment_with_env(&figment, "test.toml", |_| None)
     }
 
     // ---- Outbound budget webhooks (ADR 011) --------------------------------
@@ -2046,8 +2166,10 @@ mod tests {
         load_str(&format!("{AUTH_ON}\n[usage_events]\n{block}"))
     }
 
+    const INSTANCE: &str = "0192f3c1-7c2e-7b1a-9f00-3c9d2e4a5b61";
+
     const UE_OK: &str =
-        "url = \"https://lab.example\"\nsigning_key_env = \"LUMEN_UE_SECRET\"\nsource = \"eu-1\"\n";
+        "url = \"https://lab.example\"\ninstance_id = \"0192f3c1-7c2e-7b1a-9f00-3c9d2e4a5b61\"\n";
 
     #[test]
     fn usage_events_parse_with_defaults() {
@@ -2055,7 +2177,16 @@ mod tests {
         let ue = cfg.usage_events.unwrap();
         assert_eq!(ue.batch_size, 500);
         assert_eq!(ue.timeout_ms, 5_000);
+        assert_eq!(ue.secret_env, "LAB_INSTANCE_SECRET");
+        assert_eq!(ue.secret_env_name(), "LAB_INSTANCE_SECRET");
+        assert_eq!(ue.signing_key_env, None);
+        assert_eq!(ue.source, None);
+        assert_eq!(ue.source_label(), INSTANCE);
         assert_eq!(ue.events_url(), "https://lab.example/internal/events");
+        assert_eq!(
+            ue.instances_me_url(),
+            "https://lab.example/internal/instances/me"
+        );
     }
 
     #[test]
@@ -2126,16 +2257,77 @@ mod tests {
             "batch_size = 0",
             "batch_size = 1001",
             "timeout_ms = 50",
+            "secret_env = \"\"",
+            "secret_env = \"  \"",
+            "secret_env = \" LAB_INSTANCE_SECRET \"",
             "signing_key_env = \"\"",
-            "signing_key_env = \"  \"",
-            "signing_key_env = \" LUMEN_UE_SECRET \"",
+            "instance_id = \"acme\"",
+            "instance_id = \"\"",
         ] {
             let key = bad.split(" =").next().unwrap();
             let mut lines: Vec<&str> = UE_OK.lines().filter(|l| !l.starts_with(key)).collect();
             lines.push(bad);
             let block = lines.join("\n");
-            assert!(with_usage_events(&block).is_err(), "{bad}");
+            let err = with_usage_events(&block).unwrap_err().to_string();
+            assert!(err.contains(key), "{bad}: {err}");
         }
+        // No instance id at all: refused, naming both spellings.
+        let err = with_usage_events("url = \"https://lab.example\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("instance_id") && err.contains("LAB_INSTANCE_ID"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_signing_key_env_alias_is_accepted() {
+        let block = format!("{UE_OK}signing_key_env = \"LUMEN_UE_SECRET\"\n");
+        let ue = with_usage_events(&block).unwrap().usage_events.unwrap();
+        assert_eq!(ue.secret_env_name(), "LUMEN_UE_SECRET", "the alias wins");
+    }
+
+    #[test]
+    fn lab_env_vars_create_the_block_when_the_toml_has_none() {
+        let mut cfg = load_str(AUTH_ON).unwrap();
+        assert!(cfg.usage_events.is_none());
+        apply_lab_env(&mut cfg, |name| match name {
+            "LAB_URL" => Some("https://lab.example/".to_owned()),
+            "LAB_INSTANCE_ID" => Some(INSTANCE.to_owned()),
+            _ => None,
+        });
+        let ue = cfg.usage_events.as_ref().unwrap();
+        assert_eq!(ue.url, "https://lab.example/");
+        assert_eq!(ue.instance_id.as_deref(), Some(INSTANCE));
+        assert_eq!(ue.secret_env, "LAB_INSTANCE_SECRET");
+        assert!(cfg.validate("test").is_ok());
+    }
+
+    #[test]
+    fn lab_env_vars_win_over_the_toml_block() {
+        let mut cfg = with_usage_events(UE_OK).unwrap();
+        apply_lab_env(&mut cfg, |name| match name {
+            "LAB_URL" => Some("https://other.example".to_owned()),
+            "LAB_INSTANCE_ID" => Some("0192f3c1-7c2e-7b1a-9f00-3c9d2e4a5b62".to_owned()),
+            _ => None,
+        });
+        let ue = cfg.usage_events.as_ref().unwrap();
+        assert_eq!(ue.url, "https://other.example");
+        assert_eq!(
+            ue.instance_id.as_deref(),
+            Some("0192f3c1-7c2e-7b1a-9f00-3c9d2e4a5b62")
+        );
+        // Blank values are ignored, not applied.
+        apply_lab_env(&mut cfg, |_| Some("  ".to_owned()));
+        assert_eq!(
+            cfg.usage_events.as_ref().unwrap().url,
+            "https://other.example"
+        );
+        // Nothing set: nothing created.
+        let mut bare = load_str(AUTH_ON).unwrap();
+        apply_lab_env(&mut bare, |_| None);
+        assert!(bare.usage_events.is_none());
     }
 
     #[test]
@@ -2143,7 +2335,7 @@ mod tests {
         let doc = format!("[usage_events]\n{UE_OK}");
         assert!(ensure_boot_only(&doc, "boot").is_ok());
         assert!(ensure_dynamic_only(&doc, "dynamic").is_err());
-        let changed = doc.replace("eu-1", "eu-2");
+        let changed = doc.replace("lab.example", "lab2.example");
         assert_eq!(boot_layer_diff(&doc, &changed).unwrap(), ["usage_events"]);
     }
 
@@ -2152,15 +2344,19 @@ mod tests {
         // Same contract as the webhook secret: the operator-chosen variable
         // is a process secret, not a config field, so it must be kept out of
         // figment's LUMEN_ overlay or `deny_unknown_fields` fails every load.
+        // Both spellings are peeked; the default LAB_INSTANCE_SECRET has no
+        // LUMEN_ prefix and never collides.
         #[allow(clippy::result_large_err)]
         figment::Jail::expect_with(|jail| {
             jail.create_file(
                 "config.toml",
-                &format!("{AUTH_ON}\n[usage_events]\n{UE_OK}"),
+                &format!(
+                    "{AUTH_ON}\n[usage_events]\n{UE_OK}secret_env = \"LUMEN_UE_SECRET\"\nsigning_key_env = \"LUMEN_UE_OLD\"\n"
+                ),
             )?;
             assert_eq!(
                 secret_env_keys(Path::new("config.toml")),
-                ["master_key", "webhook_allowed_hosts", "ue_secret"]
+                ["master_key", "webhook_allowed_hosts", "ue_secret", "ue_old"]
             );
             Ok(())
         });

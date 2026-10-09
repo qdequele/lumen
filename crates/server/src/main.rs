@@ -853,14 +853,19 @@ fn boot_usage_events(
     metrics: &Metrics,
     cancel: &CancellationToken,
 ) -> anyhow::Result<UsageEventsHandle> {
-    let secret = std::env::var(&config.signing_key_env)
+    if let Some(alias) = &config.signing_key_env {
+        tracing::warn!(
+            variable = %alias,
+            "usage_events.signing_key_env is deprecated: name the instance secret with \
+             usage_events.secret_env (default LAB_INSTANCE_SECRET)"
+        );
+    }
+    let secret_var = config.secret_env_name();
+    let secret = std::env::var(secret_var)
         .ok()
         .filter(|s| !s.trim().is_empty())
         .with_context(|| {
-            format!(
-                "[usage_events] requires the {} env var (the events signing secret)",
-                config.signing_key_env
-            )
+            format!("[usage_events] requires the {secret_var} env var (the Lab instance secret)")
         })?;
     let metrics = lumen_telemetry::UsageEventMetrics::register(metrics)
         .context("could not register the usage-event metrics")?;
@@ -1267,9 +1272,9 @@ async fn boot_auth_stack(
     let keys = AuthState::load(groups, entries);
     if let Some(usage_events) = &config.usage_events {
         keys.set_billing(Some(Arc::new(lumen_auth::billing::BillingPolicy {
-            source: usage_events.source.clone(),
+            source: usage_events.source_label().to_owned(),
         })));
-        tracing::info!(source = %usage_events.source, "billing usage events enabled");
+        tracing::info!(source = %usage_events.source_label(), "billing usage events enabled");
     }
     tracing::info!(key_count = keys.len(), group_count, "virtual keys loaded");
 
