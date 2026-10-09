@@ -50,7 +50,7 @@ use lumen_core::{
 };
 use serde::Serialize;
 
-use super::family::question_body;
+use super::family::question_body_len;
 use serde_json::value::{to_raw_value, RawValue};
 use tokio_util::sync::CancellationToken;
 
@@ -318,7 +318,7 @@ fn bytes_to_tokens(bytes: usize) -> u64 {
 /// TypeSafe wire body without the id, per question, exactly as Jev's rerank
 /// always packed (D7). Every target packs by this one measure.
 fn question_tokens(q: &Question) -> Result<u64, ProviderError> {
-    question_body(q).map(|body| bytes_to_tokens(body.len()))
+    question_body_len(q).map(bytes_to_tokens)
 }
 
 /// Documents per call: the profile's cap, lowered so a call never exceeds
@@ -513,12 +513,14 @@ impl RerankProvider for DecisionRerankProvider {
 impl DecisionRerankProvider {
     /// Fail before any call when the target cannot take `batch`.
     fn check(&self, batch: &DecisionRequest) -> Result<(), ProviderError> {
-        self.inner
-            .check(batch)
-            .map_err(|e| ProviderError::UnsupportedInput {
+        // The bare reason: `UnsupportedInput` names the provider itself.
+        match self.inner.limits().violation(batch) {
+            None => Ok(()),
+            Some(reason) => Err(ProviderError::UnsupportedInput {
                 provider: self.provider_name.clone(),
-                reason: e.to_string(),
-            })
+                reason,
+            }),
+        }
     }
 
     /// `predicate`, `score` and `composite`: questions per document, packed.
@@ -1180,6 +1182,8 @@ mod tests {
             ProviderError::UnsupportedInput { provider, reason } => {
                 assert_eq!(provider, "tiny");
                 assert!(reason.contains("at most 0 questions"), "{reason}");
+                // A bare reason: the error's Display names the provider once.
+                assert!(!reason.contains("provider"), "{reason}");
             }
             other => panic!("expected UnsupportedInput, got {other:?}"),
         }

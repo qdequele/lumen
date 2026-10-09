@@ -135,24 +135,30 @@ impl FamilyProfile {
 
 /// The wire id of each question: its name, or `q{index}` prefixed with `_`
 /// until it collides with no name and no earlier id (spec 7.1).
+///
+/// Generated ids for different indices never collide (their digits differ),
+/// so only the names need checking; when every question is named (every
+/// TypeSafe-format request) the names are returned without building a set.
 #[must_use]
 pub fn wire_ids(questions: &[Question]) -> Vec<String> {
+    if questions.iter().all(|q| q.name.is_some()) {
+        return questions
+            .iter()
+            .map(|q| q.name.clone().unwrap_or_default())
+            .collect();
+    }
     let names: HashSet<&str> = questions.iter().filter_map(|q| q.name.as_deref()).collect();
-    let mut used: HashSet<String> = HashSet::new();
     questions
         .iter()
         .enumerate()
         .map(|(i, q)| {
-            let id = if let Some(name) = &q.name {
-                name.clone()
-            } else {
-                let mut id = format!("q{i}");
-                while names.contains(id.as_str()) || used.contains(&id) {
-                    id.insert(0, '_');
-                }
-                id
-            };
-            used.insert(id.clone());
+            if let Some(name) = &q.name {
+                return name.clone();
+            }
+            let mut id = format!("q{i}");
+            while names.contains(id.as_str()) {
+                id.insert(0, '_');
+            }
             id
         })
         .collect()
@@ -179,13 +185,48 @@ pub fn encode(
             profile.kind
         )));
     }
-    serde_json::to_vec(&WireRequest {
-        req,
-        upstream_id,
-        profile,
-        ids,
-    })
-    .map_err(|e| translation(format!("{} decisions request: {e}", profile.kind)))
+    let mut out = Vec::with_capacity(request_size_hint(req));
+    serde_json::to_writer(
+        &mut out,
+        &WireRequest {
+            req,
+            upstream_id,
+            profile,
+            ids,
+        },
+    )
+    .map_err(|e| translation(format!("{} decisions request: {e}", profile.kind)))?;
+    Ok(out)
+}
+
+/// A starting capacity for an encoded request: the raw sizes it carries
+/// (input, verbatim question bodies, text) plus a little framing per
+/// question, so the buffer rarely regrows on a large state.
+#[must_use]
+pub fn request_size_hint(req: &DecisionRequest) -> usize {
+    let input = match req.input() {
+        Input::Text(text) => text.len(),
+        Input::Structured(raw) => raw.get().len(),
+        Input::Messages(parts) => parts
+            .iter()
+            .map(|p| match p {
+                Part::Text(t) => t.byte_len(),
+                Part::Image(img) => img.data_url.len(),
+            })
+            .sum(),
+    };
+    let questions: usize = req
+        .questions()
+        .iter()
+        .map(|q| {
+            q.raw.as_ref().map_or_else(
+                || q.instructions.as_ref().map_or(0, Text::byte_len) + 128,
+                |raw| raw.get().len(),
+            ) + q.name.as_ref().map_or(8, String::len)
+                + 8
+        })
+        .sum();
+    input + questions + 256
 }
 
 struct WireRequest<'a> {
@@ -315,14 +356,31 @@ impl Serialize for Questions<'_> {
     }
 }
 
-/// The TypeSafe wire body of one synthesized question (without its id), as
-/// [`encode`] sends it. The rerank remap packs calls by its estimated
+/// The byte length of the TypeSafe wire body of one synthesized question
+/// (without its id), as [`encode`] sends it, counted without allocating. The rerank remap packs calls by its estimated
 /// tokens, exactly as Jev's rerank always did (D7).
 ///
 /// # Errors
 /// [`ProviderError::Translation`] if serialization fails.
-pub fn question_body(q: &Question) -> Result<Vec<u8>, ProviderError> {
-    serde_json::to_vec(&QuestionOut(q)).map_err(|e| translation(format!("decisions question: {e}")))
+pub fn question_body_len(q: &Question) -> Result<usize, ProviderError> {
+    let mut counter = ByteCounter(0);
+    serde_json::to_writer(&mut counter, &QuestionOut(q))
+        .map_err(|e| translation(format!("decisions question: {e}")))?;
+    Ok(counter.0)
+}
+
+/// An `io::Write` sink that only counts bytes.
+struct ByteCounter(usize);
+
+impl std::io::Write for ByteCounter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0 += buf.len();
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// A synthesized question, keys in TypeSafe order: `type`, `instructions`,
@@ -497,20 +555,35 @@ pub fn decode(
     }
     let answers_raw =
         answers_raw.ok_or_else(|| translation(format!("{kind} response: missing `answers`")))?;
-    let mut by_id: std::collections::HashMap<String, Box<RawValue>> =
-        serde_json::from_str(answers_raw.get())
-            .map_err(|_| translation(format!("{kind} `answers` is not an object of answers")))?;
+    // Ordered entries, duplicates rejected (value-free message): a repeated
+    // answer id must never silently keep one of its answers.
+    let by_id = object_entries(answers_raw.get().as_bytes(), "`answers`").map_err(|e| {
+        if e.contains("duplicate") {
+            translation(format!("{kind} response: {e}"))
+        } else {
+            translation(format!("{kind} `answers` is not an object of answers"))
+        }
+    })?;
     let mut answers = Vec::with_capacity(ids.len());
     for (i, (q, id)) in req.questions().iter().zip(ids).enumerate() {
-        let raw = by_id
-            .remove(id)
-            .ok_or_else(|| translation(format!("{kind} response: no answer for question #{i}")))?;
-        answers.push(decode_answer(&raw, q, i, kind)?);
+        // Upstreams answer in request order: try the same position first.
+        let raw = match by_id.get(i) {
+            Some((key, raw)) if key == id => raw,
+            _ => by_id
+                .iter()
+                .find(|(key, _)| key == id)
+                .map(|(_, raw)| raw)
+                .ok_or_else(|| {
+                    translation(format!("{kind} response: no answer for question #{i}"))
+                })?,
+        };
+        answers.push(decode_answer(raw, q, i, kind)?);
     }
-    if !by_id.is_empty() {
+    // Ids are unique and every one was found, so any surplus is unexpected.
+    if by_id.len() > ids.len() {
         return Err(translation(format!(
             "{kind} response: {} unexpected answers",
-            by_id.len()
+            by_id.len() - ids.len()
         )));
     }
     Ok(DecisionResponse {
@@ -954,6 +1027,47 @@ mod tests {
                 "{body}"
             );
         }
+    }
+
+    #[test]
+    fn a_duplicate_answer_id_is_a_translation_error() {
+        let req = three();
+        let ids = wire_ids(req.questions());
+        let p = FamilyProfile::typesafe(true);
+        let duplicate = ANSWERS.replace(
+            r#""u":{"type":"noul","noul":0.9},"#,
+            r#""u":{"type":"noul","noul":0.9},"u":{"type":"noul","noul":"LEAKME"},"#,
+        );
+        match decode(duplicate.as_bytes(), &req, &ids, &p, "typesafe") {
+            Err(ProviderError::Translation(m)) => {
+                assert!(m.contains("duplicate"), "{m}");
+                assert!(!m.contains("LEAKME"), "{m}");
+            }
+            other => panic!("expected a translation error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn answers_out_of_request_order_still_map_by_id() {
+        let req = three();
+        let ids = wire_ids(req.questions());
+        let reordered = r#"{"model":"j","answers":{
+            "m":{"type":"score","score":1.0,"probabilities":{"1":1.0}},
+            "t":{"type":"choice","choice":"billing","probabilities":{"billing":1.0}},
+            "u":{"type":"noul","noul":0.25}}}"#;
+        let resp = decode(
+            reordered.as_bytes(),
+            &req,
+            &ids,
+            &FamilyProfile::typesafe(true),
+            "t",
+        )
+        .unwrap();
+        assert!(
+            matches!(resp.answers[0], Answer::Predicate { probability } if (probability - 0.25).abs() < 1e-9)
+        );
+        assert!(matches!(resp.answers[1], Answer::Choice { .. }));
+        assert!(matches!(resp.answers[2], Answer::Score { .. }));
     }
 
     #[test]

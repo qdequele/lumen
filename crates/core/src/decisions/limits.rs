@@ -64,15 +64,24 @@ impl DecisionLimits {
     /// [`GatewayError::InvalidRequest`] (`LM-1001`) naming the question (or
     /// the count) and `provider`.
     pub fn check(&self, req: &DecisionRequest, provider: &str) -> Result<(), GatewayError> {
-        let fail = |what: String| {
-            Err(GatewayError::InvalidRequest(format!(
+        match self.violation(req) {
+            None => Ok(()),
+            Some(what) => Err(GatewayError::InvalidRequest(format!(
                 "{what} is not supported by provider '{provider}'"
-            )))
-        };
+            ))),
+        }
+    }
+
+    /// The first shape of `req` these limits reject, as a bare reason naming
+    /// the question (or the count) and the limit, without the provider (for
+    /// errors that name it themselves); `None` when `req` fits. Allocates
+    /// only on a violation.
+    #[must_use]
+    pub fn violation(&self, req: &DecisionRequest) -> Option<String> {
         let questions = req.questions();
         if let Some(max) = self.max_questions {
             if questions.len() > max {
-                return fail(format!(
+                return Some(format!(
                     "a request of {} questions (at most {max} questions)",
                     questions.len()
                 ));
@@ -81,45 +90,50 @@ impl DecisionLimits {
         if let Some(max) = self.max_images {
             let n = req.image_count();
             if n > max {
-                return fail(format!("a request of {n} images (at most {max} images)"));
+                return Some(format!("a request of {n} images (at most {max} images)"));
             }
         }
         for (i, q) in questions.iter().enumerate() {
-            let label = q.label(i);
             match &q.kind {
                 QuestionKind::Predicate { .. } => {
                     if self.predicate_needs_instructions && q.instructions.is_none() {
-                        return fail(format!(
-                            "question {label}: a predicate without instructions"
+                        return Some(format!(
+                            "question {}: a predicate without instructions",
+                            q.label(i)
                         ));
                     }
                 }
                 QuestionKind::Choice { choices } => {
                     let n = choices.len();
                     if n < self.min_choice_options || n > self.max_choice_options {
-                        return fail(format!(
-                            "question {label}: a choice of {n} options (needs {} to {})",
-                            self.min_choice_options, self.max_choice_options
+                        return Some(format!(
+                            "question {}: a choice of {n} options (needs {} to {})",
+                            q.label(i),
+                            self.min_choice_options,
+                            self.max_choice_options
                         ));
                     }
                     if self.string_keyed_choices && has_spelling_collision(choices) {
-                        return fail(format!(
-                            "question {label}: a string and a boolean choice with the same spelling"
+                        return Some(format!(
+                            "question {}: a string and a boolean choice with the same spelling",
+                            q.label(i)
                         ));
                     }
                 }
                 QuestionKind::Score { levels } => {
                     let n = levels.len();
                     if n < self.min_score_levels || n > self.max_score_levels {
-                        return fail(format!(
-                            "question {label}: a score of {n} levels (needs {} to {})",
-                            self.min_score_levels, self.max_score_levels
+                        return Some(format!(
+                            "question {}: a score of {n} levels (needs {} to {})",
+                            q.label(i),
+                            self.min_score_levels,
+                            self.max_score_levels
                         ));
                     }
                 }
             }
         }
-        Ok(())
+        None
     }
 }
 

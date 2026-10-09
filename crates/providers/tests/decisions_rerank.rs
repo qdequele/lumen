@@ -532,6 +532,7 @@ async fn a_listwise_choice_over_more_than_26_documents_is_unsupported_on_ollama(
         ProviderError::UnsupportedInput { provider, reason } => {
             assert_eq!(provider, "ollama");
             assert!(reason.contains("26"), "{reason}");
+            assert!(!reason.contains("provider"), "{reason}");
         }
         other => panic!("expected UnsupportedInput, got {other:?}"),
     }
