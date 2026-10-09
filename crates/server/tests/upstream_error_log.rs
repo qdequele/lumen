@@ -50,6 +50,8 @@ fn registry(kind: ProviderKind, upstream: &str) -> Arc<Registry> {
         api_version: None,
         strict: false,
         connect_timeout_ms: None,
+        decisions_path: None,
+        forward_unknown_fields: None,
         models: vec![ModelSpec {
             id: "claude".to_owned(),
             upstream_id: "claude-sonnet-5-5".to_owned(),

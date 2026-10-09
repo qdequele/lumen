@@ -20,7 +20,6 @@
 use crate::chat::{ChatRequest, MessageContent};
 use crate::embed::EmbedRequest;
 use crate::rerank::RerankRequest;
-use crate::systemone::SystemOneRequest;
 
 /// The heuristic's byte-per-token ratio.
 const BYTES_PER_TOKEN: u64 = 4;
@@ -120,17 +119,67 @@ pub fn estimate_rerank(req: &RerankRequest) -> u64 {
         .sum()
 }
 
-/// Estimate the input tokens of a SystemOne request: the state is ingested
-/// once and every question is evaluated against it, so the estimate is the
-/// state's JSON plus each question body's JSON (ADR 013).
+/// Estimate the input tokens of a decision request (ADR 003, 016): the
+/// input once (text, raw state, and the flat per-image estimate per
+/// `detail`), plus every question as sent. A question that carries its
+/// client TypeSafe body counts that body, so TypeSafe-format requests
+/// estimate as the state once plus each question body.
 #[must_use]
-pub fn estimate_systemone(req: &SystemOneRequest) -> u64 {
+pub fn estimate_decisions(req: &crate::decisions::DecisionRequest) -> u64 {
+    use crate::decisions::{Input, Part, QuestionKind};
+    let input = match req.input() {
+        Input::Text(s) => estimate_text(s),
+        Input::Structured(raw) => estimate_text(raw.get()),
+        Input::Messages(parts) => parts
+            .iter()
+            .map(|p| match p {
+                Part::Text(t) => estimate_text(&t.as_prompt()),
+                Part::Image(img) => estimate_image_tokens(img.detail.as_deref()),
+            })
+            .sum(),
+    };
     let questions: u64 = req
         .questions()
         .iter()
-        .map(|(_, body)| estimate_text(body.get()))
+        .map(|q| {
+            if let Some(raw) = &q.raw {
+                return estimate_text(raw.get());
+            }
+            let mut text = q
+                .instructions
+                .as_ref()
+                .map_or(0, |t| estimate_text(&t.as_prompt()));
+            match &q.kind {
+                QuestionKind::Predicate { criteria } => {
+                    if let Some(c) = criteria {
+                        for t in [&c.when_true, &c.when_false].into_iter().flatten() {
+                            text += estimate_text(&t.as_prompt());
+                        }
+                    }
+                }
+                QuestionKind::Choice { choices } => {
+                    for c in choices {
+                        text += estimate_text(&c.value.wire_key());
+                        text += c
+                            .description
+                            .as_ref()
+                            .map_or(0, |d| estimate_text(&d.as_prompt()));
+                    }
+                }
+                QuestionKind::Score { levels } => {
+                    for l in levels {
+                        text += estimate_text(&l.label.as_prompt());
+                        text += l
+                            .description
+                            .as_ref()
+                            .map_or(0, |d| estimate_text(&d.as_prompt()));
+                    }
+                }
+            }
+            text
+        })
         .sum();
-    estimate_text(req.state().get()).saturating_add(questions)
+    input.saturating_add(questions)
 }
 
 #[cfg(test)]
@@ -247,19 +296,6 @@ mod tests {
     }
 
     #[test]
-    fn systemone_counts_state_once_plus_every_question() {
-        // state `"abcdef"` is 8 bytes (2 tokens); each question body below is
-        // 36 bytes (9 tokens).
-        let req: SystemOneRequest = serde_json::from_str(
-            r#"{"model":"m","state":"abcdef","questions":{
-                "a":{"type":"noul","instructions":"?!"},
-                "b":{"type":"noul","instructions":"!?"}}}"#,
-        )
-        .expect("valid request");
-        assert_eq!(estimate_systemone(&req), 2 + 9 + 9);
-    }
-
-    #[test]
     fn image_part_adds_strictly_more_tokens_than_text_only() {
         let text_only = request(vec![parts_msg(vec![text_part("hello")])]);
         let with_image = request(vec![parts_msg(vec![text_part("hello"), image_part(None)])]);
@@ -312,6 +348,47 @@ mod tests {
         assert_eq!(
             estimate_chat_prompt(&three) - estimate_chat_prompt(&one),
             2 * DEFAULT_IMAGE_TOKENS
+        );
+    }
+
+    #[test]
+    fn decisions_counts_state_once_plus_every_question() {
+        use crate::decisions::format::{parse, Format};
+        // state `"abcdef"` is 8 bytes (2 tokens); each question body below is
+        // 36 bytes (9 tokens).
+        let body = r#"{"model":"m","state":"abcdef","questions":{
+                "a":{"type":"noul","instructions":"?!"},
+                "b":{"type":"noul","instructions":"!?"}}}"#;
+        let (_, req) = parse(body.as_bytes(), Some(Format::TypeSafe)).expect("valid request");
+        assert_eq!(estimate_decisions(&req), 2 + 9 + 9);
+    }
+
+    #[test]
+    fn decisions_estimate_counts_images_by_detail() {
+        use crate::decisions::{DecisionRequest, Image, Input, Part, Question, QuestionKind, Text};
+        let q = Question {
+            name: None,
+            instructions: Some(Text::Plain("q".into())),
+            kind: QuestionKind::Predicate { criteria: None },
+            raw: None,
+        };
+        let req = DecisionRequest::new(
+            "m".into(),
+            Input::Messages(vec![
+                Part::Image(Image {
+                    data_url: "data:x".into(),
+                    detail: Some("low".into()),
+                }),
+                Part::Image(Image {
+                    data_url: "data:y".into(),
+                    detail: None,
+                }),
+            ]),
+            vec![q],
+        );
+        assert!(
+            estimate_decisions(&req)
+                >= estimate_image_tokens(Some("low")) + estimate_image_tokens(None)
         );
     }
 }

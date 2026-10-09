@@ -177,6 +177,11 @@ pub struct RerankUsage {
     /// upstream reported none (ADR 003); omitted for upstream-reported usage.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tokens_estimated: Option<bool>,
+    /// Questions a decision model refused while serving a rerank remap
+    /// (ADR 017); internal, never serialized. Feeds
+    /// `lumen_decision_refusals_total`.
+    #[serde(skip)]
+    pub refusals: u32,
 }
 
 /// A rerank response, ordered by descending `relevance_score`.
@@ -192,6 +197,22 @@ pub struct RerankResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refusals_never_reach_the_wire() {
+        let usage = RerankUsage {
+            refusals: 3,
+            total_tokens: 7,
+            ..RerankUsage::default()
+        };
+        let json = serde_json::to_value(usage).unwrap();
+        assert!(json.get("refusals").is_none(), "{json}");
+        assert_eq!(json["total_tokens"], 7);
+        // A client cannot set it either.
+        let parsed: RerankUsage =
+            serde_json::from_str(r#"{"search_units":1,"total_tokens":2,"refusals":9}"#).unwrap();
+        assert_eq!(parsed.refusals, 0);
+    }
 
     #[test]
     fn arbitrary_object_document_preserves_all_fields() {

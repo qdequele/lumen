@@ -102,16 +102,19 @@ The foundation model that actually served the request (primary or a fallback)
 is reported in the `x-lumen-model-used` response header, and the path taken in
 `x-lumen-route`. See [Resilience](../operations/resilience.md).
 
-## Jev as a reranker (TypeSafe)
+## Decision models as rerankers (Jev, Perplexity, OpenAI, Ollama, Cloudflare)
 
-A rerank [virtual model](../virtual-models.md#7-jev-as-a-reranker) whose
-target carries a `remap` is served by Jev. The target points at a `typesafe`
-foundation model that declares `systemone` (a `typesafe` model can no longer
-declare `rerank` itself). Each request becomes SystemOne calls whose `state`
-is `{"query": ...}` and whose questions, by default, are one `noul` per
-document, the document carried in structured instructions; Jev's noul (its
-calibrated probability that the document is relevant) is the
-`relevance_score`.
+A rerank [virtual model](../virtual-models.md#7-decision-models-as-rerankers)
+whose target carries a `remap` is served by a decision model. The target
+points at **any** foundation model that declares `decisions` (`typesafe`,
+`perplexity`, `openai`, `ollama` or `cloudflare` kinds; a `typesafe` model can
+no longer declare `rerank` itself). Each request becomes decision calls whose
+`state` is `{"query": ...}` and whose questions, by default, are one
+`predicate` (alias `noul`) per document, the document carried in structured
+instructions; the predicate's calibrated probability that the document is
+relevant is the `relevance_score`. Jev receives the same bytes as before the
+rename; an OpenAI target receives the structured instructions as compact JSON
+text. The examples below use Jev.
 
 ```toml
 [[providers]]
@@ -122,7 +125,7 @@ api_key_env = "TYPESAFE_API_KEY"
 [[providers.models]]
 id = "jev"
 upstream_id = "jev-latest"
-capabilities = ["systemone"]
+capabilities = ["decisions"]
 cost_per_1m_input = 0.042
 
 # Optional remap fields: the question asked about every document. Unset
@@ -135,27 +138,39 @@ strategy = "single"
 [[virtual_models.targets]]
 model = "jev"
 [virtual_models.targets.remap]
-strategy = "noul"
+strategy = "predicate"
 instructions = "Could `document` be the precedent cited in the query?"
 criteria.true = "The document states the specific rule the query cites."
 criteria.false = "The document is only on a similar topic."
 ```
 
-- Besides `noul`, the remap strategies are `score`, `composite` (weighted
+- Besides `predicate`, the remap strategies are `score`, `composite` (weighted
   criteria) and `choice`, and a static `context` can be added; see
-  [Virtual models](../virtual-models.md#7-jev-as-a-reranker).
+  [Virtual models](../virtual-models.md#7-decision-models-as-rerankers).
+  `strategy = "noul"` is still accepted as an alias of `predicate`, and
+  `lumen config migrate` rewrites it.
 - Clients call plain `/v1/rerank`; ordering, `top_n`, `return_documents`,
   `rank_fields` and fallbacks (a `fallback` virtual model whose second target
   is `cohere/rerank-english`, say) work as for any reranker.
-- Documents are packed into as few upstream calls as Jev's context allows (at
-  most 100 documents and about 48k estimated tokens per call), run up to 4 at
-  a time. A document longer than about 4,096 tokens is truncated first, like
-  Cohere's default `max_tokens_per_doc`.
+- Documents are packed into as few upstream calls as the target allows. The
+  default is at most 100 documents and about 48k estimated tokens per call,
+  4 calls in flight. A target's own limits tighten that: Cloudflare packs at
+  most 64 documents per call; Ollama packs about 16k tokens per call with one
+  call in flight (a local GPU). A listwise `choice` over more documents than
+  the target's option limit (Ollama 26, otherwise 255) is `LM-1001`. A
+  document longer than about 4,096 tokens is truncated first, like Cohere's
+  default `max_tokens_per_doc`.
+- Refusals: OpenAI can refuse a question. A refused `predicate` or `score`
+  question scores that document (or that composite criterion) 0.0; a refused
+  listwise `choice` fails the attempt as `content_filter`, so a virtual model
+  with `fallback_on = ["content_filter"]` moves to its next target. Every
+  refusal is counted in `lumen_decision_refusals_total{model}`, including
+  those of a `choice` that then falls back.
 - Because scores are calibrated probabilities, they are comparable across
   requests: a cut-off such as 0.5 means the same thing everywhere.
-- Usage: Jev's upstream `input_tokens` is `usage.total_tokens` (unflagged);
-  search units are derived. The SystemOne model's `cost_per_1m_input` bills
-  per input token.
+- Usage: the upstream `input_tokens` is `usage.total_tokens` (unflagged
+  when the upstream reports it); search units are derived. The decision
+  model's `cost_per_1m_input` bills per input token.
 - The remap belongs to a target of a virtual model. For per-tenant relevance
   rules, put a `switch` on the budget group in front of several such virtual
   models.

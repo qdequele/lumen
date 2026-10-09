@@ -2,7 +2,7 @@
 
 LUMEN ships twenty-seven built-in provider kinds - sixteen native integrations
 (their own request/response translation, including deployment-routed `azure`,
-SigV4-signed `bedrock` and SystemOne-only `typesafe`) plus eleven
+SigV4-signed `bedrock` and decisions-only `typesafe`) plus eleven
 **OpenAI-compatible** hosts that reuse the OpenAI path with a per-kind base
 URL. Each `[[providers]]` block in your config selects one with a `kind`
 string and gives it a unique `name` (your own label). Each `[[providers.models]]` block under it exposes a model to clients:
@@ -17,7 +17,7 @@ api_key_env = "OPENAI_API_KEY"   # NAME of the env var holding the key
 [[providers.models]]
 id = "gpt-4o"             # the id clients send (owned entirely by you)
 upstream_id = "gpt-4o-2024-08-06"   # what LUMEN sends upstream (defaults to `id`)
-capabilities = ["chat"]   # any of "chat", "embed", "rerank", "systemone"
+capabilities = ["chat"]   # any of "chat", "embed", "rerank", "decisions"
 release_date = "2024-08-06"   # optional; lets clients sort GET /v1/models by release
 ```
 
@@ -53,9 +53,9 @@ Rules that apply to every provider:
   item (a mixed item is sent as its image, its caption text is not combined).
   See the multimodal-embeddings design spec for the full guard list.
 
-| `kind`      | Chat | Embed | Rerank | SystemOne | `api_key_env` | `base_url`     | Embed batch limit |
+| `kind`      | Chat | Embed | Rerank | Decisions | `api_key_env` | `base_url`     | Embed batch limit |
 |-------------|:----:|:-----:|:------:|:---------:|:-------------:|:--------------:|:-----------------:|
-| `openai`    |  ✅  |  ✅   |        |           | required      | optional       | 2048              |
+| `openai`    |  ✅  |  ✅   |        |    ✅     | required      | optional       | 2048              |
 | `mistral`   |  ✅  |  ✅   |        |           | required      | optional       | 512               |
 | `anthropic` |  ✅  |       |        |           | required      | optional       | -                 |
 | `google`    |  ✅  |  ✅   |        |           | required      | optional       | 100               |
@@ -68,17 +68,23 @@ Rules that apply to every provider:
 | `pinecone`  |      |      |   ✅   |           | required      | optional       | -                 |
 | `nvidia`    |      |      |   ✅   |           | keyless       | **required**   | -                 |
 | `tei`       |      |  ✅   |   ✅   |           | keyless       | **required**   | 32                |
-| `ollama`    |  ✅  |  ✅   |        |           | keyless       | **required**   | 512               |
+| `ollama`    |  ✅  |  ✅   |        |    ✅     | keyless       | **required**   | 512               |
 | `azure`     |  ✅  |  ✅   |        |           | required      | **required**   | 2048              |
 | `typesafe`  |      |       |   ✅   |    ✅     | required      | optional       | -                 |
 
-The `typesafe` kind serves rerank through a converter over Jev (see its
-section). The `together` kind (in the OpenAI-compatible table below) additionally serves
+The `typesafe` kind serves decisions only; reranking a decision model goes
+through a virtual model `remap` (see
+[Decision models as rerankers](reranking/reranking.md#decision-models-as-rerankers-jev-perplexity-openai-ollama-cloudflare)).
+`perplexity` and `cloudflare` (OpenAI-compatible table below) also serve
+decisions. The full decisions matrix is [below](#decisions-by-provider-kind).
+The `together` kind (in the OpenAI-compatible table below) additionally serves
 **rerank** (LlamaRank) natively; see its section for the model config.
 
 OpenAI-compatible hosts (chat + embed via the OpenAI path). The Embed column
 reflects what each host actually serves upstream: `groq`, `deepseek`,
-`openrouter`, `perplexity` and `xai` expose no `/embeddings` endpoint, so a
+`openrouter`, `perplexity` and `xai` expose no `/embeddings` endpoint (`perplexity`
+and `cloudflare` do serve `decisions`, see [Decisions by provider
+kind](#decisions-by-provider-kind)), so a
 model declaring `embed` on those kinds is **rejected at config load** (it
 could only ever 404 at request time) - unless the provider sets a custom
 `base_url`, which is taken to mean an operator-run proxy that may serve
@@ -118,11 +124,15 @@ which covers only the chat/embed OpenAI-compatible path): its BAAI
 
 ## openai
 
-- **kind**: `openai` · **capabilities**: chat, embed
+- **kind**: `openai` · **capabilities**: chat, embed, decisions
 - **Auth**: `api_key_env` (e.g. `OPENAI_API_KEY`), sent as a bearer token.
 - **base_url**: optional; defaults to OpenAI's public API. Set it to point at any
   OpenAI-compatible endpoint.
 - **Embed batch limit**: 2048 inputs per upstream call.
+- **Decisions**: `gpt-6-luna` on `POST {base_url}/decisions` (public beta).
+  A `choice` needs at least 2 options and a request at most 128 images. Set
+  `cost_per_1m_input = 0.10` and `modalities = ["text", "image"]`. See
+  [Decisions](decisions/decisions.md).
 
 ```toml
 [[providers]]
@@ -138,6 +148,12 @@ capabilities = ["chat"]
 [[providers.models]]
 id = "text-embedding-3-small"
 capabilities = ["embed"]
+
+[[providers.models]]
+id = "gpt-6-luna"
+capabilities = ["decisions"]
+modalities = ["text", "image"]
+cost_per_1m_input = 0.10
 ```
 
 ## mistral
@@ -513,20 +529,31 @@ capabilities = ["rerank"]
 
 ## typesafe
 
-- **kind**: `typesafe` · **capabilities**: systemone (TypeSafe's Jev
-  typed-decision models, served on `POST /v1/systemone`; see
-  [SystemOne](systemone/systemone.md) and
-  [ADR 013](adr/013-systemone-capability.md)), and rerank through a converter
-  ([Jev as a reranker](reranking/reranking.md#jev-as-a-reranker-typesafe)).
-- **Auth**: `api_key_env` (e.g. `TYPESAFE_API_KEY`), **required**, sent as a
-  bearer token. Never logged, redacted from `Debug`.
+- **kind**: `typesafe` · **capabilities**: decisions (TypeSafe's Jev
+  typed-decision models, and any other TypeSafe-format vendor, served on
+  `POST /v1/decisions`; see [Decisions](decisions/decisions.md) and
+  [ADR 017](adr/017-decisions-capability.md)). Reranking goes through a
+  virtual model `remap`
+  ([Decision models as rerankers](reranking/reranking.md#decision-models-as-rerankers-jev-perplexity-openai-ollama-cloudflare)).
+- **Auth**: `api_key_env` (e.g. `TYPESAFE_API_KEY`), sent as a bearer token.
+  Never logged, redacted from `Debug`.
 - **base_url**: optional; defaults to `https://api.typesafe.ai`. An override
-  is the API root, with or without a trailing `/v1`; the gateway posts to
-  `{base}/v1/systemone`.
+  is the API root. Without `decisions_path` a trailing `/v1` is tolerated and
+  the gateway posts to `{base}/v1/systemone`.
+- **`decisions_path`** (optional, `typesafe` only): the upstream path appended
+  to `base_url` verbatim. Must start with `/`. Default `/v1/systemone`. This
+  and the next field make `typesafe` the generic TypeSafe-format kind.
+- **`forward_unknown_fields`** (optional, `typesafe` only, default `true`):
+  forward unknown top-level request fields upstream, as TypeSafe accepts them.
+  Set `false` for a vendor that rejects them (Perplexity answers 400).
+  Setting either field on another `kind` is refused at config load.
 - **Schema note**: the request and response are TypeSafe's own, forwarded
-  verbatim (only `model` is rewritten to the `upstream_id`); `state`, question
-  and answer JSON keeps its key order byte-for-byte. The question contract is
-  validated at the edge (`LM-2011` / `LM-1001`) before any upstream call.
+  verbatim for a TypeSafe-format client (only `model` is rewritten to the
+  `upstream_id`); `state`, question and answer JSON keeps its key order
+  byte-for-byte. The question contract is validated at the edge
+  (`LM-2011` / `LM-1001`) before any upstream call. An OpenAI-format client is
+  translated to this wire format. A `noul` question without `instructions`
+  is not sent to a `typesafe` model (Jev requires them): the target is skipped.
 - **Models**: `jev-latest` (stable alias), `jev-preview` (preview alias) and
   versioned ids such as `jev-1.13.0`, mapped through `upstream_id`.
 - **Errors**: TypeSafe `401` / `422` surface as `LM-3003` (502, not retried,
@@ -552,25 +579,25 @@ api_key_env = "TYPESAFE_API_KEY"
 [[providers.models]]
 id = "jev"
 upstream_id = "jev-latest"
-capabilities = ["systemone"]
+capabilities = ["decisions"]
 cost_per_1m_input = 0.042
 
 # A pinned version for reproducible answers.
 [[providers.models]]
 id = "typesafe/jev-1.13.0"
 upstream_id = "jev-1.13.0"
-capabilities = ["systemone"]
+capabilities = ["decisions"]
 cost_per_1m_input = 0.042
 
 # Clients call `jev-1.13.0`; it falls back to the stable alias when the pinned
 # version is overloaded (529) or its circuit is open.
 [[virtual_models]]
 id = "jev-1.13.0"
-capability = "systemone"
+capability = "decisions"
 strategy = "fallback"
 targets = [{ model = "typesafe/jev-1.13.0" }, { model = "jev" }]
 
-# Jev as a reranker: plain /v1/rerank, one noul question per document. A
+# Jev as a reranker: plain /v1/rerank, one predicate question per document. A
 # `typesafe` model cannot declare `rerank` itself; a virtual model's `remap`
 # does the conversion (see docs/virtual-models.md).
 [[virtual_models]]
@@ -580,8 +607,90 @@ strategy = "single"
 
 [[virtual_models.targets]]
 model = "jev"
-remap = { strategy = "noul" }
+remap = { strategy = "predicate" }
 ```
+
+### Other TypeSafe-format vendors
+
+Each recipe below is a `typesafe` provider with its own `base_url` and
+`decisions_path`. The TypeSafe format is shared, the path is not. LUMEN has
+not been tested against these vendors' live APIs: check each vendor's
+documentation for the model id and whether it tolerates unknown fields.
+
+```toml
+# Liquid d1. Unverified: set forward_unknown_fields = true if Liquid
+# accepts unknown fields.
+[[providers]]
+name = "liquid"
+kind = "typesafe"
+base_url = "https://api.liquid.ai"
+decisions_path = "/decisions/v1/systemone"
+forward_unknown_fields = false
+api_key_env = "LIQUID_API_KEY"
+[[providers.models]]
+id = "liquid-d1"
+upstream_id = "d1"
+capabilities = ["decisions"]
+
+# Inception Mercury Decide.
+[[providers]]
+name = "inception"
+kind = "typesafe"
+base_url = "https://api.inceptionlabs.ai"
+decisions_path = "/v1/decisions"
+api_key_env = "INCEPTION_API_KEY"
+[[providers.models]]
+id = "mercury-decide"
+upstream_id = "mercury-decide"
+capabilities = ["decisions"]
+
+# Self-hosted Kev (kev.serve) on its default path /v1/systemone.
+[[providers]]
+name = "kev"
+kind = "typesafe"
+base_url = "http://localhost:8000"
+[[providers.models]]
+id = "kev"
+upstream_id = "kev"
+capabilities = ["decisions"]
+```
+
+Upstage Solar Decide serves `/v1/systemone`, but its base URL is unconfirmed:
+set `base_url` to the host Upstage documents for your account and keep the
+default path. The `upstream_id` values above for Inception and Kev
+(`mercury-decide`, `kev`) are placeholders: use the model id your vendor
+documents. For Inception, Kev and Upstage the `forward_unknown_fields` default
+(`true`) is untested.
+
+## Decisions by provider kind
+
+Five kinds serve `decisions`. All use bearer auth except `ollama` (keyless;
+a bearer key is sent if one is configured). Limits are checked before any
+upstream call; a target that cannot take the request is skipped (see
+[Decisions](decisions/decisions.md#cross-vendor-fallback)).
+
+| `kind` | Endpoint | Image placement | Limits | Price per 1M input (output free) |
+|---|---|---|---|---|
+| `typesafe` | `{base_url}` (default `https://api.typesafe.ai`) + `decisions_path` (default `/v1/systemone`) | none | a `noul` needs `instructions` | Jev $0.042 |
+| `perplexity` | `{base_url}` (default `https://api.perplexity.ai`) + `/v1/decisions` | inside `state` as `image_url` parts | 128 questions; upstream: under 262,144 input tokens, 32 MiB body, 10 RPS per org, 504 after about 60 s | $0.02 |
+| `openai` | `{base_url}` (default `https://api.openai.com/v1`) + `/decisions` | OpenAI `input_image` | `choice` needs at least 2 options; at most 128 images | `gpt-6-luna` $0.10 |
+| `ollama` | `{base_url}` + `/v1/systemone` (Ollama 0.35+) | top-level `images`, raw base64 | `choice` and `score` take 2 to 26 options or levels; images only on `clef` and `clef-flash` | 0 (local) |
+| `cloudflare` | Workers AI `{account root}/ai/run/@cf/cloudflare/{upstream_id}`, with `upstream_id` `clef` or `clef-flash` | top-level `images` | 64 questions, 4 images | Clef $0.24 |
+
+Unknown top-level request fields are forwarded by `typesafe` (unless
+`forward_unknown_fields = false`) and stripped by the other kinds; `openai`
+sends only `safety_identifier`. There is no question-count cap at the gateway
+edge: the per-target limits above apply when a target is chosen. Prices are
+the published ones as of 2026-10 and only feed `cost_per_1m_input`: set it on
+each model, the gateway never fills prices in. A model accepts images only if
+it declares `modalities = ["text", "image"]` (the default is `["text"]`).
+
+`perplexity` and `cloudflare` dispatch per model, so one provider block can
+hold chat models and decision models side by side. Status mapping is the
+usual one (`429` is `LM-3001` honouring `Retry-After`, `5xx` is retryable
+`LM-3003`, upstream bodies never reach the client); see
+[Error codes](errors.md). An Ollama server that is not running is
+`LM-3004` and falls back like any unavailable upstream.
 
 ## nvidia (NIM)
 
@@ -657,7 +766,10 @@ capabilities = ["rerank"]
 
 ## ollama (self-hosted)
 
-- **kind**: `ollama` · **capabilities**: chat, embed.
+- **kind**: `ollama` · **capabilities**: chat, embed, decisions (Ollama 0.35+,
+  on `POST {base_url}/v1/systemone`; `choice` and `score` take 2 to 26 options
+  or levels, and only `clef` and `clef-flash` accept images; see
+  [Local decision models with Ollama](decisions/decisions.md#local-decision-models-with-ollama)).
 - **Auth**: keyless.
 - **base_url**: **required** - points at your Ollama server **root** (no
   `/v1`). Embeddings use Ollama's native `POST /api/embed`; chat goes through
@@ -699,6 +811,11 @@ capabilities = ["chat"]
 id = "nomic-embed"
 upstream_id = "nomic-embed-text"
 capabilities = ["embed"]
+
+[[providers.models]]
+id = "nimble"
+upstream_id = "nimble"
+capabilities = ["decisions"]
 ```
 
 ## azure
@@ -797,6 +914,11 @@ The native rerank request is `{ query, contexts: [{ text }, ...], top_k }`
 with `id` mapped back onto the original document index. Workers AI reports no
 token usage for this model; LUMEN derives a local estimate per ADR 003.
 
+Decisions use the Clef models (`clef`, `clef-flash`) through
+`POST {account root}/ai/run/@cf/cloudflare/{upstream_id}` on the same
+`base_url`, with at most 64 questions and 4 images per request. HTTP 200 with
+`success: false` is `LM-3003`.
+
 ```toml
 [[providers]]
 name = "cf"
@@ -811,6 +933,37 @@ capabilities = ["chat"]
 id = "cf-rerank"
 upstream_id = "@cf/baai/bge-reranker-base"
 capabilities = ["rerank"]
+[[providers.models]]
+id = "clef"
+upstream_id = "clef"
+capabilities = ["decisions"]
+modalities = ["text", "image"]
+cost_per_1m_input = 0.24
+```
+
+### perplexity decisions
+
+The `perplexity` kind also serves Perplexity's decision models
+(`pplx-decider-v1.1-27b`, `pplx-decider-v1-27b`) on `POST {base_url}/v1/decisions`,
+next to its chat models in the same provider block. Unknown request fields are
+stripped (Perplexity answers 400 to them), at most 128 questions, images go in
+`state`. A 504 (no answer within about 60 s) is a retryable `LM-3003`; a 413
+(body over 32 MiB) is a non-retryable `LM-3003`.
+
+```toml
+[[providers]]
+name = "perplexity"
+kind = "perplexity"
+api_key_env = "PERPLEXITY_API_KEY"
+[[providers.models]]
+id = "sonar"
+capabilities = ["chat"]
+[[providers.models]]
+id = "pplx-decider"
+upstream_id = "pplx-decider-v1.1-27b"
+capabilities = ["decisions"]
+modalities = ["text", "image"]
+cost_per_1m_input = 0.02
 ```
 
 ### vllm

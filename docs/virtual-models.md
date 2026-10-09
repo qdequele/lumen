@@ -25,7 +25,8 @@ Both layers share **one id namespace**. Ids are non-empty and use only the
 characters `A-Z a-z 0-9 . _ : / -`; `company/model` is a convention, not a
 rule. A collision between a foundation id and a virtual id is a validation
 error naming both. A virtual model serves exactly **one capability** (`chat`,
-`embed`, `rerank` or `systemone`); to offer the same product name for two
+`embed`, `rerank` or `decisions`; `systemone` is accepted as an alias of
+`decisions`); to offer the same product name for two
 capabilities, define two ids.
 
 Virtual models live in the dynamic config document ([config
@@ -208,7 +209,7 @@ targets = [{ model = "openai/gpt-4o", overrides = { set = { max_tokens = 4096 },
 | `chat` | `temperature`, `top_p`, `max_tokens`, `max_completion_tokens`, `stop`, `seed`, `presence_penalty`, `frequency_penalty`, `response_format`, `reasoning_effort`, `parallel_tool_calls` |
 | `embed` | `dimensions`, `encoding_format` |
 | `rerank` | `top_n` |
-| `systemone` | none |
+| `decisions` | none |
 
 An unknown field, a field outside the allow-list, or a value of the wrong type
 is a validation error.
@@ -250,23 +251,25 @@ preset = { system_prompt = "You are Acme's support assistant. Answer briefly and
 - Preset text is operator-authored config: never client-supplied, never
   logged, never echoed in errors.
 
-## 7. Jev as a reranker
+## 7. Decision models as rerankers
 
 A `remap` on a target of a **rerank** virtual model converts `POST
-/v1/rerank` into [SystemOne](systemone/systemone.md) calls. The target must
-point **directly** at a foundation model that serves `systemone` (a
-`kind = "typesafe"` model such as `jev`). A `typesafe` model can no longer
-declare `rerank` itself.
+/v1/rerank` into [decision](decisions/decisions.md) calls. The target must
+point **directly** at a foundation model that serves `decisions`: any of the
+`typesafe` (Jev and other TypeSafe-format vendors), `perplexity`, `openai`,
+`ollama` and `cloudflare` kinds. A `typesafe` model can no longer declare
+`rerank` itself.
 
 The state sent upstream is `{ "query": <query> }`, plus `"context"` when set.
 Each question's instructions are structured as `{ "document": <document>,
-"question": <instructions> }`.
+"question": <instructions> }`. Jev receives exactly these bytes; an OpenAI
+target receives them as compact JSON text.
 
 | `strategy` | Fields | Questions per request | `relevance_score` |
 |---|---|---|---|
-| `noul` (default) | `instructions`, `criteria.true`, `criteria.false` (all default to a generic relevance question) | One noul per document | The noul |
+| `predicate` (default; alias `noul`) | `instructions`, `criteria.true`, `criteria.false` (all default to a generic relevance question) | One predicate per document | The predicate probability |
 | `score` | `instructions`, `levels` (worst first, 2 to 10 entries) | One score per document | `level / (levels - 1)` |
-| `composite` | `questions`: 1 to 8 entries of `{ instructions, criteria.true, criteria.false, weight > 0 }` | N noul per document | `sum(weight_i * noul_i) / sum(weight_i)` |
+| `composite` | `questions`: 1 to 8 entries of `{ instructions, criteria.true, criteria.false, weight > 0 }` | N predicates per document | `sum(weight_i * p_i) / sum(weight_i)` |
 | `choice` | `instructions` | One choice question; the options are the documents | The option's probability (scores sum to 1) |
 
 `context` is a static, operator-authored string sent in the state next to the
@@ -275,19 +278,30 @@ federal case law. Prefer holdings over dicta.").
 
 **Batching and limits**
 
-- `noul`, `score` and `composite` are batched: at most 100 documents and about
-  48k estimated tokens per upstream call, with 4 calls in flight. For
-  `composite` the per-call budget counts every question of every document.
+- `predicate`, `score` and `composite` are batched: by default at most 100
+  documents and about 48k estimated tokens per upstream call, with 4 calls in
+  flight. Each target's limits tighten that: Cloudflare packs at most 64
+  documents per call, Ollama about 16k tokens per call with one call in flight.
+  For `composite` the per-call budget counts every question of every document.
 - `choice` must fit **one call**, because its scores are relative and cannot be
-  merged across calls: at most **255 documents** and within the per-call token
-  budget. Otherwise the request fails with `LM-1001` (400) naming the limit,
-  before any upstream call.
+  merged across calls: at most **255 documents** (26 on Ollama) and within the
+  per-call token budget. Otherwise the request fails with `LM-1001` (400)
+  naming the limit, before any upstream call. A `choice` over one document
+  returns relevance 1.0 without an upstream call.
 - Documents are truncated to about 4,096 estimated tokens.
 
-**Accounting.** `usage.total_tokens` is the sum of the `input_tokens` Jev
-reports over all calls (upstream-reported, not `estimated`). Cost is the
-SystemOne model's `cost_per_1m_input`; `search_units` stay derived from the
-document count. `x-lumen-model-used` names the SystemOne model.
+**Refusals.** An OpenAI target can refuse a question. A refused `predicate` or
+`score` scores that document (or that composite criterion) 0.0. A refused
+`choice` fails the attempt as `content_filter`: with
+`fallback_on = ["content_filter"]` on the virtual model, the request moves to
+the next target, otherwise it surfaces as `LM-2013`. Every refusal increments
+`lumen_decision_refusals_total{model}`, including a refused `choice` that falls
+back.
+
+**Accounting.** `usage.total_tokens` is the sum of the `input_tokens` the
+decision model reports over all calls (upstream-reported, not `estimated`).
+Cost is the decision model's `cost_per_1m_input`; `search_units` stay derived
+from the document count. `x-lumen-model-used` names the decision model.
 
 **Jev with a Cohere fallback.** A remap target and a plain reranker in one
 `fallback` give a cross-capability fallback. A TypeSafe `529 Overloaded` is a
@@ -434,11 +448,15 @@ takes over the public id and the foundation model is renamed:
   `P/M`, without fallback. `--dry-run` shows this before anything is written.
 - A `typesafe` model `R` declaring `rerank` (with or without a converter
   block) becomes a virtual `R` with `capability = "rerank"`,
-  `strategy = "single"`, and one target with a `noul` remap that copies the
-  converter's fields, pointing at the provider's SystemOne foundation model
+  `strategy = "single"`, and one target with a `predicate` remap that copies the
+  converter's fields, pointing at the provider's decisions foundation model
   with the same `upstream_id`. If none exists, the migrator creates
-  `P/<upstream_id>` with `capabilities = ["systemone"]`. When the prices of the
+  `P/<upstream_id>` with `capabilities = ["decisions"]`. When the prices of the
   removed reranker differ from that model's, a note asks you to review them.
+- The capability spelling `systemone` (model `capabilities`, virtual model
+  `capability`) becomes `decisions`, and `remap.strategy = "noul"` becomes
+  `predicate` (ADR 017). Both old spellings keep loading without the
+  migrator and log a boot warning.
 
 **Visible side effect.** `usage_log.model_used` and the Prometheus model
 labels of renamed foundation models change, for example `gpt-4o` becomes

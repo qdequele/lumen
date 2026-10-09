@@ -4,7 +4,7 @@
 
 A universal, self-hostable LLM gateway written in Rust. One OpenAI-compatible
 endpoint in front of many providers - for **chat**, **embeddings**,
-**reranking** and **SystemOne typed decisions** alike. It is designed to be light, fast and sovereign: a single
+**reranking** and **typed decisions** alike. It is designed to be light, fast and sovereign: a single
 static binary, **zero telemetry**, and prompts that are **never logged by
 default**.
 
@@ -39,7 +39,8 @@ reference.
 | `POST /v1/chat/completions`    | Chat completions, OpenAI format, streaming SSE.         |
 | `POST /v1/embeddings`          | Embeddings, OpenAI format.                              |
 | `POST /v1/rerank`              | Reranking, Cohere format (`query`, `documents`, `top_n`).|
-| `POST /v1/systemone`           | SystemOne typed decisions (TypeSafe Jev), TypeSafe format (`state`, `questions`); TypeSafe SDKs work via `TYPESAFE_BASE_URL`. See [SystemOne](docs/systemone/systemone.md). |
+| `POST /v1/decisions`           | Typed decisions (calibrated probabilities) from TypeSafe, Perplexity, OpenAI, Cloudflare and Ollama models, in the OpenAI format (`input`, `questions` array) or the TypeSafe format (`state`, `questions` object), answered in the format received. See [Decisions](docs/decisions/decisions.md). |
+| `POST /v1/systemone`           | **Deprecated**, removed in 0.7.0: TypeSafe-format-only alias of `/v1/decisions`. Send the same body to `/v1/decisions`; see [Migrating](docs/decisions/decisions.md#migrating-from-v1systemone). |
 | `GET  /v1/models`              | Lists configured models with a `capabilities` array and `"virtual": true/false` (virtual models also carry an optional `description`; `listed = false` hides one), plus `release_date` / `created` when configured, to sort by release. |
 | `GET  /v1/models/{id}`         | Retrieves one model (same object as the list entry); unknown id is a 404 (`LM-2001`). |
 | `GET  /health`                 | Liveness. No I/O, never touches the DB or providers.    |
@@ -48,7 +49,7 @@ reference.
 | `POST/GET/PUT/PATCH/DELETE /admin/*` | Keys, budgets, budget webhooks, usage reporting & export, provider-key rotation, whole-document and granular (per-provider, per-section) config read/apply. Only mounted when auth is enabled. See [Config source modes](docs/operations/config-modes.md). |
 
 A foundation model id is owned entirely by you and may serve one or more of the
-four capabilities (`chat`, `embed`, `rerank`, `systemone`); a [virtual
+four capabilities (`chat`, `embed`, `rerank`, `decisions`); a [virtual
 model](docs/virtual-models.md) serves exactly one. The router resolves each request by `(capability, model)`.
 
 **Vision (image input):** `POST /v1/chat/completions` also accepts OpenAI's
@@ -174,9 +175,9 @@ Twenty-seven provider kinds: sixteen **native** integrations plus eleven
 `api_key_env` (`bedrock` uses AWS env credentials; for `vertex_ai` the
 `api_key_env` var holds a GCP service-account JSON).
 
-| `kind`      | Chat | Embed | Rerank | SystemOne | Auth                  | Notes                          |
+| `kind`      | Chat | Embed | Rerank | Decisions | Auth                  | Notes                          |
 |-------------|:----:|:-----:|:------:|:---------:|-----------------------|--------------------------------|
-| `openai`    |  ✅  |  ✅   |        |           | `api_key_env`         |                                |
+| `openai`    |  ✅  |  ✅   |        |    ✅     | `api_key_env`         | decisions: `gpt-6-luna`        |
 | `mistral`   |  ✅  |  ✅   |        |           | `api_key_env`         | OpenAI-style API, native module |
 | `anthropic` |  ✅  |       |        |           | `api_key_env`         | bidirectional translation      |
 | `google`    |  ✅  |  ✅   |        |           | `api_key_env`         | Gemini Developer API           |
@@ -190,8 +191,10 @@ Twenty-seven provider kinds: sixteen **native** integrations plus eleven
 | `pinecone`  |      |      |   ✅   |           | `api_key_env`         | `Api-Key` header; reports units |
 | `nvidia`    |      |      |   ✅   |           | keyless, **`base_url`** | NIM `/v1/ranking`; logit scores |
 | `tei`       |      |  ✅   |   ✅   |           | keyless, **`base_url`** | self-hosted (Text Embeddings Inference) |
-| `ollama`    |  ✅  |  ✅   |        |           | keyless, **`base_url`** | self-hosted; chat via its OpenAI-compatible `/v1` |
-| `typesafe`  |      |       |   ✅   |    ✅     | `api_key_env`         | Jev typed decisions; rerank via a converter; input-only pricing |
+| `ollama`    |  ✅  |  ✅   |        |    ✅     | keyless, **`base_url`** | self-hosted; chat via its OpenAI-compatible `/v1`; local decision models (Ollama 0.35+) |
+| `typesafe`  |      |       |        |    ✅     | `api_key_env`         | Jev and any TypeSafe-format vendor (`decisions_path`); input-only pricing |
+| `perplexity`|  ✅  |       |        |    ✅     | `api_key_env`         | `pplx-decider-*`; one block can mix chat and decision models |
+| `cloudflare`|  ✅  |  ✅   |   ✅   |    ✅     | `api_key_env`, **`base_url`** | Workers AI; decisions: Clef |
 
 **OpenAI-compatible hosts** (chat + embed, reusing the OpenAI path with a
 built-in base URL): `groq`, `together`, `fireworks`, `deepseek`, `openrouter`,
@@ -205,7 +208,10 @@ config load, unless a custom `base_url` fronts the host with an
 embedding-capable proxy. Two of the OpenAI-compatible hosts additionally serve
 **rerank** natively: `together` (LlamaRank) and `cloudflare` (BAAI `bge-reranker-*`,
 through Workers AI's native `/ai/run/{model}` endpoint rather than the OpenAI
-path). Full capability table in [`docs/providers.md`](docs/providers.md).
+path). `perplexity` and `cloudflare` also appear in the table above for their
+decision models. Reranking through a decision model is a virtual model `remap`
+(any `decisions` kind, see [Reranking](docs/reranking/reranking.md)). Full
+capability table in [`docs/providers.md`](docs/providers.md).
 
 Per-provider setup (env var, `base_url`, defaults, batch limits) is in
 [`docs/providers.md`](docs/providers.md).

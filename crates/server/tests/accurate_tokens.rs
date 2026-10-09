@@ -105,6 +105,8 @@ async fn chat_envelope_stays_heuristic_while_metrics_get_the_accurate_count() {
             modalities: vec!["text".to_owned()],
             release_date: None,
         }],
+        decisions_path: None,
+        forward_unknown_fields: None,
     }];
     let registry = Arc::new(
         Registry::build(
@@ -173,6 +175,8 @@ async fn embed_envelope_stays_heuristic_while_metrics_get_the_accurate_count() {
             modalities: vec!["text".to_owned()],
             release_date: None,
         }],
+        decisions_path: None,
+        forward_unknown_fields: None,
     }];
     let registry = Arc::new(
         Registry::build(
@@ -235,6 +239,8 @@ async fn rerank_metrics_get_the_accurate_count_via_the_deferred_close() {
             modalities: vec!["text".to_owned()],
             release_date: None,
         }],
+        decisions_path: None,
+        forward_unknown_fields: None,
     }];
     let registry = Arc::new(
         Registry::build(

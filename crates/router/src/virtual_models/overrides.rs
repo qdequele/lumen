@@ -53,7 +53,7 @@ const fn fields(capability: Capability) -> &'static [(&'static str, Ty)] {
         Capability::Chat => CHAT_FIELDS,
         Capability::Embed => EMBED_FIELDS,
         Capability::Rerank => RERANK_FIELDS,
-        Capability::SystemOne => &[],
+        Capability::Decisions => &[],
     }
 }
 
@@ -507,7 +507,7 @@ mod tests {
             bad(json!({ "set": { "dimensions": 3 } }), Capability::Chat).contains("not allowed")
         );
         assert!(
-            bad(json!({ "set": { "top_n": 3 } }), Capability::SystemOne).contains("not allowed")
+            bad(json!({ "set": { "top_n": 3 } }), Capability::Decisions).contains("not allowed")
         );
         assert!(bad(json!({}), Capability::Chat).contains("at least one"));
     }

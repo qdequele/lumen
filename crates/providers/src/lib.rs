@@ -17,6 +17,7 @@ pub mod bedrock;
 pub mod chat;
 pub mod cloudflare;
 pub mod cohere;
+pub mod decisions;
 pub mod google;
 pub mod http;
 pub mod image_fetch;
@@ -35,7 +36,6 @@ pub mod rerank;
 pub mod sse;
 pub mod tei;
 pub mod together;
-pub mod typesafe;
 pub mod voyage;
 
 pub use anthropic::AnthropicProvider;
@@ -44,6 +44,8 @@ pub use batch::embed_batched;
 pub use bedrock::BedrockProvider;
 pub use cloudflare::CloudflareRerankProvider;
 pub use cohere::CohereProvider;
+pub use decisions::family::FamilyDecisionProvider;
+pub use decisions::openai::OpenAiDecisionProvider;
 pub use google::vertex::VertexProvider;
 pub use google::GoogleProvider;
 pub use jina::JinaProvider;
@@ -56,10 +58,9 @@ pub use ollama::OllamaProvider;
 pub use openai::OpenAiProvider;
 pub use pinecone::PineconeProvider;
 pub use registry::{
-    ChatRoute, EmbeddingRoute, LoadedModelSummary, ModelSpec, ProviderSpec, Registry,
-    RegistryError, RerankRoute, SystemOneRoute,
+    ChatRoute, DecisionRoute, EmbeddingRoute, LoadedModelSummary, ModelSpec, ProviderSpec,
+    Registry, RegistryError, RerankRoute,
 };
 pub use tei::TeiProvider;
 pub use together::TogetherRerankProvider;
-pub use typesafe::TypesafeProvider;
 pub use voyage::VoyageProvider;

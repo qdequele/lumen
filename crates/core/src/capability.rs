@@ -16,9 +16,10 @@ pub enum Capability {
     Embed,
     /// Document reranking (`POST /v1/rerank`).
     Rerank,
-    /// Typed decisions over a state (`POST /v1/systemone`, ADR 013).
-    #[serde(rename = "systemone")]
-    SystemOne,
+    /// Typed decisions over an input (`POST /v1/decisions`, ADR 017).
+    /// `"systemone"` (ADR 013) is accepted as an alias.
+    #[serde(rename = "decisions", alias = "systemone")]
+    Decisions,
 }
 
 impl Capability {
@@ -29,7 +30,7 @@ impl Capability {
             Capability::Chat => "chat",
             Capability::Embed => "embed",
             Capability::Rerank => "rerank",
-            Capability::SystemOne => "systemone",
+            Capability::Decisions => "decisions",
         }
     }
 }
@@ -37,5 +38,23 @@ impl Capability {
 impl fmt::Display for Capability {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decisions_serializes_as_decisions_and_accepts_the_systemone_alias() {
+        assert_eq!(Capability::Decisions.as_str(), "decisions");
+        assert_eq!(
+            serde_json::to_string(&Capability::Decisions).unwrap(),
+            "\"decisions\""
+        );
+        let old: Capability = serde_json::from_str("\"systemone\"").unwrap();
+        let new: Capability = serde_json::from_str("\"decisions\"").unwrap();
+        assert_eq!(old, Capability::Decisions);
+        assert_eq!(new, Capability::Decisions);
     }
 }

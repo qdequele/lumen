@@ -7,7 +7,7 @@
 //! requested capability (`LM-2002`, 400).
 //!
 //! Fallback chains, weighted splits and conditional routing are virtual models
-//! (ADR 014, [`virtual_models`]). The SystemOne capability (ADR 013) resolves
+//! (ADR 014, [`virtual_models`]). The decisions capability (ADR 017) resolves
 //! exactly like the other three.
 
 #![forbid(unsafe_code)]
@@ -21,12 +21,12 @@ pub mod triggers;
 pub mod virtual_models;
 
 pub use attempts::{
-    decision_links, resolve_chat_decision, resolve_embedding_decision, resolve_rerank_decision,
-    resolve_systemone_decision,
+    decision_links, resolve_chat_decision, resolve_decisions, resolve_embedding_decision,
+    resolve_rerank_decision,
 };
 
 use lumen_core::{Capability, GatewayError};
-use lumen_providers::{ChatRoute, EmbeddingRoute, Registry, RerankRoute, SystemOneRoute};
+use lumen_providers::{ChatRoute, DecisionRoute, EmbeddingRoute, Registry, RerankRoute};
 
 /// Resolve a model id to a chat route, or the appropriate routing error.
 ///
@@ -94,11 +94,11 @@ pub struct RerankChainLink {
     pub model_id: String,
 }
 
-/// One resolved attempt of a SystemOne decision (ADR 013).
+/// One resolved attempt of a decisions request (ADR 017).
 #[derive(Debug, Clone)]
-pub struct SystemOneChainLink {
+pub struct DecisionChainLink {
     /// The resolved route.
-    pub route: SystemOneRoute,
+    pub route: DecisionRoute,
     /// The foundation model id of this attempt.
     pub model_id: String,
 }
@@ -142,6 +142,8 @@ mod tests {
                 strict: false,
                 connect_timeout_ms: None,
                 models,
+                decisions_path: None,
+                forward_unknown_fields: None,
             }],
             reqwest::Client::new(),
             std::time::Duration::from_secs(300),
@@ -160,6 +162,8 @@ mod tests {
                 strict: false,
                 connect_timeout_ms: None,
                 models,
+                decisions_path: None,
+                forward_unknown_fields: None,
             }],
             reqwest::Client::new(),
             std::time::Duration::from_secs(300),
@@ -245,42 +249,6 @@ mod tests {
         let chain = resolve_chat_decision(&reg, &mut d).unwrap();
         assert_eq!(chain.len(), 1);
         assert_eq!(chain[0].model_id, "gpt");
-    }
-
-    #[test]
-    fn systemone_decision_resolves_and_rejects_other_capabilities() {
-        let reg = Registry::build(
-            vec![ProviderSpec {
-                name: "typesafe".to_owned(),
-                kind: ProviderKind::Typesafe,
-                api_key: Some("ts-test-xxx".to_owned()),
-                base_url: None,
-                api_version: None,
-                strict: false,
-                connect_timeout_ms: None,
-                models: vec![
-                    model("jev-latest", &[Capability::SystemOne]),
-                    model("jev-1.13.0", &[Capability::SystemOne]),
-                ],
-            }],
-            reqwest::Client::new(),
-            std::time::Duration::from_secs(300),
-        )
-        .expect("registry builds");
-        let mut d = Decision::linear(["jev-1.13.0", "jev-latest"].map(str::to_owned));
-        let chain = resolve_systemone_decision(&reg, &mut d).unwrap();
-        let links = decision_links(&d, chain.iter().map(|l| l.route.provider_name.as_str()));
-        assert_eq!(links.len(), 2);
-        assert_eq!(links[0].provider_name, "typesafe");
-        assert_eq!(links[1].model_id, "jev-latest");
-
-        let err = resolve_systemone_decision(&reg, &mut Decision::direct("nope")).unwrap_err();
-        assert_eq!(err.code(), "LM-2001");
-
-        let chat = registry_with(vec![model("gpt", &[Capability::Chat])]);
-        let err = resolve_systemone_decision(&chat, &mut Decision::direct("gpt")).unwrap_err();
-        assert_eq!(err.code(), "LM-2002");
-        assert!(err.to_string().contains("systemone"));
     }
 
     #[test]

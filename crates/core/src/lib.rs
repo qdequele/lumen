@@ -3,16 +3,16 @@
 //! This crate is deliberately free of any web framework, HTTP client or
 //! database dependency: it defines the vocabulary the rest of the workspace
 //! speaks. Four capabilities are first-class citizens - chat, embeddings,
-//! reranking and SystemOne typed decisions - each with its own
+//! reranking and typed decisions - each with its own
 //! request/response types and provider trait.
 //!
 //! # Modules
 //! * [`chat`] - OpenAI `chat/completions` request/response/chunk types.
 //! * [`embed`] - OpenAI `embeddings` types.
 //! * [`rerank`] - Cohere `rerank` types.
-//! * [`systemone`] - TypeSafe `systemone` types (ADR 013).
+//! * [`decisions`] - vendor-neutral decision types (ADR 017).
 //! * [`provider`] - the [`ChatProvider`], [`EmbeddingProvider`],
-//!   [`RerankProvider`] and [`SystemOneProvider`] traits.
+//!   [`RerankProvider`] and [`DecisionProvider`] traits.
 //! * [`error`] - the [`ProviderError`] / [`GatewayError`] taxonomy.
 //! * [`capability`] - the [`Capability`] enum.
 //! * [`release`] - the [`ReleaseDate`] a model was released.
@@ -21,13 +21,13 @@
 
 pub mod capability;
 pub mod chat;
+pub mod decisions;
 pub mod embed;
 pub mod error;
 pub mod media;
 pub mod provider;
 pub mod release;
 pub mod rerank;
-pub mod systemone;
 pub mod tokens;
 
 pub use capability::Capability;
@@ -35,6 +35,11 @@ pub use chat::{
     developer_role_as_system, ChatChoice, ChatChunk, ChatChunkChoice, ChatDelta, ChatMessage,
     ChatRequest, ChatResponse, CompletionTokensDetails, ContentPart, DataUri, ImageUrl,
     MessageContent, PromptTokensDetails, Usage, DEVELOPER_ROLE,
+};
+pub use decisions::{
+    Answer, ChoiceOption, ChoiceValue, DecisionLimits, DecisionRequest, DecisionResponse,
+    DecisionUsage, Image, Input, Level, PackLimits, Part, PredicateCriteria, Question,
+    QuestionKind, Text,
 };
 pub use embed::{
     encode_embedding_base64, EmbedData, EmbedInput, EmbedItem, EmbedRequest, EmbedResponse,
@@ -44,12 +49,11 @@ pub use error::{
     BudgetScope, ErrorBody, ErrorEnvelope, ErrorType, GatewayError, ProviderError, QuotaKind,
 };
 pub use media::{measure_media, MediaTypeUsage, MediaUsage};
-pub use provider::{ChatProvider, EmbeddingProvider, RerankProvider, SystemOneProvider};
+pub use provider::{ChatProvider, DecisionProvider, EmbeddingProvider, RerankProvider};
 pub use release::{ReleaseDate, ReleaseDateError};
 pub use rerank::{
     RerankDocument, RerankRequest, RerankResponse, RerankResult, RerankResultDocument, RerankUsage,
 };
-pub use systemone::{SystemOneRequest, SystemOneResponse, SystemOneUsage};
 
 #[cfg(test)]
 mod tests {

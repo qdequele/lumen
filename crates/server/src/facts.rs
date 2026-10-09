@@ -88,9 +88,9 @@ impl<'a> Facts<'a> {
         facts
     }
 
-    /// Facts of a `SystemOne` request (group and metadata only).
+    /// Facts of a decisions request (group and metadata only).
     #[must_use]
-    pub fn systemone(headers: &'a HeaderMap, key: Option<&AuthedKey>) -> Self {
+    pub fn decisions(headers: &'a HeaderMap, key: Option<&AuthedKey>) -> Self {
         Self::new(headers, key, Box::new(|| 0))
     }
 }

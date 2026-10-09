@@ -172,7 +172,7 @@ cost_per_1m_input = 0.042
         .unwrap();
     assert_eq!(
         created.capabilities,
-        vec![lumen_core::Capability::SystemOne]
+        vec![lumen_core::Capability::Decisions]
     );
     assert_eq!(created.cost_per_1m_input, Some(0.042));
     assert_eq!(
@@ -457,7 +457,7 @@ capabilities = ["systemone", "rerank"]
     loads(&m.text);
     assert!(
         m.notes.iter().any(|n| n.contains("'jev'")
-            && n.contains("systemone")
+            && n.contains("decisions")
             && n.contains("'typesafe/jev'")),
         "{:?}",
         m.notes
@@ -498,7 +498,7 @@ cost_per_1k_searches = 2.5
     assert!(hint.contains("[[providers.models]]"), "{hint}");
     assert!(hint.contains("id = \"typesafe/jev-latest\""), "{hint}");
     assert!(hint.contains("upstream_id = \"jev-latest\""), "{hint}");
-    assert!(hint.contains("capabilities = [\"systemone\"]"), "{hint}");
+    assert!(hint.contains("capabilities = [\"decisions\"]"), "{hint}");
     assert!(hint.contains("cost_per_1m_input = 0.042"), "{hint}");
     assert!(hint.contains("cost_per_1k_searches = 2.5"), "{hint}");
     assert!(hint.contains("remove that foundation model"), "{hint}");
@@ -670,4 +670,78 @@ mod cli {
             .is_symlink());
         assert_eq!(std::fs::read_to_string(&backup).unwrap(), LEGACY);
     }
+}
+
+#[test]
+fn renames_systemone_and_noul_preserving_layout() {
+    let doc = r#"# my gateway
+[[providers]]
+name = "typesafe"
+kind = "typesafe"
+
+[[providers.models]]
+id = "jev"   # the Jev alias
+capabilities = ["systemone"]
+
+[[virtual_models]]
+id = "jev-vm"
+capability = "systemone"
+strategy = "single"
+targets = [{ model = "jev" }]
+
+[[virtual_models]]
+id = "rr"
+capability = "rerank"
+strategy = "single"
+targets = [{ model = "jev", remap = { strategy = "noul", instructions = "q?" } }]
+"#;
+    let m = migrate_document(doc).unwrap();
+    assert!(m.changed);
+    assert!(
+        m.text.contains(r#"capabilities = ["decisions"]"#),
+        "{}",
+        m.text
+    );
+    assert!(m.text.contains(r#"capability = "decisions""#));
+    assert!(m.text.contains(r#"strategy = "predicate""#));
+    assert!(m.text.contains("# the Jev alias"), "comments survive");
+    assert!(!m.text.contains("systemone") && !m.text.contains("noul"));
+    assert!(m.notes.iter().any(|n| n.contains("decisions")));
+    let again = migrate_document(&m.text).unwrap();
+    assert!(!again.changed);
+}
+
+#[test]
+fn renames_noul_in_array_of_tables_targets() {
+    let doc = r#"[[providers]]
+name = "typesafe"
+kind = "typesafe"
+
+[[providers.models]]
+id = "jev"
+capabilities = ["systemone"]
+
+[[virtual_models]]
+id = "rr"
+capability = "rerank"
+strategy = "single"
+
+[[virtual_models.targets]]
+model = "jev"
+
+[virtual_models.targets.remap]
+strategy = "noul"
+instructions = "q?"
+"#;
+    let m = migrate_document(doc).unwrap();
+    assert!(m.changed);
+    assert!(m.text.contains(r#"strategy = "predicate""#), "{}", m.text);
+    assert!(!m.text.contains("noul"));
+    assert!(!migrate_document(&m.text).unwrap().changed);
+}
+
+#[test]
+fn a_config_without_legacy_spellings_is_unchanged() {
+    let doc = "[[providers]]\nname = \"o\"\nkind = \"openai\"\n";
+    assert!(!migrate_document(doc).unwrap().changed);
 }

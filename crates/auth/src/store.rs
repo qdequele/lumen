@@ -335,7 +335,7 @@ pub struct UsageRecord {
     /// Provider instance that served the request (issue #64). Empty for rows
     /// written before the column existed.
     pub provider: String,
-    /// `chat` | `embed` | `rerank` | `systemone`.
+    /// `chat` | `embed` | `rerank` | `decisions`.
     pub capability: String,
     /// Input/prompt tokens.
     pub tokens_in: i64,
@@ -370,6 +370,16 @@ pub struct UsageRecord {
     pub ts: i64,
 }
 
+/// `usage_log.capability` values a filter matches: rows written before ADR 017
+/// carry `systemone`, later rows `decisions`; either spelling matches both.
+fn capability_values(filter: Option<&str>) -> Vec<&str> {
+    match filter {
+        None => Vec::new(),
+        Some("decisions" | "systemone") => vec!["decisions", "systemone"],
+        Some(other) => vec![other],
+    }
+}
+
 /// Filters for a [`KeyStore::usage_summary`] query. All string filters are
 /// exact matches; the time window is inclusive on both ends (unix seconds).
 #[derive(Debug, Clone, Default)]
@@ -382,7 +392,7 @@ pub struct UsageFilter {
     pub model: Option<String>,
     /// Only rows served by this provider instance.
     pub provider: Option<String>,
-    /// Only rows of this capability (`chat` | `embed` | `rerank` | `systemone`).
+    /// Only rows of this capability (`chat` | `embed` | `rerank` | `decisions`).
     pub capability: Option<String>,
     /// Window start, unix seconds (inclusive).
     pub since: i64,
@@ -403,7 +413,7 @@ pub enum UsageGroupBy {
     ModelUsed,
     /// Group by the provider instance that served the request.
     Provider,
-    /// Group by capability (`chat` | `embed` | `rerank` | `systemone`).
+    /// Group by capability (`chat` | `embed` | `rerank` | `decisions`).
     Capability,
     /// Group by virtual key id (rows without a key group under `""`).
     KeyId,
@@ -524,7 +534,7 @@ pub struct UsageRow {
     pub route: Option<String>,
     /// Provider instance that served the request.
     pub provider: String,
-    /// `chat` | `embed` | `rerank` | `systemone`.
+    /// `chat` | `embed` | `rerank` | `decisions`.
     pub capability: String,
     /// Input/prompt tokens.
     pub tokens_in: i64,
@@ -1358,15 +1368,23 @@ impl KeyStore {
             (filter.group_id.is_some(), " AND group_id = ?"),
             (filter.model.is_some(), " AND model = ?"),
             (filter.provider.is_some(), " AND provider = ?"),
-            (filter.capability.is_some(), " AND capability = ?"),
         ] {
             if present {
                 sql.push_str(clause);
             }
         }
+        // Rows written before ADR 017 carry `systemone`, so a decisions filter
+        // matches both spellings (fixed fragments only, one `?` per value).
+        let capability_values = capability_values(filter.capability.as_deref());
+        match capability_values.len() {
+            0 => {}
+            1 => sql.push_str(" AND capability IN (?)"),
+            _ => sql.push_str(" AND capability IN (?, ?)"),
+        }
         sql.push_str(" GROUP BY grp ORDER BY cost DESC, grp ASC LIMIT ?");
 
-        // AssertSqlSafe: audited above - only fixed fragments and binds.
+        // AssertSqlSafe: audited above - only fixed fragments (the capability
+        // clause is one of two fixed `IN` lists) and binds.
         let mut query = sqlx::query(sqlx::AssertSqlSafe(sql))
             .bind(filter.since)
             .bind(filter.until);
@@ -1375,11 +1393,13 @@ impl KeyStore {
             &filter.group_id,
             &filter.model,
             &filter.provider,
-            &filter.capability,
         ]
         .into_iter()
         .flatten()
         {
+            query = query.bind(value);
+        }
+        for value in capability_values {
             query = query.bind(value);
         }
         let rows = query.bind(filter.limit).fetch_all(&self.pool).await?;

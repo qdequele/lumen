@@ -10,7 +10,7 @@ use lumen_providers::ProviderKind;
 use lumen_router::virtual_models::config::{
     CriteriaConfig, RemapConfig, StrategyKind, TargetConfig, VirtualModelConfig,
 };
-use toml_edit::{DocumentMut, Item};
+use toml_edit::{ArrayOfTables, DocumentMut, Item};
 
 use crate::config::{Config, ModelConfig, ProviderConfig};
 use crate::config_edit::{normalize_to_array_of_tables, upsert_virtual_model, EditError};
@@ -134,7 +134,7 @@ fn plan_foundations(
         for m in &p.models {
             let legacy = is_legacy_rerank(p, m);
             let keeps_foundation = (!m.fallbacks.is_empty() && !legacy)
-                || (legacy && m.capabilities.contains(&Capability::SystemOne));
+                || (legacy && m.capabilities.contains(&Capability::Decisions));
             if keeps_foundation {
                 let new_id = claim(format!("{}/{}", p.name, m.id), ids)?;
                 plan.renames.insert(m.id.clone(), new_id);
@@ -166,7 +166,7 @@ fn plan_foundations(
                 let upstream = m.resolved_upstream_id();
                 let sibling = p.models.iter().find(|o| {
                     o.id != m.id
-                        && o.capabilities.contains(&Capability::SystemOne)
+                        && o.capabilities.contains(&Capability::Decisions)
                         && o.resolved_upstream_id() == upstream
                 });
                 if let Some(sibling) = sibling {
@@ -192,7 +192,7 @@ fn plan_foundations(
                         provider: pi,
                         model: ModelConfig {
                             upstream_id: Some(upstream.to_owned()),
-                            capabilities: vec![Capability::SystemOne],
+                            capabilities: vec![Capability::Decisions],
                             cost_per_1m_input: m.cost_per_1m_input,
                             cost_per_1m_output: m.cost_per_1m_output,
                             cost_per_1k_searches: m.cost_per_1k_searches,
@@ -302,24 +302,135 @@ fn plan(cfg: &Config) -> Result<Plan, MigrateError> {
     Ok(plan)
 }
 
+/// Replace the string `value` with `new`, keeping its surrounding decor.
+fn set_str_keep_decor(value: &mut toml_edit::Value, new: &str) {
+    let decor = value.decor().clone();
+    *value = toml_edit::Value::from(new);
+    *value.decor_mut() = decor;
+}
+
+/// Rename `remap.strategy = "noul"` on one target (inline or table form).
+/// Returns whether it was renamed.
+fn rename_noul(target: &mut dyn toml_edit::TableLike) -> bool {
+    let Some(strategy) = target
+        .get_mut("remap")
+        .and_then(Item::as_table_like_mut)
+        .and_then(|remap| remap.get_mut("strategy"))
+        .and_then(Item::as_value_mut)
+    else {
+        return false;
+    };
+    if strategy.as_str() == Some("noul") {
+        set_str_keep_decor(strategy, "predicate");
+        true
+    } else {
+        false
+    }
+}
+
+/// Rewrite the spellings ADR 017 renamed, in place and format preserving:
+/// the `systemone` capability (model `capabilities`, virtual model
+/// `capability`) and the `noul` remap strategy. Returns the notes.
+fn rename_legacy_spellings(document: &mut DocumentMut) -> Vec<String> {
+    let mut capabilities = 0usize;
+    let mut strategies = 0usize;
+    if let Some(providers) = document.get_mut("providers") {
+        normalize_to_array_of_tables(providers);
+        for provider in providers
+            .as_array_of_tables_mut()
+            .into_iter()
+            .flat_map(ArrayOfTables::iter_mut)
+        {
+            let Some(models) = provider.get_mut("models") else {
+                continue;
+            };
+            normalize_to_array_of_tables(models);
+            for model in models
+                .as_array_of_tables_mut()
+                .into_iter()
+                .flat_map(ArrayOfTables::iter_mut)
+            {
+                let Some(array) = model.get_mut("capabilities").and_then(Item::as_array_mut) else {
+                    continue;
+                };
+                for value in array.iter_mut() {
+                    if value.as_str() == Some("systemone") {
+                        set_str_keep_decor(value, "decisions");
+                        capabilities += 1;
+                    }
+                }
+            }
+        }
+    }
+    if let Some(virtuals) = document.get_mut("virtual_models") {
+        normalize_to_array_of_tables(virtuals);
+        for vm in virtuals
+            .as_array_of_tables_mut()
+            .into_iter()
+            .flat_map(ArrayOfTables::iter_mut)
+        {
+            if let Some(value) = vm.get_mut("capability").and_then(Item::as_value_mut) {
+                if value.as_str() == Some("systemone") {
+                    set_str_keep_decor(value, "decisions");
+                    capabilities += 1;
+                }
+            }
+            let Some(targets) = vm.get_mut("targets") else {
+                continue;
+            };
+            if let Some(array) = targets.as_array_mut() {
+                for target in array.iter_mut() {
+                    if let Some(table) = target.as_inline_table_mut() {
+                        strategies += usize::from(rename_noul(table));
+                    }
+                }
+            } else if let Some(tables) = targets.as_array_of_tables_mut() {
+                for table in tables.iter_mut() {
+                    strategies += usize::from(rename_noul(table));
+                }
+            }
+        }
+    }
+    let mut notes = Vec::new();
+    if capabilities > 0 {
+        notes.push(format!(
+            "renamed {capabilities} `systemone` capability spelling(s) to `decisions` (ADR 017)"
+        ));
+    }
+    if strategies > 0 {
+        notes.push(format!(
+            "renamed {strategies} remap strategy `noul` to `predicate` (ADR 017)"
+        ));
+    }
+    notes
+}
+
 /// Rewrite `doc` (see the module docs).
 ///
 /// # Errors
 /// [`MigrateError`] when the document does not parse, a needed id exists,
 /// or an edit fails.
 pub fn migrate_document(doc: &str) -> Result<Migration, MigrateError> {
-    let cfg: Config = toml::from_str(doc).map_err(|e| MigrateError::Parse(e.to_string()))?;
-    let plan = plan(&cfg)?;
-    if plan.virtuals.is_empty() {
-        return Ok(Migration {
-            text: doc.to_owned(),
-            changed: false,
-            notes: Vec::new(),
-        });
-    }
     let mut document = doc
         .parse::<DocumentMut>()
         .map_err(|e| MigrateError::Parse(e.to_string()))?;
+    let rename_notes = rename_legacy_spellings(&mut document);
+    let renamed_text = document.to_string();
+    let cfg: Config =
+        toml::from_str(&renamed_text).map_err(|e| MigrateError::Parse(e.to_string()))?;
+    let plan = plan(&cfg)?;
+    if plan.virtuals.is_empty() {
+        let changed = !rename_notes.is_empty();
+        return Ok(Migration {
+            text: if changed {
+                renamed_text
+            } else {
+                doc.to_owned()
+            },
+            changed,
+            notes: rename_notes,
+        });
+    }
     let providers = document
         .get_mut("providers")
         .ok_or_else(|| MigrateError::Parse("no providers".to_owned()))?;
@@ -381,10 +492,12 @@ pub fn migrate_document(doc: &str) -> Result<Migration, MigrateError> {
     for vm in &plan.virtuals {
         text = upsert_virtual_model(&text, vm)?;
     }
+    let mut notes = rename_notes;
+    notes.extend(plan.notes);
     Ok(Migration {
         text,
         changed: true,
-        notes: plan.notes,
+        notes,
     })
 }
 

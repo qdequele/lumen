@@ -989,3 +989,34 @@ async fn usage_log_persists_the_virtual_model_route() {
     );
     assert_eq!(rows[1].route, None);
 }
+
+/// ADR 017: rows written before the rename carry `systemone`, later rows
+/// `decisions`; a filter on either spelling matches both.
+#[tokio::test]
+async fn usage_summary_capability_filter_matches_both_decisions_spellings() {
+    let store = KeyStore::in_memory().await.expect("open store");
+    let mut old = usage("key-a", 100);
+    old.capability = "systemone".to_owned();
+    let mut new = usage("key-a", 200);
+    new.capability = "decisions".to_owned();
+    let chat = usage("key-a", 300);
+    store.insert_usage(&[old, new, chat]).await.expect("seed");
+
+    for spelling in ["decisions", "systemone"] {
+        let groups = store
+            .usage_summary(
+                &UsageFilter {
+                    since: 0,
+                    until: 1000,
+                    limit: 10,
+                    capability: Some(spelling.to_owned()),
+                    ..UsageFilter::default()
+                },
+                UsageGroupBy::KeyId,
+            )
+            .await
+            .expect("summary");
+        let total: i64 = groups.iter().map(|g| g.requests).sum();
+        assert_eq!(total, 2, "filter {spelling}");
+    }
+}
