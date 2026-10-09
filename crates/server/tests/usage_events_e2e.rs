@@ -1,11 +1,13 @@
 //! ADR 015 end to end on the real binary: configured through `LAB_URL`,
-//! `LAB_INSTANCE_ID` and `LAB_INSTANCE_SECRET` only, a key in a Lab-linked
+//! `LAB_INSTANCE_ID` and `LAB_INSTANCE_SECRET` only, boot confirms the
+//! instance identity (`GET /internal/instances/me`), a key in a Lab-linked
 //! lease spends, usage events reach a mock Lab signed as this instance (after
 //! one rejected delivery), a grant from the event's group snapshot keeps the
 //! key serving, SIGTERM delivers the final flush, and the instance secret
-//! never reaches the logs. Boot refuses a missing or blank secret and a
-//! non-UUID `account_ref` on a live group; the deprecated `signing_key_env`
-//! alias still boots, with one warning and no secret in the logs.
+//! never reaches the logs. Boot refuses a missing or blank secret, a
+//! non-UUID `account_ref` on a live group and an identity the Lab rejects;
+//! the deprecated `signing_key_env` alias still boots, with one warning and
+//! no secret in the logs.
 #![cfg(unix)]
 
 use serde_json::{json, Value};
@@ -159,6 +161,19 @@ fn remove_db_files(db: &std::path::Path) {
     }
 }
 
+/// Serve this instance's identity on the mock Lab (`GET
+/// /internal/instances/me`, spec section 3.6), so boot confirms it.
+async fn mount_identity(lab: &MockServer) {
+    Mock::given(method("GET"))
+        .and(path("/internal/instances/me"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "instance_id": INSTANCE, "kind": "hosted", "product": "lumen",
+            "region": "eu-west-1", "lab_url": lab.uri()
+        })))
+        .mount(lab)
+        .await;
+}
+
 fn billed(events: &[Value]) -> i64 {
     events
         .iter()
@@ -201,6 +216,7 @@ async fn a_lease_is_billed_topped_up_and_flushed_on_shutdown() {
         .respond_with(accept.clone())
         .mount(&lab)
         .await;
+    mount_identity(&lab).await;
 
     let port = free_port();
     let db = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("usage-events-e2e.db");
@@ -317,7 +333,11 @@ cost_per_1m_output = 1000.0
         (2, 2000, 2000)
     );
     assert_eq!(unit("tokens_estimated"), 0, "upstream usage was reported");
-    let first = &lab.received_requests().await.expect("recorded")[0];
+    let received = lab.received_requests().await.expect("recorded");
+    let first = received
+        .iter()
+        .find(|r| r.url.path() == "/internal/events")
+        .expect("an event delivery");
     assert_eq!(
         first
             .headers
@@ -349,6 +369,10 @@ cost_per_1m_output = 1000.0
     // Always drain both streams: they are checked for the secret below.
     let output = collect(stdout, stderr);
     assert!(status.success(), "{status:?}\n{output}");
+    assert!(
+        output.contains("Lab instance identity confirmed"),
+        "{output}"
+    );
     assert_eq!(billed(&accept.events()), 6_000_000);
 
     // The 401 branch ran (it is the one that names the instance secret) and
@@ -500,6 +524,7 @@ source = "e2e"
 #[tokio::test]
 async fn the_deprecated_signing_key_env_alias_still_boots_and_never_logs_the_secret() {
     let lab = MockServer::start().await;
+    mount_identity(&lab).await;
     let port = free_port();
     let db = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("usage-events-alias.db");
     remove_db_files(&db);
@@ -557,7 +582,51 @@ signing_key_env = "E2E_ALIAS_USAGE_EVENTS_SECRET"
         "the warning names the replacement:\n{output}"
     );
     assert!(
+        output.contains("Lab instance identity confirmed"),
+        "boot confirmed the identity with the aliased secret:\n{output}"
+    );
+    assert!(
         !output.contains(SECRET),
         "the secret named by the alias leaked into the logs"
     );
+}
+
+#[tokio::test]
+async fn a_rejected_instance_identity_refuses_to_boot() {
+    let lab = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/internal/instances/me"))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&lab)
+        .await;
+    let port = free_port();
+    let db = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("usage-events-rejected.db");
+    remove_db_files(&db);
+    let toml = format!(
+        r#"
+[server]
+host = "127.0.0.1"
+port = {port}
+
+[auth]
+enabled = true
+db_path = "{db}"
+"#,
+        db = db.display()
+    );
+    let output = boot_failure_output(
+        "rejected",
+        &toml,
+        &[
+            ("LAB_URL", lab.uri().as_str()),
+            ("LAB_INSTANCE_ID", INSTANCE),
+            ("LAB_INSTANCE_SECRET", SECRET),
+        ],
+    )
+    .await;
+    assert!(
+        output.contains("rejected the instance credentials"),
+        "{output}"
+    );
+    assert!(!output.contains(SECRET), "the secret leaked: {output}");
 }

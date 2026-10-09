@@ -726,12 +726,9 @@ fn run(config_path: PathBuf) -> anyhow::Result<()> {
         // [usage_events] block nothing below runs and no metric is registered.
         let usage_events_cancel = CancellationToken::new();
         let usage_events = match (&config.usage_events, &auth_runtime) {
-            (Some(ue), Some(runtime)) => Some(boot_usage_events(
-                ue,
-                runtime,
-                &metrics,
-                &usage_events_cancel,
-            )?),
+            (Some(ue), Some(runtime)) => {
+                Some(boot_usage_events(ue, runtime, &metrics, &usage_events_cancel).await?)
+            }
             _ => None,
         };
 
@@ -846,8 +843,10 @@ fn attach_optional(
 
 /// Build and spawn the usage-event sender (ADR 015). The signing secret must
 /// be set and not blank: billing without authenticity is refused at boot.
-/// The error names only the variable, never its value.
-fn boot_usage_events(
+/// The error names only the variable, never its value. Once, before the
+/// sender starts, the instance credentials are confirmed against the Lab
+/// (`GET /internal/instances/me`, contract v2 section 3.6).
+async fn boot_usage_events(
     config: &lumen_server::config::UsageEventsConfig,
     runtime: &Arc<AuthRuntime>,
     metrics: &Metrics,
@@ -872,6 +871,29 @@ fn boot_usage_events(
     // No redirects: the body is a signed bill and must reach this endpoint only.
     let timeout = Duration::from_millis(config.timeout_ms);
     let client = lumen_providers::http::build_client_with(timeout, timeout);
+    // Confirm the credentials and log who we are to the Lab (contract v2
+    // section 3.6). Rejected credentials or an answer for another product
+    // abort boot; an unreachable Lab is only a warning: a control-plane
+    // outage must never keep a gateway down.
+    let identity_client = lumen_server::lab_identity::LabIdentityClient::new(
+        client.clone(),
+        &config.url,
+        config.instance_id.clone().unwrap_or_default(),
+        secret.clone(),
+    );
+    match identity_client.fetch().await {
+        Ok(identity) => tracing::info!(
+            instance_id = %identity.instance_id,
+            region = identity.region.as_deref().unwrap_or("-"),
+            source = %config.source_label(),
+            "Lab instance identity confirmed"
+        ),
+        Err(error) if error.is_fatal() => anyhow::bail!("[usage_events]: {error}"),
+        Err(error) => tracing::warn!(
+            %error,
+            "Lab instance identity not confirmed at boot; events will still be sent and retried"
+        ),
+    }
     let sender = Arc::new(lumen_server::usage_events::UsageEventsSender::new(
         runtime.store.clone(),
         client,
