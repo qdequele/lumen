@@ -12,6 +12,7 @@ use axum::{
     Router,
 };
 use lumen_core::GatewayError;
+use std::sync::Arc;
 use tower::ServiceBuilder;
 use tower_http::{
     limit::RequestBodyLimitLayer,
@@ -62,7 +63,7 @@ pub fn build_app(state: AppState) -> Router {
         // `Deprecation` / `Link` headers on every response, including the
         // auth and body-limit rejections produced further in.
         .layer(middleware::from_fn_with_state(
-            state.clone(),
+            Arc::new(state.decision_metrics.clone()),
             decisions::systemone_deprecation,
         ))
         // `RequestBodyLimitLayer` short-circuits an over-limit body with a bare

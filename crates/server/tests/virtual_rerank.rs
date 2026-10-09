@@ -440,3 +440,44 @@ async fn a_refused_choice_falls_back_on_content_filter() {
         "{metrics}"
     );
 }
+
+#[tokio::test]
+async fn a_refused_choice_without_fallback_is_a_400_lm_2013() {
+    let luna = mount_luna(json!([{ "type": "refusal", "name": "rank" }])).await;
+    let cfg = Config::load_text(
+        &format!(
+            r#"
+            [resilience]
+            retry_max_attempts = 1
+
+            [[providers]]
+            name = "openai"
+            kind = "openai"
+            base_url = "{}/v1"
+            api_key_env = "LUMEN_TEST_OPENAI_KEY_UNUSED"
+            [[providers.models]]
+            id = "luna"
+            upstream_id = "gpt-6-luna"
+            capabilities = ["decisions"]
+
+            [[virtual_models]]
+            id = "acme/rerank"
+            capability = "rerank"
+            strategy = "single"
+            targets = [{{ model = "luna", remap = {{ strategy = "choice" }} }}]
+            "#,
+            luna.uri()
+        ),
+        "test",
+    )
+    .unwrap();
+    let base = spawn(&cfg).await;
+
+    let resp = rerank(&base, &["a", "b"]).await;
+    // The upstream answered 200 with a refusal: the client gets a 4xx
+    // content-filter error, never a 200 nor a 5xx.
+    assert_eq!(resp.status(), 400);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "LM-2013", "{body}");
+    assert_eq!(luna.received_requests().await.unwrap().len(), 1);
+}

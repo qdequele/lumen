@@ -10,6 +10,7 @@
 //! content: never logged and never in `usage_log`.
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use axum::body::Bytes;
 use axum::extract::{Request, State};
@@ -19,6 +20,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Extension;
 use lumen_core::decisions::format::{self, Format};
 use lumen_core::{tokens, Answer, Capability, DecisionUsage};
+use lumen_telemetry::DecisionMetrics;
 use tokio_util::sync::CancellationToken;
 
 use crate::accounting::{Accounting, Outcome, Target, TokenBreakdown};
@@ -77,15 +79,18 @@ pub const SYSTEMONE_PATH: &str = "/v1/systemone";
 /// every response, including auth (`LM-4004`, 429) and body-limit
 /// (`LM-1002`) rejections that never reach the handler. Other paths pass
 /// through untouched.
+///
+/// Its state is only the [`DecisionMetrics`] handle behind an [`Arc`] (one
+/// refcount bump per request), not the whole [`AppState`].
 pub async fn systemone_deprecation(
-    State(state): State<AppState>,
+    State(metrics): State<Arc<DecisionMetrics>>,
     request: Request,
     next: Next,
 ) -> Response {
     if request.uri().path() != SYSTEMONE_PATH {
         return next.run(request).await;
     }
-    state.decision_metrics.inc_deprecated(SYSTEMONE_PATH);
+    metrics.inc_deprecated(SYSTEMONE_PATH);
     warn_deprecated_use();
     let mut response = next.run(request).await;
     let h = response.headers_mut();
@@ -199,6 +204,9 @@ async fn handle(
     let tokens_in = u64::from(usage.input_tokens);
     let tokens_out = u64::from(usage.output_tokens);
     let cost = pricing.token_cost(&executed.model_used, tokens_in, tokens_out);
+    // Render before settling: a render failure returns a 500 and drops
+    // `accounting` (refunding the reservation), never billing an error.
+    let bytes = format::render(format, &response, &req)?;
     accounting.finish(&Outcome {
         tokens_in,
         tokens_out,
@@ -210,7 +218,6 @@ async fn handle(
         status: 200,
     });
 
-    let bytes = format::render(format, &response, &req)?;
     let mut out_headers = routing_headers(&executed.model_used, route);
     out_headers.insert(
         header::CONTENT_TYPE,

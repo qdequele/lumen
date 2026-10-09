@@ -43,7 +43,7 @@ code prefix groups by cause: `1xxx` request, `2xxx` routing, `3xxx` upstream,
 | `LM-2010` | 400  | A rerank request supplied no `documents` to score.             |
 | `LM-2011` | 400  | A decisions request (`POST /v1/decisions`, or the deprecated `POST /v1/systemone`) supplied empty `questions`: an empty array in the OpenAI format, an empty map in the TypeSafe format. Rejected before any upstream call; other decisions contract violations are `LM-1001` ([ADR 016](adr/016-decisions-capability.md), [Decisions](decisions/decisions.md#validation-and-errors)). The code is unchanged from the SystemOne era. |
 | `LM-2012` | 4xx  | The upstream rejected the input as longer than the model's context window (classified from its error body, ADR 014). Names the provider; the HTTP status is the upstream's (400, 403, 413 or 422). A virtual model can fail over on it with `fallback_on = ["context_length"]`; this code surfaces when no target absorbed it. |
-| `LM-2013` | 4xx  | The upstream refused the request on content policy (classified from its error body, ADR 014). Names the provider; the HTTP status is the upstream's (400 or 403). A virtual model can fail over on it with `fallback_on = ["content_filter"]`. |
+| `LM-2013` | 4xx  | The upstream refused the request on content policy, either with an error body (classified, ADR 014) or, for a `choice` rerank remap, with a `refusal` answer in a 200 response (ADR 016). Names the provider. The HTTP status is the upstream's when it was a 4xx (usually 400 or 403), else 400 (a refused rerank choice is always 400). A virtual model can fail over on it with `fallback_on = ["content_filter"]`. |
 
 ## Upstream errors - `LM-3xxx` · `type: upstream_error`
 
