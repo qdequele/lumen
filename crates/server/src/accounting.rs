@@ -13,7 +13,7 @@ use crate::metadata::{MetadataOutcome, RequestMetadata};
 use crate::pricing::CostTable;
 use crate::state::AppState;
 use axum::http::HeaderMap;
-use lumen_auth::state::{usd_to_micro, Reservation};
+use lumen_auth::state::{usd_to_micro, Reservation, SettledUsage};
 use lumen_auth::store::UsageRecord;
 use lumen_auth::usage::UsageLogger;
 use lumen_core::GatewayError;
@@ -319,10 +319,14 @@ impl Accounting {
     pub fn finish(mut self, outcome: &Outcome) {
         if let Some(reservation) = self.reservation.take() {
             // Settle both dimensions to the real usage: the budget to the real
-            // cost and the TPM window to the real token count (in - out).
-            let actual_tokens = i64::try_from(outcome.tokens_in.saturating_add(outcome.tokens_out))
-                .unwrap_or(i64::MAX);
-            reservation.settle(usd_to_micro(outcome.cost), actual_tokens);
+            // cost, the TPM window to the real token count, and the billing
+            // units to the in/out split with the estimate flag (contract v2).
+            reservation.settle_usage(SettledUsage {
+                cost_micro: usd_to_micro(outcome.cost),
+                tokens_in: i64::try_from(outcome.tokens_in).unwrap_or(i64::MAX),
+                tokens_out: i64::try_from(outcome.tokens_out).unwrap_or(i64::MAX),
+                estimated: outcome.estimated,
+            });
         }
 
         // One clock read closes the record: the log event, the histogram and

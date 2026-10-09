@@ -20,6 +20,21 @@ pub struct BillingPolicy {
     pub source: String,
 }
 
+/// The raw unit counts of one billed window (spec section 4.3). The Lab
+/// prices them; LUMEN never does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+pub struct UsageUnits {
+    /// Settled requests.
+    pub requests: i64,
+    /// Input (prompt) tokens.
+    pub tokens_in: i64,
+    /// Output (completion) tokens.
+    pub tokens_out: i64,
+    /// Tokens (in plus out) of the requests whose counts were local
+    /// estimates (ADR 003), so the Lab can tell exact from estimated.
+    pub tokens_estimated: i64,
+}
+
 /// One billable key's spend since its last billed flush, in micro-USD.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UsageDelta {
@@ -31,10 +46,8 @@ pub struct UsageDelta {
     pub external_ref: Option<String>,
     /// Spend since the watermark; always positive.
     pub cost_micro: i64,
-    /// Settled requests since the last billed flush (informational).
-    pub requests: i64,
-    /// Settled tokens since the last billed flush (informational).
-    pub tokens: i64,
+    /// Unit counts since the last billed flush (informational).
+    pub units: UsageUnits,
     /// Previous billed flush (or boot), unix ms.
     pub window_start_ms: i64,
     /// This flush, unix ms.
@@ -120,8 +133,8 @@ impl UsageEvent {
             product: PRODUCT,
             data: UsageEventData {
                 cost_micro_usd: delta.cost_micro,
-                requests: delta.requests,
-                tokens: delta.tokens,
+                requests: delta.units.requests,
+                tokens: delta.units.tokens_in + delta.units.tokens_out,
                 window: EventWindow {
                     start: rfc3339_ms(delta.window_start_ms),
                     end: rfc3339_ms(delta.window_end_ms),
@@ -204,8 +217,12 @@ mod tests {
             account_ref: "0192f3c1-7c2e-7b1a-9f00-3c9d2e4a5b61".to_owned(),
             external_ref: Some("lab-key-9".to_owned()),
             cost_micro: 1834,
-            requests: 412,
-            tokens: 96_120,
+            units: UsageUnits {
+                requests: 412,
+                tokens_in: 90_000,
+                tokens_out: 6_120,
+                tokens_estimated: 0,
+            },
             window_start_ms: 1_000_000_000_000,
             window_end_ms: 1_000_000_010_000,
             group_id: "g1".to_owned(),
