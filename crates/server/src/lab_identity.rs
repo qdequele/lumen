@@ -189,21 +189,31 @@ mod tests {
             mount(&server, status, serde_json::json!({})).await;
             let error = client(&server).fetch().await.unwrap_err();
             assert_eq!(error.is_fatal(), fatal, "{status}: {error}");
+            if !fatal {
+                assert!(
+                    matches!(error, IdentityError::Status(_)),
+                    "{status}: {error}"
+                );
+            }
         }
-        // Unreachable: not fatal.
-        let server = MockServer::start().await;
-        let unreachable = server.uri();
-        drop(server);
+        // Unreachable: not fatal. A dropped `MockServer` goes back to
+        // wiremock's shared pool and keeps listening, so take a port from a
+        // plain listener and close it: nothing answers there.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
         let client = LabIdentityClient::new(
             lumen_providers::http::build_client_with(
                 Duration::from_millis(500),
                 Duration::from_secs(1),
             ),
-            &unreachable,
+            &format!("http://127.0.0.1:{port}"),
             INSTANCE.to_owned(),
             SECRET.to_owned(),
         );
-        assert!(!client.fetch().await.unwrap_err().is_fatal());
+        let error = client.fetch().await.unwrap_err();
+        assert!(matches!(error, IdentityError::Transport(_)), "{error}");
+        assert!(!error.is_fatal());
     }
 
     #[tokio::test]
