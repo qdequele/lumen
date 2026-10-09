@@ -77,9 +77,10 @@ Same machine and toolchain as above (Apple Silicon arm64, macOS, rustc 1.97.0,
 release profile). Command: `cargo bench -p server --bench gateway_overhead -- decisions`
 (add `CARGO_PROFILE_RELEASE_STRIP=false` on macOS 27). Passthrough is parse +
 token estimate + one attempt's clone and encode to the same vendor; cross-vendor
-is parse + encode to the other vendor's wire format. "Large" is the parser
-maximum: 300 questions and 128 KB of state for TypeSafe (same shape as the old
-SystemOne large case), 128 questions and 128 KB of input for OpenAI.
+is parse + encode to the other vendor's wire format. "Large" is a big body, not
+a gateway limit (there is no question-count cap at the edge): 300 questions and
+128 KB of state for TypeSafe (same shape as the old SystemOne large case), and
+128 questions (chosen for the case) and 128 KB of input for OpenAI.
 
 | Bench | Median | 95 % CI |
 |---|---|---|

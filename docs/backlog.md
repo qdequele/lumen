@@ -55,6 +55,27 @@ milestone.
   fails locally unless `CARGO_PROFILE_RELEASE_STRIP=false`. Consider
   `strip = "debuginfo"` or a separate bench profile.
 
+## Noted while building ADR 016 (decisions capability)
+
+Follow-ups of the decisions spec (`docs/superpowers/specs/2026-10-08-decisions-design.md`, section 15):
+
+- Spec 2: classify / auto-router on the core decision type.
+- Evaluate structured vs plain-text rerank prompts on all three vendors, then
+  simplify the byte-identical Jev prompt rule if they rank the same.
+- Raise OpenAI and Perplexity rerank packing limits once measured or published.
+- Remove `/v1/systemone` in 0.7.0 (add a `Sunset` header once the release is
+  dated).
+- Perplexity's embeddings API as a capability of the `perplexity` kind (chat is
+  already served through its OpenAI-compatible endpoint).
+- `decisions` on the existing `openrouter` kind (`/api/alpha/decisions`): one
+  key for about 15 models, including Respan and Tev1; needs `noul` criteria
+  synthesis and `provider` routing preferences.
+- Respan's native `/scores` API and Together's chat-based Tev1 (reachable
+  through OpenRouter meanwhile).
+- An integration test against a real local Ollama (`nimble`) in CI, and one
+  manual call against a real Cloudflare account at release time.
+- A true per-image tile count for token estimates.
+
 ## Noted while building ADR 014 (virtual models)
 
 - **Model-driven routing (spec 2).** `classify` (one SystemOne `choice` call

@@ -46,7 +46,7 @@ context = "US federal case law. Prefer holdings over dicta."
 
 As decided in ADR 014, the profile is not a separate table: it is the `remap`
 of a target of a rerank virtual model (the decided form is shown under
-Proposal A below, and in [Virtual models](../virtual-models.md#7-jev-as-a-reranker)).
+Proposal A below, and in [Virtual models](../virtual-models.md#7-decision-models-as-rerankers)).
 The document is named `document` there rather than `candidate`.
 
 ### Encoding strategies
