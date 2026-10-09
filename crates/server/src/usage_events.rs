@@ -11,7 +11,11 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
-/// Header carrying `sha256=<hex HMAC-SHA256 of the raw body>`.
+/// Header naming the reporting deployment (`LAB_INSTANCE_ID`).
+pub const INSTANCE_HEADER: &str = "X-Lab-Instance-Id";
+/// Header carrying the unix time (whole seconds) the signature covers.
+pub const TIMESTAMP_HEADER: &str = "X-Lab-Timestamp";
+/// Header carrying `sha256=<hex HMAC-SHA256(secret, "<timestamp>.<body>")>`.
 pub const SIGNATURE_HEADER: &str = "X-Lab-Signature";
 /// How often the sender polls the outbox when it is not draining a backlog.
 const POLL: Duration = Duration::from_secs(2);
@@ -38,11 +42,22 @@ struct Ack {
     accepted: Vec<String>,
 }
 
+/// `hex HMAC-SHA256(secret, "<timestamp>.<body>")`: the timestamp binds the
+/// signature to a 300 s window on the Lab side (spec section 3.4).
+pub(crate) fn sign_batch(key: &SigningKey, timestamp: &str, body: &[u8]) -> String {
+    let mut signed = Vec::with_capacity(timestamp.len() + 1 + body.len());
+    signed.extend_from_slice(timestamp.as_bytes());
+    signed.push(b'.');
+    signed.extend_from_slice(body);
+    key.sign(&signed)
+}
+
 /// Delivers billing usage events from the outbox.
 pub struct UsageEventsSender {
     store: KeyStore,
     client: reqwest::Client,
     endpoint: String,
+    instance_id: String,
     signing: SigningKey,
     batch_size: i64,
     metrics: UsageEventMetrics,
@@ -52,6 +67,7 @@ impl fmt::Debug for UsageEventsSender {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("UsageEventsSender")
             .field("endpoint", &self.endpoint)
+            .field("instance_id", &self.instance_id)
             .field("signing", &self.signing)
             .finish_non_exhaustive()
     }
@@ -65,6 +81,7 @@ impl UsageEventsSender {
         store: KeyStore,
         client: reqwest::Client,
         endpoint: String,
+        instance_id: String,
         signing: SigningKey,
         batch_size: usize,
         metrics: UsageEventMetrics,
@@ -73,6 +90,7 @@ impl UsageEventsSender {
             store,
             client,
             endpoint,
+            instance_id,
             signing,
             batch_size: i64::try_from(batch_size).unwrap_or(500),
             metrics,
@@ -94,11 +112,17 @@ impl UsageEventsSender {
         }
         let ids: Vec<String> = rows.iter().map(|r| r.id.clone()).collect();
         let body = batch_body(&rows);
-        let signature = format!("sha256={}", self.signing.sign(body.as_bytes()));
+        let timestamp = now_ms.div_euclid(1000).to_string();
+        let signature = format!(
+            "sha256={}",
+            sign_batch(&self.signing, &timestamp, body.as_bytes())
+        );
         let response = self
             .client
             .post(&self.endpoint)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .header(INSTANCE_HEADER, &self.instance_id)
+            .header(TIMESTAMP_HEADER, &timestamp)
             .header(SIGNATURE_HEADER, signature)
             .body(body)
             .send()
@@ -120,7 +144,7 @@ impl UsageEventsSender {
             },
         };
         if reason == "auth" {
-            tracing::error!(endpoint = %self.endpoint, "usage events rejected with 401: check the signing secret");
+            tracing::error!(endpoint = %self.endpoint, "usage events rejected with 401: check LAB_INSTANCE_ID and the instance secret");
         } else {
             tracing::warn!(endpoint = %self.endpoint, reason, error = %detail, "usage events delivery failed; will retry");
         }
@@ -245,10 +269,11 @@ mod tests {
     use super::*;
     use lumen_auth::store::{KeyStore, OutboxInsert};
     use lumen_telemetry::Metrics;
-    use wiremock::matchers::{header_exists, method, path};
+    use wiremock::matchers::{header, header_exists, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     const SECRET: &str = "test-events-secret";
+    const INSTANCE: &str = "0192f3c1-7c2e-7b1a-9f00-3c9d2e4a5b71";
 
     async fn sender(server: &MockServer, rows: &[&str]) -> (UsageEventsSender, KeyStore, Metrics) {
         let store = KeyStore::in_memory().await.unwrap();
@@ -271,6 +296,7 @@ mod tests {
                 std::time::Duration::from_secs(5),
             ),
             format!("{}/internal/events", server.uri()),
+            INSTANCE.to_owned(),
             SigningKey::new(SECRET.as_bytes().to_vec()),
             500,
             m,
@@ -279,11 +305,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delivers_a_signed_batch_and_marks_accepted_rows() {
+    async fn delivers_a_batch_signed_as_this_instance_and_marks_accepted_rows() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/internal/events"))
             .and(header_exists(SIGNATURE_HEADER))
+            .and(header(INSTANCE_HEADER, INSTANCE))
+            .and(header(TIMESTAMP_HEADER, "1700000000"))
             .respond_with(
                 ResponseTemplate::new(200).set_body_json(serde_json::json!({"accepted":["a","b"]})),
             )
@@ -291,16 +319,23 @@ mod tests {
             .mount(&server)
             .await;
         let (s, store, metrics) = sender(&server, &["a", "b"]).await;
-        assert_eq!(s.deliver_once(10).await, Delivery::Delivered(2));
+        // 1 700 000 000 s and 123 ms: the timestamp is whole seconds.
+        assert_eq!(
+            s.deliver_once(1_700_000_000_123).await,
+            Delivery::Delivered(2)
+        );
         let got = store.outbox_due(i64::MAX, 10).await.unwrap();
         assert!(got.is_empty(), "{got:?}");
 
         let req = &server.received_requests().await.unwrap()[0];
         let body = std::str::from_utf8(&req.body).unwrap();
         assert_eq!(body, r#"{"events":[{"id":"a"},{"id":"b"}]}"#);
+        // sha256=HMAC(secret, "<timestamp>.<body>"), spec section 3.4.
+        let mut signed = b"1700000000.".to_vec();
+        signed.extend_from_slice(req.body.as_slice());
         let expected = format!(
             "sha256={}",
-            SigningKey::new(SECRET.as_bytes().to_vec()).sign(req.body.as_slice())
+            SigningKey::new(SECRET.as_bytes().to_vec()).sign(&signed)
         );
         assert_eq!(
             req.headers.get(SIGNATURE_HEADER).unwrap().to_str().unwrap(),

@@ -876,6 +876,8 @@ fn boot_usage_events(
         runtime.store.clone(),
         client,
         config.events_url(),
+        // Validated `Some` (a UUID) at config load whenever the block exists.
+        config.instance_id.clone().unwrap_or_default(),
         lumen_server::webhooks::SigningKey::new(secret.into_bytes()),
         config.batch_size,
         metrics,
