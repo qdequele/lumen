@@ -7,7 +7,7 @@
 # --- build stage: static musl binary --------------------------------------
 # Alpine's Rust defaults to the *-musl target, producing a fully static binary.
 # build-base gives the C toolchain that libsqlite3-sys (bundled) needs.
-FROM rust:1.97-alpine AS builder
+FROM rust:1.99-alpine AS builder
 RUN apk add --no-cache musl-dev build-base
 WORKDIR /build
 COPY . .
@@ -16,7 +16,7 @@ RUN cargo build --release --bin lumen \
     && cp target/release/lumen /lumen
 
 # --- runtime stage: distroless static, non-root ---------------------------
-FROM gcr.io/distroless/static-debian12:nonroot
+FROM gcr.io/distroless/static-debian13:nonroot
 COPY --from=builder /lumen /lumen
 EXPOSE 8080
 # Bind to all interfaces inside the container (override in config as needed).
