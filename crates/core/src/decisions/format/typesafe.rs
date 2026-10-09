@@ -7,7 +7,7 @@ use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::value::RawValue;
 
-use super::object_entries;
+use super::{duplicate_field, object_entries};
 use crate::decisions::{
     Answer, ChoiceOption, ChoiceValue, DecisionRequest, DecisionResponse, DecisionUsage, Image,
     Input, Level, Part, PredicateCriteria, Question, QuestionKind, RawEntries, Text,
@@ -72,8 +72,10 @@ fn parse_state(state: Box<RawValue>) -> Result<Input, GatewayError> {
     if !state.get().trim_start().starts_with('[') {
         return Ok(Input::Structured(state));
     }
-    let elements: Vec<Box<RawValue>> = serde_json::from_str(state.get())
-        .map_err(|e| invalid(format!("malformed `state`: {e}")))?;
+    // `state` is already valid JSON, so this cannot fail on a `[` value;
+    // the message stays value-free regardless (spec 12).
+    let elements: Vec<Box<RawValue>> =
+        serde_json::from_str(state.get()).map_err(|_| invalid("`state` is malformed"))?;
     let mut parts = Vec::with_capacity(elements.len());
     let mut images = 0;
     for element in elements {
@@ -128,25 +130,35 @@ fn image_part(element: &RawValue) -> Result<Option<Image>, GatewayError> {
 }
 
 /// The fields of a question the gateway reads; everything else is skipped.
+/// Every field stays raw so a type error can never quote a client value
+/// (spec 12): the only deserialization failure left is a duplicate field.
 #[derive(Deserialize)]
 struct QuestionView {
     #[serde(rename = "type")]
-    kind: Option<String>,
+    kind: Option<Box<RawValue>>,
     instructions: Option<Box<RawValue>>,
     criteria: Option<Box<RawValue>>,
 }
 
 fn parse_question(id: String, body: Box<RawValue>) -> Result<Question, GatewayError> {
     let fail = |m: String| Err(invalid(format!("question `{id}` {m}")));
+    if !body.get().trim_start().starts_with('{') {
+        return fail("must be an object".to_owned());
+    }
     let view: QuestionView = match serde_json::from_str(body.get()) {
         Ok(v) => v,
-        Err(e) if body.get().trim_start().starts_with('{') => {
-            return fail(format!("is malformed: {e}"))
+        Err(e) => {
+            return fail(match duplicate_field(&e) {
+                Some(duplicate) => format!("is malformed: {duplicate}"),
+                None => "is malformed".to_owned(),
+            })
         }
-        Err(_) => return fail("must be an object".to_owned()),
     };
-    let Some(kind) = view.kind else {
+    let Some(kind) = view.kind.filter(|k| k.get() != "null") else {
         return fail("is missing `type`".to_owned());
+    };
+    let Ok(kind) = serde_json::from_str::<String>(kind.get()) else {
+        return fail("is malformed: `type` must be a string".to_owned());
     };
     let instructions = view.instructions.map(Text::from_raw);
     let criteria = view.criteria.filter(|c| c.get() != "null");
@@ -217,10 +229,8 @@ fn parse_question(id: String, body: Box<RawValue>) -> Result<Question, GatewayEr
                     .collect(),
             }
         }
-        other => {
-            return fail(format!(
-                "has unknown type '{other}': expected noul, choice or score"
-            ));
+        _ => {
+            return fail("has an unknown `type`: expected noul, choice or score".to_owned());
         }
     };
     Ok(Question {
@@ -256,14 +266,19 @@ fn predicate_criteria(raw: &RawValue) -> Option<PredicateCriteria> {
 /// # Errors
 /// [`GatewayError::Internal`] if serialization fails.
 pub fn render(resp: &DecisionResponse, req: &DecisionRequest) -> Result<Vec<u8>, GatewayError> {
-    let out = match &resp.upstream {
-        Some(entries) => serde_json::to_vec(&Verbatim {
-            entries,
-            usage: resp.usage,
-        }),
-        None => serde_json::to_vec(&Synthesized { resp, req }),
+    let mut out = Vec::with_capacity(super::response_size_hint(resp));
+    let written = match &resp.upstream {
+        Some(entries) => serde_json::to_writer(
+            &mut out,
+            &Verbatim {
+                entries,
+                usage: resp.usage,
+            },
+        ),
+        None => serde_json::to_writer(&mut out, &Synthesized { resp, req }),
     };
-    out.map_err(|e| GatewayError::Internal(format!("decisions render: {e}")))
+    written.map_err(|e| GatewayError::Internal(format!("decisions render: {e}")))?;
+    Ok(out)
 }
 
 /// TypeSafe's `usage`: `{input_tokens, output_tokens}` plus `estimated`.
@@ -772,7 +787,7 @@ mod tests {
             ),
             (
                 r#""q":{"type":"essay","instructions":"?"}"#,
-                "unknown type 'essay'",
+                "unknown `type`",
             ),
             (r#""q":{"type":"noul"}"#, "instructions or criteria"),
             (

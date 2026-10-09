@@ -340,7 +340,7 @@ async fn contract_violations_are_rejected_before_any_upstream_call() {
         (
             r#"{"model":"jev","state":"s","questions":{"q":{"type":"essay","instructions":"?"}}}"#,
             "LM-1001",
-            "unknown type 'essay'",
+            "unknown `type`",
         ),
         (
             r#"{"model":"jev","state":"s","questions":{"q":{"type":"choice","instructions":"?"}}}"#,

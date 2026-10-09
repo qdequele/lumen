@@ -309,8 +309,10 @@ fn convert_question(i: usize, raw: &serde_json::value::RawValue) -> Result<Quest
 /// # Errors
 /// [`GatewayError::Internal`] if serialization fails.
 pub fn render(resp: &DecisionResponse, req: &DecisionRequest) -> Result<Vec<u8>, GatewayError> {
-    serde_json::to_vec(&Out { resp, req })
-        .map_err(|e| GatewayError::Internal(format!("decisions render: {e}")))
+    let mut out = Vec::with_capacity(super::response_size_hint(resp));
+    serde_json::to_writer(&mut out, &Out { resp, req })
+        .map_err(|e| GatewayError::Internal(format!("decisions render: {e}")))?;
+    Ok(out)
 }
 
 struct Out<'a> {

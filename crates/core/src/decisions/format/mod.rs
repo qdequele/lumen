@@ -14,7 +14,7 @@ use serde::de::{MapAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 use serde_json::value::RawValue;
 
-use super::{DecisionRequest, DecisionResponse, RawEntries};
+use super::{Answer, DecisionRequest, DecisionResponse, RawEntries};
 use crate::error::GatewayError;
 
 /// A request or response format at the edge.
@@ -77,6 +77,28 @@ pub fn render(
     }
 }
 
+/// A starting capacity for a rendered response: the upstream entries' raw
+/// sizes when re-emitted verbatim, else a per-answer allowance (an answer
+/// with its probabilities), plus a little framing.
+fn response_size_hint(resp: &DecisionResponse) -> usize {
+    let body: usize = match &resp.upstream {
+        Some(entries) => entries
+            .iter()
+            .map(|(key, value)| key.len() + value.get().len() + 4)
+            .sum(),
+        None => resp
+            .answers
+            .iter()
+            .map(|a| match a {
+                Answer::Choice { probabilities, .. } => 96 + 32 * probabilities.len(),
+                Answer::Score { probabilities, .. } => 128 + 32 * probabilities.len(),
+                Answer::Predicate { .. } | Answer::Refusal => 64,
+            })
+            .sum(),
+    };
+    body + 128
+}
+
 /// `Some(format)` when the keys match exactly one format (spec 6.1).
 fn detect(entries: &RawEntries) -> Option<Format> {
     let has = |k: &str| entries.iter().any(|(key, _)| key == k);
@@ -126,15 +148,35 @@ pub fn object_entries(bytes: &[u8], what: &str) -> Result<RawEntries, String> {
         }
     }
 
+    // Messages are value-free (spec 12): serde's syntax and EOF messages
+    // carry only a position, a duplicate names the key (structure), and a
+    // type error, whose serde text quotes the value, becomes fixed text.
     serde_json::from_slice::<Entries>(bytes)
         .map(|e| e.0)
         .map_err(|e| {
             if e.is_syntax() || e.is_eof() {
                 format!("malformed JSON {what}: {e}")
+            } else if let Some(duplicate) = duplicate_field(&e) {
+                format!("{what} has a {duplicate}")
             } else {
-                format!("{what} must be a JSON object: {e}")
+                format!("{what} must be a JSON object")
             }
         })
+}
+
+/// The `` duplicate field `key` `` part of a duplicate-key error (from
+/// [`object_entries`] or a serde derive), without its position; `None` for
+/// any other error. A key is structure, not content, so it may be named.
+pub(crate) fn duplicate_field(e: &serde_json::Error) -> Option<String> {
+    if !e.is_data() {
+        return None;
+    }
+    let message = e.to_string();
+    if !message.starts_with("duplicate field `") {
+        return None;
+    }
+    let end = message.rfind(" at line ").unwrap_or(message.len());
+    Some(message[..end].to_owned())
 }
 
 #[cfg(test)]
@@ -185,6 +227,39 @@ mod tests {
         // A TypeSafe body missing `state` keeps the precise TypeSafe message.
         let missing = r#"{"model":"jev","questions":{"q":{"type":"noul","instructions":"i"}}}"#;
         assert!(err(missing, Some(Format::TypeSafe)).contains("`state`"));
+    }
+
+    #[test]
+    fn typesafe_edge_errors_never_echo_client_values() {
+        let q = |question: &str| {
+            format!(r#"{{"model":"m","state":"s","questions":{{"q1":{question}}}}}"#)
+        };
+        let cases = [
+            r#""SECRET-BODY-STRING""#.to_owned(),
+            "12345678901234567890123".to_owned(),
+            r#"{"model":"m","state":"s","questions":"SECRET-QUESTIONS"}"#.to_owned(),
+            q("98765"),
+            q(r#"{"type":["SECRET-TYPE"],"instructions":"i"}"#),
+            q(r#"{"type":"SECRET-UNKNOWN-TYPE","instructions":"i"}"#),
+            q(r#"{"type":"noul","type":"SECRET-DUP","instructions":"i"}"#),
+            r#"{"model":"m","state":["SECRET-STATE",{"type":"image_url"}],"questions":{"q":{"type":"noul","instructions":"i"}}}"#.to_owned(),
+            r#"{"model":["SECRET-MODEL"],"state":"s","questions":{"q":{"type":"noul","instructions":"i"}}}"#.to_owned(),
+            r#"{"model":"m","state":"SECRET-SYNTAX"#.to_owned(),
+        ];
+        for body in &cases {
+            for forced in [None, Some(Format::TypeSafe)] {
+                if let Err(e) = parse(body.as_bytes(), forced) {
+                    let m = e.to_string();
+                    assert!(
+                        !m.contains("SECRET") && !m.contains("98765") && !m.contains("1234567"),
+                        "{body}: {m}"
+                    );
+                }
+            }
+        }
+        // The question that is a number is named by its id, not its value.
+        let m = err(&q("98765"), Some(Format::TypeSafe));
+        assert!(m.contains("`q1`") && m.contains("must be an object"), "{m}");
     }
 
     #[test]
