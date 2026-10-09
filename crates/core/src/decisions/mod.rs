@@ -37,6 +37,9 @@ impl Text {
     /// (decoded), anything else [`Text::Json`].
     #[must_use]
     pub fn from_raw(raw: Box<RawValue>) -> Self {
+        if !is_json_string(&raw) {
+            return Text::Json(raw);
+        }
         match serde_json::from_str::<String>(raw.get()) {
             Ok(s) => Text::Plain(s),
             Err(_) => Text::Json(raw),
@@ -49,10 +52,7 @@ impl Text {
     pub fn as_prompt(&self) -> Cow<'_, str> {
         match self {
             Text::Plain(s) => Cow::Borrowed(s),
-            Text::Json(raw) => match serde_json::from_str::<String>(raw.get()) {
-                Ok(s) => Cow::Owned(s),
-                Err(_) => Cow::Borrowed(raw.get()),
-            },
+            Text::Json(raw) => raw_as_prompt(raw),
         }
     }
 
@@ -63,6 +63,25 @@ impl Text {
             Text::Plain(s) => s.len(),
             Text::Json(raw) => raw.get().len(),
         }
+    }
+}
+
+/// Whether a raw JSON value is a string (its first non-whitespace byte is `"`).
+fn is_json_string(raw: &RawValue) -> bool {
+    raw.get().trim_start().starts_with('"')
+}
+
+/// A raw JSON value as a model reads it in a plain-text field: a JSON string
+/// decoded, anything else its JSON text, borrowed. Only a value starting
+/// with `"` is decoded, so a large structured value is never copied.
+#[must_use]
+pub fn raw_as_prompt(raw: &RawValue) -> Cow<'_, str> {
+    if !is_json_string(raw) {
+        return Cow::Borrowed(raw.get());
+    }
+    match serde_json::from_str::<Cow<'_, str>>(raw.get()) {
+        Ok(s) => s,
+        Err(_) => Cow::Borrowed(raw.get()),
     }
 }
 
@@ -409,6 +428,16 @@ mod tests {
         let obj = Text::from_raw(raw(r#"{"document":"d","question":"q"}"#));
         assert!(matches!(obj, Text::Json(_)));
         assert_eq!(obj.as_prompt(), r#"{"document":"d","question":"q"}"#);
+    }
+
+    #[test]
+    fn raw_as_prompt_borrows_structured_values() {
+        let obj = raw(r#"{"a":[1,"x"]}"#);
+        assert!(matches!(raw_as_prompt(&obj), Cow::Borrowed(_)));
+        assert_eq!(raw_as_prompt(&obj), r#"{"a":[1,"x"]}"#);
+        assert_eq!(raw_as_prompt(&raw(r#""plain""#)), "plain");
+        assert_eq!(raw_as_prompt(&raw(r#""a\nb""#)), "a\nb");
+        assert_eq!(raw_as_prompt(&raw("42")), "42");
     }
 
     #[test]

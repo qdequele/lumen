@@ -2,8 +2,8 @@
 
 use async_trait::async_trait;
 use lumen_core::decisions::{
-    Answer, ChoiceValue, DecisionLimits, DecisionRequest, DecisionResponse, DecisionUsage, Input,
-    PackLimits, Part, PredicateCriteria, Question, QuestionKind, Text,
+    raw_as_prompt, Answer, ChoiceValue, DecisionLimits, DecisionRequest, DecisionResponse,
+    DecisionUsage, Input, PackLimits, Part, PredicateCriteria, Question, QuestionKind,
 };
 use lumen_core::{DecisionProvider, ProviderError};
 use tokio_util::sync::CancellationToken;
@@ -39,8 +39,10 @@ fn translation(msg: impl Into<String>) -> ProviderError {
 /// # Errors
 /// [`ProviderError::Translation`] if serialization fails.
 pub fn encode(req: &DecisionRequest, upstream_id: &str) -> Result<Vec<u8>, ProviderError> {
-    serde_json::to_vec(&WireRequest { req, upstream_id })
-        .map_err(|_| translation("openai decisions request could not be serialized"))
+    let mut out = Vec::with_capacity(super::family::request_size_hint(req));
+    serde_json::to_writer(&mut out, &WireRequest { req, upstream_id })
+        .map_err(|_| translation("openai decisions request could not be serialized"))?;
+    Ok(out)
 }
 
 struct WireRequest<'a> {
@@ -69,7 +71,7 @@ impl Serialize for InputOut<'_> {
             Input::Text(text) => s.serialize_str(text),
             // A JSON-string state is sent as its text; anything else as its
             // JSON text, which the model reads (spec 7.2).
-            Input::Structured(raw) => s.serialize_str(&Text::Json(raw.clone()).as_prompt()),
+            Input::Structured(raw) => s.serialize_str(&raw_as_prompt(raw)),
             Input::Messages(parts) => {
                 #[derive(Serialize)]
                 struct Message<'a> {
