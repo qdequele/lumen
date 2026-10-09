@@ -82,22 +82,28 @@ a gateway limit (there is no question-count cap at the edge): 300 questions and
 128 KB of state for TypeSafe (same shape as the old SystemOne large case), and
 128 questions (chosen for the case) and 128 KB of input for OpenAI.
 
-| Bench | Median | 95 % CI |
-|---|---|---|
-| `decisions_passthrough_typesafe_small` (1 KB, 3 questions) | **3.48 µs** | 3.48 – 3.49 µs |
-| `decisions_passthrough_typesafe_large` (128 KB, 300 questions) | **307.1 µs** | 306.9 – 307.4 µs |
-| `decisions_passthrough_openai_small` | **3.00 µs** | 2.99 – 3.00 µs |
-| `decisions_passthrough_openai_large` | **155.8 µs** | 155.4 – 156.2 µs |
-| `decisions_cross_vendor_typesafe_small` (TypeSafe in, OpenAI out) | **4.62 µs** | 4.61 – 4.66 µs |
-| `decisions_cross_vendor_typesafe_large` | **414.3 µs** | 413.8 – 414.9 µs |
-| `decisions_cross_vendor_openai_small` (OpenAI in, TypeSafe out) | **3.10 µs** | 3.10 – 3.11 µs |
-| `decisions_cross_vendor_openai_large` | **169.8 µs** | 167.8 – 172.7 µs |
+| Bench | Median | 95 % CI | Before the final fixes |
+|---|---|---|---|
+| `decisions_passthrough_typesafe_small` (1 KB, 3 questions) | **3.23 µs** | 3.22 – 3.23 µs | 3.48 µs |
+| `decisions_passthrough_typesafe_large` (128 KB, 300 questions) | **280.0 µs** | 279.6 – 280.4 µs | 307.1 µs |
+| `decisions_passthrough_openai_small` | **2.87 µs** | 2.86 – 2.90 µs | 3.00 µs |
+| `decisions_passthrough_openai_large` | **152.5 µs** | 152.2 – 152.9 µs | 155.8 µs |
+| `decisions_cross_vendor_typesafe_small` (TypeSafe in, OpenAI out) | **4.56 µs** | 4.55 – 4.56 µs | 4.62 µs |
+| `decisions_cross_vendor_typesafe_large` | **417.2 µs** | 416.8 – 417.6 µs | 414.3 µs |
+| `decisions_cross_vendor_openai_small` (OpenAI in, TypeSafe out) | **2.80 µs** | 2.77 – 2.86 µs | 3.10 µs |
+| `decisions_cross_vendor_openai_large` | **149.8 µs** | 149.5 – 150.1 µs | 169.8 µs |
 
-Every case is below the 1 ms budget; the worst (TypeSafe to OpenAI translation
-at 300 questions) is 414 us. The TypeSafe small passthrough (3.48 µs) is within
-6 % of the old `systemone_request_pipeline_small` (3.3 µs), and the large one
-(307 µs) within 10 % of the old `systemone_request_pipeline_large` (~280 µs,
-noisy host).
+The final fixes (pre-sized output buffers, the name-only `wire_ids` fast
+path, a borrowed structured state in the OpenAI encoder, the question type
+borrowed at the TypeSafe edge) cut the TypeSafe large passthrough by 9 %
+(307 to 280 µs) and the OpenAI-to-TypeSafe large translation by 12 % (170 to
+150 µs). The TypeSafe-to-OpenAI large translation is flat (414 to 417 µs,
+within run-to-run noise: a same-session run of the previous commit measured
+415.6 µs); its cost is the 300 per-question instruction strings the OpenAI
+wire needs, not buffer growth. Every case is below the 1 ms budget; the worst
+is 417 µs. The TypeSafe large passthrough (280 µs) now matches the old
+`systemone_request_pipeline_large` (~280 µs), and the small one (3.23 µs) is
+within 2 % of the old `systemone_request_pipeline_small` (3.3 µs).
 
 ### Streaming time to first bit (measured here)
 
