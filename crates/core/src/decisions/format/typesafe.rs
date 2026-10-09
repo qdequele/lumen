@@ -133,9 +133,9 @@ fn image_part(element: &RawValue) -> Result<Option<Image>, GatewayError> {
 /// Every field stays raw so a type error can never quote a client value
 /// (spec 12): the only deserialization failure left is a duplicate field.
 #[derive(Deserialize)]
-struct QuestionView {
-    #[serde(rename = "type")]
-    kind: Option<Box<RawValue>>,
+struct QuestionView<'a> {
+    #[serde(rename = "type", borrow)]
+    kind: Option<&'a RawValue>,
     instructions: Option<Box<RawValue>>,
     criteria: Option<Box<RawValue>>,
 }
@@ -145,7 +145,7 @@ fn parse_question(id: String, body: Box<RawValue>) -> Result<Question, GatewayEr
     if !body.get().trim_start().starts_with('{') {
         return fail("must be an object".to_owned());
     }
-    let view: QuestionView = match serde_json::from_str(body.get()) {
+    let view: QuestionView<'_> = match serde_json::from_str(body.get()) {
         Ok(v) => v,
         Err(e) => {
             return fail(match duplicate_field(&e) {
