@@ -155,9 +155,9 @@ fn billed(events: &[Value]) -> i64 {
     events
         .iter()
         .map(|e| {
-            e["data"]["cost_micro_usd"]
+            e["data"]["provider_cost_micro_usd"]
                 .as_i64()
-                .expect("cost_micro_usd")
+                .expect("provider_cost_micro_usd")
         })
         .sum()
 }
@@ -300,19 +300,24 @@ cost_per_1m_output = 1000.0
     let last = events.last().expect("at least one event");
     assert_eq!(last["account_id"], ACCOUNT);
     assert_eq!(last["api_key_id"], "lab-key-1");
-    assert_eq!(last["data"]["source"], "e2e");
+    assert_eq!(last["data"]["operation"], "gateway");
+    // Both calls may land in one flush or two: compare the sums.
+    let unit = |name: &str| -> i64 {
+        events
+            .iter()
+            .map(|e| e["data"]["units"][name].as_i64().expect(name))
+            .sum()
+    };
+    assert_eq!(
+        (unit("requests"), unit("tokens_in"), unit("tokens_out")),
+        (2, 2000, 2000)
+    );
+    assert_eq!(unit("tokens_estimated"), 0, "upstream usage was reported");
     assert!(lab.received_requests().await.expect("recorded")[0]
         .headers
         .contains_key("x-lab-signature"));
 
-    // The lease has $1 left: the Lab tops up from the event's snapshot.
-    let remaining = last["data"]["group"]["budget_max_micro"]
-        .as_i64()
-        .expect("budget_max_micro")
-        - last["data"]["group"]["spent_micro"]
-            .as_i64()
-            .expect("spent_micro");
-    assert!(remaining < 2_000_000);
+    // The lease has $1 left: the Lab tops it up (the top-up job is Lab-side).
     let grant = http
         .post(format!("{base}/admin/groups/{gid}/grant"))
         .bearer_auth(MASTER)

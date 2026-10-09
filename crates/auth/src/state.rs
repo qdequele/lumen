@@ -1147,17 +1147,12 @@ impl FlushBatch {
     ///
     /// # Errors
     /// Serialization failure (not expected for these plain structs).
-    pub fn outbox_inserts(
-        &self,
-        source: &str,
-        now_ms: i64,
-    ) -> Result<Vec<OutboxInsert>, serde_json::Error> {
+    pub fn outbox_inserts(&self, now_ms: i64) -> Result<Vec<OutboxInsert>, serde_json::Error> {
         self.deltas()
             .into_iter()
             .map(|delta| {
                 let id = uuid_v7(now_ms);
-                let body =
-                    serde_json::to_string(&UsageEvent::from_delta(id.clone(), delta, source))?;
+                let body = serde_json::to_string(&UsageEvent::from_delta(id.clone(), delta))?;
                 Ok(OutboxInsert {
                     id,
                     body,
@@ -1202,7 +1197,7 @@ impl KeyEntry {
                     .load_full()
                     .map(|account| (group, account))
             });
-        let Some((group, account)) = billable else {
+        let Some((_group, account)) = billable else {
             // Not billed: keep the watermark caught up so the key never bills
             // this cost if it becomes billable later; units are discarded.
             self.take_units();
@@ -1212,7 +1207,6 @@ impl KeyEntry {
             // Nothing new settled (only reachable at equality).
             return item(billed, None);
         }
-        let max = group.budget_max_micro.load(Ordering::SeqCst);
         let delta = UsageDelta {
             key_id: self.id.clone(),
             account_ref: account.as_str().to_owned(),
@@ -1221,9 +1215,6 @@ impl KeyEntry {
             units: self.take_units(),
             window_start_ms: self.last_billed_ms.load(Ordering::SeqCst),
             window_end_ms: now_ms,
-            group_id: group.id.clone(),
-            group_spent_micro: group.spent_micro.load(Ordering::SeqCst),
-            group_budget_max_micro: (max != UNLIMITED).then_some(max),
         };
         item(settled, Some(delta))
     }

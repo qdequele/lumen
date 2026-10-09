@@ -62,7 +62,7 @@ fn spend(runtime: &AuthRuntime, plaintext: &str, cost_micro: i64) {
     entry.admit(1, 0, cost_micro).unwrap().settle(cost_micro, 3);
 }
 
-/// Every queued usage event as `(account_id, cost_micro_usd)`, sorted (the
+/// Every queued usage event as `(account_id, provider_cost_micro_usd)`, sorted (the
 /// handler's flush stamps the wall clock, the test's flush a synthetic one, so
 /// creation order is not meaningful here).
 async fn events(runtime: &AuthRuntime) -> Vec<(String, i64)> {
@@ -76,7 +76,7 @@ async fn events(runtime: &AuthRuntime) -> Vec<(String, i64)> {
             let body: Value = serde_json::from_str(&row.body).unwrap();
             (
                 body["account_id"].as_str().unwrap().to_owned(),
-                body["data"]["cost_micro_usd"].as_i64().unwrap(),
+                body["data"]["provider_cost_micro_usd"].as_i64().unwrap(),
             )
         })
         .collect();

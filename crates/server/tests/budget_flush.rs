@@ -75,7 +75,7 @@ async fn a_flush_persists_spend_and_enqueues_one_event() {
     assert_eq!(due.len(), 1);
     let body: serde_json::Value = serde_json::from_str(&due[0].body).unwrap();
     assert_eq!(body["account_id"], ACCOUNT);
-    assert_eq!(body["data"]["cost_micro_usd"], 250_000);
+    assert_eq!(body["data"]["provider_cost_micro_usd"], 250_000);
     // Nothing new spent: the next flush writes nothing.
     assert!(flush_budgets(&rt).await);
     assert_eq!(rt.store.outbox_due(i64::MAX, 10).await.unwrap().len(), 1);
@@ -108,7 +108,7 @@ async fn joining_a_billable_group_bills_only_new_spend() {
     let due = rt.store.outbox_due(i64::MAX, 10).await.unwrap();
     assert_eq!(due.len(), 1);
     let body: serde_json::Value = serde_json::from_str(&due[0].body).unwrap();
-    assert_eq!(body["data"]["cost_micro_usd"], 100_000);
+    assert_eq!(body["data"]["provider_cost_micro_usd"], 100_000);
 }
 
 #[tokio::test]
@@ -138,7 +138,7 @@ async fn concurrent_flushes_bill_a_delta_once() {
     let due = rt.store.outbox_due(i64::MAX, 10).await.unwrap();
     assert_eq!(due.len(), 1, "two overlapping flushes bill one delta");
     let body: serde_json::Value = serde_json::from_str(&due[0].body).unwrap();
-    assert_eq!(body["data"]["cost_micro_usd"], 250_000);
+    assert_eq!(body["data"]["provider_cost_micro_usd"], 250_000);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -188,7 +188,7 @@ async fn a_dropped_delete_flush_loses_nothing() {
         .iter()
         .map(|row| {
             let body: serde_json::Value = serde_json::from_str(&row.body).unwrap();
-            body["data"]["cost_micro_usd"].as_i64().unwrap()
+            body["data"]["provider_cost_micro_usd"].as_i64().unwrap()
         })
         .collect();
     costs.sort_unstable();
@@ -218,7 +218,7 @@ async fn a_request_in_flight_on_a_deleted_key_is_still_billed() {
     let due = rt.store.outbox_due(i64::MAX, 10).await.unwrap();
     assert_eq!(due.len(), 1);
     let body: serde_json::Value = serde_json::from_str(&due[0].body).unwrap();
-    assert_eq!(body["data"]["cost_micro_usd"], 40_000);
+    assert_eq!(body["data"]["provider_cost_micro_usd"], 40_000);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

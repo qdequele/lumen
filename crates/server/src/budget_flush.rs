@@ -80,12 +80,7 @@ async fn persist(runtime: &AuthRuntime, batch: FlushBatch, now_ms: i64) -> bool 
         runtime.keys.commit_flush(batch);
         return true;
     }
-    let source = runtime
-        .keys
-        .billing()
-        .map(|policy| policy.source.clone())
-        .unwrap_or_default();
-    let events = match batch.outbox_inserts(&source, now_ms) {
+    let events = match batch.outbox_inserts(now_ms) {
         Ok(events) => events,
         Err(error) => {
             tracing::warn!(%error, "budget flush: could not serialize usage events; will retry");

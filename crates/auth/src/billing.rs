@@ -12,11 +12,15 @@ use serde::Serialize;
 pub const PRODUCT: &str = "lumen";
 /// The only event type LUMEN reports.
 pub const EVENT_TYPE: &str = "usage.recorded";
+/// The operation LUMEN reports: one event aggregates every capability of a
+/// key over the billed window (spec section 4.3).
+pub const OPERATION: &str = "gateway";
 
 /// The live billing policy: present only when `[usage_events]` is configured.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BillingPolicy {
-    /// Gateway name copied into every event (`data.source`).
+    /// Gateway label for logs; not sent in events (the Lab identifies the
+    /// instance from the `X-Lab-Instance-Id` header).
     pub source: String,
 }
 
@@ -52,12 +56,6 @@ pub struct UsageDelta {
     pub window_start_ms: i64,
     /// This flush, unix ms.
     pub window_end_ms: i64,
-    /// The group (lease) id.
-    pub group_id: String,
-    /// The lease's spend at flush time.
-    pub group_spent_micro: i64,
-    /// The lease's cap at flush time; `None` = unlimited.
-    pub group_budget_max_micro: Option<i64>,
 }
 
 /// A `usage.recorded` event in the Lab envelope.
@@ -80,50 +78,27 @@ pub struct UsageEvent {
     pub data: UsageEventData,
 }
 
-/// The `data` object of a LUMEN usage event.
+/// The `data` object of a LUMEN `usage.recorded` event (spec section 4.2).
+/// Exactly the four properties the Lab-owned schema allows: `usageData`
+/// forbids additional properties, so the key id and the window travel in
+/// `description`.
 #[derive(Debug, Serialize)]
 pub struct UsageEventData {
-    /// Spend in micro-USD; the Lab converts to credits.
-    pub cost_micro_usd: i64,
-    /// Settled requests in the window.
-    pub requests: i64,
-    /// Settled tokens in the window.
-    pub tokens: i64,
-    /// The billed window.
-    pub window: EventWindow,
-    /// Gateway name.
-    pub source: String,
-    /// The LUMEN key id.
-    pub key_id: String,
-    /// The lease at flush time.
-    pub group: GroupSnapshot,
-}
-
-/// A billed window, RFC 3339 bounds.
-#[derive(Debug, Serialize)]
-pub struct EventWindow {
-    /// Window start.
-    pub start: String,
-    /// Window end.
-    pub end: String,
-}
-
-/// The lease (budget group) at flush time, so the Lab can top up without polling.
-#[derive(Debug, Serialize)]
-pub struct GroupSnapshot {
-    /// Group id.
-    pub id: String,
-    /// Pool spend, micro-USD.
-    pub spent_micro: i64,
-    /// Pool cap, micro-USD; `null` = unlimited.
-    pub budget_max_micro: Option<i64>,
+    /// Always [`OPERATION`].
+    pub operation: &'static str,
+    /// Raw unit counts; the Lab prices them.
+    pub units: UsageUnits,
+    /// Settled cost delta in micro-USD, passed through and marked up by the Lab.
+    pub provider_cost_micro_usd: i64,
+    /// `key <lumen key id> <window start>..<window end>`.
+    pub description: String,
 }
 
 impl UsageEvent {
     /// Build the event for one delta. `id` is minted once by the caller and
     /// stored with the event, so retries reuse it.
     #[must_use]
-    pub fn from_delta(id: String, delta: &UsageDelta, source: &str) -> Self {
+    pub fn from_delta(id: String, delta: &UsageDelta) -> Self {
         Self {
             id,
             kind: EVENT_TYPE,
@@ -132,20 +107,15 @@ impl UsageEvent {
             api_key_id: delta.external_ref.clone(),
             product: PRODUCT,
             data: UsageEventData {
-                cost_micro_usd: delta.cost_micro,
-                requests: delta.units.requests,
-                tokens: delta.units.tokens_in + delta.units.tokens_out,
-                window: EventWindow {
-                    start: rfc3339_ms(delta.window_start_ms),
-                    end: rfc3339_ms(delta.window_end_ms),
-                },
-                source: source.to_owned(),
-                key_id: delta.key_id.clone(),
-                group: GroupSnapshot {
-                    id: delta.group_id.clone(),
-                    spent_micro: delta.group_spent_micro,
-                    budget_max_micro: delta.group_budget_max_micro,
-                },
+                operation: OPERATION,
+                units: delta.units,
+                provider_cost_micro_usd: delta.cost_micro,
+                description: format!(
+                    "key {} {}..{}",
+                    delta.key_id,
+                    rfc3339_ms(delta.window_start_ms),
+                    rfc3339_ms(delta.window_end_ms)
+                ),
             },
         }
     }
@@ -225,9 +195,6 @@ mod tests {
             },
             window_start_ms: 1_000_000_000_000,
             window_end_ms: 1_000_000_010_000,
-            group_id: "g1".to_owned(),
-            group_spent_micro: 8_123_400,
-            group_budget_max_micro: Some(10_000_000),
         }
     }
 
@@ -261,63 +228,62 @@ mod tests {
 
     #[test]
     fn event_serializes_to_the_contract_shape() {
-        let event = UsageEvent::from_delta(uuid_v7(1), &delta(), "eu-1");
+        let event = UsageEvent::from_delta(uuid_v7(1), &delta());
         let v = serde_json::to_value(&event).unwrap();
         assert_eq!(v["type"], "usage.recorded");
         assert_eq!(v["product"], "lumen");
         assert_eq!(v["account_id"], "0192f3c1-7c2e-7b1a-9f00-3c9d2e4a5b61");
         assert_eq!(v["api_key_id"], "lab-key-9");
         assert_eq!(v["occurred_at"], "2001-09-09T01:46:50.000Z");
-        assert_eq!(v["data"]["cost_micro_usd"], 1834);
-        assert_eq!(v["data"]["window"]["start"], "2001-09-09T01:46:40.000Z");
-        assert_eq!(v["data"]["source"], "eu-1");
-        assert_eq!(v["data"]["group"]["budget_max_micro"], 10_000_000);
+        assert_eq!(v["data"]["operation"], "gateway");
+        assert_eq!(v["data"]["provider_cost_micro_usd"], 1834);
+        assert_eq!(v["data"]["units"]["requests"], 412);
+        assert_eq!(v["data"]["units"]["tokens_in"], 90_000);
+        assert_eq!(v["data"]["units"]["tokens_out"], 6_120);
+        assert_eq!(v["data"]["units"]["tokens_estimated"], 0);
+        assert_eq!(
+            v["data"]["description"],
+            "key k1 2001-09-09T01:46:40.000Z..2001-09-09T01:46:50.000Z"
+        );
+        let data = v["data"].as_object().unwrap();
+        assert_eq!(data.len(), 4, "nothing the schema forbids: {data:?}");
     }
 
     #[test]
     fn events_validate_against_the_vendored_contract() {
         let schema: serde_json::Value = serde_json::from_str(include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../contracts/lab-events.schema.json"
+            "/../../contracts/vendor/lab/lab-events.schema.json"
         )))
         .unwrap();
         let validator = jsonschema::options()
             .should_validate_formats(true)
             .build(&schema)
             .unwrap();
-        let mut unlimited = delta();
-        unlimited.group_budget_max_micro = None;
-        unlimited.external_ref = None;
-        for d in [delta(), unlimited] {
-            let v = serde_json::to_value(UsageEvent::from_delta(uuid_v7(5), &d, "eu-1")).unwrap();
+        let mut keyless = delta();
+        keyless.external_ref = None;
+        for d in [delta(), keyless] {
+            let v = serde_json::to_value(UsageEvent::from_delta(uuid_v7(5), &d)).unwrap();
             let errors: Vec<String> = validator.iter_errors(&v).map(|e| e.to_string()).collect();
             assert!(errors.is_empty(), "{errors:?}");
         }
 
-        // Negative assertions: account_id must be a valid UUID
-        let mut invalid_uuid =
-            serde_json::to_value(UsageEvent::from_delta(uuid_v7(5), &delta(), "eu-1")).unwrap();
+        // Negative assertions, so the schema is really enforced.
+        let valid = serde_json::to_value(UsageEvent::from_delta(uuid_v7(5), &delta())).unwrap();
+        let mut invalid_uuid = valid.clone();
         invalid_uuid["account_id"] = serde_json::json!("not-a-uuid");
-        let errors: Vec<String> = validator
-            .iter_errors(&invalid_uuid)
-            .map(|e| e.to_string())
-            .collect();
+        assert!(validator.iter_errors(&invalid_uuid).next().is_some());
+        let mut negative_cost = valid.clone();
+        negative_cost["data"]["provider_cost_micro_usd"] = serde_json::json!(-1);
+        assert!(validator.iter_errors(&negative_cost).next().is_some());
+        let mut negative_unit = valid.clone();
+        negative_unit["data"]["units"]["requests"] = serde_json::json!(-1);
+        assert!(validator.iter_errors(&negative_unit).next().is_some());
+        let mut extra = valid;
+        extra["data"]["source"] = serde_json::json!("eu-1");
         assert!(
-            !errors.is_empty(),
-            "invalid account_id should fail validation"
-        );
-
-        // cost_micro_usd must be >= 1
-        let mut zero_cost =
-            serde_json::to_value(UsageEvent::from_delta(uuid_v7(5), &delta(), "eu-1")).unwrap();
-        zero_cost["data"]["cost_micro_usd"] = serde_json::json!(0);
-        let errors: Vec<String> = validator
-            .iter_errors(&zero_cost)
-            .map(|e| e.to_string())
-            .collect();
-        assert!(
-            !errors.is_empty(),
-            "zero cost_micro_usd should fail validation"
+            validator.iter_errors(&extra).next().is_some(),
+            "usageData forbids additional properties"
         );
     }
 }

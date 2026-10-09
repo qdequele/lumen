@@ -1,0 +1,93 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://lab.meilisearch.com/contracts/lab-events.schema.json",
+  "title": "Meilisearch Lab event (platform contract v2)",
+  "description": "One event a hosted engine deployment sends to the Lab at POST /internal/events, delivered in batches of at most 500 as {\"events\": [<event>, ...]} and answered with 200 {\"accepted\": [<id>, ...]}. Owned by meilisearch/lab (docs/superpowers/specs/2026-10-08-lab-platform-contract-v2.md, section 4); every engine vendors a byte copy under contracts/vendor/lab/ and drift-checks it in CI. The reporting instance is not in the body: the Lab takes it from the authenticated X-Lab-Instance-Id header.",
+  "type": "object",
+  "required": ["id", "type", "occurred_at", "account_id", "api_key_id", "product", "data"],
+  "additionalProperties": false,
+  "properties": {
+    "id": { "$ref": "#/$defs/uuid", "description": "Idempotency key: UUIDv7 per request, UUIDv5 of a stable name for job-final events." },
+    "type": { "enum": ["usage.recorded", "job.completed", "job.failed"] },
+    "occurred_at": { "type": "string", "format": "date-time" },
+    "account_id": { "$ref": "#/$defs/uuid", "description": "The Lab account the usage belongs to." },
+    "api_key_id": { "type": ["string", "null"], "description": "The Lab API key id when known." },
+    "product": { "enum": ["scrapix", "lumen", "glutony"] },
+    "data": { "type": "object" }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "type": { "const": "usage.recorded" } }, "required": ["type"] },
+      "then": { "properties": { "data": { "$ref": "#/$defs/usageData" } } }
+    },
+    {
+      "if": { "properties": { "type": { "const": "job.completed" } }, "required": ["type"] },
+      "then": { "properties": { "data": { "$ref": "#/$defs/jobCompletedData" } } }
+    },
+    {
+      "if": { "properties": { "type": { "const": "job.failed" } }, "required": ["type"] },
+      "then": { "properties": { "data": { "$ref": "#/$defs/jobFailedData" } } }
+    },
+    {
+      "if": { "properties": { "type": { "const": "usage.recorded" }, "product": { "const": "scrapix" } }, "required": ["type", "product"] },
+      "then": { "properties": { "data": { "properties": { "operation": { "enum": ["scrape", "map", "search", "parse", "ocr", "extract", "crawl"] } } } } }
+    },
+    {
+      "if": { "properties": { "type": { "const": "usage.recorded" }, "product": { "const": "glutony" } }, "required": ["type", "product"] },
+      "then": { "properties": { "data": { "properties": { "operation": { "const": "ingest" } } } } }
+    },
+    {
+      "if": { "properties": { "type": { "const": "usage.recorded" }, "product": { "const": "lumen" } }, "required": ["type", "product"] },
+      "then": { "properties": { "data": { "properties": { "operation": { "enum": ["chat", "embed", "rerank", "systemone", "gateway"] } } } } }
+    },
+    {
+      "if": { "properties": { "product": { "const": "lumen" } }, "required": ["product"] },
+      "then": { "properties": { "type": { "const": "usage.recorded" } } }
+    }
+  ],
+  "$defs": {
+    "uuid": {
+      "type": "string",
+      "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+    },
+    "usageData": {
+      "type": "object",
+      "required": ["operation", "units"],
+      "additionalProperties": false,
+      "properties": {
+        "operation": { "type": "string", "minLength": 1, "description": "Product-specific operation name (spec section 4.3)." },
+        "units": {
+          "type": "object",
+          "description": "Raw unit counts by name. The Lab prices the names in saas/config/pricing.yml and stores the rest.",
+          "additionalProperties": { "type": "integer", "minimum": 0 }
+        },
+        "provider_cost_micro_usd": { "type": "integer", "minimum": 0, "default": 0, "description": "Real money the engine paid upstream, priced by markup in the Lab." },
+        "description": { "type": "string", "description": "Human label for the ledger." },
+        "job_id": { "type": "string" },
+        "credits": { "type": "integer", "minimum": 0, "deprecated": true, "description": "Legacy hosted Scrapix only; removed next release." }
+      }
+    },
+    "jobCompletedData": {
+      "type": "object",
+      "required": ["job_id", "index_uid", "pages_crawled", "documents_indexed", "duration_secs"],
+      "additionalProperties": false,
+      "properties": {
+        "job_id": { "type": "string" },
+        "index_uid": { "type": "string" },
+        "pages_crawled": { "type": "integer", "minimum": 0 },
+        "documents_indexed": { "type": "integer", "minimum": 0 },
+        "duration_secs": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "jobFailedData": {
+      "type": "object",
+      "required": ["job_id", "error_message", "pages_crawled"],
+      "additionalProperties": false,
+      "properties": {
+        "job_id": { "type": "string" },
+        "error_message": { "type": "string" },
+        "pages_crawled": { "type": "integer", "minimum": 0 }
+      }
+    }
+  }
+}
