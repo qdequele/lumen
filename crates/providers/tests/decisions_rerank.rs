@@ -1,4 +1,4 @@
-//! Any decision model as a reranker (ADR 014, ADR 016): wire tests for the
+//! Any decision model as a reranker (ADR 014, ADR 017): wire tests for the
 //! rerank remap against mocked TypeSafe-family and OpenAI upstreams. The
 //! mocks answer every predicate question with the score embedded in its
 //! document text (`"text #0.42"`), so the tests check the question shape,

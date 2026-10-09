@@ -597,7 +597,7 @@ pub struct ProviderConfig {
     pub api_version: Option<String>,
     /// `typesafe` kind only: the decisions endpoint path appended to
     /// `base_url` (default `/v1/systemone`), for TypeSafe-format vendors
-    /// (ADR 016). Must start with `/`.
+    /// (ADR 017). Must start with `/`.
     #[serde(default)]
     pub decisions_path: Option<String>,
     /// `typesafe` kind only: forward unknown top-level request fields
@@ -1457,7 +1457,7 @@ impl Config {
         for message in legacy_spellings(figment) {
             tracing::warn!(
                 config = %path_label,
-                "{message} (ADR 016); run `lumen config migrate` to rewrite it"
+                "{message} (ADR 017); run `lumen config migrate` to rewrite it"
             );
         }
         Ok(config)
@@ -1731,7 +1731,7 @@ impl Config {
     }
 }
 
-/// Spellings ADR 016 renamed, read from the raw document (the typed config
+/// Spellings ADR 017 renamed, read from the raw document (the typed config
 /// already accepted them through serde aliases, so it cannot tell).
 #[derive(Deserialize, Default)]
 struct LegacyDoc {
@@ -1772,7 +1772,7 @@ struct LegacyRemap {
     strategy: Option<String>,
 }
 
-/// One message per renamed spelling still in the document (ADR 016): the
+/// One message per renamed spelling still in the document (ADR 017): the
 /// `systemone` capability and the `noul` remap strategy.
 pub(crate) fn legacy_spellings(figment: &Figment) -> Vec<String> {
     let Ok(doc) = figment.extract::<LegacyDoc>() else {

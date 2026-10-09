@@ -183,7 +183,7 @@ fn openai_body(questions: usize, input_bytes: usize) -> Vec<u8> {
 }
 
 /// `/v1/decisions` pipeline: parse + estimate + one attempt's encode
-/// (passthrough), and parse + cross-vendor encode (translation). ADR 016.
+/// (passthrough), and parse + cross-vendor encode (translation). ADR 017.
 fn bench_decisions(c: &mut Criterion) {
     use lumen_core::decisions::format::parse;
     use lumen_providers::decisions::{family, openai};

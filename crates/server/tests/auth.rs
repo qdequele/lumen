@@ -547,7 +547,7 @@ async fn exhausted_budget_is_402_fg4001_with_zero_upstream_calls() {
 
 #[tokio::test]
 async fn systemone_budget_is_enforced_before_the_upstream_call() {
-    // ADR 016: decisions admission reserves the state+questions input
+    // ADR 017: decisions admission reserves the state+questions input
     // estimate (several tokens, i.e. several dollars here) like any other
     // capability; a key that cannot cover it never reaches TypeSafe.
     let upstream = MockServer::start().await;

@@ -10,7 +10,7 @@
 //! * [`chat`] - OpenAI `chat/completions` request/response/chunk types.
 //! * [`embed`] - OpenAI `embeddings` types.
 //! * [`rerank`] - Cohere `rerank` types.
-//! * [`decisions`] - vendor-neutral decision types (ADR 016).
+//! * [`decisions`] - vendor-neutral decision types (ADR 017).
 //! * [`provider`] - the [`ChatProvider`], [`EmbeddingProvider`],
 //!   [`RerankProvider`] and [`DecisionProvider`] traits.
 //! * [`error`] - the [`ProviderError`] / [`GatewayError`] taxonomy.

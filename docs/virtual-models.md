@@ -455,7 +455,7 @@ takes over the public id and the foundation model is renamed:
   removed reranker differ from that model's, a note asks you to review them.
 - The capability spelling `systemone` (model `capabilities`, virtual model
   `capability`) becomes `decisions`, and `remap.strategy = "noul"` becomes
-  `predicate` (ADR 016). Both old spellings keep loading without the
+  `predicate` (ADR 017). Both old spellings keep loading without the
   migrator and log a boot warning.
 
 **Visible side effect.** `usage_log.model_used` and the Prometheus model

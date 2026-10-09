@@ -370,7 +370,7 @@ pub struct UsageRecord {
     pub ts: i64,
 }
 
-/// `usage_log.capability` values a filter matches: rows written before ADR 016
+/// `usage_log.capability` values a filter matches: rows written before ADR 017
 /// carry `systemone`, later rows `decisions`; either spelling matches both.
 fn capability_values(filter: Option<&str>) -> Vec<&str> {
     match filter {
@@ -1373,7 +1373,7 @@ impl KeyStore {
                 sql.push_str(clause);
             }
         }
-        // Rows written before ADR 016 carry `systemone`, so a decisions filter
+        // Rows written before ADR 017 carry `systemone`, so a decisions filter
         // matches both spellings (fixed fragments only, one `?` per value).
         let capability_values = capability_values(filter.capability.as_deref());
         match capability_values.len() {

@@ -14,7 +14,7 @@ capability, `decisions`, so any of them can be a target of the same
 [virtual model](../virtual-models.md) (fallback, split, switch) and a
 [reranker](../reranking/reranking.md#decision-models-as-rerankers-jev-perplexity-openai-ollama-cloudflare).
 The design and its trade-offs are in
-[ADR 016](../adr/016-decisions-capability.md).
+[ADR 017](../adr/017-decisions-capability.md).
 
 The `model` field is one of *your* configured model ids: the `id` of a
 `[[providers.models]]` block declaring `capabilities = ["decisions"]`, or a

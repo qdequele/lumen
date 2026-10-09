@@ -1,4 +1,4 @@
-//! Decisions counters (ADR 016): deprecated-route traffic and refusals.
+//! Decisions counters (ADR 017): deprecated-route traffic and refusals.
 
 use crate::metrics::Metrics;
 use prometheus::{IntCounterVec, Opts};

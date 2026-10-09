@@ -178,7 +178,7 @@ pub struct RerankUsage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tokens_estimated: Option<bool>,
     /// Questions a decision model refused while serving a rerank remap
-    /// (ADR 016); internal, never serialized. Feeds
+    /// (ADR 017); internal, never serialized. Feeds
     /// `lumen_decision_refusals_total`.
     #[serde(skip)]
     pub refusals: u32,

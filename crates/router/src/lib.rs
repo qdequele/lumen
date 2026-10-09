@@ -7,7 +7,7 @@
 //! requested capability (`LM-2002`, 400).
 //!
 //! Fallback chains, weighted splits and conditional routing are virtual models
-//! (ADR 014, [`virtual_models`]). The decisions capability (ADR 016) resolves
+//! (ADR 014, [`virtual_models`]). The decisions capability (ADR 017) resolves
 //! exactly like the other three.
 
 #![forbid(unsafe_code)]
@@ -94,7 +94,7 @@ pub struct RerankChainLink {
     pub model_id: String,
 }
 
-/// One resolved attempt of a decisions request (ADR 016).
+/// One resolved attempt of a decisions request (ADR 017).
 #[derive(Debug, Clone)]
 pub struct DecisionChainLink {
     /// The resolved route.

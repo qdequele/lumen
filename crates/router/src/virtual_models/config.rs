@@ -136,7 +136,7 @@ pub enum SystemPromptMode {
     IfAbsent,
 }
 
-/// A rerank remap onto a decision model on a target (ADR 014, ADR 016).
+/// A rerank remap onto a decision model on a target (ADR 014, ADR 017).
 #[derive(Clone, PartialEq, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RemapConfig {

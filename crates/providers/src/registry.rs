@@ -75,7 +75,7 @@ pub struct ProviderSpec {
     pub api_version: Option<String>,
     /// `typesafe` kind only: the decisions endpoint path appended to
     /// `base_url` (default `/v1/systemone`), for TypeSafe-format vendors
-    /// (Liquid, Inception, Upstage, Kev). ADR 016.
+    /// (Liquid, Inception, Upstage, Kev). ADR 017.
     pub decisions_path: Option<String>,
     /// `typesafe` kind only: forward unknown top-level request fields
     /// (default `true`; `false` for vendors that reject them).
@@ -234,7 +234,7 @@ impl std::fmt::Debug for RerankRoute {
 }
 
 /// A resolved decision route: the provider to call and the upstream model id
-/// (ADR 016).
+/// (ADR 017).
 #[derive(Clone)]
 pub struct DecisionRoute {
     /// The provider serving the model.
@@ -299,7 +299,7 @@ struct Inner {
     embedding: HashMap<String, EmbeddingRoute>,
     /// model id -> rerank route.
     rerank: HashMap<String, RerankRoute>,
-    /// model id -> decision route (ADR 016).
+    /// model id -> decision route (ADR 017).
     decisions: HashMap<String, DecisionRoute>,
     /// model id -> declared capabilities (all of them, even not-yet-served
     /// ones like chat). Lets the router tell "unknown model" apart from
@@ -385,7 +385,7 @@ impl Registry {
         self.inner.load().rerank.get(model_id).cloned()
     }
 
-    /// Resolve a decision model to its route (ADR 016).
+    /// Resolve a decision model to its route (ADR 017).
     #[must_use]
     pub fn decision_route(&self, model_id: &str) -> Option<DecisionRoute> {
         self.inner.load().decisions.get(model_id).cloned()
@@ -760,7 +760,7 @@ fn build_providers(
                     spec.base_url.as_deref(),
                 )),
             );
-            // Decisions (ADR 016): OpenAI Responses-style for `openai`, the
+            // Decisions (ADR 017): OpenAI Responses-style for `openai`, the
             // family codec for `perplexity`; every other kind has none.
             let decisions: Option<Arc<dyn DecisionProvider>> = match spec.kind {
                 ProviderKind::Openai => Some(Arc::new(OpenAiDecisionProvider::new(

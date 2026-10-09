@@ -71,7 +71,7 @@ passthrough that would roughly halve the large case is in `docs/backlog.md`.
 The large case needs `CARGO_PROFILE_RELEASE_STRIP=false` to build on macOS
 27, where `strip = true` corrupts proc-macro dylibs (pre-existing, unrelated).
 
-### Decisions (ADR 016)
+### Decisions (ADR 017)
 
 Same machine and toolchain as above (Apple Silicon arm64, macOS, rustc 1.97.0,
 release profile). Command: `cargo bench -p server --bench gateway_overhead -- decisions`

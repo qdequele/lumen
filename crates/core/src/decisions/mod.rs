@@ -1,4 +1,4 @@
-//! Decisions: typed answers with calibrated probabilities (ADR 016).
+//! Decisions: typed answers with calibrated probabilities (ADR 017).
 //!
 //! The neutral request and response every edge format parses into and every
 //! upstream codec encodes from. The core follows OpenAI's schema (ordered

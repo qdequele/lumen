@@ -131,7 +131,7 @@ impl Decision {
 
     /// Like [`Decision::retain_mask`], but the primary is dropped too when
     /// its `keep` entry is false: the first surviving attempt becomes the
-    /// primary (a decisions target incompatible with the request, ADR 016).
+    /// primary (a decisions target incompatible with the request, ADR 017).
     /// A mask that keeps nothing changes nothing, so the decision is never
     /// left empty.
     pub fn retain_compatible(&mut self, keep: &[bool]) {

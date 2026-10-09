@@ -532,7 +532,7 @@ capabilities = ["rerank"]
 - **kind**: `typesafe` · **capabilities**: decisions (TypeSafe's Jev
   typed-decision models, and any other TypeSafe-format vendor, served on
   `POST /v1/decisions`; see [Decisions](decisions/decisions.md) and
-  [ADR 016](adr/016-decisions-capability.md)). Reranking goes through a
+  [ADR 017](adr/017-decisions-capability.md)). Reranking goes through a
   virtual model `remap`
   ([Decision models as rerankers](reranking/reranking.md#decision-models-as-rerankers-jev-perplexity-openai-ollama-cloudflare)).
 - **Auth**: `api_key_env` (e.g. `TYPESAFE_API_KEY`), sent as a bearer token.

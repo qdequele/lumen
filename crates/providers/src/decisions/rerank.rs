@@ -1,4 +1,4 @@
-//! Any decision model as a reranker (ADR 014, ADR 016): operator-authored
+//! Any decision model as a reranker (ADR 014, ADR 017): operator-authored
 //! templates from `/v1/rerank` to a [`DecisionProvider`].
 //!
 //! A rerank virtual model's target that carries a `remap` onto a decision

@@ -1,4 +1,4 @@
-//! `POST /v1/decisions` (ADR 016) and its deprecated alias `/v1/systemone`.
+//! `POST /v1/decisions` (ADR 017) and its deprecated alias `/v1/systemone`.
 //!
 //! Flow: detect the format (OpenAI or TypeSafe) → parse and validate → route
 //! (model → provider chain, incompatible targets skipped before any call) →

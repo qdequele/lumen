@@ -11,7 +11,7 @@ and on demand locally.
   consume its output.
 - `chat_request` - deserializing + re-serializing an OpenAI `ChatRequest`,
   exercising the `extra` (unknown-field) passthrough flatten.
-- `decisions_request` - the `/v1/decisions` edge (ADR 016): format
+- `decisions_request` - the `/v1/decisions` edge (ADR 017): format
   detection and parsing (auto-detected and TypeSafe-forced, as the
   deprecated `/v1/systemone` alias does), the token estimate, the TypeSafe
   and OpenAI target limits, the TypeSafe-family encoder (every profile) and

@@ -39,7 +39,7 @@ All notable changes to LUMEN are documented here. The format is based on
 ### Added
 
 - `GET /health` reports the gateway version: `{"status": "ok", "version": "x.y.z"}`, still unauthenticated and I/O-free, so a control plane can display it (Lab QA F9).
-- `POST /v1/decisions` (ADR 016): decision models from TypeSafe, Perplexity, OpenAI (`gpt-6-luna`), Ollama and Cloudflare, in the OpenAI or the TypeSafe format, answered in the format received. Cross-vendor fallback skips incompatible targets before any upstream call. See `docs/decisions/decisions.md`.
+- `POST /v1/decisions` (ADR 017): decision models from TypeSafe, Perplexity, OpenAI (`gpt-6-luna`), Ollama and Cloudflare, in the OpenAI or the TypeSafe format, answered in the format received. Cross-vendor fallback skips incompatible targets before any upstream call. See `docs/decisions/decisions.md`.
 - Decisions hardening: TypeSafe-edge 400 messages never echo client values (a duplicate names only its key); a duplicate answer id from a TypeSafe-family upstream is a translation error (`LM-3002`) instead of keeping the last; rerank `UnsupportedInput` reasons no longer repeat the provider; a render failure is never billed; the `decisions_request` fuzz target replaces `systemone_request`; fewer copies and pre-sized buffers on the decisions request path (TypeSafe large passthrough 307 to 280 us).
 - `typesafe` providers accept `decisions_path` and `forward_unknown_fields`, so any TypeSafe-format vendor (Liquid, Inception, Upstage, Kev) can be configured.
 - Any decision model can be a rerank `remap` target; packing follows each target's limits.

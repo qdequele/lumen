@@ -1,4 +1,4 @@
-//! Golden Jev wire bytes (ADR 016, D7 and D9). Run once with
+//! Golden Jev wire bytes (ADR 017, D7 and D9). Run once with
 //! `LUMEN_BLESS=1` on the pre-refactor code to write the fixtures; every
 //! later run compares the bytes the code sends against them.
 

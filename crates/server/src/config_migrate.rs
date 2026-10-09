@@ -328,7 +328,7 @@ fn rename_noul(target: &mut dyn toml_edit::TableLike) -> bool {
     }
 }
 
-/// Rewrite the spellings ADR 016 renamed, in place and format preserving:
+/// Rewrite the spellings ADR 017 renamed, in place and format preserving:
 /// the `systemone` capability (model `capabilities`, virtual model
 /// `capability`) and the `noul` remap strategy. Returns the notes.
 fn rename_legacy_spellings(document: &mut DocumentMut) -> Vec<String> {
@@ -394,12 +394,12 @@ fn rename_legacy_spellings(document: &mut DocumentMut) -> Vec<String> {
     let mut notes = Vec::new();
     if capabilities > 0 {
         notes.push(format!(
-            "renamed {capabilities} `systemone` capability spelling(s) to `decisions` (ADR 016)"
+            "renamed {capabilities} `systemone` capability spelling(s) to `decisions` (ADR 017)"
         ));
     }
     if strategies > 0 {
         notes.push(format!(
-            "renamed {strategies} remap strategy `noul` to `predicate` (ADR 016)"
+            "renamed {strategies} remap strategy `noul` to `predicate` (ADR 017)"
         ));
     }
     notes

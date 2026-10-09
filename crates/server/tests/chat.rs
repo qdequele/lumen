@@ -2053,6 +2053,8 @@ fn single_chat_registry(kind: ProviderKind, upstream: &str) -> Arc<Registry> {
         api_version: None,
         strict: false,
         connect_timeout_ms: None,
+        decisions_path: None,
+        forward_unknown_fields: None,
         models: vec![ModelSpec {
             id: "m".to_owned(),
             upstream_id: "upstream-m".to_owned(),

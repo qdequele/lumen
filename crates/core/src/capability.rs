@@ -16,7 +16,7 @@ pub enum Capability {
     Embed,
     /// Document reranking (`POST /v1/rerank`).
     Rerank,
-    /// Typed decisions over an input (`POST /v1/decisions`, ADR 016).
+    /// Typed decisions over an input (`POST /v1/decisions`, ADR 017).
     /// `"systemone"` (ADR 013) is accepted as an alias.
     #[serde(rename = "decisions", alias = "systemone")]
     Decisions,

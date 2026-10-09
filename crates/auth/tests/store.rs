@@ -990,7 +990,7 @@ async fn usage_log_persists_the_virtual_model_route() {
     assert_eq!(rows[1].route, None);
 }
 
-/// ADR 016: rows written before the rename carry `systemone`, later rows
+/// ADR 017: rows written before the rename carry `systemone`, later rows
 /// `decisions`; a filter on either spelling matches both.
 #[tokio::test]
 async fn usage_summary_capability_filter_matches_both_decisions_spellings() {

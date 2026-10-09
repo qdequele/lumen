@@ -117,7 +117,7 @@ pub trait RerankProvider: Send + Sync {
     ) -> Result<RerankResponse, ProviderError>;
 }
 
-/// A provider that answers typed decision questions (ADR 016).
+/// A provider that answers typed decision questions (ADR 017).
 #[async_trait]
 pub trait DecisionProvider: Send + Sync {
     /// Answer every question of `req` (with `req.model` already the

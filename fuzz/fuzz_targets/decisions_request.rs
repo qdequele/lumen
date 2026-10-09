@@ -1,5 +1,5 @@
 #![no_main]
-//! Fuzz the decisions client-input boundary (ADR 016): format detection and
+//! Fuzz the decisions client-input boundary (ADR 017): format detection and
 //! parsing (auto-detected and TypeSafe-forced, as `/v1/systemone` does), the
 //! token estimate, per-target limits, both upstream encoders, and both edge
 //! renderers over a synthesized response must never panic.

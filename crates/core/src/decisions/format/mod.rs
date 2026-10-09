@@ -1,4 +1,4 @@
-//! Edge formats of `POST /v1/decisions` (ADR 016): the OpenAI format
+//! Edge formats of `POST /v1/decisions` (ADR 017): the OpenAI format
 //! (`input`, `questions` array) and the TypeSafe format (`state`,
 //! `questions` object). The body is split once into ordered raw top-level
 //! entries; detection reads only the keys and the first byte of

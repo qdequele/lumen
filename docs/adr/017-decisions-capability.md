@@ -1,4 +1,4 @@
-# ADR 016 - Decisions, one capability for every decision-model vendor
+# ADR 017 - Decisions, one capability for every decision-model vendor
 
 - Status: accepted
 - Date: 2026-10-08

@@ -93,7 +93,7 @@ pub fn resolve_embedding_decision(
         .collect())
 }
 
-/// Resolve a decision request (ADR 016): every attempt must serve
+/// Resolve a decision request (ADR 017): every attempt must serve
 /// `decisions`, then attempts that cannot take this request (an image to a
 /// text-only model, a choice of one option to OpenAI, ...) are skipped
 /// before any upstream call. A skipped attempt is not an attempt: it never

@@ -325,7 +325,7 @@ health_check_interval_ms = 30000  # probe cadence (must not be 0 when enabled)
 # model on this provider, callable directly by its id.
 #   id            the id clients send (owned entirely by you)
 #   upstream_id   what LUMEN sends upstream (defaults to `id`)
-#   capabilities  any of: "chat", "embed", "rerank", "decisions" (ADR 016; the
+#   capabilities  any of: "chat", "embed", "rerank", "decisions" (ADR 017; the
 #                 old spelling "systemone" is still accepted with a boot
 #                 warning, `lumen config migrate` rewrites it). A typesafe
 #                 model serves "decisions" only; any decision model can be
@@ -599,7 +599,7 @@ id = "pinecone-rerank"
 upstream_id = "pinecone-rerank-v0"
 capabilities = ["rerank"]
 
-# TypeSafe: typed decisions (Jev), served on POST /v1/decisions (ADR 016,
+# TypeSafe: typed decisions (Jev), served on POST /v1/decisions (ADR 017,
 # docs/decisions/decisions.md). Bearer auth; api_key_env is required.
 # base_url defaults to https://api.typesafe.ai (a trailing /v1 is tolerated).
 # The upstream path defaults to /v1/systemone. Two optional fields, accepted on

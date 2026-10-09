@@ -1,4 +1,4 @@
-//! End-to-end HTTP tests for `POST /v1/decisions` (ADR 016) and its
+//! End-to-end HTTP tests for `POST /v1/decisions` (ADR 017) and its
 //! deprecated alias `/v1/systemone`: both edge formats (OpenAI and TypeSafe),
 //! TypeSafe-wire passthrough, alias resolution, edge validation (LM-2011 /
 //! LM-1001 before any upstream call), routing misses, upstream error mapping,
@@ -658,7 +658,7 @@ async fn golden_passthrough_response_bytes() {
     }
 }
 
-// ---- /v1/decisions across vendors (ADR 016) ----------------------------------
+// ---- /v1/decisions across vendors (ADR 017) ----------------------------------
 
 /// An OpenAI-format request with a named predicate, a choice between a
 /// string and a boolean, and a score: [`LUNA_OUT`] answers it.

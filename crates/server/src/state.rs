@@ -54,7 +54,7 @@ pub struct AppState {
     pub tokens: TokenMetrics,
     /// Request-latency histograms (HTTP + per-capability) - always on.
     pub latency: LatencyMetrics,
-    /// Decisions counters (ADR 016) - always on.
+    /// Decisions counters (ADR 017) - always on.
     pub decision_metrics: DecisionMetrics,
     /// Virtual-key auth runtime; `None` = auth disabled (open gateway).
     pub auth: Option<Arc<AuthRuntime>>,

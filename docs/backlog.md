@@ -55,7 +55,7 @@ milestone.
   fails locally unless `CARGO_PROFILE_RELEASE_STRIP=false`. Consider
   `strip = "debuginfo"` or a separate bench profile.
 
-## Noted while building ADR 016 (decisions capability)
+## Noted while building ADR 017 (decisions capability)
 
 Follow-ups of the decisions spec (`docs/superpowers/specs/2026-10-08-decisions-design.md`, section 15):
 
