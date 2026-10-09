@@ -80,6 +80,15 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ### Changed
 
+- Dependency refresh (October 2026): toolchain to Rust **1.99.0** (from
+  1.97.0), Docker builder to `rust:1.99-alpine` and runtime to
+  `distroless/static-debian13`, and `Cargo.lock` moved to the highest
+  compatible versions (tokio 1.53.2, hyper 1.12.0, tower-http 0.7.1,
+  jsonwebtoken 11.1.0, aes-gcm 0.11.1, rand 0.10.3, tiktoken-rs 0.12.1, among
+  others). Supersedes dependabot #167. Two majors stay held on purpose:
+  `toml` stays on 0.8 to match the version figment 0.10 vendors, and
+  `reqwest` 0.13 still needs its own ADR (its `rustls` feature pulls
+  `aws-lc-sys` and swaps the bundled roots for the OS trust store).
 - **Breaking (admin API):** an unknown or soft-deleted key or group id on `PATCH`/`DELETE /admin/keys/{id}`, `POST /admin/keys/{id}/rotate`, `POST /admin/keys/{id}/grant`, `PATCH`/`DELETE /admin/groups/{id}` and `POST /admin/groups/{id}/grant` is now `404 LM-1003` naming the id (was `400 LM-1001`), like every other admin lookup. `PUT /admin/provider-keys/{name}` for a provider the config document does not define is `404 LM-1003` and stores nothing (was `204`) (Lab QA F11).
 - Key and group writes (create and `PATCH`, API and `lumen keys create`) refuse a blank `name`, a negative `budget_max`, `rpm_limit`, `tpm_limit` or `expires_at`, and a `budget_max` above `1e12` USD with `400 LM-1001` naming the field; they were stored as given (Lab QA F11).
 - `DELETE /admin/config/providers/{name}` also forgets the provider's stored key, so a provider recreated under the same name no longer silently inherits it (Lab QA F11).
