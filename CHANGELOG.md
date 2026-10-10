@@ -6,6 +6,8 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-10-10
+
 ### Security
 
 - **Webhook receivers set through the admin API must be publicly
@@ -38,13 +40,68 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ### Added
 
+- **Meilisearch Lab platform contract v2** (`docs/operations/lab-integration.md`,
+  ADR 015 amendment). The gateway is now a Lab *instance*: `LAB_URL`,
+  `LAB_INSTANCE_ID` and `LAB_INSTANCE_SECRET` configure billing events with
+  the same three variables Scrapix and glutony read, and win over the TOML
+  (`[usage_events]` gains `instance_id` and `secret_env`, default
+  `LAB_INSTANCE_SECRET`; `signing_key_env` stays as a deprecated alias with a
+  boot warning; `source` is optional and only labels the boot log).
+  `LAB_INSTANCE_ID` without `LAB_URL` (and no `url` in the TOML) refuses to
+  boot with an error naming `LAB_URL`. Every batch carries
+  `X-Lab-Instance-Id`, `X-Lab-Timestamp` and `X-Lab-Signature:
+  sha256=HMAC-SHA256(secret, "<timestamp>.<body>")`. At boot the gateway calls
+  `GET {LAB_URL}/internal/instances/me` to confirm the credentials and log
+  its identity: rejected credentials, an instance registered for another
+  product, or an answer for a different instance id (compared
+  case-insensitively) refuse to boot; an unreachable Lab is only a warning.
+  Billing attribution is unchanged (a key is billed when its group has an
+  `account_ref`). The event is the Lab-owned v2 shape:
+  `data.operation = "gateway"`, `data.units = {requests, tokens_in,
+  tokens_out, tokens_estimated}`, `data.provider_cost_micro_usd` (the settled
+  cost delta) and `data.description = "key <id> <start>..<end>"`; the group
+  snapshot, `source`, `key_id` and `window` left `data`. The vendored schema
+  also lists `systemone` as a lumen operation (the Lab's spec predates the
+  decisions rename); LUMEN sends only `gateway`. The schema is vendored byte
+  for byte at `contracts/vendor/lab/lab-events.schema.json` (the old
+  `contracts/lab-events.schema.json` is gone) and CI fails on drift from
+  `meilisearch/lab` once the `LAB_REPO_TOKEN` secret is set. An event the Lab
+  answers with a `2xx` but keeps out of `accepted` is dropped 24 h after the
+  first such answer, with an error log and `lumen_usage_events_dropped_total`
+  (migration 0013 adds `usage_outbox.first_skipped_ms`, when that clock
+  started, and `usage_outbox.dropped_ms`); a non-2xx answer or an
+  unreachable Lab never starts or resets the clock, so an outage still never
+  drops a bill.
+- **Per-account scoping of the admin surface** (platform contract v2
+  section 8.3): a shared hosted gateway serves many Lab accounts through one
+  master key, so an `/admin/*` call carrying `X-Lumen-Account-Ref: <uuid>`
+  now lists only the keys, groups and usage of groups with that
+  `account_ref`, gets `404 LM-1003` on another account's key or group (or a
+  key with no group), must create keys inside a group of that account and
+  gets `account_ref` forced on a created group, and is refused with the new
+  `403 LM-4005` on the platform-only routes (`/admin/provider-keys/*`,
+  `/admin/providers/{name}/check`, `/admin/webhooks*`, `/admin/config*`) and
+  `/openapi.json`. A malformed or repeated header is `400 LM-1001`, never
+  read as unscoped. Without the header the master key is unchanged. New
+  `GET /admin/groups/{id}` returns the record plus the live `spent_micro`
+  and `budget_max_micro` the Lab's lease sync reads; it sets the lease with
+  `PATCH /admin/groups/{id}` (`budget_max`) or `POST /admin/groups/{id}/grant`.
+- `docs/openapi.yaml`: the gateway's HTTP contract (`/v1/*`, `/health`,
+  `/health/providers`, `/metrics`, every `/admin/*` route), pinned by a test
+  against the mounted router, and served at `GET /openapi.json` (master key)
+  so a control plane can vendor it.
+- Release engineering: `release.yml` no longer fails when the GitHub release
+  is already published (the v0.5.0 image push was lost that way), pushes the
+  image under the version tag first and moves `latest` only after the
+  release is published. The `v0.3.0` tag referenced by older notes was never
+  created; `v0.3.1` is the first 0.3 tag.
 - `GET /health` reports the gateway version: `{"status": "ok", "version": "x.y.z"}`, still unauthenticated and I/O-free, so a control plane can display it (Lab QA F9).
 - `POST /v1/decisions` (ADR 017): decision models from TypeSafe, Perplexity, OpenAI (`gpt-6-luna`), Ollama and Cloudflare, in the OpenAI or the TypeSafe format, answered in the format received. Cross-vendor fallback skips incompatible targets before any upstream call. See `docs/decisions/decisions.md`.
 - Decisions hardening: TypeSafe-edge 400 messages never echo client values (a duplicate names only its key); a duplicate answer id from a TypeSafe-family upstream is a translation error (`LM-3002`) instead of keeping the last; rerank `UnsupportedInput` reasons no longer repeat the provider; a render failure is never billed; the `decisions_request` fuzz target replaces `systemone_request`; fewer copies and pre-sized buffers on the decisions request path (TypeSafe large passthrough 307 to 280 us).
 - `typesafe` providers accept `decisions_path` and `forward_unknown_fields`, so any TypeSafe-format vendor (Liquid, Inception, Upstage, Kev) can be configured.
 - Any decision model can be a rerank `remap` target; packing follows each target's limits.
 - Metrics `lumen_deprecated_requests_total{route}` and `lumen_decision_refusals_total{model}`.
-- Meilisearch Lab integration (ADR 015, `docs/operations/lab-integration.md`): opaque `account_ref` on budget groups and `external_ref` on keys (set on create/PATCH, `null` clears, filterable on the list routes; `account_ref` must be a UUID while `[usage_events]` is set), and opt-in, restart-only `[usage_events]` billing events. Each budget flush turns a billable key's newly settled cost (never in-flight reservations, never negative) into a signed `usage.recorded` event (`X-Lab-Signature: sha256=<hex>`), stored in the same SQLite transaction as the spend and pushed to `{url}/internal/events` until the control plane lists it in `accepted`: batched, retried with capped exponential backoff (2 s to 5 min), never dropped, delivered rows purged after 7 days, one bounded delivery attempt on shutdown. Periodic, shutdown and key-delete flushes share one function and one lock; deleted keys are retired until their last spend is billed. With billing on, `PATCH /admin/keys/{id}` with `group_id` and `PATCH /admin/groups/{id}` with `account_ref` flush first and answer `500 LM-5001` without changing anything if that flush fails. New metrics `lumen_usage_events_pending`, `lumen_usage_events_oldest_pending_seconds`, `lumen_usage_events_delivered_total` and `lumen_usage_events_failed_total{reason}`, alert `LumenUsageEventsStuck`, vendored contract `contracts/lab-events.schema.json` with an advisory CI drift job. Migrations 0011 and 0012. With the block set, boot refuses a blank signing secret and any live group whose `account_ref` is not a UUID (the error lists the group ids), and `url` must carry no credentials, query or fragment. The delivered-row purge deletes in chunks of 5000, and gauges refresh at most every 10 s. New criterion bench `cargo bench -p auth --bench admit_settle` (admit + settle per request, recorded in `docs/perf-baseline.md`). Without the block nothing changes: no outbox rows, no sender, no outbound call.
+- Meilisearch Lab integration (ADR 015, `docs/operations/lab-integration.md`): opaque `account_ref` on budget groups and `external_ref` on keys (set on create/PATCH, `null` clears, filterable on the list routes; `account_ref` must be a UUID while `[usage_events]` is set), and opt-in, restart-only `[usage_events]` billing events. Each budget flush turns a billable key's newly settled cost (never in-flight reservations, never negative) into a signed `usage.recorded` event (wire shape and signature: the platform contract v2 entry above), stored in the same SQLite transaction as the spend and pushed to `{url}/internal/events` until the control plane lists it in `accepted`: batched, retried with capped exponential backoff (2 s to 5 min), never dropped while the Lab is unreachable (the 24 h rejection rule is in the contract v2 entry), delivered rows purged after 7 days, one bounded delivery attempt on shutdown. Periodic, shutdown and key-delete flushes share one function and one lock; deleted keys are retired until their last spend is billed. With billing on, `PATCH /admin/keys/{id}` with `group_id` and `PATCH /admin/groups/{id}` with `account_ref` flush first and answer `500 LM-5001` without changing anything if that flush fails. New metrics `lumen_usage_events_pending`, `lumen_usage_events_oldest_pending_seconds`, `lumen_usage_events_delivered_total` and `lumen_usage_events_failed_total{reason}`, alert `LumenUsageEventsStuck`, and a vendored event schema with a CI drift job (now `contracts/vendor/lab/lab-events.schema.json`, see the contract v2 entry). Migrations 0011 and 0012. With the block set, boot refuses a blank signing secret and any live group whose `account_ref` is not a UUID (the error lists the group ids), and `url` must carry no credentials, query or fragment. The delivered-row purge deletes in chunks of 5000, and gauges refresh at most every 10 s. New criterion bench `cargo bench -p auth --bench admit_settle` (admit + settle per request, recorded in `docs/perf-baseline.md`). Without the block nothing changes: no outbox rows, no sender, no outbound call.
 - `PUT /admin/config/virtual_models/{id}` refuses a body holding a JSON `null` inside `when`, `overrides.set` or `overrides.default` (nested included), or any other value TOML cannot store, with `LM-1001` naming the field instead of a 500.
 - Virtual-model validation caps a request at 64 flattened attempts (`MAX_ATTEMPTS`: a `fallback` or `split` sums its targets, a `switch` takes its largest branch) and stops descending at the nesting limit, so a DAG listing the same child many times per level, or a chain of thousands of models, is rejected with the model id instead of slowing every request or overflowing the stack.
 - Criterion benches for the virtual-model decide phase (`cargo bench -p router --bench decide`): about 0.95 us per call (mean 926 to 975 ns across runs) for a 3-level plan with a regex rule, and about 60 ns for a foundation id called directly (decide plus the retain pass every handler runs; 142 ns before the direct-path fast paths).
@@ -69,17 +126,9 @@ All notable changes to LUMEN are documented here. The format is based on
   request. Library: `Registry::check_key`, `BedrockProvider::check_key`,
   `VertexProvider::check_key`.
 
-- **Model release dates on `GET /v1/models`.** A model may declare
-  `release_date = "YYYY-MM-DD"` (quoted, or as a bare TOML date) in its
-  `[[providers.models]]` block (validated at load: an impossible or malformed date aborts startup or is
-  refused by a reload). `GET /v1/models` and `GET /v1/models/{id}` then
-  return it as `release_date` and as the OpenAI-compatible integer `created`
-  (Unix seconds at midnight UTC), so clients can sort models by release.
-  Both fields are omitted for an undated model rather than reporting a
-  misleading epoch 0. Metadata only: it never affects routing.
-
 ### Changed
 
+- **Breaking (Lab billing):** `[usage_events]` requires `instance_id` (or `LAB_INSTANCE_ID`); the v1 event shape (`data.cost_micro_usd`, `data.tokens`, `data.group`, `data.source`, `data.key_id`, `data.window`) and the body-only `X-Lab-Signature` are gone. The Lab must run platform contract v2.
 - Dependency refresh (October 2026): toolchain to Rust **1.99.0** (from
   1.97.0), Docker builder to `rust:1.99-alpine` and runtime to
   `distroless/static-debian13`, and `Cargo.lock` moved to the highest
@@ -112,6 +161,8 @@ All notable changes to LUMEN are documented here. The format is based on
 
 - **OpenAI `developer` messages no longer fail on non-OpenAI upstreams (ADR 016).** A message with `"role": "developer"` (how Meilisearch chat sends its system prompt for the `openAi` source) reached Anthropic as a message role and failed with `LM-3003` (upstream 400). It is now treated as `system` everywhere the upstream has no such role: hoisted into `system` (Anthropic, Bedrock) or `systemInstruction` (Gemini, Vertex) in message order alongside `system` messages, sent as `system` to Cohere, and rewritten to `system` in place for Mistral, Azure, every OpenAI-compatible host (vLLM, Groq, Ollama chat, ...) and `kind = "openai"` pointed at a `base_url` other than `api.openai.com` (LiteLLM, llama.cpp). Only OpenAI itself receives it verbatim. Virtual-model presets count it as a client system prompt (`replace` removes it, `if_absent` sees it).
 - **Upstream client errors are diagnosable from the log (ADR 016).** An upstream 4xx (except 429) whose JSON body carries a message string now logs a `warn` line `upstream returned an error` with `provider`, `status` and `upstream_error`: the vendor's own message string (for example Anthropic's `error.message`), cut before any echo of the request (pydantic `input`), with probable credentials redacted (including a value printed after `key`, `token`, `password`, ...) and at most 512 characters, under the same request span as the `request failed` line. Previously only the status was logged. A body without a message string is not logged at all, the body is still never returned to the client, and 5xx bodies are still not read. Filter target `lumen_providers::mapping` to drop the line (`docs/operations/logging.md`).
+- `/health/providers` follows hot reloads: a provider added through `PUT /admin/config/providers/{name}` (or any reload) is listed as `unknown` and, with health checks on, probed from the next interval; a removed one disappears. The registry was only filled at boot (Lab QA F2).
+- A provider added after boot gets its key from `PUT /admin/provider-keys/{name}` on the next reload. The reloader only re-read stored keys for the providers present at boot, so such a key applied only after a restart.
 
 ### Deprecated
 
@@ -121,12 +172,20 @@ All notable changes to LUMEN are documented here. The format is based on
 
 - **Breaking (ADR 014):** per-model `fallbacks`, the `[providers.models.rerank]` block and the `rerank` capability on `typesafe` models are removed. A config using them fails validation with the equivalent `[[virtual_models]]` snippet (remap instructions and criteria show as a placeholder, so operator prompt text never reaches the boot error, the reload log or an admin `LM-1001` body; the migration copies the real text); run `lumen config migrate` (or `--dry-run`). Migrated foundation models are renamed `<provider>/<id>`, so `usage_log.model_used`, the Prometheus `model` label and the `x-lumen-model-used` response header of those models change (for example `gpt-4o` becomes `openai/gpt-4o`; the public id clients send is unchanged). A migrated model that declared several capabilities keeps only the first one under its old id; the others return `LM-2002` there until you add a virtual model for them (the migration prints each one; they still work through `<provider>/<id>`).
 
-### Fixed
+## [0.6.1] - 2026-09-29
 
-- `/health/providers` follows hot reloads: a provider added through `PUT /admin/config/providers/{name}` (or any reload) is listed as `unknown` and, with health checks on, probed from the next interval; a removed one disappears. The registry was only filled at boot (Lab QA F2).
-- A provider added after boot gets its key from `PUT /admin/provider-keys/{name}` on the next reload. The reloader only re-read stored keys for the providers present at boot, so such a key applied only after a restart.
+### Added
 
-## [0.5.0] - 2026-09-26
+- **Model release dates on `GET /v1/models`.** A model may declare
+  `release_date = "YYYY-MM-DD"` (quoted, or as a bare TOML date) in its
+  `[[providers.models]]` block (validated at load: an impossible or malformed date aborts startup or is
+  refused by a reload). `GET /v1/models` and `GET /v1/models/{id}` then
+  return it as `release_date` and as the OpenAI-compatible integer `created`
+  (Unix seconds at midnight UTC), so clients can sort models by release.
+  Both fields are omitted for an undated model rather than reporting a
+  misleading epoch 0. Metadata only: it never affects routing.
+
+## [0.6.0] - 2026-09-28
 
 ### Added
 
@@ -168,6 +227,10 @@ All notable changes to LUMEN are documented here. The format is based on
   `/v1/rerank` is not included; design proposals for how a rerank model maps
   onto SystemOne questions, including per-tenant mappings, are in
   `docs/design/systemone-rerank-mapping.md`.
+
+## [0.5.0] - 2026-09-26
+
+### Added
 
 - **Docs: config source modes (ADR 012, task 10 of the config-source-abstraction
   plan).** New `docs/operations/config-modes.md`: the
@@ -1918,7 +1981,10 @@ This closes every remaining streaming criterion:
 - Docs: error-code reference (`docs/errors.md`), ADR 001 (crate/lib naming),
   and this changelog.
 
-[Unreleased]: https://github.com/qdequele/lumen/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/qdequele/lumen/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/qdequele/lumen/compare/v0.6.1...v0.7.0
+[0.6.1]: https://github.com/qdequele/lumen/compare/v0.6.0...v0.6.1
+[0.6.0]: https://github.com/qdequele/lumen/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/qdequele/lumen/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/qdequele/lumen/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/qdequele/lumen/compare/v0.2.0...v0.3.1

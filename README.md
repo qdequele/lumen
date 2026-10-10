@@ -322,6 +322,26 @@ the book's
 API keys are **never** written in the config - a provider references the *name*
 of the env var that holds its key.
 
+### Meilisearch Lab
+
+A gateway can report billing usage to the
+[Meilisearch Lab](https://github.com/meilisearch/lab) control plane as one of
+its instances. Three environment variables, the same ones Scrapix and glutony
+read, switch it on:
+
+```bash
+LAB_URL=https://lab.meilisearch.com      # the Lab's base URL
+LAB_INSTANCE_ID=<uuid>                   # minted by the Lab for this gateway
+LAB_INSTANCE_SECRET=<64 hex>             # shown once by the Lab, never logged
+```
+
+Everything else (what an event carries, per-account scoping of `/admin/*`,
+delivery guarantees, metrics and the runbook) is in
+[Lab integration](https://qdequele.github.io/lumen/operations/lab-integration.html)
+(source: [`docs/operations/lab-integration.md`](docs/operations/lab-integration.md)).
+Without these variables (or a `[usage_events]` block) the gateway makes no
+call to the Lab.
+
 ## Benchmarks
 
 From [`docs/perf-baseline.md`](docs/perf-baseline.md) (Apple Silicon, release
