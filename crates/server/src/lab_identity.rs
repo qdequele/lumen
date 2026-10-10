@@ -39,7 +39,8 @@ pub enum IdentityError {
     /// Any other non-2xx answer (the endpoint may not exist on this Lab yet).
     #[error("the Lab answered HTTP {0} to GET /internal/instances/me")]
     Status(u16),
-    /// Connect error or timeout; the message never carries the URL.
+    /// Connect error, timeout, or a 2xx body that stalls or breaks mid-read;
+    /// the message never carries the URL.
     #[error("could not reach the Lab: {0}")]
     Transport(String),
     /// A 2xx body that is not an identity, or one for another product (the
@@ -112,10 +113,15 @@ impl LabIdentityClient {
             200..=299 => {}
             other => return Err(IdentityError::Status(other)),
         }
-        let identity: InstanceIdentity = response
-            .json()
+        // Read the body and parse it separately: reqwest reports a body that
+        // stalls or breaks mid-read as a decode error too, and that is an
+        // outage (non-fatal), not a malformed identity (fatal).
+        let body = response
+            .bytes()
             .await
-            .map_err(|e| IdentityError::Malformed(e.without_url().to_string()))?;
+            .map_err(|e| IdentityError::Transport(e.without_url().to_string()))?;
+        let identity: InstanceIdentity =
+            serde_json::from_slice(&body).map_err(|e| IdentityError::Malformed(e.to_string()))?;
         // Instance ids are UUIDs (not secrets): compare case-insensitively.
         if !identity.instance_id.eq_ignore_ascii_case(&self.instance_id) {
             return Err(IdentityError::Malformed(format!(
@@ -244,6 +250,56 @@ mod tests {
             );
             assert!(error.is_fatal());
         }
+    }
+
+    #[tokio::test]
+    async fn a_2xx_whose_body_stalls_is_an_outage_not_a_config_error() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // Headers arrive (200, 64-byte body announced), then the body stalls
+        // past the client's overall timeout. Wiremock's `set_delay` holds the
+        // headers too (that is already a `send()` timeout), so a raw socket
+        // is the only way to stall mid-body.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0_u8; 1024];
+            let _ = socket.read(&mut buf).await;
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 64\r\n\r\n{\"instance_id\":",
+                )
+                .await
+                .unwrap();
+            socket.flush().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        });
+        let client = LabIdentityClient::new(
+            lumen_providers::http::build_client_with(
+                Duration::from_millis(500),
+                Duration::from_secs(1),
+            ),
+            &format!("http://127.0.0.1:{port}"),
+            INSTANCE.to_owned(),
+            SECRET.to_owned(),
+        );
+        let error = client.fetch().await.unwrap_err();
+        assert!(matches!(error, IdentityError::Transport(_)), "{error}");
+        assert!(!error.is_fatal());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_2xx_with_invalid_json_stays_malformed() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/internal/instances/me"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw("{not json", "application/json"))
+            .mount(&server)
+            .await;
+        let error = client(&server).fetch().await.unwrap_err();
+        assert!(matches!(error, IdentityError::Malformed(_)), "{error}");
+        assert!(error.is_fatal());
     }
 
     #[tokio::test]

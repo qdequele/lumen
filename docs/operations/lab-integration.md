@@ -130,8 +130,9 @@ reports is billed by the Lab.
   a `product` other than `lumen` (the Lab would skip every event with
   `product mismatch`) or a `kind` other than `hosted`.
 - **Anything else only warns** (any other status, for example a `404` from a
-  Lab that does not serve the endpoint yet or a `5xx`, a connect error or a
-  timeout): the gateway logs one warning and boots. Events are durable and
+  Lab that does not serve the endpoint yet or a `5xx`, a connect error, a
+  timeout, or a `2xx` whose body stalls or breaks mid-read): the gateway
+  logs one warning and boots. Events are durable and
   the sender retries them.
 - **An unreachable Lab delays serving.** The call is bounded by
   `timeout_ms` (default 5000 ms) and runs after the listener is bound but
