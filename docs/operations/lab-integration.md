@@ -423,6 +423,44 @@ A dropped row was never billed: reconcile its amount with the Lab by hand
 before the 7-day purge removes it. Never delete a pending row: it is the
 only record of that bill.
 
+### Upgrading a build from main with pending v1 events
+
+No tagged release shipped the first usage-event shape (v1). Builds from
+`main` since the first ADR 015 usage-events commit, after 0.6.1, may still
+hold pending outbox rows in that shape, and a v2 Lab cannot validate them.
+A v1 body has no `data.operation`. Those builds also predate the
+`dropped_ms` column (migration 0013 adds it when the new build boots), so
+set the rows aside in two steps.
+
+1. Stop the old gateway, then inspect the v1 rows still pending and keep
+   the output, it is the only record of that spend:
+
+   ```bash
+   sqlite3 -readonly lumen.db "SELECT id, attempts, created_ms, body FROM usage_outbox \
+     WHERE delivered_ms IS NULL AND json_extract(body, '$.data.operation') IS NULL \
+     ORDER BY created_ms, id"
+   ```
+
+2. Still before upgrading, park them so the new sender never selects them:
+
+   ```bash
+   sqlite3 lumen.db "UPDATE usage_outbox SET next_attempt_ms = 9223372036854775807 \
+     WHERE delivered_ms IS NULL AND json_extract(body, '$.data.operation') IS NULL"
+   ```
+
+3. Upgrade and start the new build, then mark the parked rows dropped (now
+   in milliseconds), so they leave `lumen_usage_events_pending` and are
+   purged after 7 days like any dropped row:
+
+   ```bash
+   sqlite3 lumen.db "UPDATE usage_outbox SET dropped_ms = CAST(strftime('%s','now') AS INTEGER) * 1000 \
+     WHERE delivered_ms IS NULL AND dropped_ms IS NULL AND json_extract(body, '$.data.operation') IS NULL"
+   ```
+
+The gateway never sends these rows, so the spend they carry
+(`data.cost_micro_usd` in each body) must be reconciled with the Lab by
+hand.
+
 ## Sovereignty
 
 Enabling this block makes the gateway call the configured URL. Events carry
@@ -447,8 +485,12 @@ LUMEN carries no Lab code. The Lab side of platform contract v2 is:
    `provider_cost_micro_usd`).
 3. Verify `X-Lab-Instance-Id`, `X-Lab-Timestamp` and `X-Lab-Signature` on
    `POST /internal/events` and answer `{"accepted": [...]}`.
-4. Set `X-Lumen-Account-Ref` (the canonical lowercase account UUID) on every
+4. Validate each event of a batch on its own and leave an invalid one's id
+   out of `accepted`; never answer non-2xx for a whole batch because of one
+   event. A non-2xx never starts the gateway's 24 h drop clock, so one bad
+   event would stall billing for every event behind it.
+5. Set `X-Lumen-Account-Ref` (the canonical lowercase account UUID) on every
    proxied `/admin/*` call and never expose the platform-only routes to
    users.
-5. Run `SyncLumenLeasesJob` against `GET /admin/groups/{id}` and
+6. Run `SyncLumenLeasesJob` against `GET /admin/groups/{id}` and
    `PATCH /admin/groups/{id}` (or `grant`), see "The lease sync".

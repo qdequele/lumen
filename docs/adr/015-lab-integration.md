@@ -4,6 +4,7 @@
 - Date: 2026-09-30
 - Builds on: ADR 009, ADR 010, ADR 011
 - Amends: ADR 011 §2 (billing events only)
+- Amended: 2026-10-10 (platform contract v2)
 
 ## Context
 
@@ -87,8 +88,8 @@ has no billing leg that is exact.
 
 ## Amendment 2026-10-09: platform contract v2
 
-Decisions 2, 3, 4 and 7 stand. Decision 1 is extended and decisions 5 and 6
-are amended by the Lab's platform contract v2 (`meilisearch/lab`,
+Decisions 2, 3 and 4 stand. Decisions 1 and 7 are extended and decisions 5
+and 6 are amended by the Lab's platform contract v2 (`meilisearch/lab`,
 `docs/superpowers/specs/2026-10-08-lab-platform-contract-v2.md`),
 implemented in LUMEN 0.7.0:
 
@@ -140,7 +141,13 @@ implemented in LUMEN 0.7.0:
    gateway-wide setting. `GET /admin/groups/{id}` exposes the live
    `spent_micro` and `budget_max_micro` the Lab's lease sync reads; `PATCH`
    (`budget_max`) and `grant` set the lease.
-6. **Out of scope here:** Postgres, horizontal scaling with auth on,
+6. **Opt-in from the environment too (decision 7 extended).** The block is
+   still the only switch and still boot layer, but `LAB_URL` and
+   `LAB_INSTANCE_ID` in the environment create it when the file has none
+   (and overlay it when it does), so a hosted gateway is configured like
+   Scrapix and glutony. Without the block and without those variables the
+   gateway is unchanged and makes no new outbound call.
+7. **Out of scope here:** Postgres, horizontal scaling with auth on,
    per-account provider keys (hosted LUMEN runs on Meilisearch's keys,
    decision F of the contract).
 

@@ -128,7 +128,7 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ### Changed
 
-- **Breaking (Lab billing):** `[usage_events]` requires `instance_id` (or `LAB_INSTANCE_ID`); the v1 event shape (`data.cost_micro_usd`, `data.tokens`, `data.group`, `data.source`, `data.key_id`, `data.window`) and the body-only `X-Lab-Signature` are gone. The Lab must run platform contract v2.
+- **Breaking (Lab billing):** `[usage_events]` requires `instance_id` (or `LAB_INSTANCE_ID`); the v1 event shape (`data.cost_micro_usd`, `data.tokens`, `data.group`, `data.source`, `data.key_id`, `data.window`) and the body-only `X-Lab-Signature` are gone. The Lab must run platform contract v2. This only affects builds from `main` after 0.6.1: no tagged release shipped the v1 events. Such a build may hold pending v1 rows; set them aside before upgrading, see "Upgrading a build from main with pending v1 events" in `docs/operations/lab-integration.md`.
 - Dependency refresh (October 2026): toolchain to Rust **1.99.0** (from
   1.97.0), Docker builder to `rust:1.99-alpine` and runtime to
   `distroless/static-debian13`, and `Cargo.lock` moved to the highest
