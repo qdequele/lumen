@@ -46,7 +46,9 @@ All notable changes to LUMEN are documented here. The format is based on
   the same three variables Scrapix and glutony read, and win over the TOML
   (`[usage_events]` gains `instance_id` and `secret_env`, default
   `LAB_INSTANCE_SECRET`; `signing_key_env` stays as a deprecated alias with a
-  boot warning; `source` is optional and only labels the boot log).
+  boot warning; `source` is optional and only labels the boot log;
+  `batch_size` is 1 to 500, the Lab's own batch limit, since it refuses a
+  larger batch as a whole).
   `LAB_INSTANCE_ID` without `LAB_URL` (and no `url` in the TOML) refuses to
   boot with an error naming `LAB_URL`. Every batch carries
   `X-Lab-Instance-Id`, `X-Lab-Timestamp` and `X-Lab-Signature:

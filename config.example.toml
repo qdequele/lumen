@@ -211,7 +211,7 @@ retention_days = 30               # purge usage_log rows older than this
 # instance_id = "<uuid from the Lab>"           # LAB_INSTANCE_ID
 # secret_env = "LAB_INSTANCE_SECRET"            # env var holding the instance secret
 # source = "eu-1"                               # optional label for the boot log
-# batch_size = 500                              # 1..=1000
+# batch_size = 500                              # 1..=500 (the Lab's batch limit)
 # timeout_ms = 5000                             # 100..=60000
 # LAB_URL and LAB_INSTANCE_ID in the environment overlay url and instance_id
 # (and create the block when it is absent); signing_key_env is a deprecated

@@ -161,7 +161,7 @@ pub struct UsageEventsConfig {
     /// `X-Lab-Instance-Id`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
-    /// Events per delivery request, 1 to 1000.
+    /// Events per delivery request, 1 to [`USAGE_EVENTS_MAX_BATCH`] (500).
     #[serde(default = "default_usage_events_batch_size")]
     pub batch_size: usize,
     /// Per-request timeout, 100 to 60000 ms.
@@ -173,8 +173,14 @@ fn default_secret_env() -> String {
     "LAB_INSTANCE_SECRET".to_owned()
 }
 
+/// The Lab accepts at most 500 events per `POST /internal/events` and
+/// answers a larger batch with a 400 for the whole batch (platform contract
+/// v2 section 4). A non-2xx never acknowledges anything, so a bigger batch
+/// would be retried forever: config load refuses it.
+pub const USAGE_EVENTS_MAX_BATCH: usize = 500;
+
 const fn default_usage_events_batch_size() -> usize {
-    500
+    USAGE_EVENTS_MAX_BATCH
 }
 
 const fn default_usage_events_timeout_ms() -> u64 {
@@ -299,8 +305,11 @@ impl UsageEventsConfig {
                 );
             }
         }
-        if !(1..=1000).contains(&self.batch_size) {
-            return Err("usage_events.batch_size must be between 1 and 1000".to_owned());
+        if !(1..=USAGE_EVENTS_MAX_BATCH).contains(&self.batch_size) {
+            return Err(format!(
+                "usage_events.batch_size must be between 1 and {USAGE_EVENTS_MAX_BATCH} (the Lab \
+                 refuses a larger batch as a whole)"
+            ));
         }
         if !(100..=60_000).contains(&self.timeout_ms) {
             return Err("usage_events.timeout_ms must be between 100 and 60000".to_owned());
@@ -2380,7 +2389,7 @@ mod tests {
             "source = \"\"",
             "source = \"has space\"",
             "batch_size = 0",
-            "batch_size = 1001",
+            "batch_size = 501",
             "timeout_ms = 50",
             "secret_env = \"\"",
             "secret_env = \"  \"",

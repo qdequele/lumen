@@ -64,7 +64,7 @@ url = "https://lab.meilisearch.com"      # LAB_URL
 instance_id = "<uuid>"                   # LAB_INSTANCE_ID
 secret_env = "LAB_INSTANCE_SECRET"       # env var holding the instance secret
 source = "eu-1"                          # optional label for the boot log
-batch_size = 500                         # 1..=1000
+batch_size = 500                         # 1..=500
 timeout_ms = 5000                        # 100..=60000
 ```
 
@@ -75,7 +75,7 @@ timeout_ms = 5000                        # 100..=60000
 | `secret_env` | no | `LAB_INSTANCE_SECRET` | Name of the environment variable holding the instance secret, never the secret itself. Non-blank, no surrounding whitespace. |
 | `signing_key_env` | no | none | Deprecated alias of `secret_env` (the ADR 015 name). When set it wins, and boot logs one warning naming `secret_env` as the replacement. |
 | `source` | no | the instance id | Label in the boot log, 1 to 64 characters of `A-Z a-z 0-9 . _ -`. Not in events: the Lab knows the instance from `X-Lab-Instance-Id`. |
-| `batch_size` | no | `500` | Events per delivery request, 1 to 1000. |
+| `batch_size` | no | `500` | Events per delivery request, 1 to 500: the Lab answers a larger batch with a 400 for the whole batch, which would never be acknowledged, so a larger value refuses to boot. |
 | `timeout_ms` | no | `5000` | Per-request timeout, 100 to 60000 ms. Also bounds the boot-time identity call. |
 
 - **Opt-in and restart-only.** The block is part of the boot layer
