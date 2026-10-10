@@ -67,8 +67,8 @@ All notable changes to LUMEN are documented here. The format is based on
   `contracts/lab-events.schema.json` is gone) and CI fails on drift from
   `meilisearch/lab` once the `LAB_REPO_TOKEN` secret is set. An event the Lab
   answers with a `2xx` but keeps out of `accepted` is dropped 24 h after the
-  first such answer, with an error log and `lumen_usage_events_dropped_total`
-  (migration 0013 adds `usage_outbox.first_skipped_ms`, when that clock
+  first such answer, with an error log, `lumen_usage_events_dropped_total`
+  and the starter alert `LumenUsageEventsDropped` (migration 0013 adds `usage_outbox.first_skipped_ms`, when that clock
   started, and `usage_outbox.dropped_ms`); a non-2xx answer or an
   unreachable Lab never starts or resets the clock, so an outage still never
   drops a bill.

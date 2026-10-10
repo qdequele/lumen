@@ -67,8 +67,11 @@ groups:
           summary: "more than 5% of requests are failing"
           description: "5xx responses exceed 5% of accounted requests over the last 5m."
 
-      # Billing usage events are durable and never dropped, but a control
-      # plane that stays unreachable or rejects them delays every bill.
+      # Billing usage events are durable: an unreachable or failing Lab never
+      # drops one, it only delays every bill. The one exception is the 24 h
+      # drop rule (contract v2 section 3.5): an event a reachable Lab keeps
+      # leaving out of `accepted` for 24 h is dropped (see
+      # LumenUsageEventsDropped below).
       - alert: LumenUsageEventsStuck
         expr: lumen_usage_events_oldest_pending_seconds > 900
         for: 5m
@@ -77,3 +80,14 @@ groups:
         annotations:
           summary: "billing usage events are not being delivered"
           description: "The oldest pending usage event is {{ $value }}s old; check lumen_usage_events_failed_total by reason."
+
+      # An event a reachable Lab kept leaving out of `accepted` for 24 h was
+      # dropped: that usage was never billed and must be reconciled with the
+      # Lab by hand before the 7-day purge removes the row.
+      - alert: LumenUsageEventsDropped
+        expr: increase(lumen_usage_events_dropped_total[1h]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "a billing usage event was dropped (runbook: docs/operations/lab-integration.md, \"Runbook: an event the Lab never accepts\")"
+          description: "{{ $value }} usage events were dropped in the last 1h after the Lab refused them for 24 h; the gateway logged each id at error level. That usage was never billed: reconcile it with the Lab before the 7-day purge."

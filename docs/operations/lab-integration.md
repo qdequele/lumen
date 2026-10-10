@@ -373,7 +373,11 @@ fires when `lumen_usage_events_oldest_pending_seconds > 900` for 5 minutes.
 Serving is unaffected while it fires, but every bill is delayed. Look at
 `lumen_usage_events_failed_total` by `reason`: `auth` is a secret mismatch,
 `connect` and `timeout` are reachability, `status` is a Lab-side error, and
-`not_accepted` is the Lab skipping events.
+`not_accepted` is the Lab skipping events. A second starter alert,
+`LumenUsageEventsDropped`, fires on
+`increase(lumen_usage_events_dropped_total[1h]) > 0`: an event was dropped
+under the 24 h rule and was never billed; follow the runbook below to
+reconcile it.
 
 ### Runbook: an event the Lab never accepts
 
