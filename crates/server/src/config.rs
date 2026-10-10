@@ -46,7 +46,7 @@ pub struct Config {
     #[serde(default)]
     pub providers: Vec<ProviderConfig>,
     /// Virtual models (ADR 014): public ids carrying routing logic (fallback,
-    /// split, switch, presets, SystemOne rerank remap) over the foundation
+    /// split, switch, presets, decisions rerank remap) over the foundation
     /// models. Dynamic layer.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub virtual_models: Vec<lumen_router::virtual_models::VirtualModelConfig>,
@@ -663,6 +663,15 @@ pub struct ProviderConfig {
     /// which takes precedence over the built-in default (issue #65).
     #[serde(default)]
     pub api_version: Option<String>,
+    /// `typesafe` kind only: the decisions endpoint path appended to
+    /// `base_url` (default `/v1/systemone`), for TypeSafe-format vendors
+    /// (ADR 017). Must start with `/`.
+    #[serde(default)]
+    pub decisions_path: Option<String>,
+    /// `typesafe` kind only: forward unknown top-level request fields
+    /// (default `true`); set `false` for vendors that reject them.
+    #[serde(default)]
+    pub forward_unknown_fields: Option<bool>,
     /// Per-provider first-token timeout override in ms (else the global
     /// [`ServerConfig::first_token_timeout_ms`]).
     #[serde(default)]
@@ -873,6 +882,29 @@ fn validate_provider_knobs(
                  (kind '{}' would ignore it)",
                 provider.name,
                 provider.kind.as_str()
+            )));
+        }
+    }
+    for (field, set) in [
+        ("decisions_path", provider.decisions_path.is_some()),
+        (
+            "forward_unknown_fields",
+            provider.forward_unknown_fields.is_some(),
+        ),
+    ] {
+        if set && provider.kind != ProviderKind::Typesafe {
+            return Err(err(format!(
+                "provider '{}': {field} is only supported by kind 'typesafe' (kind '{}' would ignore it)",
+                provider.name,
+                provider.kind.as_str()
+            )));
+        }
+    }
+    if let Some(path) = &provider.decisions_path {
+        if !path.starts_with('/') || path.trim() != path {
+            return Err(err(format!(
+                "provider '{}': decisions_path must start with '/' and carry no whitespace",
+                provider.name
             )));
         }
     }
@@ -1539,6 +1571,12 @@ impl Config {
         })?;
         apply_lab_env(&mut config, lookup);
         config.validate(path_label)?;
+        for message in legacy_spellings(figment) {
+            tracing::warn!(
+                config = %path_label,
+                "{message} (ADR 017); run `lumen config migrate` to rewrite it"
+            );
+        }
         Ok(config)
     }
 
@@ -1775,6 +1813,8 @@ impl Config {
                     .and_then(|var| std::env::var(var).ok()),
                 base_url: p.base_url.clone(),
                 api_version: p.api_version.clone(),
+                decisions_path: p.decisions_path.clone(),
+                forward_unknown_fields: p.forward_unknown_fields,
                 strict: p.strict,
                 connect_timeout_ms: p.connect_timeout_ms,
                 models: p
@@ -1806,6 +1846,83 @@ impl Config {
             })
             .collect()
     }
+}
+
+/// Spellings ADR 017 renamed, read from the raw document (the typed config
+/// already accepted them through serde aliases, so it cannot tell).
+#[derive(Deserialize, Default)]
+struct LegacyDoc {
+    #[serde(default)]
+    providers: Vec<LegacyProvider>,
+    #[serde(default)]
+    virtual_models: Vec<LegacyVirtual>,
+}
+#[derive(Deserialize, Default)]
+struct LegacyProvider {
+    #[serde(default)]
+    models: Vec<LegacyModel>,
+}
+#[derive(Deserialize, Default)]
+struct LegacyModel {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    capabilities: Vec<String>,
+}
+#[derive(Deserialize, Default)]
+struct LegacyVirtual {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    capability: String,
+    #[serde(default)]
+    targets: Vec<LegacyTarget>,
+}
+#[derive(Deserialize, Default)]
+struct LegacyTarget {
+    #[serde(default)]
+    remap: Option<LegacyRemap>,
+}
+#[derive(Deserialize, Default)]
+struct LegacyRemap {
+    #[serde(default)]
+    strategy: Option<String>,
+}
+
+/// One message per renamed spelling still in the document (ADR 017): the
+/// `systemone` capability and the `noul` remap strategy.
+pub(crate) fn legacy_spellings(figment: &Figment) -> Vec<String> {
+    let Ok(doc) = figment.extract::<LegacyDoc>() else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    for model in doc.providers.iter().flat_map(|p| &p.models) {
+        if model.capabilities.iter().any(|c| c == "systemone") {
+            found.push(format!(
+                "model '{}' uses capability \"systemone\", renamed \"decisions\"",
+                model.id
+            ));
+        }
+    }
+    for vm in &doc.virtual_models {
+        if vm.capability == "systemone" {
+            found.push(format!(
+                "virtual model '{}' uses capability \"systemone\", renamed \"decisions\"",
+                vm.id
+            ));
+        }
+        if vm
+            .targets
+            .iter()
+            .any(|t| t.remap.as_ref().and_then(|r| r.strategy.as_deref()) == Some("noul"))
+        {
+            found.push(format!(
+                "virtual model '{}' uses remap strategy \"noul\", renamed \"predicate\"",
+                vm.id
+            ));
+        }
+    }
+    found
 }
 
 #[cfg(test)]
@@ -2738,6 +2855,39 @@ mod tests {
     }
 
     #[test]
+    fn the_systemone_spellings_are_reported_for_a_boot_warning() {
+        let figment = Figment::new().merge(Toml::string(
+            r#"
+            [[providers]]
+            name = "typesafe"
+            kind = "typesafe"
+            [[providers.models]]
+            id = "jev"
+            capabilities = ["systemone"]
+            [[virtual_models]]
+            id = "jev-vm"
+            capability = "systemone"
+            strategy = "single"
+            targets = [{ model = "jev" }]
+            [[virtual_models]]
+            id = "rr"
+            capability = "rerank"
+            strategy = "single"
+            targets = [{ model = "jev", remap = { strategy = "noul" } }]
+        "#,
+        ));
+        let found = legacy_spellings(&figment);
+        assert_eq!(found.len(), 3, "{found:?}");
+        assert!(found
+            .iter()
+            .any(|s| s.contains("model 'jev'") && s.contains("\"decisions\"")));
+        assert!(found.iter().any(|s| s.contains("virtual model 'jev-vm'")));
+        assert!(found
+            .iter()
+            .any(|s| s.contains("virtual model 'rr'") && s.contains("\"predicate\"")));
+    }
+
+    #[test]
     fn config_debug_never_prints_preset_or_remap_text() {
         // Parsed only (a legacy rerank block would fail validation): Debug is
         // the leak surface, whatever the load outcome.
@@ -2748,7 +2898,7 @@ mod tests {
             kind = "typesafe"
             [[providers.models]]
             id = "jev"
-            capabilities = ["systemone"]
+            capabilities = ["decisions"]
             [providers.models.rerank]
             instructions = "SENTINEL-LEGACY"
             criteria.true = "SENTINEL-LEGACY-YES"
@@ -3003,6 +3153,41 @@ mod tests {
             specs[0].base_url.as_deref(),
             Some("https://my-resource.openai.azure.com?api-version=2023-05-15")
         );
+    }
+
+    #[test]
+    fn decisions_path_and_forward_unknown_fields_are_typesafe_only() {
+        let ok = r#"
+            [[providers]]
+            name = "liquid"
+            kind = "typesafe"
+            base_url = "https://api.liquid.ai"
+            decisions_path = "/decisions/v1/systemone"
+            forward_unknown_fields = false
+            [[providers.models]]
+            id = "d1"
+            capabilities = ["decisions"]
+        "#;
+        let cfg = load_str(ok).unwrap();
+        let spec = &cfg.provider_specs()[0];
+        assert_eq!(
+            spec.decisions_path.as_deref(),
+            Some("/decisions/v1/systemone")
+        );
+        assert_eq!(spec.forward_unknown_fields, Some(false));
+
+        let wrong_kind = ok.replace(r#"kind = "typesafe""#, r#"kind = "perplexity""#);
+        let e = load_str(&wrong_kind).unwrap_err().to_string();
+        assert!(
+            e.contains("decisions_path") && e.contains("typesafe"),
+            "{e}"
+        );
+
+        let no_slash = ok.replace(r#""/decisions/v1/systemone""#, r#""decisions""#);
+        assert!(load_str(&no_slash)
+            .unwrap_err()
+            .to_string()
+            .contains("start with '/'"));
     }
 
     #[test]

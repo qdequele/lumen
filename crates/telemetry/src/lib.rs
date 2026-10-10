@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod decisions;
 pub mod latency;
 pub mod logging;
 pub mod metrics;
@@ -16,6 +17,7 @@ pub mod tokens;
 pub mod usage_events;
 pub mod webhooks;
 
+pub use decisions::DecisionMetrics;
 pub use latency::LatencyMetrics;
 pub use logging::init_logging;
 pub use metrics::Metrics;

@@ -25,9 +25,9 @@
 
 - [Reranking](reranking/reranking.md)
 
-# SystemOne (typed decisions)
+# Decisions (typed answers)
 
-- [SystemOne](systemone/systemone.md)
+- [Decisions](decisions/decisions.md)
 
 # Routing
 
@@ -74,6 +74,7 @@
 - [014 - Virtual models](adr/014-virtual-models.md)
 - [015 - Lab integration](adr/015-lab-integration.md)
 - [016 - The developer role and upstream error detail](adr/016-developer-role-and-upstream-error-detail.md)
+- [017 - Decisions capability](adr/017-decisions-capability.md)
 
 # Project
 

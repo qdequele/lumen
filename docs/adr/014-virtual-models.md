@@ -199,3 +199,9 @@ The goals are:
   named reusable remap templates (remaps are inline on a target); presets for
   capabilities other than chat; per-key model allow-lists and per-tenant
   BYOK.
+
+## Amendment (2026-10-08, ADR 017)
+
+A rerank `remap` targets any model serving `decisions`, not only Jev. The
+`noul` strategy is renamed `predicate`; `noul` stays accepted as an alias and
+`lumen config migrate` rewrites it.

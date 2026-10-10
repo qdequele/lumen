@@ -1,6 +1,6 @@
 //! Virtual models (ADR 014): admin-defined public ids that carry routing
 //! logic over the foundation models - `single`, `fallback`, `split` and
-//! `switch` strategies, per-target overrides, chat presets and a SystemOne
+//! `switch` strategies, per-target overrides, chat presets and a decisions
 //! rerank remap. Config is compiled once per load into a routing table; a
 //! request only runs a pure decide step.
 

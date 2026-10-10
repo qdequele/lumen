@@ -53,7 +53,9 @@ config_source = "file"
 [server]
 host = "127.0.0.1"        # bind address; use "0.0.0.0" in a container
 port = 8080               # must not be 0
-body_limit = 10485760     # max request body in bytes (10 MiB)
+body_limit = 10485760     # max request body in bytes (10 MiB). Raise to 33554432
+                          # (32 MiB) if /v1/decisions carries images (a 413 /
+                          # LM-1002 is the symptom).
 
 # How long to wait for the upstream's first sign of life before failing with
 # LM-3011 (504). Streaming: time to the first SSE frame. Non-streaming: the
@@ -328,13 +330,17 @@ health_check_interval_ms = 30000  # probe cadence (must not be 0 when enabled)
 # model on this provider, callable directly by its id.
 #   id            the id clients send (owned entirely by you)
 #   upstream_id   what LUMEN sends upstream (defaults to `id`)
-#   capabilities  any of: "chat", "embed", "rerank", "systemone" (a typesafe
-#                 model serves "systemone" only; Jev reranks through a virtual
-#                 model `remap`, see below)
+#   capabilities  any of: "chat", "embed", "rerank", "decisions" (ADR 017; the
+#                 old spelling "systemone" is still accepted with a boot
+#                 warning, `lumen config migrate` rewrites it). A typesafe
+#                 model serves "decisions" only; any decision model can be
+#                 reranked through a virtual model `remap`, see below. The
+#                 kinds that serve "decisions": typesafe, perplexity, openai,
+#                 ollama, cloudflare.
 #   modalities    input modalities; defaults to ["text"]. Add "image" to accept
-#                 image content parts on chat (vision) and /v1/embeddings (M9).
-#                 Image input to a model without "image" is rejected with
-#                 LM-2003.
+#                 image content parts on chat (vision), /v1/embeddings (M9) and
+#                 /v1/decisions. Image input to a model without "image" is
+#                 rejected with LM-2003.
 #   cost_per_1m_input / cost_per_1m_output / cost_per_1k_searches
 #                 optional prices (USD), the source of cost counting and hard
 #                 budgets
@@ -384,6 +390,16 @@ cost_per_1m_output = 10.0
 [[providers.models]]
 id = "text-embedding-3-small"
 capabilities = ["embed"]
+
+# OpenAI decision model (POST /v1/decisions, public beta): typed answers with
+# calibrated probabilities. Priced on input tokens only. Uncomment to enable;
+# docs/decisions/decisions.md. Needs a choice with at least 2 options and at
+# most 128 images per request.
+# [[providers.models]]
+# id = "gpt-6-luna"
+# capabilities = ["decisions"]
+# modalities = ["text", "image"]
+# cost_per_1m_input = 0.10
 
 # Anthropic: chat (bidirectional OpenAI <-> Anthropic translation). The second
 # target of the `gpt-4o` virtual model below: the same capability from a
@@ -508,6 +524,14 @@ id = "nomic-embed"
 upstream_id = "nomic-embed-text"
 capabilities = ["embed"]
 
+# Local decision model (Ollama 0.35+, `ollama pull nimble`), served on Ollama's
+# POST /v1/systemone. Free (cost 0). Choice and score questions take 2 to 26
+# options or levels. Only the `clef` and `clef-flash` models accept images.
+# [[providers.models]]
+# id = "nimble"
+# upstream_id = "nimble"
+# capabilities = ["decisions"]
+
 # Cohere: embeddings + reranking. A single model can serve BOTH capabilities.
 [[providers]]
 name = "cohere"
@@ -580,20 +604,28 @@ id = "pinecone-rerank"
 upstream_id = "pinecone-rerank-v0"
 capabilities = ["rerank"]
 
-# TypeSafe: SystemOne typed decisions (Jev), served on POST /v1/systemone
-# (ADR 013, docs/systemone/systemone.md). Bearer auth; api_key_env is required.
+# TypeSafe: typed decisions (Jev), served on POST /v1/decisions (ADR 017,
+# docs/decisions/decisions.md). Bearer auth; api_key_env is required.
 # base_url defaults to https://api.typesafe.ai (a trailing /v1 is tolerated).
-# The TypeSafe SDKs work unchanged with TYPESAFE_BASE_URL set to this gateway.
+# The upstream path defaults to /v1/systemone. Two optional fields, accepted on
+# kind = "typesafe" only, make this the generic TypeSafe-format kind:
+#   decisions_path          path appended to base_url, must start with "/"
+#                           (default: "/v1/systemone")
+#   forward_unknown_fields  forward unknown top-level request fields upstream
+#                           (default: true); set false for a vendor that
+#                           rejects them, as Perplexity does
 [[providers]]
 name = "typesafe"
 kind = "typesafe"
 api_key_env = "TYPESAFE_API_KEY"
 # base_url = "https://api.typesafe.ai"   # optional override
+# decisions_path = "/v1/systemone"       # optional, default shown
+# forward_unknown_fields = true          # optional, default shown
 
 [[providers.models]]
 id = "jev"
 upstream_id = "jev-latest"   # stable alias; also jev-preview, or a version
-capabilities = ["systemone"]
+capabilities = ["decisions"]
 # Jev bills input tokens only: no cost_per_1m_output needed.
 cost_per_1m_input = 0.042
 
@@ -602,8 +634,57 @@ cost_per_1m_input = 0.042
 [[providers.models]]
 id = "typesafe/jev-1.13.0"
 upstream_id = "jev-1.13.0"
-capabilities = ["systemone"]
+capabilities = ["decisions"]
 cost_per_1m_input = 0.042
+
+# Another TypeSafe-format vendor on the same kind: Liquid d1. Unverified:
+# set forward_unknown_fields = true if Liquid accepts unknown fields.
+# Inception Mercury Decide: base_url "https://api.inceptionlabs.ai" with
+# decisions_path "/v1/decisions". A self-hosted Kev (`kev.serve`) uses the
+# default "/v1/systemone" on its own base_url. See docs/providers.md#typesafe.
+# [[providers]]
+# name = "liquid"
+# kind = "typesafe"
+# base_url = "https://api.liquid.ai"
+# decisions_path = "/decisions/v1/systemone"
+# forward_unknown_fields = false
+# api_key_env = "LIQUID_API_KEY"
+# [[providers.models]]
+# id = "liquid-d1"
+# upstream_id = "d1"
+# capabilities = ["decisions"]
+
+# Perplexity: decision models (pplx-decider-*) on POST /v1/decisions, and chat
+# models on the same provider block. Bearer auth. base_url defaults to
+# https://api.perplexity.ai. Unknown fields are stripped (Perplexity answers
+# 400 to them); at most 128 questions per request; images go in `state`.
+# Priced on input only ($0.02 per 1M).
+# [[providers]]
+# name = "perplexity"
+# kind = "perplexity"
+# api_key_env = "PERPLEXITY_API_KEY"
+# [[providers.models]]
+# id = "pplx-decider"
+# upstream_id = "pplx-decider-v1.1-27b"
+# capabilities = ["decisions"]
+# modalities = ["text", "image"]
+# cost_per_1m_input = 0.02
+
+# Cloudflare Workers AI Clef: decisions on /ai/run/@cf/cloudflare/{upstream_id}
+# (base_url is the same account URL used for chat; see docs/providers.md).
+# At most 64 questions and 4 images per request. upstream_id is clef or
+# clef-flash.
+# [[providers]]
+# name = "cf"
+# kind = "cloudflare"
+# api_key_env = "CLOUDFLARE_API_TOKEN"
+# base_url = "https://api.cloudflare.com/client/v4/accounts/YOUR_ACCOUNT_ID/ai/v1"
+# [[providers.models]]
+# id = "clef"
+# upstream_id = "clef"
+# capabilities = ["decisions"]
+# modalities = ["text", "image"]
+# cost_per_1m_input = 0.24
 
 # NVIDIA NIM: reranking via `{base}/v1/ranking`. base_url REQUIRED (the NIM
 # root); keyless for self-hosted NIMs (set api_key_env for the hosted API).
@@ -680,8 +761,9 @@ capabilities = ["chat"]
 #
 # Fields of a `[[virtual_models]]` entry:
 #   id           the id clients send, e.g. "acme/legal-rerank" (required)
-#   capability   exactly one of "chat", "embed", "rerank", "systemone"
-#                (required); define two ids to serve two capabilities
+#   capability   exactly one of "chat", "embed", "rerank", "decisions"
+#                (required; "systemone" is accepted as an alias of
+#                "decisions"); define two ids to serve two capabilities
 #   strategy     how `targets` are used (required):
 #                  "single"   the one target (exactly 1 target)
 #                  "fallback" targets in order, moving to the next when the
@@ -705,21 +787,25 @@ capabilities = ["chat"]
 #                             presence_penalty, frequency_penalty,
 #                             response_format, reasoning_effort,
 #                             parallel_tool_calls; embed dimensions,
-#                             encoding_format; rerank top_n; systemone none.
+#                             encoding_format; rerank top_n; decisions none.
 #                             The level closest to the foundation leaf wins.
 #                  remap      rerank virtual models only, on a target that
 #                             points directly at a foundation model serving
-#                             "systemone": converts /v1/rerank into Jev
-#                             SystemOne calls. `strategy` is "noul" (default:
+#                             "decisions" (any vendor): converts /v1/rerank
+#                             into decision calls. `strategy` is "predicate"
+#                             (default; "noul" is accepted as an alias, and
+#                             `lumen config migrate` rewrites it; fields
 #                             `instructions`, `criteria.true`,
 #                             `criteria.false`), "score" (`instructions`,
 #                             `levels`, worst first), "composite" (1 to 8
 #                             `questions`, each with `instructions`,
 #                             `criteria`, `weight`) or "choice"
 #                             (`instructions`; the documents are the options,
-#                             at most 255 in one call). An optional `context`
-#                             is sent in the SystemOne state. Cost is the
-#                             SystemOne model's cost_per_1m_input.
+#                             at most 255 in one call, fewer on a target with a
+#                             lower option limit such as Ollama's 26). An
+#                             optional `context` is sent in the state. Packing
+#                             follows the target's limits. Cost is the
+#                             decision model's cost_per_1m_input.
 #   fallback_on  "fallback" and "split" only. Triggers that move to the next
 #                target. Default:
 #                ["provider_error", "rate_limited", "timeout", "circuit_open"]
@@ -782,14 +868,25 @@ targets = [{ model = "cohere/rerank-english" }, { model = "jina-rerank" }, { mod
 # open.
 [[virtual_models]]
 id = "jev-1.13.0"
-capability = "systemone"
+capability = "decisions"
 strategy = "fallback"
 targets = [{ model = "typesafe/jev-1.13.0" }, { model = "jev" }]
 
-# Jev as a reranker: POST /v1/rerank on `jev-rerank` is converted to SystemOne
-# calls on `jev` whose state is the query and whose questions are one noul per
-# document; the noul is the relevance_score. Every remap field is optional
-# (the defaults are a generic relevance question).
+# Cross-vendor fallback: Perplexity first (cheapest), then Jev, then OpenAI's
+# gpt-6-luna. Needs the `pplx-decider` and `gpt-6-luna` models, commented out
+# above. A target that cannot take the request (an image for Jev, a one-option
+# choice for OpenAI) is skipped before any upstream call. Add
+# fallback_on = ["content_filter"] to also move on when a model refuses.
+# [[virtual_models]]
+# id = "cross"
+# capability = "decisions"
+# strategy = "fallback"
+# targets = [{ model = "pplx-decider" }, { model = "jev" }, { model = "gpt-6-luna" }]
+
+# Jev as a reranker: POST /v1/rerank on `jev-rerank` is converted to decision
+# calls on `jev` whose state is the query and whose questions are one predicate
+# per document; the predicate probability is the relevance_score. Every remap
+# field is optional (the defaults are a generic relevance question).
 [[virtual_models]]
 id = "jev-rerank"
 capability = "rerank"
@@ -799,7 +896,7 @@ description = "Jev relevance reranking"
 [[virtual_models.targets]]
 model = "jev"
 [virtual_models.targets.remap]
-strategy = "noul"
+strategy = "predicate"
 instructions = "Is `document` relevant to the query in the state, that is, does it answer the query or contain information that directly helps answer it?"
 criteria.true = "The document answers the query or contains information that directly helps answer it."
 criteria.false = "The document is off-topic, or only shares keywords with the query without helping answer it."

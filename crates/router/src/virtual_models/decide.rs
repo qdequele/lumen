@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use lumen_core::{Capability, GatewayError};
-use lumen_providers::typesafe::rerank::RerankTemplate;
+use lumen_providers::decisions::rerank::RerankTemplate;
 
 use super::condition::FactSource;
 use super::overrides::{apply_chain, effective_field, Overridable, Overrides, Preset};
@@ -23,7 +23,7 @@ pub struct Attempt {
     pub path: String,
     /// Override levels, outermost first.
     pub overrides: Vec<Arc<Overrides>>,
-    /// Rerank remap through a SystemOne model, if any.
+    /// Rerank remap through a decision model, if any.
     pub remap: Option<Arc<RerankTemplate>>,
     /// Where to continue on failure, innermost first.
     pub escapes: Vec<Escape>,
@@ -126,12 +126,29 @@ impl Decision {
     /// Drop the attempts whose `keep` entry is false (the primary is always
     /// kept) and rewire escapes to the next surviving attempt.
     pub fn retain_mask(&mut self, keep: &[bool]) {
+        self.retain(keep, true);
+    }
+
+    /// Like [`Decision::retain_mask`], but the primary is dropped too when
+    /// its `keep` entry is false: the first surviving attempt becomes the
+    /// primary (a decisions target incompatible with the request, ADR 017).
+    /// A mask that keeps nothing changes nothing, so the decision is never
+    /// left empty.
+    pub fn retain_compatible(&mut self, keep: &[bool]) {
         let n = self.attempts.len();
-        if (1..n).all(|i| keep.get(i).copied().unwrap_or(true)) {
+        if (0..n).any(|i| keep.get(i).copied().unwrap_or(true)) {
+            self.retain(keep, false);
+        }
+    }
+
+    fn retain(&mut self, keep: &[bool], keep_primary: bool) {
+        let n = self.attempts.len();
+        let first = usize::from(keep_primary);
+        if (first..n).all(|i| keep.get(i).copied().unwrap_or(true)) {
             return;
         }
         let kept: Vec<bool> = (0..n)
-            .map(|i| i == 0 || keep.get(i).copied().unwrap_or(true))
+            .map(|i| (keep_primary && i == 0) || keep.get(i).copied().unwrap_or(true))
             .collect();
         let mut new_index = vec![usize::MAX; n];
         let mut count = 0;
@@ -591,5 +608,22 @@ mod tests {
         let mut d = Decision::linear(["a", "b"].map(str::to_owned));
         d.retain_mask(&[false, true]);
         assert_eq!(ids(&d), vec!["a", "b"], "the primary is never removed");
+    }
+
+    #[test]
+    fn retain_compatible_can_drop_the_primary() {
+        let mut d = Decision::linear(["a", "b", "c"].map(str::to_owned));
+        d.retain_compatible(&[false, true, true]);
+        assert_eq!(ids(&d), vec!["b", "c"]);
+        assert_eq!(
+            d.attempts[0].escapes,
+            vec![Escape {
+                on: Triggers::DEFAULT,
+                next: 1
+            }]
+        );
+        let mut d = Decision::linear(["a", "b"].map(str::to_owned));
+        d.retain_compatible(&[false, false]);
+        assert_eq!(ids(&d), vec!["a", "b"], "a mask keeping nothing is ignored");
     }
 }

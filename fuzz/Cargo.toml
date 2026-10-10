@@ -31,8 +31,8 @@ doc = false
 bench = false
 
 [[bin]]
-name = "systemone_request"
-path = "fuzz_targets/systemone_request.rs"
+name = "decisions_request"
+path = "fuzz_targets/decisions_request.rs"
 test = false
 doc = false
 bench = false

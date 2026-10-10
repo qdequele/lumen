@@ -19,7 +19,7 @@ use criterion::{criterion_group, criterion_main, Criterion};
 use futures::stream::BoxStream;
 use lumen_core::{
     ChatChoice, ChatMessage, ChatProvider, ChatRequest, ChatResponse, MessageContent,
-    ProviderError, SystemOneRequest, Usage,
+    ProviderError, Usage,
 };
 use lumen_router::circuit::{BreakerConfig, CircuitBreakers};
 use lumen_router::executor::{execute, ExecConfig, Link};
@@ -154,45 +154,71 @@ fn bench_json_roundtrip(c: &mut Criterion) {
     });
 }
 
-/// A SystemOne request body with `questions` mixed noul/choice/score
-/// questions and a string `state` of `state_bytes` bytes.
-fn systemone_body(questions: usize, state_bytes: usize) -> Vec<u8> {
+fn typesafe_body(questions: usize, state_bytes: usize) -> Vec<u8> {
+    let state = "x".repeat(state_bytes);
     let qs: Vec<String> = (0..questions)
-        .map(|i| match i % 3 {
-            0 => format!(r#""q{i}":{{"type":"noul","instructions":"Is this urgent?"}}"#),
-            1 => format!(
-                r#""q{i}":{{"type":"choice","instructions":"Which team?","criteria":{{"billing":"Payments","technical":"Bugs","sales":null}}}}"#
-            ),
-            _ => format!(
-                r#""q{i}":{{"type":"score","instructions":"How angry?","criteria":["Calm","Frustrated","Very angry"]}}"#
-            ),
-        })
+        .map(|i| format!(r#""q{i}":{{"type":"noul","instructions":"Is item {i} relevant?","criteria":{{"true":"yes","false":"no"}}}}"#))
         .collect();
     format!(
-        r#"{{"model":"jev-latest","state":"{}","questions":{{{}}}}}"#,
-        "a".repeat(state_bytes),
+        r#"{{"model":"jev","state":"{state}","questions":{{{}}}}}"#,
         qs.join(",")
     )
     .into_bytes()
 }
 
-/// The per-request SystemOne pipeline (ADR 013): parse + validate + estimate,
-/// then one attempt's clone + upstream serialization, for a small request
-/// and a max-size one (128 KB state, 300 questions).
-fn bench_systemone(c: &mut Criterion) {
+fn openai_body(questions: usize, input_bytes: usize) -> Vec<u8> {
+    let input = "x".repeat(input_bytes);
+    let qs: Vec<String> = (0..questions)
+        .map(|i| {
+            format!(
+                r#"{{"type":"predicate","name":"q{i}","instructions":"Is item {i} relevant?"}}"#
+            )
+        })
+        .collect();
+    format!(
+        r#"{{"model":"luna","input":"{input}","questions":[{}]}}"#,
+        qs.join(",")
+    )
+    .into_bytes()
+}
+
+/// `/v1/decisions` pipeline: parse + estimate + one attempt's encode
+/// (passthrough), and parse + cross-vendor encode (translation). ADR 017.
+fn bench_decisions(c: &mut Criterion) {
+    use lumen_core::decisions::format::parse;
+    use lumen_providers::decisions::{family, openai};
+    let ts = family::FamilyProfile::typesafe(true);
     for (name, body) in [
-        ("small", systemone_body(3, 1024)),
-        ("large", systemone_body(300, 128 * 1024)),
+        ("typesafe_small", typesafe_body(3, 1024)),
+        ("typesafe_large", typesafe_body(300, 128 * 1024)),
+        ("openai_small", openai_body(3, 1024)),
+        ("openai_large", openai_body(128, 128 * 1024)),
     ] {
-        c.bench_function(&format!("systemone_request_pipeline_{name}"), |b| {
+        c.bench_function(&format!("decisions_passthrough_{name}"), |b| {
             b.iter(|| {
-                let req: SystemOneRequest =
-                    serde_json::from_slice(black_box(&body)).expect("parse");
-                req.validate().expect("valid");
-                black_box(lumen_core::tokens::estimate_systemone(&req));
+                let (_, req) = parse(black_box(&body), None).expect("parse");
+                black_box(lumen_core::tokens::estimate_decisions(&req));
                 let mut attempt = req.clone();
-                "jev-1.13.0".clone_into(&mut attempt.model);
-                black_box(serde_json::to_vec(&attempt).expect("serialize").len());
+                "upstream".clone_into(&mut attempt.model);
+                let bytes = if name.starts_with("typesafe") {
+                    let ids = family::wire_ids(attempt.questions());
+                    family::encode(&attempt, "upstream", &ts, &ids).expect("encode")
+                } else {
+                    openai::encode(&attempt, "upstream").expect("encode")
+                };
+                black_box(bytes.len());
+            });
+        });
+        c.bench_function(&format!("decisions_cross_vendor_{name}"), |b| {
+            b.iter(|| {
+                let (_, req) = parse(black_box(&body), None).expect("parse");
+                let bytes = if name.starts_with("typesafe") {
+                    openai::encode(&req, "gpt-6-luna").expect("encode")
+                } else {
+                    let ids = family::wire_ids(req.questions());
+                    family::encode(&req, "jev-latest", &ts, &ids).expect("encode")
+                };
+                black_box(bytes.len());
             });
         });
     }
@@ -202,6 +228,6 @@ criterion_group!(
     benches,
     bench_executor,
     bench_json_roundtrip,
-    bench_systemone
+    bench_decisions
 );
 criterion_main!(benches);

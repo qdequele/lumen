@@ -1,0 +1,1 @@
+{"model":"jev-latest","state":{"zeta":"café\n","alpha":[1,2]},"questions":{"urgent":{"type":"noul","instructions":{"q":"urgent?"},"criteria":{"true":"yes"}},"team":{"type":"choice","instructions":"Which team?","criteria":{"tech":"Bugs","billing":null}},"mood":{"type":"score","instructions":"Mood?","criteria":["calm","angry"]}},"future_flag":true}

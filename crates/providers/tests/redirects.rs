@@ -139,6 +139,8 @@ async fn key_check_reports_a_redirect_without_following_it() {
             modalities: vec!["text".to_owned()],
             release_date: None,
         }],
+        decisions_path: None,
+        forward_unknown_fields: None,
     };
     let registry = Registry::build(vec![spec], http::build_client(), Duration::from_secs(30))
         .expect("registry builds");

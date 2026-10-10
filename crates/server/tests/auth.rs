@@ -66,6 +66,8 @@ fn full_registry(upstream: &str) -> Arc<Registry> {
                     release_date: None,
                 },
             ],
+            decisions_path: None,
+            forward_unknown_fields: None,
         },
         ProviderSpec {
             name: "cohere".to_owned(),
@@ -82,6 +84,8 @@ fn full_registry(upstream: &str) -> Arc<Registry> {
                 modalities: vec!["text".to_owned()],
                 release_date: None,
             }],
+            decisions_path: None,
+            forward_unknown_fields: None,
         },
         ProviderSpec {
             name: "typesafe".to_owned(),
@@ -94,10 +98,12 @@ fn full_registry(upstream: &str) -> Arc<Registry> {
             models: vec![ModelSpec {
                 id: "jev".to_owned(),
                 upstream_id: "jev-latest".to_owned(),
-                capabilities: vec![Capability::SystemOne],
+                capabilities: vec![Capability::Decisions],
                 modalities: vec!["text".to_owned()],
                 release_date: None,
             }],
+            decisions_path: None,
+            forward_unknown_fields: None,
         },
         ProviderSpec {
             name: "tei".to_owned(),
@@ -114,6 +120,8 @@ fn full_registry(upstream: &str) -> Arc<Registry> {
                 modalities: vec!["text".to_owned()],
                 release_date: None,
             }],
+            decisions_path: None,
+            forward_unknown_fields: None,
         },
     ];
     Arc::new(
@@ -155,7 +163,7 @@ fn dollar_pricing() -> CostTable {
         kind = "typesafe"
         [[providers.models]]
         id = "jev"
-        capabilities = ["systemone"]
+        capabilities = ["decisions"]
         # Input-only pricing, like Jev itself: output tokens are free.
         cost_per_1m_input = 1000000.0
     "#;
@@ -539,7 +547,7 @@ async fn exhausted_budget_is_402_fg4001_with_zero_upstream_calls() {
 
 #[tokio::test]
 async fn systemone_budget_is_enforced_before_the_upstream_call() {
-    // ADR 013: SystemOne admission reserves the state+questions input
+    // ADR 017: decisions admission reserves the state+questions input
     // estimate (several tokens, i.e. several dollars here) like any other
     // capability; a key that cannot cover it never reaches TypeSafe.
     let upstream = MockServer::start().await;
@@ -585,7 +593,7 @@ async fn systemone_usage_row_records_tokens_and_input_only_cost() {
     // Columns: model|model_used|capability|tokens_in|tokens_out|search_units|
     // cached|reasoning|cache_write|estimated|cost.
     assert!(
-        dump.contains("'jev'|'jev'|'systemone'|5|20|NULL|NULL|NULL|NULL|0|5.0|"),
+        dump.contains("'jev'|'jev'|'decisions'|5|20|NULL|NULL|NULL|NULL|0|5.0|"),
         "dump:\n{dump}"
     );
     // The request content never reaches the usage log.
@@ -617,7 +625,7 @@ async fn jev_rerank_is_billed_per_input_token() {
         kind = "typesafe"
         [[providers.models]]
         id = "jev"
-        capabilities = ["systemone"]
+        capabilities = ["decisions"]
         [[virtual_models]]
         id = "jev-rerank"
         capability = "rerank"

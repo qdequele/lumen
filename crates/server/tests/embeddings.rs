@@ -47,6 +47,8 @@ fn registry_for(upstream: &str) -> Arc<Registry> {
                 release_date: None,
             },
         ],
+        decisions_path: None,
+        forward_unknown_fields: None,
     }];
     Arc::new(
         Registry::build(
@@ -76,6 +78,8 @@ fn registry_for_cohere(upstream: &str) -> Arc<Registry> {
             modalities: vec!["text".to_owned()],
             release_date: None,
         }],
+        decisions_path: None,
+        forward_unknown_fields: None,
     }];
     Arc::new(
         Registry::build(
@@ -184,6 +188,8 @@ async fn token_input_to_text_only_provider_is_400_fg1001_without_upstream_call()
             modalities: vec!["text".to_owned()],
             release_date: None,
         }],
+        decisions_path: None,
+        forward_unknown_fields: None,
     }];
     let registry = Arc::new(
         Registry::build(

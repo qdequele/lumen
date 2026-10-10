@@ -783,7 +783,7 @@ mod tests {
         let attempt_ids = |model: &str| -> Vec<String> {
             t.resilience
                 .decide(lumen_core::Capability::Chat, model, |_| {
-                    crate::facts::Facts::systemone(&headers, None)
+                    crate::facts::Facts::decisions(&headers, None)
                 })
                 .unwrap()
                 .attempts
@@ -1306,6 +1306,8 @@ mod tests {
                 strict: false,
                 connect_timeout_ms: None,
                 models: Vec::new(),
+                decisions_path: None,
+                forward_unknown_fields: None,
             },
             ProviderSpec {
                 name: "from-db".to_owned(),
@@ -1316,6 +1318,8 @@ mod tests {
                 strict: false,
                 connect_timeout_ms: None,
                 models: Vec::new(),
+                decisions_path: None,
+                forward_unknown_fields: None,
             },
         ];
         let mut backfill = HashMap::new();

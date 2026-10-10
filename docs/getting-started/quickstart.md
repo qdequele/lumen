@@ -115,5 +115,5 @@ non-empty: an empty list is rejected with `LM-2010`.
 - [Chat completions](../chat/completions.md)
 - [Embeddings](../embeddings/embeddings.md)
 - [Reranking](../reranking/reranking.md)
-- [SystemOne (typed decisions)](../systemone/systemone.md)
+- [Decisions (typed answers)](../decisions/decisions.md)
 - [Token accounting](../operations/token-accounting.md)

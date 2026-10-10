@@ -1,0 +1,1 @@
+{"model":"jev-latest","state":{"query":"which case \"cites\" Smith v. Jones?","context":"US case law"},"questions":{"rank":{"type":"choice","instructions":"Which document best answers?","criteria":{"d0":"Smith v. Jones (1999) held that cafés...","d1":"Unrelated text with a\nnewline","d2":"Third doc"}}}}

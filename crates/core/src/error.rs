@@ -316,7 +316,7 @@ pub enum GatewayError {
     #[error("`documents` must not be empty")]
     EmptyDocuments,
 
-    /// A SystemOne request supplied no questions to answer (ADR 013).
+    /// A decisions request supplied no questions to answer (ADR 017).
     #[error("`questions` must not be empty")]
     EmptyQuestions,
 
@@ -817,7 +817,7 @@ mod tests {
         );
         // Empty rerank documents (pinned by the M3 spec).
         assert_eq!(GatewayError::EmptyDocuments.code(), "LM-2010");
-        // Empty SystemOne questions (ADR 013).
+        // Empty decisions questions (ADR 017).
         assert_eq!(GatewayError::EmptyQuestions.code(), "LM-2011");
         // Classified upstream input refusals (ADR 014).
         assert_eq!(

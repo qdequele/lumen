@@ -150,6 +150,27 @@ where
     send(builder, provider, cancel).await
 }
 
+/// Like [`post_json`], for a body the caller already serialized (the
+/// decisions codecs write their JSON by hand to keep key order and raw
+/// values).
+pub async fn post_json_bytes(
+    client: &reqwest::Client,
+    url: &str,
+    body: Vec<u8>,
+    api_key: Option<&str>,
+    provider: &str,
+    cancel: &CancellationToken,
+) -> Result<Bytes, ProviderError> {
+    let mut builder = client
+        .post(url)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(body);
+    if let Some(key) = api_key {
+        builder = builder.bearer_auth(key);
+    }
+    send(builder, provider, cancel).await
+}
+
 /// Like [`post_json`], but applies arbitrary request headers instead of bearer
 /// auth. Used by providers whose auth is not a bearer token (e.g. Anthropic's
 /// `x-api-key` + `anthropic-version`). Header values must never be logged.
