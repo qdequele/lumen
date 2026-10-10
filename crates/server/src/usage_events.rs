@@ -178,8 +178,9 @@ impl UsageEventsSender {
             return Delivery::Delivered(done.len());
         }
         // The Lab is reachable and skipped these ids: the first skip starts
-        // a 24 h clock, and a skip 24 h later is permanent (account_not_owned,
-        // an unknown account, ...).
+        // a 24 h clock, and a skip 24 h later is permanent. The Lab skips an
+        // event only when its id, account_id, type, product or occurred_at is
+        // invalid, or its product differs from this instance's (spec 3.5).
         let rest: Vec<String> = rest.into_iter().map(|row| row.id.clone()).collect();
         let retry: Vec<String> = match self
             .store
