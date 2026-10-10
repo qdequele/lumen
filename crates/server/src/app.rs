@@ -355,3 +355,141 @@ fn admin_routes(state: &AppState) -> Router<AppState> {
             auth::require_master_key,
         ))
 }
+
+#[cfg(test)]
+mod routes_match_openapi {
+    use std::collections::BTreeSet;
+
+    /// Every `(METHOD, path)` this file mounts, parsed from its own source
+    /// (up to this test module): each `.route(<path>, <chain>)` call and
+    /// every `get(` / `post(` / `put(` / `patch(` / `delete(` inside that
+    /// call's parentheses. axum does not expose a route listing, and the
+    /// source is the truth. `<path>` is a string literal or a path constant
+    /// resolved by [`path_constant`]; a `.route(` call the parser cannot read
+    /// fails the test rather than going unchecked.
+    fn mounted() -> BTreeSet<(String, String)> {
+        let full = include_str!("app.rs");
+        let source = full
+            .split("mod routes_match_openapi {")
+            .next()
+            .unwrap_or(full);
+        let route = regex::Regex::new(r#"\.route\(\s*(?:"([^"]+)"|([A-Za-z_][A-Za-z0-9_:]*))\s*,"#)
+            .unwrap();
+        let method = regex::Regex::new(r"\b(get|post|put|patch|delete)\(").unwrap();
+        let calls = source.matches(".route(").count();
+        let mut parsed = 0;
+        let mut out = BTreeSet::new();
+        for found in route.captures_iter(source) {
+            parsed += 1;
+            let path = match (found.get(1), found.get(2)) {
+                (Some(literal), _) => literal.as_str().to_owned(),
+                (None, Some(constant)) => path_constant(constant.as_str()).to_owned(),
+                (None, None) => unreachable!("the regex captures one of the two"),
+            };
+            let rest = &source[found.get(0).unwrap().end()..];
+            let mut depth = 1_i32;
+            let mut end = rest.len();
+            for (i, c) in rest.char_indices() {
+                match c {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = i;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            for m in method.captures_iter(&rest[..end]) {
+                out.insert((m[1].to_uppercase(), normalize(&path)));
+            }
+        }
+        assert_eq!(
+            parsed, calls,
+            "a `.route(` call has a path the parser cannot read"
+        );
+        out
+    }
+
+    /// The value of a path constant mounted by name in `.route(...)`.
+    fn path_constant(name: &str) -> &'static str {
+        match name {
+            "decisions::SYSTEMONE_PATH" => crate::decisions::SYSTEMONE_PATH,
+            other => panic!("unknown route path constant `{other}`: add it here"),
+        }
+    }
+
+    /// `{*id}` (axum wildcard) and `{id}` document the same parameter.
+    fn normalize(path: &str) -> String {
+        path.replace("{*", "{")
+    }
+
+    fn spec() -> serde_json::Value {
+        serde_yaml_ng::from_str(include_str!("../../../docs/openapi.yaml")).unwrap()
+    }
+
+    fn documented() -> BTreeSet<(String, String)> {
+        let spec = spec();
+        let mut out = BTreeSet::new();
+        for (path, item) in spec["paths"].as_object().unwrap() {
+            for (method, _) in item.as_object().unwrap() {
+                if ["get", "post", "put", "patch", "delete"].contains(&method.as_str()) {
+                    out.insert((method.to_uppercase(), normalize(path)));
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn every_mounted_route_is_documented_and_nothing_else() {
+        let mounted = mounted();
+        assert!(
+            mounted.len() >= 30,
+            "the parser found too few routes: {mounted:?}"
+        );
+        assert_eq!(
+            mounted,
+            documented(),
+            "app.rs and docs/openapi.yaml disagree"
+        );
+    }
+
+    #[test]
+    fn the_spec_version_is_the_crate_version() {
+        let spec = spec();
+        assert_eq!(spec["openapi"], "3.1.0");
+        assert_eq!(spec["info"]["version"], env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
+    fn admin_routes_require_the_master_key_in_the_spec() {
+        let spec = spec();
+        for (path, item) in spec["paths"].as_object().unwrap() {
+            for (method, op) in item.as_object().unwrap() {
+                if !["get", "post", "put", "patch", "delete"].contains(&method.as_str()) {
+                    continue;
+                }
+                let schemes: Vec<&str> = op["security"]
+                    .as_array()
+                    .map(|reqs| {
+                        reqs.iter()
+                            .flat_map(|r| r.as_object().unwrap().keys())
+                            .map(String::as_str)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let expected: &[&str] = if path.starts_with("/admin/") {
+                    &["masterKey"]
+                } else if path.starts_with("/v1/") {
+                    &["virtualKey"]
+                } else {
+                    &[]
+                };
+                assert_eq!(schemes, expected, "{method} {path}");
+            }
+        }
+    }
+}
