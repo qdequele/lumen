@@ -25,6 +25,7 @@ pub mod lab_identity;
 pub mod lifecycle;
 pub mod metadata;
 pub mod models;
+pub mod openapi;
 pub mod pricing;
 pub mod reload;
 pub mod rerank;

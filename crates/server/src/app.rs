@@ -1,7 +1,7 @@
 //! Assembly of the axum application and its middleware stack.
 
 use crate::{
-    admin, admin_scope, auth, chat, decisions, embeddings, health, models, rerank, routes,
+    admin, admin_scope, auth, chat, decisions, embeddings, health, models, openapi, rerank, routes,
     state::AppState,
 };
 use axum::extract::{MatchedPath, Request, State};
@@ -42,8 +42,8 @@ use crate::error::ApiError;
 /// * `/health`, `/health/providers`, `/metrics` - operational, never
 ///   authenticated, no I/O (`/health` never depends on provider state);
 /// * `/v1/*` - the API surface; virtual-key auth when enabled (M5);
-/// * `/admin/*` - key management, budget webhooks and usage reporting; mounted
-///   only when auth
+/// * `/admin/*` and `/openapi.json` - key management, budget webhooks, usage
+///   reporting and the gateway's own OpenAPI document; mounted only when auth
 ///   is enabled, protected by the master key.
 ///
 /// The body-size limit is read from `state.body_limit` - the single source of
@@ -270,7 +270,8 @@ fn make_request_span<B>(request: &axum::http::Request<B>) -> tracing::Span {
 ///
 /// Two halves: the account routes (keys, groups, usage), which a control
 /// plane may scope to one account with `X-Lumen-Account-Ref`, and the
-/// platform routes (provider keys and checks, webhooks, config), which
+/// platform routes (provider keys and checks, webhooks, config,
+/// `/openapi.json`), which
 /// refuse a scoped call with `403 LM-4005` (platform contract v2 section
 /// 8.3, see [`admin_scope`]). The master key is checked first on both.
 fn admin_routes(state: &AppState) -> Router<AppState> {
@@ -347,6 +348,9 @@ fn admin_routes(state: &AppState) -> Router<AppState> {
             "/admin/config/{section}",
             get(admin::get_config_section).put(admin::put_config_section),
         )
+        // The gateway's own contract (docs/openapi.yaml as JSON). Not under
+        // `/admin`, but platform-only and master-key gated like it.
+        .route("/openapi.json", get(openapi::openapi_json))
         .route_layer(middleware::from_fn(admin_scope::platform_only));
     account
         .merge(platform)
@@ -481,7 +485,7 @@ mod routes_match_openapi {
                             .collect()
                     })
                     .unwrap_or_default();
-                let expected: &[&str] = if path.starts_with("/admin/") {
+                let expected: &[&str] = if path.starts_with("/admin/") || path == "/openapi.json" {
                     &["masterKey"]
                 } else if path.starts_with("/v1/") {
                     &["virtualKey"]

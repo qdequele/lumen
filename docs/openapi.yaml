@@ -11,14 +11,15 @@ info:
     `{"error": {"code": "LM-xxxx", "message": "...", "type": "..."}}`
     (see docs/errors.md); a body over `server.body_limit` is 413 `LM-1002`
     on every route, and a path that matches no route is 404 `LM-1003`.
-    `/admin/*` is mounted only when `[auth] enabled = true`. A control plane
-    sharing this gateway between accounts scopes an `/admin/*` call with
+    `/admin/*` and `/openapi.json` are mounted only when
+    `[auth] enabled = true`. A control plane sharing this gateway between
+    accounts scopes an `/admin/*` call with
     `X-Lumen-Account-Ref: <account uuid>` (platform contract v2 section
     8.3): keys, groups and usage are then filtered to groups with that
     `account_ref`, foreign ids are 404, creation is forced into the account,
     and the platform-only routes (provider keys and checks, webhooks,
-    config) answer 403 `LM-4005`. Source of truth: this file, pinned to the
-    router by a test in `crates/server/src/app.rs`.
+    config, this document) answer 403 `LM-4005`. Source of truth: this
+    file, pinned to the router by a test in `crates/server/src/app.rs`.
   license:
     name: Apache-2.0
 servers:
@@ -32,14 +33,14 @@ components:
     masterKey:
       type: http
       scheme: bearer
-      description: The `LUMEN_MASTER_KEY` value. Required on every `/admin/*` route (401 `LM-4004` otherwise).
+      description: The `LUMEN_MASTER_KEY` value. Required on every `/admin/*` route and on `/openapi.json` (401 `LM-4004` otherwise).
   parameters:
     AccountRef:
       name: X-Lumen-Account-Ref
       in: header
       required: false
       schema: { type: string, format: uuid }
-      description: Scope this call to one Lab account (platform contract v2 section 8.3). On the key, group and usage routes only that account's rows are visible and writable, and a value that is not exactly one UUID (or the header sent twice) is 400 `LM-1001`. On the platform-only routes (provider keys and checks, webhooks, config) the header, whatever its value, is refused with 403 `LM-4005`.
+      description: Scope this call to one Lab account (platform contract v2 section 8.3). On the key, group and usage routes only that account's rows are visible and writable, and a value that is not exactly one UUID (or the header sent twice) is 400 `LM-1001`. On the platform-only routes (provider keys and checks, webhooks, config, `/openapi.json`) the header, whatever its value, is refused with 403 `LM-4005`.
     IfMatch:
       name: If-Match
       in: header
@@ -797,6 +798,21 @@ paths:
           description: Text exposition format.
           content:
             text/plain: { schema: { type: string } }
+  /openapi.json:
+    parameters:
+      - $ref: "#/components/parameters/AccountRef"
+    get:
+      summary: This document as JSON (mounted with the admin surface, platform-only)
+      operationId: openapiJson
+      security: [{ masterKey: [] }]
+      responses:
+        "200":
+          description: The OpenAPI 3.1 document.
+          content:
+            application/json: { schema: { type: object, additionalProperties: true } }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "500": { $ref: "#/components/responses/Error" }
   /v1/models:
     get:
       summary: List models (foundation and listed virtual models)
