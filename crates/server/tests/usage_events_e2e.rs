@@ -1,8 +1,13 @@
-//! ADR 015 end to end on the real binary: a key in a Lab-linked lease spends,
-//! usage events reach a mock Lab (after one rejected delivery), a grant from
-//! the event's group snapshot keeps the key serving, SIGTERM delivers the
-//! final flush, and the signing secret never reaches the logs. Boot refuses a
-//! missing or blank secret and a non-UUID `account_ref` on a live group.
+//! ADR 015 end to end on the real binary: configured through `LAB_URL`,
+//! `LAB_INSTANCE_ID` and `LAB_INSTANCE_SECRET` only, boot confirms the
+//! instance identity (`GET /internal/instances/me`), a key in a Lab-linked
+//! lease spends, usage events reach a mock Lab signed as this instance (after
+//! one rejected delivery), a grant from the event's group snapshot keeps the
+//! key serving, SIGTERM delivers the final flush, and the instance secret
+//! never reaches the logs. Boot refuses a missing or blank secret, a
+//! non-UUID `account_ref` on a live group and an identity the Lab rejects;
+//! the deprecated `signing_key_env` alias still boots, with one warning and
+//! no secret in the logs.
 #![cfg(unix)]
 
 use serde_json::{json, Value};
@@ -104,8 +109,13 @@ fn collect(stdout: JoinHandle<String>, stderr: JoinHandle<String>) -> String {
 
 const MASTER: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const ACCOUNT: &str = "0192f3c1-7c2e-7b1a-9f00-3c9d2e4a5b61";
-/// The events signing secret: distinctive, so a leak into any log is found.
+/// The instance secret: distinctive, so a leak into any log is found.
 const SECRET: &str = "e2e-signing-secret-7f3a9c";
+/// The Lab instance id this deployment reports as.
+const INSTANCE: &str = "0192f3c1-7c2e-7b1a-9f00-3c9d2e4a5b71";
+/// The Lab settings read from the environment. Every spawned binary sets or
+/// removes each of them, so a value in the developer's shell never leaks in.
+const LAB_ENV: [&str; 3] = ["LAB_URL", "LAB_INSTANCE_ID", "LAB_INSTANCE_SECRET"];
 
 /// The mock Lab accepts every event id it receives and records the events it
 /// acknowledged, so a rejected batch is never counted as billed.
@@ -151,13 +161,26 @@ fn remove_db_files(db: &std::path::Path) {
     }
 }
 
+/// Serve this instance's identity on the mock Lab (`GET
+/// /internal/instances/me`, spec section 3.6), so boot confirms it.
+async fn mount_identity(lab: &MockServer) {
+    Mock::given(method("GET"))
+        .and(path("/internal/instances/me"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "instance_id": INSTANCE, "kind": "hosted", "product": "lumen",
+            "region": "eu-west-1", "lab_url": lab.uri()
+        })))
+        .mount(lab)
+        .await;
+}
+
 fn billed(events: &[Value]) -> i64 {
     events
         .iter()
         .map(|e| {
-            e["data"]["cost_micro_usd"]
+            e["data"]["provider_cost_micro_usd"]
                 .as_i64()
-                .expect("cost_micro_usd")
+                .expect("provider_cost_micro_usd")
         })
         .sum()
 }
@@ -193,6 +216,7 @@ async fn a_lease_is_billed_topped_up_and_flushed_on_shutdown() {
         .respond_with(accept.clone())
         .mount(&lab)
         .await;
+    mount_identity(&lab).await;
 
     let port = free_port();
     let db = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("usage-events-e2e.db");
@@ -210,11 +234,6 @@ enabled = true
 db_path = "{db}"
 flush_interval_ms = 200
 
-[usage_events]
-url = "{lab}"
-signing_key_env = "E2E_USAGE_EVENTS_SECRET"
-source = "e2e"
-
 [[providers]]
 name = "mock"
 kind = "openai"
@@ -229,7 +248,6 @@ cost_per_1m_input = 1000.0
 cost_per_1m_output = 1000.0
 "#,
             db = db.display(),
-            lab = lab.uri(),
             upstream = upstream.uri(),
         ),
     );
@@ -237,7 +255,9 @@ cost_per_1m_output = 1000.0
         .arg("--config")
         .arg(&config)
         .env("LUMEN_MASTER_KEY", MASTER)
-        .env("E2E_USAGE_EVENTS_SECRET", SECRET)
+        .env("LAB_URL", lab.uri())
+        .env("LAB_INSTANCE_ID", INSTANCE)
+        .env("LAB_INSTANCE_SECRET", SECRET)
         .env("E2E_UPSTREAM_KEY", "sk-test")
         .env("RUST_LOG", "debug")
         .stdout(Stdio::piped())
@@ -300,19 +320,35 @@ cost_per_1m_output = 1000.0
     let last = events.last().expect("at least one event");
     assert_eq!(last["account_id"], ACCOUNT);
     assert_eq!(last["api_key_id"], "lab-key-1");
-    assert_eq!(last["data"]["source"], "e2e");
-    assert!(lab.received_requests().await.expect("recorded")[0]
-        .headers
-        .contains_key("x-lab-signature"));
+    assert_eq!(last["data"]["operation"], "gateway");
+    // Both calls may land in one flush or two: compare the sums.
+    let unit = |name: &str| -> i64 {
+        events
+            .iter()
+            .map(|e| e["data"]["units"][name].as_i64().expect(name))
+            .sum()
+    };
+    assert_eq!(
+        (unit("requests"), unit("tokens_in"), unit("tokens_out")),
+        (2, 2000, 2000)
+    );
+    assert_eq!(unit("tokens_estimated"), 0, "upstream usage was reported");
+    let received = lab.received_requests().await.expect("recorded");
+    let first = received
+        .iter()
+        .find(|r| r.url.path() == "/internal/events")
+        .expect("an event delivery");
+    assert_eq!(
+        first
+            .headers
+            .get("x-lab-instance-id")
+            .map(|v| v.to_str().unwrap()),
+        Some(INSTANCE)
+    );
+    assert!(first.headers.contains_key("x-lab-timestamp"));
+    assert!(first.headers.contains_key("x-lab-signature"));
 
-    // The lease has $1 left: the Lab tops up from the event's snapshot.
-    let remaining = last["data"]["group"]["budget_max_micro"]
-        .as_i64()
-        .expect("budget_max_micro")
-        - last["data"]["group"]["spent_micro"]
-            .as_i64()
-            .expect("spent_micro");
-    assert!(remaining < 2_000_000);
+    // The lease has $1 left: the Lab tops it up (the top-up job is Lab-side).
     let grant = http
         .post(format!("{base}/admin/groups/{gid}/grant"))
         .bearer_auth(MASTER)
@@ -333,9 +369,13 @@ cost_per_1m_output = 1000.0
     // Always drain both streams: they are checked for the secret below.
     let output = collect(stdout, stderr);
     assert!(status.success(), "{status:?}\n{output}");
+    assert!(
+        output.contains("Lab instance identity confirmed"),
+        "{output}"
+    );
     assert_eq!(billed(&accept.events()), 6_000_000);
 
-    // The 401 branch ran (it is the one that names the signing secret) and
+    // The 401 branch ran (it is the one that names the instance secret) and
     // no log line at debug level carries the secret's value.
     assert!(
         output.contains("usage events rejected with 401"),
@@ -360,6 +400,9 @@ async fn boot_failure_output(unique: &str, toml: &str, env: &[(&str, &str)]) -> 
         .env_remove("E2E_UNSET_USAGE_EVENTS_SECRET")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    for name in LAB_ENV {
+        command.env_remove(name);
+    }
     for (name, value) in env {
         command.env(name, value);
     }
@@ -411,7 +454,8 @@ db_path = "{db}"
 
 [usage_events]
 url = "https://lab.example"
-signing_key_env = "E2E_UNSET_USAGE_EVENTS_SECRET"
+instance_id = "0192f3c1-7c2e-7b1a-9f00-3c9d2e4a5b71"
+secret_env = "E2E_UNSET_USAGE_EVENTS_SECRET"
 source = "e2e"
 "#,
             db = db.display()
@@ -455,7 +499,8 @@ db_path = "{db}"
 
 [usage_events]
 url = "https://lab.example"
-signing_key_env = "E2E_BADREF_USAGE_EVENTS_SECRET"
+instance_id = "0192f3c1-7c2e-7b1a-9f00-3c9d2e4a5b71"
+secret_env = "E2E_BADREF_USAGE_EVENTS_SECRET"
 source = "e2e"
 "#,
         db = db.display()
@@ -471,4 +516,117 @@ source = "e2e"
         !output.contains("acme"),
         "names only group ids, never the ref: {output}"
     );
+}
+
+/// An operator config still naming the secret with the deprecated
+/// `signing_key_env` alias keeps booting: one warning naming the replacement,
+/// and the secret it names never reaches a log line, even at debug level.
+#[tokio::test]
+async fn the_deprecated_signing_key_env_alias_still_boots_and_never_logs_the_secret() {
+    let lab = MockServer::start().await;
+    mount_identity(&lab).await;
+    let port = free_port();
+    let db = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("usage-events-alias.db");
+    remove_db_files(&db);
+    let config = write_temp_config(
+        "alias",
+        &format!(
+            r#"
+[server]
+host = "127.0.0.1"
+port = {port}
+
+[auth]
+enabled = true
+db_path = "{db}"
+
+[usage_events]
+url = "{lab}"
+instance_id = "{INSTANCE}"
+signing_key_env = "E2E_ALIAS_USAGE_EVENTS_SECRET"
+"#,
+            db = db.display(),
+            lab = lab.uri(),
+        ),
+    );
+    let mut command = Command::new(env!("CARGO_BIN_EXE_lumen"));
+    command
+        .arg("--config")
+        .arg(&config)
+        .env("LUMEN_MASTER_KEY", MASTER)
+        .env("E2E_ALIAS_USAGE_EVENTS_SECRET", SECRET)
+        .env("RUST_LOG", "debug")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for name in LAB_ENV {
+        command.env_remove(name);
+    }
+    let mut child = command.spawn().expect("spawn lumen binary");
+    let stdout = drain(child.stdout.take());
+    let stderr = drain(child.stderr.take());
+    wait_until_ready(&format!("http://127.0.0.1:{port}"), Duration::from_secs(10)).await;
+
+    send_signal(&child, libc::SIGTERM);
+    let status = wait_for_exit(&mut child, Duration::from_secs(15)).await;
+    let output = collect(stdout, stderr);
+    assert!(status.success(), "{status:?}\n{output}");
+    assert_eq!(
+        output
+            .matches("usage_events.signing_key_env is deprecated")
+            .count(),
+        1,
+        "one deprecation warning:\n{output}"
+    );
+    assert!(
+        output.contains("usage_events.secret_env"),
+        "the warning names the replacement:\n{output}"
+    );
+    assert!(
+        output.contains("Lab instance identity confirmed"),
+        "boot confirmed the identity with the aliased secret:\n{output}"
+    );
+    assert!(
+        !output.contains(SECRET),
+        "the secret named by the alias leaked into the logs"
+    );
+}
+
+#[tokio::test]
+async fn a_rejected_instance_identity_refuses_to_boot() {
+    let lab = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/internal/instances/me"))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&lab)
+        .await;
+    let port = free_port();
+    let db = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("usage-events-rejected.db");
+    remove_db_files(&db);
+    let toml = format!(
+        r#"
+[server]
+host = "127.0.0.1"
+port = {port}
+
+[auth]
+enabled = true
+db_path = "{db}"
+"#,
+        db = db.display()
+    );
+    let output = boot_failure_output(
+        "rejected",
+        &toml,
+        &[
+            ("LAB_URL", lab.uri().as_str()),
+            ("LAB_INSTANCE_ID", INSTANCE),
+            ("LAB_INSTANCE_SECRET", SECRET),
+        ],
+    )
+    .await;
+    assert!(
+        output.contains("rejected the instance credentials"),
+        "{output}"
+    );
+    assert!(!output.contains(SECRET), "the secret leaked: {output}");
 }

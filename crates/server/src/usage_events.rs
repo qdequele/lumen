@@ -1,7 +1,9 @@
 //! Billing usage-event delivery (ADR 015): pushes due outbox rows to the
 //! control plane in signed batches and marks what it acknowledges. Never on
-//! the request path; never drops an event; a failing control plane only
-//! delays delivery.
+//! the request path; a failing or unreachable control plane only delays
+//! delivery. The one drop: an event a reachable control plane kept out of
+//! `accepted` for [`REJECTION_TTL_MS`] since its first such answer
+//! (contract v2 section 3.5).
 
 use crate::webhooks::SigningKey;
 use lumen_auth::store::{KeyStore, OutboxRow};
@@ -11,15 +13,24 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
-/// Header carrying `sha256=<hex HMAC-SHA256 of the raw body>`.
+/// Header naming the reporting deployment (`LAB_INSTANCE_ID`).
+pub const INSTANCE_HEADER: &str = "X-Lab-Instance-Id";
+/// Header carrying the unix time (whole seconds) the signature covers.
+pub const TIMESTAMP_HEADER: &str = "X-Lab-Timestamp";
+/// Header carrying `sha256=<hex HMAC-SHA256(secret, "<timestamp>.<body>")>`.
 pub const SIGNATURE_HEADER: &str = "X-Lab-Signature";
 /// How often the sender polls the outbox when it is not draining a backlog.
 const POLL: Duration = Duration::from_secs(2);
 /// The pending and oldest-age gauges are re-read at most this often (ms):
 /// a scrape interval is coarser, and a backlog drain loops without waiting.
 const GAUGE_REFRESH_MS: i64 = 10_000;
-/// Delivered rows are kept this long, then purged.
+/// Delivered (and dropped) rows are kept this long, then purged.
 pub const DELIVERED_RETENTION_MS: i64 = 7 * 86_400_000;
+/// A row the Lab has kept out of `accepted` for this long, counted from the
+/// first 2xx answer that skipped it, is dropped (contract v2 section 3.5).
+/// Only such answers start the clock: an unreachable or failing Lab never
+/// drops a row, and a row skipped for the first time is never dropped.
+pub const REJECTION_TTL_MS: i64 = 24 * 3_600_000;
 
 /// The outcome of one delivery attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,11 +49,22 @@ struct Ack {
     accepted: Vec<String>,
 }
 
+/// `hex HMAC-SHA256(secret, "<timestamp>.<body>")`: the timestamp binds the
+/// signature to a 300 s window on the Lab side (spec section 3.4).
+pub(crate) fn sign_batch(key: &SigningKey, timestamp: &str, body: &[u8]) -> String {
+    let mut signed = Vec::with_capacity(timestamp.len() + 1 + body.len());
+    signed.extend_from_slice(timestamp.as_bytes());
+    signed.push(b'.');
+    signed.extend_from_slice(body);
+    key.sign(&signed)
+}
+
 /// Delivers billing usage events from the outbox.
 pub struct UsageEventsSender {
     store: KeyStore,
     client: reqwest::Client,
     endpoint: String,
+    instance_id: String,
     signing: SigningKey,
     batch_size: i64,
     metrics: UsageEventMetrics,
@@ -52,6 +74,7 @@ impl fmt::Debug for UsageEventsSender {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("UsageEventsSender")
             .field("endpoint", &self.endpoint)
+            .field("instance_id", &self.instance_id)
             .field("signing", &self.signing)
             .finish_non_exhaustive()
     }
@@ -65,6 +88,7 @@ impl UsageEventsSender {
         store: KeyStore,
         client: reqwest::Client,
         endpoint: String,
+        instance_id: String,
         signing: SigningKey,
         batch_size: usize,
         metrics: UsageEventMetrics,
@@ -73,6 +97,7 @@ impl UsageEventsSender {
             store,
             client,
             endpoint,
+            instance_id,
             signing,
             batch_size: i64::try_from(batch_size).unwrap_or(500),
             metrics,
@@ -94,11 +119,17 @@ impl UsageEventsSender {
         }
         let ids: Vec<String> = rows.iter().map(|r| r.id.clone()).collect();
         let body = batch_body(&rows);
-        let signature = format!("sha256={}", self.signing.sign(body.as_bytes()));
+        let timestamp = now_ms.div_euclid(1000).to_string();
+        let signature = format!(
+            "sha256={}",
+            sign_batch(&self.signing, &timestamp, body.as_bytes())
+        );
         let response = self
             .client
             .post(&self.endpoint)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .header(INSTANCE_HEADER, &self.instance_id)
+            .header(TIMESTAMP_HEADER, &timestamp)
             .header(SIGNATURE_HEADER, signature)
             .body(body)
             .send()
@@ -115,12 +146,12 @@ impl UsageEventsSender {
                 ("status", format!("HTTP {}", resp.status().as_u16()))
             }
             Ok(resp) => match resp.json::<Ack>().await {
-                Ok(ack) => return self.settle_ack(&ids, &ack.accepted, now_ms).await,
+                Ok(ack) => return self.settle_ack(&rows, &ack.accepted, now_ms).await,
                 Err(error) => ("malformed", error.without_url().to_string()),
             },
         };
         if reason == "auth" {
-            tracing::error!(endpoint = %self.endpoint, "usage events rejected with 401: check the signing secret");
+            tracing::error!(endpoint = %self.endpoint, "usage events rejected with 401: check LAB_INSTANCE_ID and the instance secret");
         } else {
             tracing::warn!(endpoint = %self.endpoint, reason, error = %detail, "usage events delivery failed; will retry");
         }
@@ -130,9 +161,10 @@ impl UsageEventsSender {
         Delivery::Failed
     }
 
-    async fn settle_ack(&self, ids: &[String], accepted: &[String], now_ms: i64) -> Delivery {
-        let (done, rest): (Vec<String>, Vec<String>) =
-            ids.iter().cloned().partition(|id| accepted.contains(id));
+    async fn settle_ack(&self, rows: &[OutboxRow], accepted: &[String], now_ms: i64) -> Delivery {
+        let (done, rest): (Vec<&OutboxRow>, Vec<&OutboxRow>) =
+            rows.iter().partition(|row| accepted.contains(&row.id));
+        let done: Vec<String> = done.into_iter().map(|row| row.id.clone()).collect();
         if let Err(error) = self.store.outbox_mark_delivered(&done, now_ms).await {
             // The Lab has them and dedups on id: a re-send is harmless.
             tracing::warn!(%error, "usage events: could not mark delivered rows");
@@ -142,14 +174,54 @@ impl UsageEventsSender {
         }
         self.metrics
             .add_delivered(u64::try_from(done.len()).unwrap_or(0));
-        if !rest.is_empty() {
+        if rest.is_empty() {
+            return Delivery::Delivered(done.len());
+        }
+        // The Lab is reachable and skipped these ids: the first skip starts
+        // a 24 h clock, and a skip 24 h later is permanent. The Lab skips an
+        // event only when its id, account_id, type, product or occurred_at is
+        // invalid, or its product differs from this instance's (spec 3.5).
+        let rest: Vec<String> = rest.into_iter().map(|row| row.id.clone()).collect();
+        let retry: Vec<String> = match self
+            .store
+            .outbox_record_skips(&rest, now_ms, REJECTION_TTL_MS)
+            .await
+        {
+            Ok(settled) => {
+                let mut retry = Vec::with_capacity(settled.len());
+                let mut dropped = 0_u64;
+                for row in settled {
+                    if row.dropped {
+                        dropped += 1;
+                        tracing::error!(
+                            event_id = %row.id,
+                            skipped_hours = now_ms.saturating_sub(row.first_skipped_ms) / 3_600_000,
+                            "usage event refused by the Lab for 24 h; dropped (see the body in usage_outbox)"
+                        );
+                    } else {
+                        retry.push(row.id);
+                    }
+                }
+                self.metrics.add_dropped(dropped);
+                retry
+            }
+            // Nothing was recorded: no clock started, nothing dropped. The
+            // rows are retried and the next skip records them.
+            Err(error) => {
+                tracing::warn!(%error, "usage events: could not record skipped rows");
+                rest
+            }
+        };
+        if !retry.is_empty() {
             tracing::warn!(
-                count = rest.len(),
+                count = retry.len(),
                 "usage events not accepted by the control plane; will retry"
             );
+            // Only rows that will be retried count here; a dropped row
+            // counts in `lumen_usage_events_dropped_total` alone.
             self.metrics
-                .inc_failed("not_accepted", u64::try_from(rest.len()).unwrap_or(0));
-            self.reschedule(&rest, now_ms).await;
+                .inc_failed("not_accepted", u64::try_from(retry.len()).unwrap_or(0));
+            self.reschedule(&retry, now_ms).await;
         }
         Delivery::Delivered(done.len())
     }
@@ -170,7 +242,7 @@ impl UsageEventsSender {
         }
     }
 
-    /// Purge delivered rows past retention.
+    /// Purge delivered and dropped rows past retention.
     pub async fn purge(&self, now_ms: i64) {
         if let Err(error) = self
             .store
@@ -245,10 +317,11 @@ mod tests {
     use super::*;
     use lumen_auth::store::{KeyStore, OutboxInsert};
     use lumen_telemetry::Metrics;
-    use wiremock::matchers::{header_exists, method, path};
+    use wiremock::matchers::{header, header_exists, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     const SECRET: &str = "test-events-secret";
+    const INSTANCE: &str = "0192f3c1-7c2e-7b1a-9f00-3c9d2e4a5b71";
 
     async fn sender(server: &MockServer, rows: &[&str]) -> (UsageEventsSender, KeyStore, Metrics) {
         let store = KeyStore::in_memory().await.unwrap();
@@ -271,6 +344,7 @@ mod tests {
                 std::time::Duration::from_secs(5),
             ),
             format!("{}/internal/events", server.uri()),
+            INSTANCE.to_owned(),
             SigningKey::new(SECRET.as_bytes().to_vec()),
             500,
             m,
@@ -279,11 +353,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delivers_a_signed_batch_and_marks_accepted_rows() {
+    async fn delivers_a_batch_signed_as_this_instance_and_marks_accepted_rows() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/internal/events"))
             .and(header_exists(SIGNATURE_HEADER))
+            .and(header(INSTANCE_HEADER, INSTANCE))
+            .and(header(TIMESTAMP_HEADER, "1700000000"))
             .respond_with(
                 ResponseTemplate::new(200).set_body_json(serde_json::json!({"accepted":["a","b"]})),
             )
@@ -291,16 +367,23 @@ mod tests {
             .mount(&server)
             .await;
         let (s, store, metrics) = sender(&server, &["a", "b"]).await;
-        assert_eq!(s.deliver_once(10).await, Delivery::Delivered(2));
+        // 1 700 000 000 s and 123 ms: the timestamp is whole seconds.
+        assert_eq!(
+            s.deliver_once(1_700_000_000_123).await,
+            Delivery::Delivered(2)
+        );
         let got = store.outbox_due(i64::MAX, 10).await.unwrap();
         assert!(got.is_empty(), "{got:?}");
 
         let req = &server.received_requests().await.unwrap()[0];
         let body = std::str::from_utf8(&req.body).unwrap();
         assert_eq!(body, r#"{"events":[{"id":"a"},{"id":"b"}]}"#);
+        // sha256=HMAC(secret, "<timestamp>.<body>"), spec section 3.4.
+        let mut signed = b"1700000000.".to_vec();
+        signed.extend_from_slice(req.body.as_slice());
         let expected = format!(
             "sha256={}",
-            SigningKey::new(SECRET.as_bytes().to_vec()).sign(req.body.as_slice())
+            SigningKey::new(SECRET.as_bytes().to_vec()).sign(&signed)
         );
         assert_eq!(
             req.headers.get(SIGNATURE_HEADER).unwrap().to_str().unwrap(),
@@ -482,6 +565,108 @@ mod tests {
         let server = MockServer::start().await;
         let (s, _, _) = sender(&server, &[]).await;
         assert!(!format!("{s:?}").contains(SECRET));
+    }
+
+    #[tokio::test]
+    async fn an_event_the_lab_keeps_skipping_is_dropped_24h_after_its_first_skip() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"accepted":[]})),
+            )
+            .mount(&server)
+            .await;
+        let (s, store, metrics) = sender(&server, &["a"]).await;
+        let t0 = 10;
+        // First skip: the clock starts, the row is kept and retried.
+        assert_eq!(s.deliver_once(t0).await, Delivery::Delivered(0));
+        assert_eq!(store.outbox_stats().await.unwrap().0, 1);
+        // 10 s short of 24 h after the first skip: still kept (and backed
+        // off by 4 s plus jitter, so due again at the 24 h mark).
+        assert_eq!(
+            s.deliver_once(t0 + REJECTION_TTL_MS - 10_000).await,
+            Delivery::Delivered(0)
+        );
+        assert_eq!(store.outbox_stats().await.unwrap().0, 1);
+        assert!(!metrics
+            .encode_text()
+            .contains("lumen_usage_events_dropped_total 1"));
+        // Exactly 24 h after the first skip: dropped.
+        assert_eq!(
+            s.deliver_once(t0 + REJECTION_TTL_MS).await,
+            Delivery::Delivered(0)
+        );
+        assert_eq!(store.outbox_stats().await.unwrap().0, 0, "a was dropped");
+        assert_eq!(
+            store.outbox_due(i64::MAX, 10).await.unwrap(),
+            [] as [OutboxRow; 0]
+        );
+        let text = metrics.encode_text();
+        assert!(
+            text.contains("lumen_usage_events_dropped_total 1\n"),
+            "{text}"
+        );
+        // The two retried rounds count; the dropping round does not.
+        assert!(
+            text.contains("lumen_usage_events_failed_total{reason=\"not_accepted\"} 2\n"),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lab_back_from_a_long_outage_does_not_drop_on_its_first_skip() {
+        const H: i64 = 3_600_000;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"accepted":[]})),
+            )
+            .mount(&server)
+            .await;
+        let (s, store, metrics) = sender(&server, &["a"]).await; // created at 0
+        assert_eq!(s.deliver_once(0).await, Delivery::Failed);
+        // Back after 30 h: the first skip starts the clock, nothing drops.
+        assert_eq!(s.deliver_once(30 * H).await, Delivery::Delivered(0));
+        assert_eq!(
+            store.outbox_stats().await.unwrap().0,
+            1,
+            "the first skip never drops"
+        );
+        let due = store.outbox_due(i64::MAX, 10).await.unwrap();
+        assert_eq!(due[0].first_skipped_ms, Some(30 * H));
+        assert!(!metrics
+            .encode_text()
+            .contains("lumen_usage_events_dropped_total 1"));
+        // Skipped again 24 h later: dropped.
+        assert_eq!(s.deliver_once(54 * H).await, Delivery::Delivered(0));
+        assert_eq!(store.outbox_stats().await.unwrap().0, 0);
+        assert!(metrics
+            .encode_text()
+            .contains("lumen_usage_events_dropped_total 1\n"));
+    }
+
+    #[tokio::test]
+    async fn a_lab_that_stays_unreachable_never_drops_a_row() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        let (s, store, metrics) = sender(&server, &["a"]).await;
+        assert_eq!(
+            s.deliver_once(REJECTION_TTL_MS * 30).await,
+            Delivery::Failed
+        );
+        assert_eq!(store.outbox_stats().await.unwrap().0, 1);
+        assert!(!metrics
+            .encode_text()
+            .contains("lumen_usage_events_dropped_total 1"));
     }
 
     #[tokio::test]

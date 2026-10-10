@@ -72,7 +72,8 @@ The **boot layer** is read once at startup and needs a restart:
 `[telemetry]` (its label allowlist becomes the Prometheus label set),
 `auth.enabled`, `auth.db_path`, the usage-log channel knobs
 (`usage_channel_capacity`, `usage_batch_max`, `usage_flush_ms`),
-`[usage_events]` (billing usage events, ADR 015), and
+`[usage_events]` (billing usage events for the Meilisearch Lab, ADR 015;
+also set by `LAB_URL` and `LAB_INSTANCE_ID`), and
 `config_source`. Details in
 [Deployment](../operations/deployment.md#hot-reload).
 

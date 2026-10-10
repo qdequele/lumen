@@ -149,19 +149,38 @@ jobs:
   lab-contract-drift:
     name: Lab event contract drift
     runs-on: ubuntu-latest
-    # Advisory until the Lab publishes product "lumen" (ADR 015, docs/operations/lab-integration.md).
-    continue-on-error: true
     permissions:
       contents: read
     steps:
       - uses: actions/checkout@v7
-      - name: Compare the vendored schema with the Lab's published copy
+
+      # The vendored copy must equal meilisearch/lab main byte for byte
+      # (platform contract v2, decision C). The Lab repository is private, so
+      # the comparison needs LAB_REPO_TOKEN (a read-only token on it): forks
+      # and PRs without the secret skip with a notice, never fail.
+      - name: Compare the vendored schema with meilisearch/lab main
         env:
-          LAB_EVENTS_SCHEMA_URL: ${{ vars.LAB_EVENTS_SCHEMA_URL }}
+          LAB_REPO_TOKEN: ${{ secrets.LAB_REPO_TOKEN }}
         run: |
-          if [ -z "$LAB_EVENTS_SCHEMA_URL" ]; then
-            echo "LAB_EVENTS_SCHEMA_URL not set; skipping"
+          if [ -z "$LAB_REPO_TOKEN" ]; then
+            echo "::notice::LAB_REPO_TOKEN is not set; skipping the Lab contract drift check"
             exit 0
           fi
-          curl -fsSL "$LAB_EVENTS_SCHEMA_URL" -o /tmp/lab.json
-          diff <(jq -S . contracts/lab-events.schema.json) <(jq -S . /tmp/lab.json)
+          code=$(curl -sS -o /tmp/lab-events.schema.json -w '%{http_code}' \
+            -H "Authorization: Bearer $LAB_REPO_TOKEN" \
+            -H "Accept: application/vnd.github.raw+json" \
+            "https://api.github.com/repos/meilisearch/lab/contents/contracts/lab-events.schema.json?ref=main")
+          if [ "$code" = "404" ]; then
+            echo "::warning::meilisearch/lab main has no contracts/lab-events.schema.json yet; nothing to compare"
+            exit 0
+          fi
+          if [ "$code" != "200" ]; then
+            echo "::error::could not fetch the Lab schema (HTTP $code)" >&2
+            exit 1
+          fi
+          if ! cmp -s contracts/vendor/lab/lab-events.schema.json /tmp/lab-events.schema.json; then
+            echo "::error::contracts/vendor/lab/lab-events.schema.json drifted from meilisearch/lab main; copy the Lab's file over it (never edit it here)" >&2
+            diff -u contracts/vendor/lab/lab-events.schema.json /tmp/lab-events.schema.json | head -80 >&2 || true
+            exit 1
+          fi
+          echo "vendored Lab schema matches meilisearch/lab main"

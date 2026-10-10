@@ -1,7 +1,8 @@
 //! Assembly of the axum application and its middleware stack.
 
 use crate::{
-    admin, auth, chat, decisions, embeddings, health, models, rerank, routes, state::AppState,
+    admin, admin_scope, auth, chat, decisions, embeddings, health, models, openapi, rerank, routes,
+    state::AppState,
 };
 use axum::extract::{MatchedPath, Request, State};
 use axum::http::{header, HeaderValue, StatusCode};
@@ -41,8 +42,8 @@ use crate::error::ApiError;
 /// * `/health`, `/health/providers`, `/metrics` - operational, never
 ///   authenticated, no I/O (`/health` never depends on provider state);
 /// * `/v1/*` - the API surface; virtual-key auth when enabled (M5);
-/// * `/admin/*` - key management, budget webhooks and usage reporting; mounted
-///   only when auth
+/// * `/admin/*` and `/openapi.json` - key management, budget webhooks, usage
+///   reporting and the gateway's own OpenAPI document; mounted only when auth
 ///   is enabled, protected by the master key.
 ///
 /// The body-size limit is read from `state.body_limit` - the single source of
@@ -102,12 +103,21 @@ pub fn build_app(state: AppState) -> Router {
             auth::require_virtual_key,
         ));
 
-    let mut app = Router::new()
-        .route("/health", get(routes::health))
-        // Separate from /health (which never depends on provider state): the
-        // observability view of background health checks (M6 §6.5).
+    // The operational views that describe the whole platform: the provider
+    // health view of background checks (M6 §6.5, separate from /health,
+    // which never depends on provider state) and the Prometheus metrics
+    // (provider, model and key labels across every account). An
+    // account-scoped call (`X-Lumen-Account-Ref`, platform contract v2
+    // section 8.3) is refused with 403 `LM-4005` like the other
+    // platform-only routes; without the header both stay open as before.
+    let operational = Router::new()
         .route("/health/providers", get(health::providers_health))
         .route("/metrics", get(routes::metrics))
+        .route_layer(middleware::from_fn(admin_scope::platform_only));
+
+    let mut app = Router::new()
+        .route("/health", get(routes::health))
+        .merge(operational)
         .merge(api);
 
     if state.auth.is_some() {
@@ -266,8 +276,15 @@ fn make_request_span<B>(request: &axum::http::Request<B>) -> tracing::Span {
 
 /// The master-key-protected `/admin` surface (mounted only when auth is
 /// enabled). Split out of [`build_app`] to keep that function readable.
+///
+/// Two halves: the account routes (keys, groups, usage), which a control
+/// plane may scope to one account with `X-Lumen-Account-Ref`, and the
+/// platform routes (provider keys and checks, webhooks, config,
+/// `/openapi.json`), which
+/// refuse a scoped call with `403 LM-4005` (platform contract v2 section
+/// 8.3, see [`admin_scope`]). The master key is checked first on both.
 fn admin_routes(state: &AppState) -> Router<AppState> {
-    Router::new()
+    let account = Router::new()
         .route("/admin/keys", post(admin::create_key).get(admin::list_keys))
         .route(
             "/admin/keys/{id}",
@@ -281,9 +298,14 @@ fn admin_routes(state: &AppState) -> Router<AppState> {
         )
         .route(
             "/admin/groups/{id}",
-            patch(admin::patch_group).delete(admin::delete_group),
+            get(admin::get_group)
+                .patch(admin::patch_group)
+                .delete(admin::delete_group),
         )
         .route("/admin/groups/{id}/grant", post(admin::grant_group))
+        .route("/admin/usage", get(admin::usage_report))
+        .route("/admin/usage/export", get(admin::usage_export));
+    let platform = Router::new()
         .route("/admin/provider-keys/{name}", put(admin::put_provider_key))
         .route(
             "/admin/providers/{name}/check",
@@ -299,8 +321,6 @@ fn admin_routes(state: &AppState) -> Router<AppState> {
             "/admin/webhooks/signing-key",
             put(admin::put_webhook_signing_key).delete(admin::delete_webhook_signing_key),
         )
-        .route("/admin/usage", get(admin::usage_report))
-        .route("/admin/usage/export", get(admin::usage_export))
         .route(
             "/admin/config",
             get(admin::get_config).put(admin::put_config),
@@ -337,8 +357,152 @@ fn admin_routes(state: &AppState) -> Router<AppState> {
             "/admin/config/{section}",
             get(admin::get_config_section).put(admin::put_config_section),
         )
+        // The gateway's own contract (docs/openapi.yaml as JSON). Not under
+        // `/admin`, but platform-only and master-key gated like it.
+        .route("/openapi.json", get(openapi::openapi_json))
+        .route_layer(middleware::from_fn(admin_scope::platform_only));
+    account
+        .merge(platform)
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth::require_master_key,
         ))
+}
+
+#[cfg(test)]
+mod routes_match_openapi {
+    use std::collections::BTreeSet;
+
+    /// Every `(METHOD, path)` this file mounts, parsed from its own source
+    /// (up to this test module): each `.route(<path>, <chain>)` call and
+    /// every `get(` / `post(` / `put(` / `patch(` / `delete(` inside that
+    /// call's parentheses. axum does not expose a route listing, and the
+    /// source is the truth. `<path>` is a string literal or a path constant
+    /// resolved by [`path_constant`]; a `.route(` call the parser cannot read
+    /// fails the test rather than going unchecked.
+    fn mounted() -> BTreeSet<(String, String)> {
+        let full = include_str!("app.rs");
+        let source = full
+            .split("mod routes_match_openapi {")
+            .next()
+            .unwrap_or(full);
+        let route = regex::Regex::new(r#"\.route\(\s*(?:"([^"]+)"|([A-Za-z_][A-Za-z0-9_:]*))\s*,"#)
+            .unwrap();
+        let method = regex::Regex::new(r"\b(get|post|put|patch|delete)\(").unwrap();
+        let calls = source.matches(".route(").count();
+        let mut parsed = 0;
+        let mut out = BTreeSet::new();
+        for found in route.captures_iter(source) {
+            parsed += 1;
+            let path = match (found.get(1), found.get(2)) {
+                (Some(literal), _) => literal.as_str().to_owned(),
+                (None, Some(constant)) => path_constant(constant.as_str()).to_owned(),
+                (None, None) => unreachable!("the regex captures one of the two"),
+            };
+            let rest = &source[found.get(0).unwrap().end()..];
+            let mut depth = 1_i32;
+            let mut end = rest.len();
+            for (i, c) in rest.char_indices() {
+                match c {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = i;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            for m in method.captures_iter(&rest[..end]) {
+                out.insert((m[1].to_uppercase(), normalize(&path)));
+            }
+        }
+        assert_eq!(
+            parsed, calls,
+            "a `.route(` call has a path the parser cannot read"
+        );
+        out
+    }
+
+    /// The value of a path constant mounted by name in `.route(...)`.
+    fn path_constant(name: &str) -> &'static str {
+        match name {
+            "decisions::SYSTEMONE_PATH" => crate::decisions::SYSTEMONE_PATH,
+            other => panic!("unknown route path constant `{other}`: add it here"),
+        }
+    }
+
+    /// `{*id}` (axum wildcard) and `{id}` document the same parameter.
+    fn normalize(path: &str) -> String {
+        path.replace("{*", "{")
+    }
+
+    fn spec() -> serde_json::Value {
+        serde_yaml_ng::from_str(include_str!("../../../docs/openapi.yaml")).unwrap()
+    }
+
+    fn documented() -> BTreeSet<(String, String)> {
+        let spec = spec();
+        let mut out = BTreeSet::new();
+        for (path, item) in spec["paths"].as_object().unwrap() {
+            for (method, _) in item.as_object().unwrap() {
+                if ["get", "post", "put", "patch", "delete"].contains(&method.as_str()) {
+                    out.insert((method.to_uppercase(), normalize(path)));
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn every_mounted_route_is_documented_and_nothing_else() {
+        let mounted = mounted();
+        assert!(
+            mounted.len() >= 30,
+            "the parser found too few routes: {mounted:?}"
+        );
+        assert_eq!(
+            mounted,
+            documented(),
+            "app.rs and docs/openapi.yaml disagree"
+        );
+    }
+
+    #[test]
+    fn the_spec_version_is_the_crate_version() {
+        let spec = spec();
+        assert_eq!(spec["openapi"], "3.1.0");
+        assert_eq!(spec["info"]["version"], env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
+    fn admin_routes_require_the_master_key_in_the_spec() {
+        let spec = spec();
+        for (path, item) in spec["paths"].as_object().unwrap() {
+            for (method, op) in item.as_object().unwrap() {
+                if !["get", "post", "put", "patch", "delete"].contains(&method.as_str()) {
+                    continue;
+                }
+                let schemes: Vec<&str> = op["security"]
+                    .as_array()
+                    .map(|reqs| {
+                        reqs.iter()
+                            .flat_map(|r| r.as_object().unwrap().keys())
+                            .map(String::as_str)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let expected: &[&str] = if path.starts_with("/admin/") || path == "/openapi.json" {
+                    &["masterKey"]
+                } else if path.starts_with("/v1/") {
+                    &["virtualKey"]
+                } else {
+                    &[]
+                };
+                assert_eq!(schemes, expected, "{method} {path}");
+            }
+        }
+    }
 }

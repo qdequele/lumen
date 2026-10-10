@@ -197,18 +197,25 @@ retention_days = 30               # purge usage_log rows older than this
 # turns each billable key's newly settled cost (keys in a group with an
 # account_ref) into a signed usage.recorded event, stored in the database in
 # the same transaction as the spend and pushed to {url}/internal/events until
-# the control plane acknowledges it. Delivery is retried with capped backoff
-# and never dropped. Enabling this block makes LUMEN call that URL; events
+# the control plane acknowledges it. Delivery is retried with capped backoff;
+# an event is dropped only when a reachable Lab keeps it out of `accepted`
+# for 24 h (an unreachable Lab never drops one). Enabling this block makes
+# LUMEN call that URL (and GET {url}/internal/instances/me once at boot); events
 # carry no prompt, response, metadata or model id. Requires [auth]
-# enabled = true, and the env var named by signing_key_env must be set.
+# enabled = true, and the env var named by secret_env (LAB_INSTANCE_SECRET by
+# default) must be set.
 # See docs/operations/lab-integration.md.
 #
 # [usage_events]
-# url = "https://lab.internal"                 # https, or http to a private IP
-# signing_key_env = "LUMEN_USAGE_EVENTS_SECRET"
-# source = "eu-1"                              # gateway name in every event
-# batch_size = 500                             # 1..=1000
-# timeout_ms = 5000                            # 100..=60000
+# url = "https://lab.meilisearch.com"          # LAB_URL: https, or http to a private IP
+# instance_id = "<uuid from the Lab>"           # LAB_INSTANCE_ID
+# secret_env = "LAB_INSTANCE_SECRET"            # env var holding the instance secret
+# source = "eu-1"                               # optional label for the boot log
+# batch_size = 500                              # 1..=500 (the Lab's batch limit)
+# timeout_ms = 5000                             # 100..=60000
+# LAB_URL and LAB_INSTANCE_ID in the environment overlay url and instance_id
+# (and create the block when it is absent); signing_key_env is a deprecated
+# alias of secret_env.
 
 # ---------------------------------------------------------------------------
 # Telemetry (ADR 002).

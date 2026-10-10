@@ -185,7 +185,9 @@ The **boot layer** stays boot-time only and needs a real restart:
 fixed when the metrics are registered), `auth.enabled`, `auth.db_path`,
 the bounded usage-log channel knobs (`usage_channel_capacity`,
 `usage_batch_max`, `usage_flush_ms`), `usage_events` (the billing
-outbox sender is wired at startup) and `config_source` - rebinding a
+outbox sender is wired at startup; the `LAB_URL`, `LAB_INSTANCE_ID` and
+`LAB_INSTANCE_SECRET` variables feed it, see
+[Lab integration](lab-integration.md)) and `config_source` - rebinding a
 live listener, re-registering metrics or resizing a running channel is out
 of scope for a live swap. The admin config API refuses a change to any of
 them (`400` `LM-1001`) rather than accepting a value that would not apply;

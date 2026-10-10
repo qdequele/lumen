@@ -8,6 +8,8 @@ target/
 .claude/
 bench/
 docs/
+# Compiled into the binary (`include_str!` in crates/server/src/openapi.rs).
+!docs/openapi.yaml
 tests/
 examples/
 monitoring/

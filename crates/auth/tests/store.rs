@@ -557,14 +557,14 @@ async fn usage_export_pages_by_cursor_without_gaps_or_repeats() {
     store.insert_usage(&batch).await.expect("seed usage");
 
     let first = store
-        .usage_export(0, i64::MAX, None, 2)
+        .usage_export(0, i64::MAX, None, 2, None)
         .await
         .expect("first page");
     assert_eq!(first.len(), 2);
 
     let cursor = first.last().map(|row| row.id).expect("a last row");
     let second = store
-        .usage_export(0, i64::MAX, Some(cursor), 2)
+        .usage_export(0, i64::MAX, Some(cursor), 2, None)
         .await
         .expect("second page");
     assert_eq!(second.len(), 2);
@@ -574,7 +574,7 @@ async fn usage_export_pages_by_cursor_without_gaps_or_repeats() {
     assert!(first[0].id < first[1].id);
 
     let third = store
-        .usage_export(0, i64::MAX, second.last().map(|r| r.id), 2)
+        .usage_export(0, i64::MAX, second.last().map(|r| r.id), 2, None)
         .await
         .expect("third page");
     assert_eq!(third.len(), 1, "five rows over pages of two");
@@ -605,7 +605,7 @@ async fn usage_export_honours_the_time_window() {
         .expect("seed usage");
 
     let rows = store
-        .usage_export(150, 250, None, 100)
+        .usage_export(150, 250, None, 100, None)
         .await
         .expect("windowed export");
     assert_eq!(rows.len(), 1);
@@ -616,7 +616,7 @@ async fn usage_export_honours_the_time_window() {
     // or `>`/`<`, so it cannot prove that on its own: this one puts a row
     // exactly on each edge, where a half-open window would drop both.
     let inclusive = store
-        .usage_export(100, 300, None, 100)
+        .usage_export(100, 300, None, 100, None)
         .await
         .expect("inclusive export");
     assert_eq!(
@@ -636,7 +636,7 @@ async fn usage_export_carries_the_attribution_columns() {
     store.insert_usage(&[usage(&id, 42)]).await.expect("seed");
 
     let rows = store
-        .usage_export(0, i64::MAX, None, 10)
+        .usage_export(0, i64::MAX, None, 10, None)
         .await
         .expect("export");
     let row = rows.first().expect("one row");
@@ -980,7 +980,7 @@ async fn usage_log_persists_the_virtual_model_route() {
     let direct = usage("key-b", 200);
     store.insert_usage(&[routed, direct]).await.expect("insert");
     let rows = store
-        .usage_export(0, i64::MAX, None, 10)
+        .usage_export(0, i64::MAX, None, 10, None)
         .await
         .expect("export");
     assert_eq!(

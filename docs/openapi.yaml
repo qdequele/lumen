@@ -1,0 +1,1522 @@
+openapi: 3.1.0
+info:
+  title: LUMEN gateway API
+  version: 0.7.0
+  description: |
+    The HTTP contract of a LUMEN gateway: the OpenAI-compatible `/v1` surface
+    (chat completions, embeddings, Cohere-style rerank, typed decisions,
+    model discovery), the operational routes, and the master-key `/admin`
+    surface a control plane drives (virtual keys, budget groups, provider
+    keys, webhooks, usage, config). Every error is a JSON envelope
+    `{"error": {"code": "LM-xxxx", "message": "...", "type": "..."}}`
+    (see docs/errors.md); a body over `server.body_limit` is 413 `LM-1002`
+    on every route, and a path that matches no route is 404 `LM-1003`.
+    `/admin/*` and `/openapi.json` are mounted only when
+    `[auth] enabled = true`. A control plane sharing this gateway between
+    accounts scopes an `/admin/*` call with
+    `X-Lumen-Account-Ref: <account uuid>` (platform contract v2 section
+    8.3): keys, groups and usage are then filtered to groups with that
+    `account_ref`, foreign ids are 404, creation is forced into the account,
+    and the platform-only routes (provider keys and checks, webhooks,
+    config, this document, `/health/providers`, `/metrics`) answer 403
+    `LM-4005`.
+    Source of truth: this
+    file, pinned to the router by a test in `crates/server/src/app.rs`.
+  license:
+    name: Apache-2.0
+servers:
+  - url: http://localhost:8080
+components:
+  securitySchemes:
+    virtualKey:
+      type: http
+      scheme: bearer
+      description: A virtual key minted by `POST /admin/keys`. Required on `/v1/*` when `[auth] enabled = true` (401 `LM-4004` otherwise); `/v1/*` is open when auth is off.
+    masterKey:
+      type: http
+      scheme: bearer
+      description: The `LUMEN_MASTER_KEY` value. Required on every `/admin/*` route and on `/openapi.json` (401 `LM-4004` otherwise).
+  parameters:
+    AccountRef:
+      name: X-Lumen-Account-Ref
+      in: header
+      required: false
+      schema: { type: string, format: uuid }
+      description: Scope this call to one Lab account (platform contract v2 section 8.3). On the key, group and usage routes only that account's rows are visible and writable, and a value that is not exactly one UUID (or the header sent twice) is 400 `LM-1001`. On the platform-only routes (provider keys and checks, webhooks, config, `/openapi.json`, `/health/providers`, `/metrics`) the header, whatever its value, is refused with 403 `LM-4005`.
+    IfMatch:
+      name: If-Match
+      in: header
+      required: true
+      schema: { type: string }
+      description: The `hash` returned by the matching GET (surrounding quotes are stripped); a stale value is 412 `LM-1004`, a missing one 400 `LM-1001`.
+    IncludeDeleted:
+      name: include_deleted
+      in: query
+      schema: { type: boolean, default: false }
+      description: Also list soft-deleted tombstones.
+    Since:
+      name: since
+      in: query
+      schema: { type: string }
+      description: Window start (inclusive), unix seconds or RFC 3339 (default 24 h before `until`).
+    Until:
+      name: until
+      in: query
+      schema: { type: string }
+      description: Window end (inclusive), unix seconds or RFC 3339 (default now).
+    KeyId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string }
+    GroupId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string }
+    ProviderName:
+      name: name
+      in: path
+      required: true
+      schema: { type: string }
+    VirtualModelId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string }
+      description: Percent-encode `/` (`acme%2Fchat`).
+  headers:
+    ModelUsed:
+      description: The model id that actually served the request (primary or fallback).
+      schema: { type: string }
+    Route:
+      description: The path a virtual-model request took through its targets (ADR 014); absent for a direct call.
+      schema: { type: string }
+    RequestId:
+      description: The request id (the client's `x-request-id`, or a generated UUID).
+      schema: { type: string }
+    Deprecation:
+      description: RFC 9745 deprecation date of `/v1/systemone`, `@1791417600`.
+      schema: { type: string }
+    Link:
+      description: RFC 8288 link to the migration guide, `rel="deprecation"`.
+      schema: { type: string }
+  responses:
+    Error:
+      description: Error envelope.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    NoContent:
+      description: Applied.
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message, type]
+          properties:
+            code: { type: string, pattern: "^LM-[0-9]{4}$" }
+            message: { type: string }
+            type: { type: string, enum: [invalid_request, upstream_error, internal, client_cancelled] }
+    Health:
+      type: object
+      required: [status, version]
+      properties:
+        status: { type: string, const: ok }
+        version: { type: string }
+    ProviderStatus:
+      type: object
+      required: [status]
+      properties:
+        status: { type: string, enum: [up, down, unknown] }
+        checked_at: { type: integer, description: "Unix seconds of the last probe." }
+        latency_ms: { type: integer }
+        detail: { type: string }
+    Capability:
+      type: string
+      enum: [chat, embed, rerank, decisions]
+    Model:
+      type: object
+      required: [id, object, owned_by, capabilities, modalities, virtual]
+      properties:
+        id: { type: string }
+        object: { type: string, const: model }
+        created: { type: integer, description: "Unix seconds at midnight UTC of `release_date`; absent when undated." }
+        owned_by: { type: string, description: "The provider name, or `lumen` for a virtual model." }
+        capabilities:
+          type: array
+          items: { $ref: "#/components/schemas/Capability" }
+        modalities:
+          type: array
+          items: { type: string }
+        release_date: { type: string, format: date }
+        description: { type: string, description: "Virtual models only, when set." }
+        virtual: { type: boolean }
+    ModelList:
+      type: object
+      required: [object, data]
+      properties:
+        object: { type: string, const: list }
+        data:
+          type: array
+          items: { $ref: "#/components/schemas/Model" }
+    ChatMessage:
+      type: object
+      required: [role]
+      properties:
+        role: { type: string, description: "`system`, `developer`, `user`, `assistant` or `tool`." }
+        content:
+          description: A string, or an array of content parts (text and image_url parts for vision).
+          oneOf:
+            - type: string
+            - type: array
+              items: { type: object, additionalProperties: true }
+        name: { type: string }
+        tool_calls: { type: array, items: { type: object, additionalProperties: true } }
+        tool_call_id: { type: string }
+      additionalProperties: true
+    ChatCompletionRequest:
+      type: object
+      required: [model, messages]
+      properties:
+        model: { type: string, description: "A foundation or virtual model id." }
+        messages:
+          type: array
+          items: { $ref: "#/components/schemas/ChatMessage" }
+        stream: { type: boolean, default: false }
+        max_tokens: { type: integer, minimum: 0 }
+        max_completion_tokens: { type: integer, minimum: 0 }
+        n: { type: integer, minimum: 0 }
+        temperature: { type: number }
+        top_p: { type: number }
+        stop: { oneOf: [{ type: string }, { type: array, items: { type: string } }] }
+        tools: { type: array, items: { type: object, additionalProperties: true } }
+        tool_choice: { oneOf: [{ type: string }, { type: object, additionalProperties: true }] }
+        response_format: { type: object, additionalProperties: true }
+        seed: { type: integer }
+        user: { type: string }
+      additionalProperties: true
+    ChatUsage:
+      type: object
+      required: [prompt_tokens, completion_tokens, total_tokens]
+      properties:
+        prompt_tokens: { type: integer }
+        completion_tokens: { type: integer }
+        total_tokens: { type: integer }
+        estimated: { type: boolean, description: "True when the gateway estimated the counts locally (ADR 003); absent otherwise." }
+        prompt_tokens_details:
+          type: object
+          properties:
+            cached_tokens: { type: integer }
+            cache_creation_tokens: { type: integer }
+        completion_tokens_details:
+          type: object
+          properties:
+            reasoning_tokens: { type: integer }
+      additionalProperties: true
+    ChatCompletionResponse:
+      type: object
+      required: [id, object, created, model, choices]
+      properties:
+        id: { type: string }
+        object: { type: string, const: chat.completion }
+        created: { type: integer }
+        model: { type: string }
+        choices:
+          type: array
+          items:
+            type: object
+            required: [index, message]
+            properties:
+              index: { type: integer }
+              message: { $ref: "#/components/schemas/ChatMessage" }
+              finish_reason: { type: string }
+            additionalProperties: true
+        usage: { $ref: "#/components/schemas/ChatUsage" }
+      additionalProperties: true
+    EmbeddingsRequest:
+      type: object
+      required: [model, input]
+      properties:
+        model: { type: string }
+        input:
+          description: A string, an array of strings, a token-id array, an array of token-id arrays, or multimodal items (a string or an array of content parts each).
+          oneOf:
+            - type: string
+            - type: array
+              items: {}
+        encoding_format: { type: string, enum: [float, base64] }
+        dimensions: { type: integer, minimum: 0 }
+        user: { type: string }
+      additionalProperties: true
+    EmbeddingsResponse:
+      type: object
+      required: [object, data, model, usage]
+      properties:
+        object: { type: string, const: list }
+        data:
+          type: array
+          items:
+            type: object
+            required: [object, index, embedding]
+            properties:
+              object: { type: string, const: embedding }
+              index: { type: integer }
+              embedding:
+                description: Floats, or a base64 string when `encoding_format` is `base64`.
+                oneOf:
+                  - type: array
+                    items: { type: number }
+                  - type: string
+        model: { type: string }
+        usage:
+          type: object
+          required: [prompt_tokens, total_tokens]
+          properties:
+            prompt_tokens: { type: integer }
+            total_tokens: { type: integer }
+            estimated: { type: boolean, description: "True when the gateway estimated the count (ADR 003); absent otherwise." }
+    RerankRequest:
+      type: object
+      required: [model, query, documents]
+      properties:
+        model: { type: string }
+        query: { type: string }
+        documents:
+          type: array
+          minItems: 1
+          description: 'Strings, `{"text": ...}` objects, or objects reduced to text by `rank_fields`. An empty array is 400 `LM-2010`.'
+          items:
+            oneOf:
+              - type: string
+              - type: object
+                additionalProperties: true
+        rank_fields: { type: array, items: { type: string } }
+        top_n: { type: integer, minimum: 0, description: "Clamped to the document count." }
+        return_documents: { type: boolean, default: false }
+    RerankResponse:
+      type: object
+      required: [results, usage]
+      properties:
+        results:
+          type: array
+          description: Most relevant first.
+          items:
+            type: object
+            required: [index, relevance_score]
+            properties:
+              index: { type: integer }
+              relevance_score: { type: number }
+              document:
+                type: object
+                required: [text]
+                properties:
+                  text: { type: string, description: "The text that was ranked." }
+        usage:
+          type: object
+          required: [search_units, total_tokens]
+          properties:
+            search_units: { type: integer }
+            estimated: { type: boolean, description: "True when the gateway derived `search_units` (ADR 003); absent otherwise." }
+            total_tokens: { type: integer }
+            tokens_estimated: { type: boolean, description: "True when the gateway derived `total_tokens` (ADR 003); absent otherwise." }
+    DecisionsTypeSafeRequest:
+      type: object
+      description: The TypeSafe format (also Perplexity's), detected by `state` plus an object `questions`.
+      required: [model, state, questions]
+      properties:
+        model: { type: string }
+        state: { description: "The content to evaluate: a string, an object or an array (never null); images go inside an array as `image_url` parts with a `data:` URL." }
+        questions:
+          type: object
+          minProperties: 1
+          description: Question id to question. An empty object is 400 `LM-2011`.
+          additionalProperties:
+            type: object
+            required: [type]
+            properties:
+              type: { type: string, enum: [noul, choice, score] }
+              instructions: { type: string, description: "Required, unless a `noul` question has `criteria`." }
+              criteria:
+                description: "`noul`: optional object (`true` / `false` meanings); `choice`: object of 1 to 255 options (option id to description or null); `score`: array of 1 to 10 levels."
+            additionalProperties: true
+      additionalProperties: true
+    DecisionsOpenAiRequest:
+      type: object
+      description: OpenAI's format, detected by `input` plus an array `questions`. An unknown top-level field is 400 `LM-1001`.
+      required: [model, input, questions]
+      properties:
+        model: { type: string }
+        input:
+          description: A string, or user messages whose content parts are `input_text` / `input_image` (`image_url` a `data:` URL, at most 128 images).
+          oneOf:
+            - type: string
+            - type: array
+              items: { type: object, additionalProperties: true }
+        questions:
+          type: array
+          minItems: 1
+          description: An empty array is 400 `LM-2011`.
+          items:
+            type: object
+            required: [type, instructions]
+            properties:
+              type: { type: string, enum: [predicate, choice, score] }
+              name: { type: string, description: "Optional; unique when present." }
+              instructions: { type: string }
+              choices:
+                type: array
+                minItems: 2
+                maxItems: 255
+                description: "`choice` only; unique values."
+                items:
+                  type: object
+                  required: [value]
+                  properties:
+                    value: { type: [string, boolean] }
+                    description: { type: string }
+              levels:
+                type: array
+                minItems: 1
+                description: "`score` only."
+                items:
+                  type: object
+                  required: [label]
+                  properties:
+                    label: { type: string }
+                    description: { type: string }
+        safety_identifier: { type: string, maxLength: 128, description: "Forwarded to OpenAI, dropped for other vendors." }
+      additionalProperties: false
+    DecisionsTypeSafeResponse:
+      type: object
+      description: When the upstream speaks the TypeSafe format its body is returned verbatim (unknown fields included), with `usage` completed by the gateway.
+      required: [model, answers]
+      properties:
+        model: { type: string, description: "The versioned upstream model that answered." }
+        answers:
+          type: object
+          description: Question id to answer.
+          additionalProperties:
+            type: object
+            required: [type]
+            properties:
+              type: { type: string, enum: [noul, choice, score, refusal] }
+              noul: { type: number, description: "Probability of yes." }
+              choice: { type: [string, boolean] }
+              score: { type: number, description: "Probability-weighted mean level index." }
+              legend: { type: object, additionalProperties: { type: string } }
+              probabilities: { type: object, additionalProperties: { type: number } }
+              confidence: { type: number }
+            additionalProperties: true
+        usage:
+          type: object
+          required: [input_tokens, output_tokens]
+          properties:
+            input_tokens: { type: integer }
+            output_tokens: { type: integer }
+            estimated: { type: boolean, description: "True when the gateway estimated the count (ADR 003); absent otherwise." }
+      additionalProperties: true
+    DecisionsOpenAiResponse:
+      type: object
+      required: [model, answers, usage]
+      properties:
+        model: { type: string }
+        answers:
+          type: array
+          description: In question order.
+          items:
+            type: object
+            required: [type, name]
+            properties:
+              type: { type: string, enum: [predicate, choice, score, refusal] }
+              name: { type: [string, "null"] }
+              probability: { type: number }
+              choice: { type: [string, boolean] }
+              score: { type: number }
+              probabilities:
+                type: array
+                items:
+                  type: object
+                  required: [value, probability]
+                  properties:
+                    value: { type: [string, boolean, integer] }
+                    label: { type: string, description: "`score` answers only." }
+                    probability: { type: number }
+              confidence: { type: number, description: "The highest probability when the upstream gave none." }
+        usage:
+          type: object
+          required: [input_tokens, input_tokens_details, output_tokens, output_tokens_details, total_tokens]
+          properties:
+            input_tokens: { type: integer }
+            input_tokens_details:
+              type: object
+              required: [cached_tokens, cache_write_tokens]
+              properties:
+                cached_tokens: { type: integer }
+                cache_write_tokens: { type: integer }
+            output_tokens: { type: integer }
+            output_tokens_details:
+              type: object
+              required: [reasoning_tokens]
+              properties:
+                reasoning_tokens: { type: integer }
+            total_tokens: { type: integer }
+            estimated: { type: boolean, description: "True when the gateway estimated the count (ADR 003); absent otherwise." }
+    Key:
+      type: object
+      required: [id, name, group_id, budget_max, budget_spent, rpm_limit, tpm_limit, expires_at, disabled, created_at, deleted_at, external_ref]
+      properties:
+        id: { type: string }
+        name: { type: string }
+        group_id: { type: [string, "null"] }
+        budget_max: { type: [number, "null"], description: "USD; null when unlimited." }
+        budget_spent: { type: number, description: "USD." }
+        rpm_limit: { type: [integer, "null"] }
+        tpm_limit: { type: [integer, "null"] }
+        expires_at: { type: [integer, "null"], description: "Unix seconds." }
+        disabled: { type: boolean }
+        created_at: { type: integer }
+        deleted_at: { type: [integer, "null"] }
+        external_ref: { type: [string, "null"], description: "The control plane's key id (ADR 015)." }
+    CreatedKey:
+      allOf:
+        - $ref: "#/components/schemas/Key"
+        - type: object
+          required: [key]
+          properties:
+            key: { type: string, description: "The plaintext virtual key, shown once." }
+    NewKey:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string, minLength: 1 }
+        group_id: { type: string, description: "Must name an active group; required on a call scoped by `X-Lumen-Account-Ref` (a group of that account)." }
+        budget_max: { type: number, minimum: 0, maximum: 1000000000000 }
+        rpm_limit: { type: integer, minimum: 0 }
+        tpm_limit: { type: integer, minimum: 0 }
+        expires_at: { type: integer, minimum: 0 }
+        external_ref: { type: string, minLength: 1, maxLength: 128 }
+    KeyPatch:
+      type: object
+      description: Absent fields are unchanged. `group_id` and `external_ref` accept `null` to clear (a scoped call cannot clear `group_id`, and may only move the key to a group of its account). With `[usage_events]` on, a `group_id` change first flushes pending spend and answers 500 `LM-5001` if that fails.
+      properties:
+        name: { type: string, minLength: 1 }
+        group_id: { type: [string, "null"] }
+        budget_max: { type: number, minimum: 0, maximum: 1000000000000 }
+        rpm_limit: { type: integer, minimum: 0 }
+        tpm_limit: { type: integer, minimum: 0 }
+        expires_at: { type: integer, minimum: 0 }
+        disabled: { type: boolean }
+        external_ref: { type: [string, "null"], minLength: 1, maxLength: 128 }
+    Group:
+      type: object
+      required: [id, name, budget_max, budget_spent, created_at, deleted_at, account_ref]
+      properties:
+        id: { type: string }
+        name: { type: string }
+        budget_max: { type: [number, "null"], description: "USD; null when unlimited." }
+        budget_spent: { type: number, description: "USD, as last flushed." }
+        created_at: { type: integer }
+        deleted_at: { type: [integer, "null"] }
+        account_ref: { type: [string, "null"], description: "The Lab account id this lease belongs to (ADR 015); a UUID while [usage_events] is on." }
+    GroupView:
+      allOf:
+        - $ref: "#/components/schemas/Group"
+        - type: object
+          required: [spent_micro, budget_max_micro]
+          properties:
+            spent_micro: { type: integer, description: "Live pool spend in micro-USD, reservations included." }
+            budget_max_micro: { type: [integer, "null"], description: "Live pool cap in micro-USD; null when unlimited." }
+    NewGroup:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string, minLength: 1 }
+        budget_max: { type: number, minimum: 0, maximum: 1000000000000 }
+        account_ref: { type: string, minLength: 1, maxLength: 128, description: "Forced to the header's account on a scoped call (any other value is 400 `LM-1001`); a UUID while [usage_events] is on." }
+    GroupPatch:
+      type: object
+      description: Absent fields are unchanged; `account_ref` accepts `null` to clear (flushes first while billing is on) and cannot change on a scoped call.
+      properties:
+        name: { type: string, minLength: 1 }
+        budget_max: { type: number, minimum: 0, maximum: 1000000000000 }
+        account_ref: { type: [string, "null"], minLength: 1, maxLength: 128 }
+    Grant:
+      type: object
+      required: [amount]
+      properties:
+        amount: { type: number, exclusiveMinimum: 0, maximum: 1000000000000, description: "USD added to the budget cap; a capless key or group is 400 `LM-1001`." }
+    ProviderKeyBody:
+      type: object
+      required: [key]
+      properties:
+        key: { type: string, minLength: 1, description: "Sealed at rest under the master key; never returned." }
+    ProviderKeyCheck:
+      type: object
+      required: [provider, kind, key_valid, reachable, http_status, latency_ms, endpoint, detail]
+      properties:
+        provider: { type: string, description: "The configured provider name." }
+        kind: { type: string }
+        key_valid: { type: [boolean, "null"], description: "`false` when rejected or not configured; `null` when the kind has no free authenticated endpoint or the check was inconclusive." }
+        reachable: { type: [boolean, "null"], description: "`null` when no request was made." }
+        http_status: { type: [integer, "null"] }
+        latency_ms: { type: [integer, "null"] }
+        endpoint: { type: [string, "null"], description: "What was probed, e.g. `GET https://api.openai.com/v1/models`." }
+        detail: { type: string }
+    WebhookSettings:
+      type: object
+      required: [url]
+      properties:
+        url: { type: string, format: uri, description: "An http:// or https:// URL; must be publicly routable unless listed in `LUMEN_WEBHOOK_ALLOWED_HOSTS`." }
+        signing_key_env: { type: [string, "null"], description: "Name of the variable holding the HMAC secret; must not start with `LUMEN_` through the admin API." }
+        events:
+          type: array
+          minItems: 1
+          default: [budget.threshold, budget.exhausted]
+          items: { type: string, enum: [budget.threshold, budget.exhausted, key.disabled, key.rotated, key.deleted] }
+        thresholds:
+          type: array
+          default: [50, 80, 95]
+          items: { type: integer, minimum: 1, maximum: 100 }
+        channel_capacity: { type: integer, minimum: 1, default: 1024 }
+        timeout_ms: { type: integer, minimum: 1, default: 5000 }
+        max_attempts: { type: integer, minimum: 1, default: 5 }
+        retry_base_ms: { type: integer, minimum: 1, default: 500 }
+      additionalProperties: false
+    WebhookStatus:
+      type: object
+      required: [enabled, source, signed, signing_key_stored]
+      properties:
+        enabled: { type: boolean }
+        source: { type: string, enum: [database, config, none], description: "A stored row (`database`) wins over the `[webhooks]` block (`config`)." }
+        settings: { $ref: "#/components/schemas/WebhookSettings" }
+        signed: { type: boolean }
+        signing_key_stored: { type: boolean }
+        updated_at: { type: integer, description: "Unix seconds; only when `source` is `database`." }
+    WebhookSecretBody:
+      type: object
+      required: [secret]
+      properties:
+        secret: { type: string, minLength: 1 }
+    UsageAggregate:
+      type: object
+      required: [group, requests, requests_ok, requests_client_error, requests_server_error, tokens_in, tokens_out, tokens_total, estimated_requests, upstream_requests, search_units, media_count, media_bytes, cost]
+      properties:
+        group: { type: string, description: "The value of the `group_by` dimension (`\"\"` for rows without a key or group)." }
+        requests: { type: integer }
+        requests_ok: { type: integer }
+        requests_client_error: { type: integer }
+        requests_server_error: { type: integer }
+        tokens_in: { type: integer }
+        tokens_out: { type: integer }
+        tokens_total: { type: integer }
+        estimated_requests: { type: integer }
+        upstream_requests: { type: integer }
+        search_units: { type: integer }
+        media_count: { type: integer }
+        media_bytes: { type: integer }
+        cost: { type: number, description: "USD." }
+    UsageReport:
+      type: object
+      required: [since, until, group_by, truncated, groups]
+      properties:
+        since: { type: integer }
+        until: { type: integer }
+        group_by: { type: string, enum: [model, model_used, provider, capability, key_id, group_id, status, total] }
+        truncated: { type: boolean }
+        groups:
+          type: array
+          description: Most expensive first.
+          items: { $ref: "#/components/schemas/UsageAggregate" }
+    UsageRow:
+      type: object
+      required: [id, key_id, group_id, model, model_used, route, provider, capability, tokens_in, tokens_out, cached_tokens, reasoning_tokens, cache_write_tokens, search_units, media_count, media_bytes, estimated, cost, latency_ms, status, metadata, ts]
+      properties:
+        id: { type: integer }
+        key_id: { type: [string, "null"] }
+        group_id: { type: [string, "null"] }
+        model: { type: string }
+        model_used: { type: string }
+        route: { type: [string, "null"] }
+        provider: { type: string }
+        capability: { type: string }
+        tokens_in: { type: integer }
+        tokens_out: { type: integer }
+        cached_tokens: { type: [integer, "null"] }
+        reasoning_tokens: { type: [integer, "null"] }
+        cache_write_tokens: { type: [integer, "null"] }
+        search_units: { type: [integer, "null"] }
+        media_count: { type: integer }
+        media_bytes: { type: integer }
+        estimated: { type: boolean }
+        cost: { type: number }
+        latency_ms: { type: integer }
+        status: { type: integer }
+        metadata: { type: [string, "null"], description: "The ADR 002 request metadata as a compact JSON object, encoded as a string." }
+        ts: { type: integer }
+    UsageExportPage:
+      type: object
+      required: [since, until, rows, next_cursor]
+      properties:
+        since: { type: integer }
+        until: { type: integer }
+        rows:
+          type: array
+          items: { $ref: "#/components/schemas/UsageRow" }
+        next_cursor: { type: [integer, "null"] }
+    ConfigDocument:
+      type: object
+      required: [config, hash, key_sources]
+      properties:
+        config: { type: string, description: "The dynamic TOML document, byte for byte." }
+        hash: { type: string, description: "BLAKE3 of config, echoed as If-Match on writes." }
+        key_sources:
+          type: object
+          additionalProperties: { type: string, enum: [env, stored, missing, not_required] }
+    ProvidersList:
+      type: object
+      required: [providers, hash]
+      properties:
+        providers:
+          type: array
+          items:
+            type: object
+            required: [name, kind]
+            properties:
+              name: { type: string }
+              kind: { type: string }
+        hash: { type: string }
+    ProviderConfig:
+      type: object
+      description: One `[[providers]]` table as JSON (see config.example.toml).
+      required: [name, kind]
+      properties:
+        name: { type: string }
+        kind: { type: string }
+        api_key_env: { type: [string, "null"] }
+        base_url: { type: [string, "null"] }
+        api_version: { type: [string, "null"] }
+        decisions_path: { type: [string, "null"] }
+        forward_unknown_fields: { type: [boolean, "null"] }
+        first_token_timeout_ms: { type: [integer, "null"] }
+        total_timeout_ms: { type: [integer, "null"] }
+        strict: { type: boolean, default: false }
+        connect_timeout_ms: { type: [integer, "null"] }
+        models:
+          type: array
+          description: "`[[providers.models]]` tables (`id`, `capabilities`, ...)."
+          items: { type: object, additionalProperties: true }
+    ProviderDocument:
+      allOf:
+        - $ref: "#/components/schemas/ProviderConfig"
+        - type: object
+          required: [hash]
+          properties:
+            hash: { type: string }
+    ProviderWrite:
+      description: "`name` must equal the path name; an unknown field is 400 `LM-1001`."
+      allOf:
+        - $ref: "#/components/schemas/ProviderConfig"
+      unevaluatedProperties: false
+    VirtualModelsList:
+      type: object
+      required: [virtual_models, hash]
+      properties:
+        virtual_models:
+          type: array
+          items:
+            type: object
+            required: [id, capability, strategy]
+            properties:
+              id: { type: string }
+              capability: { $ref: "#/components/schemas/Capability" }
+              strategy: { type: string, enum: [single, fallback, split, switch] }
+        hash: { type: string }
+    VirtualModel:
+      type: object
+      description: One `[[virtual_models]]` table as JSON (ADR 014).
+      required: [id, capability, strategy, targets]
+      properties:
+        id: { type: string }
+        capability: { type: string, enum: [chat, embed, rerank, decisions, systemone], description: "`systemone` is accepted on writes as an alias of `decisions`." }
+        strategy: { type: string, enum: [single, fallback, split, switch] }
+        targets:
+          type: array
+          items: { type: object, additionalProperties: true }
+        fallback_on: { type: array, items: { type: string } }
+        preset: { type: object, additionalProperties: true }
+        description: { type: string }
+        listed: { type: boolean, default: true }
+    VirtualModelDocument:
+      allOf:
+        - $ref: "#/components/schemas/VirtualModel"
+        - type: object
+          required: [hash]
+          properties:
+            hash: { type: string }
+    VirtualModelWrite:
+      description: "`id` must equal the (percent-decoded) path id; an unknown field or a JSON null is 400 `LM-1001`."
+      allOf:
+        - $ref: "#/components/schemas/VirtualModel"
+      unevaluatedProperties: false
+    VirtualModelPlan:
+      type: object
+      required: [plan, hash]
+      properties:
+        plan: { type: object, additionalProperties: true, description: "The resolved routing tree (references expanded to foundation leaves)." }
+        hash: { type: string }
+paths:
+  /health:
+    get:
+      summary: Liveness, no I/O
+      operationId: health
+      responses:
+        "200":
+          description: Always, while the process runs.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Health" }
+  /health/providers:
+    parameters:
+      - $ref: "#/components/parameters/AccountRef"
+    get:
+      summary: Last observed provider health (background probe, off by default)
+      description: Needs no key. It names the platform's providers and their health, so a call carrying `X-Lumen-Account-Ref` (any value) is refused with 403 `LM-4005`.
+      operationId: providersHealth
+      responses:
+        "200":
+          description: Provider name to status.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: { $ref: "#/components/schemas/ProviderStatus" }
+        "403": { $ref: "#/components/responses/Error" }
+  /metrics:
+    parameters:
+      - $ref: "#/components/parameters/AccountRef"
+    get:
+      summary: Prometheus metrics
+      description: Needs no key. Its labels cover every provider, model and key on the gateway, so a call carrying `X-Lumen-Account-Ref` (any value) is refused with 403 `LM-4005`.
+      operationId: metrics
+      responses:
+        "200":
+          description: Text exposition format.
+          content:
+            text/plain: { schema: { type: string } }
+        "403": { $ref: "#/components/responses/Error" }
+  /openapi.json:
+    parameters:
+      - $ref: "#/components/parameters/AccountRef"
+    get:
+      summary: This document as JSON (mounted with the admin surface, platform-only)
+      operationId: openapiJson
+      security: [{ masterKey: [] }]
+      responses:
+        "200":
+          description: The OpenAPI 3.1 document.
+          content:
+            application/json: { schema: { type: object, additionalProperties: true } }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "500": { $ref: "#/components/responses/Error" }
+  /v1/models:
+    get:
+      summary: List models (foundation and listed virtual models)
+      operationId: listModels
+      security: [{ virtualKey: [] }]
+      responses:
+        "200": { description: The model list., content: { application/json: { schema: { $ref: "#/components/schemas/ModelList" } } } }
+        "401": { $ref: "#/components/responses/Error" }
+  /v1/models/{id}:
+    get:
+      summary: One model
+      operationId: getModel
+      security: [{ virtualKey: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+          description: May contain slashes (`mistralai/Mistral-7B`).
+      responses:
+        "200": { description: The model., content: { application/json: { schema: { $ref: "#/components/schemas/Model" } } } }
+        "401": { $ref: "#/components/responses/Error" }
+        "404": { description: "Unknown or hidden model (`LM-2001`).", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+  /v1/chat/completions:
+    post:
+      summary: Chat completion (OpenAI shape, SSE when `stream` is true)
+      operationId: chatCompletions
+      security: [{ virtualKey: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json: { schema: { $ref: "#/components/schemas/ChatCompletionRequest" } }
+      responses:
+        "200":
+          description: "The completion; text/event-stream of chat.completion.chunk objects ending with data [DONE] when streaming."
+          headers:
+            x-lumen-model-used: { $ref: "#/components/headers/ModelUsed" }
+            x-lumen-route: { $ref: "#/components/headers/Route" }
+            x-request-id: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json: { schema: { $ref: "#/components/schemas/ChatCompletionResponse" } }
+            text/event-stream: { schema: { type: string } }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "402": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "413": { $ref: "#/components/responses/Error" }
+        "429": { $ref: "#/components/responses/Error" }
+        "500": { $ref: "#/components/responses/Error" }
+        "502": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/Error" }
+        "504": { $ref: "#/components/responses/Error" }
+  /v1/embeddings:
+    post:
+      summary: Embeddings (OpenAI shape)
+      operationId: embeddings
+      security: [{ virtualKey: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json: { schema: { $ref: "#/components/schemas/EmbeddingsRequest" } }
+      responses:
+        "200":
+          description: The vectors.
+          headers:
+            x-lumen-model-used: { $ref: "#/components/headers/ModelUsed" }
+            x-lumen-route: { $ref: "#/components/headers/Route" }
+            x-request-id: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json: { schema: { $ref: "#/components/schemas/EmbeddingsResponse" } }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "402": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "413": { $ref: "#/components/responses/Error" }
+        "429": { $ref: "#/components/responses/Error" }
+        "500": { $ref: "#/components/responses/Error" }
+        "502": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/Error" }
+        "504": { $ref: "#/components/responses/Error" }
+  /v1/rerank:
+    post:
+      summary: Rerank documents (Cohere shape)
+      operationId: rerank
+      security: [{ virtualKey: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json: { schema: { $ref: "#/components/schemas/RerankRequest" } }
+      responses:
+        "200":
+          description: Scored documents, best first.
+          headers:
+            x-lumen-model-used: { $ref: "#/components/headers/ModelUsed" }
+            x-lumen-route: { $ref: "#/components/headers/Route" }
+            x-request-id: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json: { schema: { $ref: "#/components/schemas/RerankResponse" } }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "402": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "413": { $ref: "#/components/responses/Error" }
+        "429": { $ref: "#/components/responses/Error" }
+        "500": { $ref: "#/components/responses/Error" }
+        "502": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/Error" }
+        "504": { $ref: "#/components/responses/Error" }
+  /v1/decisions:
+    post:
+      summary: Typed decisions (ADR 017), OpenAI or TypeSafe format, answered in the format received
+      operationId: decisions
+      security: [{ virtualKey: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              description: A body matching neither format (or both) is 400 `LM-1001`.
+              oneOf:
+                - $ref: "#/components/schemas/DecisionsOpenAiRequest"
+                - $ref: "#/components/schemas/DecisionsTypeSafeRequest"
+      responses:
+        "200":
+          description: One answer per question, in the request's format.
+          headers:
+            x-lumen-model-used: { $ref: "#/components/headers/ModelUsed" }
+            x-lumen-route: { $ref: "#/components/headers/Route" }
+            x-request-id: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/DecisionsOpenAiResponse"
+                  - $ref: "#/components/schemas/DecisionsTypeSafeResponse"
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "402": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "413": { $ref: "#/components/responses/Error" }
+        "429": { $ref: "#/components/responses/Error" }
+        "500": { $ref: "#/components/responses/Error" }
+        "502": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/Error" }
+        "504": { $ref: "#/components/responses/Error" }
+  /v1/systemone:
+    post:
+      summary: Deprecated alias of `/v1/decisions` (TypeSafe format only)
+      description: The same pipeline as `/v1/decisions`, accepting only the TypeSafe format (an OpenAI-format body is 400 `LM-1001`). Every response, rejections included, carries the `Deprecation` and `Link` headers. Send the same body to `/v1/decisions`.
+      operationId: systemone
+      deprecated: true
+      security: [{ virtualKey: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json: { schema: { $ref: "#/components/schemas/DecisionsTypeSafeRequest" } }
+      responses:
+        "200":
+          description: One typed answer per question.
+          headers:
+            Deprecation: { $ref: "#/components/headers/Deprecation" }
+            Link: { $ref: "#/components/headers/Link" }
+            x-lumen-model-used: { $ref: "#/components/headers/ModelUsed" }
+            x-lumen-route: { $ref: "#/components/headers/Route" }
+            x-request-id: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json: { schema: { $ref: "#/components/schemas/DecisionsTypeSafeResponse" } }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "402": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "413": { $ref: "#/components/responses/Error" }
+        "429": { $ref: "#/components/responses/Error" }
+        "500": { $ref: "#/components/responses/Error" }
+        "502": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/Error" }
+        "504": { $ref: "#/components/responses/Error" }
+  /admin/keys:
+    parameters:
+      - $ref: "#/components/parameters/AccountRef"
+    get:
+      summary: List virtual keys
+      operationId: listKeys
+      security: [{ masterKey: [] }]
+      parameters:
+        - $ref: "#/components/parameters/IncludeDeleted"
+        - name: external_ref
+          in: query
+          schema: { type: string }
+          description: Only keys with this `external_ref`.
+      responses:
+        "200": { description: Keys (no secrets)., content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/Key" } } } } }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "500": { $ref: "#/components/responses/Error" }
+    post:
+      summary: Create a virtual key
+      operationId: createKey
+      security: [{ masterKey: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json: { schema: { $ref: "#/components/schemas/NewKey" } }
+      responses:
+        "201": { description: The record plus the one-time plaintext key., content: { application/json: { schema: { $ref: "#/components/schemas/CreatedKey" } } } }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "500": { $ref: "#/components/responses/Error" }
+  /admin/keys/{id}:
+    parameters:
+      - $ref: "#/components/parameters/AccountRef"
+      - $ref: "#/components/parameters/KeyId"
+    patch:
+      summary: Update a key
+      operationId: patchKey
+      security: [{ masterKey: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json: { schema: { $ref: "#/components/schemas/KeyPatch" } }
+      responses:
+        "200": { description: The updated record., content: { application/json: { schema: { $ref: "#/components/schemas/Key" } } } }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "500": { $ref: "#/components/responses/Error" }
+    delete:
+      summary: Soft-delete a key (its last spend is still billed)
+      operationId: deleteKey
+      security: [{ masterKey: [] }]
+      responses:
+        "204": { $ref: "#/components/responses/NoContent" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "500": { $ref: "#/components/responses/Error" }
+  /admin/keys/{id}/rotate:
+    parameters:
+      - $ref: "#/components/parameters/AccountRef"
+      - $ref: "#/components/parameters/KeyId"
+    post:
+      summary: Rotate a key's secret
+      operationId: rotateKey
+      security: [{ masterKey: [] }]
+      responses:
+        "200": { description: The record plus the new plaintext key., content: { application/json: { schema: { $ref: "#/components/schemas/CreatedKey" } } } }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "500": { $ref: "#/components/responses/Error" }
+  /admin/keys/{id}/grant:
+    parameters:
+      - $ref: "#/components/parameters/AccountRef"
+      - $ref: "#/components/parameters/KeyId"
+    post:
+      summary: Raise a key's budget cap
+      operationId: grantKey
+      security: [{ masterKey: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json: { schema: { $ref: "#/components/schemas/Grant" } }
+      responses:
+        "200": { description: The updated record., content: { application/json: { schema: { $ref: "#/components/schemas/Key" } } } }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "500": { $ref: "#/components/responses/Error" }
+  /admin/groups:
+    parameters:
+      - $ref: "#/components/parameters/AccountRef"
+    get:
+      summary: List budget groups
+      operationId: listGroups
+      security: [{ masterKey: [] }]
+      parameters:
+        - $ref: "#/components/parameters/IncludeDeleted"
+        - name: account_ref
+          in: query
+          schema: { type: string }
+          description: Only groups with this `account_ref`; on a scoped call it narrows within the account, never widens it.
+      responses:
+        "200": { description: Groups., content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/Group" } } } } }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "500": { $ref: "#/components/responses/Error" }
+    post:
+      summary: Create a budget group (a Lab account's lease when `account_ref` is set)
+      operationId: createGroup
+      security: [{ masterKey: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json: { schema: { $ref: "#/components/schemas/NewGroup" } }
+      responses:
+        "201": { description: The group., content: { application/json: { schema: { $ref: "#/components/schemas/Group" } } } }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "500": { $ref: "#/components/responses/Error" }
+  /admin/groups/{id}:
+    parameters:
+      - $ref: "#/components/parameters/AccountRef"
+      - $ref: "#/components/parameters/GroupId"
+    get:
+      summary: One group with its live pool figures (what the Lab's lease sync reads)
+      operationId: getGroup
+      security: [{ masterKey: [] }]
+      responses:
+        "200": { description: The group record plus `spent_micro` and `budget_max_micro`., content: { application/json: { schema: { $ref: "#/components/schemas/GroupView" } } } }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "500": { $ref: "#/components/responses/Error" }
+    patch:
+      summary: Update a group (the lease sync sets `budget_max` absolutely here)
+      operationId: patchGroup
+      security: [{ masterKey: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json: { schema: { $ref: "#/components/schemas/GroupPatch" } }
+      responses:
+        "200": { description: The updated group., content: { application/json: { schema: { $ref: "#/components/schemas/Group" } } } }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "500": { $ref: "#/components/responses/Error" }
+    delete:
+      summary: Soft-delete a group (refused with 400 while it has active member keys)
+      operationId: deleteGroup
+      security: [{ masterKey: [] }]
+      responses:
+        "204": { $ref: "#/components/responses/NoContent" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "500": { $ref: "#/components/responses/Error" }
+  /admin/groups/{id}/grant:
+    parameters:
+      - $ref: "#/components/parameters/AccountRef"
+      - $ref: "#/components/parameters/GroupId"
+    post:
+      summary: Top a group's shared budget up (the Lab's lease top-up)
+      operationId: grantGroup
+      security: [{ masterKey: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json: { schema: { $ref: "#/components/schemas/Grant" } }
+      responses:
+        "200": { description: The updated group., content: { application/json: { schema: { $ref: "#/components/schemas/Group" } } } }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "500": { $ref: "#/components/responses/Error" }
+  /admin/usage:
+    parameters:
+      - $ref: "#/components/parameters/AccountRef"
+    get:
+      summary: Aggregated usage from `usage_log` (best effort, not the bill)
+      description: Unknown query parameters are 400 `LM-1001`.
+      operationId: usageReport
+      security: [{ masterKey: [] }]
+      parameters:
+        - { name: key_id, in: query, schema: { type: string } }
+        - { name: group_id, in: query, schema: { type: string } }
+        - { name: model, in: query, schema: { type: string } }
+        - { name: provider, in: query, schema: { type: string } }
+        - { name: capability, in: query, schema: { type: string, enum: [chat, embed, rerank, decisions, systemone] }, description: "`systemone` is accepted for rows written before the rename." }
+        - $ref: "#/components/parameters/Since"
+        - $ref: "#/components/parameters/Until"
+        - { name: group_by, in: query, schema: { type: string, enum: [model, model_used, provider, capability, key_id, group_id, status, total], default: model } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 1000, default: 100 } }
+      responses:
+        "200": { description: One aggregate per group., content: { application/json: { schema: { $ref: "#/components/schemas/UsageReport" } } } }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "500": { $ref: "#/components/responses/Error" }
+  /admin/usage/export:
+    parameters:
+      - $ref: "#/components/parameters/AccountRef"
+    get:
+      summary: Raw usage rows, paginated by id
+      description: Unknown query parameters are 400 `LM-1001`.
+      operationId: usageExport
+      security: [{ masterKey: [] }]
+      parameters:
+        - $ref: "#/components/parameters/Since"
+        - $ref: "#/components/parameters/Until"
+        - { name: cursor, in: query, schema: { type: integer }, description: "Rows with an id strictly greater than this." }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 10000, default: 1000 } }
+      responses:
+        "200": { description: A page., content: { application/json: { schema: { $ref: "#/components/schemas/UsageExportPage" } } } }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "500": { $ref: "#/components/responses/Error" }
+  /admin/provider-keys/{name}:
+    parameters:
+      - $ref: "#/components/parameters/AccountRef"
+      - $ref: "#/components/parameters/ProviderName"
+    put:
+      summary: Store a provider API key encrypted at rest and apply it live
+      operationId: putProviderKey
+      security: [{ masterKey: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json: { schema: { $ref: "#/components/schemas/ProviderKeyBody" } }
+      responses:
+        "204": { $ref: "#/components/responses/NoContent" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "500": { $ref: "#/components/responses/Error" }
+  /admin/providers/{name}/check:
+    parameters:
+      - $ref: "#/components/parameters/AccountRef"
+      - $ref: "#/components/parameters/ProviderName"
+    post:
+      summary: Verify a provider's credentials without inference
+      operationId: checkProviderKey
+      security: [{ masterKey: [] }]
+      responses:
+        "200": { description: The verdict (a rejected key is `key_valid` false in a 200, never an error code)., content: { application/json: { schema: { $ref: "#/components/schemas/ProviderKeyCheck" } } } }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+  /admin/webhooks:
+    parameters:
+      - $ref: "#/components/parameters/AccountRef"
+    get:
+      summary: Webhook settings in force
+      operationId: getWebhooks
+      security: [{ masterKey: [] }]
+      responses:
+        "200": { description: Status and settings (never the signing secret)., content: { application/json: { schema: { $ref: "#/components/schemas/WebhookStatus" } } } }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+    put:
+      summary: Replace the webhook settings (stored; wins over the config block)
+      operationId: putWebhooks
+      security: [{ masterKey: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json: { schema: { $ref: "#/components/schemas/WebhookSettings" } }
+      responses:
+        "200": { description: The settings in force., content: { application/json: { schema: { $ref: "#/components/schemas/WebhookStatus" } } } }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "500": { $ref: "#/components/responses/Error" }
+    delete:
+      summary: Stop emitting events, persistently (idempotent; the config block does not re-enable them)
+      operationId: deleteWebhooks
+      security: [{ masterKey: [] }]
+      responses:
+        "200": { description: The resulting status., content: { application/json: { schema: { $ref: "#/components/schemas/WebhookStatus" } } } }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "500": { $ref: "#/components/responses/Error" }
+  /admin/webhooks/signing-key:
+    parameters:
+      - $ref: "#/components/parameters/AccountRef"
+    put:
+      summary: Seal the webhook signing secret in the database
+      operationId: putWebhookSigningKey
+      security: [{ masterKey: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json: { schema: { $ref: "#/components/schemas/WebhookSecretBody" } }
+      responses:
+        "204": { $ref: "#/components/responses/NoContent" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "500": { $ref: "#/components/responses/Error" }
+    delete:
+      summary: Forget the sealed signing secret
+      operationId: deleteWebhookSigningKey
+      security: [{ masterKey: [] }]
+      responses:
+        "204": { $ref: "#/components/responses/NoContent" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "500": { $ref: "#/components/responses/Error" }
+  /admin/config:
+    parameters:
+      - $ref: "#/components/parameters/AccountRef"
+    get:
+      summary: The dynamic config document and its hash
+      operationId: getConfig
+      security: [{ masterKey: [] }]
+      responses:
+        "200": { description: The document., content: { application/json: { schema: { $ref: "#/components/schemas/ConfigDocument" } } } }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "500": { $ref: "#/components/responses/Error" }
+    put:
+      summary: Replace the dynamic config document (validated, hot reloaded)
+      operationId: putConfig
+      security: [{ masterKey: [] }]
+      parameters:
+        - $ref: "#/components/parameters/IfMatch"
+      requestBody:
+        required: true
+        content:
+          application/toml: { schema: { type: string } }
+          text/plain: { schema: { type: string } }
+      responses:
+        "204": { $ref: "#/components/responses/NoContent" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "412": { $ref: "#/components/responses/Error" }
+        "500": { $ref: "#/components/responses/Error" }
+  /admin/config/providers:
+    parameters:
+      - $ref: "#/components/parameters/AccountRef"
+    get:
+      summary: Providers in the current document (name and kind)
+      operationId: listProviders
+      security: [{ masterKey: [] }]
+      responses:
+        "200": { description: The list and the document hash., content: { application/json: { schema: { $ref: "#/components/schemas/ProvidersList" } } } }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "500": { $ref: "#/components/responses/Error" }
+  /admin/config/providers/{name}:
+    parameters:
+      - $ref: "#/components/parameters/AccountRef"
+      - $ref: "#/components/parameters/ProviderName"
+    get:
+      summary: One provider's full config
+      operationId: getProvider
+      security: [{ masterKey: [] }]
+      responses:
+        "200": { description: The provider plus the document hash., content: { application/json: { schema: { $ref: "#/components/schemas/ProviderDocument" } } } }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "500": { $ref: "#/components/responses/Error" }
+    put:
+      summary: Create or replace one provider
+      operationId: putProvider
+      security: [{ masterKey: [] }]
+      parameters:
+        - $ref: "#/components/parameters/IfMatch"
+      requestBody:
+        required: true
+        content:
+          application/json: { schema: { $ref: "#/components/schemas/ProviderWrite" } }
+      responses:
+        "204": { $ref: "#/components/responses/NoContent" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "412": { $ref: "#/components/responses/Error" }
+        "500": { $ref: "#/components/responses/Error" }
+    delete:
+      summary: Remove one provider (and its stored key)
+      operationId: deleteProvider
+      security: [{ masterKey: [] }]
+      parameters:
+        - $ref: "#/components/parameters/IfMatch"
+      responses:
+        "204": { $ref: "#/components/responses/NoContent" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "412": { $ref: "#/components/responses/Error" }
+        "500": { $ref: "#/components/responses/Error" }
+  /admin/config/virtual_models:
+    parameters:
+      - $ref: "#/components/parameters/AccountRef"
+    get:
+      summary: Virtual models in the current document
+      operationId: listVirtualModels
+      security: [{ masterKey: [] }]
+      responses:
+        "200": { description: The list and the document hash., content: { application/json: { schema: { $ref: "#/components/schemas/VirtualModelsList" } } } }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "500": { $ref: "#/components/responses/Error" }
+  /admin/config/virtual_models/{id}:
+    parameters:
+      - $ref: "#/components/parameters/AccountRef"
+      - $ref: "#/components/parameters/VirtualModelId"
+    get:
+      summary: One virtual model
+      operationId: getVirtualModel
+      security: [{ masterKey: [] }]
+      responses:
+        "200": { description: The virtual model plus the document hash., content: { application/json: { schema: { $ref: "#/components/schemas/VirtualModelDocument" } } } }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "500": { $ref: "#/components/responses/Error" }
+    put:
+      summary: Create or replace one virtual model
+      operationId: putVirtualModel
+      security: [{ masterKey: [] }]
+      parameters:
+        - $ref: "#/components/parameters/IfMatch"
+      requestBody:
+        required: true
+        content:
+          application/json: { schema: { $ref: "#/components/schemas/VirtualModelWrite" } }
+      responses:
+        "204": { $ref: "#/components/responses/NoContent" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "412": { $ref: "#/components/responses/Error" }
+        "500": { $ref: "#/components/responses/Error" }
+    delete:
+      summary: Remove one virtual model
+      operationId: deleteVirtualModel
+      security: [{ masterKey: [] }]
+      parameters:
+        - $ref: "#/components/parameters/IfMatch"
+      responses:
+        "204": { $ref: "#/components/responses/NoContent" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "412": { $ref: "#/components/responses/Error" }
+        "500": { $ref: "#/components/responses/Error" }
+  /admin/config/virtual_models/{id}/plan:
+    parameters:
+      - $ref: "#/components/parameters/AccountRef"
+      - $ref: "#/components/parameters/VirtualModelId"
+    get:
+      summary: The resolved routing tree of one virtual model
+      operationId: getVirtualModelPlan
+      security: [{ masterKey: [] }]
+      responses:
+        "200": { description: The plan plus the document hash., content: { application/json: { schema: { $ref: "#/components/schemas/VirtualModelPlan" } } } }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "500": { $ref: "#/components/responses/Error" }
+  /admin/config/{section}:
+    parameters:
+      - $ref: "#/components/parameters/AccountRef"
+      - name: section
+        in: path
+        required: true
+        schema: { type: string, enum: [resilience, tokenizer, image_fetch, webhooks, auth] }
+        description: "`auth` covers only `flush_interval_ms` and `retention_days`. Any other section is 404 `LM-1003`."
+    get:
+      summary: One dynamic config section as JSON
+      operationId: getConfigSection
+      security: [{ masterKey: [] }]
+      responses:
+        "200":
+          description: "`{\"<section>\": <value>, \"hash\": \"...\"}`; the `webhooks` value is null when the block is absent."
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [hash]
+                properties:
+                  hash: { type: string }
+                additionalProperties: true
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "500": { $ref: "#/components/responses/Error" }
+    put:
+      summary: Replace one dynamic config section (JSON body)
+      operationId: putConfigSection
+      security: [{ masterKey: [] }]
+      parameters:
+        - $ref: "#/components/parameters/IfMatch"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              description: The section's value; for `webhooks`, `null` removes the block.
+              type: [object, "null"]
+              additionalProperties: true
+      responses:
+        "204": { $ref: "#/components/responses/NoContent" }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "412": { $ref: "#/components/responses/Error" }
+        "500": { $ref: "#/components/responses/Error" }

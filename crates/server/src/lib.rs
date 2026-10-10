@@ -7,6 +7,7 @@
 
 pub mod accounting;
 pub mod admin;
+pub mod admin_scope;
 pub mod app;
 pub mod auth;
 pub mod budget_flush;
@@ -20,9 +21,11 @@ pub mod embeddings;
 pub mod error;
 pub mod facts;
 pub mod health;
+pub mod lab_identity;
 pub mod lifecycle;
 pub mod metadata;
 pub mod models;
+pub mod openapi;
 pub mod pricing;
 pub mod reload;
 pub mod rerank;

@@ -394,6 +394,9 @@ pub struct UsageFilter {
     pub provider: Option<String>,
     /// Only rows of this capability (`chat` | `embed` | `rerank` | `decisions`).
     pub capability: Option<String>,
+    /// Only rows of groups with this `account_ref` (platform contract v2
+    /// section 8.3); rows with no group never match.
+    pub account_ref: Option<String>,
     /// Window start, unix seconds (inclusive).
     pub since: i64,
     /// Window end, unix seconds (inclusive).
@@ -599,6 +602,20 @@ pub struct OutboxRow {
     pub id: String,
     /// Serialized event JSON, sent verbatim.
     pub body: String,
+    /// When a 2xx answer from the Lab first left this event out of
+    /// `accepted`, unix ms; `None` until then (contract v2 section 3.5).
+    pub first_skipped_ms: Option<i64>,
+}
+
+/// One row settled by [`KeyStore::outbox_record_skips`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkippedRow {
+    /// Event id.
+    pub id: String,
+    /// The first skip, unix ms (`now_ms` when this was the first one).
+    pub first_skipped_ms: i64,
+    /// The event had been skipped for the whole window and is now dropped.
+    pub dropped: bool,
 }
 
 /// Every `virtual_keys` column a [`VirtualKeyRecord`] reads, in one place so
@@ -804,6 +821,45 @@ impl KeyStore {
         Ok(records)
     }
 
+    /// One live key by id: `None` for an unknown id or a tombstone.
+    ///
+    /// # Errors
+    ///
+    /// [`AuthError::Db`] if the query fails.
+    pub async fn get_key(&self, id: &str) -> Result<Option<VirtualKeyRecord>, AuthError> {
+        let record = sqlx::query_as::<_, VirtualKeyRecord>(concat!(
+            "SELECT ",
+            key_columns!(),
+            " FROM virtual_keys WHERE id = ? AND deleted_at IS NULL"
+        ))
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(record)
+    }
+
+    /// One key by id, tombstones included (`deleted_at` set): `None` only for
+    /// an id that never existed. For the admin delete path, whose retry must
+    /// still find a tombstoned row to repair a missed in-memory eviction.
+    ///
+    /// # Errors
+    ///
+    /// [`AuthError::Db`] if the query fails.
+    pub async fn get_key_including_deleted(
+        &self,
+        id: &str,
+    ) -> Result<Option<VirtualKeyRecord>, AuthError> {
+        let record = sqlx::query_as::<_, VirtualKeyRecord>(concat!(
+            "SELECT ",
+            key_columns!(),
+            " FROM virtual_keys WHERE id = ?"
+        ))
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(record)
+    }
+
     /// Apply a partial update; returns the updated record, or `None` when the
     /// id does not exist (or was deleted - tombstones reject updates).
     pub async fn update_key(
@@ -965,8 +1021,8 @@ impl KeyStore {
     /// Up to `limit` pending events whose next attempt is due, oldest first.
     pub async fn outbox_due(&self, now_ms: i64, limit: i64) -> Result<Vec<OutboxRow>, AuthError> {
         let rows = sqlx::query_as::<_, OutboxRow>(
-            "SELECT id, body FROM usage_outbox \
-             WHERE delivered_ms IS NULL AND next_attempt_ms <= ? \
+            "SELECT id, body, first_skipped_ms FROM usage_outbox \
+             WHERE delivered_ms IS NULL AND dropped_ms IS NULL AND next_attempt_ms <= ? \
              ORDER BY created_ms, id LIMIT ?",
         )
         .bind(now_ms)
@@ -998,6 +1054,49 @@ impl KeyStore {
         Ok(changed)
     }
 
+    /// Record that a reachable Lab left `ids` out of `accepted` at `now_ms`
+    /// (contract v2 section 3.5). The first skip starts the clock
+    /// (`first_skipped_ms`, never reset); an event whose earlier first skip
+    /// is at least `window_ms` old is dropped instead: no longer pending,
+    /// never resent, purged with delivered rows. A first skip never drops
+    /// in the same call. One statement per row in one transaction, so the
+    /// clock and the drop cannot race another sender. Rows already
+    /// delivered or dropped are left alone and not returned.
+    pub async fn outbox_record_skips(
+        &self,
+        ids: &[String],
+        now_ms: i64,
+        window_ms: i64,
+    ) -> Result<Vec<SkippedRow>, AuthError> {
+        let mut tx = self.pool.begin().await?;
+        let mut settled = Vec::with_capacity(ids.len());
+        for id in ids {
+            // SET expressions read the row as it was before the update.
+            let row = sqlx::query(
+                "UPDATE usage_outbox SET \
+                   first_skipped_ms = COALESCE(first_skipped_ms, ?1), \
+                   dropped_ms = CASE WHEN first_skipped_ms IS NOT NULL \
+                                      AND ?1 - first_skipped_ms >= ?2 THEN ?1 END \
+                 WHERE id = ?3 AND delivered_ms IS NULL AND dropped_ms IS NULL \
+                 RETURNING first_skipped_ms, dropped_ms",
+            )
+            .bind(now_ms)
+            .bind(window_ms)
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if let Some(row) = row {
+                settled.push(SkippedRow {
+                    id: id.clone(),
+                    first_skipped_ms: row.try_get("first_skipped_ms")?,
+                    dropped: row.try_get::<Option<i64>, _>("dropped_ms")?.is_some(),
+                });
+            }
+        }
+        tx.commit().await?;
+        Ok(settled)
+    }
+
     /// Push failed events back: `attempts += 1` and the next attempt at
     /// `now + min(2^attempts s, 300 s) + jitter_ms`.
     pub async fn outbox_reschedule(
@@ -1026,14 +1125,15 @@ impl KeyStore {
     /// Pending event count and the oldest pending `created_ms`.
     pub async fn outbox_stats(&self) -> Result<(i64, Option<i64>), AuthError> {
         let row = sqlx::query(
-            "SELECT COUNT(*) AS n, MIN(created_ms) AS oldest FROM usage_outbox WHERE delivered_ms IS NULL",
+            "SELECT COUNT(*) AS n, MIN(created_ms) AS oldest FROM usage_outbox \
+             WHERE delivered_ms IS NULL AND dropped_ms IS NULL",
         )
         .fetch_one(&self.pool)
         .await?;
         Ok((row.try_get("n")?, row.try_get("oldest")?))
     }
 
-    /// Delete delivered events acknowledged before `older_than_ms`; returns
+    /// Delete delivered or dropped events settled before `older_than_ms`; returns
     /// the total deleted. Deletes in chunks of [`OUTBOX_PURGE_CHUNK`] rows,
     /// yielding between chunks, so a large backlog never holds the SQLite
     /// write lock (shared with the budget flush) for one long statement.
@@ -1043,8 +1143,10 @@ impl KeyStore {
             let purged = sqlx::query(
                 "DELETE FROM usage_outbox WHERE rowid IN (\
                    SELECT rowid FROM usage_outbox \
-                   WHERE delivered_ms IS NOT NULL AND delivered_ms < ? LIMIT ?)",
+                   WHERE (delivered_ms IS NOT NULL AND delivered_ms < ?) \
+                      OR (dropped_ms IS NOT NULL AND dropped_ms < ?) LIMIT ?)",
             )
+            .bind(older_than_ms)
             .bind(older_than_ms)
             .bind(OUTBOX_PURGE_CHUNK)
             .execute(&self.pool)
@@ -1070,7 +1172,9 @@ impl KeyStore {
             budget_spent: 0.0,
             created_at: now_unix(),
             deleted_at: None,
-            account_ref: params.account_ref,
+            account_ref: params
+                .account_ref
+                .map(crate::billing::canonical_account_ref),
         };
         sqlx::query(
             "INSERT INTO budget_groups (id, name, budget_max, budget_spent, created_at, account_ref) \
@@ -1109,6 +1213,23 @@ impl KeyStore {
         Ok(records)
     }
 
+    /// One live group by id: `None` for an unknown id or a tombstone.
+    ///
+    /// # Errors
+    ///
+    /// [`AuthError::Db`] if the query fails.
+    pub async fn get_group(&self, id: &str) -> Result<Option<GroupRecord>, AuthError> {
+        let record = sqlx::query_as::<_, GroupRecord>(concat!(
+            "SELECT ",
+            group_columns!(),
+            " FROM budget_groups WHERE id = ? AND deleted_at IS NULL"
+        ))
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(record)
+    }
+
     /// Every **active** group - exclusively for building the in-memory
     /// [`AuthState`](crate::state::AuthState) at boot and on reload.
     pub async fn load_groups(&self) -> Result<Vec<GroupRecord>, AuthError> {
@@ -1123,7 +1244,10 @@ impl KeyStore {
         patch: GroupPatch,
     ) -> Result<Option<GroupRecord>, AuthError> {
         let ref_change = patch.account_ref.is_some();
-        let ref_value = patch.account_ref.flatten();
+        let ref_value = patch
+            .account_ref
+            .flatten()
+            .map(crate::billing::canonical_account_ref);
         let changed = sqlx::query(
             "UPDATE budget_groups SET \
                name = COALESCE(?, name), \
@@ -1381,6 +1505,9 @@ impl KeyStore {
             1 => sql.push_str(" AND capability IN (?)"),
             _ => sql.push_str(" AND capability IN (?, ?)"),
         }
+        if filter.account_ref.is_some() {
+            sql.push_str(" AND group_id IN (SELECT id FROM budget_groups WHERE account_ref = ?)");
+        }
         sql.push_str(" GROUP BY grp ORDER BY cost DESC, grp ASC LIMIT ?");
 
         // AssertSqlSafe: audited above - only fixed fragments (the capability
@@ -1401,6 +1528,10 @@ impl KeyStore {
         }
         for value in capability_values {
             query = query.bind(value);
+        }
+        // Same order as the clauses above: the account filter comes last.
+        if let Some(account) = &filter.account_ref {
+            query = query.bind(account);
         }
         let rows = query.bind(filter.limit).fetch_all(&self.pool).await?;
 
@@ -1438,6 +1569,8 @@ impl KeyStore {
     /// row when new requests land mid-export, which an offset scan would.
     ///
     /// `limit` bounds the page; the caller is responsible for capping it.
+    /// `account_ref` keeps only rows of groups with that `account_ref`
+    /// (platform contract v2 section 8.3); rows with no group never match it.
     ///
     /// # Errors
     ///
@@ -1448,24 +1581,30 @@ impl KeyStore {
         until: i64,
         cursor: Option<i64>,
         limit: i64,
+        account_ref: Option<&str>,
     ) -> Result<Vec<UsageRow>, AuthError> {
-        let rows = sqlx::query_as::<_, UsageRow>(
+        let mut sql = String::from(
             "SELECT id, key_id, group_id, model, model_used, route, provider, capability, \
              tokens_in, tokens_out, cached_tokens, reasoning_tokens, cache_write_tokens, \
              search_units, media_count, media_bytes, estimated, cost, latency_ms, \
              status, metadata, ts \
              FROM usage_log \
-             WHERE ts >= ? AND ts <= ? AND id > ? \
-             ORDER BY id \
-             LIMIT ?",
-        )
-        .bind(since)
-        .bind(until)
-        // AUTOINCREMENT ids start at 1, so 0 is a safe "from the beginning".
-        .bind(cursor.unwrap_or(0))
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
+             WHERE ts >= ? AND ts <= ? AND id > ?",
+        );
+        if account_ref.is_some() {
+            sql.push_str(" AND group_id IN (SELECT id FROM budget_groups WHERE account_ref = ?)");
+        }
+        sql.push_str(" ORDER BY id LIMIT ?");
+        // AssertSqlSafe: fixed fragments only; every caller value is a bind.
+        let mut query = sqlx::query_as::<_, UsageRow>(sqlx::AssertSqlSafe(sql))
+            .bind(since)
+            .bind(until)
+            // AUTOINCREMENT ids start at 1, so 0 is a safe "from the beginning".
+            .bind(cursor.unwrap_or(0));
+        if let Some(account) = account_ref {
+            query = query.bind(account.to_owned());
+        }
+        let rows = query.bind(limit).fetch_all(&self.pool).await?;
         Ok(rows)
     }
 

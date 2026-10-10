@@ -9,6 +9,13 @@ name: Release
 # release is published only once every asset is attached. Draft-first is
 # mandatory: with immutable releases, GitHub rejects any asset upload after
 # publication, so publish must be the last step, never the first.
+#
+# The image depends on the test gate only and pushes the version tag only, so
+# a release-notes or binaries problem can never cost the image again. The
+# `latest` image tag moves in the final `latest` job, once the release is
+# published (or when a re-run finds it already published). A re-run on a tag
+# whose release is already published does not fail: it leaves the immutable
+# release alone and only (re)pushes the image.
 on:
   push:
     tags:
@@ -56,6 +63,8 @@ jobs:
     name: create draft release with CHANGELOG notes
     runs-on: ubuntu-latest
     needs: gate
+    outputs:
+      published: ${{ steps.state.outputs.published }}
     steps:
       - uses: actions/checkout@v7
 
@@ -73,16 +82,38 @@ jobs:
           fi
           echo "extracted $(wc -l < RELEASE_NOTES.md) lines of release notes"
 
-      # Idempotent: a re-run must not fail on the already-created draft, and
-      # must never touch an already-published (immutable) release.
-      - name: Create the draft release
+      # A re-run on a tag whose release is already published must not fail
+      # the whole workflow (that is how the v0.5.0 image push was lost): the
+      # published release is immutable, so it is left alone and only the
+      # image jobs run.
+      - name: Detect an already-published release
+        id: state
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # Only a confirmed "release not found" means a fresh tag. Any other
+        # lookup failure (API outage, auth) fails the step: treating it as
+        # "not published" would rewrite the notes of an immutable release and
+        # then fail on the asset upload, far from the real error.
+        run: |
+          if view="$(gh release view "$GITHUB_REF_NAME" --json isDraft --jq .isDraft 2>&1)"; then
+            if [ "$view" = "false" ]; then
+              echo "::notice::release $GITHUB_REF_NAME is already published; skipping notes and binaries, pushing the image only"
+              echo "published=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "published=false" >> "$GITHUB_OUTPUT"
+            fi
+          elif printf '%s\n' "$view" | grep -qi 'release not found'; then
+            echo "published=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::could not look up release $GITHUB_REF_NAME: $view" >&2
+            exit 1
+          fi
+
+      - name: Create or update the draft release
+        if: steps.state.outputs.published != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          if gh release view "$GITHUB_REF_NAME" --json isDraft --jq .isDraft 2>/dev/null | grep -q false; then
-            echo "::error::release $GITHUB_REF_NAME is already published (immutable); delete it before re-running." >&2
-            exit 1
-          fi
           gh release create "$GITHUB_REF_NAME" --draft --verify-tag \
             --title "$GITHUB_REF_NAME" --notes-file RELEASE_NOTES.md 2>/dev/null \
             || gh release edit "$GITHUB_REF_NAME" --notes-file RELEASE_NOTES.md
@@ -91,6 +122,7 @@ jobs:
     name: static binary (${{ matrix.target }})
     runs-on: ubuntu-latest
     needs: release-notes
+    if: needs.release-notes.outputs.published != 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -132,10 +164,13 @@ jobs:
             "lumen-${{ matrix.target }}.tar.gz" \
             "lumen-${{ matrix.target }}.tar.gz.sha256"
 
+  # The image needs only the test gate: a release-notes problem must never
+  # cost the image again. Only the version tag is pushed here; `latest`
+  # moves in the last job, after the release is published.
   image:
-    name: multi-arch image → GHCR
+    name: multi-arch image to GHCR
     runs-on: ubuntu-latest
-    needs: release-notes
+    needs: gate
     steps:
       - uses: actions/checkout@v7
 
@@ -158,16 +193,15 @@ jobs:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: |
-            ghcr.io/${{ github.repository }}:${{ github.ref_name }}
-            ghcr.io/${{ github.repository }}:latest
+          tags: ghcr.io/${{ github.repository }}:${{ github.ref_name }}
 
   # Publish LAST, once every binary is attached and the image is pushed. From
   # this moment the release is immutable: no asset can be added or changed.
   publish:
     name: publish release
     runs-on: ubuntu-latest
-    needs: [binaries, image]
+    needs: [release-notes, binaries, image]
+    if: needs.release-notes.outputs.published != 'true'
     steps:
       - uses: actions/checkout@v7
 
@@ -181,3 +215,25 @@ jobs:
             exit 1
           fi
           gh release edit "$GITHUB_REF_NAME" --draft=false --latest
+
+  # `latest` points at a published release only: after `publish` succeeded,
+  # or when the release was already published and the image has just been
+  # (re)pushed. A failed publish leaves `latest` where it was.
+  latest:
+    name: move the latest image tag
+    runs-on: ubuntu-latest
+    needs: [release-notes, image, publish]
+    if: always() && needs.image.result == 'success' && (needs.publish.result == 'success' || (needs.publish.result == 'skipped' && needs.release-notes.outputs.published == 'true'))
+    steps:
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Retag the version image as latest
+        run: |
+          docker buildx imagetools create \
+            -t "ghcr.io/$GITHUB_REPOSITORY:latest" \
+            "ghcr.io/$GITHUB_REPOSITORY:$GITHUB_REF_NAME"

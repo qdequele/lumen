@@ -52,6 +52,7 @@
 
 # Reference
 
+- [HTTP API (OpenAPI)](api.md)
 - [Providers](providers.md)
 - [Error codes](errors.md)
 - [Performance baseline](perf-baseline.md)

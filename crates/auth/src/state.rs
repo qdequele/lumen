@@ -22,7 +22,7 @@
 //! settle that already happens per request, and delivery is decoupled through
 //! a bounded queue (see [`events`](crate::events)).
 
-use crate::billing::{uuid_v7, BillingPolicy, UsageDelta, UsageEvent};
+use crate::billing::{uuid_v7, BillingPolicy, UsageDelta, UsageEvent, UsageUnits};
 use crate::events::{BudgetSignals, EventKind, EventScope, SignalCell, SignalState, Subject};
 use crate::key::hash_key;
 use crate::store::{FlushRow, GroupRecord, OutboxInsert, VirtualKeyRecord};
@@ -207,6 +207,13 @@ impl GroupEntry {
     pub fn spent_micro(&self) -> i64 {
         self.spent_micro.load(Ordering::SeqCst)
     }
+
+    /// The pool cap in micro-USD; `None` = unlimited.
+    #[must_use]
+    pub fn budget_max_micro(&self) -> Option<i64> {
+        let max = self.budget_max_micro.load(Ordering::SeqCst);
+        (max != UNLIMITED).then_some(max)
+    }
 }
 
 /// The live, request-path view of one virtual key.
@@ -269,8 +276,12 @@ pub struct KeyEntry {
     last_billed_ms: AtomicI64,
     /// Settled requests since the last billed flush (informational units).
     requests: AtomicI64,
-    /// Settled tokens since the last billed flush (informational units).
-    tokens: AtomicI64,
+    /// Input tokens settled since the last billed flush (informational units).
+    tokens_in: AtomicI64,
+    /// Output tokens settled since the last billed flush.
+    tokens_out: AtomicI64,
+    /// Tokens of locally estimated requests since the last billed flush.
+    tokens_estimated: AtomicI64,
 }
 
 // Compile-time guard: the `repr(align)` attributes above must match
@@ -300,7 +311,9 @@ impl KeyEntry {
             billed_micro: AtomicI64::new(record.billed_micro),
             last_billed_ms: AtomicI64::new(crate::now_unix_ms()),
             requests: AtomicI64::new(0),
-            tokens: AtomicI64::new(0),
+            tokens_in: AtomicI64::new(0),
+            tokens_out: AtomicI64::new(0),
+            tokens_estimated: AtomicI64::new(0),
         };
         entry.apply_limits(record);
         entry
@@ -552,6 +565,19 @@ pub struct Reservation {
     settled: bool,
 }
 
+/// What one finished request really used, as `settle_usage` records it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SettledUsage {
+    /// Real cost in micro-USD (the billing source).
+    pub cost_micro: i64,
+    /// Input tokens.
+    pub tokens_in: i64,
+    /// Output tokens.
+    pub tokens_out: i64,
+    /// Whether the token counts were a local estimate (ADR 003).
+    pub estimated: bool,
+}
+
 impl Reservation {
     /// The id of the group pool this reservation was charged against, if
     /// any - the authoritative attribution for the request's usage row: a
@@ -567,7 +593,22 @@ impl Reservation {
     /// adjusted from the pre-call estimate to the real token count. In both
     /// dimensions the real figure wins even past the limit - the *next*
     /// request is the one that gets refused.
-    pub fn settle(mut self, actual_cost_micro: i64, actual_tokens: i64) {
+    pub fn settle(self, actual_cost_micro: i64, actual_tokens: i64) {
+        self.settle_usage(SettledUsage {
+            cost_micro: actual_cost_micro,
+            tokens_in: actual_tokens,
+            tokens_out: 0,
+            estimated: false,
+        });
+    }
+
+    /// [`settle`](Self::settle) with the full usage breakdown the billing
+    /// units need (ADR 015, platform contract v2).
+    pub fn settle_usage(mut self, usage: SettledUsage) {
+        let actual_cost_micro = usage.cost_micro;
+        let tokens_in = usage.tokens_in.max(0);
+        let tokens_out = usage.tokens_out.max(0);
+        let actual_tokens = tokens_in.saturating_add(tokens_out);
         let delta = actual_cost_micro.max(0) - self.reserved_micro;
         self.entry.spent_micro.fetch_add(delta, Ordering::SeqCst);
         if let Some(group) = &self.group {
@@ -576,20 +617,26 @@ impl Reservation {
             group.dirty.store(true, Ordering::SeqCst);
         }
         if let Some(debited) = self.tpm_debit {
-            let token_delta = actual_tokens.max(0) - debited;
+            let token_delta = actual_tokens - debited;
             adjust_window(&self.entry.tpm_window, self.minute, token_delta);
         }
         // Billing figures (ADR 015): the settled real cost (the billing
-        // source) and the informational units, three relaxed increments on the
+        // source) and the informational units, relaxed increments on the
         // entry this settle already touches. They come BEFORE the SeqCst dirty
         // store below, which publishes them to the flush's SeqCst swap.
         self.entry
             .settled_micro
             .fetch_add(actual_cost_micro.max(0), Ordering::Relaxed);
         self.entry.requests.fetch_add(1, Ordering::Relaxed);
+        self.entry.tokens_in.fetch_add(tokens_in, Ordering::Relaxed);
         self.entry
-            .tokens
-            .fetch_add(actual_tokens.max(0), Ordering::Relaxed);
+            .tokens_out
+            .fetch_add(tokens_out, Ordering::Relaxed);
+        if usage.estimated {
+            self.entry
+                .tokens_estimated
+                .fetch_add(actual_tokens, Ordering::Relaxed);
+        }
         self.entry.dirty.store(true, Ordering::SeqCst);
         self.settled = true;
 
@@ -848,6 +895,12 @@ impl AuthState {
         }
     }
 
+    /// The live entry of a group, for the admin API's group view.
+    #[must_use]
+    pub fn group(&self, id: &str) -> Option<Arc<GroupEntry>> {
+        self.groups.get(id).map(|entry| Arc::clone(entry.value()))
+    }
+
     /// Apply an admin update to an existing group (by id). Pool spend is
     /// preserved; the budget takes effect for every member on their very
     /// next request (the members share the entry through an `Arc`).
@@ -1019,10 +1072,17 @@ impl AuthState {
         for item in batch.items {
             item.entry.dirty.store(true, Ordering::SeqCst);
             if let Some(delta) = item.delta {
+                let u = delta.units;
+                item.entry.requests.fetch_add(u.requests, Ordering::Relaxed);
                 item.entry
-                    .requests
-                    .fetch_add(delta.requests, Ordering::Relaxed);
-                item.entry.tokens.fetch_add(delta.tokens, Ordering::Relaxed);
+                    .tokens_in
+                    .fetch_add(u.tokens_in, Ordering::Relaxed);
+                item.entry
+                    .tokens_out
+                    .fetch_add(u.tokens_out, Ordering::Relaxed);
+                item.entry
+                    .tokens_estimated
+                    .fetch_add(u.tokens_estimated, Ordering::Relaxed);
             }
         }
     }
@@ -1100,17 +1160,12 @@ impl FlushBatch {
     ///
     /// # Errors
     /// Serialization failure (not expected for these plain structs).
-    pub fn outbox_inserts(
-        &self,
-        source: &str,
-        now_ms: i64,
-    ) -> Result<Vec<OutboxInsert>, serde_json::Error> {
+    pub fn outbox_inserts(&self, now_ms: i64) -> Result<Vec<OutboxInsert>, serde_json::Error> {
         self.deltas()
             .into_iter()
             .map(|delta| {
                 let id = uuid_v7(now_ms);
-                let body =
-                    serde_json::to_string(&UsageEvent::from_delta(id.clone(), delta, source))?;
+                let body = serde_json::to_string(&UsageEvent::from_delta(id.clone(), delta))?;
                 Ok(OutboxInsert {
                     id,
                     body,
@@ -1122,6 +1177,16 @@ impl FlushBatch {
 }
 
 impl KeyEntry {
+    /// Swap every unit counter out (the flush consumed them).
+    fn take_units(&self) -> UsageUnits {
+        UsageUnits {
+            requests: self.requests.swap(0, Ordering::Relaxed),
+            tokens_in: self.tokens_in.swap(0, Ordering::Relaxed),
+            tokens_out: self.tokens_out.swap(0, Ordering::Relaxed),
+            tokens_estimated: self.tokens_estimated.swap(0, Ordering::Relaxed),
+        }
+    }
+
     /// Build this key's flush item under the billing rule (ADR 015). The
     /// watermark tracks SETTLED cost, never the reservation-inclusive spend,
     /// so an in-flight estimate is never billed and a delta is never negative.
@@ -1145,30 +1210,24 @@ impl KeyEntry {
                     .load_full()
                     .map(|account| (group, account))
             });
-        let Some((group, account)) = billable else {
+        let Some((_group, account)) = billable else {
             // Not billed: keep the watermark caught up so the key never bills
             // this cost if it becomes billable later; units are discarded.
-            self.requests.swap(0, Ordering::Relaxed);
-            self.tokens.swap(0, Ordering::Relaxed);
+            self.take_units();
             return item(settled, None);
         };
         if settled <= billed {
             // Nothing new settled (only reachable at equality).
             return item(billed, None);
         }
-        let max = group.budget_max_micro.load(Ordering::SeqCst);
         let delta = UsageDelta {
             key_id: self.id.clone(),
             account_ref: account.as_str().to_owned(),
             external_ref: self.external_ref.load_full().map(|r| r.as_str().to_owned()),
             cost_micro: settled - billed,
-            requests: self.requests.swap(0, Ordering::Relaxed),
-            tokens: self.tokens.swap(0, Ordering::Relaxed),
+            units: self.take_units(),
             window_start_ms: self.last_billed_ms.load(Ordering::SeqCst),
             window_end_ms: now_ms,
-            group_id: group.id.clone(),
-            group_spent_micro: group.spent_micro.load(Ordering::SeqCst),
-            group_budget_max_micro: (max != UNLIMITED).then_some(max),
         };
         item(settled, Some(delta))
     }

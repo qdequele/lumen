@@ -452,6 +452,12 @@ pub enum GatewayError {
     #[error("authentication required")]
     Unauthorized,
 
+    /// The route is platform-only (providers, config, webhooks, the OpenAPI
+    /// document) and the call was scoped to one account with
+    /// `X-Lumen-Account-Ref` (platform contract v2 section 8.3).
+    #[error("this route is platform-only and not available to an account-scoped call")]
+    PlatformOnly,
+
     // ---- Internal errors (LM-5xxx) ------------------------------------------
     /// An internal gateway malfunction. The detail is logged, never returned.
     #[error("internal error: {0}")]
@@ -507,6 +513,7 @@ impl GatewayError {
                 ..
             } => "LM-4003",
             GatewayError::Unauthorized => "LM-4004",
+            GatewayError::PlatformOnly => "LM-4005",
             GatewayError::Internal(_) => "LM-5001",
             GatewayError::ClientCancelled => "LM-6001",
         }
@@ -530,6 +537,7 @@ impl GatewayError {
             GatewayError::ContextLengthExceeded { status, .. }
             | GatewayError::ContentFiltered { status, .. } => *status,
             GatewayError::Unauthorized => 401,
+            GatewayError::PlatformOnly => 403,
             GatewayError::BudgetExceeded { .. } => 402,
             GatewayError::ModelNotFound(_)
             | GatewayError::RouteNotFound
@@ -576,6 +584,7 @@ impl GatewayError {
             | GatewayError::ContentFiltered { .. }
             | GatewayError::PayloadTooLarge { .. }
             | GatewayError::Unauthorized
+            | GatewayError::PlatformOnly
             | GatewayError::BudgetExceeded { .. }
             | GatewayError::QuotaExceeded { .. } => ErrorType::InvalidRequest,
             GatewayError::Upstream { .. }
@@ -927,6 +936,12 @@ mod tests {
             "LM-4003"
         );
         assert_eq!(GatewayError::Unauthorized.code(), "LM-4004");
+        assert_eq!(GatewayError::PlatformOnly.code(), "LM-4005");
+        assert_eq!(GatewayError::PlatformOnly.http_status(), 403);
+        assert_eq!(
+            GatewayError::PlatformOnly.error_type(),
+            ErrorType::InvalidRequest
+        );
         assert_eq!(GatewayError::Internal("boom".into()).code(), "LM-5001");
         // Resilience codes (M6).
         assert_eq!(

@@ -726,12 +726,9 @@ fn run(config_path: PathBuf) -> anyhow::Result<()> {
         // [usage_events] block nothing below runs and no metric is registered.
         let usage_events_cancel = CancellationToken::new();
         let usage_events = match (&config.usage_events, &auth_runtime) {
-            (Some(ue), Some(runtime)) => Some(boot_usage_events(
-                ue,
-                runtime,
-                &metrics,
-                &usage_events_cancel,
-            )?),
+            (Some(ue), Some(runtime)) => {
+                Some(boot_usage_events(ue, runtime, &metrics, &usage_events_cancel).await?)
+            }
             _ => None,
         };
 
@@ -846,31 +843,68 @@ fn attach_optional(
 
 /// Build and spawn the usage-event sender (ADR 015). The signing secret must
 /// be set and not blank: billing without authenticity is refused at boot.
-/// The error names only the variable, never its value.
-fn boot_usage_events(
+/// The error names only the variable, never its value. Once, before the
+/// sender starts, the instance credentials are confirmed against the Lab
+/// (`GET /internal/instances/me`, contract v2 section 3.6).
+async fn boot_usage_events(
     config: &lumen_server::config::UsageEventsConfig,
     runtime: &Arc<AuthRuntime>,
     metrics: &Metrics,
     cancel: &CancellationToken,
 ) -> anyhow::Result<UsageEventsHandle> {
-    let secret = std::env::var(&config.signing_key_env)
+    if let Some(alias) = &config.signing_key_env {
+        tracing::warn!(
+            variable = %alias,
+            "usage_events.signing_key_env is deprecated: name the instance secret with \
+             usage_events.secret_env (default LAB_INSTANCE_SECRET)"
+        );
+    }
+    // Validated `Some` (a UUID) at config load whenever the block exists;
+    // never fall back to an empty id on the wire.
+    let instance_id = config
+        .instance_id
+        .clone()
+        .context("usage_events.instance_id missing after validation")?;
+    let secret_var = config.secret_env_name();
+    let secret = std::env::var(secret_var)
         .ok()
         .filter(|s| !s.trim().is_empty())
         .with_context(|| {
-            format!(
-                "[usage_events] requires the {} env var (the events signing secret)",
-                config.signing_key_env
-            )
+            format!("[usage_events] requires the {secret_var} env var (the Lab instance secret)")
         })?;
     let metrics = lumen_telemetry::UsageEventMetrics::register(metrics)
         .context("could not register the usage-event metrics")?;
     // No redirects: the body is a signed bill and must reach this endpoint only.
     let timeout = Duration::from_millis(config.timeout_ms);
     let client = lumen_providers::http::build_client_with(timeout, timeout);
+    // Confirm the credentials and log who we are to the Lab (contract v2
+    // section 3.6). Rejected credentials or an answer for another product
+    // or another instance abort boot; an unreachable Lab is only a warning:
+    // a control-plane outage must never keep a gateway down.
+    let identity_client = lumen_server::lab_identity::LabIdentityClient::new(
+        client.clone(),
+        &config.url,
+        instance_id.clone(),
+        secret.clone(),
+    );
+    match identity_client.fetch().await {
+        Ok(identity) => tracing::info!(
+            instance_id = %identity.instance_id,
+            region = identity.region.as_deref().unwrap_or("-"),
+            source = %config.source_label(),
+            "Lab instance identity confirmed"
+        ),
+        Err(error) if error.is_fatal() => anyhow::bail!("[usage_events]: {error}"),
+        Err(error) => tracing::warn!(
+            %error,
+            "Lab instance identity not confirmed at boot; events will still be sent and retried"
+        ),
+    }
     let sender = Arc::new(lumen_server::usage_events::UsageEventsSender::new(
         runtime.store.clone(),
         client,
         config.events_url(),
+        instance_id,
         lumen_server::webhooks::SigningKey::new(secret.into_bytes()),
         config.batch_size,
         metrics,
@@ -1267,9 +1301,9 @@ async fn boot_auth_stack(
     let keys = AuthState::load(groups, entries);
     if let Some(usage_events) = &config.usage_events {
         keys.set_billing(Some(Arc::new(lumen_auth::billing::BillingPolicy {
-            source: usage_events.source.clone(),
+            source: usage_events.source_label().to_owned(),
         })));
-        tracing::info!(source = %usage_events.source, "billing usage events enabled");
+        tracing::info!(source = %usage_events.source_label(), "billing usage events enabled");
     }
     tracing::info!(key_count = keys.len(), group_count, "virtual keys loaded");
 

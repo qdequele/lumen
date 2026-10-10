@@ -11,6 +11,7 @@ pub struct UsageEventMetrics {
     oldest_pending_seconds: IntGauge,
     delivered_total: IntCounter,
     failed_total: IntCounterVec,
+    dropped_total: IntCounter,
 }
 
 impl UsageEventMetrics {
@@ -38,16 +39,22 @@ impl UsageEventMetrics {
             ),
             &["reason"],
         )?;
+        let dropped_total = IntCounter::new(
+            "lumen_usage_events_dropped_total",
+            "Billing usage events the control plane kept refusing for 24 h from its first refusal, dropped by the gateway (contract v2 section 3.5).",
+        )?;
         let registry = metrics.registry();
         registry.register(Box::new(pending.clone()))?;
         registry.register(Box::new(oldest_pending_seconds.clone()))?;
         registry.register(Box::new(delivered_total.clone()))?;
         registry.register(Box::new(failed_total.clone()))?;
+        registry.register(Box::new(dropped_total.clone()))?;
         Ok(Self {
             pending,
             oldest_pending_seconds,
             delivered_total,
             failed_total,
+            dropped_total,
         })
     }
 
@@ -70,5 +77,10 @@ impl UsageEventMetrics {
     /// `status`, `malformed`, `not_accepted`, `store`), one increment per event.
     pub fn inc_failed(&self, reason: &str, n: u64) {
         self.failed_total.with_label_values(&[reason]).inc_by(n);
+    }
+
+    /// `n` events dropped 24 h after the control plane first refused them.
+    pub fn add_dropped(&self, n: u64) {
+        self.dropped_total.inc_by(n);
     }
 }

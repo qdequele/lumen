@@ -1,0 +1,112 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://lab.meilisearch.com/contracts/lab-events.schema.json",
+  "title": "Lab event",
+  "description": "One event a product engine reports to the Lab at POST /internal/events, delivered in batches of at most 500 as {\"events\": [<event>, ...]} and acknowledged with 200 {\"accepted\": [<id>, ...]}. Owned by meilisearch/lab (contracts/lab-events.schema.json); Scrapix, glutony and Lumen vendor a byte copy under contracts/vendor/lab/ and drift-check it in CI. The Lab takes the reporting deployment from the authenticated X-Lab-Instance-Id header, never from the body.",
+  "type": "object",
+  "required": ["id", "type", "occurred_at", "account_id", "api_key_id", "product", "data"],
+  "additionalProperties": false,
+  "properties": {
+    "id": {
+      "$ref": "#/$defs/uuid",
+      "description": "Idempotency key. UUIDv7 per request; UUIDv5 of a stable name for job-final events (job:{job_id}:usage, job:{job_id}:lifecycle)."
+    },
+    "type": { "enum": ["usage.recorded", "job.completed", "job.failed"] },
+    "occurred_at": { "type": "string", "format": "date-time" },
+    "account_id": { "$ref": "#/$defs/uuid", "description": "The Lab account the usage belongs to." },
+    "api_key_id": { "type": ["string", "null"], "description": "The Lab API key id when known." },
+    "product": { "enum": ["scrapix", "lumen", "glutony"] },
+    "data": { "type": "object" }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "type": { "const": "usage.recorded" } }, "required": ["type"] },
+      "then": { "properties": { "data": { "$ref": "#/$defs/usageData" } } }
+    },
+    {
+      "if": { "properties": { "type": { "const": "job.completed" } }, "required": ["type"] },
+      "then": { "properties": { "data": { "$ref": "#/$defs/jobCompletedData" } } }
+    },
+    {
+      "if": { "properties": { "type": { "const": "job.failed" } }, "required": ["type"] },
+      "then": { "properties": { "data": { "$ref": "#/$defs/jobFailedData" } } }
+    },
+    {
+      "if": { "properties": { "type": { "const": "usage.recorded" }, "product": { "const": "scrapix" } }, "required": ["type", "product"] },
+      "then": { "properties": { "data": { "properties": { "operation": { "enum": ["scrape", "map", "search", "parse", "ocr", "extract", "crawl"] } } } } }
+    },
+    {
+      "if": { "properties": { "type": { "const": "usage.recorded" }, "product": { "const": "glutony" } }, "required": ["type", "product"] },
+      "then": { "properties": { "data": { "properties": { "operation": { "enum": ["ingest"] } } } } }
+    },
+    {
+      "if": { "properties": { "type": { "const": "usage.recorded" }, "product": { "const": "lumen" } }, "required": ["type", "product"] },
+      "then": { "properties": { "data": { "properties": { "operation": { "enum": ["chat", "embed", "rerank", "systemone", "gateway"] } } } } }
+    },
+    {
+      "if": { "properties": { "product": { "const": "lumen" } }, "required": ["product"] },
+      "then": { "properties": { "type": { "const": "usage.recorded" } } }
+    }
+  ],
+  "$defs": {
+    "uuid": {
+      "type": "string",
+      "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+    },
+    "units": {
+      "type": "object",
+      "description": "Raw units by name. The Lab prices the names in saas/config/pricing.yml; unknown names are kept and ignored.",
+      "additionalProperties": { "type": "integer", "minimum": 0 }
+    },
+    "usageData": {
+      "type": "object",
+      "required": ["operation", "units"],
+      "additionalProperties": false,
+      "properties": {
+        "operation": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Product-specific operation name. scrapix: scrape|map|search|parse|ocr|extract|crawl. glutony: ingest. lumen: chat|embed|rerank|systemone|gateway."
+        },
+        "units": { "$ref": "#/$defs/units" },
+        "provider_cost_micro_usd": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9223372036854775807,
+          "default": 0,
+          "description": "Money the engine paid upstream for this usage (LLM tokens, OCR API), in micro-USD. The Lab prices it with its markup."
+        },
+        "description": { "type": "string", "description": "Human label for the ledger." },
+        "job_id": { "type": "string" },
+        "credits": {
+          "type": "integer",
+          "minimum": 0,
+          "deprecated": true,
+          "description": "Deprecated: pre-v2 engines priced usage themselves. Honoured only for product scrapix, where it is authoritative: the Lab debits it and does not price the units. Removed next release."
+        }
+      }
+    },
+    "jobCompletedData": {
+      "type": "object",
+      "required": ["job_id", "index_uid", "pages_crawled", "documents_indexed", "duration_secs"],
+      "additionalProperties": false,
+      "properties": {
+        "job_id": { "type": "string" },
+        "index_uid": { "type": "string" },
+        "pages_crawled": { "type": "integer", "minimum": 0 },
+        "documents_indexed": { "type": "integer", "minimum": 0 },
+        "duration_secs": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "jobFailedData": {
+      "type": "object",
+      "required": ["job_id", "error_message", "pages_crawled"],
+      "additionalProperties": false,
+      "properties": {
+        "job_id": { "type": "string" },
+        "error_message": { "type": "string" },
+        "pages_crawled": { "type": "integer", "minimum": 0 }
+      }
+    }
+  }
+}

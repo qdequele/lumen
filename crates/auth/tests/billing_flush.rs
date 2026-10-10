@@ -69,13 +69,10 @@ fn a_billable_key_emits_its_positive_delta_with_units() {
     assert_eq!(deltas.len(), 1);
     let d = deltas[0];
     assert_eq!(d.cost_micro, 2_000);
-    assert_eq!((d.requests, d.tokens), (2, 42));
+    assert_eq!((d.units.requests, d.units.tokens_in), (2, 42));
     assert_eq!(d.account_ref, ACCOUNT);
     assert_eq!(d.external_ref.as_deref(), Some("lab-key"));
     assert_eq!(d.window_end_ms, 2_000);
-    assert_eq!(d.group_id, "g");
-    assert_eq!(d.group_spent_micro, 2_000);
-    assert_eq!(d.group_budget_max_micro, Some(100_000_000));
     assert_eq!(batch.rows()[0].billed_micro, 2_000);
     s.commit_flush(batch);
 
@@ -123,7 +120,7 @@ fn non_billable_keys_keep_the_watermark_caught_up() {
         assert_eq!(batch.deltas(), [] as [&lumen_auth::billing::UsageDelta; 0]);
         assert_eq!(batch.rows()[0].billed_micro, 700);
         assert_eq!(
-            batch.outbox_inserts("eu-1", 2_000).unwrap(),
+            batch.outbox_inserts(2_000).unwrap(),
             [] as [lumen_auth::store::OutboxInsert; 0]
         );
     }
@@ -150,7 +147,10 @@ fn rollback_redirties_and_restores_counters() {
     // No new spend, yet the key is flushed again with the same money and units.
     let retry = s.drain_flush(3_000);
     let d = retry.deltas()[0];
-    assert_eq!((d.cost_micro, d.requests, d.tokens), (900, 1, 9));
+    assert_eq!(
+        (d.cost_micro, d.units.requests, d.units.tokens_in),
+        (900, 1, 9)
+    );
 }
 
 #[test]
@@ -222,10 +222,57 @@ fn outbox_inserts_carry_valid_events() {
     let s = state(Some(ACCOUNT), Some("g"), true);
     spend(&s, 42, 1);
     let batch = s.drain_flush(2_000);
-    let inserts = batch.outbox_inserts("eu-1", 2_000).unwrap();
+    let inserts = batch.outbox_inserts(2_000).unwrap();
     assert_eq!(inserts.len(), 1);
     let body: serde_json::Value = serde_json::from_str(&inserts[0].body).unwrap();
     assert_eq!(body["id"], inserts[0].id.as_str());
-    assert_eq!(body["data"]["cost_micro_usd"], 42);
+    assert_eq!(body["data"]["provider_cost_micro_usd"], 42);
     assert_eq!(inserts[0].created_ms, 2_000);
+}
+
+/// Admit and settle one request with a full usage breakdown.
+fn spend_usage(state: &AuthState, usage: lumen_auth::state::SettledUsage) {
+    let entry = state.authenticate("sk", NOW).unwrap();
+    entry
+        .admit(NOW, usage.tokens_in + usage.tokens_out, usage.cost_micro)
+        .unwrap()
+        .settle_usage(usage);
+}
+
+#[test]
+fn units_split_tokens_and_count_estimates() {
+    use lumen_auth::state::SettledUsage;
+    let s = state(Some(ACCOUNT), Some("g"), true);
+    // Upstream usage: exact counts, nothing estimated.
+    spend_usage(
+        &s,
+        SettledUsage {
+            cost_micro: 1_000,
+            tokens_in: 30,
+            tokens_out: 10,
+            estimated: false,
+        },
+    );
+    // No upstream usage: the local estimate is flagged (ADR 003).
+    spend_usage(
+        &s,
+        SettledUsage {
+            cost_micro: 500,
+            tokens_in: 7,
+            tokens_out: 3,
+            estimated: true,
+        },
+    );
+    let batch = s.drain_flush(2_000);
+    let d = batch.deltas()[0];
+    assert_eq!(d.cost_micro, 1_500);
+    assert_eq!(
+        d.units,
+        lumen_auth::billing::UsageUnits {
+            requests: 2,
+            tokens_in: 37,
+            tokens_out: 13,
+            tokens_estimated: 10,
+        }
+    );
 }

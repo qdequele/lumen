@@ -33,7 +33,8 @@ to gate it. See [`SECURITY.md`](https://github.com/qdequele/lumen/blob/main/SECU
 | `lumen_usage_events_pending` | none | Billing usage events in the outbox and not yet acknowledged (ADR 015). Only registered when `[usage_events]` is configured. See [Lab integration](lab-integration.md). |
 | `lumen_usage_events_oldest_pending_seconds` | none | Age of the oldest unacknowledged billing usage event, in seconds (0 when none). |
 | `lumen_usage_events_delivered_total` | none | Billing usage events the control plane acknowledged in `accepted`. |
-| `lumen_usage_events_failed_total` | `reason` | Billing usage events whose delivery attempt failed, one increment per event; they stay pending and are retried, never dropped. `reason` is `connect`, `timeout`, `auth`, `status`, `malformed`, `not_accepted` or `store`. |
+| `lumen_usage_events_failed_total` | `reason` | Billing usage events whose delivery attempt failed, one increment per event; they stay pending and are retried; see `lumen_usage_events_dropped_total` for the one exception. `not_accepted` counts only the events that will be retried: an event dropped on that attempt counts in `lumen_usage_events_dropped_total` instead. `reason` is `connect`, `timeout`, `auth`, `status`, `malformed`, `not_accepted` or `store`. |
+| `lumen_usage_events_dropped_total` | none | Billing usage events the control plane kept out of `accepted` for 24 h, counted from its first `2xx` answer that left the event out, dropped with an error log naming the event id (platform contract v2). A skip after a long outage starts the clock; it never drops on its own. The row stays in `usage_outbox` with `dropped_ms` set until the 7-day purge. An unreachable or failing control plane never drops an event. |
 
 `lumen_tokens_total`, `lumen_rerank_search_units_total`, `lumen_media_total`
 and `lumen_media_bytes_total` also gain one extra label per key listed in
@@ -59,6 +60,7 @@ something watches these:
 | `increase(lumen_webhook_dropped_total[5m]) > 0` | The webhook queue is full and signals are being shed: a billing backend relying on `budget.threshold` for auto-recharge is running blind, and key-lifecycle events are being lost too. Raise `channel_capacity` or fix a slow receiver. |
 | `increase(lumen_webhook_dead_total[15m]) > 0` | Events are being abandoned - the receiver is down past the retry budget, or rejecting deliveries outright (check for a signature mismatch). Reconcile through `GET /admin/usage/export` until it recovers. |
 | `lumen_usage_events_oldest_pending_seconds > 900` for 5m | Billing usage events are not reaching the control plane (unreachable, rejecting, or skipping them). Serving is unaffected, but every bill is delayed; check `lumen_usage_events_failed_total` by `reason`. See [Lab integration](lab-integration.md). |
+| `increase(lumen_usage_events_dropped_total[1h]) > 0` | A reachable Lab kept leaving a usage event out of `accepted` for 24 h and the gateway dropped it: that usage was never billed. Reconcile it by hand before the 7-day purge, see the runbook in [Lab integration](lab-integration.md#runbook-an-event-the-lab-never-accepts). |
 | `lumen_circuit_state == 1` for 2m | A provider/model circuit is open: calls are short-circuited to fallbacks (or failing). |
 | `lumen_provider_up == 0` for 5m | A background health probe cannot reach a provider (only exported for probed providers). |
 | 5xx share of `lumen_request_duration_seconds_count` > 5% | Upstream or gateway failures; `499` (client cancelled) is deliberately outside the 5xx class and does not count. |
