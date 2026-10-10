@@ -197,8 +197,10 @@ retention_days = 30               # purge usage_log rows older than this
 # turns each billable key's newly settled cost (keys in a group with an
 # account_ref) into a signed usage.recorded event, stored in the database in
 # the same transaction as the spend and pushed to {url}/internal/events until
-# the control plane acknowledges it. Delivery is retried with capped backoff
-# and never dropped. Enabling this block makes LUMEN call that URL; events
+# the control plane acknowledges it. Delivery is retried with capped backoff;
+# an event is dropped only when a reachable Lab keeps it out of `accepted`
+# for 24 h (an unreachable Lab never drops one). Enabling this block makes
+# LUMEN call that URL (and GET {url}/internal/instances/me once at boot); events
 # carry no prompt, response, metadata or model id. Requires [auth]
 # enabled = true, and the env var named by secret_env (LAB_INSTANCE_SECRET by
 # default) must be set.
