@@ -32,7 +32,8 @@ pub struct AccountScope(Option<String>);
 impl AccountScope {
     /// Read the header: absent is unscoped; a value that is not a UUID, or
     /// the header sent more than once, is `LM-1001` (never read as
-    /// "unscoped", which would widen the call to every account).
+    /// "unscoped", which would widen the call to every account). A valid
+    /// UUID is kept in canonical lowercase.
     ///
     /// # Errors
     /// `LM-1001` when the header is present but not exactly one UUID.
@@ -55,7 +56,10 @@ impl AccountScope {
             .map(str::trim)
             .filter(|v| lumen_auth::billing::is_uuid(v))
             .ok_or_else(invalid)?;
-        Ok(Self(Some(account.to_owned())))
+        // Canonical lowercase, so lists, foreign-id checks and a forced
+        // `account_ref` on a scoped create all agree whatever case the
+        // caller sent.
+        Ok(Self(Some(account.to_ascii_lowercase())))
     }
 
     /// The scoped account, if any.

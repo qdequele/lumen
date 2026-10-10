@@ -484,8 +484,11 @@ pub async fn create_group(
     // section 8.3): forced when absent, refused when it names another one.
     if let Some(account) = scope.account() {
         match params.account_ref.as_deref() {
+            // The header is canonical lowercase; store that form.
             None => params.account_ref = Some(account.to_owned()),
-            Some(same) if same == account => {}
+            Some(same) if same.eq_ignore_ascii_case(account) => {
+                params.account_ref = Some(account.to_owned());
+            }
             Some(_) => {
                 return Err(GatewayError::InvalidRequest(
                     "`account_ref` must equal X-Lumen-Account-Ref on a scoped call".to_owned(),

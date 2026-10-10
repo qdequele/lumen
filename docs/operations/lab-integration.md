@@ -147,14 +147,16 @@ reports is billed by the Lab.
 A hosted gateway serves many Lab accounts through one master key, so the
 gateway enforces the account boundary itself (contract v2, section 8.3).
 The Lab sets `X-Lumen-Account-Ref: <account uuid>` on every `/admin/*` call
-it proxies for a user; with that header:
+it proxies for a user. The UUID is matched in its canonical lowercase form
+whatever case the caller sends, and a group created under the header stores
+that lowercase form. With that header:
 
 | Routes | Behaviour |
 |---|---|
 | `GET /admin/keys`, `GET /admin/groups`, `GET /admin/usage`, `GET /admin/usage/export` | Only rows of groups whose `account_ref` equals the header. A key with no group is never listed. A query filter naming another account (`?account_ref=` on groups, `?key_id=` or `?group_id=` on usage) matches nothing: a filter narrows the scope, never widens it. |
 | `PATCH`, `DELETE`, `rotate` and `grant` on a key; `GET`, `PATCH`, `DELETE` and `grant` on a group: when the key or group belongs to another account, or the key has no group | `404 LM-1003`, the same envelope an unknown id gets, so a scoped caller cannot tell a foreign id from one that never existed. |
 | `POST /admin/keys` | `group_id` is required and must name a group of the account (`400 LM-1001` without one, `404 LM-1003` for another account's group). A scoped `PATCH` cannot clear `group_id` (`400 LM-1001`) or move the key to another account's group (`404 LM-1003`). |
-| `POST /admin/groups` | `account_ref` is set to the header's value when absent; a different value is `400 LM-1001`. A scoped `PATCH` that carries `account_ref` at all is `400 LM-1001`. |
+| `POST /admin/groups` | `account_ref` is set to the header's value when absent; a different value (compared ignoring case) is `400 LM-1001`. A scoped `PATCH` that carries `account_ref` at all is `400 LM-1001`. |
 | `/admin/provider-keys/*`, `/admin/providers/{name}/check`, `/admin/webhooks*`, `/admin/config*`, `/openapi.json` | `403 LM-4005`: platform-only, whatever the header's value. |
 
 - **Webhooks are platform-only rather than filtered.** The budget webhook

@@ -654,3 +654,65 @@ async fn usage_report_and_export_are_scoped() {
     .await;
     assert_eq!(page["rows"].as_array().unwrap().len(), 3);
 }
+
+#[tokio::test]
+async fn the_account_header_is_a_canonical_lowercase_uuid() {
+    let (base, _) = spawn().await;
+    let (group_a, key_a, _, _, _) = seed(&base).await;
+    let upper = A.to_ascii_uppercase();
+    assert_ne!(upper, A);
+    // An uppercase header sees exactly the rows the lowercase one sees.
+    for path in ["/admin/keys", "/admin/groups"] {
+        let (status, lower_rows) = call(&base, reqwest::Method::GET, path, Some(A), None).await;
+        assert_eq!(status, 200, "{path}: {lower_rows}");
+        let (status, upper_rows) =
+            call(&base, reqwest::Method::GET, path, Some(&upper), None).await;
+        assert_eq!(status, 200, "{path}: {upper_rows}");
+        assert_eq!(ids(&upper_rows), ids(&lower_rows), "{path}");
+    }
+    let (_, keys) = call(
+        &base,
+        reqwest::Method::GET,
+        "/admin/keys",
+        Some(&upper),
+        None,
+    )
+    .await;
+    assert_eq!(ids(&keys), std::slice::from_ref(&key_a));
+    let (status, group) = call(
+        &base,
+        reqwest::Method::GET,
+        &format!("/admin/groups/{group_a}"),
+        Some(&upper),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{group}");
+    // A scoped create under an uppercase header stores the lowercase ref,
+    // whether the ref is forced or echoed in the body.
+    for body in [
+        json!({"name": "forced", "budget_max": 1.0}),
+        json!({"name": "echoed", "budget_max": 1.0, "account_ref": upper}),
+    ] {
+        let (status, created) = call(
+            &base,
+            reqwest::Method::POST,
+            "/admin/groups",
+            Some(&upper),
+            Some(body.clone()),
+        )
+        .await;
+        assert_eq!(status, 201, "{body}: {created}");
+        let id = created["id"].as_str().unwrap();
+        let (status, stored) = call(
+            &base,
+            reqwest::Method::GET,
+            &format!("/admin/groups/{id}"),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status, 200, "{stored}");
+        assert_eq!(stored["account_ref"], A, "{body}: {stored}");
+    }
+}

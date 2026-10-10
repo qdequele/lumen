@@ -859,6 +859,12 @@ async fn boot_usage_events(
              usage_events.secret_env (default LAB_INSTANCE_SECRET)"
         );
     }
+    // Validated `Some` (a UUID) at config load whenever the block exists;
+    // never fall back to an empty id on the wire.
+    let instance_id = config
+        .instance_id
+        .clone()
+        .context("usage_events.instance_id missing after validation")?;
     let secret_var = config.secret_env_name();
     let secret = std::env::var(secret_var)
         .ok()
@@ -873,12 +879,12 @@ async fn boot_usage_events(
     let client = lumen_providers::http::build_client_with(timeout, timeout);
     // Confirm the credentials and log who we are to the Lab (contract v2
     // section 3.6). Rejected credentials or an answer for another product
-    // abort boot; an unreachable Lab is only a warning: a control-plane
-    // outage must never keep a gateway down.
+    // or another instance abort boot; an unreachable Lab is only a warning:
+    // a control-plane outage must never keep a gateway down.
     let identity_client = lumen_server::lab_identity::LabIdentityClient::new(
         client.clone(),
         &config.url,
-        config.instance_id.clone().unwrap_or_default(),
+        instance_id.clone(),
         secret.clone(),
     );
     match identity_client.fetch().await {
@@ -898,8 +904,7 @@ async fn boot_usage_events(
         runtime.store.clone(),
         client,
         config.events_url(),
-        // Validated `Some` (a UUID) at config load whenever the block exists.
-        config.instance_id.clone().unwrap_or_default(),
+        instance_id,
         lumen_server::webhooks::SigningKey::new(secret.into_bytes()),
         config.batch_size,
         metrics,
