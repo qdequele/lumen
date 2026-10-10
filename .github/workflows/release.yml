@@ -90,12 +90,23 @@ jobs:
         id: state
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # Only a confirmed "release not found" means a fresh tag. Any other
+        # lookup failure (API outage, auth) fails the step: treating it as
+        # "not published" would rewrite the notes of an immutable release and
+        # then fail on the asset upload, far from the real error.
         run: |
-          if gh release view "$GITHUB_REF_NAME" --json isDraft --jq .isDraft 2>/dev/null | grep -q false; then
-            echo "::notice::release $GITHUB_REF_NAME is already published; skipping notes and binaries, pushing the image only"
-            echo "published=true" >> "$GITHUB_OUTPUT"
-          else
+          if view="$(gh release view "$GITHUB_REF_NAME" --json isDraft --jq .isDraft 2>&1)"; then
+            if [ "$view" = "false" ]; then
+              echo "::notice::release $GITHUB_REF_NAME is already published; skipping notes and binaries, pushing the image only"
+              echo "published=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "published=false" >> "$GITHUB_OUTPUT"
+            fi
+          elif printf '%s\n' "$view" | grep -qi 'release not found'; then
             echo "published=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::could not look up release $GITHUB_REF_NAME: $view" >&2
+            exit 1
           fi
 
       - name: Create or update the draft release
