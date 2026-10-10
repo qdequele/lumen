@@ -110,7 +110,9 @@ implemented in LUMEN 0.7.0:
    not this instance's identity (malformed, another `instance_id`, another
    product, a kind other than `hosted`), refuses to boot. Any other answer
    or an unreachable Lab is a warning, never a request-path concern; it
-   delays the listener bind by at most `usage_events.timeout_ms`.
+   runs after the listener is bound and before serving starts, so it delays
+   serving (HTTP requests, `/health` included) by at most
+   `usage_events.timeout_ms`.
 3. **Units, not a price (decision 6 amended).** The event reports
    `operation: "gateway"`, `units {requests, tokens_in, tokens_out,
    tokens_estimated}` and `provider_cost_micro_usd` (the settled-cost delta).

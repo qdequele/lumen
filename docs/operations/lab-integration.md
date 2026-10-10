@@ -133,10 +133,11 @@ reports is billed by the Lab.
   Lab that does not serve the endpoint yet or a `5xx`, a connect error or a
   timeout): the gateway logs one warning and boots. Events are durable and
   the sender retries them.
-- **An unreachable Lab delays readiness.** The call is bounded by
-  `timeout_ms` (default 5000 ms) and runs before the listener binds, so a
-  Lab that does not answer delays the bind by up to that long. Give
-  readiness probes that margin.
+- **An unreachable Lab delays serving.** The call is bounded by
+  `timeout_ms` (default 5000 ms) and runs after the listener is bound but
+  before the gateway starts serving: while a Lab does not answer, the socket
+  accepts TCP connections but HTTP requests, `/health` included, wait up to
+  that long. HTTP readiness probes need that margin; TCP probes pass at once.
 - Billing attribution is unchanged from ADR 015: a key is billed when its
   group has an `account_ref`; every other key is an operator key.
 
