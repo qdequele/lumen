@@ -103,20 +103,21 @@ pub fn build_app(state: AppState) -> Router {
             auth::require_virtual_key,
         ));
 
-    // Separate from /health (which never depends on provider state): the
-    // observability view of background health checks (M6 §6.5). It names the
-    // platform's providers and their health, so an account-scoped call
-    // (`X-Lumen-Account-Ref`, platform contract v2 section 8.3) is refused
-    // with 403 `LM-4005` like the other platform-only routes; without the
-    // header it stays the open operational view.
-    let provider_health = Router::new()
+    // The operational views that describe the whole platform: the provider
+    // health view of background checks (M6 §6.5, separate from /health,
+    // which never depends on provider state) and the Prometheus metrics
+    // (provider, model and key labels across every account). An
+    // account-scoped call (`X-Lumen-Account-Ref`, platform contract v2
+    // section 8.3) is refused with 403 `LM-4005` like the other
+    // platform-only routes; without the header both stay open as before.
+    let operational = Router::new()
         .route("/health/providers", get(health::providers_health))
+        .route("/metrics", get(routes::metrics))
         .route_layer(middleware::from_fn(admin_scope::platform_only));
 
     let mut app = Router::new()
         .route("/health", get(routes::health))
-        .merge(provider_health)
-        .route("/metrics", get(routes::metrics))
+        .merge(operational)
         .merge(api);
 
     if state.auth.is_some() {

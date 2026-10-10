@@ -18,7 +18,8 @@ info:
     8.3): keys, groups and usage are then filtered to groups with that
     `account_ref`, foreign ids are 404, creation is forced into the account,
     and the platform-only routes (provider keys and checks, webhooks,
-    config, this document, `/health/providers`) answer 403 `LM-4005`.
+    config, this document, `/health/providers`, `/metrics`) answer 403
+    `LM-4005`.
     Source of truth: this
     file, pinned to the router by a test in `crates/server/src/app.rs`.
   license:
@@ -41,7 +42,7 @@ components:
       in: header
       required: false
       schema: { type: string, format: uuid }
-      description: Scope this call to one Lab account (platform contract v2 section 8.3). On the key, group and usage routes only that account's rows are visible and writable, and a value that is not exactly one UUID (or the header sent twice) is 400 `LM-1001`. On the platform-only routes (provider keys and checks, webhooks, config, `/openapi.json`, `/health/providers`) the header, whatever its value, is refused with 403 `LM-4005`.
+      description: Scope this call to one Lab account (platform contract v2 section 8.3). On the key, group and usage routes only that account's rows are visible and writable, and a value that is not exactly one UUID (or the header sent twice) is 400 `LM-1001`. On the platform-only routes (provider keys and checks, webhooks, config, `/openapi.json`, `/health/providers`, `/metrics`) the header, whatever its value, is refused with 403 `LM-4005`.
     IfMatch:
       name: If-Match
       in: header
@@ -795,14 +796,18 @@ paths:
                 additionalProperties: { $ref: "#/components/schemas/ProviderStatus" }
         "403": { $ref: "#/components/responses/Error" }
   /metrics:
+    parameters:
+      - $ref: "#/components/parameters/AccountRef"
     get:
       summary: Prometheus metrics
+      description: Needs no key. Its labels cover every provider, model and key on the gateway, so a call carrying `X-Lumen-Account-Ref` (any value) is refused with 403 `LM-4005`.
       operationId: metrics
       responses:
         "200":
           description: Text exposition format.
           content:
             text/plain: { schema: { type: string } }
+        "403": { $ref: "#/components/responses/Error" }
   /openapi.json:
     parameters:
       - $ref: "#/components/parameters/AccountRef"

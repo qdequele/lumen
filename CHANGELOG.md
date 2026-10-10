@@ -83,9 +83,9 @@ All notable changes to LUMEN are documented here. The format is based on
   gets `account_ref` forced on a created group, and is refused with the new
   `403 LM-4005` on the platform-only routes (`/admin/provider-keys/*`,
   `/admin/providers/{name}/check`, `/admin/webhooks*`, `/admin/config*`),
-  `/openapi.json` and `/health/providers` (open without the header, but it
-  names the platform's providers). A malformed or repeated header is `400 LM-1001`, never
-  read as unscoped. Without the header the master key is unchanged. New
+  `/openapi.json`, `/health/providers` and `/metrics` (both open without
+  the header, but they describe the whole platform). A malformed or
+  repeated header is `400 LM-1001`, never read as unscoped. Without the header the master key is unchanged. New
   `GET /admin/groups/{id}` returns the record plus the live `spent_micro`
   and `budget_max_micro` the Lab's lease sync reads; it sets the lease with
   `PATCH /admin/groups/{id}` (`budget_max`) or `POST /admin/groups/{id}/grant`.

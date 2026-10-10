@@ -370,36 +370,40 @@ async fn platform_routes_are_403_with_the_header() {
 }
 
 #[tokio::test]
-async fn provider_health_is_platform_only_with_the_header() {
-    // `/health/providers` names the platform's providers and their health:
-    // an account-scoped caller must not see it, with or without a key.
+async fn operational_views_are_platform_only_with_the_header() {
+    // `/health/providers` names the platform's providers and their health,
+    // and `/metrics` carries provider, model and key labels across every
+    // account: an account-scoped caller must see neither, with or without a
+    // key. `/health` (status and version only) stays open.
     let (base, _) = spawn().await;
-    let (status, body) = call(
-        &base,
-        reqwest::Method::GET,
-        "/health/providers",
-        Some(A),
-        None,
-    )
-    .await;
-    assert_eq!(status, 403, "{body}");
-    assert_eq!(body["error"]["code"], "LM-4005");
+    for path in ["/health/providers", "/metrics"] {
+        let (status, body) = call(&base, reqwest::Method::GET, path, Some(A), None).await;
+        assert_eq!(status, 403, "{path}: {body}");
+        assert_eq!(body["error"]["code"], "LM-4005", "{path}");
+        let resp = reqwest::Client::new()
+            .get(format!("{base}{path}"))
+            .header(HEADER, "not-even-a-uuid")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 403, "{path}: any value, no key");
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(body["error"]["code"], "LM-4005", "{path}");
+        // Without the header it stays the open operational view it was.
+        let resp = reqwest::Client::new()
+            .get(format!("{base}{path}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200, "{path}");
+    }
     let resp = reqwest::Client::new()
-        .get(format!("{base}/health/providers"))
-        .header(HEADER, "not-even-a-uuid")
+        .get(format!("{base}/health"))
+        .header(HEADER, A)
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status().as_u16(), 403, "any value, no key");
-    let body: Value = resp.json().await.unwrap();
-    assert_eq!(body["error"]["code"], "LM-4005");
-    // Without the header it stays the open operational view it was.
-    let resp = reqwest::Client::new()
-        .get(format!("{base}/health/providers"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status().as_u16(), 200);
+    assert_eq!(resp.status().as_u16(), 200, "/health stays open");
 }
 
 #[tokio::test]
