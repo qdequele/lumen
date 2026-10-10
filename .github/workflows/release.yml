@@ -224,5 +224,5 @@ jobs:
       - name: Retag the version image as latest
         run: |
           docker buildx imagetools create \
-            -t "ghcr.io/${{ github.repository }}:latest" \
-            "ghcr.io/${{ github.repository }}:${{ github.ref_name }}"
+            -t "ghcr.io/$GITHUB_REPOSITORY:latest" \
+            "ghcr.io/$GITHUB_REPOSITORY:$GITHUB_REF_NAME"
