@@ -370,6 +370,39 @@ async fn platform_routes_are_403_with_the_header() {
 }
 
 #[tokio::test]
+async fn provider_health_is_platform_only_with_the_header() {
+    // `/health/providers` names the platform's providers and their health:
+    // an account-scoped caller must not see it, with or without a key.
+    let (base, _) = spawn().await;
+    let (status, body) = call(
+        &base,
+        reqwest::Method::GET,
+        "/health/providers",
+        Some(A),
+        None,
+    )
+    .await;
+    assert_eq!(status, 403, "{body}");
+    assert_eq!(body["error"]["code"], "LM-4005");
+    let resp = reqwest::Client::new()
+        .get(format!("{base}/health/providers"))
+        .header(HEADER, "not-even-a-uuid")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 403, "any value, no key");
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "LM-4005");
+    // Without the header it stays the open operational view it was.
+    let resp = reqwest::Client::new()
+        .get(format!("{base}/health/providers"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+}
+
+#[tokio::test]
 async fn a_malformed_header_is_400_and_no_key_is_401_first() {
     let (base, _) = spawn().await;
     for bad in ["acme", "", "0192f3c1-7c2e-7b1a-9f00"] {

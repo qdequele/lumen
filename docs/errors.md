@@ -103,7 +103,7 @@ upstream call - a rejected request never leaks spend to a provider.
 | `LM-4002` | 429  | The key's requests-per-minute quota was exceeded.              |
 | `LM-4003` | 429  | The key's tokens-per-minute quota was exceeded.                |
 | `LM-4004` | 401  | Missing or invalid virtual key. Deliberately does not say *why* (unknown, disabled and expired are indistinguishable) so callers cannot probe key state. |
-| `LM-4005` | 403  | The call carried `X-Lumen-Account-Ref` (an account-scoped control-plane call, platform contract v2 section 8.3) on a platform-only route: `/admin/provider-keys/*`, `/admin/providers/*`, `/admin/webhooks*`, `/admin/config*`, `/openapi.json`. Keys, groups and usage routes accept the header and are filtered by it. |
+| `LM-4005` | 403  | The call carried `X-Lumen-Account-Ref` (an account-scoped control-plane call, platform contract v2 section 8.3) on a platform-only route: `/admin/provider-keys/*`, `/admin/providers/*`, `/admin/webhooks*`, `/admin/config*`, `/openapi.json`, and `GET /health/providers` (which needs no key, but names the platform's providers and their health). Keys, groups and usage routes accept the header and are filtered by it. |
 
 ## Internal errors - `LM-5xxx` · `type: internal`
 

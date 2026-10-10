@@ -157,7 +157,7 @@ that lowercase form. With that header:
 | `PATCH`, `DELETE`, `rotate` and `grant` on a key; `GET`, `PATCH`, `DELETE` and `grant` on a group: when the key or group belongs to another account, or the key has no group | `404 LM-1003`, the same envelope an unknown id gets, so a scoped caller cannot tell a foreign id from one that never existed. |
 | `POST /admin/keys` | `group_id` is required and must name a group of the account (`400 LM-1001` without one, `404 LM-1003` for another account's group). A scoped `PATCH` cannot clear `group_id` (`400 LM-1001`) or move the key to another account's group (`404 LM-1003`). |
 | `POST /admin/groups` | `account_ref` is set to the header's value when absent; a different value (compared ignoring case) is `400 LM-1001`. A scoped `PATCH` that carries `account_ref` at all is `400 LM-1001`. |
-| `/admin/provider-keys/*`, `/admin/providers/{name}/check`, `/admin/webhooks*`, `/admin/config*`, `/openapi.json` | `403 LM-4005`: platform-only, whatever the header's value. |
+| `/admin/provider-keys/*`, `/admin/providers/{name}/check`, `/admin/webhooks*`, `/admin/config*`, `/openapi.json`, `/health/providers` | `403 LM-4005`: platform-only, whatever the header's value. `/health/providers` needs no key without the header, but it names the platform's providers and their health, so a scoped call never sees it. |
 
 - **Webhooks are platform-only rather than filtered.** The budget webhook
   receiver is one gateway-wide setting that carries every account's budget

@@ -136,7 +136,8 @@ implemented in LUMEN 0.7.0:
    is confined to that account's groups and keys (lists filtered, foreign
    ids `404 LM-1003` like unknown ones, creation forced into the account)
    and refused on the platform-only routes (provider keys and checks,
-   webhooks, config, `/openapi.json`) with the new `403 LM-4005`. Webhooks
+   webhooks, config, `/openapi.json`, `/health/providers`) with the new
+   `403 LM-4005`. Webhooks
    are platform-only rather than filtered because the receiver is one
    gateway-wide setting. `GET /admin/groups/{id}` exposes the live
    `spent_micro` and `budget_max_micro` the Lab's lease sync reads; `PATCH`

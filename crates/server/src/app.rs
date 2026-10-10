@@ -103,11 +103,19 @@ pub fn build_app(state: AppState) -> Router {
             auth::require_virtual_key,
         ));
 
+    // Separate from /health (which never depends on provider state): the
+    // observability view of background health checks (M6 §6.5). It names the
+    // platform's providers and their health, so an account-scoped call
+    // (`X-Lumen-Account-Ref`, platform contract v2 section 8.3) is refused
+    // with 403 `LM-4005` like the other platform-only routes; without the
+    // header it stays the open operational view.
+    let provider_health = Router::new()
+        .route("/health/providers", get(health::providers_health))
+        .route_layer(middleware::from_fn(admin_scope::platform_only));
+
     let mut app = Router::new()
         .route("/health", get(routes::health))
-        // Separate from /health (which never depends on provider state): the
-        // observability view of background health checks (M6 §6.5).
-        .route("/health/providers", get(health::providers_health))
+        .merge(provider_health)
         .route("/metrics", get(routes::metrics))
         .merge(api);
 

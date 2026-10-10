@@ -18,7 +18,8 @@ info:
     8.3): keys, groups and usage are then filtered to groups with that
     `account_ref`, foreign ids are 404, creation is forced into the account,
     and the platform-only routes (provider keys and checks, webhooks,
-    config, this document) answer 403 `LM-4005`. Source of truth: this
+    config, this document, `/health/providers`) answer 403 `LM-4005`.
+    Source of truth: this
     file, pinned to the router by a test in `crates/server/src/app.rs`.
   license:
     name: Apache-2.0
@@ -40,7 +41,7 @@ components:
       in: header
       required: false
       schema: { type: string, format: uuid }
-      description: Scope this call to one Lab account (platform contract v2 section 8.3). On the key, group and usage routes only that account's rows are visible and writable, and a value that is not exactly one UUID (or the header sent twice) is 400 `LM-1001`. On the platform-only routes (provider keys and checks, webhooks, config, `/openapi.json`) the header, whatever its value, is refused with 403 `LM-4005`.
+      description: Scope this call to one Lab account (platform contract v2 section 8.3). On the key, group and usage routes only that account's rows are visible and writable, and a value that is not exactly one UUID (or the header sent twice) is 400 `LM-1001`. On the platform-only routes (provider keys and checks, webhooks, config, `/openapi.json`, `/health/providers`) the header, whatever its value, is refused with 403 `LM-4005`.
     IfMatch:
       name: If-Match
       in: header
@@ -778,8 +779,11 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Health" }
   /health/providers:
+    parameters:
+      - $ref: "#/components/parameters/AccountRef"
     get:
       summary: Last observed provider health (background probe, off by default)
+      description: Needs no key. It names the platform's providers and their health, so a call carrying `X-Lumen-Account-Ref` (any value) is refused with 403 `LM-4005`.
       operationId: providersHealth
       responses:
         "200":
@@ -789,6 +793,7 @@ paths:
               schema:
                 type: object
                 additionalProperties: { $ref: "#/components/schemas/ProviderStatus" }
+        "403": { $ref: "#/components/responses/Error" }
   /metrics:
     get:
       summary: Prometheus metrics
