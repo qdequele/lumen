@@ -1,8 +1,9 @@
 //! Billing usage-event delivery (ADR 015): pushes due outbox rows to the
 //! control plane in signed batches and marks what it acknowledges. Never on
 //! the request path; a failing or unreachable control plane only delays
-//! delivery. The one drop: an event a reachable control plane answered but
-//! kept out of `accepted` for [`REJECTION_TTL_MS`] (contract v2 section 3.5).
+//! delivery. The one drop: an event a reachable control plane kept out of
+//! `accepted` for [`REJECTION_TTL_MS`] since its first such answer
+//! (contract v2 section 3.5).
 
 use crate::webhooks::SigningKey;
 use lumen_auth::store::{KeyStore, OutboxRow};
@@ -25,9 +26,10 @@ const POLL: Duration = Duration::from_secs(2);
 const GAUGE_REFRESH_MS: i64 = 10_000;
 /// Delivered (and dropped) rows are kept this long, then purged.
 pub const DELIVERED_RETENTION_MS: i64 = 7 * 86_400_000;
-/// A row the Lab answered but never accepted for this long is dropped
-/// (contract v2 section 3.5). Only a 2xx ack that leaves the id out of
-/// `accepted` counts: an unreachable or failing Lab never drops a row.
+/// A row the Lab has kept out of `accepted` for this long, counted from the
+/// first 2xx answer that skipped it, is dropped (contract v2 section 3.5).
+/// Only such answers start the clock: an unreachable or failing Lab never
+/// drops a row, and a row skipped for the first time is never dropped.
 pub const REJECTION_TTL_MS: i64 = 24 * 3_600_000;
 
 /// The outcome of one delivery attempt.
@@ -172,29 +174,44 @@ impl UsageEventsSender {
         }
         self.metrics
             .add_delivered(u64::try_from(done.len()).unwrap_or(0));
-        // The Lab is reachable and keeps skipping these ids: after 24 h the
-        // skip is permanent (account_not_owned, an unknown account, ...).
-        let (expired, retry): (Vec<&OutboxRow>, Vec<&OutboxRow>) = rest
-            .into_iter()
-            .partition(|row| now_ms.saturating_sub(row.created_ms) >= REJECTION_TTL_MS);
-        if !expired.is_empty() {
-            for row in &expired {
-                tracing::error!(
-                    event_id = %row.id,
-                    age_hours = now_ms.saturating_sub(row.created_ms) / 3_600_000,
-                    "usage event never accepted by the Lab for 24 h; dropped (see the body in usage_outbox)"
-                );
-            }
-            let expired: Vec<String> = expired.into_iter().map(|row| row.id.clone()).collect();
-            match self.store.outbox_mark_dropped(&expired, now_ms).await {
-                Ok(n) => self.metrics.add_dropped(n),
-                // The rows stay pending: the next due round resends them and,
-                // if the Lab still skips them, tries the drop again.
-                Err(error) => tracing::warn!(%error, "usage events: could not mark dropped rows"),
-            }
+        if rest.is_empty() {
+            return Delivery::Delivered(done.len());
         }
+        // The Lab is reachable and skipped these ids: the first skip starts
+        // a 24 h clock, and a skip 24 h later is permanent (account_not_owned,
+        // an unknown account, ...).
+        let rest: Vec<String> = rest.into_iter().map(|row| row.id.clone()).collect();
+        let retry: Vec<String> = match self
+            .store
+            .outbox_record_skips(&rest, now_ms, REJECTION_TTL_MS)
+            .await
+        {
+            Ok(settled) => {
+                let mut retry = Vec::with_capacity(settled.len());
+                let mut dropped = 0_u64;
+                for row in settled {
+                    if row.dropped {
+                        dropped += 1;
+                        tracing::error!(
+                            event_id = %row.id,
+                            skipped_hours = now_ms.saturating_sub(row.first_skipped_ms) / 3_600_000,
+                            "usage event refused by the Lab for 24 h; dropped (see the body in usage_outbox)"
+                        );
+                    } else {
+                        retry.push(row.id);
+                    }
+                }
+                self.metrics.add_dropped(dropped);
+                retry
+            }
+            // Nothing was recorded: no clock started, nothing dropped. The
+            // rows are retried and the next skip records them.
+            Err(error) => {
+                tracing::warn!(%error, "usage events: could not record skipped rows");
+                rest
+            }
+        };
         if !retry.is_empty() {
-            let retry: Vec<String> = retry.into_iter().map(|row| row.id.clone()).collect();
             tracing::warn!(
                 count = retry.len(),
                 "usage events not accepted by the control plane; will retry"
@@ -550,7 +567,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_event_the_lab_keeps_skipping_is_dropped_after_24h() {
+    async fn an_event_the_lab_keeps_skipping_is_dropped_24h_after_its_first_skip() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .respond_with(
@@ -558,21 +575,79 @@ mod tests {
             )
             .mount(&server)
             .await;
-        // "a" was created at 0 ms, "b" at 1 ms (the helper's index).
-        let (s, store, metrics) = sender(&server, &["a", "b"]).await;
-        let now = REJECTION_TTL_MS; // exactly 24 h after "a", 1 ms short for "b"
-        assert_eq!(s.deliver_once(now).await, Delivery::Delivered(0));
+        let (s, store, metrics) = sender(&server, &["a"]).await;
+        let t0 = 10;
+        // First skip: the clock starts, the row is kept and retried.
+        assert_eq!(s.deliver_once(t0).await, Delivery::Delivered(0));
+        assert_eq!(store.outbox_stats().await.unwrap().0, 1);
+        // 10 s short of 24 h after the first skip: still kept (and backed
+        // off by 4 s plus jitter, so due again at the 24 h mark).
         assert_eq!(
-            store.outbox_stats().await.unwrap().0,
-            1,
-            "only b is pending"
+            s.deliver_once(t0 + REJECTION_TTL_MS - 10_000).await,
+            Delivery::Delivered(0)
+        );
+        assert_eq!(store.outbox_stats().await.unwrap().0, 1);
+        assert!(!metrics
+            .encode_text()
+            .contains("lumen_usage_events_dropped_total 1"));
+        // Exactly 24 h after the first skip: dropped.
+        assert_eq!(
+            s.deliver_once(t0 + REJECTION_TTL_MS).await,
+            Delivery::Delivered(0)
+        );
+        assert_eq!(store.outbox_stats().await.unwrap().0, 0, "a was dropped");
+        assert_eq!(
+            store.outbox_due(i64::MAX, 10).await.unwrap(),
+            [] as [OutboxRow; 0]
         );
         let text = metrics.encode_text();
         assert!(
-            text.contains("lumen_usage_events_dropped_total 1"),
+            text.contains("lumen_usage_events_dropped_total 1\n"),
             "{text}"
         );
-        assert!(text.contains(r#"lumen_usage_events_failed_total{reason="not_accepted"} 1"#));
+        // The two retried rounds count; the dropping round does not.
+        assert!(
+            text.contains("lumen_usage_events_failed_total{reason=\"not_accepted\"} 2\n"),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lab_back_from_a_long_outage_does_not_drop_on_its_first_skip() {
+        const H: i64 = 3_600_000;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"accepted":[]})),
+            )
+            .mount(&server)
+            .await;
+        let (s, store, metrics) = sender(&server, &["a"]).await; // created at 0
+        assert_eq!(s.deliver_once(0).await, Delivery::Failed);
+        // Back after 30 h: the first skip starts the clock, nothing drops.
+        assert_eq!(s.deliver_once(30 * H).await, Delivery::Delivered(0));
+        assert_eq!(
+            store.outbox_stats().await.unwrap().0,
+            1,
+            "the first skip never drops"
+        );
+        let due = store.outbox_due(i64::MAX, 10).await.unwrap();
+        assert_eq!(due[0].first_skipped_ms, Some(30 * H));
+        assert!(!metrics
+            .encode_text()
+            .contains("lumen_usage_events_dropped_total 1"));
+        // Skipped again 24 h later: dropped.
+        assert_eq!(s.deliver_once(54 * H).await, Delivery::Delivered(0));
+        assert_eq!(store.outbox_stats().await.unwrap().0, 0);
+        assert!(metrics
+            .encode_text()
+            .contains("lumen_usage_events_dropped_total 1\n"));
     }
 
     #[tokio::test]

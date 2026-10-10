@@ -599,8 +599,20 @@ pub struct OutboxRow {
     pub id: String,
     /// Serialized event JSON, sent verbatim.
     pub body: String,
-    /// Creation time, unix ms (the sender ages rows by it).
-    pub created_ms: i64,
+    /// When a 2xx answer from the Lab first left this event out of
+    /// `accepted`, unix ms; `None` until then (contract v2 section 3.5).
+    pub first_skipped_ms: Option<i64>,
+}
+
+/// One row settled by [`KeyStore::outbox_record_skips`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkippedRow {
+    /// Event id.
+    pub id: String,
+    /// The first skip, unix ms (`now_ms` when this was the first one).
+    pub first_skipped_ms: i64,
+    /// The event had been skipped for the whole window and is now dropped.
+    pub dropped: bool,
 }
 
 /// Every `virtual_keys` column a [`VirtualKeyRecord`] reads, in one place so
@@ -967,7 +979,7 @@ impl KeyStore {
     /// Up to `limit` pending events whose next attempt is due, oldest first.
     pub async fn outbox_due(&self, now_ms: i64, limit: i64) -> Result<Vec<OutboxRow>, AuthError> {
         let rows = sqlx::query_as::<_, OutboxRow>(
-            "SELECT id, body, created_ms FROM usage_outbox \
+            "SELECT id, body, first_skipped_ms FROM usage_outbox \
              WHERE delivered_ms IS NULL AND dropped_ms IS NULL AND next_attempt_ms <= ? \
              ORDER BY created_ms, id LIMIT ?",
         )
@@ -1000,25 +1012,47 @@ impl KeyStore {
         Ok(changed)
     }
 
-    /// Mark events the Lab has refused for the rejection window as dropped
-    /// (contract v2 section 3.5): no longer pending, never resent, purged
-    /// with delivered rows. Returns rows changed.
-    pub async fn outbox_mark_dropped(&self, ids: &[String], now_ms: i64) -> Result<u64, AuthError> {
+    /// Record that a reachable Lab left `ids` out of `accepted` at `now_ms`
+    /// (contract v2 section 3.5). The first skip starts the clock
+    /// (`first_skipped_ms`, never reset); an event whose earlier first skip
+    /// is at least `window_ms` old is dropped instead: no longer pending,
+    /// never resent, purged with delivered rows. A first skip never drops
+    /// in the same call. One statement per row in one transaction, so the
+    /// clock and the drop cannot race another sender. Rows already
+    /// delivered or dropped are left alone and not returned.
+    pub async fn outbox_record_skips(
+        &self,
+        ids: &[String],
+        now_ms: i64,
+        window_ms: i64,
+    ) -> Result<Vec<SkippedRow>, AuthError> {
         let mut tx = self.pool.begin().await?;
-        let mut changed = 0;
+        let mut settled = Vec::with_capacity(ids.len());
         for id in ids {
-            changed += sqlx::query(
-                "UPDATE usage_outbox SET dropped_ms = ? \
-                 WHERE id = ? AND delivered_ms IS NULL AND dropped_ms IS NULL",
+            // SET expressions read the row as it was before the update.
+            let row = sqlx::query(
+                "UPDATE usage_outbox SET \
+                   first_skipped_ms = COALESCE(first_skipped_ms, ?1), \
+                   dropped_ms = CASE WHEN first_skipped_ms IS NOT NULL \
+                                      AND ?1 - first_skipped_ms >= ?2 THEN ?1 END \
+                 WHERE id = ?3 AND delivered_ms IS NULL AND dropped_ms IS NULL \
+                 RETURNING first_skipped_ms, dropped_ms",
             )
             .bind(now_ms)
+            .bind(window_ms)
             .bind(id)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
+            .fetch_optional(&mut *tx)
+            .await?;
+            if let Some(row) = row {
+                settled.push(SkippedRow {
+                    id: id.clone(),
+                    first_skipped_ms: row.try_get("first_skipped_ms")?,
+                    dropped: row.try_get::<Option<i64>, _>("dropped_ms")?.is_some(),
+                });
+            }
         }
         tx.commit().await?;
-        Ok(changed)
+        Ok(settled)
     }
 
     /// Push failed events back: `attempts += 1` and the next attempt at

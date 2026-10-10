@@ -41,7 +41,7 @@ impl UsageEventMetrics {
         )?;
         let dropped_total = IntCounter::new(
             "lumen_usage_events_dropped_total",
-            "Billing usage events the control plane kept refusing for 24 h and the gateway dropped (contract v2 section 3.5).",
+            "Billing usage events the control plane kept refusing for 24 h from its first refusal, dropped by the gateway (contract v2 section 3.5).",
         )?;
         let registry = metrics.registry();
         registry.register(Box::new(pending.clone()))?;
@@ -79,7 +79,7 @@ impl UsageEventMetrics {
         self.failed_total.with_label_values(&[reason]).inc_by(n);
     }
 
-    /// `n` events dropped after the rejection window.
+    /// `n` events dropped 24 h after the control plane first refused them.
     pub fn add_dropped(&self, n: u64) {
         self.dropped_total.inc_by(n);
     }

@@ -2,7 +2,7 @@
 
 #![allow(clippy::float_cmp)]
 
-use lumen_auth::store::{FlushRow, KeyStore, NewKey, OutboxInsert};
+use lumen_auth::store::{FlushRow, KeyStore, NewKey, OutboxInsert, SkippedRow};
 use sqlx::Row;
 
 async fn store_with_key() -> (KeyStore, String) {
@@ -160,7 +160,7 @@ async fn the_sender_queries_only_walk_pending_rows() {
     let (store, _) = store_with_key().await;
     let due = plan(
         &store,
-        "SELECT id, body, created_ms FROM usage_outbox \
+        "SELECT id, body, first_skipped_ms FROM usage_outbox \
          WHERE delivered_ms IS NULL AND dropped_ms IS NULL AND next_attempt_ms <= ? \
          ORDER BY created_ms, id LIMIT ?",
         2,
@@ -235,21 +235,45 @@ async fn the_purge_deletes_in_chunks_until_the_old_delivered_rows_are_gone() {
 }
 
 #[tokio::test]
-async fn dropped_rows_leave_the_pending_set_and_are_purged_with_delivered_ones() {
+async fn skips_start_a_clock_and_only_a_later_skip_past_the_window_drops() {
     let (store, _) = store_with_key().await;
     store
         .persist_flush(&[], &[insert("old", 0), insert("new", 5_000)])
         .await
         .unwrap();
+    let old = || vec!["old".to_owned()];
     let due = store.outbox_due(i64::MAX, 10).await.unwrap();
-    assert_eq!(due[0].created_ms, 0, "the sender reads the age of each row");
+    assert_eq!(due[0].first_skipped_ms, None, "never skipped yet");
+    // The first skip starts the clock and never drops, however old the row.
+    let first = store
+        .outbox_record_skips(&old(), 50_000, 10_000)
+        .await
+        .unwrap();
     assert_eq!(
-        store
-            .outbox_mark_dropped(&["old".to_owned()], 10_000)
-            .await
-            .unwrap(),
-        1
+        first,
+        [SkippedRow {
+            id: "old".to_owned(),
+            first_skipped_ms: 50_000,
+            dropped: false,
+        }]
     );
+    // A later skip inside the window keeps the first skip time.
+    let again = store
+        .outbox_record_skips(&old(), 59_999, 10_000)
+        .await
+        .unwrap();
+    assert_eq!(
+        (again[0].first_skipped_ms, again[0].dropped),
+        (50_000, false)
+    );
+    let due = store.outbox_due(i64::MAX, 10).await.unwrap();
+    assert_eq!(due[0].first_skipped_ms, Some(50_000));
+    // A skip a full window after the first one drops.
+    let last = store
+        .outbox_record_skips(&old(), 60_000, 10_000)
+        .await
+        .unwrap();
+    assert_eq!((last[0].first_skipped_ms, last[0].dropped), (50_000, true));
     // Dropped: no longer due, no longer pending, not re-droppable.
     let ids: Vec<String> = store
         .outbox_due(i64::MAX, 10)
@@ -262,17 +286,31 @@ async fn dropped_rows_leave_the_pending_set_and_are_purged_with_delivered_ones()
     assert_eq!(store.outbox_stats().await.unwrap(), (1, Some(5_000)));
     assert_eq!(
         store
-            .outbox_mark_dropped(&["old".to_owned()], 11_000)
+            .outbox_record_skips(&old(), 70_000, 10_000)
             .await
             .unwrap(),
-        0
+        [] as [SkippedRow; 0]
     );
-    // The body survives for the operator until the retention purge.
+    // A delivered row is never touched by a skip.
+    store
+        .outbox_mark_delivered(&["new".to_owned()], 61_000)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .outbox_record_skips(&["new".to_owned()], 62_000, 10_000)
+            .await
+            .unwrap(),
+        [] as [SkippedRow; 0]
+    );
+    // The body survives for the operator until the retention purge, which
+    // takes dropped and delivered rows alike.
     let body: String = sqlx::query("SELECT body FROM usage_outbox WHERE id = 'old'")
         .fetch_one(store.pool())
         .await
         .unwrap()
         .get("body");
     assert!(body.contains("old"));
-    assert_eq!(store.outbox_purge_delivered(10_001).await.unwrap(), 1);
+    assert_eq!(store.outbox_purge_delivered(60_001).await.unwrap(), 1);
+    assert_eq!(store.outbox_purge_delivered(61_001).await.unwrap(), 1);
 }
