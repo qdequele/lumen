@@ -211,6 +211,14 @@ impl UsageEventsConfig {
     }
 
     fn validate(&self) -> Result<(), String> {
+        // `LAB_INSTANCE_ID` alone creates the block with an empty url (see
+        // [`apply_lab_env`]): name the missing variable, not a parse error.
+        if self.url.trim().is_empty() {
+            return Err(
+                "usage_events.url (or the LAB_URL env var) is required: the Lab base URL"
+                    .to_owned(),
+            );
+        }
         let url = reqwest::Url::parse(&self.url)
             .map_err(|e| format!("usage_events.url is not a valid URL: {e}"))?;
         // Credentials in the URL would reach logs and `Debug` (the URL is
@@ -2445,6 +2453,63 @@ mod tests {
         let mut bare = load_str(AUTH_ON).unwrap();
         apply_lab_env(&mut bare, |_| None);
         assert!(bare.usage_events.is_none());
+    }
+
+    /// Load `toml` through the real load path with `env` as the only
+    /// `LAB_*` variables.
+    fn load_with_lab_env(toml: &str, env: &[(&str, &str)]) -> Result<Config, ConfigError> {
+        let figment = Figment::new().merge(Toml::string(toml));
+        Config::from_figment_with_env(&figment, "test.toml", |name| {
+            env.iter()
+                .find(|(k, _)| *k == name)
+                .map(|(_, v)| (*v).to_owned())
+        })
+    }
+
+    #[test]
+    fn lab_instance_id_without_lab_url_is_refused_naming_lab_url() {
+        let err = load_with_lab_env(AUTH_ON, &[("LAB_INSTANCE_ID", INSTANCE)])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("LAB_URL"), "{err}");
+        assert!(err.contains("usage_events.url"), "{err}");
+        // A blank TOML url gets the same message.
+        let err = with_usage_events(&format!("url = \"  \"\ninstance_id = \"{INSTANCE}\"\n"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("LAB_URL"), "{err}");
+        // A TOML url plus the env instance id keeps working.
+        let toml = format!("{AUTH_ON}\n[usage_events]\nurl = \"https://lab.example\"\n");
+        let cfg = load_with_lab_env(&toml, &[("LAB_INSTANCE_ID", INSTANCE)]).unwrap();
+        assert_eq!(
+            cfg.usage_events.unwrap().instance_id.as_deref(),
+            Some(INSTANCE)
+        );
+    }
+
+    #[test]
+    fn lab_env_vars_are_validated_on_the_load_path() {
+        let err = load_with_lab_env(
+            AUTH_ON,
+            &[
+                ("LAB_URL", "https://lab.example"),
+                ("LAB_INSTANCE_ID", "acme"),
+            ],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("instance_id"), "{err}");
+        let cfg = load_with_lab_env(
+            AUTH_ON,
+            &[
+                ("LAB_URL", "https://lab.example"),
+                ("LAB_INSTANCE_ID", INSTANCE),
+            ],
+        )
+        .unwrap();
+        let ue = cfg.usage_events.unwrap();
+        assert_eq!(ue.instance_id.as_deref(), Some(INSTANCE));
+        assert_eq!(ue.url, "https://lab.example");
     }
 
     #[test]

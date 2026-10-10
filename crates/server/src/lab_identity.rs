@@ -2,9 +2,9 @@
 //! `GET {LAB_URL}/internal/instances/me` confirms the instance credentials
 //! and tells the gateway which hosted deployment it is, for the boot log.
 //! Called once at boot, off the request path. Rejected credentials (401 or
-//! 403) and an answer for another product abort boot; a Lab that cannot
-//! answer only costs a warning, so a control-plane outage never keeps a
-//! gateway down.
+//! 403) and an answer for another product or instance abort boot; a Lab
+//! that cannot answer only costs a warning, so a control-plane outage never
+//! keeps a gateway down.
 
 use crate::usage_events::INSTANCE_HEADER;
 use std::fmt;
@@ -42,8 +42,9 @@ pub enum IdentityError {
     /// Connect error or timeout; the message never carries the URL.
     #[error("could not reach the Lab: {0}")]
     Transport(String),
-    /// A 2xx body that is not an identity, or one for another product: the
-    /// Lab would skip every event with `product mismatch` (spec section 3.5).
+    /// A 2xx body that is not an identity, or one for another product (the
+    /// Lab would skip every event with `product mismatch`, spec section 3.5)
+    /// or for another instance.
     #[error("the Lab's answer to GET /internal/instances/me is not this gateway's identity: {0}")]
     Malformed(String),
 }
@@ -115,6 +116,13 @@ impl LabIdentityClient {
             .json()
             .await
             .map_err(|e| IdentityError::Malformed(e.without_url().to_string()))?;
+        // Instance ids are UUIDs (not secrets): compare case-insensitively.
+        if !identity.instance_id.eq_ignore_ascii_case(&self.instance_id) {
+            return Err(IdentityError::Malformed(format!(
+                "the Lab answered for instance '{}', not '{}'",
+                identity.instance_id, self.instance_id
+            )));
+        }
         if identity.product.as_deref().is_some_and(|p| p != "lumen") {
             return Err(IdentityError::Malformed(format!(
                 "the instance is registered for product '{}', not lumen",
@@ -221,6 +229,11 @@ mod tests {
         for body in [
             serde_json::json!({ "instance_id": INSTANCE, "kind": "hosted", "product": "scrapix" }),
             serde_json::json!({ "hello": "world" }),
+            // An answer for another instance: the credentials map elsewhere.
+            serde_json::json!({
+                "instance_id": "0192f3c1-7c2e-7b1a-9f00-3c9d2e4a5b72",
+                "kind": "hosted", "product": "lumen"
+            }),
         ] {
             let server = MockServer::start().await;
             mount(&server, 200, body.clone()).await;
@@ -231,6 +244,22 @@ mod tests {
             );
             assert!(error.is_fatal());
         }
+    }
+
+    #[tokio::test]
+    async fn the_instance_id_echo_ignores_ascii_case() {
+        let server = MockServer::start().await;
+        mount(
+            &server,
+            200,
+            serde_json::json!({
+                "instance_id": INSTANCE.to_ascii_uppercase(),
+                "kind": "hosted", "product": "lumen"
+            }),
+        )
+        .await;
+        let identity = client(&server).fetch().await.unwrap();
+        assert!(identity.instance_id.eq_ignore_ascii_case(INSTANCE));
     }
 
     #[tokio::test]
