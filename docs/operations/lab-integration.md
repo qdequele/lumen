@@ -148,8 +148,9 @@ A hosted gateway serves many Lab accounts through one master key, so the
 gateway enforces the account boundary itself (contract v2, section 8.3).
 The Lab sets `X-Lumen-Account-Ref: <account uuid>` on every `/admin/*` call
 it proxies for a user. The UUID is matched in its canonical lowercase form
-whatever case the caller sends, and a group created under the header stores
-that lowercase form. With that header:
+whatever case the caller sends: every write stores a UUID `account_ref` in
+lowercase, scoped or not (migration 0014 lowercased the ones stored before),
+while a ref that is not a UUID is kept exactly as written. With that header:
 
 | Routes | Behaviour |
 |---|---|
@@ -167,9 +168,10 @@ that lowercase form. With that header:
   or sent twice) is `400 LM-1001`, never read as "unscoped". The master key
   is checked before the scope, so a missing or wrong key is still
   `401 LM-4004`.
-- **Send the canonical lowercase UUID.** The account compare is exact. An
-  uppercase header fails closed (empty lists, `404` on every id), but a
-  scoped `POST /admin/groups` would store it as sent.
+- **Case does not matter for UUIDs.** The header and every stored UUID
+  `account_ref` are lowercase, so an uppercase header, an uppercase ref sent
+  by an unscoped call or an uppercase `?account_ref=` filter all match the
+  same groups.
 - **Usage follows the group's current account.** The usage routes filter on
   the `account_ref` a group has now: if an operator moves a group to another
   account, its usage history moves with it.

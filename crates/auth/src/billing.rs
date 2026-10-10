@@ -155,6 +155,19 @@ pub fn is_uuid(s: &str) -> bool {
         })
 }
 
+/// The stored form of a group's `account_ref`: a UUID (a Lab account id) is
+/// lowercased, so the exact matches of account-scoped admin calls (whose
+/// `X-Lumen-Account-Ref` is read as lowercase) and of the usage filters
+/// always find it; any other operator ref is kept exactly as written.
+#[must_use]
+pub fn canonical_account_ref(value: String) -> String {
+    if is_uuid(&value) {
+        value.to_ascii_lowercase()
+    } else {
+        value
+    }
+}
+
 /// `unix_ms` as RFC 3339 UTC with milliseconds (`2001-09-09T01:46:40.000Z`).
 /// Civil-from-days after Howard Hinnant; no date crate needed.
 #[must_use]
@@ -224,6 +237,15 @@ mod tests {
         assert_eq!(rfc3339_ms(0), "1970-01-01T00:00:00.000Z");
         assert_eq!(rfc3339_ms(1_000_000_000_000), "2001-09-09T01:46:40.000Z");
         assert_eq!(rfc3339_ms(951_782_400_007), "2000-02-29T00:00:00.007Z");
+    }
+
+    #[test]
+    fn a_uuid_account_ref_is_canonical_lowercase() {
+        assert_eq!(
+            canonical_account_ref("0192F3C1-7C2E-7B1A-9F00-3C9D2E4A5B61".to_owned()),
+            "0192f3c1-7c2e-7b1a-9f00-3c9d2e4a5b61"
+        );
+        assert_eq!(canonical_account_ref("Team-A".to_owned()), "Team-A");
     }
 
     #[test]

@@ -536,7 +536,9 @@ pub async fn list_groups(
         .list_groups(params.include_deleted)
         .await
         .map_err(|e| internal(&e))?;
-    if let Some(want) = &params.account_ref {
+    if let Some(want) = params.account_ref {
+        // Stored refs are canonical (a UUID is lowercase): compare that form.
+        let want = lumen_auth::billing::canonical_account_ref(want);
         groups.retain(|g| g.account_ref.as_deref() == Some(want.as_str()));
     }
     // Applied on top of the query filter, so `?account_ref=<other>` on a

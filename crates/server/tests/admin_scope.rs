@@ -753,3 +753,45 @@ async fn the_account_header_is_a_canonical_lowercase_uuid() {
         assert_eq!(stored["account_ref"], A, "{body}: {stored}");
     }
 }
+
+#[tokio::test]
+async fn an_unscoped_uppercase_account_ref_is_stored_canonical() {
+    // An operator (or any unscoped caller) that writes an uppercase UUID
+    // must not hide the group from the account's own scoped calls.
+    let (base, _) = spawn().await;
+    let upper = A.to_ascii_uppercase();
+    let (status, group) = call(
+        &base,
+        reqwest::Method::POST,
+        "/admin/groups",
+        None,
+        Some(json!({"name": "upper", "account_ref": upper})),
+    )
+    .await;
+    assert_eq!(status, 201, "{group}");
+    assert_eq!(group["account_ref"], A);
+    let gid = group["id"].as_str().unwrap().to_owned();
+    let (status, listed) = call(&base, reqwest::Method::GET, "/admin/groups", Some(A), None).await;
+    assert_eq!(status, 200, "{listed}");
+    assert_eq!(ids(&listed), std::slice::from_ref(&gid));
+    let (status, view) = call(
+        &base,
+        reqwest::Method::GET,
+        &format!("/admin/groups/{gid}"),
+        Some(A),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{view}");
+    // The unscoped `?account_ref=` filter accepts either case too.
+    let (status, filtered) = call(
+        &base,
+        reqwest::Method::GET,
+        &format!("/admin/groups?account_ref={upper}"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{filtered}");
+    assert_eq!(ids(&filtered), [gid]);
+}

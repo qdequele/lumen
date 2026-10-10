@@ -1172,7 +1172,9 @@ impl KeyStore {
             budget_spent: 0.0,
             created_at: now_unix(),
             deleted_at: None,
-            account_ref: params.account_ref,
+            account_ref: params
+                .account_ref
+                .map(crate::billing::canonical_account_ref),
         };
         sqlx::query(
             "INSERT INTO budget_groups (id, name, budget_max, budget_spent, created_at, account_ref) \
@@ -1242,7 +1244,10 @@ impl KeyStore {
         patch: GroupPatch,
     ) -> Result<Option<GroupRecord>, AuthError> {
         let ref_change = patch.account_ref.is_some();
-        let ref_value = patch.account_ref.flatten();
+        let ref_value = patch
+            .account_ref
+            .flatten()
+            .map(crate::billing::canonical_account_ref);
         let changed = sqlx::query(
             "UPDATE budget_groups SET \
                name = COALESCE(?, name), \
