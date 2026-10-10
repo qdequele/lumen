@@ -160,8 +160,8 @@ async fn the_sender_queries_only_walk_pending_rows() {
     let (store, _) = store_with_key().await;
     let due = plan(
         &store,
-        "SELECT id, body FROM usage_outbox \
-         WHERE delivered_ms IS NULL AND next_attempt_ms <= ? \
+        "SELECT id, body, created_ms FROM usage_outbox \
+         WHERE delivered_ms IS NULL AND dropped_ms IS NULL AND next_attempt_ms <= ? \
          ORDER BY created_ms, id LIMIT ?",
         2,
     )
@@ -172,7 +172,8 @@ async fn the_sender_queries_only_walk_pending_rows() {
     );
     let stats = plan(
         &store,
-        "SELECT COUNT(*) AS n, MIN(created_ms) AS oldest FROM usage_outbox WHERE delivered_ms IS NULL",
+        "SELECT COUNT(*) AS n, MIN(created_ms) AS oldest FROM usage_outbox \
+         WHERE delivered_ms IS NULL AND dropped_ms IS NULL",
         0,
     )
     .await;
@@ -180,17 +181,22 @@ async fn the_sender_queries_only_walk_pending_rows() {
         stats.contains("USING INDEX idx_usage_outbox_due (delivered_ms=?)"),
         "outbox_stats: {stats}"
     );
-    // One purge chunk (`outbox_purge_delivered`): a range on the same index.
+    // One purge chunk (`outbox_purge_delivered`): a range on the same index
+    // for delivered rows OR'd with one on `idx_usage_outbox_dropped` for
+    // dropped rows, never a table scan.
     let purge = plan(
         &store,
         "DELETE FROM usage_outbox WHERE rowid IN (\
            SELECT rowid FROM usage_outbox \
-           WHERE delivered_ms IS NOT NULL AND delivered_ms < ? LIMIT ?)",
-        2,
+           WHERE (delivered_ms IS NOT NULL AND delivered_ms < ?) \
+              OR (dropped_ms IS NOT NULL AND dropped_ms < ?) LIMIT ?)",
+        3,
     )
     .await;
     assert!(
-        purge.contains("COVERING INDEX idx_usage_outbox_due (delivered_ms>? AND delivered_ms<?)"),
+        purge.contains("INDEX idx_usage_outbox_due (delivered_ms>? AND delivered_ms<?)")
+            && purge.contains("INDEX idx_usage_outbox_dropped (dropped_ms>? AND dropped_ms<?)")
+            && !purge.contains("SCAN usage_outbox"),
         "outbox_purge_delivered: {purge}"
     );
 }
@@ -226,4 +232,47 @@ async fn the_purge_deletes_in_chunks_until_the_old_delivered_rows_are_gone() {
         .collect();
     assert_eq!(left, ["pending", "recent"]);
     assert_eq!(store.outbox_purge_delivered(200).await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn dropped_rows_leave_the_pending_set_and_are_purged_with_delivered_ones() {
+    let (store, _) = store_with_key().await;
+    store
+        .persist_flush(&[], &[insert("old", 0), insert("new", 5_000)])
+        .await
+        .unwrap();
+    let due = store.outbox_due(i64::MAX, 10).await.unwrap();
+    assert_eq!(due[0].created_ms, 0, "the sender reads the age of each row");
+    assert_eq!(
+        store
+            .outbox_mark_dropped(&["old".to_owned()], 10_000)
+            .await
+            .unwrap(),
+        1
+    );
+    // Dropped: no longer due, no longer pending, not re-droppable.
+    let ids: Vec<String> = store
+        .outbox_due(i64::MAX, 10)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| r.id)
+        .collect();
+    assert_eq!(ids, ["new"]);
+    assert_eq!(store.outbox_stats().await.unwrap(), (1, Some(5_000)));
+    assert_eq!(
+        store
+            .outbox_mark_dropped(&["old".to_owned()], 11_000)
+            .await
+            .unwrap(),
+        0
+    );
+    // The body survives for the operator until the retention purge.
+    let body: String = sqlx::query("SELECT body FROM usage_outbox WHERE id = 'old'")
+        .fetch_one(store.pool())
+        .await
+        .unwrap()
+        .get("body");
+    assert!(body.contains("old"));
+    assert_eq!(store.outbox_purge_delivered(10_001).await.unwrap(), 1);
 }

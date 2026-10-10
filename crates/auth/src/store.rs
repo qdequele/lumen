@@ -599,6 +599,8 @@ pub struct OutboxRow {
     pub id: String,
     /// Serialized event JSON, sent verbatim.
     pub body: String,
+    /// Creation time, unix ms (the sender ages rows by it).
+    pub created_ms: i64,
 }
 
 /// Every `virtual_keys` column a [`VirtualKeyRecord`] reads, in one place so
@@ -965,8 +967,8 @@ impl KeyStore {
     /// Up to `limit` pending events whose next attempt is due, oldest first.
     pub async fn outbox_due(&self, now_ms: i64, limit: i64) -> Result<Vec<OutboxRow>, AuthError> {
         let rows = sqlx::query_as::<_, OutboxRow>(
-            "SELECT id, body FROM usage_outbox \
-             WHERE delivered_ms IS NULL AND next_attempt_ms <= ? \
+            "SELECT id, body, created_ms FROM usage_outbox \
+             WHERE delivered_ms IS NULL AND dropped_ms IS NULL AND next_attempt_ms <= ? \
              ORDER BY created_ms, id LIMIT ?",
         )
         .bind(now_ms)
@@ -987,6 +989,27 @@ impl KeyStore {
         for id in ids {
             changed += sqlx::query(
                 "UPDATE usage_outbox SET delivered_ms = ? WHERE id = ? AND delivered_ms IS NULL",
+            )
+            .bind(now_ms)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        }
+        tx.commit().await?;
+        Ok(changed)
+    }
+
+    /// Mark events the Lab has refused for the rejection window as dropped
+    /// (contract v2 section 3.5): no longer pending, never resent, purged
+    /// with delivered rows. Returns rows changed.
+    pub async fn outbox_mark_dropped(&self, ids: &[String], now_ms: i64) -> Result<u64, AuthError> {
+        let mut tx = self.pool.begin().await?;
+        let mut changed = 0;
+        for id in ids {
+            changed += sqlx::query(
+                "UPDATE usage_outbox SET dropped_ms = ? \
+                 WHERE id = ? AND delivered_ms IS NULL AND dropped_ms IS NULL",
             )
             .bind(now_ms)
             .bind(id)
@@ -1026,14 +1049,15 @@ impl KeyStore {
     /// Pending event count and the oldest pending `created_ms`.
     pub async fn outbox_stats(&self) -> Result<(i64, Option<i64>), AuthError> {
         let row = sqlx::query(
-            "SELECT COUNT(*) AS n, MIN(created_ms) AS oldest FROM usage_outbox WHERE delivered_ms IS NULL",
+            "SELECT COUNT(*) AS n, MIN(created_ms) AS oldest FROM usage_outbox \
+             WHERE delivered_ms IS NULL AND dropped_ms IS NULL",
         )
         .fetch_one(&self.pool)
         .await?;
         Ok((row.try_get("n")?, row.try_get("oldest")?))
     }
 
-    /// Delete delivered events acknowledged before `older_than_ms`; returns
+    /// Delete delivered or dropped events settled before `older_than_ms`; returns
     /// the total deleted. Deletes in chunks of [`OUTBOX_PURGE_CHUNK`] rows,
     /// yielding between chunks, so a large backlog never holds the SQLite
     /// write lock (shared with the budget flush) for one long statement.
@@ -1043,8 +1067,10 @@ impl KeyStore {
             let purged = sqlx::query(
                 "DELETE FROM usage_outbox WHERE rowid IN (\
                    SELECT rowid FROM usage_outbox \
-                   WHERE delivered_ms IS NOT NULL AND delivered_ms < ? LIMIT ?)",
+                   WHERE (delivered_ms IS NOT NULL AND delivered_ms < ?) \
+                      OR (dropped_ms IS NOT NULL AND dropped_ms < ?) LIMIT ?)",
             )
+            .bind(older_than_ms)
             .bind(older_than_ms)
             .bind(OUTBOX_PURGE_CHUNK)
             .execute(&self.pool)

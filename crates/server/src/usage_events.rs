@@ -1,7 +1,8 @@
 //! Billing usage-event delivery (ADR 015): pushes due outbox rows to the
 //! control plane in signed batches and marks what it acknowledges. Never on
-//! the request path; never drops an event; a failing control plane only
-//! delays delivery.
+//! the request path; a failing or unreachable control plane only delays
+//! delivery. The one drop: an event a reachable control plane answered but
+//! kept out of `accepted` for [`REJECTION_TTL_MS`] (contract v2 section 3.5).
 
 use crate::webhooks::SigningKey;
 use lumen_auth::store::{KeyStore, OutboxRow};
@@ -22,8 +23,12 @@ const POLL: Duration = Duration::from_secs(2);
 /// The pending and oldest-age gauges are re-read at most this often (ms):
 /// a scrape interval is coarser, and a backlog drain loops without waiting.
 const GAUGE_REFRESH_MS: i64 = 10_000;
-/// Delivered rows are kept this long, then purged.
+/// Delivered (and dropped) rows are kept this long, then purged.
 pub const DELIVERED_RETENTION_MS: i64 = 7 * 86_400_000;
+/// A row the Lab answered but never accepted for this long is dropped
+/// (contract v2 section 3.5). Only a 2xx ack that leaves the id out of
+/// `accepted` counts: an unreachable or failing Lab never drops a row.
+pub const REJECTION_TTL_MS: i64 = 24 * 3_600_000;
 
 /// The outcome of one delivery attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -139,7 +144,7 @@ impl UsageEventsSender {
                 ("status", format!("HTTP {}", resp.status().as_u16()))
             }
             Ok(resp) => match resp.json::<Ack>().await {
-                Ok(ack) => return self.settle_ack(&ids, &ack.accepted, now_ms).await,
+                Ok(ack) => return self.settle_ack(&rows, &ack.accepted, now_ms).await,
                 Err(error) => ("malformed", error.without_url().to_string()),
             },
         };
@@ -154,9 +159,10 @@ impl UsageEventsSender {
         Delivery::Failed
     }
 
-    async fn settle_ack(&self, ids: &[String], accepted: &[String], now_ms: i64) -> Delivery {
-        let (done, rest): (Vec<String>, Vec<String>) =
-            ids.iter().cloned().partition(|id| accepted.contains(id));
+    async fn settle_ack(&self, rows: &[OutboxRow], accepted: &[String], now_ms: i64) -> Delivery {
+        let (done, rest): (Vec<&OutboxRow>, Vec<&OutboxRow>) =
+            rows.iter().partition(|row| accepted.contains(&row.id));
+        let done: Vec<String> = done.into_iter().map(|row| row.id.clone()).collect();
         if let Err(error) = self.store.outbox_mark_delivered(&done, now_ms).await {
             // The Lab has them and dedups on id: a re-send is harmless.
             tracing::warn!(%error, "usage events: could not mark delivered rows");
@@ -166,14 +172,38 @@ impl UsageEventsSender {
         }
         self.metrics
             .add_delivered(u64::try_from(done.len()).unwrap_or(0));
-        if !rest.is_empty() {
+        // The Lab is reachable and keeps skipping these ids: after 24 h the
+        // skip is permanent (account_not_owned, an unknown account, ...).
+        let (expired, retry): (Vec<&OutboxRow>, Vec<&OutboxRow>) = rest
+            .into_iter()
+            .partition(|row| now_ms.saturating_sub(row.created_ms) >= REJECTION_TTL_MS);
+        if !expired.is_empty() {
+            for row in &expired {
+                tracing::error!(
+                    event_id = %row.id,
+                    age_hours = now_ms.saturating_sub(row.created_ms) / 3_600_000,
+                    "usage event never accepted by the Lab for 24 h; dropped (see the body in usage_outbox)"
+                );
+            }
+            let expired: Vec<String> = expired.into_iter().map(|row| row.id.clone()).collect();
+            match self.store.outbox_mark_dropped(&expired, now_ms).await {
+                Ok(n) => self.metrics.add_dropped(n),
+                // The rows stay pending: the next due round resends them and,
+                // if the Lab still skips them, tries the drop again.
+                Err(error) => tracing::warn!(%error, "usage events: could not mark dropped rows"),
+            }
+        }
+        if !retry.is_empty() {
+            let retry: Vec<String> = retry.into_iter().map(|row| row.id.clone()).collect();
             tracing::warn!(
-                count = rest.len(),
+                count = retry.len(),
                 "usage events not accepted by the control plane; will retry"
             );
+            // Only rows that will be retried count here; a dropped row
+            // counts in `lumen_usage_events_dropped_total` alone.
             self.metrics
-                .inc_failed("not_accepted", u64::try_from(rest.len()).unwrap_or(0));
-            self.reschedule(&rest, now_ms).await;
+                .inc_failed("not_accepted", u64::try_from(retry.len()).unwrap_or(0));
+            self.reschedule(&retry, now_ms).await;
         }
         Delivery::Delivered(done.len())
     }
@@ -194,7 +224,7 @@ impl UsageEventsSender {
         }
     }
 
-    /// Purge delivered rows past retention.
+    /// Purge delivered and dropped rows past retention.
     pub async fn purge(&self, now_ms: i64) {
         if let Err(error) = self
             .store
@@ -517,6 +547,50 @@ mod tests {
         let server = MockServer::start().await;
         let (s, _, _) = sender(&server, &[]).await;
         assert!(!format!("{s:?}").contains(SECRET));
+    }
+
+    #[tokio::test]
+    async fn an_event_the_lab_keeps_skipping_is_dropped_after_24h() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"accepted":[]})),
+            )
+            .mount(&server)
+            .await;
+        // "a" was created at 0 ms, "b" at 1 ms (the helper's index).
+        let (s, store, metrics) = sender(&server, &["a", "b"]).await;
+        let now = REJECTION_TTL_MS; // exactly 24 h after "a", 1 ms short for "b"
+        assert_eq!(s.deliver_once(now).await, Delivery::Delivered(0));
+        assert_eq!(
+            store.outbox_stats().await.unwrap().0,
+            1,
+            "only b is pending"
+        );
+        let text = metrics.encode_text();
+        assert!(
+            text.contains("lumen_usage_events_dropped_total 1"),
+            "{text}"
+        );
+        assert!(text.contains(r#"lumen_usage_events_failed_total{reason="not_accepted"} 1"#));
+    }
+
+    #[tokio::test]
+    async fn a_lab_that_stays_unreachable_never_drops_a_row() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        let (s, store, metrics) = sender(&server, &["a"]).await;
+        assert_eq!(
+            s.deliver_once(REJECTION_TTL_MS * 30).await,
+            Delivery::Failed
+        );
+        assert_eq!(store.outbox_stats().await.unwrap().0, 1);
+        assert!(!metrics
+            .encode_text()
+            .contains("lumen_usage_events_dropped_total 1"));
     }
 
     #[tokio::test]

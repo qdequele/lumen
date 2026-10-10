@@ -33,7 +33,8 @@ to gate it. See [`SECURITY.md`](https://github.com/qdequele/lumen/blob/main/SECU
 | `lumen_usage_events_pending` | none | Billing usage events in the outbox and not yet acknowledged (ADR 015). Only registered when `[usage_events]` is configured. See [Lab integration](lab-integration.md). |
 | `lumen_usage_events_oldest_pending_seconds` | none | Age of the oldest unacknowledged billing usage event, in seconds (0 when none). |
 | `lumen_usage_events_delivered_total` | none | Billing usage events the control plane acknowledged in `accepted`. |
-| `lumen_usage_events_failed_total` | `reason` | Billing usage events whose delivery attempt failed, one increment per event; they stay pending and are retried, never dropped. `reason` is `connect`, `timeout`, `auth`, `status`, `malformed`, `not_accepted` or `store`. |
+| `lumen_usage_events_failed_total` | `reason` | Billing usage events whose delivery attempt failed, one increment per event; they stay pending and are retried; see `lumen_usage_events_dropped_total` for the one exception. `not_accepted` counts only the events that will be retried: an event dropped on that attempt counts in `lumen_usage_events_dropped_total` instead. `reason` is `connect`, `timeout`, `auth`, `status`, `malformed`, `not_accepted` or `store`. |
+| `lumen_usage_events_dropped_total` | none | Billing usage events the control plane answered but kept out of `accepted` for 24 h, dropped with an error log naming the event id (platform contract v2). The row stays in `usage_outbox` with `dropped_ms` set until the 7-day purge. An unreachable or failing control plane never drops an event. |
 
 `lumen_tokens_total`, `lumen_rerank_search_units_total`, `lumen_media_total`
 and `lumen_media_bytes_total` also gain one extra label per key listed in
