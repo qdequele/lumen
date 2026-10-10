@@ -15,6 +15,9 @@
 //! * `POST /admin/groups` / `GET /admin/groups` - create and list budget
 //!   groups (ADR 009): shared pools that member keys draw from in addition
 //!   to their own budgets.
+//! * `GET /admin/groups/{id}` - one group with its live `spent_micro` and
+//!   `budget_max_micro`, for a control plane's lease sync (platform
+//!   contract v2 section 8.2).
 //! * `PATCH /admin/groups/{id}` - adjust a group's shared budget; binds
 //!   every member on their next request.
 //! * `DELETE /admin/groups/{id}` - soft-delete a group; refused while it
@@ -85,7 +88,13 @@
 //!
 //! Every change is applied to the database AND the in-memory state, so it
 //! takes effect immediately without a restart.
+//!
+//! A call carrying `X-Lumen-Account-Ref: <uuid>` is scoped to that account
+//! (platform contract v2 section 8.3, see [`crate::admin_scope`]): the key,
+//! group and usage routes see and touch only that account's rows, and the
+//! provider, webhook and config routes answer `403 LM-4005`.
 
+use crate::admin_scope::AccountScope;
 use crate::error::ApiError;
 use crate::state::AppState;
 use axum::extract::rejection::{JsonRejection, QueryRejection};
@@ -94,7 +103,7 @@ use axum::http::StatusCode;
 use axum::Json;
 use lumen_auth::events::{EventKind, SettingsOrigin, SettingsSource, WebhookSettings};
 use lumen_auth::key::hash_key;
-use lumen_auth::state::micro_to_usd;
+use lumen_auth::state::{micro_to_usd, usd_to_micro};
 use lumen_auth::store::{
     DeleteGroupOutcome, GroupPatch, GroupRecord, KeyPatch, NewGroup, NewKey, UsageAggregate,
     UsageFilter, UsageGroupBy, VirtualKeyRecord,
@@ -262,12 +271,24 @@ async fn flush_before_billability_change(
 /// Create a virtual key.
 pub async fn create_key(
     State(state): State<AppState>,
+    scope: AccountScope,
     payload: Result<Json<NewKey>, JsonRejection>,
 ) -> Result<(StatusCode, Json<CreatedKey>), ApiError> {
     let Json(params) = payload.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
     params.validate().map_err(GatewayError::InvalidRequest)?;
     validate_ref("external_ref", params.external_ref.as_deref(), false)?;
     let auth = runtime(&state)?;
+    // A scoped key must be born inside the account (platform contract v2
+    // section 8.3): a group of that account is required.
+    if scope.account().is_some() {
+        let Some(group_id) = params.group_id.as_deref() else {
+            return Err(GatewayError::InvalidRequest(
+                "`group_id` is required when the call is scoped by X-Lumen-Account-Ref".to_owned(),
+            )
+            .into());
+        };
+        scope.guard_group(&auth.store, group_id).await?;
+    }
     let (plaintext, record) = auth.store.create_key(params).await.map_err(store_error)?;
     // Make the key usable immediately, without waiting for a reboot.
     auth.keys.upsert(hash_key(plaintext.reveal()), &record);
@@ -297,6 +318,7 @@ pub struct ListKeysParams {
 /// extractor failure in this module - never axum's bare-text rejection.
 pub async fn list_keys(
     State(state): State<AppState>,
+    scope: AccountScope,
     params: Result<Query<ListKeysParams>, QueryRejection>,
 ) -> Result<Json<Vec<VirtualKeyRecord>>, ApiError> {
     let Query(params) = params.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
@@ -309,6 +331,7 @@ pub async fn list_keys(
     if let Some(want) = &params.external_ref {
         keys.retain(|k| k.external_ref.as_deref() == Some(want.as_str()));
     }
+    let keys = scope.filter_keys(&auth.store, keys).await?;
     Ok(Json(keys))
 }
 
@@ -318,6 +341,7 @@ pub async fn list_keys(
 pub async fn patch_key(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    scope: AccountScope,
     payload: Result<Json<KeyPatch>, JsonRejection>,
 ) -> Result<Json<VirtualKeyRecord>, ApiError> {
     let Json(patch) = payload.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
@@ -329,6 +353,20 @@ pub async fn patch_key(
     )?;
     let shared = runtime_arc(&state)?;
     let auth = shared.as_ref();
+    scope.guard_key(&auth.store, &id).await?;
+    // A scoped key may move only to another group of its account.
+    if scope.account().is_some() {
+        match patch.group_id.as_ref() {
+            Some(None) => {
+                return Err(GatewayError::InvalidRequest(
+                    "a scoped key must keep a group of its account".to_owned(),
+                )
+                .into())
+            }
+            Some(Some(group_id)) => scope.guard_group(&auth.store, group_id).await?,
+            None => {}
+        }
+    }
     // Snapshot the live disabled flag BEFORE the patch so `key.disabled` can
     // be edge-triggered: a PATCH that leaves an already-disabled key disabled
     // is not a state change and must not re-notify the billing backend
@@ -363,9 +401,13 @@ pub async fn patch_key(
 pub async fn delete_key(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    scope: AccountScope,
 ) -> Result<StatusCode, ApiError> {
     let shared = runtime_arc(&state)?;
     let auth = shared.as_ref();
+    // Tombstones of the account pass, so a retry still repairs a missed
+    // eviction below (see `AccountScope::guard_key_delete`).
+    scope.guard_key_delete(&auth.store, &id).await?;
     let deleted = auth.store.delete_key(&id).await.map_err(|e| internal(&e))?;
     // Evict from the live table UNCONDITIONALLY - whether this call's DB
     // write actually matched a row (`Some`) or the row was already
@@ -402,8 +444,10 @@ pub async fn delete_key(
 pub async fn rotate_key(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    scope: AccountScope,
 ) -> Result<Json<CreatedKey>, ApiError> {
     let auth = runtime(&state)?;
+    scope.guard_key(&auth.store, &id).await?;
     let (plaintext, record) = auth
         .store
         .rotate_key(&id)
@@ -430,11 +474,26 @@ pub async fn rotate_key(
 /// just the record - nothing one-time about it.
 pub async fn create_group(
     State(state): State<AppState>,
+    scope: AccountScope,
     payload: Result<Json<NewGroup>, JsonRejection>,
 ) -> Result<(StatusCode, Json<GroupRecord>), ApiError> {
-    let Json(params) = payload.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
+    let Json(mut params) = payload.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
     params.validate().map_err(GatewayError::InvalidRequest)?;
     let auth = runtime(&state)?;
+    // A scoped group belongs to the header's account (platform contract v2
+    // section 8.3): forced when absent, refused when it names another one.
+    if let Some(account) = scope.account() {
+        match params.account_ref.as_deref() {
+            None => params.account_ref = Some(account.to_owned()),
+            Some(same) if same == account => {}
+            Some(_) => {
+                return Err(GatewayError::InvalidRequest(
+                    "`account_ref` must equal X-Lumen-Account-Ref on a scoped call".to_owned(),
+                )
+                .into())
+            }
+        }
+    }
     validate_ref(
         "account_ref",
         params.account_ref.as_deref(),
@@ -464,6 +523,7 @@ pub struct ListGroupsParams {
 /// List every active budget group; `?include_deleted=true` adds tombstones.
 pub async fn list_groups(
     State(state): State<AppState>,
+    scope: AccountScope,
     params: Result<Query<ListGroupsParams>, QueryRejection>,
 ) -> Result<Json<Vec<GroupRecord>>, ApiError> {
     let Query(params) = params.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
@@ -476,7 +536,50 @@ pub async fn list_groups(
     if let Some(want) = &params.account_ref {
         groups.retain(|g| g.account_ref.as_deref() == Some(want.as_str()));
     }
+    // Applied on top of the query filter, so `?account_ref=<other>` on a
+    // scoped call narrows to nothing rather than widening the scope.
+    groups.retain(|g| scope.allows_group(g));
     Ok(Json(groups))
+}
+
+/// `GET /admin/groups/{id}` response: the record plus the live pool
+/// figures a control plane's lease sync reads (platform contract v2
+/// section 8.2). `spent_micro` includes in-flight reservations, like the
+/// budget check itself; `budget_max_micro` is `null` for a capless group.
+#[derive(Debug, Serialize)]
+pub struct GroupView {
+    /// The stored record.
+    #[serde(flatten)]
+    pub record: GroupRecord,
+    /// Live pool spend, micro-USD.
+    pub spent_micro: i64,
+    /// Live pool cap, micro-USD; `null` = unlimited.
+    pub budget_max_micro: Option<i64>,
+}
+
+/// One group with its live pool figures (the in-memory entry, so spend not
+/// yet flushed is included; the stored record only if the group is not
+/// live). An unknown, deleted or out-of-scope id is a 404 `LM-1003`.
+pub async fn get_group(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    scope: AccountScope,
+) -> Result<Json<GroupView>, ApiError> {
+    let auth = runtime(&state)?;
+    let record = scope.require_group(&auth.store, &id).await?;
+    let live = auth.keys.group(&id);
+    let spent_micro = live
+        .as_ref()
+        .map_or_else(|| usd_to_micro(record.budget_spent), |g| g.spent_micro());
+    let budget_max_micro = live.as_ref().map_or_else(
+        || record.budget_max.map(usd_to_micro),
+        |g| g.budget_max_micro(),
+    );
+    Ok(Json(GroupView {
+        record,
+        spent_micro,
+        budget_max_micro,
+    }))
 }
 
 /// Patch a group: adjust the shared budget or the label. Pool spend is
@@ -485,12 +588,20 @@ pub async fn list_groups(
 pub async fn patch_group(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    scope: AccountScope,
     payload: Result<Json<GroupPatch>, JsonRejection>,
 ) -> Result<Json<GroupRecord>, ApiError> {
     let Json(patch) = payload.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
     patch.validate().map_err(GatewayError::InvalidRequest)?;
     let shared = runtime_arc(&state)?;
     let auth = shared.as_ref();
+    scope.guard_group(&auth.store, &id).await?;
+    if scope.account().is_some() && patch.account_ref.is_some() {
+        return Err(GatewayError::InvalidRequest(
+            "`account_ref` cannot change on a scoped call".to_owned(),
+        )
+        .into());
+    }
     validate_ref(
         "account_ref",
         patch.account_ref.as_ref().and_then(Option::as_deref),
@@ -519,8 +630,10 @@ pub async fn patch_group(
 pub async fn delete_group(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    scope: AccountScope,
 ) -> Result<StatusCode, ApiError> {
     let auth = runtime(&state)?;
+    scope.guard_group(&auth.store, &id).await?;
     let outcome = auth
         .store
         .delete_group(&id)
@@ -600,10 +713,12 @@ fn validated_grant_amount(
 pub async fn grant_key(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    scope: AccountScope,
     payload: Result<Json<GrantBody>, JsonRejection>,
 ) -> Result<Json<VirtualKeyRecord>, ApiError> {
     let amount = validated_grant_amount(payload)?;
     let auth = runtime(&state)?;
+    scope.guard_key(&auth.store, &id).await?;
     let record = auth
         .store
         .grant_key_budget(&id, amount)
@@ -620,8 +735,7 @@ pub async fn grant_key(
     // a hot reload or a PATCH stores caps ABSOLUTELY and can interleave
     // with the two-step grant in either direction, and a client disconnect
     // between the DB write and this line credits the DB but not memory.
-    auth.keys
-        .grant_key(&id, lumen_auth::state::usd_to_micro(amount));
+    auth.keys.grant_key(&id, usd_to_micro(amount));
     Ok(Json(record))
 }
 
@@ -630,18 +744,19 @@ pub async fn grant_key(
 pub async fn grant_group(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    scope: AccountScope,
     payload: Result<Json<GrantBody>, JsonRejection>,
 ) -> Result<Json<GroupRecord>, ApiError> {
     let amount = validated_grant_amount(payload)?;
     let auth = runtime(&state)?;
+    scope.guard_group(&auth.store, &id).await?;
     let record = auth
         .store
         .grant_group_budget(&id, amount)
         .await
         .map_err(store_error)?
         .ok_or_else(|| unknown_group(&id))?;
-    auth.keys
-        .grant_group(&id, lumen_auth::state::usd_to_micro(amount));
+    auth.keys.grant_group(&id, usd_to_micro(amount));
     Ok(Json(record))
 }
 
@@ -1015,6 +1130,7 @@ pub struct UsageReport {
 /// `LM-1001`; a window that matches nothing is a 200 with empty `groups`.
 pub async fn usage_report(
     State(state): State<AppState>,
+    scope: AccountScope,
     params: Result<Query<UsageParams>, QueryRejection>,
 ) -> Result<Json<UsageReport>, ApiError> {
     let Query(params) = params.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
@@ -1068,6 +1184,9 @@ pub async fn usage_report(
         model: params.model,
         provider: params.provider,
         capability: params.capability,
+        // AND-ed with every query filter, so naming another account's key
+        // or group on a scoped call matches nothing.
+        account_ref: scope.account().map(str::to_owned),
         since,
         until,
         // One extra row detects truncation without a second COUNT query.
@@ -1144,6 +1263,7 @@ pub struct UsageExportPage {
 /// themselves (ADR 010). The rows carry no prompt or response content.
 pub async fn usage_export(
     State(state): State<AppState>,
+    scope: AccountScope,
     params: Result<Query<UsageExportParams>, QueryRejection>,
 ) -> Result<Json<UsageExportPage>, ApiError> {
     let Query(params) = params.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
@@ -1175,7 +1295,13 @@ pub async fn usage_export(
     let auth = runtime(&state)?;
     let rows = auth
         .store
-        .usage_export(since, until, params.cursor, i64::from(limit))
+        .usage_export(
+            since,
+            until,
+            params.cursor,
+            i64::from(limit),
+            scope.account(),
+        )
         .await
         .map_err(|e| internal(&e))?;
 

@@ -7,6 +7,7 @@
 
 pub mod accounting;
 pub mod admin;
+pub mod admin_scope;
 pub mod app;
 pub mod auth;
 pub mod budget_flush;

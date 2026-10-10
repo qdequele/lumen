@@ -207,6 +207,13 @@ impl GroupEntry {
     pub fn spent_micro(&self) -> i64 {
         self.spent_micro.load(Ordering::SeqCst)
     }
+
+    /// The pool cap in micro-USD; `None` = unlimited.
+    #[must_use]
+    pub fn budget_max_micro(&self) -> Option<i64> {
+        let max = self.budget_max_micro.load(Ordering::SeqCst);
+        (max != UNLIMITED).then_some(max)
+    }
 }
 
 /// The live, request-path view of one virtual key.
@@ -886,6 +893,12 @@ impl AuthState {
                 )));
             }
         }
+    }
+
+    /// The live entry of a group, for the admin API's group view.
+    #[must_use]
+    pub fn group(&self, id: &str) -> Option<Arc<GroupEntry>> {
+        self.groups.get(id).map(|entry| Arc::clone(entry.value()))
     }
 
     /// Apply an admin update to an existing group (by id). Pool spend is

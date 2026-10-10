@@ -394,6 +394,9 @@ pub struct UsageFilter {
     pub provider: Option<String>,
     /// Only rows of this capability (`chat` | `embed` | `rerank` | `decisions`).
     pub capability: Option<String>,
+    /// Only rows of groups with this `account_ref` (platform contract v2
+    /// section 8.3); rows with no group never match.
+    pub account_ref: Option<String>,
     /// Window start, unix seconds (inclusive).
     pub since: i64,
     /// Window end, unix seconds (inclusive).
@@ -818,6 +821,45 @@ impl KeyStore {
         Ok(records)
     }
 
+    /// One live key by id: `None` for an unknown id or a tombstone.
+    ///
+    /// # Errors
+    ///
+    /// [`AuthError::Db`] if the query fails.
+    pub async fn get_key(&self, id: &str) -> Result<Option<VirtualKeyRecord>, AuthError> {
+        let record = sqlx::query_as::<_, VirtualKeyRecord>(concat!(
+            "SELECT ",
+            key_columns!(),
+            " FROM virtual_keys WHERE id = ? AND deleted_at IS NULL"
+        ))
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(record)
+    }
+
+    /// One key by id, tombstones included (`deleted_at` set): `None` only for
+    /// an id that never existed. For the admin delete path, whose retry must
+    /// still find a tombstoned row to repair a missed in-memory eviction.
+    ///
+    /// # Errors
+    ///
+    /// [`AuthError::Db`] if the query fails.
+    pub async fn get_key_including_deleted(
+        &self,
+        id: &str,
+    ) -> Result<Option<VirtualKeyRecord>, AuthError> {
+        let record = sqlx::query_as::<_, VirtualKeyRecord>(concat!(
+            "SELECT ",
+            key_columns!(),
+            " FROM virtual_keys WHERE id = ?"
+        ))
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(record)
+    }
+
     /// Apply a partial update; returns the updated record, or `None` when the
     /// id does not exist (or was deleted - tombstones reject updates).
     pub async fn update_key(
@@ -1169,6 +1211,23 @@ impl KeyStore {
         Ok(records)
     }
 
+    /// One live group by id: `None` for an unknown id or a tombstone.
+    ///
+    /// # Errors
+    ///
+    /// [`AuthError::Db`] if the query fails.
+    pub async fn get_group(&self, id: &str) -> Result<Option<GroupRecord>, AuthError> {
+        let record = sqlx::query_as::<_, GroupRecord>(concat!(
+            "SELECT ",
+            group_columns!(),
+            " FROM budget_groups WHERE id = ? AND deleted_at IS NULL"
+        ))
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(record)
+    }
+
     /// Every **active** group - exclusively for building the in-memory
     /// [`AuthState`](crate::state::AuthState) at boot and on reload.
     pub async fn load_groups(&self) -> Result<Vec<GroupRecord>, AuthError> {
@@ -1441,6 +1500,9 @@ impl KeyStore {
             1 => sql.push_str(" AND capability IN (?)"),
             _ => sql.push_str(" AND capability IN (?, ?)"),
         }
+        if filter.account_ref.is_some() {
+            sql.push_str(" AND group_id IN (SELECT id FROM budget_groups WHERE account_ref = ?)");
+        }
         sql.push_str(" GROUP BY grp ORDER BY cost DESC, grp ASC LIMIT ?");
 
         // AssertSqlSafe: audited above - only fixed fragments (the capability
@@ -1461,6 +1523,10 @@ impl KeyStore {
         }
         for value in capability_values {
             query = query.bind(value);
+        }
+        // Same order as the clauses above: the account filter comes last.
+        if let Some(account) = &filter.account_ref {
+            query = query.bind(account);
         }
         let rows = query.bind(filter.limit).fetch_all(&self.pool).await?;
 
@@ -1498,6 +1564,8 @@ impl KeyStore {
     /// row when new requests land mid-export, which an offset scan would.
     ///
     /// `limit` bounds the page; the caller is responsible for capping it.
+    /// `account_ref` keeps only rows of groups with that `account_ref`
+    /// (platform contract v2 section 8.3); rows with no group never match it.
     ///
     /// # Errors
     ///
@@ -1508,24 +1576,30 @@ impl KeyStore {
         until: i64,
         cursor: Option<i64>,
         limit: i64,
+        account_ref: Option<&str>,
     ) -> Result<Vec<UsageRow>, AuthError> {
-        let rows = sqlx::query_as::<_, UsageRow>(
+        let mut sql = String::from(
             "SELECT id, key_id, group_id, model, model_used, route, provider, capability, \
              tokens_in, tokens_out, cached_tokens, reasoning_tokens, cache_write_tokens, \
              search_units, media_count, media_bytes, estimated, cost, latency_ms, \
              status, metadata, ts \
              FROM usage_log \
-             WHERE ts >= ? AND ts <= ? AND id > ? \
-             ORDER BY id \
-             LIMIT ?",
-        )
-        .bind(since)
-        .bind(until)
-        // AUTOINCREMENT ids start at 1, so 0 is a safe "from the beginning".
-        .bind(cursor.unwrap_or(0))
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
+             WHERE ts >= ? AND ts <= ? AND id > ?",
+        );
+        if account_ref.is_some() {
+            sql.push_str(" AND group_id IN (SELECT id FROM budget_groups WHERE account_ref = ?)");
+        }
+        sql.push_str(" ORDER BY id LIMIT ?");
+        // AssertSqlSafe: fixed fragments only; every caller value is a bind.
+        let mut query = sqlx::query_as::<_, UsageRow>(sqlx::AssertSqlSafe(sql))
+            .bind(since)
+            .bind(until)
+            // AUTOINCREMENT ids start at 1, so 0 is a safe "from the beginning".
+            .bind(cursor.unwrap_or(0));
+        if let Some(account) = account_ref {
+            query = query.bind(account.to_owned());
+        }
+        let rows = query.bind(limit).fetch_all(&self.pool).await?;
         Ok(rows)
     }
 

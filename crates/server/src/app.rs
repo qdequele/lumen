@@ -1,7 +1,8 @@
 //! Assembly of the axum application and its middleware stack.
 
 use crate::{
-    admin, auth, chat, decisions, embeddings, health, models, rerank, routes, state::AppState,
+    admin, admin_scope, auth, chat, decisions, embeddings, health, models, rerank, routes,
+    state::AppState,
 };
 use axum::extract::{MatchedPath, Request, State};
 use axum::http::{header, HeaderValue, StatusCode};
@@ -266,8 +267,14 @@ fn make_request_span<B>(request: &axum::http::Request<B>) -> tracing::Span {
 
 /// The master-key-protected `/admin` surface (mounted only when auth is
 /// enabled). Split out of [`build_app`] to keep that function readable.
+///
+/// Two halves: the account routes (keys, groups, usage), which a control
+/// plane may scope to one account with `X-Lumen-Account-Ref`, and the
+/// platform routes (provider keys and checks, webhooks, config), which
+/// refuse a scoped call with `403 LM-4005` (platform contract v2 section
+/// 8.3, see [`admin_scope`]). The master key is checked first on both.
 fn admin_routes(state: &AppState) -> Router<AppState> {
-    Router::new()
+    let account = Router::new()
         .route("/admin/keys", post(admin::create_key).get(admin::list_keys))
         .route(
             "/admin/keys/{id}",
@@ -281,9 +288,14 @@ fn admin_routes(state: &AppState) -> Router<AppState> {
         )
         .route(
             "/admin/groups/{id}",
-            patch(admin::patch_group).delete(admin::delete_group),
+            get(admin::get_group)
+                .patch(admin::patch_group)
+                .delete(admin::delete_group),
         )
         .route("/admin/groups/{id}/grant", post(admin::grant_group))
+        .route("/admin/usage", get(admin::usage_report))
+        .route("/admin/usage/export", get(admin::usage_export));
+    let platform = Router::new()
         .route("/admin/provider-keys/{name}", put(admin::put_provider_key))
         .route(
             "/admin/providers/{name}/check",
@@ -299,8 +311,6 @@ fn admin_routes(state: &AppState) -> Router<AppState> {
             "/admin/webhooks/signing-key",
             put(admin::put_webhook_signing_key).delete(admin::delete_webhook_signing_key),
         )
-        .route("/admin/usage", get(admin::usage_report))
-        .route("/admin/usage/export", get(admin::usage_export))
         .route(
             "/admin/config",
             get(admin::get_config).put(admin::put_config),
@@ -337,6 +347,9 @@ fn admin_routes(state: &AppState) -> Router<AppState> {
             "/admin/config/{section}",
             get(admin::get_config_section).put(admin::put_config_section),
         )
+        .route_layer(middleware::from_fn(admin_scope::platform_only));
+    account
+        .merge(platform)
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth::require_master_key,
