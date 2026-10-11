@@ -3,9 +3,8 @@
 The gateway's HTTP contract is one OpenAPI 3.1 document,
 [`docs/openapi.yaml`](https://github.com/qdequele/lumen/blob/main/docs/openapi.yaml)
 (its `info.version` is the gateway version): the OpenAI-compatible `/v1`
-surface (chat completions, embeddings, rerank, decisions, models; the
-deprecated `/v1/systemone` alias of `/v1/decisions` is documented as such),
-the operational routes (`/health`, `/health/providers`, `/metrics`) and
+surface (chat completions, embeddings, rerank, decisions, models), the
+operational routes (`/health`, `/health/providers`, `/metrics`) and
 every master-key `/admin` route a control plane drives.
 
 - A test in `crates/server/src/app.rs` fails the build when a mounted route

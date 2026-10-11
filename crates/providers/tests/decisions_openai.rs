@@ -3,7 +3,7 @@
 
 use std::time::{Duration, Instant};
 
-use lumen_core::decisions::format::{parse, Format};
+use lumen_core::decisions::format::parse;
 use lumen_core::{Answer, DecisionProvider, DecisionRequest, ProviderError};
 use lumen_providers::decisions::openai::OpenAiDecisionProvider;
 use lumen_providers::http::build_client;
@@ -20,9 +20,7 @@ fn ts_req() -> DecisionRequest {
         "urgent":{"type":"noul","instructions":"Urgent?","criteria":{"true":"time-sensitive","false":"can wait"}},
         "only":{"type":"noul","criteria":{"true":"mentions money"}},
         "team":{"type":"choice","instructions":{"q":"team"},"criteria":{"tech":"Bugs","billing":null}},
-        "mood":{"type":"score","instructions":"Mood?","criteria":["calm","angry"]}},"future":1}"#,
-        Some(Format::TypeSafe),
-    )
+        "mood":{"type":"score","instructions":"Mood?","criteria":["calm","angry"]}},"future":1}"#)
     .unwrap()
     .1;
     "gpt-6-luna".clone_into(&mut req.model);
@@ -32,7 +30,6 @@ fn ts_req() -> DecisionRequest {
 fn one_q_req() -> DecisionRequest {
     let mut req = parse(
         br#"{"model":"client","state":"s","questions":{"q":{"type":"noul","instructions":"i"}}}"#,
-        Some(Format::TypeSafe),
     )
     .unwrap()
     .1;

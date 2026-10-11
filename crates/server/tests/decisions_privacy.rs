@@ -1,8 +1,7 @@
-//! Privacy of `POST /v1/decisions` and `/v1/systemone` (spec 12): input,
-//! questions and `safety_identifier` are request content and never reach a
-//! log line, in either format, on success, on a rejected request, on a
-//! skipped incompatible target, or through the deprecated alias. The
-//! provider key never does either.
+//! Privacy of `POST /v1/decisions` (spec 12): input, questions and
+//! `safety_identifier` are request content and never reach a log line, in
+//! either format, on success, on a rejected request, or on a skipped
+//! incompatible target. The provider key never does either.
 //!
 //! Its own test binary: the server runs on tokio worker threads, which only
 //! a *global* subscriber sees (`tracing::subscriber::with_default` is
@@ -177,8 +176,6 @@ async fn decisions_content_never_reaches_the_logs() {
         ("/v1/decisions", openai_invalid, 400),
         ("/v1/decisions", typesafe_invalid, 400),
         ("/v1/decisions", skipped, 200),
-        ("/v1/systemone", typesafe_ok, 200),
-        ("/v1/systemone", openai_ok, 400),
     ];
     for (route, body, status) in cases {
         let resp = post(&base, route, body).await;
@@ -194,10 +191,6 @@ async fn decisions_content_never_reaches_the_logs() {
 
     let logs = String::from_utf8(buffer.lock().expect("log buffer").clone()).expect("utf8 logs");
     assert!(!logs.is_empty(), "the subscriber captured nothing");
-    assert!(
-        logs.contains("deprecated route used"),
-        "the deprecation warning is logged"
-    );
     assert!(
         logs.contains("skipping an incompatible decisions target"),
         "the skip is logged at debug"

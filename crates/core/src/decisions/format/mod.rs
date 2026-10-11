@@ -29,30 +29,16 @@ pub enum Format {
 const EITHER: &str = "send either OpenAI format (`input`, `questions` array) or TypeSafe format \
                       (`state`, `questions` object)";
 
-/// Detect, parse and validate a request body. `forced` is the format a
-/// route accepts exclusively (`/v1/systemone`: TypeSafe).
+/// Detect, parse and validate a request body.
 ///
 /// # Errors
-/// `LM-1001` for malformed JSON, an undetectable or forbidden format, or any
-/// contract violation; `LM-2011` for empty questions; `LM-2004` for a
-/// remote image URL.
-pub fn parse(
-    bytes: &[u8],
-    forced: Option<Format>,
-) -> Result<(Format, DecisionRequest), GatewayError> {
+/// `LM-1001` for malformed JSON, an undetectable format, or any contract
+/// violation; `LM-2011` for empty questions; `LM-2004` for a remote image
+/// URL.
+pub fn parse(bytes: &[u8]) -> Result<(Format, DecisionRequest), GatewayError> {
     let entries = object_entries(bytes, "request body").map_err(GatewayError::InvalidRequest)?;
-    let detected = detect(&entries);
-    let format = match (forced, detected) {
-        (Some(Format::TypeSafe), Some(Format::OpenAi)) => {
-            return Err(GatewayError::InvalidRequest(
-                "/v1/systemone accepts only the TypeSafe format (`state`, `questions` object); \
-                 send OpenAI-format bodies to /v1/decisions"
-                    .to_owned(),
-            ))
-        }
-        (Some(forced), _) => forced,
-        (None, Some(format)) => format,
-        (None, None) => return Err(GatewayError::InvalidRequest(EITHER.to_owned())),
+    let Some(format) = detect(&entries) else {
+        return Err(GatewayError::InvalidRequest(EITHER.to_owned()));
     };
     let req = match format {
         Format::TypeSafe => typesafe::parse(entries)?,
@@ -183,8 +169,8 @@ pub(crate) fn duplicate_field(e: &serde_json::Error) -> Option<String> {
 mod tests {
     use super::*;
 
-    fn err(body: &str, forced: Option<Format>) -> String {
-        match parse(body.as_bytes(), forced) {
+    fn err(body: &str) -> String {
+        match parse(body.as_bytes()) {
             Err(GatewayError::InvalidRequest(m)) => m,
             other => panic!("expected LM-1001, got {other:?}"),
         }
@@ -194,10 +180,7 @@ mod tests {
     fn detection_table() {
         let ts =
             r#"{"model":"jev","state":"s","questions":{"q":{"type":"noul","instructions":"i"}}}"#;
-        assert!(matches!(
-            parse(ts.as_bytes(), None),
-            Ok((Format::TypeSafe, _))
-        ));
+        assert!(matches!(parse(ts.as_bytes()), Ok((Format::TypeSafe, _))));
         for bad in [
             r#"{"model":"m","input":"x","state":"s","questions":[]}"#,
             r#"{"model":"m","questions":{}}"#,
@@ -205,7 +188,7 @@ mod tests {
             r#"{"model":"m","state":"s","questions":[{"type":"predicate"}]}"#,
             r#"{"model":"m","state":"s","questions":"nope"}"#,
         ] {
-            let m = err(bad, None);
+            let m = err(bad);
             assert!(m.contains("either OpenAI format"), "{bad}: {m}");
         }
     }
@@ -213,20 +196,7 @@ mod tests {
     #[test]
     fn openai_bodies_detect_and_parse() {
         let body = r#"{"model":"gpt-6-luna","input":"x","questions":[{"type":"predicate","instructions":"i"}]}"#;
-        assert!(matches!(
-            parse(body.as_bytes(), None),
-            Ok((Format::OpenAi, _))
-        ));
-    }
-
-    #[test]
-    fn systemone_forces_the_typesafe_format() {
-        let openai =
-            r#"{"model":"m","input":"x","questions":[{"type":"predicate","instructions":"i"}]}"#;
-        assert!(err(openai, Some(Format::TypeSafe)).contains("/v1/systemone"));
-        // A TypeSafe body missing `state` keeps the precise TypeSafe message.
-        let missing = r#"{"model":"jev","questions":{"q":{"type":"noul","instructions":"i"}}}"#;
-        assert!(err(missing, Some(Format::TypeSafe)).contains("`state`"));
+        assert!(matches!(parse(body.as_bytes()), Ok((Format::OpenAi, _))));
     }
 
     #[test]
@@ -247,25 +217,23 @@ mod tests {
             r#"{"model":"m","state":"SECRET-SYNTAX"#.to_owned(),
         ];
         for body in &cases {
-            for forced in [None, Some(Format::TypeSafe)] {
-                if let Err(e) = parse(body.as_bytes(), forced) {
-                    let m = e.to_string();
-                    assert!(
-                        !m.contains("SECRET") && !m.contains("98765") && !m.contains("1234567"),
-                        "{body}: {m}"
-                    );
-                }
+            if let Err(e) = parse(body.as_bytes()) {
+                let m = e.to_string();
+                assert!(
+                    !m.contains("SECRET") && !m.contains("98765") && !m.contains("1234567"),
+                    "{body}: {m}"
+                );
             }
         }
         // The question that is a number is named by its id, not its value.
-        let m = err(&q("98765"), Some(Format::TypeSafe));
+        let m = err(&q("98765"));
         assert!(m.contains("`q1`") && m.contains("must be an object"), "{m}");
     }
 
     #[test]
     fn malformed_json_and_duplicate_keys_are_lm_1001() {
-        assert!(err("{", None).contains("malformed"));
-        assert!(err("[1]", None).contains("object"));
-        assert!(err(r#"{"model":"a","model":"b"}"#, None).contains("duplicate"));
+        assert!(err("{").contains("malformed"));
+        assert!(err("[1]").contains("object"));
+        assert!(err(r#"{"model":"a","model":"b"}"#).contains("duplicate"));
     }
 }

@@ -1,8 +1,7 @@
 #![no_main]
 //! Fuzz the decisions client-input boundary (ADR 017): format detection and
-//! parsing (auto-detected and TypeSafe-forced, as `/v1/systemone` does), the
-//! token estimate, per-target limits, both upstream encoders, and both edge
-//! renderers over a synthesized response must never panic.
+//! parsing, the token estimate, per-target limits, both upstream encoders,
+//! and both edge renderers over a synthesized response must never panic.
 use lumen_core::decisions::format::{self, Format};
 use lumen_core::decisions::{
     Answer, DecisionLimits, DecisionRequest, DecisionResponse, QuestionKind,
@@ -60,9 +59,7 @@ fn exercise(req: &DecisionRequest) {
 }
 
 fuzz_target!(|data: &[u8]| {
-    for forced in [None, Some(Format::TypeSafe)] {
-        if let Ok((_, req)) = format::parse(data, forced) {
-            exercise(&req);
-        }
+    if let Ok((_, req)) = format::parse(data) {
+        exercise(&req);
     }
 });

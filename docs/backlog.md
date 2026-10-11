@@ -33,8 +33,8 @@ milestone.
 
 ## Noted while building ADR 013 (SystemOne capability)
 
-- **Byte-splice passthrough for `/v1/systemone`.** The request is parsed into
-  per-question raw boxes and re-serialized for each upstream attempt. Since
+- **Byte-splice passthrough for TypeSafe-format `/v1/decisions`.** The
+  request is parsed into per-question raw boxes and re-serialized for each upstream attempt. Since
   the only mutation is `model`, the handler could keep the client's `Bytes`,
   validate through one borrowed pass, and splice the upstream model id into
   the recorded byte range per attempt (`.body(..)` instead of `.json(..)`).
@@ -63,8 +63,6 @@ Follow-ups of the decisions spec (`docs/superpowers/specs/2026-10-08-decisions-d
 - Evaluate structured vs plain-text rerank prompts on all three vendors, then
   simplify the byte-identical Jev prompt rule if they rank the same.
 - Raise OpenAI and Perplexity rerank packing limits once measured or published.
-- Remove `/v1/systemone` in 0.7.0 (add a `Sunset` header once the release is
-  dated).
 - Perplexity's embeddings API as a capability of the `perplexity` kind (chat is
   already served through its OpenAI-compatible endpoint).
 - `decisions` on the existing `openrouter` kind (`/api/alpha/decisions`): one

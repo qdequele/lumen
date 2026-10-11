@@ -13,7 +13,6 @@ use axum::{
     Router,
 };
 use lumen_core::GatewayError;
-use std::sync::Arc;
 use tower::ServiceBuilder;
 use tower_http::{
     limit::RequestBodyLimitLayer,
@@ -60,13 +59,6 @@ pub fn build_app(state: AppState) -> Router {
         .layer(middleware::from_fn_with_state(state.clone(), track_latency))
         // Conservative default security headers on every response (M7 §7.4).
         .layer(middleware::from_fn(security_headers))
-        // Deprecated `/v1/systemone` (spec 6.4): count once and add the
-        // `Deprecation` / `Link` headers on every response, including the
-        // auth and body-limit rejections produced further in.
-        .layer(middleware::from_fn_with_state(
-            Arc::new(state.decision_metrics.clone()),
-            decisions::systemone_deprecation,
-        ))
         // `RequestBodyLimitLayer` short-circuits an over-limit body with a bare
         // `413 Payload Too Large` plain-text response *before* axum routing or
         // any handler runs (verified empirically: it fires on `Content-Length`
@@ -94,10 +86,6 @@ pub fn build_app(state: AppState) -> Router {
         .route("/v1/embeddings", post(embeddings::embeddings))
         .route("/v1/rerank", post(rerank::rerank_handler))
         .route("/v1/decisions", post(decisions::decisions_handler))
-        .route(
-            decisions::SYSTEMONE_PATH,
-            post(decisions::systemone_handler),
-        )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth::require_virtual_key,
@@ -377,28 +365,23 @@ mod routes_match_openapi {
     /// (up to this test module): each `.route(<path>, <chain>)` call and
     /// every `get(` / `post(` / `put(` / `patch(` / `delete(` inside that
     /// call's parentheses. axum does not expose a route listing, and the
-    /// source is the truth. `<path>` is a string literal or a path constant
-    /// resolved by [`path_constant`]; a `.route(` call the parser cannot read
-    /// fails the test rather than going unchecked.
+    /// source is the truth. `<path>` must be a string literal; a `.route(`
+    /// call the parser cannot read fails the test rather than going
+    /// unchecked.
     fn mounted() -> BTreeSet<(String, String)> {
         let full = include_str!("app.rs");
         let source = full
             .split("mod routes_match_openapi {")
             .next()
             .unwrap_or(full);
-        let route = regex::Regex::new(r#"\.route\(\s*(?:"([^"]+)"|([A-Za-z_][A-Za-z0-9_:]*))\s*,"#)
-            .unwrap();
+        let route = regex::Regex::new(r#"\.route\(\s*"([^"]+)"\s*,"#).unwrap();
         let method = regex::Regex::new(r"\b(get|post|put|patch|delete)\(").unwrap();
         let calls = source.matches(".route(").count();
         let mut parsed = 0;
         let mut out = BTreeSet::new();
         for found in route.captures_iter(source) {
             parsed += 1;
-            let path = match (found.get(1), found.get(2)) {
-                (Some(literal), _) => literal.as_str().to_owned(),
-                (None, Some(constant)) => path_constant(constant.as_str()).to_owned(),
-                (None, None) => unreachable!("the regex captures one of the two"),
-            };
+            let path = found[1].to_owned();
             let rest = &source[found.get(0).unwrap().end()..];
             let mut depth = 1_i32;
             let mut end = rest.len();
@@ -424,14 +407,6 @@ mod routes_match_openapi {
             "a `.route(` call has a path the parser cannot read"
         );
         out
-    }
-
-    /// The value of a path constant mounted by name in `.route(...)`.
-    fn path_constant(name: &str) -> &'static str {
-        match name {
-            "decisions::SYSTEMONE_PATH" => crate::decisions::SYSTEMONE_PATH,
-            other => panic!("unknown route path constant `{other}`: add it here"),
-        }
     }
 
     /// `{*id}` (axum wildcard) and `{id}` document the same parameter.

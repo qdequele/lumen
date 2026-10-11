@@ -353,13 +353,13 @@ mod tests {
 
     #[test]
     fn decisions_counts_state_once_plus_every_question() {
-        use crate::decisions::format::{parse, Format};
+        use crate::decisions::format::parse;
         // state `"abcdef"` is 8 bytes (2 tokens); each question body below is
         // 36 bytes (9 tokens).
         let body = r#"{"model":"m","state":"abcdef","questions":{
                 "a":{"type":"noul","instructions":"?!"},
                 "b":{"type":"noul","instructions":"!?"}}}"#;
-        let (_, req) = parse(body.as_bytes(), Some(Format::TypeSafe)).expect("valid request");
+        let (_, req) = parse(body.as_bytes()).expect("valid request");
         assert_eq!(estimate_decisions(&req), 2 + 9 + 9);
     }
 

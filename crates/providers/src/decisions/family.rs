@@ -839,15 +839,15 @@ impl DecisionProvider for FamilyDecisionProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lumen_core::decisions::format::{parse, Format};
+    use lumen_core::decisions::format::parse;
     use lumen_core::decisions::ChoiceValue;
 
     fn ts(body: &str) -> DecisionRequest {
-        parse(body.as_bytes(), Some(Format::TypeSafe)).unwrap().1
+        parse(body.as_bytes()).unwrap().1
     }
 
     fn oa(body: &str) -> DecisionRequest {
-        parse(body.as_bytes(), None).unwrap().1
+        parse(body.as_bytes()).unwrap().1
     }
 
     fn enc(req: &DecisionRequest, profile: &FamilyProfile) -> String {

@@ -106,11 +106,7 @@ async fn passthrough_request_bytes() {
         true,
         Some("k".into()),
     );
-    let (_, mut req) = lumen_core::decisions::format::parse(
-        PASSTHROUGH.as_bytes(),
-        Some(lumen_core::decisions::format::Format::TypeSafe),
-    )
-    .unwrap();
+    let (_, mut req) = lumen_core::decisions::format::parse(PASSTHROUGH.as_bytes()).unwrap();
     "jev-latest".clone_into(&mut req.model);
     lumen_core::DecisionProvider::decide(&provider, req, CancellationToken::new())
         .await

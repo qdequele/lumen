@@ -39,8 +39,7 @@ reference.
 | `POST /v1/chat/completions`    | Chat completions, OpenAI format, streaming SSE.         |
 | `POST /v1/embeddings`          | Embeddings, OpenAI format.                              |
 | `POST /v1/rerank`              | Reranking, Cohere format (`query`, `documents`, `top_n`).|
-| `POST /v1/decisions`           | Typed decisions (calibrated probabilities) from TypeSafe, Perplexity, OpenAI, Cloudflare and Ollama models, in the OpenAI format (`input`, `questions` array) or the TypeSafe format (`state`, `questions` object), answered in the format received. See [Decisions](docs/decisions/decisions.md). |
-| `POST /v1/systemone`           | **Deprecated**, removed in 0.7.0: TypeSafe-format-only alias of `/v1/decisions`. Send the same body to `/v1/decisions`; see [Migrating](docs/decisions/decisions.md#migrating-from-v1systemone). |
+| `POST /v1/decisions`           | Typed decisions (calibrated probabilities) from TypeSafe, Perplexity, OpenAI, Cloudflare and Ollama models, in the OpenAI format (`input`, `questions` array) or the TypeSafe format (`state`, `questions` object), answered in the format received. See [Decisions](docs/decisions/decisions.md). Replaces `POST /v1/systemone`, removed in 0.7.0 ([Migrating](docs/decisions/decisions.md#migrating-from-v1systemone)). |
 | `GET  /v1/models`              | Lists configured models with a `capabilities` array and `"virtual": true/false` (virtual models also carry an optional `description`; `listed = false` hides one), plus `release_date` / `created` when configured, to sort by release. |
 | `GET  /v1/models/{id}`         | Retrieves one model (same object as the list entry); unknown id is a 404 (`LM-2001`). |
 | `GET  /health`                 | Liveness. No I/O, never touches the DB or providers.    |

@@ -369,7 +369,7 @@ async fn mount_typesafe(upstream: &MockServer, input_tokens: u32) {
         .await;
 }
 
-fn systemone_body() -> Value {
+fn typesafe_decisions_body() -> Value {
     json!({
         "model": "jev",
         "state": "abcd",
@@ -546,7 +546,7 @@ async fn exhausted_budget_is_402_fg4001_with_zero_upstream_calls() {
 }
 
 #[tokio::test]
-async fn systemone_budget_is_enforced_before_the_upstream_call() {
+async fn decisions_budget_is_enforced_before_the_upstream_call() {
     // ADR 017: decisions admission reserves the state+questions input
     // estimate (several tokens, i.e. several dollars here) like any other
     // capability; a key that cannot cover it never reaches TypeSafe.
@@ -557,9 +557,9 @@ async fn systemone_budget_is_enforced_before_the_upstream_call() {
 
     let resp = h
         .client
-        .post(format!("{}/v1/systemone", h.base))
+        .post(format!("{}/v1/decisions", h.base))
         .bearer_auth(&key)
-        .json(&systemone_body())
+        .json(&typesafe_decisions_body())
         .send()
         .await
         .expect("send");
@@ -570,7 +570,7 @@ async fn systemone_budget_is_enforced_before_the_upstream_call() {
 }
 
 #[tokio::test]
-async fn systemone_usage_row_records_tokens_and_input_only_cost() {
+async fn decisions_usage_row_records_tokens_and_input_only_cost() {
     let upstream = MockServer::start().await;
     mount_typesafe(&upstream, 5).await;
     let h = spawn_auth(full_registry(&upstream.uri()), &[]).await;
@@ -578,9 +578,9 @@ async fn systemone_usage_row_records_tokens_and_input_only_cost() {
 
     let resp = h
         .client
-        .post(format!("{}/v1/systemone", h.base))
+        .post(format!("{}/v1/decisions", h.base))
         .bearer_auth(&key)
-        .json(&systemone_body())
+        .json(&typesafe_decisions_body())
         .send()
         .await
         .expect("send");
@@ -664,7 +664,7 @@ async fn jev_rerank_is_billed_per_input_token() {
 }
 
 #[tokio::test]
-async fn systemone_reservation_is_refunded_on_upstream_error_and_disconnect() {
+async fn decisions_reservation_is_refunded_on_upstream_error_and_disconnect() {
     // ADR 003 / ADR 013: an admitted request that never settles (upstream
     // 502, or the client hanging up mid-call) leaves the key's spend at 0.
     let failing = MockServer::start().await;
@@ -683,9 +683,9 @@ async fn systemone_reservation_is_refunded_on_upstream_error_and_disconnect() {
 
     let resp = h
         .client
-        .post(format!("{}/v1/systemone", h.base))
+        .post(format!("{}/v1/decisions", h.base))
         .bearer_auth(&key)
-        .json(&systemone_body())
+        .json(&typesafe_decisions_body())
         .send()
         .await
         .expect("send");
@@ -711,10 +711,10 @@ async fn systemone_reservation_is_refunded_on_upstream_error_and_disconnect() {
         .expect("key");
     let result = h
         .client
-        .post(format!("{}/v1/systemone", h.base))
+        .post(format!("{}/v1/decisions", h.base))
         .bearer_auth(&key)
         .timeout(Duration::from_millis(200))
-        .json(&systemone_body())
+        .json(&typesafe_decisions_body())
         .send()
         .await;
     assert!(result.is_err(), "client should have timed out");
