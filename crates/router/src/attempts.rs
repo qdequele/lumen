@@ -354,7 +354,7 @@ mod tests {
     }
 
     fn parse_req(body: &str) -> lumen_core::DecisionRequest {
-        lumen_core::decisions::format::parse(body.as_bytes(), None)
+        lumen_core::decisions::format::parse(body.as_bytes())
             .unwrap()
             .1
     }

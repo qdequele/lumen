@@ -3,7 +3,7 @@
 
 use std::time::{Duration, Instant};
 
-use lumen_core::decisions::format::{parse, Format};
+use lumen_core::decisions::format::parse;
 use lumen_core::{DecisionProvider, DecisionRequest, ProviderError};
 use lumen_providers::decisions::family::FamilyDecisionProvider;
 use lumen_providers::http::build_client;
@@ -15,8 +15,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 const KEY: &str = "family-key-do-not-leak";
 
 fn ts_req() -> DecisionRequest {
-    let mut req = parse(br#"{"model":"client","state":"s","questions":{"q":{"type":"noul","instructions":"i"}},"x":1}"#,
-                        Some(Format::TypeSafe)).unwrap().1;
+    let mut req = parse(br#"{"model":"client","state":"s","questions":{"q":{"type":"noul","instructions":"i"}},"x":1}"#).unwrap().1;
     "pplx-decider-v1.1-27b".clone_into(&mut req.model);
     req
 }
@@ -113,7 +112,6 @@ async fn ollama_is_keyless_and_puts_raw_base64_images_top_level() {
         br#"{"model":"x","input":[{"role":"user","content":[{"type":"input_text","text":"look"},
         {"type":"input_image","image_url":"data:image/png;base64,QUJD"}]}],
         "questions":[{"type":"predicate","instructions":"i"}]}"#,
-        None,
     )
     .unwrap()
     .1;

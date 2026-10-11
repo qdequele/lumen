@@ -529,23 +529,20 @@ mod tests {
         let p = OpenAiDecisionProvider::new(c, "o", Some("https://proxy/v1/".into()), None);
         assert_eq!(p.url, "https://proxy/v1/decisions");
     }
-    use lumen_core::decisions::format::{parse, Format};
+    use lumen_core::decisions::format::parse;
 
-    fn enc(body: &str, forced: Option<Format>) -> String {
-        let req = parse(body.as_bytes(), forced).unwrap().1;
+    fn enc(body: &str) -> String {
+        let req = parse(body.as_bytes()).unwrap().1;
         String::from_utf8(encode(&req, "gpt-6-luna").unwrap()).unwrap()
     }
 
     #[test]
     fn typesafe_requests_translate_to_openai_wire() {
-        let out = enc(
-            r#"{"model":"x","state":{"ticket":"help"},"questions":{
+        let out = enc(r#"{"model":"x","state":{"ticket":"help"},"questions":{
             "urgent":{"type":"noul","instructions":"Urgent?","criteria":{"true":"time-sensitive","false":"can wait"}},
             "only":{"type":"noul","criteria":{"true":"mentions money"}},
             "team":{"type":"choice","instructions":{"q":"team"},"criteria":{"tech":"Bugs","billing":null}},
-            "mood":{"type":"score","instructions":"Mood?","criteria":["calm","angry"]}},"future":1}"#,
-            Some(Format::TypeSafe),
-        );
+            "mood":{"type":"score","instructions":"Mood?","criteria":["calm","angry"]}},"future":1}"#);
         assert_eq!(
             out,
             concat!(
@@ -562,20 +559,16 @@ mod tests {
     fn a_string_state_is_sent_as_its_text() {
         let out = enc(
             r#"{"model":"x","state":"café","questions":{"q":{"type":"noul","instructions":"i"}}}"#,
-            Some(Format::TypeSafe),
         );
         assert!(out.contains("\"input\":\"caf\u{e9}\""), "{out}");
     }
 
     #[test]
     fn openai_requests_round_trip_with_images_and_safety_identifier() {
-        let out = enc(
-            r#"{"model":"x","input":[{"role":"user","content":[
+        let out = enc(r#"{"model":"x","input":[{"role":"user","content":[
             {"type":"input_text","text":"look"},{"type":"input_image","image_url":"data:image/png;base64,AA","detail":"low"}]}],
             "questions":[{"type":"choice","instructions":"i","choices":[{"value":true},{"value":"true","description":"d"}]}],
-            "safety_identifier":"u1"}"#,
-            None,
-        );
+            "safety_identifier":"u1"}"#);
         assert_eq!(
             out,
             concat!(
@@ -592,7 +585,6 @@ mod tests {
             {"type":"predicate","name":"u","instructions":"i"},
             {"type":"choice","instructions":"i","choices":[{"value":"a"},{"value":false}]},
             {"type":"score","instructions":"i","levels":[{"label":"lo"},{"label":"hi"}]}]}"#,
-            None,
         )
         .unwrap()
         .1

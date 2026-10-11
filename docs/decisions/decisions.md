@@ -43,8 +43,9 @@ The old capability spelling `systemone` still loads (with a boot warning);
 
 `/v1/decisions` accepts both formats, detects which one from the body, and
 answers in the format it received. Clients of every vendor point at LUMEN with
-no code change: the OpenAI SDK, Perplexity-style and TypeSafe-style HTTP
-clients.
+no code change: the OpenAI SDK, Perplexity-style and TypeSafe-format HTTP
+clients (TypeSafe clients that post to `/v1/systemone` switch the path to
+`/v1/decisions`, see [Migrating](#migrating-from-v1systemone)).
 
 | The body has | Format |
 |---|---|
@@ -439,81 +440,28 @@ upstream. A model can take a while to load into VRAM on its first call: relax
 
 ## Migrating from /v1/systemone
 
-`POST /v1/systemone` is **deprecated**: it is a TypeSafe-format-only alias of
-`/v1/decisions`, deprecated in 0.6.0 and removed in 0.7.0.
+`POST /v1/systemone`, the TypeSafe-format-only route of 0.6.x, is **removed
+in 0.7.0**: it now answers `404 LM-1003` like any unknown route.
 
 1. **Send the same body to `/v1/decisions`.** Nothing else changes in the
-   request or the response. An OpenAI-format body sent to `/v1/systemone` is
-   `LM-1001`.
-2. **Watch the headers.** Every response from `/v1/systemone`, including auth
-   (`401`, `429`) and body-limit (`413`) rejections, carries
-   `Deprecation: @1791417600` and
-   `Link: </docs/decisions#migrating-from-v1systemone>; rel="deprecation"`.
-   A `Sunset` header will be added once the removal release is dated.
-3. **Find remaining traffic.** `lumen_deprecated_requests_total{route="/v1/systemone"}`
-   counts every request, and a warning is logged at most once per minute.
-4. **Rewrite your config.** Run `lumen config migrate` (add `--dry-run` to
+   request or the response: `/v1/decisions` detects the TypeSafe format and
+   answers in it.
+2. **Rewrite your config.** Run `lumen config migrate` (add `--dry-run` to
    preview): it renames the capability `systemone` to `decisions` and the remap
    strategy `noul` to `predicate`. The old spellings still load, with a boot
    warning.
-5. **Update dashboards.** The `capability` label of every metric and the
+3. **Update dashboards.** The `capability` label of every metric and the
    capability in `GET /v1/models` change from `systemone` to `decisions`. This
    is a breaking change for queries that filter on the old value. `usage_log`
    keeps old rows as they were (see above).
 
-TypeSafe SDK users keep working through 0.6.x, since the SDKs call
-`/v1/systemone`. Before 0.7.0, call `/v1/decisions` with the same body over
-plain HTTP, or switch SDK. `/v1/systemone` no longer requires
-`content-type: application/json`, and a malformed body now gets the format
-detection `LM-1001` message.
-
-## TypeSafe SDK drop-in
-
-The TypeSafe SDKs read their base URL from `TYPESAFE_BASE_URL` and their key
-from `TYPESAFE_API_KEY`. Point them at LUMEN and existing code goes through
-the gateway unchanged (until `/v1/systemone` is removed):
-
-```bash
-export TYPESAFE_BASE_URL=http://localhost:8080   # the LUMEN base URL, no /v1
-export TYPESAFE_API_KEY=sk-lumen-...             # a LUMEN virtual key (any value when auth is off)
-```
-
-The `model` your code sends must be one of your configured ids. To keep code
-that sends TypeSafe's own ids untouched, expose ids that match them:
-
-```toml
-[[providers.models]]
-id = "jev-latest"
-capabilities = ["decisions"]
-cost_per_1m_input = 0.042
-```
-
-With those variables set, the TypeSafe Python SDK (`pip install typesafe-sdk`,
-default model `jev-latest`) goes through LUMEN unchanged:
-
-```python
-from typesafe_sdk import Choice, Noul, TypeSafeClient
-
-with TypeSafeClient() as client:
-    response = client.system_one(
-        state={"document": "I was charged twice. Please fix this ASAP."},
-        questions={
-            "billing": Noul(instructions="Is this ticket about billing?"),
-            "tone": Choice(
-                instructions="What is the customer's tone?",
-                criteria={"calm": None, "frustrated": None, "angry": None},
-            ),
-        },
-    )
-print(response.nouls["billing"].noul)
-print(response.choices["tone"].choice)
-```
+The TypeSafe SDKs call `/v1/systemone`, so they no longer go through LUMEN
+from 0.7.0: call `/v1/decisions` with the same body over plain HTTP instead.
+Upstream providers are unaffected: the gateway still calls TypeSafe, Ollama
+and the other TypeSafe-family vendors on their own `/v1/systemone`.
 
 ## Limitations
 
-- **`models.list()` does not work through LUMEN for the TypeSafe SDKs.**
-  `GET /v1/models` keeps LUMEN's OpenAI list shape (each decision model is
-  listed with `"capabilities": ["decisions"]`), which they do not parse.
 - **No streaming.** `/v1/decisions` is request/response only.
 - **Jev rate limits** (TypeSafe, 2026-09): 64k tokens of context per request
   (32k for `state` plus the longest question), 250k tokens/s and 1200 RPM,

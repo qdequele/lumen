@@ -95,12 +95,6 @@ components:
     RequestId:
       description: The request id (the client's `x-request-id`, or a generated UUID).
       schema: { type: string }
-    Deprecation:
-      description: RFC 9745 deprecation date of `/v1/systemone`, `@1791417600`.
-      schema: { type: string }
-    Link:
-      description: RFC 8288 link to the migration guide, `rel="deprecation"`.
-      schema: { type: string }
   responses:
     Error:
       description: Error envelope.
@@ -958,38 +952,6 @@ paths:
                 oneOf:
                   - $ref: "#/components/schemas/DecisionsOpenAiResponse"
                   - $ref: "#/components/schemas/DecisionsTypeSafeResponse"
-        "400": { $ref: "#/components/responses/Error" }
-        "401": { $ref: "#/components/responses/Error" }
-        "402": { $ref: "#/components/responses/Error" }
-        "404": { $ref: "#/components/responses/Error" }
-        "413": { $ref: "#/components/responses/Error" }
-        "429": { $ref: "#/components/responses/Error" }
-        "500": { $ref: "#/components/responses/Error" }
-        "502": { $ref: "#/components/responses/Error" }
-        "503": { $ref: "#/components/responses/Error" }
-        "504": { $ref: "#/components/responses/Error" }
-  /v1/systemone:
-    post:
-      summary: Deprecated alias of `/v1/decisions` (TypeSafe format only)
-      description: The same pipeline as `/v1/decisions`, accepting only the TypeSafe format (an OpenAI-format body is 400 `LM-1001`). Every response, rejections included, carries the `Deprecation` and `Link` headers. Send the same body to `/v1/decisions`.
-      operationId: systemone
-      deprecated: true
-      security: [{ virtualKey: [] }]
-      requestBody:
-        required: true
-        content:
-          application/json: { schema: { $ref: "#/components/schemas/DecisionsTypeSafeRequest" } }
-      responses:
-        "200":
-          description: One typed answer per question.
-          headers:
-            Deprecation: { $ref: "#/components/headers/Deprecation" }
-            Link: { $ref: "#/components/headers/Link" }
-            x-lumen-model-used: { $ref: "#/components/headers/ModelUsed" }
-            x-lumen-route: { $ref: "#/components/headers/Route" }
-            x-request-id: { $ref: "#/components/headers/RequestId" }
-          content:
-            application/json: { schema: { $ref: "#/components/schemas/DecisionsTypeSafeResponse" } }
         "400": { $ref: "#/components/responses/Error" }
         "401": { $ref: "#/components/responses/Error" }
         "402": { $ref: "#/components/responses/Error" }

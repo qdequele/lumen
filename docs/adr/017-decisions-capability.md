@@ -22,7 +22,7 @@ its own format, backed by SDK reach.
 |---|---|
 | D1 | One capability, renamed `systemone` to **`decisions`**. |
 | D2 | **`POST /v1/decisions`** is the public endpoint. It accepts **both formats**, detected from the body, and answers in the format it received. |
-| D3 | **`POST /v1/systemone` is deprecated**: a TypeSafe-format-only alias of `/v1/decisions`, removed one minor release later. |
+| D3 | **`POST /v1/systemone` is deprecated**: a TypeSafe-format-only alias of `/v1/decisions`, removed one minor release later. Superseded by the 2026-10-11 amendment below: removed outright in 0.7.0 (`404 LM-1003`). |
 | D4 | The **core type follows OpenAI's schema** (ordered questions, optional names, images, refusals), widened so text fields may hold structured JSON. |
 | D5 | Five existing provider kinds serve decisions in this change: `typesafe` (path now configurable, so it is also the generic kind for Liquid, Inception, Upstage and a self-hosted Kev), and `openai`, `ollama`, `cloudflare` and `perplexity` (new `decisions` capability next to their existing ones; `perplexity` and `cloudflare` are today OpenAI-compatible chat kinds). `decisions` on the existing `openrouter` kind is a follow-up. |
 | D6 | The rerank `remap` targets **any decision model**; `noul` strategy renamed `predicate` (alias kept). |
@@ -35,9 +35,14 @@ its own format, backed by SDK reach.
 - `capability = "systemone"` becomes `"decisions"` (alias with a boot warning,
   `lumen config migrate` rewrites it); the `GET /v1/models` value and the
   `capability` metric label change (breaking, CHANGELOG).
-- `/v1/systemone` is deprecated in 0.6.0 and removed in 0.7.0; it returns
-  `Deprecation` and `Link` headers and is counted in
-  `lumen_deprecated_requests_total{route="/v1/systemone"}`.
+- `/v1/systemone` was planned as deprecated in 0.6.0 and removed in 0.7.0,
+  with `Deprecation` and `Link` headers and a
+  `lumen_deprecated_requests_total{route}` counter.
+- Amendment (2026-10-11): the deprecation landed after 0.6.1 and never
+  shipped in a tagged release, so `/v1/systemone` is removed outright in
+  0.7.0 (it answers `404 LM-1003`), together with its headers, its counter
+  and the core "forced TypeSafe format" parse path. TypeSafe SDK clients,
+  which call `/v1/systemone`, must call `/v1/decisions` instead.
 - An incompatible fallback target (image to a text-only model, a choice of
   one option to OpenAI, ...) is skipped before any upstream call; it is not an
   attempt and never a circuit failure.

@@ -1,13 +1,12 @@
-//! End-to-end HTTP tests for `POST /v1/decisions` (ADR 017) and its
-//! deprecated alias `/v1/systemone`: both edge formats (OpenAI and TypeSafe),
-//! TypeSafe-wire passthrough, alias resolution, edge validation (LM-2011 /
-//! LM-1001 before any upstream call), routing misses, upstream error mapping,
-//! fallback on `529 Overloaded` (also across vendors in both directions),
-//! target compatibility skips (images, a choice of one option), ADR 003 usage
-//! (upstream vs flagged estimate), token and decisions metrics, deprecation
-//! headers, and client-disconnect handling. The upstreams are wiremock
-//! servers: TypeSafe's `/v1/systemone`, OpenAI's and Perplexity's
-//! `/v1/decisions`.
+//! End-to-end HTTP tests for `POST /v1/decisions` (ADR 017): both edge
+//! formats (OpenAI and TypeSafe), TypeSafe-wire passthrough, alias
+//! resolution, edge validation (LM-2011 / LM-1001 before any upstream call),
+//! routing misses, upstream error mapping, fallback on `529 Overloaded` (also
+//! across vendors in both directions), target compatibility skips (images, a
+//! choice of one option), ADR 003 usage (upstream vs flagged estimate), token
+//! and decisions metrics, the removed `/v1/systemone` alias, and
+//! client-disconnect handling. The upstreams are wiremock servers:
+//! TypeSafe's `/v1/systemone`, OpenAI's and Perplexity's `/v1/decisions`.
 
 mod common;
 
@@ -640,7 +639,7 @@ async fn golden_passthrough_response_bytes() {
     mount_answers(&upstream, UPSTREAM_OUT).await;
     let base = spawn(&upstream.uri(), &upstream.uri()).await;
     let body = r#"{"model":"jev","state":"s","questions":{"is_urgent":{"type":"noul","instructions":"u?"},"mood":{"type":"score","instructions":"m?","criteria":["calm","angry"]}}}"#;
-    let bytes = post_to(&base, "/v1/systemone", body)
+    let bytes = post_to(&base, "/v1/decisions", body)
         .await
         .bytes()
         .await
@@ -1007,68 +1006,54 @@ async fn an_incompatible_skip_is_not_an_attempt() {
     luna.verify().await;
 }
 
+/// `/v1/systemone` was removed in 0.7.0: it is an unknown route (`404
+/// LM-1003`, no deprecation headers) and never reaches an upstream.
 #[tokio::test]
-async fn systemone_alias_carries_deprecation_headers_and_is_counted() {
+async fn the_removed_systemone_alias_is_route_not_found() {
     let upstream = MockServer::start().await;
-    mount_answers(&upstream, ANSWERS).await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(ANSWERS, "application/json"))
+        .expect(0)
+        .mount(&upstream)
+        .await;
     let base = spawn(&upstream.uri(), &upstream.uri()).await;
 
     let resp = post_to(&base, "/v1/systemone", REQUEST).await;
-    assert_eq!(resp.status(), 200);
-    assert_eq!(resp.headers()["deprecation"], "@1791417600");
-    assert_eq!(
-        resp.headers()["link"],
-        r#"</docs/decisions#migrating-from-v1systemone>; rel="deprecation""#
-    );
-    assert_eq!(resp.text().await.expect("body"), ANSWERS);
-
-    let openai =
-        r#"{"model":"jev","input":"x","questions":[{"type":"predicate","instructions":"i"}]}"#;
-    let rejected = post_to(&base, "/v1/systemone", openai).await;
-    assert_eq!(rejected.status(), 400);
-    assert!(
-        rejected.headers().contains_key("deprecation"),
-        "errors carry the headers too"
-    );
-    assert!(rejected.headers().contains_key("link"));
-    let err: Value = rejected.json().await.expect("json");
-    assert_eq!(err["error"]["code"], "LM-1001");
-
-    // `/v1/decisions` carries no deprecation header and is not counted.
-    let resp = post(&base, REQUEST).await;
-    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.status(), 404);
     assert!(!resp.headers().contains_key("deprecation"));
-
-    let metrics = scrape(&base).await;
-    assert!(
-        metrics.contains(r#"lumen_deprecated_requests_total{route="/v1/systemone"} 2"#),
-        "{metrics}"
-    );
+    assert!(!resp.headers().contains_key("link"));
+    let err: Value = resp.json().await.expect("json");
+    assert_eq!(err["error"]["code"], "LM-1003");
+    upstream.verify().await;
 }
 
+/// With auth on and no key, the removed route is still `404 LM-1003`, never
+/// a misleading `401`: the route-not-found fallback sits outside the
+/// virtual-key layer.
 #[tokio::test]
-async fn refusals_are_counted() {
-    let luna = MockServer::start().await;
-    mount_at(&luna, "/v1/decisions", 200, LUNA_OUT).await;
-    let other = MockServer::start().await;
-    let base = spawn_upstreams(&Upstreams {
-        luna: &luna.uri(),
-        ..Upstreams::one(&other.uri())
-    })
-    .await;
+async fn the_removed_systemone_alias_is_route_not_found_with_auth_on() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(ANSWERS, "application/json"))
+        .expect(0)
+        .mount(&upstream)
+        .await;
+    let base = spawn_auth(&upstream.uri()).await;
 
-    let resp = post(&base, OPENAI_REQUEST).await;
-    assert_eq!(resp.status(), 200);
-    let metrics = scrape(&base).await;
-    assert!(
-        metrics.contains(r#"lumen_decision_refusals_total{model="luna"} 1"#),
-        "{metrics}"
-    );
+    let resp = post_to(&base, "/v1/systemone", REQUEST).await;
+    assert_eq!(resp.status(), 404);
+    let err: Value = resp.json().await.expect("json");
+    assert_eq!(err["error"]["code"], "LM-1003");
+
+    // `/v1/decisions` without a key is the auth layer's 401.
+    let resp = post(&base, REQUEST).await;
+    assert_eq!(resp.status(), 401);
+    upstream.verify().await;
 }
 
-/// Spawn with virtual-key auth enabled (no key issued) and a small body
-/// limit, around the standard config.
-async fn spawn_auth_small_limit(upstream: &str, body_limit: usize) -> String {
+/// Spawn with virtual-key auth enabled (no key issued) around the standard
+/// config.
+async fn spawn_auth(upstream: &str) -> String {
     use lumen_auth::key::hash_key;
     use lumen_auth::state::AuthState;
     use lumen_auth::store::KeyStore;
@@ -1093,56 +1078,25 @@ async fn spawn_auth_small_limit(upstream: &str, body_limit: usize) -> String {
     let state = common::base_state(registry)
         .with_resilience(Arc::new(ResilienceRuntime::from_config(&config, None)))
         .with_auth(runtime);
-    common::spawn_state(state, body_limit).await
-}
-
-fn assert_deprecation_headers(resp: &reqwest::Response) {
-    assert_eq!(resp.headers()["deprecation"], "@1791417600");
-    assert_eq!(
-        resp.headers()["link"],
-        r#"</docs/decisions#migrating-from-v1systemone>; rel="deprecation""#
-    );
+    common::spawn_state(state, 1024 * 1024).await
 }
 
 #[tokio::test]
-async fn systemone_rejections_before_the_handler_still_carry_deprecation_headers() {
-    let upstream = MockServer::start().await;
-    Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200).set_body_raw(ANSWERS, "application/json"))
-        .expect(0)
-        .mount(&upstream)
-        .await;
-    let base = spawn_auth_small_limit(&upstream.uri(), 1024).await;
+async fn refusals_are_counted() {
+    let luna = MockServer::start().await;
+    mount_at(&luna, "/v1/decisions", 200, LUNA_OUT).await;
+    let other = MockServer::start().await;
+    let base = spawn_upstreams(&Upstreams {
+        luna: &luna.uri(),
+        ..Upstreams::one(&other.uri())
+    })
+    .await;
 
-    // Auth enabled, no key: 401 LM-4004 from the auth layer.
-    let resp = post_to(&base, "/v1/systemone", REQUEST).await;
-    assert_eq!(resp.status(), 401);
-    assert_deprecation_headers(&resp);
-    let err: Value = resp.json().await.expect("json");
-    assert_eq!(err["error"]["code"], "LM-4004");
-
-    // Over the body limit: 413 LM-1002 from the body-limit layer.
-    let big = format!(
-        r#"{{"model":"jev","state":"{}","questions":{{"q":{{"type":"noul","instructions":"i"}}}}}}"#,
-        "x".repeat(4096)
-    );
-    let resp = post_to(&base, "/v1/systemone", &big).await;
-    assert_eq!(resp.status(), 413);
-    assert_deprecation_headers(&resp);
-    let err: Value = resp.json().await.expect("json");
-    assert_eq!(err["error"]["code"], "LM-1002");
-
-    // Other routes are untouched: 401 without the deprecation headers.
-    let resp = post(&base, REQUEST).await;
-    assert_eq!(resp.status(), 401);
-    assert!(!resp.headers().contains_key("deprecation"));
-    assert!(!resp.headers().contains_key("link"));
-
-    // Counted once per request, rejected or not.
+    let resp = post(&base, OPENAI_REQUEST).await;
+    assert_eq!(resp.status(), 200);
     let metrics = scrape(&base).await;
     assert!(
-        metrics.contains(r#"lumen_deprecated_requests_total{route="/v1/systemone"} 2"#),
+        metrics.contains(r#"lumen_decision_refusals_total{model="luna"} 1"#),
         "{metrics}"
     );
-    upstream.verify().await;
 }

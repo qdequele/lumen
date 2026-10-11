@@ -1,4 +1,4 @@
-//! `POST /v1/decisions` (ADR 017) and its deprecated alias `/v1/systemone`.
+//! `POST /v1/decisions` (ADR 017).
 //!
 //! Flow: detect the format (OpenAI or TypeSafe) → parse and validate → route
 //! (model → provider chain, incompatible targets skipped before any call) →
@@ -9,18 +9,13 @@
 //! Input, images, questions, answers and `safety_identifier` are request
 //! content: never logged and never in `usage_log`.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-
 use axum::body::Bytes;
-use axum::extract::{Request, State};
+use axum::extract::State;
 use axum::http::{header, HeaderMap, HeaderValue};
-use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::Extension;
-use lumen_core::decisions::format::{self, Format};
+use lumen_core::decisions::format;
 use lumen_core::{tokens, Answer, Capability, DecisionUsage};
-use lumen_telemetry::DecisionMetrics;
 use tokio_util::sync::CancellationToken;
 
 use crate::accounting::{Accounting, Outcome, Target, TokenBreakdown};
@@ -30,17 +25,6 @@ use crate::facts::Facts;
 use crate::resilience::routing_headers;
 use crate::state::AppState;
 
-/// RFC 9745 `Deprecation` value for `/v1/systemone`: the deprecating
-/// release (0.6.0), as `@<unix seconds>` (2026-10-08 00:00 UTC; updated to
-/// the release date when 0.6.0 is cut).
-pub const SYSTEMONE_DEPRECATION: &str = "@1791417600";
-
-/// RFC 8288 `Link` to the migration guide, sent with [`SYSTEMONE_DEPRECATION`].
-const SYSTEMONE_LINK: &str = r#"</docs/decisions#migrating-from-v1systemone>; rel="deprecation""#;
-
-/// Unix second of the last deprecation warning (one per minute at most).
-static LAST_DEPRECATION_WARNING: AtomicU64 = AtomicU64::new(0);
-
 /// `POST /v1/decisions`: either format, answered in the format received.
 pub async fn decisions_handler(
     State(state): State<AppState>,
@@ -48,74 +32,7 @@ pub async fn decisions_handler(
     key: Option<Extension<AuthedKey>>,
     body: Bytes,
 ) -> Result<Response, ApiError> {
-    handle(state, &headers, key.as_deref(), &body, None).await
-}
-
-/// `POST /v1/systemone` (deprecated in 0.6.0, removed in 0.7.0): the
-/// TypeSafe format only, on the same pipeline. The `Deprecation` / `Link`
-/// headers and the counter are applied by [`systemone_deprecation`], outside
-/// auth and the body limit, so rejected requests carry them too.
-pub async fn systemone_handler(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    key: Option<Extension<AuthedKey>>,
-    body: Bytes,
-) -> Result<Response, ApiError> {
-    handle(
-        state,
-        &headers,
-        key.as_deref(),
-        &body,
-        Some(Format::TypeSafe),
-    )
-    .await
-}
-
-/// The deprecated route's path.
-pub const SYSTEMONE_PATH: &str = "/v1/systemone";
-
-/// Outer middleware for [`SYSTEMONE_PATH`] (spec 6.4): counts each request
-/// once, logs the rate-limited warning, and puts `Deprecation` and `Link` on
-/// every response, including auth (`LM-4004`, 429) and body-limit
-/// (`LM-1002`) rejections that never reach the handler. Other paths pass
-/// through untouched.
-///
-/// Its state is only the [`DecisionMetrics`] handle behind an [`Arc`] (one
-/// refcount bump per request), not the whole [`AppState`].
-pub async fn systemone_deprecation(
-    State(metrics): State<Arc<DecisionMetrics>>,
-    request: Request,
-    next: Next,
-) -> Response {
-    if request.uri().path() != SYSTEMONE_PATH {
-        return next.run(request).await;
-    }
-    metrics.inc_deprecated(SYSTEMONE_PATH);
-    warn_deprecated_use();
-    let mut response = next.run(request).await;
-    let h = response.headers_mut();
-    h.insert(
-        header::HeaderName::from_static("deprecation"),
-        HeaderValue::from_static(SYSTEMONE_DEPRECATION),
-    );
-    h.insert(header::LINK, HeaderValue::from_static(SYSTEMONE_LINK));
-    response
-}
-
-/// Log the deprecated-route warning at most once per minute (process-wide).
-fn warn_deprecated_use() {
-    let now = crate::auth::now_unix().max(0).unsigned_abs();
-    let last = LAST_DEPRECATION_WARNING.load(Ordering::Relaxed);
-    if (last == 0 || now.saturating_sub(last) >= 60)
-        && LAST_DEPRECATION_WARNING
-            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
-            .is_ok()
-    {
-        tracing::warn!(
-            route = "/v1/systemone",
-            "deprecated route used: send the same body to /v1/decisions (removed in 0.7.0)"
-        );
-    }
+    handle(state, &headers, key.as_deref(), &body).await
 }
 
 async fn handle(
@@ -123,11 +40,10 @@ async fn handle(
     headers: &HeaderMap,
     key: Option<&AuthedKey>,
     body: &[u8],
-    forced: Option<Format>,
 ) -> Result<Response, ApiError> {
     // Malformed JSON, an undetectable format or a contract violation →
     // LM-1001; empty questions → LM-2011; all before any routing.
-    let (format, req) = format::parse(body, forced)?;
+    let (format, req) = format::parse(body)?;
     let client_model = req.model.clone();
     // Facts are only built for a virtual model (ADR 014).
     let mut decision = state

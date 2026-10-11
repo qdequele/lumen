@@ -196,7 +196,7 @@ fn bench_decisions(c: &mut Criterion) {
     ] {
         c.bench_function(&format!("decisions_passthrough_{name}"), |b| {
             b.iter(|| {
-                let (_, req) = parse(black_box(&body), None).expect("parse");
+                let (_, req) = parse(black_box(&body)).expect("parse");
                 black_box(lumen_core::tokens::estimate_decisions(&req));
                 let mut attempt = req.clone();
                 "upstream".clone_into(&mut attempt.model);
@@ -211,7 +211,7 @@ fn bench_decisions(c: &mut Criterion) {
         });
         c.bench_function(&format!("decisions_cross_vendor_{name}"), |b| {
             b.iter(|| {
-                let (_, req) = parse(black_box(&body), None).expect("parse");
+                let (_, req) = parse(black_box(&body)).expect("parse");
                 let bytes = if name.starts_with("typesafe") {
                     openai::encode(&req, "gpt-6-luna").expect("encode")
                 } else {

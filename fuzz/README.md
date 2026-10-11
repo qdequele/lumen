@@ -12,10 +12,9 @@ and on demand locally.
 - `chat_request` - deserializing + re-serializing an OpenAI `ChatRequest`,
   exercising the `extra` (unknown-field) passthrough flatten.
 - `decisions_request` - the `/v1/decisions` edge (ADR 017): format
-  detection and parsing (auto-detected and TypeSafe-forced, as the
-  deprecated `/v1/systemone` alias does), the token estimate, the TypeSafe
-  and OpenAI target limits, the TypeSafe-family encoder (every profile) and
-  the OpenAI encoder, and both edge renderers over a synthesized response.
+  detection and parsing, the token estimate, the TypeSafe and OpenAI target
+  limits, the TypeSafe-family encoder (every profile) and the OpenAI
+  encoder, and both edge renderers over a synthesized response.
 - `anthropic_translate_request` / `anthropic_translate_response` - the
   Anthropic provider's `translate_request`/`translate_response` (client<->
   upstream JSON translation), reached through the `#[cfg(fuzzing)]` shim in
