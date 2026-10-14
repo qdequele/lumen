@@ -942,7 +942,7 @@ dependencies = [
  "pear",
  "serde",
  "tempfile",
- "toml",
+ "toml 0.8.23",
  "uncased",
  "version_check",
 ]
@@ -2573,7 +2573,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-util",
- "toml",
+ "toml 1.1.8+spec-1.1.0",
  "tracing",
 ]
 
@@ -2841,7 +2841,7 @@ dependencies = [
  "tiktoken-rs",
  "tokio",
  "tokio-util",
- "toml",
+ "toml 1.1.8+spec-1.1.0",
  "toml_edit 0.25.17+spec-1.1.0",
  "tower",
  "tower-http 0.7.1",
@@ -3425,6 +3425,21 @@ dependencies = [
  "serde_spanned 0.6.9",
  "toml_datetime 0.6.11",
  "toml_edit 0.22.27",
+]
+
+[[package]]
+name = "toml"
+version = "1.1.8+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "20489e00e4d8741d6be680764cc12e270655e375a20d1011e844a9c3379e678d"
+dependencies = [
+ "indexmap",
+ "serde_core",
+ "serde_spanned 1.1.2",
+ "toml_datetime 1.1.2+spec-1.1.0",
+ "toml_parser",
+ "toml_writer",
+ "winnow 1.0.4",
 ]
 
 [[package]]

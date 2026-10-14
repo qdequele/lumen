@@ -71,7 +71,7 @@ notify = "8"
 # does not expose a generic `Value`, so the boot-only key allowlist walks a
 # `toml::Value` table directly. Same version figment vendors internally, so
 # this adds no new major version to the dependency graph.
-toml = "0.8"
+toml = "1.1"
 # Format-preserving TOML document editing (ADR 012 Task 7): comments and
 # formatting outside the edited table survive an admin `upsert_provider` /
 # `replace_section`, unlike a parse-mutate-reserialize round trip through
