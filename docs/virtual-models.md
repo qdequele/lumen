@@ -201,6 +201,9 @@ targets = [{ model = "openai/gpt-4o", overrides = { set = { max_tokens = 4096 },
 
 - `set` always applies; `default` applies only when the client did not send the
   field; `drop` removes it.
+- On translated providers (Anthropic, Bedrock, Google, Cohere) a client-sent
+  `max_tokens` wins over `max_completion_tokens`. To cap output tokens there
+  with an override, `set` `max_tokens`.
 - Overrides act on the parsed request, not on JSON paths, and each capability
   has an allow-list of fields:
 

@@ -41,6 +41,17 @@ All notable changes to LUMEN are documented here. The format is based on
   Repository tooling only, nothing changes in the gateway. See
   `docs/operations/model-watch.md`.
 
+### Fixed
+
+- **`max_completion_tokens` is now honoured on non-OpenAI providers.** OpenAI
+  reasoning models reject `max_tokens` and require `max_completion_tokens`, so
+  clients such as Scrapix send only the latter. The Anthropic, Bedrock, Google
+  and Cohere translations read only `max_tokens`, so the cap was silently
+  dropped (Anthropic fell back to its 4096 default). They now read the cap
+  through `ChatRequest::effective_max_tokens()`, which falls back to
+  `max_completion_tokens` when `max_tokens` is absent; `max_tokens` wins when
+  both are set. OpenAI-kind providers already forwarded the body unchanged.
+
 ## [0.7.0] - 2026-10-11
 
 ### Security
