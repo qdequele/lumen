@@ -76,6 +76,7 @@
 - [015 - Lab integration](adr/015-lab-integration.md)
 - [016 - The developer role and upstream error detail](adr/016-developer-role-and-upstream-error-detail.md)
 - [017 - Decisions capability](adr/017-decisions-capability.md)
+- [020 - Multi-vector embeddings](adr/020-multi-vector-embeddings.md)
 
 # Project
 
