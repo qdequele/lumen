@@ -82,8 +82,11 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
           DRY_RUN: ${{ inputs.dry_run && '--dry-run' || '' }}
-          MAX_NEW_ISSUES: ${{ inputs.max_new_issues || 10 }}
-        run: python3 scripts/model-watch/model_watch.py $DRY_RUN --max-new-issues "$MAX_NEW_ISSUES"
+          # Passed through unchanged: `|| 10` here would turn an explicit 0
+          # (file nothing) into 10. Scheduled runs have no inputs, so the
+          # shell default below applies only when the value is empty.
+          MAX_NEW_ISSUES: ${{ inputs.max_new_issues }}
+        run: python3 scripts/model-watch/model_watch.py $DRY_RUN --max-new-issues "${MAX_NEW_ISSUES:-10}"
 
       - name: Commit refreshed snapshot
         if: ${{ !inputs.dry_run }}
