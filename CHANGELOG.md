@@ -6,6 +6,17 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **`openrouter` providers serve embeddings.** OpenRouter now exposes an
+  OpenAI-format `POST /embeddings` endpoint (catalog at
+  `/api/v1/embeddings/models`), so a model declaring `embed` on an
+  `openrouter` provider is no longer rejected at config load with
+  `NoUpstreamEmbeddings`. It routes through the shared OpenAI embed path, and
+  token counts come from the upstream `usage`. The 2026-07 check behind
+  issue #74 predates the endpoint; `groq`, `deepseek`, `perplexity` and `xai`
+  are still embed-less.
+
 ### Security
 
 - **TLS and crypto dependencies bumped for the October 2026 RustSec

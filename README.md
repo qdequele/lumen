@@ -201,7 +201,7 @@ built-in base URL): `groq`, `together`, `fireworks`, `deepseek`, `openrouter`,
 `cloudflare` (Workers AI - `base_url` carries your account id), and `vllm` (any
 self-hosted OpenAI-compatible server: vLLM, llama.cpp, LM Studio, …). Anything
 else that speaks the OpenAI format works via `kind = "openai"` + a `base_url`.
-Note that `groq`, `deepseek`, `openrouter`, `perplexity` and `xai` serve chat
+Note that `groq`, `deepseek`, `perplexity` and `xai` serve chat
 only (no upstream embeddings API): declaring `embed` on them is rejected at
 config load, unless a custom `base_url` fronts the host with an
 embedding-capable proxy. Two of the OpenAI-compatible hosts additionally serve

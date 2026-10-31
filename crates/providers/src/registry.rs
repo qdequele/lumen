@@ -1477,15 +1477,13 @@ mod tests {
 
     #[test]
     fn embed_on_a_hosted_kind_with_no_upstream_embeddings_api_is_a_build_error() {
-        // Groq, DeepSeek, OpenRouter, Perplexity and xAI have no upstream
-        // /embeddings endpoint: an embed model there (with no base_url
-        // override, i.e. pointing at the vendor's own API) could only ever
-        // 404 at request time, so the registry rejects it at build time
-        // (issue #74).
+        // Groq, DeepSeek, Perplexity and xAI have no upstream /embeddings
+        // endpoint: an embed model there (with no base_url override, i.e.
+        // pointing at the vendor's own API) could only ever 404 at request
+        // time, so the registry rejects it at build time (issue #74).
         for kind in [
             ProviderKind::Groq,
             ProviderKind::Deepseek,
-            ProviderKind::Openrouter,
             ProviderKind::Perplexity,
             ProviderKind::Xai,
         ] {
