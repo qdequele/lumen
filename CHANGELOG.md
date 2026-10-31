@@ -6,6 +6,19 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **Model release watcher.** A daily GitHub Actions workflow
+  (`.github/workflows/model-watch.yml`, standard-library Python under
+  `scripts/model-watch/`) diffs models.dev, LiteLLM's price JSON and
+  OpenRouter's model lists against a committed snapshot, and classifies each
+  addition against `ProviderKind` and the `docs/providers.md` capability
+  tables: config-only (new model on a supported provider, batched into one
+  rolling issue), OpenAI-compatible provider (candidate `ProviderKind`
+  variant), or provider needing a real connector (one issue per provider).
+  Repository tooling only, nothing changes in the gateway. See
+  `docs/operations/model-watch.md`.
+
 ## [0.7.0] - 2026-10-11
 
 ### Security
