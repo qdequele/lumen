@@ -91,7 +91,95 @@ fn registry_for_cohere(upstream: &str) -> Arc<Registry> {
     )
 }
 
+/// Registry with one OpenRouter-kind provider pointed at `upstream`, exposing
+/// a single embedding model under OpenRouter's `vendor/model` id.
+fn registry_for_openrouter(upstream: &str) -> Arc<Registry> {
+    let specs = vec![ProviderSpec {
+        name: "openrouter".to_owned(),
+        kind: ProviderKind::Openrouter,
+        api_key: Some("sk-or-test-xxx".to_owned()),
+        base_url: Some(upstream.to_owned()),
+        api_version: None,
+        strict: false,
+        connect_timeout_ms: None,
+        models: vec![ModelSpec {
+            id: "or-embed".to_owned(),
+            upstream_id: "openai/text-embedding-3-small".to_owned(),
+            capabilities: vec![Capability::Embed],
+            modalities: vec!["text".to_owned()],
+            release_date: None,
+        }],
+        decisions_path: None,
+        forward_unknown_fields: None,
+    }];
+    Arc::new(
+        Registry::build(
+            specs,
+            http::build_client(),
+            std::time::Duration::from_secs(300),
+        )
+        .expect("registry builds"),
+    )
+}
+
 const LIMIT: usize = 10 * 1024 * 1024;
+
+#[tokio::test]
+async fn openrouter_embeddings_round_trip_in_openai_format_with_upstream_usage() {
+    // OpenRouter's POST /embeddings speaks the OpenAI format, plus extras the
+    // gateway must tolerate: a response `id` and OpenRouter-specific `usage`
+    // fields (`cost`, `cost_details`, `is_byok`).
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/embeddings"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "embd-1234567890",
+            "object": "list",
+            "data": [
+                { "object": "embedding", "index": 0, "embedding": [0.1, 0.2] },
+                { "object": "embedding", "index": 1, "embedding": [0.3, 0.4] }
+            ],
+            "model": "openai/text-embedding-3-small",
+            "usage": {
+                "prompt_tokens": 8,
+                "total_tokens": 8,
+                "cost": 0.000_000_16,
+                "cost_details": { "upstream_inference_cost": 0.000_000_16 },
+                "is_byok": false
+            }
+        })))
+        .mount(&upstream)
+        .await;
+
+    let base = common::spawn_with(registry_for_openrouter(&upstream.uri()), LIMIT).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/embeddings"))
+        .json(&json!({ "model": "or-embed", "input": ["hello", "world"] }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["object"], "list");
+    assert_eq!(body["data"][0]["embedding"][0], 0.1);
+    assert_eq!(body["data"][1]["embedding"][1], 0.4);
+    // The upstream token count is surfaced, not a local estimate (ADR 003).
+    assert_eq!(body["usage"]["prompt_tokens"], 8);
+    assert_eq!(body["usage"]["total_tokens"], 8);
+
+    // The OpenRouter `vendor/model` upstream id and the bearer key reach it.
+    let requests = upstream.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    let sent: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(sent["model"], "openai/text-embedding-3-small");
+    assert_eq!(sent["input"], json!(["hello", "world"]));
+    assert_eq!(
+        requests[0].headers.get("authorization").unwrap(),
+        "Bearer sk-or-test-xxx"
+    );
+}
 
 #[tokio::test]
 async fn happy_path_returns_openai_format_and_resolves_alias() {
