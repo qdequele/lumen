@@ -6,6 +6,28 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ## [Unreleased]
 
+### Security
+
+- **TLS and crypto dependencies bumped for the October 2026 RustSec
+  advisories.** `rustls` 0.23.45 -> 0.23.46 (RUSTSEC-2026-0346, -0347, -0348,
+  -0349: TLS secrets in `Debug` output, data sent after an ECH rejection,
+  unbounded Brotli certificate decompression, a key-exchange downgrade),
+  `rustls-webpki` 0.103.15 -> 0.103.16 (RUSTSEC-2026-0382, distrusted
+  intermediates accepted), `webpki-roots` 1.0.9 -> 1.0.11 (RUSTSEC-2026-0381,
+  distrusted emSign root removed), `ctutils` 0.4.3 -> 0.4.7
+  (RUSTSEC-2026-0385, non-constant-time masks) and `tokio` 1.53.2 -> 1.54.1
+  (RUSTSEC-2026-0386, unsound `AsyncFd` constructors). The lockfile also takes
+  the other patch bumps from the dependabot minor-and-patch group
+  (`tokio-util`, `serde_json`, `notify`, `arc-swap`, `sha2`, `libc`). Two
+  advisories without a compatible fix are ignored in `deny.toml` and CI with
+  a dated rationale: RUSTSEC-2026-0387 (`crypto-bigint` 0.5, reachable only
+  through jsonwebtoken's ECDSA code, which LUMEN never calls: Vertex AI
+  signing is RS256) and RUSTSEC-2024-0449 (`unsafe-libyaml` unmaintained,
+  used only to parse the compiled-in `docs/openapi.yaml`). The stale
+  RUSTSEC-2024-0384 ignore is dropped (`instant` is gone from the graph), and
+  the RUSTSEC-2023-0071 rationale is corrected: `rsa` is compiled in for
+  RS256 signing, which offers no remote timing oracle.
+
 ## [0.7.0] - 2026-10-11
 
 ### Security

@@ -114,7 +114,7 @@ jobs:
         uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          ignore: RUSTSEC-2023-0071,RUSTSEC-2024-0384
+          ignore: RUSTSEC-2023-0071,RUSTSEC-2026-0387,RUSTSEC-2024-0449
 
       # License policy + advisories + source pinning (see deny.toml).
       - name: cargo deny
