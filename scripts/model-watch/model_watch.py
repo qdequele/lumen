@@ -400,7 +400,9 @@ class ProviderFinding:
     doc: str | None
     openai_compatible: bool | None
     is_new: bool
-    models: dict[str, Addition]
+    # Keyed by (model id, capability): catalogs can disagree on one id's
+    # capability, and each one counts for category, labels and priority.
+    models: dict[tuple[str, str], Addition]
 
     @property
     def caps(self) -> set[str]:
@@ -427,7 +429,9 @@ class Report:
 
 def diff_and_classify(old: dict[str, Catalog], fetched: Fetched, lumen: Lumen) -> Report:
     known_keys = {norm(pid) for cat in old.values() for pid in cat}
-    supported: dict[tuple[str, str], SupportedChange] = {}
+    # Keyed by (kind, model, capability): when catalogs report one model id
+    # with different capabilities, each keeps its own row and gap status.
+    supported: dict[tuple[str, str, str], SupportedChange] = {}
     findings: dict[str, ProviderFinding] = {}
     removed: dict[str, int] = {}
 
@@ -447,7 +451,7 @@ def diff_and_classify(old: dict[str, Catalog], fetched: Fetched, lumen: Lumen) -
             if kind is not None:
                 for mid, cap in added.items():
                     entry = supported.setdefault(
-                        (kind, mid),
+                        (kind, mid, cap),
                         SupportedChange(kind, mid, cap, set(), cap not in lumen.caps.get(kind, set())),
                     )
                     entry.sources.add(source)
@@ -476,7 +480,7 @@ def diff_and_classify(old: dict[str, Catalog], fetched: Fetched, lumen: Lumen) -
             if source == "models.dev":
                 finding.name = meta.name  # the friendliest display name
             for mid, cap in added.items():
-                finding.models.setdefault(mid, Addition(mid, cap, set())).sources.add(source)
+                finding.models.setdefault((mid, cap), Addition(mid, cap, set())).sources.add(source)
 
     return Report(
         supported=sorted(supported.values(), key=lambda c: (c.kind, c.cap, c.model)),
@@ -727,7 +731,10 @@ def read_snapshot(path: Path) -> dict[str, Catalog] | None:
     data = json.loads(path.read_text(encoding="utf-8"))
     if data.get("version") != SNAPSHOT_VERSION:
         raise ShapeError(f"{path}: unsupported snapshot version {data.get('version')!r}")
-    return data["sources"]
+    sources = data.get("sources")
+    if not isinstance(sources, dict):
+        raise ShapeError(f"{path}: 'sources' is not an object")
+    return sources
 
 
 def write_snapshot(path: Path, sources: dict[str, Catalog]) -> None:
@@ -787,11 +794,15 @@ def main(argv: list[str] | None = None) -> int:
                         help="abort (filing nothing) if a run would open more issues than this")
     parser.add_argument("--show-bodies", action="store_true", help="with --dry-run, print full issue bodies")
     args = parser.parse_args(argv)
+    if args.init and args.dry_run:
+        print("error: --init writes the snapshot, --dry-run promises no writes; pick one", file=sys.stderr)
+        return 1
 
     lumen = load_lumen(args.repo_root)
     fetched = fetch_all(args.source_dir)
-    old = read_snapshot(args.snapshot)
 
+    # --init never reads the old snapshot, so it can replace a corrupt or
+    # older-version one.
     if args.init:
         if fetched.errors:
             print(f"error: cannot initialize with failing sources: {fetched.errors}", file=sys.stderr)
@@ -799,6 +810,7 @@ def main(argv: list[str] | None = None) -> int:
         write_snapshot(args.snapshot, fetched.catalogs)
         print(f"wrote {args.snapshot} ({sum(count(c) for c in fetched.catalogs.values())} models)")
         return 0
+    old = read_snapshot(args.snapshot)
     if old is None:
         print(f"error: {args.snapshot} not found; run with --init first", file=sys.stderr)
         return 1

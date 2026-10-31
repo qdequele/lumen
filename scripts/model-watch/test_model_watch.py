@@ -166,7 +166,7 @@ class ClassificationTest(unittest.TestCase):
         self.assertFalse(finding.is_new)
         self.assertEqual(finding.category, "c")
         # Chat additions on an already-known unsupported provider are baseline noise.
-        self.assertEqual(set(finding.models), {"rr"})
+        self.assertEqual(set(finding.models), {("rr", "rerank")})
 
     def test_known_unsupported_provider_chat_only_is_silent(self):
         old = {"models.dev": {"lab": {"m1": "chat"}}}
@@ -268,6 +268,63 @@ class PlanAndSnapshotTest(unittest.TestCase):
             self.assertIn("Truncated by the watcher", text)
         self.assertEqual(actions[0].body, body)  # dry-run output keeps the full list
         self.assertEqual(mw.cap_body("short"), "short")
+
+
+class ReviewRegressionTest(unittest.TestCase):
+    """Findings from the PR review: per-capability keys and CLI/snapshot edges."""
+
+    def setUp(self):
+        self.lumen = mw.load_lumen(REPO_ROOT)
+
+    def test_unsupported_provider_keeps_each_capability_of_one_model_id(self):
+        old = {"models.dev": {"lab": {"m0": "chat"}}, "litellm": {"lab": {"m0": "chat"}}}
+        new = fetched(
+            models_dev={"lab": models_dev_provider("lab", {"m0": None, "m": "embedding"})},
+            litellm={"m0": {"litellm_provider": "lab", "mode": "chat"}, "m": {"litellm_provider": "lab", "mode": "rerank"}},
+        )
+        [finding] = mw.diff_and_classify(old, new, self.lumen).providers
+        self.assertEqual(set(finding.models), {("m", "embedding"), ("m", "rerank")})
+        self.assertEqual(finding.caps, {"embedding", "rerank"})
+        self.assertEqual(finding.category, "c")
+        self.assertIn("scope: reranking", mw.provider_labels(finding))
+
+    def test_supported_kind_keeps_each_capability_with_its_own_gap(self):
+        old = {"models.dev": {"anthropic": {}}, "litellm": {"anthropic": {}}}
+        new = fetched(
+            models_dev={"anthropic": models_dev_provider("anthropic", {"m": None}, npm="@ai-sdk/anthropic", api=None)},
+            litellm={"m": {"litellm_provider": "anthropic", "mode": "embedding"}},
+        )
+        report = mw.diff_and_classify(old, new, self.lumen)
+        self.assertEqual(
+            sorted((c.model, c.cap, c.gap) for c in report.supported),
+            [("m", "chat", False), ("m", "embedding", True)],
+        )
+
+    def test_read_snapshot_rejects_non_object_sources(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "snapshot.json"
+            path.write_text(json.dumps({"version": mw.SNAPSHOT_VERSION, "sources": []}), encoding="utf-8")
+            with self.assertRaises(mw.ShapeError):
+                mw.read_snapshot(path)
+
+    def test_init_and_dry_run_together_are_refused_without_writing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "snapshot.json"
+            self.assertEqual(mw.main(["--init", "--dry-run", "--snapshot", str(path)]), 1)
+            self.assertFalse(path.exists())
+
+    def test_init_replaces_an_unreadable_snapshot(self):
+        catalogs = {"litellm": {"acme": {"m": "chat"}}}
+        original = mw.fetch_all
+        mw.fetch_all = lambda source_dir: mw.Fetched(catalogs, {}, {})
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "snapshot.json"
+                path.write_text('{"version": 999}', encoding="utf-8")
+                self.assertEqual(mw.main(["--init", "--snapshot", str(path), "--repo-root", str(REPO_ROOT)]), 0)
+                self.assertEqual(mw.read_snapshot(path), catalogs)
+        finally:
+            mw.fetch_all = original
 
 
 if __name__ == "__main__":
