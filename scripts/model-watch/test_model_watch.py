@@ -237,6 +237,38 @@ class PlanAndSnapshotTest(unittest.TestCase):
         table = mw._models_table(rows)
         self.assertIn("... and 5 more", table)
 
+    def test_oversized_bodies_are_capped_when_sent(self):
+        # Many kinds at once can exceed GitHub's 65,536-character body limit
+        # even with MAX_LISTED per table; a 422 would fail every later run.
+        changes = [
+            mw.SupportedChange(f"kind{k}", f"model-{k}-{i}-" + "x" * 40, "chat", {"models.dev"}, False)
+            for k in range(40) for i in range(mw.MAX_LISTED)
+        ]
+        body = mw.rolling_body(changes, "2026-10-31")
+        self.assertGreater(len(body), 65_536)
+
+        sent = []
+
+        class FakeGitHub:
+            def create(self, title, text, labels):
+                sent.append(text)
+                return 1
+
+            def comment(self, number, text):
+                sent.append(text)
+
+            def add_labels(self, number, labels):
+                pass
+
+        actions = [mw.Action("create", "t", body, []), mw.Action("comment", "t", body, [], 2)]
+        mw.apply_actions(FakeGitHub(), actions)
+        self.assertEqual(len(sent), 2)
+        for text in sent:
+            self.assertLessEqual(len(text), mw.MAX_BODY)
+            self.assertIn("Truncated by the watcher", text)
+        self.assertEqual(actions[0].body, body)  # dry-run output keeps the full list
+        self.assertEqual(mw.cap_body("short"), "short")
+
 
 if __name__ == "__main__":
     unittest.main()

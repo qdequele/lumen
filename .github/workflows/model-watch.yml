@@ -28,35 +28,51 @@ on:
 permissions:
   contents: read
 
-# Never run two watchers at once: both would diff the same snapshot and file
-# the same issues.
-concurrency:
-  group: model-watch
-  cancel-in-progress: false
-
 jobs:
   check:
     name: tests · live dry run
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    # Per-PR group, apart from the watch group, so a PR check can never
+    # displace a pending scheduled or dispatched watch (or the reverse).
+    concurrency:
+      group: model-watch-pr-${{ github.ref }}
+      cancel-in-progress: true
+    permissions:
+      contents: read
+      issues: read # look up existing watcher issues, as a real run would
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Unit tests
         run: python3 -m unittest discover -s scripts/model-watch -v
 
       - name: Dry run against the live catalogs
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: python3 scripts/model-watch/model_watch.py --dry-run
 
   watch:
     name: watch catalogs
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
+    # Never run two watchers at once: both would diff the same snapshot and
+    # file the same issues.
+    concurrency:
+      group: model-watch
+      cancel-in-progress: false
     permissions:
       contents: write # commit the refreshed snapshot
       issues: write # open / comment on watcher issues
     steps:
+      # The branch tip at job start, not the triggering commit: a run queued
+      # behind another must see the snapshot that run just committed.
+      # Credentials persist on purpose: the last step pushes the snapshot.
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.ref }}
 
       - name: Diff catalogs and file issues
         id: watch

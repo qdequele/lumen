@@ -63,6 +63,11 @@ CAPS = ("chat", "embedding", "rerank")
 SCOPE_LABEL = {"chat": "scope: chat", "embedding": "scope: embedding", "rerank": "scope: reranking"}
 ROLLING_MARKER = "[model-watch:supported-models]"
 MAX_LISTED = 60
+# GitHub rejects an issue or comment body over 65,536 characters with a 422,
+# which would fail the run before the snapshot is written, every day. Many
+# kinds with large additions at once (an id rename upstream) can get there
+# despite the per-table MAX_LISTED, so every body is capped as a whole too.
+MAX_BODY = 60_000
 
 USER_AGENT = "lumen-model-watch (+https://github.com/qdequele/lumen)"
 
@@ -661,6 +666,20 @@ class Action:
     reason: str = ""
 
 
+def cap_body(text: str, limit: int = MAX_BODY) -> str:
+    """Cut a body at a line boundary below `limit`, saying what was dropped."""
+    if len(text) <= limit:
+        return text
+    note = (
+        "\n\n_Truncated by the watcher: {n} more characters not shown. Run "
+        "`python3 scripts/model-watch/model_watch.py --dry-run --show-bodies` for the full list._\n"
+    )
+    budget = limit - len(note.format(n=len(text)))
+    cut = text.rfind("\n", 0, budget)
+    cut = cut if cut > 0 else budget
+    return text[:cut] + note.format(n=len(text) - cut)
+
+
 def plan_actions(report: Report, existing: list[dict], today: str) -> list[Action]:
     def lookup(marker: str) -> tuple[dict | None, dict | None]:
         matches = [i for i in existing if marker in i["title"]]
@@ -689,11 +708,13 @@ def plan_actions(report: Report, existing: list[dict], today: str) -> list[Actio
 
 
 def apply_actions(gh: GitHub, actions: list[Action]) -> None:
+    # Bodies are capped only here, on the way out, so `--dry-run --show-bodies`
+    # still prints the full list the truncation note points to.
     for action in actions:
         if action.verb == "create":
-            action.number = gh.create(action.title, action.body, action.labels)
+            action.number = gh.create(action.title, cap_body(action.body), action.labels)
         elif action.verb == "comment" and action.number is not None:
-            gh.comment(action.number, action.body)
+            gh.comment(action.number, cap_body(action.body))
             gh.add_labels(action.number, action.labels)
 
 
