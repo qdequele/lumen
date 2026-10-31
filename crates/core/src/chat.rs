@@ -248,6 +248,26 @@ pub struct ChatRequest {
     pub extra: Map<String, Value>,
 }
 
+impl ChatRequest {
+    /// The output-token cap the client asked for.
+    ///
+    /// `max_tokens` wins when present. Otherwise falls back to
+    /// `max_completion_tokens` (the field OpenAI reasoning models require
+    /// instead of `max_tokens`), which lands in `extra`. A value that is not
+    /// an unsigned integer fitting in `u32` is ignored. OpenAI-kind providers
+    /// forward the body verbatim; every translating provider (Anthropic,
+    /// Bedrock, Google, Cohere) must read the cap through this accessor.
+    #[must_use]
+    pub fn effective_max_tokens(&self) -> Option<u32> {
+        self.max_tokens.or_else(|| {
+            self.extra
+                .get("max_completion_tokens")
+                .and_then(Value::as_u64)
+                .and_then(|v| u32::try_from(v).ok())
+        })
+    }
+}
+
 /// Prompt-side token breakdown, an OpenAI-compatible `prompt_tokens_details`
 /// object (issue #99). Every field is optional so an absent count is `None`
 /// (omitted from the wire), never a fabricated zero (ADR 003).
@@ -601,5 +621,54 @@ mod tests {
             detail: None,
         };
         assert!(remote.gemini_file_uri().is_none());
+    }
+
+    fn chat_request() -> ChatRequest {
+        ChatRequest {
+            model: "m".to_owned(),
+            messages: vec![msg("user")],
+            temperature: None,
+            top_p: None,
+            max_tokens: None,
+            n: None,
+            stop: None,
+            stream: false,
+            extra: Map::new(),
+        }
+    }
+
+    #[test]
+    fn effective_max_tokens_prefers_max_tokens() {
+        let mut req = chat_request();
+        req.max_tokens = Some(100);
+        req.extra
+            .insert("max_completion_tokens".into(), serde_json::json!(500));
+        assert_eq!(req.effective_max_tokens(), Some(100));
+    }
+
+    #[test]
+    fn effective_max_tokens_falls_back_to_max_completion_tokens() {
+        let mut req = chat_request();
+        assert_eq!(req.effective_max_tokens(), None);
+        req.extra
+            .insert("max_completion_tokens".into(), serde_json::json!(500));
+        assert_eq!(req.effective_max_tokens(), Some(500));
+        req.extra
+            .insert("max_completion_tokens".into(), serde_json::json!(0));
+        assert_eq!(req.effective_max_tokens(), Some(0));
+    }
+
+    #[test]
+    fn effective_max_tokens_ignores_non_integers() {
+        let mut req = chat_request();
+        for bad in [
+            serde_json::json!("500"),
+            serde_json::json!(1.5),
+            serde_json::json!(-1),
+            serde_json::json!(u64::from(u32::MAX) + 1),
+        ] {
+            req.extra.insert("max_completion_tokens".into(), bad);
+            assert_eq!(req.effective_max_tokens(), None);
+        }
     }
 }

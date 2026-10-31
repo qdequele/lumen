@@ -291,7 +291,7 @@ pub(super) fn translate_request(req: &ChatRequest, stream: bool) -> CohereChatRe
         messages: req.messages.iter().map(translate_message).collect(),
         temperature: req.temperature,
         p: req.top_p,
-        max_tokens: req.max_tokens,
+        max_tokens: req.effective_max_tokens(),
         stop_sequences: req
             .stop
             .as_ref()
@@ -900,5 +900,13 @@ mod tests {
         // regression guard should the struct ever grow one.
         let value = serde_json::to_value(translate_request(&req, false)).unwrap();
         assert!(value.get("n").is_none());
+    }
+
+    #[test]
+    fn cohere_maps_max_completion_tokens() {
+        let mut req = base_request(vec![msg("user", "hi")]);
+        req.extra.insert("max_completion_tokens".into(), json!(500));
+        let out = translate_request(&req, false);
+        assert_eq!(out.max_tokens, Some(500));
     }
 }
