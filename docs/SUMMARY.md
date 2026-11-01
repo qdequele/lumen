@@ -45,6 +45,7 @@
 - [Resilience tuning](operations/resilience.md)
 - [Deployment](operations/deployment.md)
 - [Upgrades](operations/upgrades.md)
+- [Model release watcher](operations/model-watch.md)
 
 # Examples
 

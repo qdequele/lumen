@@ -1,0 +1,115 @@
+name: model-watch
+
+# Model release watcher: diffs public model catalogs (models.dev, LiteLLM,
+# OpenRouter) against scripts/model-watch/snapshot.json, files one issue per
+# new provider plus a rolling issue for new models on supported providers,
+# then commits the refreshed snapshot. See docs/operations/model-watch.md.
+
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Print the issues it would file; file nothing, commit nothing"
+        type: boolean
+        default: false
+      max_new_issues:
+        description: "Abort if a run would open more issues than this"
+        type: number
+        default: 10
+  # On a PR touching the watcher: unit tests plus a live dry run, so the
+  # change is exercised against today's catalogs before it lands.
+  pull_request:
+    paths:
+      - "scripts/model-watch/**"
+      - ".github/workflows/model-watch.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: tests · live dry run
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    # Per-PR group, apart from the watch group, so a PR check can never
+    # displace a pending scheduled or dispatched watch (or the reverse).
+    concurrency:
+      group: model-watch-pr-${{ github.ref }}
+      cancel-in-progress: true
+    permissions:
+      contents: read
+      issues: read # look up existing watcher issues, as a real run would
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Unit tests
+        run: python3 -m unittest discover -s scripts/model-watch -v
+
+      - name: Dry run against the live catalogs
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 scripts/model-watch/model_watch.py --dry-run
+
+  watch:
+    name: watch catalogs
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    # Never run two watchers at once: both would diff the same snapshot and
+    # file the same issues.
+    concurrency:
+      group: model-watch
+      cancel-in-progress: false
+    permissions:
+      contents: write # commit the refreshed snapshot
+      issues: write # open / comment on watcher issues
+    steps:
+      # The branch tip at job start, not the triggering commit: a run queued
+      # behind another must see the snapshot that run just committed.
+      # Credentials persist on purpose: the last step pushes the snapshot.
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.ref }}
+
+      - name: Diff catalogs and file issues
+        id: watch
+        # A failing source still lets the healthy ones be filed and recorded;
+        # the last step turns the run red so the failure is noticed.
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          DRY_RUN: ${{ inputs.dry_run && '--dry-run' || '' }}
+          # Passed through unchanged: `|| 10` here would turn an explicit 0
+          # (file nothing) into 10. Scheduled runs have no inputs, so the
+          # shell default below applies only when the value is empty.
+          MAX_NEW_ISSUES: ${{ inputs.max_new_issues }}
+        run: python3 scripts/model-watch/model_watch.py $DRY_RUN --max-new-issues "${MAX_NEW_ISSUES:-10}"
+
+      - name: Commit refreshed snapshot
+        if: ${{ !inputs.dry_run }}
+        run: |
+          git add scripts/model-watch/snapshot.json
+          if git diff --cached --quiet; then
+            echo "Snapshot unchanged."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
+          git commit -m "chore(model-watch): refresh catalog snapshot"
+          for attempt in 1 2 3; do
+            if git push origin "HEAD:${GITHUB_REF_NAME}"; then
+              exit 0
+            fi
+            git pull --rebase origin "${GITHUB_REF_NAME}"
+          done
+          echo "::error::Could not push the refreshed snapshot." >&2
+          exit 1
+
+      - name: Fail if the watcher step failed
+        if: steps.watch.outcome == 'failure'
+        run: |
+          echo "::error::The watcher step failed (a source changed shape or was unreachable, or the issue guard tripped). See its log." >&2
+          exit 1
