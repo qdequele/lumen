@@ -453,7 +453,7 @@ fn translate_request(
         .map(translate_response_format)
         .unwrap_or_default();
     let generation_config = GeminiGenerationConfig {
-        max_output_tokens: req.max_tokens,
+        max_output_tokens: req.effective_max_tokens(),
         temperature: req.temperature,
         top_p: req.top_p,
         stop_sequences,
@@ -1586,5 +1586,15 @@ mod tests {
         assert!(provider.accepts_gemini_file_uri());
         assert!(!provider.accepts_anthropic_file_id());
         assert!(!provider.accepts_remote_image_url());
+    }
+
+    #[test]
+    fn google_maps_max_completion_tokens() {
+        let mut req = request(vec![msg("user", "hi")]);
+        req.max_tokens = None;
+        req.extra.insert("max_completion_tokens".into(), json!(500));
+        let out = translate_request(&req, "google").unwrap();
+        let cfg = out.generation_config.unwrap();
+        assert_eq!(cfg.max_output_tokens, Some(500));
     }
 }

@@ -82,7 +82,7 @@ The `together` kind (in the OpenAI-compatible table below) additionally serves
 
 OpenAI-compatible hosts (chat + embed via the OpenAI path). The Embed column
 reflects what each host actually serves upstream: `groq`, `deepseek`,
-`openrouter`, `perplexity` and `xai` expose no `/embeddings` endpoint (`perplexity`
+`perplexity` and `xai` expose no `/embeddings` endpoint (`perplexity`
 and `cloudflare` do serve `decisions`, see [Decisions by provider
 kind](#decisions-by-provider-kind)), so a
 model declaring `embed` on those kinds is **rejected at config load** (it
@@ -96,7 +96,7 @@ embeddings:
 | `together`    |  ✅  |  ✅   | required      | optional     | `https://api.together.xyz/v1`             |
 | `fireworks`   |  ✅  |  ✅   | required      | optional     | `https://api.fireworks.ai/inference/v1`   |
 | `deepseek`    |  ✅  |  no   | required      | optional     | `https://api.deepseek.com/v1`             |
-| `openrouter`  |  ✅  |  no   | required      | optional     | `https://openrouter.ai/api/v1`            |
+| `openrouter`  |  ✅  |  ✅   | required      | optional     | `https://openrouter.ai/api/v1`            |
 | `perplexity`  |  ✅  |  no   | required      | optional     | `https://api.perplexity.ai`               |
 | `xai`         |  ✅  |  no   | required      | optional     | `https://api.x.ai/v1`                     |
 | `deepinfra`   |  ✅  |  ✅   | required      | optional     | `https://api.deepinfra.com/v1/openai`     |
@@ -880,6 +880,25 @@ api_key_env = "GROQ_API_KEY"
 id = "fast"
 upstream_id = "llama-3.3-70b-versatile"
 capabilities = ["chat"]
+```
+
+### openrouter
+
+Chat and embeddings, both through OpenRouter's OpenAI-format API
+(`/chat/completions` and `/embeddings`). `upstream_id` is OpenRouter's
+`vendor/model` id; the embedding catalog is listed at
+`https://openrouter.ai/api/v1/embeddings/models`. Token counts come from the
+upstream `usage` (OpenRouter's extra `usage.cost` fields are ignored).
+
+```toml
+[[providers]]
+name = "openrouter"
+kind = "openrouter"
+api_key_env = "OPENROUTER_API_KEY"
+[[providers.models]]
+id = "titan-embed"
+upstream_id = "amazon/titan-embed-text-v2"
+capabilities = ["embed"]
 ```
 
 ### huggingface

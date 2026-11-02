@@ -6,6 +6,63 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **`openrouter` providers serve embeddings.** OpenRouter now exposes an
+  OpenAI-format `POST /embeddings` endpoint (catalog at
+  `/api/v1/embeddings/models`), so a model declaring `embed` on an
+  `openrouter` provider is no longer rejected at config load with
+  `NoUpstreamEmbeddings`. It routes through the shared OpenAI embed path, and
+  token counts come from the upstream `usage`. The 2026-07 check behind
+  issue #74 predates the endpoint; `groq`, `deepseek`, `perplexity` and `xai`
+  are still embed-less.
+
+### Security
+
+- **TLS and crypto dependencies bumped for the October 2026 RustSec
+  advisories.** `rustls` 0.23.45 -> 0.23.46 (RUSTSEC-2026-0346, -0347, -0348,
+  -0349: TLS secrets in `Debug` output, data sent after an ECH rejection,
+  unbounded Brotli certificate decompression, a key-exchange downgrade),
+  `rustls-webpki` 0.103.15 -> 0.103.16 (RUSTSEC-2026-0382, distrusted
+  intermediates accepted), `webpki-roots` 1.0.9 -> 1.0.11 (RUSTSEC-2026-0381,
+  distrusted emSign root removed), `ctutils` 0.4.3 -> 0.4.7
+  (RUSTSEC-2026-0385, non-constant-time masks) and `tokio` 1.53.2 -> 1.54.1
+  (RUSTSEC-2026-0386, unsound `AsyncFd` constructors). The lockfile also takes
+  the other patch bumps from the dependabot minor-and-patch group
+  (`tokio-util`, `serde_json`, `notify`, `arc-swap`, `sha2`, `libc`). Two
+  advisories without a compatible fix are ignored in `deny.toml` and CI with
+  a dated rationale: RUSTSEC-2026-0387 (`crypto-bigint` 0.5, reachable only
+  through jsonwebtoken's ECDSA code, which LUMEN never calls: Vertex AI
+  signing is RS256) and RUSTSEC-2024-0449 (`unsafe-libyaml` unmaintained,
+  used only to parse the compiled-in `docs/openapi.yaml`). The stale
+  RUSTSEC-2024-0384 ignore is dropped (`instant` is gone from the graph), and
+  the RUSTSEC-2023-0071 rationale is corrected: `rsa` is compiled in for
+  RS256 signing, which offers no remote timing oracle.
+
+### Added
+
+- **Model release watcher.** A daily GitHub Actions workflow
+  (`.github/workflows/model-watch.yml`, standard-library Python under
+  `scripts/model-watch/`) diffs models.dev, LiteLLM's price JSON and
+  OpenRouter's model lists against a committed snapshot, and classifies each
+  addition against `ProviderKind` and the `docs/providers.md` capability
+  tables: config-only (new model on a supported provider, batched into one
+  rolling issue), OpenAI-compatible provider (candidate `ProviderKind`
+  variant), or provider needing a real connector (one issue per provider).
+  Repository tooling only, nothing changes in the gateway. See
+  `docs/operations/model-watch.md`.
+
+### Fixed
+
+- **`max_completion_tokens` is now honoured on non-OpenAI providers.** OpenAI
+  reasoning models reject `max_tokens` and require `max_completion_tokens`, so
+  clients such as Scrapix send only the latter. The Anthropic, Bedrock, Google
+  and Cohere translations read only `max_tokens`, so the cap was silently
+  dropped (Anthropic fell back to its 4096 default). They now read the cap
+  through `ChatRequest::effective_max_tokens()`, which falls back to
+  `max_completion_tokens` when `max_tokens` is absent; `max_tokens` wins when
+  both are set. OpenAI-kind providers already forwarded the body unchanged.
+
 ## [0.7.0] - 2026-10-11
 
 ### Security

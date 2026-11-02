@@ -751,7 +751,7 @@ fn translate_request(req: &ChatRequest) -> ConverseRequest {
     }
 
     let inference = InferenceConfig {
-        max_tokens: req.max_tokens,
+        max_tokens: req.effective_max_tokens(),
         temperature: req.temperature,
         top_p: req.top_p,
         stop_sequences: req
@@ -1552,5 +1552,13 @@ mod tests {
 
         std::env::remove_var("AWS_ACCESS_KEY_ID");
         std::env::remove_var("AWS_SECRET_ACCESS_KEY");
+    }
+
+    #[test]
+    fn bedrock_maps_max_completion_tokens() {
+        let mut req = request(vec![msg("user", "hi")]);
+        req.extra.insert("max_completion_tokens".into(), json!(500));
+        let out = serde_json::to_value(translate_request(&req)).unwrap();
+        assert_eq!(out["inferenceConfig"]["maxTokens"], 500);
     }
 }
