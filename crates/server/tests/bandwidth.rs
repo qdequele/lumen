@@ -390,3 +390,38 @@ async fn bandwidth_ignores_gateway_refusals() {
     assert!(upstream.received_requests().await.expect("reqs").is_empty());
     h.assert_quiet().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bandwidth_counts_request_when_client_cancels_before_response() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/embeddings"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_secs(5))
+                .set_body_json(json!({
+                    "object": "list",
+                    "data": [{ "object": "embedding", "index": 0, "embedding": [0.1] }],
+                    "model": "text-embedding-3-small",
+                    "usage": { "prompt_tokens": 1, "total_tokens": 1 }
+                })),
+        )
+        .mount(&upstream)
+        .await;
+    let h = harness(registry(&upstream.uri())).await;
+
+    let body = embed_bytes();
+    let result = reqwest::Client::new()
+        .post(format!("{}/v1/embeddings", h.base))
+        .bearer_auth(&h.key)
+        .header("content-type", "application/json")
+        .body(body.clone())
+        .timeout(Duration::from_millis(300))
+        .send()
+        .await;
+    assert!(result.is_err(), "the client should have timed out");
+
+    let want = (i64::try_from(body.len()).expect("fits"), 0);
+    assert_eq!(h.wait_for(|t| t.0 > 0).await, want);
+    h.assert_quiet().await;
+}

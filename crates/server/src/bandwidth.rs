@@ -85,18 +85,20 @@ struct Credit {
     bytes_in: Arc<AtomicU64>,
 }
 
-/// Response-body wrapper counting the data bytes yielded to the client.
+/// The pending credit for one request, settled exactly once.
 ///
-/// The credit is an `Option` taken exactly once, by end of stream or by
-/// `Drop` (client disconnect, handler error), so bytes are never counted
+/// It is created before the handler runs, so a client that disconnects while
+/// the upstream call is in flight (the middleware future is dropped) is still
+/// credited the request bytes with zero response bytes. Once the response
+/// arrives it moves into [`CountingResponse`]. The credit is an `Option`
+/// taken once, by end of stream or by `Drop`, so bytes are never counted
 /// twice.
-struct CountingResponse {
-    inner: Body,
-    written: u64,
+struct Pending {
     credit: Option<Credit>,
+    written: u64,
 }
 
-impl CountingResponse {
+impl Pending {
     fn settle(&mut self) {
         if let Some(credit) = self.credit.take() {
             if credit.mark.is_marked() {
@@ -106,6 +108,18 @@ impl CountingResponse {
             }
         }
     }
+}
+
+impl Drop for Pending {
+    fn drop(&mut self) {
+        self.settle();
+    }
+}
+
+/// Response-body wrapper counting the data bytes yielded to the client.
+struct CountingResponse {
+    inner: Body,
+    pending: Pending,
 }
 
 impl HttpBody for CountingResponse {
@@ -120,10 +134,10 @@ impl HttpBody for CountingResponse {
         match &poll {
             Poll::Ready(Some(Ok(frame))) => {
                 if let Some(data) = frame.data_ref() {
-                    self.written += data.len() as u64;
+                    self.pending.written += data.len() as u64;
                 }
             }
-            Poll::Ready(None | Some(Err(_))) => self.settle(),
+            Poll::Ready(None | Some(Err(_))) => self.pending.settle(),
             Poll::Pending => {}
         }
         poll
@@ -135,12 +149,6 @@ impl HttpBody for CountingResponse {
 
     fn size_hint(&self) -> SizeHint {
         self.inner.size_hint()
-    }
-}
-
-impl Drop for CountingResponse {
-    fn drop(&mut self) {
-        self.settle();
     }
 }
 
@@ -159,16 +167,19 @@ pub async fn count_bandwidth(mut req: Request, next: Next) -> Response {
         inner: body,
         read: Arc::clone(&bytes_in),
     });
-    let response = next.run(Request::from_parts(parts, counted)).await;
-    let (parts, body) = response.into_parts();
-    let body = Body::new(CountingResponse {
-        inner: body,
-        written: 0,
+    let pending = Pending {
         credit: Some(Credit {
             entry,
             mark,
             bytes_in,
         }),
+        written: 0,
+    };
+    let response = next.run(Request::from_parts(parts, counted)).await;
+    let (parts, body) = response.into_parts();
+    let body = Body::new(CountingResponse {
+        inner: body,
+        pending,
     });
     Response::from_parts(parts, body)
 }
