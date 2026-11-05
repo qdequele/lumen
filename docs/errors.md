@@ -62,6 +62,7 @@ retried on a fallback before surfacing.
 | `LM-3012` | 504  | The connection to an upstream could not be established within the connect timeout. |
 | `LM-3013` | 504  | The whole request (all retries + fallbacks) exceeded the total timeout. |
 | `LM-3020` | 503  | The provider's circuit breaker is open and no fallback remained. |
+| `LM-3021` | 429  | Every team (BYOK) key of the caller's group for the provider is rate-limited or failing, and the group's fallback to the platform's keys is off. |
 
 For `LM-3001`, `LM-3020` (and `LM-4002`/`LM-4003`), a `Retry-After` value may be
 advertised. The three timeouts (`LM-3011` first-token, `LM-3012` connect,
@@ -79,6 +80,15 @@ The mapping between a failure and the code that eventually surfaces:
 - **`LM-3020` (503)** - the primary's circuit is open and no fallback remained.
   Skipping an open circuit is instant (no upstream call), and the response
   carries a `Retry-After` equal to the cooldown remainder.
+- **`LM-3021` (429)** - the caller's group brought its own keys for the
+  provider and none is usable right now (rate-limited keys are benched for
+  `max(Retry-After, 30s)`, keys the provider rejects with 401/403 for 10
+  minutes). Decided by the gateway, so it is never retried and never counts
+  against the circuit breaker. A fallback chain may move on under its
+  `rate_limited` trigger, but a later link only runs if the group also serves
+  it with its own keys: with the fallback off, no link reaches the platform's
+  keys. The message tells the team to add a key or turn on the fallback; it
+  never names a key.
 - **`LM-3004` (503)** - every link in the fallback chain was tried and failed
   (retries exhausted or circuits open all the way down).
 - **`LM-3013` (504)** - the total per-request deadline elapsed while retrying or

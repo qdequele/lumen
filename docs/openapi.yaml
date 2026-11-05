@@ -524,7 +524,7 @@ components:
         id: { type: string, description: "`gpk_` + random hex." }
         label: { type: string }
         last4: { type: string, description: Last 4 characters of the key; the only readable part. }
-        status: { type: string, enum: [unused, ok, rate_limited, failing], description: "`unused` until the request path reports live key health." }
+        status: { type: string, enum: [unused, ok, rate_limited, failing], description: "Live key health on the request path: `unused` until a request uses the key, `rate_limited` while benched after a 429, `failing` after the provider rejected it (401/403)." }
         status_detail: { type: [string, "null"] }
         created_at: { type: integer }
     TeamProvider:

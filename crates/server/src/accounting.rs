@@ -26,7 +26,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// The measured result of one finished request.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Outcome {
     /// Input/prompt tokens.
     pub tokens_in: u64,
@@ -47,6 +47,9 @@ pub struct Outcome {
     pub cost: f64,
     /// HTTP status returned to the client.
     pub status: u16,
+    /// `false` when a team (BYOK) key served the request: its tokens are then
+    /// counted as BYOK units and its cost is not platform spend.
+    pub billable: bool,
 }
 
 /// Upstream-reported token breakdown for one request (issue #99). Each field
@@ -326,7 +329,7 @@ impl Accounting {
                 tokens_in: i64::try_from(outcome.tokens_in).unwrap_or(i64::MAX),
                 tokens_out: i64::try_from(outcome.tokens_out).unwrap_or(i64::MAX),
                 estimated: outcome.estimated,
-                billable: true,
+                billable: outcome.billable,
             });
         }
 
@@ -484,16 +487,19 @@ pub struct StreamAccounting {
     accounting: Option<Accounting>,
     sniffer: UsageSniffer,
     estimated_input: u64,
+    billable: bool,
 }
 
 impl StreamAccounting {
     /// Wrap an open accounting record around a streaming response.
+    /// `billable` is `false` when a team (BYOK) key serves the stream.
     #[must_use]
-    pub fn new(accounting: Accounting, estimated_input: u64) -> Self {
+    pub fn new(accounting: Accounting, estimated_input: u64, billable: bool) -> Self {
         Self {
             accounting: Some(accounting),
             sniffer: UsageSniffer::default(),
             estimated_input,
+            billable,
         }
     }
 
@@ -528,6 +534,7 @@ impl StreamAccounting {
             media: lumen_core::MediaUsage::default(),
             cost,
             status,
+            billable: self.billable,
         });
     }
 }
@@ -720,7 +727,7 @@ mod tests {
     #[test]
     fn dropping_an_unfinished_stream_settles_as_a_499_client_cancel() {
         let metrics = Metrics::new();
-        let mut stream = StreamAccounting::new(open_accounting(&metrics), 7);
+        let mut stream = StreamAccounting::new(open_accounting(&metrics), 7, true);
         stream.scan(b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n");
         drop(stream);
 
@@ -739,7 +746,7 @@ mod tests {
     #[test]
     fn explicit_settlement_wins_over_the_drop_safety_net() {
         let metrics = Metrics::new();
-        let mut stream = StreamAccounting::new(open_accounting(&metrics), 7);
+        let mut stream = StreamAccounting::new(open_accounting(&metrics), 7, true);
         stream.finalize_with_status(200);
         drop(stream);
 
@@ -807,6 +814,7 @@ mod tests {
             media: lumen_core::MediaUsage::default(),
             cost: 0.0,
             status: 200,
+            billable: true,
         });
         let out = metrics.encode_text();
         assert!(out.contains("lumen_token_breakdown_total"), "{out}");

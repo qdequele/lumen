@@ -8,10 +8,11 @@
 //! first.
 //!
 //! Only requests that reached at least one upstream attempt are billed. A
-//! handler calls [`UpstreamMark::mark`] at the start of every attempt, before
-//! the provider call; a request refused by the gateway (invalid body, budget,
-//! rate limit) never marks and so is never billed. Requests without an
-//! authenticated key are not counted.
+//! handler calls [`UpstreamMark::mark`] right before each upstream call it
+//! actually sends (platform or team key); a request refused by the gateway
+//! (invalid body, budget, rate limit, team keys exhausted before any call)
+//! never marks and so is never billed. Requests without an authenticated key
+//! are not counted.
 
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};

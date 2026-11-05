@@ -566,4 +566,48 @@ mod tests {
         .unwrap_err();
         assert_eq!(err.code(), "LM-3003");
     }
+
+    #[tokio::test(start_paused = true)]
+    async fn exhausted_team_keys_move_on_without_retry_or_breaker_failure() {
+        let chain = links(&[("openai", "gpt-4o"), ("anthropic", "claude")]);
+        let cb = breakers();
+        let cancel = CancellationToken::new();
+        let primary_calls = AtomicUsize::new(0);
+        for _ in 0..10 {
+            let out = execute(&chain, &cb, &config(3), &cancel, |i| {
+                if i == 0 {
+                    primary_calls.fetch_add(1, Ordering::SeqCst);
+                }
+                async move {
+                    if i == 0 {
+                        Err(ProviderError::TeamKeysExhausted {
+                            provider: "openai".into(),
+                        })
+                    } else {
+                        Ok::<_, ProviderError>("next")
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(out.index, 1);
+        }
+        // Never retried, and never charged to the primary's breaker.
+        assert_eq!(primary_calls.load(Ordering::SeqCst), 10);
+        assert_eq!(
+            cb.get("openai", "gpt-4o").state(),
+            crate::circuit::CircuitState::Closed
+        );
+
+        // On the last link it is the final answer: LM-3021.
+        let last = links(&[("openai", "gpt-4o")]);
+        let err = execute(&last, &cb, &config(3), &cancel, |_| async {
+            Err::<&str, _>(ProviderError::TeamKeysExhausted {
+                provider: "openai".into(),
+            })
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), "LM-3021");
+    }
 }

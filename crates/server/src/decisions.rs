@@ -16,11 +16,13 @@ use axum::response::{IntoResponse, Response};
 use axum::Extension;
 use lumen_core::decisions::format;
 use lumen_core::{tokens, Answer, Capability, DecisionUsage};
+use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 use crate::accounting::{Accounting, Outcome, Target, TokenBreakdown};
 use crate::auth::AuthedKey;
 use crate::bandwidth::UpstreamMark;
+use crate::byok::{RequestKeys, Served};
 use crate::error::ApiError;
 use crate::facts::Facts;
 use crate::resilience::routing_headers;
@@ -37,6 +39,9 @@ pub async fn decisions_handler(
     handle(state, &headers, key.as_deref(), &mark, &body).await
 }
 
+// One straight-line request pipeline; the team-key routing of each attempt
+// (BYOK) tipped it over the limit.
+#[allow(clippy::too_many_lines)]
 async fn handle(
     state: AppState,
     headers: &HeaderMap,
@@ -70,7 +75,13 @@ async fn handle(
     // estimate; decisions bill input only, so no output is reserved.
     let pricing = state.pricing();
     let estimated_input = tokens::estimate_decisions(&req);
-    let estimated_cost = pricing.token_cost(&primary, estimated_input, 0);
+    // A primary served by the group's own keys (BYOK) reserves no cost.
+    let keys = RequestKeys::new(&state.team_pools, key);
+    let estimated_cost = if keys.has_usable_pool(&first.route.provider_name) {
+        0.0
+    } else {
+        pricing.token_cost(&primary, estimated_input, 0)
+    };
     let mut accounting = Accounting::begin(
         &state,
         headers,
@@ -92,18 +103,38 @@ async fn handle(
 
     let executed =
         lumen_router::executor::execute(&links, &state.resilience.breakers, &exec, &cancel, |i| {
-            mark.mark();
-            let provider = chain[i].route.provider.clone();
+            let platform = chain[i].route.provider.clone();
+            let provider_name = chain[i].route.provider_name.clone();
             let cancel = cancel.clone();
             // A refcount bump: the request body is shared.
             let mut attempt = req.clone();
             chain[i].route.upstream_id.clone_into(&mut attempt.model);
-            async move { provider.decide(attempt, cancel).await }
+            let (keys, registry) = (&keys, &*state.registry);
+            async move {
+                // Marked only when an upstream call is actually sent.
+                let call = |provider: Option<Arc<dyn lumen_core::DecisionProvider>>| {
+                    let (req, cancel, name) =
+                        (attempt.clone(), cancel.clone(), provider_name.clone());
+                    async move {
+                        let provider = provider
+                            .ok_or(lumen_core::ProviderError::Unavailable { provider: name })?;
+                        mark.mark();
+                        provider.decide(req, cancel).await
+                    }
+                };
+                keys.attempt(
+                    registry,
+                    &provider_name,
+                    || call(Some(platform)),
+                    |set| call(set.decide.clone()),
+                )
+                .await
+            }
         })
         .await?;
     // (an early return above drops `accounting`, refunding the reservation)
 
-    let mut response = executed.value;
+    let (mut response, served) = executed.value;
     accounting.served_by(&executed.model_used, &executed.provider_used);
     let route = decision.route_of(executed.index);
     accounting.set_route(route);
@@ -136,6 +167,7 @@ async fn handle(
         media: lumen_core::MediaUsage::default(),
         cost,
         status: 200,
+        billable: matches!(served, Served::Platform),
     });
 
     let mut out_headers = routing_headers(&executed.model_used, route);

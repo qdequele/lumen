@@ -68,8 +68,8 @@ pub struct TeamKeyView {
     pub label: String,
     /// Last 4 characters of the key.
     pub last4: String,
-    /// `unused` | `ok` | `rate_limited` | `failing`. Always `unused` until the
-    /// request path reports live key health.
+    /// `unused` | `ok` | `rate_limited` | `failing`: the key's live health on
+    /// the request path (`unused` until a request uses it).
     pub status: &'static str,
     /// Why the key is not `ok`, when known.
     pub status_detail: Option<String>,
@@ -181,7 +181,17 @@ pub async fn list_team_providers(
                 eligible: p.kind.byok_eligible(),
                 models: p.models.iter().map(|m| m.id.clone()).collect(),
                 fallback,
-                keys: mine.into_iter().map(TeamKeyView::from).collect(),
+                keys: mine
+                    .into_iter()
+                    .map(|record| {
+                        let (status, detail) = state.team_pools.status(&id, &record.id);
+                        TeamKeyView {
+                            status,
+                            status_detail: detail,
+                            ..TeamKeyView::from(record)
+                        }
+                    })
+                    .collect(),
                 name: p.name,
             }
         })
