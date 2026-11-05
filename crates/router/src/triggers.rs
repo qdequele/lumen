@@ -84,7 +84,10 @@ impl Triggers {
                 retryable: true, ..
             }
             | ProviderError::Unavailable { .. }
-            | ProviderError::EmptyStream { .. } => self.contains(Trigger::ProviderError),
+            | ProviderError::EmptyStream { .. }
+            // A platform pool with every key disabled: this provider cannot
+            // serve, another link of the chain may.
+            | ProviderError::PlatformKeysDisabled { .. } => self.contains(Trigger::ProviderError),
             // An exhausted team key pool moves on like a rate limit; the next
             // link refuses on its own unless the team serves it with its own
             // keys (BYOK), so this never reaches the platform's keys.

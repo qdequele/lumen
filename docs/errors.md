@@ -63,6 +63,7 @@ retried on a fallback before surfacing.
 | `LM-3013` | 504  | The whole request (all retries + fallbacks) exceeded the total timeout. |
 | `LM-3020` | 503  | The provider's circuit breaker is open and no fallback remained. |
 | `LM-3021` | 429  | Every team (BYOK) key of the caller's group for the provider is rate-limited or failing, and the group's fallback to the platform's keys is off. |
+| `LM-3022` | 503  | The provider has a platform key pool (ADR 019) and every key of it is disabled. The pool replaces the configured key, so nothing can serve the request until an operator enables or adds a key. |
 
 For `LM-3001`, `LM-3020` (and `LM-4002`/`LM-4003`), a `Retry-After` value may be
 advertised. The three timeouts (`LM-3011` first-token, `LM-3012` connect,
@@ -93,6 +94,13 @@ The mapping between a failure and the code that eventually surfaces:
   team key answered 503), a later link refused this way surfaces that earlier
   error instead, so the refusal never hides the real failure. The message
   tells the team to add a key or turn on the fallback; it never names a key.
+- **`LM-3022` (503)** - the provider has platform keys (ADR 019), all of them
+  disabled. Once a provider has a platform key, enabled or not, its
+  configured key (`api_key_env` / `provider_keys`) is ignored, so the gateway
+  refuses without calling upstream. Never retried, never counted against the
+  circuit breaker; a fallback chain may move on under its `provider_error`
+  trigger. Enabling or adding a key fixes it; deleting every platform key of
+  the provider brings back the configured key.
 - **`LM-3004` (503)** - every link in the fallback chain was tried and failed
   (retries exhausted or circuits open all the way down).
 - **`LM-3013` (504)** - the total per-request deadline elapsed while retrying or

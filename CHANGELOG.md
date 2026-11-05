@@ -23,9 +23,12 @@ All notable changes to LUMEN are documented here. The format is based on
   `GET /admin/platform-keys`, `POST /admin/platform-keys/{provider}/keys`,
   `PATCH` and `DELETE .../keys/{key_id}`. Wherever the platform key served
   before, the pool's keys are used round-robin with the BYOK rotation rules
-  (429 benches, 401/403 marks failing), then the configured key
-  (`api_key_env` / `PUT /admin/provider-keys`) as the last resort. A team
-  with the fallback off never reaches the pool. Keys are sealed at rest and
+  (429 benches, 401/403 marks failing). Once a provider has a platform key,
+  enabled or not, its configured key (`api_key_env` /
+  `PUT /admin/provider-keys`) is ignored: an exhausted pool returns its last
+  error, and a pool whose keys are all disabled fails `LM-3022` (503)
+  without calling upstream. Deleting the last platform key brings the
+  configured key back. A team with the fallback off never reaches the pool. Keys are sealed at rest and
   never returned or logged; disable and delete evict the key before
   answering.
 

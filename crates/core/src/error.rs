@@ -156,6 +156,17 @@ pub enum ProviderError {
         /// The provider whose team pool is exhausted.
         provider: String,
     },
+
+    /// The provider has a platform key pool (ADR 019) but every key of it is
+    /// disabled. The pool replaces the deployment's configured key, so no
+    /// key is left to serve the request. Decided by the gateway: never
+    /// retried, never a provider fault (the breaker is untouched); a fallback
+    /// chain may move on under its `provider_error` trigger. Maps to LM-3022.
+    #[error("every platform key for provider '{provider}' is disabled")]
+    PlatformKeysDisabled {
+        /// The provider whose platform pool has no enabled key.
+        provider: String,
+    },
 }
 
 impl ProviderError {
@@ -182,7 +193,8 @@ impl ProviderError {
             | ProviderError::UnsupportedInput { .. }
             | ProviderError::ContextLengthExceeded { .. }
             | ProviderError::ContentFiltered { .. }
-            | ProviderError::TeamKeysExhausted { .. } => false,
+            | ProviderError::TeamKeysExhausted { .. }
+            | ProviderError::PlatformKeysDisabled { .. } => false,
         }
     }
 
@@ -207,7 +219,8 @@ impl ProviderError {
             | ProviderError::UnsupportedInput { .. }
             | ProviderError::ContextLengthExceeded { .. }
             | ProviderError::ContentFiltered { .. }
-            | ProviderError::TeamKeysExhausted { .. } => false,
+            | ProviderError::TeamKeysExhausted { .. }
+            | ProviderError::PlatformKeysDisabled { .. } => false,
         }
     }
 
@@ -452,6 +465,12 @@ pub enum GatewayError {
     )]
     TeamKeysExhausted { provider: String },
 
+    /// The provider's platform key pool (ADR 019) has no enabled key, and the
+    /// pool replaces the configured key: an operator must enable or add a
+    /// key. Never names a key.
+    #[error("No key is enabled for provider '{provider}' on this gateway.")]
+    PlatformKeysDisabled { provider: String },
+
     // ---- Auth / budget errors (LM-4xxx, codes pinned by the M5 spec) --------
     /// A hard budget the key is subject to is exhausted: its own
     /// `budget_max`, or its budget group's shared pool (ADR 009). Enforced
@@ -527,6 +546,7 @@ impl GatewayError {
             GatewayError::UpstreamTotalTimeout { .. } => "LM-3013",
             GatewayError::CircuitOpen { .. } => "LM-3020",
             GatewayError::TeamKeysExhausted { .. } => "LM-3021",
+            GatewayError::PlatformKeysDisabled { .. } => "LM-3022",
             GatewayError::BudgetExceeded { .. } => "LM-4001",
             GatewayError::QuotaExceeded {
                 quota: QuotaKind::Rpm,
@@ -581,7 +601,9 @@ impl GatewayError {
             | GatewayError::UpstreamInvalidResponse { .. }
             | GatewayError::UpstreamStreamInterrupted { .. }
             | GatewayError::ImageFetchFailed => 502,
-            GatewayError::UpstreamUnavailable { .. } | GatewayError::CircuitOpen { .. } => 503,
+            GatewayError::UpstreamUnavailable { .. }
+            | GatewayError::CircuitOpen { .. }
+            | GatewayError::PlatformKeysDisabled { .. } => 503,
             GatewayError::UpstreamTimeout { .. }
             | GatewayError::UpstreamFirstTokenTimeout { .. }
             | GatewayError::UpstreamConnectTimeout { .. }
@@ -624,6 +646,7 @@ impl GatewayError {
             | GatewayError::UpstreamTotalTimeout { .. }
             | GatewayError::CircuitOpen { .. }
             | GatewayError::TeamKeysExhausted { .. }
+            | GatewayError::PlatformKeysDisabled { .. }
             | GatewayError::UpstreamRateLimited { .. } => ErrorType::UpstreamError,
             GatewayError::Internal(_) => ErrorType::Internal,
             GatewayError::ClientCancelled => ErrorType::ClientCancelled,
@@ -762,6 +785,11 @@ impl GatewayError {
             ProviderError::TeamKeysExhausted { provider: p } => GatewayError::TeamKeysExhausted {
                 provider: p_or(provider, p),
             },
+            ProviderError::PlatformKeysDisabled { provider: p } => {
+                GatewayError::PlatformKeysDisabled {
+                    provider: p_or(provider, p),
+                }
+            }
         }
     }
 }
@@ -1038,6 +1066,22 @@ mod tests {
             GatewayError::UpstreamConnectTimeout { provider } => assert_eq!(&provider, "openai"),
             other => panic!("expected UpstreamConnectTimeout, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn platform_keys_disabled_is_an_lm_3022_503_that_never_retries() {
+        let err = ProviderError::PlatformKeysDisabled {
+            provider: "openai".into(),
+        };
+        assert!(!err.is_retryable());
+        assert!(!err.is_provider_fault(), "the breaker must ignore it");
+        let ge = GatewayError::from_provider("ignored", err);
+        assert_eq!(ge.code(), "LM-3022");
+        assert_eq!(ge.http_status(), 503);
+        assert_eq!(
+            ge.public_message(),
+            "No key is enabled for provider 'openai' on this gateway."
+        );
     }
 
     #[test]

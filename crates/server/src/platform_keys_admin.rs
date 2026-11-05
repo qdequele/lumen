@@ -3,7 +3,10 @@
 //!
 //! The platform's own keys (Meilisearch's, on the hosted gateway) per
 //! provider, rotated on the request path like team keys (ADR 018) wherever
-//! the platform key serves. These routes sit with the other platform routes:
+//! the platform key serves. A provider with at least one platform key,
+//! enabled or not, ignores its configured key (`api_key_env` /
+//! `provider_keys`); with none, the configured key serves as before. These
+//! routes sit with the other platform routes:
 //! master key only, and a call scoped with `X-Lumen-Account-Ref` is refused
 //! `403 LM-4005`, so no team reaches them through a control plane.
 //!
@@ -106,8 +109,9 @@ pub struct PlatformProvider {
     /// Whether the kind takes a pool key (plain API key kinds only).
     pub eligible: bool,
     /// Whether the live provider also has a configured key (its
-    /// `api_key_env` variable or a `PUT /admin/provider-keys` row), the last
-    /// resort behind the pool.
+    /// `api_key_env` variable or a `PUT /admin/provider-keys` row). It
+    /// serves only while `keys` is empty: once the provider has a platform
+    /// key, enabled or not, the configured key is ignored.
     pub configured_key: bool,
     /// The model ids the provider serves.
     pub models: Vec<String>,
@@ -246,8 +250,9 @@ pub async fn patch_platform_key(
         .map_err(|e| internal(&e))?
         .ok_or_else(|| unknown_key(&key_id))?;
     if !record.enabled {
-        // Out of the live pool before answering; the reload reconciles.
-        state.team_pools.remove_platform(&provider, &key_id);
+        // Out of the live pool before answering; the reload reconciles. The
+        // row stays, so the pool does too: the configured key stays ignored.
+        state.team_pools.remove_platform(&provider, &key_id, false);
     }
     request_reload(&state);
     tracing::info!(%provider, %key_id, enabled = record.enabled, "platform provider key toggled");
@@ -271,7 +276,16 @@ pub async fn delete_platform_key(
     if !deleted {
         return Err(unknown_key(&key_id));
     }
-    state.team_pools.remove_platform(&provider, &key_id);
+    // The provider's last platform key: its pool goes, and the configured
+    // key serves again.
+    let last = !auth
+        .store
+        .list_platform_provider_keys()
+        .await
+        .map_err(|e| internal(&e))?
+        .iter()
+        .any(|k| k.provider == provider);
+    state.team_pools.remove_platform(&provider, &key_id, last);
     request_reload(&state);
     tracing::info!(%provider, %key_id, "platform provider key deleted");
     Ok(StatusCode::NO_CONTENT)

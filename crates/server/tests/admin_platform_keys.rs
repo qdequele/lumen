@@ -310,4 +310,26 @@ async fn disable_and_delete_evict_the_key_from_the_live_pool_before_answering() 
         .await;
     assert_eq!(status, 200);
     assert!(!h.state.team_pools.has_platform_key("openai-main", &id));
+    assert!(
+        h.state.team_pools.has_platform_pool("openai-main"),
+        "a disabled key keeps the pool, so the env key stays ignored"
+    );
+
+    // Deleting a key while another remains keeps the pool; deleting the
+    // last one drops it, and the configured key serves again.
+    let (_, second) = h.add("openai-main", SECRET, "secondary").await;
+    let second = second["id"].as_str().expect("id").to_owned();
+    let (status, _) = h.call(reqwest::Method::DELETE, &path, None, None).await;
+    assert_eq!(status, 204);
+    assert!(h.state.team_pools.has_platform_pool("openai-main"));
+    let (status, _) = h
+        .call(
+            reqwest::Method::DELETE,
+            &format!("/admin/platform-keys/openai-main/keys/{second}"),
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(status, 204);
+    assert!(!h.state.team_pools.has_platform_pool("openai-main"));
 }

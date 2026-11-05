@@ -1160,7 +1160,7 @@ impl Harness {
 }
 
 #[tokio::test]
-async fn platform_pool_rotates_before_the_configured_key_and_bills_tokens() {
+async fn platform_pool_rotates_instead_of_the_configured_key_and_bills_tokens() {
     let (a, b) = servers().await;
     mount_status(&a, POOL_1, 429).await;
     mount_ok(&a, POOL_2).await;
@@ -1186,7 +1186,7 @@ async fn platform_pool_rotates_before_the_configured_key_and_bills_tokens() {
     assert_eq!(
         hits(&a, PLATFORM).await,
         0,
-        "the configured key is the last resort"
+        "the configured key is ignored once a pool exists"
     );
     assert_eq!(h.pools.platform_status(&first).0, "rate_limited");
     assert_eq!(
@@ -1197,7 +1197,7 @@ async fn platform_pool_rotates_before_the_configured_key_and_bills_tokens() {
 }
 
 #[tokio::test]
-async fn exhausted_platform_pool_uses_the_configured_key() {
+async fn exhausted_platform_pool_never_uses_the_configured_key() {
     let (a, b) = servers().await;
     mount_status(&a, POOL_1, 401).await;
     mount_ok(&a, PLATFORM).await;
@@ -1205,10 +1205,49 @@ async fn exhausted_platform_pool_uses_the_configured_key() {
     let id = h.add_platform_key("a", POOL_1).await;
 
     let (status, body) = h.chat(&h.key_solo, "model-a").await;
-    assert_eq!(status, 200, "{body}");
+    assert_ne!(status, 200, "{body}");
     assert_eq!(hits(&a, POOL_1).await, 1);
-    assert_eq!(hits(&a, PLATFORM).await, 1);
+    assert_eq!(hits(&a, PLATFORM).await, 0, "the env key is ignored");
     assert_eq!(h.pools.platform_status(&id).0, "failing");
+}
+
+#[tokio::test]
+async fn a_pool_of_disabled_keys_ignores_the_env_key_until_its_last_key_is_deleted() {
+    let (a, b) = servers().await;
+    mount_ok(&a, POOL_1).await;
+    mount_ok(&a, PLATFORM).await;
+    let h = harness(&a, &b).await;
+    let id = h.add_platform_key("a", POOL_1).await;
+    h.runtime
+        .store
+        .set_platform_provider_key_enabled("a", &id, false)
+        .await
+        .expect("disable")
+        .expect("found");
+    h.reload().await;
+
+    let (status, body) = h.chat(&h.key_solo, "model-a").await;
+    assert_eq!(status, 503, "{body}");
+    assert!(body.contains("LM-3022"), "{body}");
+    assert_eq!(hits(&a, POOL_1).await, 0);
+    assert_eq!(hits(&a, PLATFORM).await, 0, "the env key is ignored");
+    assert_eq!(
+        h.resilience.breakers.get("a", "model-a").state(),
+        CircuitState::Closed,
+        "a disabled pool is not a provider fault"
+    );
+
+    // No platform key left: the env key serves again.
+    assert!(h
+        .runtime
+        .store
+        .delete_platform_provider_key("a", &id)
+        .await
+        .expect("delete"));
+    h.reload().await;
+    let (status, body) = h.chat(&h.key_solo, "model-a").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(hits(&a, PLATFORM).await, 1);
 }
 
 #[tokio::test]
@@ -1264,8 +1303,9 @@ async fn platform_pool_secrets_never_logged() {
     h.add_platform_key("a", POOL_1).await;
     h.add_platform_key("a", POOL_2).await;
 
+    // Both keys rotated out: the pool's last error (the 401), never the env key.
     let (status, body) = h.chat(&h.key_solo, "model-a").await;
-    assert_eq!(status, 200, "{body}");
+    assert_eq!(status, 502, "{body}");
     let logs = String::from_utf8_lossy(&buffer.lock().expect("log buffer")).into_owned();
     assert!(!logs.is_empty(), "the subscriber captured nothing");
     for secret in [POOL_1, POOL_2, "-POOL-one", "-POOL-two"] {

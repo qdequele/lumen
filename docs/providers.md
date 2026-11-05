@@ -1265,10 +1265,13 @@ under `/admin/platform-keys` (platform-only: master key, no
   pool with the fallback on and no usable team key), the pool's enabled keys
   are tried round-robin with the team-key rules: a 429 benches a key for
   `max(Retry-After, 30s)`, a 401/403 marks it failing for 10 minutes.
-- When no pool key is usable, the provider's configured key (`api_key_env` or
-  `PUT /admin/provider-keys/{name}`) serves the request if it has one;
-  otherwise the request ends with the last pool error (a 429 when every key is
-  benched).
+- A provider with at least one platform key, enabled or not, has a pool, and
+  its configured key (`api_key_env` or `PUT /admin/provider-keys/{name}`) is
+  then ignored. When no pool key is usable, the request ends with the last
+  pool error (a 429 when every key is benched). When every key is disabled,
+  it fails `LM-3022` (503) without calling upstream.
+- Only once the provider's last platform key is deleted does its configured
+  key serve again.
 - A team whose fallback is off never reaches the platform pool, directly or
   through a fallback chain (`LM-3021`, as above).
 - Pool-served requests are platform requests: tokens are billed and the

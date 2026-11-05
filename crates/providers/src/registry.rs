@@ -424,8 +424,9 @@ impl Registry {
 
     /// Whether the provider named `provider_name` was built with an API key
     /// of its own (its `api_key_env` variable or the stored
-    /// `provider_keys` row): the last resort behind a platform key pool
-    /// (ADR 019). `false` for an unknown name or a keyless provider.
+    /// `provider_keys` row). The admin API reports it; a provider with a
+    /// platform key pool ignores it (ADR 019). `false` for an unknown name
+    /// or a keyless provider.
     #[must_use]
     pub fn has_api_key(&self, provider_name: &str) -> bool {
         self.inner

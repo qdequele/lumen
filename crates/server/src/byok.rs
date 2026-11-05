@@ -20,6 +20,11 @@
 //! 3. no usable key left: the platform key when the group turned the
 //!    fallback on, else `LM-3021` ([`ProviderError::TeamKeysExhausted`]).
 //!
+//! "The platform key" is the provider's platform pool (ADR 019) when it has
+//! one, that is at least one platform key, enabled or not; the configured key
+//! (`api_key_env` / `provider_keys`) is then ignored. Only a provider with no
+//! platform key at all uses its configured key.
+//!
 //! Pools are keyed by the group of the authenticated virtual key, never by
 //! anything the client sends: a key with no group never uses a team key, and
 //! one group's keys never serve another group. Secrets are held in
@@ -151,8 +156,10 @@ type ProviderPools = HashMap<String, Arc<Pool>>;
 #[derive(Default)]
 pub struct TeamPools {
     pools: ArcSwap<GroupPools>,
-    /// The platform's keys per provider: enabled keys only, `fallback`
-    /// unused.
+    /// The platform's keys per provider: a pool for every provider with at
+    /// least one platform key row, enabled or not, holding its enabled keys
+    /// only (so possibly none). `fallback` unused. A provider with a pool
+    /// here never uses its configured key.
     platform: ArcSwap<ProviderPools>,
 }
 
@@ -277,19 +284,23 @@ impl TeamPools {
         self.pools.load().get(group_id).cloned()
     }
 
-    /// Replace every platform pool with the enabled rows of `keys`
-    /// (decrypted store rows). A key already present keeps its health and
-    /// cached instances, and a pool keeps its cursor.
+    /// Replace every platform pool with `keys` (decrypted store rows): a
+    /// provider with any row, enabled or not, has a pool of its enabled keys
+    /// (an empty one when every key is disabled). A key already present
+    /// keeps its health and cached instances, and a pool keeps its cursor.
     pub fn replace_platform(&self, keys: Vec<(PlatformProviderKeyRecord, Zeroizing<String>)>) {
         let old = self.platform.load_full();
         let mut grouped: HashMap<String, Vec<Arc<PoolKey>>> = HashMap::new();
-        for (record, secret) in keys.into_iter().filter(|(record, _)| record.enabled) {
+        for (record, secret) in keys {
+            let pool = grouped.entry(record.provider.clone()).or_default();
+            if !record.enabled {
+                continue;
+            }
             let previous = old
                 .get(&record.provider)
                 .and_then(|pool| pool.keys.iter().find(|k| k.id == record.id))
                 .cloned();
-            let key = previous.unwrap_or_else(|| Arc::new(PoolKey::new(record.id, secret)));
-            grouped.entry(record.provider).or_default().push(key);
+            pool.push(previous.unwrap_or_else(|| Arc::new(PoolKey::new(record.id, secret))));
         }
         let next = grouped
             .into_iter()
@@ -320,6 +331,13 @@ impl TeamPools {
             .map_or(("unused", None), |key| health_status(key))
     }
 
+    /// Whether `provider` has a platform pool (at least one platform key,
+    /// enabled or not): its configured key is then never used.
+    #[must_use]
+    pub fn has_platform_pool(&self, provider: &str) -> bool {
+        self.platform.load().contains_key(provider)
+    }
+
     /// Whether the live platform pool of `provider` holds `key_id`.
     #[must_use]
     pub fn has_platform_key(&self, provider: &str, key_id: &str) -> bool {
@@ -330,32 +348,37 @@ impl TeamPools {
     }
 
     /// Drop one platform key from the live pools now (a disable or a
-    /// delete), without waiting for the reloader. A request already holding
-    /// a snapshot finishes on it.
-    pub fn remove_platform(&self, provider: &str, key_id: &str) {
+    /// delete), without waiting for the reloader. The provider keeps its
+    /// pool, even empty, unless `last` says no platform key of it is left
+    /// in the store: only then does its configured key serve again. A
+    /// request already holding a snapshot finishes on it.
+    pub fn remove_platform(&self, provider: &str, key_id: &str, last: bool) {
         self.platform.rcu(|current| {
             let mut next = ProviderPools::clone(current);
-            if let Some(pool) = current.get(provider) {
+            if last {
+                next.remove(provider);
+                return next;
+            }
+            // Not loaded yet: an empty pool still keeps the configured key
+            // out until the reloader fills it.
+            let (keys, cursor) = current.get(provider).map_or((Vec::new(), 0), |pool| {
                 let keys: Vec<_> = pool
                     .keys
                     .iter()
                     .filter(|k| k.id != key_id)
                     .cloned()
                     .collect();
-                if keys.is_empty() {
-                    next.remove(provider);
-                } else {
-                    let cursor = pool.cursor.load(Ordering::Relaxed) % keys.len();
-                    next.insert(
-                        provider.to_owned(),
-                        Arc::new(Pool {
-                            keys,
-                            fallback: false,
-                            cursor: AtomicUsize::new(cursor),
-                        }),
-                    );
-                }
-            }
+                let cursor = pool.cursor.load(Ordering::Relaxed) % keys.len().max(1);
+                (keys, cursor)
+            });
+            next.insert(
+                provider.to_owned(),
+                Arc::new(Pool {
+                    keys,
+                    fallback: false,
+                    cursor: AtomicUsize::new(cursor),
+                }),
+            );
             next
         });
     }
@@ -569,11 +592,11 @@ impl RequestKeys {
     }
 
     /// Serve an attempt on the platform's keys (ADR 019): the platform pool
-    /// for `provider` round-robin when it has one, then the provider's
-    /// configured key (`platform`) when no pool key is usable and the
-    /// provider has one. Without a configured key, an exhausted pool ends
-    /// the attempt with its last error (a rate limit when every key was
-    /// already benched).
+    /// for `provider` round-robin when it has one, else the provider's
+    /// configured key (`platform`). A pool, even with every key disabled,
+    /// replaces the configured key: an exhausted pool ends the attempt with
+    /// its last error (a rate limit when every key was already benched), and
+    /// a pool with no enabled key with [`ProviderError::PlatformKeysDisabled`].
     async fn serve_platform<T, P, PF, K, KF>(
         &self,
         registry: &Registry,
@@ -594,13 +617,18 @@ impl RequestKeys {
             match rotate(pool, registry, provider, "platform", keyed).await {
                 Rotation::Served(value, _) => return Ok((value, Served::Platform)),
                 Rotation::Failed(error) => return Err(error),
-                Rotation::Exhausted(last) if !registry.has_api_key(provider) => {
-                    return Err(last.unwrap_or_else(|| ProviderError::RateLimited {
+                Rotation::Exhausted(Some(last)) => return Err(last),
+                Rotation::Exhausted(None) if pool.keys.is_empty() => {
+                    return Err(ProviderError::PlatformKeysDisabled {
+                        provider: provider.to_owned(),
+                    });
+                }
+                Rotation::Exhausted(None) => {
+                    return Err(ProviderError::RateLimited {
                         provider: provider.to_owned(),
                         retry_after: None,
-                    }));
+                    });
                 }
-                Rotation::Exhausted(_) => {}
             }
         }
         platform().await.map(|value| (value, Served::Platform))
@@ -812,82 +840,113 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn exhausted_platform_pool_uses_the_configured_key_or_returns_the_last_error() {
-        let pools = Arc::new(TeamPools::default());
-        pools.replace_platform(vec![platform_record("pk1", true)]);
-        let platform_calls = AtomicUsize::new(0);
-
-        // A configured (env / provider_keys) key is the last resort.
-        let reg = registry(ProviderKind::Openai);
-        let keys = RequestKeys::new(&pools, None);
-        let ((), served) = keys
+    /// One platform-key attempt on provider `p`: `configured` counts calls
+    /// to the configured key, `keyed` answers every pool key.
+    async fn platform_attempt(
+        pools: &Arc<TeamPools>,
+        reg: &Registry,
+        configured: &AtomicUsize,
+        keyed: fn() -> Result<(), ProviderError>,
+    ) -> Result<((), Served), ProviderError> {
+        RequestKeys::new(pools, None)
             .attempt(
-                &reg,
+                reg,
                 0,
                 "p",
                 || {
-                    platform_calls.fetch_add(1, Ordering::SeqCst);
+                    configured.fetch_add(1, Ordering::SeqCst);
                     async { Ok::<_, ProviderError>(()) }
                 },
-                |_| async { Err(rate_limited()) },
+                |_| async move { keyed() },
             )
             .await
-            .expect("served on the configured key");
-        assert_eq!(served, Served::Platform);
-        assert_eq!(platform_calls.load(Ordering::SeqCst), 1);
+    }
 
-        // No configured key: the pool's own failure is the answer, and a
-        // benched-only pool reports a rate limit without calling upstream.
-        let keyless = registry_with(ProviderKind::Openai, None);
-        let keys = RequestKeys::new(&pools, None);
-        let err = keys
-            .attempt(
-                &keyless,
-                0,
-                "p",
-                || {
-                    platform_calls.fetch_add(1, Ordering::SeqCst);
-                    async { Ok::<_, ProviderError>(()) }
-                },
-                |_| async { Ok(()) },
-            )
+    #[tokio::test]
+    async fn an_exhausted_platform_pool_never_falls_back_to_the_configured_key() {
+        let reg = registry(ProviderKind::Openai);
+        let pools = Arc::new(TeamPools::default());
+        pools.replace_platform(vec![platform_record("pk1", true)]);
+        let configured = AtomicUsize::new(0);
+
+        // The pool's own failure is the answer, configured key or not.
+        let err = platform_attempt(&pools, &reg, &configured, || Err(rate_limited()))
             .await
             .unwrap_err();
         assert!(matches!(err, ProviderError::RateLimited { ref provider, .. } if provider == "p"));
+        // Benched only: a rate limit without calling upstream.
+        let err = platform_attempt(&pools, &reg, &configured, || Ok(()))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ProviderError::RateLimited { ref provider, .. } if provider == "p"));
+        let keyless = registry_with(ProviderKind::Openai, None);
+        let err = platform_attempt(&pools, &keyless, &configured, || Ok(()))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ProviderError::RateLimited { .. }));
         assert_eq!(
-            platform_calls.load(Ordering::SeqCst),
-            1,
-            "never the keyless platform call"
+            configured.load(Ordering::SeqCst),
+            0,
+            "a pool replaces the configured key"
         );
     }
 
     #[tokio::test]
-    async fn disabled_and_removed_platform_keys_are_not_used() {
+    async fn a_pool_of_disabled_keys_still_replaces_the_configured_key() {
         let reg = registry(ProviderKind::Openai);
         let pools = Arc::new(TeamPools::default());
         pools.replace_platform(vec![
             platform_record("pk1", false),
             platform_record("pk2", true),
         ]);
-        pools.remove_platform("p", "pk2");
-        let keys = RequestKeys::new(&pools, None);
-        let keyed_calls = AtomicUsize::new(0);
-        let ((), served) = keys
-            .attempt(
-                &reg,
-                0,
-                "p",
-                || async { Ok::<_, ProviderError>(()) },
-                |_| {
-                    keyed_calls.fetch_add(1, Ordering::SeqCst);
-                    async { Ok(()) }
-                },
-            )
+        assert!(pools.has_platform_pool("p"));
+        let configured = AtomicUsize::new(0);
+
+        // pk2 serves; disabling it leaves a pool with no enabled key.
+        let ((), served) = platform_attempt(&pools, &reg, &configured, || Ok(()))
             .await
-            .expect("served");
+            .expect("served by pk2");
         assert_eq!(served, Served::Platform);
-        assert_eq!(keyed_calls.load(Ordering::SeqCst), 0, "no pool key left");
+        pools.remove_platform("p", "pk2", false);
+        assert!(pools.has_platform_pool("p"), "pk1's row keeps the pool");
+        let err = platform_attempt(&pools, &reg, &configured, || Ok(()))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ProviderError::PlatformKeysDisabled { ref provider } if provider == "p")
+        );
+        // Every row disabled at load is a pool too.
+        pools.replace_platform(vec![platform_record("pk1", false)]);
+        assert!(platform_attempt(&pools, &reg, &configured, || Ok(()))
+            .await
+            .is_err());
+        assert_eq!(
+            configured.load(Ordering::SeqCst),
+            0,
+            "the env key is ignored"
+        );
+
+        // The last platform key deleted: no pool, the configured key serves.
+        pools.remove_platform("p", "pk1", true);
+        assert!(!pools.has_platform_pool("p"));
+        let ((), served) = platform_attempt(&pools, &reg, &configured, || Ok(()))
+            .await
+            .expect("served by the configured key");
+        assert_eq!(served, Served::Platform);
+        assert_eq!(configured.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn disabling_a_key_not_loaded_yet_still_keeps_the_configured_key_out() {
+        let reg = registry(ProviderKind::Openai);
+        let pools = Arc::new(TeamPools::default());
+        pools.remove_platform("p", "pk1", false);
+        let configured = AtomicUsize::new(0);
+        let err = platform_attempt(&pools, &reg, &configured, || Ok(()))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ProviderError::PlatformKeysDisabled { .. }));
+        assert_eq!(configured.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
