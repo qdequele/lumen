@@ -93,6 +93,9 @@ pub struct GroupRecord {
     /// e.g. the Lab account id. Keys in a group with an `account_ref` are
     /// billable when `[usage_events]` is configured.
     pub account_ref: Option<String>,
+    /// Bandwidth rate in micro-USD per 10^9 bytes (billing: the Lab pushes it
+    /// already divided by its markup); 0 = bandwidth is not charged.
+    pub bandwidth_micro_usd_per_gb: i64,
 }
 
 /// Parameters for creating a budget group.
@@ -118,6 +121,8 @@ pub struct GroupPatch {
     #[allow(clippy::option_option)]
     #[serde(default, deserialize_with = "double_option")]
     pub account_ref: Option<Option<String>>,
+    /// New bandwidth rate in micro-USD per 10^9 bytes (>= 0).
+    pub bandwidth_micro_usd_per_gb: Option<i64>,
 }
 
 /// The outcome of a [`KeyStore::delete_group`] call. A group with live
@@ -310,6 +315,9 @@ impl GroupPatch {
     pub fn validate(&self) -> Result<(), String> {
         if let Some(name) = &self.name {
             validate_name(name)?;
+        }
+        if self.bandwidth_micro_usd_per_gb.is_some_and(|rate| rate < 0) {
+            return Err("`bandwidth_micro_usd_per_gb` must be >= 0".to_owned());
         }
         validate_limits(self.budget_max, None, None, None)
     }
@@ -630,7 +638,8 @@ macro_rules! key_columns {
 /// Every `budget_groups` column a [`GroupRecord`] reads.
 macro_rules! group_columns {
     () => {
-        "id, name, budget_max, budget_spent, created_at, deleted_at, account_ref"
+        "id, name, budget_max, budget_spent, created_at, deleted_at, account_ref, \
+         bandwidth_micro_usd_per_gb"
     };
 }
 
@@ -1175,6 +1184,7 @@ impl KeyStore {
             account_ref: params
                 .account_ref
                 .map(crate::billing::canonical_account_ref),
+            bandwidth_micro_usd_per_gb: 0,
         };
         sqlx::query(
             "INSERT INTO budget_groups (id, name, budget_max, budget_spent, created_at, account_ref) \
@@ -1252,13 +1262,15 @@ impl KeyStore {
             "UPDATE budget_groups SET \
                name = COALESCE(?, name), \
                budget_max = COALESCE(?, budget_max), \
-               account_ref = CASE WHEN ? THEN ? ELSE account_ref END \
+               account_ref = CASE WHEN ? THEN ? ELSE account_ref END, \
+               bandwidth_micro_usd_per_gb = COALESCE(?, bandwidth_micro_usd_per_gb) \
              WHERE id = ? AND deleted_at IS NULL",
         )
         .bind(patch.name)
         .bind(patch.budget_max)
         .bind(ref_change)
         .bind(ref_value)
+        .bind(patch.bandwidth_micro_usd_per_gb)
         .bind(id)
         .execute(&self.pool)
         .await?

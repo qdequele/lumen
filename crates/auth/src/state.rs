@@ -75,14 +75,19 @@ pub fn micro_to_usd(micro: i64) -> f64 {
 /// remaining budget. Returns `false`, without reserving, when the addition
 /// would exceed the bound. Shared by the key budget and the group pool
 /// (ADR 009).
-fn reserve_micro(spent: &AtomicI64, max_bound: i64, reserve: i64) -> bool {
+///
+/// `hard_stop` also refuses a pool already at or past its cap when `reserve`
+/// is 0: team-key traffic has no token cost, so without it a pool with no
+/// credit left would keep admitting free-looking requests while bandwidth
+/// is the only thing that spends.
+fn reserve_micro(spent: &AtomicI64, max_bound: i64, reserve: i64, hard_stop: bool) -> bool {
     if max_bound == UNLIMITED {
         spent.fetch_add(reserve, Ordering::SeqCst);
         return true;
     }
     let mut current = spent.load(Ordering::SeqCst);
     loop {
-        if current.saturating_add(reserve) > max_bound {
+        if current.saturating_add(reserve) > max_bound || (hard_stop && current >= max_bound) {
             return false;
         }
         match spent.compare_exchange_weak(
@@ -128,6 +133,9 @@ pub struct GroupEntry {
     /// The control-plane account this pool is the lease of (ADR 015); swapped
     /// by admin PATCH. `None` = the pool's keys are never billed.
     account_ref: ArcSwapOption<String>,
+    /// Bandwidth rate in micro-USD per 10^9 bytes (Lab-pushed, markup already
+    /// divided out); 0 = bandwidth is not charged to the pool.
+    bandwidth_micro_per_gb: AtomicI64,
 }
 
 impl GroupEntry {
@@ -141,6 +149,7 @@ impl GroupEntry {
             signals,
             signal_state: SignalState::default(),
             account_ref: ArcSwapOption::from(record.account_ref.clone().map(Arc::new)),
+            bandwidth_micro_per_gb: AtomicI64::new(record.bandwidth_micro_usd_per_gb.max(0)),
         }
     }
 
@@ -155,6 +164,8 @@ impl GroupEntry {
         );
         self.account_ref
             .store(record.account_ref.clone().map(Arc::new));
+        self.bandwidth_micro_per_gb
+            .store(record.bandwidth_micro_usd_per_gb.max(0), Ordering::SeqCst);
         // A changed cap starts a new budget epoch (ADR 011 §1).
         self.rearm_signals();
     }
@@ -503,7 +514,7 @@ impl KeyEntry {
             }
         };
         let key_max = self.budget_max_micro.load(Ordering::SeqCst);
-        if !reserve_micro(&self.spent_micro, key_max, reserve) {
+        if !reserve_micro(&self.spent_micro, key_max, reserve, false) {
             unwind_windows(self);
             // First LM-4001 since this key last had headroom: signal the
             // billing backend (ADR 011 §1). Edge-triggered, so a key that
@@ -522,7 +533,7 @@ impl KeyEntry {
         let group = self.group.load_full();
         if let Some(group) = &group {
             let group_max = group.budget_max_micro.load(Ordering::SeqCst);
-            if !reserve_micro(&group.spent_micro, group_max, reserve) {
+            if !reserve_micro(&group.spent_micro, group_max, reserve, true) {
                 self.spent_micro.fetch_sub(reserve, Ordering::SeqCst);
                 // The refund is a spend change too: a flush may have drained
                 // the transiently inflated value between the reserve and this
@@ -1234,14 +1245,30 @@ impl KeyEntry {
         }
     }
 
-    /// Count client-facing body bytes for billable bandwidth. Marks the key
-    /// dirty so a bandwidth-only window is still flushed; budget charging is
-    /// not done here.
+    /// Count client-facing body bytes for billable bandwidth and charge them
+    /// at the key's group rate. Marks the key dirty so a bandwidth-only window
+    /// is still flushed.
+    ///
+    /// The charge, `ceil((bytes_in + bytes_out) * rate / 10^9)` micro-USD, goes
+    /// to the key's and the group's `spent_micro` only: `settled_micro` is the
+    /// platform-cost counter the Lab bills, and bandwidth reaches the Lab as
+    /// the byte units. A key with no group, or a group with rate 0, is not
+    /// charged. It can land after settlement (the body may finish later) and
+    /// may push the pool past its cap; the next admission is the one refused.
     pub fn add_bytes(&self, bytes_in: u64, bytes_out: u64) {
         let clamp = |n: u64| i64::try_from(n).unwrap_or(i64::MAX);
         self.bytes_in.fetch_add(clamp(bytes_in), Ordering::Relaxed);
         self.bytes_out
             .fetch_add(clamp(bytes_out), Ordering::Relaxed);
+        if let Some(group) = self.group.load_full() {
+            let rate = group.bandwidth_micro_per_gb.load(Ordering::SeqCst);
+            let charge = bandwidth_charge_micro(bytes_in, bytes_out, rate);
+            if charge > 0 {
+                saturating_add_micro(&self.spent_micro, charge);
+                saturating_add_micro(&group.spent_micro, charge);
+                group.dirty.store(true, Ordering::SeqCst);
+            }
+        }
         self.dirty.store(true, Ordering::SeqCst);
     }
 
@@ -1293,6 +1320,29 @@ impl KeyEntry {
         };
         item(settled, Some(delta))
     }
+}
+
+/// `ceil((bytes_in + bytes_out) * rate / 10^9)` in micro-USD, for a rate in
+/// micro-USD per 10^9 bytes. Integer math in `u128` (a `u64` sum times an
+/// `i64` rate cannot overflow it); the result clamps to `i64::MAX`. A
+/// non-positive rate charges nothing.
+fn bandwidth_charge_micro(bytes_in: u64, bytes_out: u64, rate_micro_per_gb: i64) -> i64 {
+    const GB: u128 = 1_000_000_000;
+    let Ok(rate) = u128::try_from(rate_micro_per_gb) else {
+        return 0;
+    };
+    let bytes = u128::from(bytes_in) + u128::from(bytes_out);
+    let charge = (bytes * rate).div_ceil(GB);
+    i64::try_from(charge).unwrap_or(i64::MAX)
+}
+
+/// `counter += amount`, saturating at `i64::MAX` instead of wrapping.
+fn saturating_add_micro(counter: &AtomicI64, amount: i64) {
+    // `fetch_update`: see `grant_cap` for why not `try_update`.
+    #[allow(deprecated)]
+    let _ = counter.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+        Some(current.saturating_add(amount))
+    });
 }
 
 /// Atomically raise a budget cap by `amount_micro` (admin grant). Two rules,
@@ -1444,5 +1494,108 @@ mod tests {
         assert_eq!(window_remaining_secs(60), 60);
         // Pre-epoch clocks still produce a sane hint.
         assert_eq!(window_remaining_secs(-1), 1);
+    }
+
+    /// A one-key, one-group state; the group has `budget_max` USD (or none),
+    /// `spent` USD already spent and a bandwidth `rate`.
+    fn bandwidth_fixture(
+        budget_max: Option<f64>,
+        spent: f64,
+        rate: i64,
+        grouped: bool,
+    ) -> (Arc<KeyEntry>, Option<Arc<GroupEntry>>) {
+        let group = GroupRecord {
+            id: "g".to_owned(),
+            name: "g".to_owned(),
+            budget_max,
+            budget_spent: spent,
+            created_at: 0,
+            deleted_at: None,
+            account_ref: None,
+            bandwidth_micro_usd_per_gb: rate,
+        };
+        let key = VirtualKeyRecord {
+            id: "k".to_owned(),
+            name: "k".to_owned(),
+            group_id: grouped.then(|| "g".to_owned()),
+            budget_max: None,
+            budget_spent: 0.0,
+            rpm_limit: None,
+            tpm_limit: None,
+            expires_at: None,
+            disabled: false,
+            created_at: 0,
+            deleted_at: None,
+            external_ref: None,
+            billed_micro: 0,
+        };
+        let state = AuthState::load(vec![group], vec![(hash_key("sk"), key)]);
+        let entry = state.authenticate("sk", 0).expect("key");
+        (entry, state.group("g"))
+    }
+
+    #[test]
+    fn add_bytes_charges_group_at_its_rate() {
+        let (key, group) = bandwidth_fixture(Some(100.0), 0.0, 100_000, true);
+        let group = group.expect("group");
+        key.add_bytes(400_000_000, 600_000_000);
+        // 1 GB at 100000 micro-USD/GB.
+        assert_eq!(group.spent_micro(), 100_000);
+        assert_eq!(key.spent_micro(), 100_000);
+        // Spent, never settled: the Lab bills the bandwidth units itself.
+        assert_eq!(key.settled_micro.load(Ordering::SeqCst), 0);
+        assert!(group.dirty.load(Ordering::SeqCst), "group flushed");
+        assert!(key.dirty.load(Ordering::SeqCst), "key flushed");
+    }
+
+    #[test]
+    fn add_bytes_rounds_the_charge_up() {
+        let (key, group) = bandwidth_fixture(None, 0.0, 83_333, true);
+        key.add_bytes(1, 0);
+        // ceil(1 * 83333 / 10^9) = 1 micro-USD.
+        assert_eq!(group.expect("group").spent_micro(), 1);
+        key.add_bytes(0, 0);
+        assert_eq!(key.spent_micro(), 1, "zero bytes charge nothing");
+    }
+
+    #[test]
+    fn add_bytes_with_zero_rate_charges_nothing() {
+        let (key, group) = bandwidth_fixture(Some(100.0), 0.0, 0, true);
+        key.add_bytes(400_000_000, 600_000_000);
+        assert_eq!(group.expect("group").spent_micro(), 0);
+        assert_eq!(key.spent_micro(), 0);
+        assert_eq!(key.bytes_in.load(Ordering::Relaxed), 400_000_000);
+    }
+
+    #[test]
+    fn add_bytes_without_a_group_only_counts_bytes() {
+        let (key, _) = bandwidth_fixture(Some(100.0), 0.0, 100_000, false);
+        key.add_bytes(1_000_000_000, 1_000_000_000);
+        assert_eq!(key.spent_micro(), 0);
+        assert_eq!(key.bytes_out.load(Ordering::Relaxed), 1_000_000_000);
+    }
+
+    #[test]
+    fn add_bytes_charge_cannot_overflow() {
+        let (key, group) = bandwidth_fixture(None, 0.0, i64::MAX, true);
+        key.add_bytes(u64::MAX, u64::MAX);
+        assert_eq!(group.expect("group").spent_micro(), i64::MAX);
+    }
+
+    #[test]
+    fn zero_remaining_group_budget_refuses_zero_estimate() {
+        let (key, _) = bandwidth_fixture(Some(5.0), 5.0, 0, true);
+        assert!(matches!(
+            key.admit(0, 0, 0),
+            Err(GatewayError::BudgetExceeded {
+                scope: BudgetScope::Group
+            })
+        ));
+    }
+
+    #[test]
+    fn group_with_headroom_admits_zero_estimate() {
+        let (key, _) = bandwidth_fixture(Some(5.0), 4.0, 0, true);
+        assert!(key.admit(0, 0, 0).is_ok());
     }
 }

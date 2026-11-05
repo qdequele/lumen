@@ -643,3 +643,58 @@ async fn grant_group_budget_to_an_uncapped_group_is_refused_and_writes_nothing()
     assert_eq!(rows[0].budget_max, None);
     assert_eq!(rows[0].budget_spent, 0.0);
 }
+
+#[tokio::test]
+async fn bandwidth_charge_is_flushed_to_key_and_group_rows() {
+    // The bandwidth charge lands in spent only, and the existing flush paths
+    // (`persist_flush` for the key, `persist_group_budgets` for the pool)
+    // persist it: after a reload the stored spend includes it.
+    let store = KeyStore::in_memory().await.expect("open store");
+    let group = store.create_group(new_group("bw")).await.expect("group");
+    store
+        .update_group(
+            &group.id,
+            GroupPatch {
+                bandwidth_micro_usd_per_gb: Some(100_000),
+                ..GroupPatch::default()
+            },
+        )
+        .await
+        .expect("patch")
+        .expect("group exists");
+    let (plaintext, key) = store
+        .create_key(member_key("m", &group.id))
+        .await
+        .expect("key");
+
+    let state = lumen_auth::state::AuthState::load(
+        store.load_groups().await.expect("groups"),
+        store.load_auth_entries().await.expect("entries"),
+    );
+    let entry = state
+        .authenticate(plaintext.reveal(), 0)
+        .expect("authenticates");
+    entry.add_bytes(400_000_000, 600_000_000);
+
+    let batch = state.drain_flush(1_000);
+    store
+        .persist_flush(&batch.rows(), &[])
+        .await
+        .expect("persist key");
+    state.commit_flush(batch);
+    store
+        .persist_group_budgets(&state.drain_dirty_groups())
+        .await
+        .expect("persist group");
+
+    // 1 GB at 100000 micro-USD/GB = $0.10.
+    let stored_key = store.get_key(&key.id).await.expect("get").expect("key");
+    assert_eq!(stored_key.budget_spent, 0.1);
+    let stored_group = store
+        .get_group(&group.id)
+        .await
+        .expect("get")
+        .expect("group");
+    assert_eq!(stored_group.budget_spent, 0.1);
+    assert_eq!(stored_group.bandwidth_micro_usd_per_gb, 100_000);
+}

@@ -19,6 +19,7 @@ fn group(account_ref: Option<&str>) -> GroupRecord {
         created_at: 0,
         deleted_at: None,
         account_ref: account_ref.map(str::to_owned),
+        bandwidth_micro_usd_per_gb: 0,
     }
 }
 

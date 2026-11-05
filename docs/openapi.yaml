@@ -507,11 +507,12 @@ components:
         external_ref: { type: [string, "null"], minLength: 1, maxLength: 128 }
     Group:
       type: object
-      required: [id, name, budget_max, budget_spent, created_at, deleted_at, account_ref]
+      required: [id, name, budget_max, budget_spent, created_at, deleted_at, account_ref, bandwidth_micro_usd_per_gb]
       properties:
         id: { type: string }
         name: { type: string }
         budget_max: { type: [number, "null"], description: "USD; null when unlimited." }
+        bandwidth_micro_usd_per_gb: { type: integer, minimum: 0, description: "Bandwidth rate charged to the pool, micro-USD per 10^9 bytes (the Lab pushes it already divided by its markup); 0 = not charged. Spent only, never settled. A pool at or past its cap refuses every request with `LM-4001`, even one that costs nothing in tokens." }
         budget_spent: { type: number, description: "USD, as last flushed." }
         created_at: { type: integer }
         deleted_at: { type: [integer, "null"] }
@@ -538,6 +539,7 @@ components:
         name: { type: string, minLength: 1 }
         budget_max: { type: number, minimum: 0, maximum: 1000000000000 }
         account_ref: { type: [string, "null"], minLength: 1, maxLength: 128 }
+        bandwidth_micro_usd_per_gb: { type: integer, minimum: 0, description: "Bandwidth rate in micro-USD per 10^9 bytes; negative is 400 `LM-1001`." }
     Grant:
       type: object
       required: [amount]
