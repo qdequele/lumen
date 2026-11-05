@@ -553,7 +553,7 @@ components:
       required: [key, label]
       additionalProperties: false
       properties:
-        key: { type: string, minLength: 1, description: The provider API key. Sealed at rest, never returned or logged. }
+        key: { type: string, minLength: 16, maxLength: 1024, description: "The provider API key, 16 characters to 1024 bytes after trimming. Sealed at rest, never returned or logged." }
         label: { type: string, minLength: 1, maxLength: 64 }
     GroupView:
       allOf:
@@ -1205,6 +1205,10 @@ paths:
       - { name: provider, in: path, required: true, schema: { type: string } }
     put:
       summary: Turn the platform-key fallback on or off for one pool
+      description: |
+        A provider whose kind does not take a team key (Azure, Bedrock,
+        Google/Vertex, keyless kinds) is 400 `LM-1001`. An unknown provider
+        is 404 `LM-1003`.
       operationId: putTeamProvider
       security: [{ masterKey: [] }]
       requestBody:
@@ -1226,8 +1230,10 @@ paths:
       summary: Add a team key to a provider pool
       description: |
         The key is sealed with the master key and never returned. At most 10
-        keys per (group, provider); the 11th is 400 `LM-1001`, as are an
-        ineligible provider kind, an empty key and a label outside 1 to 64
+        keys per (group, provider); the 11th is 400 `LM-1001`, as are a
+        provider whose kind does not take a team key (Azure, Bedrock,
+        Google/Vertex, keyless kinds), a key shorter than 16 characters or
+        longer than 1024 bytes after trimming, and a label outside 1 to 64
         characters. An unknown provider is 404 `LM-1003`.
       operationId: addTeamKey
       security: [{ masterKey: [] }]

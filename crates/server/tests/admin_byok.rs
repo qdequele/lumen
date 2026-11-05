@@ -348,6 +348,31 @@ async fn ineligible_provider_kind_is_rejected() {
 }
 
 #[tokio::test]
+async fn short_key_is_rejected() {
+    // `last4` of a short key would reveal most of it: under 16 characters
+    // (after trimming) is refused.
+    let h = spawn(CONFIG_TOML).await;
+    let group = h.group(ACCOUNT_A).await;
+    for key in ["sk-short-123456", "   sk-short-123456   ", "abcd"] {
+        let (status, error) = h.add_key(&group, "openai-main", key, "prod").await;
+        assert_eq!(status, 400, "key={key:?}: {error}");
+        assert_eq!(error["error"]["code"], "LM-1001");
+        assert_eq!(
+            error["error"]["message"], "invalid request: `key` must be at least 16 characters",
+            "{error}"
+        );
+    }
+    let (_, listing) = h.list(&group).await;
+    assert_eq!(provider(&listing, "openai-main")["keys"], json!([]));
+    // Exactly 16 characters is accepted.
+    let (status, created) = h
+        .add_key(&group, "openai-main", " sk-short-1234567 ", "prod")
+        .await;
+    assert_eq!(status, 201, "{created}");
+    assert_eq!(created["last4"], "4567");
+}
+
+#[tokio::test]
 async fn eleventh_key_is_rejected() {
     let h = spawn(CONFIG_TOML).await;
     let group = h.group(ACCOUNT_A).await;

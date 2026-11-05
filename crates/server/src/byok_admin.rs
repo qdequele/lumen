@@ -29,6 +29,9 @@ use serde::{Deserialize, Serialize};
 const MAX_LABEL_CHARS: usize = 64;
 /// Longest accepted key, in bytes (real provider keys are far shorter).
 const MAX_KEY_BYTES: usize = 1024;
+/// Shortest accepted key, in characters: `last4` of a shorter key would
+/// reveal too much of it.
+const MIN_KEY_CHARS: usize = 16;
 
 /// `POST .../keys` body.
 #[derive(Deserialize)]
@@ -143,6 +146,8 @@ fn ineligible(provider: &ProviderConfig) -> ApiError {
 fn request_reload(state: &AppState) {
     if let Some(trigger) = &state.reload_trigger {
         trigger.notify_one();
+    } else {
+        tracing::warn!("team key stored; no reloader armed, applies at restart");
     }
 }
 
@@ -203,7 +208,8 @@ pub async fn list_team_providers(
 ///
 /// # Errors
 /// `LM-1003` (404) for an unknown group or provider; `LM-1001` (400) for an
-/// ineligible kind, an empty key, a bad label or a full pool.
+/// ineligible kind, a key shorter than 16 characters, a bad label or a
+/// full pool.
 pub async fn add_team_key(
     State(state): State<AppState>,
     Path((id, provider)): Path<(String, String)>,
@@ -215,8 +221,11 @@ pub async fn add_team_key(
     // JsonRejection text describes the shape, never echoes field values.
     let Json(body) = payload.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
     let key = body.key.trim();
-    if key.is_empty() {
-        return Err(GatewayError::InvalidRequest("`key` must not be empty".to_owned()).into());
+    if key.chars().count() < MIN_KEY_CHARS {
+        return Err(GatewayError::InvalidRequest(format!(
+            "`key` must be at least {MIN_KEY_CHARS} characters"
+        ))
+        .into());
     }
     if key.len() > MAX_KEY_BYTES {
         return Err(GatewayError::InvalidRequest(format!(
