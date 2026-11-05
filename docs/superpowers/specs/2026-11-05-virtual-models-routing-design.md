@@ -1,6 +1,6 @@
 # Virtual models on the hosted Gateway: catalog, routing and composite pipelines
 
-- Date: 2026-11-05 (revised the same day with Quentin's decisions, section 0)
+- Date: 2026-11-05 (revised twice the same day with Quentin's decisions, section 0)
 - Status: proposal (research and design only, nothing implemented)
 - Repos: Lumen (engine), meilisearch-lab (`saas/` proxy, `console/` admin UI, `contracts/`)
 - Builds on: ADR 003 (token accounting), ADR 005 (resilience), ADR 009 (groups),
@@ -15,12 +15,16 @@
    billed per token at the platform rate; a call served on the team's own keys
    (BYOK) is billed bandwidth only. No flat per-slug price.
 2. **The customer pays for failed attempts.** Meilisearch does not absorb them.
-   *Quentin's message was cut off right after this point: more detail on this
-   item may follow, so section 4.4 rule 3 is provisional.*
+   Confirmed: a failed call is billed what the upstream reported, or the input-token
+   estimate when it reported nothing; nothing is billed when nothing was sent
+   upstream (section 4.4 rule 3).
 3. **Teams own virtual models under their own namespace**, `<namespace>/<model>`.
    Namespaces are globally unique, derived by default from the team admin's email
    domain (`acme`, falling back to `acme-com`), and a team must never be able to
-   take another company's name. `meilisearch/` stays reserved for staff.
+   take another company's name. `meilisearch/` stays reserved for staff. When
+   several teams belong to the same company, **the first team to claim the
+   domain-derived namespace gets it**; later teams on that domain get the next
+   fallback (`acme-com`, then a custom name), never the taken one (section 4.2).
 4. **Routing is invisible to the caller.** To the customer who calls it, a virtual
    model is a normal model. The owner (the team admin for `<namespace>/*`, staff for
    `meilisearch/*`) sees exactly what happens. Routing analytics (share of traffic
@@ -29,6 +33,12 @@
    ADR 014 rule that remap text is never client-supplied, for an explicit,
    bounded field (section 4.6).
 6. **Stable slugs only.** No dated, pinned slugs.
+7. **A platform key pool replaces the env key.** Once a provider has a platform
+   key pool, its env key is ignored; the env key serves only providers without a
+   pool. "Meilisearch's keys" (platform keys) means exactly that throughout.
+8. **Staff writes need the admin or owner role in the Meilisearch team**, not just
+   membership, and every staff action goes to a persistent audit log, browsable at
+   `admin/audit` in the console (section 4.8).
 
 Still open: section 6.
 
@@ -63,7 +73,7 @@ for failover, hiding the routing from callers, and the console UI.
 | Observability | `x-lumen-route`, `x-lumen-model-used`, `usage_log.route`, `lumen_virtual_model_requests_total{virtual_model, model_used}`. |
 | Admin API | `GET/PUT/DELETE /admin/config/virtual_models/{id}` with `If-Match`, `GET .../{id}/plan`, dependency safety on delete. |
 | Billing | Tokens and cost booked to the foundation leaf that served (for a remap, the decisions model). |
-| BYOK (ADR 018) | Chain lock on the flattened attempt list: once a fallback-off team link is reached, later links with no team pool refuse (`LM-3021`), so a virtual-model chain can never silently reach platform keys. `TeamKeysExhausted` moves on like `rate_limited`. Team-served links have their own breakers. |
+| BYOK (ADR 018) | Chain lock on the flattened attempt list: once a fallback-off team link is reached, later links with no team pool refuse (`LM-3021`), so a virtual-model chain can never silently reach platform keys (Meilisearch's keys: the provider's platform key pool, or its env key only while it has no pool). `TeamKeysExhausted` moves on like `rate_limited`. Team-served links have their own breakers. |
 
 ### 2.2 Designed but not built (Lumen `docs/backlog.md`, ADR 014 non-goals)
 
@@ -86,7 +96,8 @@ for failover, hiding the routing from callers, and the console UI.
    `saas/test/services/instance_allowlist_test.rb`), and Lumen refuses
    `/admin/config` for account-scoped calls (`403 LM-4005`).
 2. **No staff gating in the Lab on `main`.** It is being built (gated on
-   membership of one Lab team, section 4.7); `console/src/app/(lab)/admin/gateway/`
+   the Meilisearch Lab team, with writes limited to its admins and owners,
+   section 4.8); `console/src/app/(lab)/admin/gateway/`
    does not exist on `main` yet.
 3. **No console UI for virtual models at all.** The Models page lists ids; only
    `UsageRow.route` is typed in `console/src/lib/lumen/types.ts`.
@@ -226,14 +237,22 @@ company's domain.
    registrable part with the Public Suffix List (`mail.acme.co.uk` gives
    `acme.co.uk`).
 2. **Default name.** The first label, slugified: `acme.com` gives `acme`.
-3. **Fallback when taken.** The whole registrable domain with dots as hyphens:
-   `acme-com`, `acme-io`, `acme-co-uk`. If even that is taken (a second team at
-   the same company), the Lab offers `acme-com-<suffix>`, where the admin picks the
-   suffix: the name still carries the proven domain.
+3. **First claim wins; later teams get the next fallback.** Several teams can
+   belong to the same company (there is no organization level in the Lab). The
+   first team whose verified admin claims the domain-derived name gets it. A later
+   team on the same domain does not get it, and is not offered it: it gets the
+   next free fallback, in this order:
+   1. the whole registrable domain with dots as hyphens: `acme-com`, `acme-io`,
+      `acme-co-uk`;
+   2. then a custom name the admin types. It goes through the same checks as any
+      name (reserved list, rule 4, rule 5); a name that keeps the domain, such as
+      `acme-com-legal`, stays domain-locked to that company.
+   Teams never share a namespace, and the first holder keeps it until staff move
+   it (rule 6).
 4. **Domain-locked names.** A namespace equal to a domain's first label or to
    its hyphenated form (`acme`, `acme-com`, `acme-com-*`) can only be granted to a
    team whose admin has a verified email at that domain. Nobody can type `acme`
-   by hand.
+   by hand, and a verified acme.com admin can only take it while it is free.
 5. **Free-mail and disposable domains get no domain-derived name.** `gmail.com`,
    `outlook.com`, `hotmail.com`, `yahoo.com`, `icloud.com`, `proton.me`,
    `gmx.*`, plus a maintained disposable-domain list. These teams choose a custom
@@ -241,8 +260,9 @@ company's domain.
    personal namespace can never look like a company. A custom slug is also
    refused when it matches the first label of a domain in a top-sites list (for
    example the Tranco top 100k), as an extra guard.
-6. **Disputes and overrides.** Staff can assign, rename or revoke any namespace
-   from the admin area (audit-logged). A company that finds its name taken, for
+6. **Disputes and overrides.** Staff (admin or owner of the Meilisearch team,
+   4.8) can assign, rename or revoke any namespace from the admin area; each action
+   is written to the audit log. A company that finds its name taken, for
    example by an employee's side team, proves domain ownership with a DNS TXT
    record (`_meilisearch-lab.acme.com TXT "lab-namespace=<token>"`); on success
    staff transfer the namespace. The previous holder gets the fallback name and
@@ -298,12 +318,14 @@ Rules:
 1. **Every model that ran is billed.** The model that answered, every decisions
    model that scored (remap) or, later, routed (`classify`, `semantic`), and every
    cascade stage. A remap that fans out into N batched Jev calls is N call records.
-2. **Who pays depends on whose key served each call.** Platform key: tokens at
-   the model's price, reported in `tokens_in`/`tokens_out` and
+2. **Who pays depends on whose key served each call.** Platform key
+   (Meilisearch's key for that provider: its platform key pool when it has one, the
+   env key being ignored then; the env key only for a provider without a pool):
+   tokens at the model's price, reported in `tokens_in`/`tokens_out` and
    `provider_cost_micro_usd`. Team key (BYOK): no token cost, tokens reported as
    `byok_tokens_in`/`byok_tokens_out` for information. One request can mix both,
    call by call.
-3. **Failed attempts are billed (provisional, see section 0).** A failed call
+3. **Failed attempts are billed (decided, section 0).** A failed call
    (upstream 5xx, timeout, 429, malformed response, a stream that broke) is
    billed what the upstream reported for it. When the upstream reported no usage,
    which is the common case for errors, it is billed the ADR 003 input estimate
@@ -399,6 +421,11 @@ Safety and injection boundary:
 
 ### 4.7 BYOK and "never fall back to Meilisearch keys"
 
+"Meilisearch's keys" (platform keys) for a provider are its platform key pool
+when one is configured. Once a provider has a pool, its env key is ignored: no
+request, BYOK fallback or cascade stage reaches it. The env key serves only
+providers without a pool. Everything below that says "platform keys" means this.
+
 The ADR 018 chain lock already applies to virtual models, because it runs on the
 flattened attempt list. This design adds:
 
@@ -423,23 +450,36 @@ flattened attempt list. This design adds:
 
 **Proxy and auth (`saas/`).**
 
-- **Staff** are the members of the Lab team `93a9f14d-b6f1-438e-8cd2-263dc85df1d5`
-  (the gating another agent is implementing now). New proxy rules for the
-  built-in hosted instance only, allowed for staff:
-  `GET /admin/config/virtual_models`, `GET|PUT|DELETE /admin/config/virtual_models/:id`,
-  `GET /admin/config/virtual_models/:id/plan`, the platform stats route, and
-  read-only `GET /admin/config/providers` for the target picker. Never forwarded
-  with `X-Lumen-Account-Ref`. Namespace assignment, rename and transfer are staff
-  actions too.
+- **Staff** are the members of the Meilisearch Lab team
+  `93a9f14d-b6f1-438e-8cd2-263dc85df1d5` (the gating another agent is implementing
+  now). New proxy rules for the built-in hosted instance only:
+  - reads, for any staff member: `GET /admin/config/virtual_models`,
+    `GET /admin/config/virtual_models/:id`, `GET /admin/config/virtual_models/:id/plan`,
+    the platform stats route, and `GET /admin/config/providers` for the target
+    picker;
+  - writes, only for staff with the **admin or owner role in the Meilisearch
+    team**: `PUT|DELETE /admin/config/virtual_models/:id` (and its `dry_run`),
+    archive and restore, and namespace assignment, rename, revoke and transfer.
+    Other staff members get the same pages read-only.
+
+  Never forwarded with `X-Lumen-Account-Ref`.
 - **Team admins** (`useLabRole().can("admin")`) get the account-scoped
   `/admin/groups/{id}/virtual_models*` and stats routes for their own group; other
   members read only.
-- Every write is recorded in a Lab audit table (who, model id, before and after
-  hash).
+- **Audit log.** Every staff action (virtual model create, update, archive,
+  restore, delete; namespace assign, rename, revoke, transfer) and every team
+  virtual-model write goes to a persistent Lab audit log: who, their role, team,
+  action, target (model id or namespace), before and after hash, request id, time.
+  Rows are append-only and kept, not pruned with usage data. Staff browse it at
+  `admin/audit` (section below).
 - Lumen gains `?dry_run=true` on both PUT routes (validate, return the compiled
   plan, persist nothing) so the editor shows errors before saving.
 
-**Staff area: `console/src/app/(lab)/admin/gateway/virtual-models/`.**
+**Staff area: `console/src/app/(lab)/admin/gateway/virtual-models/`.** Every
+staff member can open it; create, edit, archive, restore, delete and the
+namespace actions are shown only to Meilisearch-team admins and owners (the
+others see the same pages read-only, with no Save button). The proxy enforces the
+same rule, so hiding the controls is a convenience, not the check.
 
 - **List.** Model id, display name, capability, strategy, status, groups,
   requests and error rate over 24 h. Filters by capability and status. Archive and
@@ -461,15 +501,21 @@ flattened attempt list. This design adds:
   (route, calls, latency, cost per call) since staff are the owner. For rerank, a
   query, optional instructions and documents, scores side by side with a plain
   reranker.
-- **Namespaces page.** All namespaces with source (domain, custom, staff),
-  verified domain, assign, rename, transfer after DNS verification.
+- **Namespaces page.** All namespaces with source (domain, custom, staff), the
+  team that holds each and when it claimed it, verified domain; assign, rename,
+  revoke, transfer after DNS verification (admins and owners only).
+- **Audit page: `console/src/app/(lab)/admin/audit/`.** The persistent audit log
+  of every staff action, newest first, filterable by actor, action, target and
+  date, each row linking to the model or namespace it touched and showing the
+  before and after hashes. Read-only, for staff.
 
 **Team console (`console/src/app/(lab)/gateway/[slug]/`).**
 
 - **Virtual models page** (new): the same list, editor, plan, analytics and try
   components for the team's `<namespace>/*` models, editable by team admins. The
-  first visit asks for the namespace (4.2 flow, pre-filled from the verified
-  domain). The editor components are now used by two features; they can move to
+  first visit asks for the namespace (4.2 flow, pre-filled with the first free
+  name for the verified domain: `acme`, else `acme-com`, else an empty field for a
+  custom name). The editor components are now used by two features; they can move to
   a shared location under the gateway section, still short of the 3-feature
   threshold for top-level `components/`.
 - **Models page:** `meilisearch/*` models are listed like any model (display name,
@@ -531,11 +577,12 @@ targets = [{ model = "openai/gpt-4o-mini" }, { model = "anthropic/claude-haiku-4
    admission estimate, `usage_calls`, hidden routing on hosted, rerank
    `instructions` (amends ADR 014 decision 7), BYOK preference, `dry_run`,
    stats routes. Re-vendor Lumen's OpenAPI in `meilisearch-lab/contracts/`.
-2. Lab: namespace registry and assignment flow (PSL, free-mail list, DNS TXT
-   verification, staff override), staff proxy rules on the staff team, team proxy
-   rules, audit log, pushing `namespace` with the group.
-3. Console: staff area (list, editor, plan, analytics, try, namespaces), team
-   virtual models page, Models and Usage page changes.
+2. Lab: namespace registry and assignment flow (first claim wins, PSL, free-mail
+   list, DNS TXT verification, staff override), staff proxy rules (reads for the
+   staff team, writes for its admins and owners), team proxy rules, persistent
+   audit log, pushing `namespace` with the group.
+3. Console: staff area (list, editor, plan, analytics, try, namespaces,
+   `admin/audit`), team virtual models page, Models and Usage page changes.
 4. Later: `rank = "latency"`, least-busy, caps, sticky split, history and
    rollback, `classify`/`semantic`, embedding-similarity reranker, fusion.
 
@@ -547,13 +594,8 @@ targets = [{ model = "openai/gpt-4o-mini" }, { model = "anthropic/claude-haiku-4
 2. **Latency state.** Is a per-instance latency EWMA good enough, or does the
    hosted gateway run enough replicas to need shared state (which ADR 014 avoided
    on purpose)?
-3. **Staff identity.** The Lab team `93a9f14d-b6f1-438e-8cd2-263dc85df1d5` is the
-   gate being implemented. Keep it long-term, or move to an SSO group later?
-4. **Failed attempts, remaining detail.** Quentin's answer was cut off after
-   "the customer pays for failed attempts too". To confirm: billing the input
-   estimate when the upstream reports no usage, billing retries inside a leaf,
-   and not billing circuit-open skips and chain-lock refusals.
-5. **Namespace edge cases.** Is `acme-com-<suffix>` right for a second team at
-   the same company, or should several teams of one company share a namespace
-   (an organization level the Lab does not have yet)? Is `u-` acceptable as the
-   free-mail prefix?
+3. **Staff identity.** The Lab team `93a9f14d-b6f1-438e-8cd2-263dc85df1d5` (writes
+   for its admins and owners) is the gate being implemented. Keep it long-term, or
+   move to an SSO group later?
+4. **Free-mail prefix.** Is `u-` acceptable as the prefix of free-mail teams'
+   custom namespaces?
