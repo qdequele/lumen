@@ -1,15 +1,15 @@
 //! Assembly of the axum application and its middleware stack.
 
 use crate::{
-    admin, admin_scope, auth, chat, decisions, embeddings, health, models, openapi, rerank, routes,
-    state::AppState,
+    admin, admin_scope, auth, byok_admin, chat, decisions, embeddings, health, models, openapi,
+    rerank, routes, state::AppState,
 };
 use axum::extract::{MatchedPath, Request, State};
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::{
     middleware::{self, Next},
-    routing::{get, patch, post, put},
+    routing::{delete, get, patch, post, put},
     Router,
 };
 use lumen_core::GatewayError;
@@ -294,6 +294,22 @@ fn admin_routes(state: &AppState) -> Router<AppState> {
                 .delete(admin::delete_group),
         )
         .route("/admin/groups/{id}/grant", post(admin::grant_group))
+        .route(
+            "/admin/groups/{id}/byok",
+            get(byok_admin::list_team_providers),
+        )
+        .route(
+            "/admin/groups/{id}/byok/{provider}",
+            put(byok_admin::put_team_provider),
+        )
+        .route(
+            "/admin/groups/{id}/byok/{provider}/keys",
+            post(byok_admin::add_team_key),
+        )
+        .route(
+            "/admin/groups/{id}/byok/{provider}/keys/{key_id}",
+            delete(byok_admin::delete_team_key),
+        )
         .route("/admin/usage", get(admin::usage_report))
         .route("/admin/usage/export", get(admin::usage_export));
     let platform = Router::new()

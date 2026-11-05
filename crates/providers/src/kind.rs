@@ -92,6 +92,31 @@ impl ProviderKind {
         }
     }
 
+    /// Whether a team may bring its own key for this kind (BYOK): kinds that
+    /// take a plain API key on the vendor's own URL. Cloud-credential kinds
+    /// (Azure, Bedrock, Google, Vertex), self-hosted and keyless kinds are
+    /// not.
+    #[must_use]
+    pub const fn byok_eligible(self) -> bool {
+        matches!(
+            self,
+            ProviderKind::Openai
+                | ProviderKind::Anthropic
+                | ProviderKind::Mistral
+                | ProviderKind::Cohere
+                | ProviderKind::Jina
+                | ProviderKind::Voyage
+                | ProviderKind::Groq
+                | ProviderKind::Together
+                | ProviderKind::Fireworks
+                | ProviderKind::Deepseek
+                | ProviderKind::Openrouter
+                | ProviderKind::Perplexity
+                | ProviderKind::Xai
+                | ProviderKind::Deepinfra
+        )
+    }
+
     /// Whether this kind is served by the OpenAI provider (OpenAI-compatible
     /// `/chat/completions` + `/embeddings`).
     #[must_use]
@@ -193,6 +218,46 @@ impl ProviderKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn byok_eligible_is_exactly_the_plain_api_key_kinds() {
+        let eligible = [
+            ProviderKind::Openai,
+            ProviderKind::Anthropic,
+            ProviderKind::Mistral,
+            ProviderKind::Cohere,
+            ProviderKind::Jina,
+            ProviderKind::Voyage,
+            ProviderKind::Groq,
+            ProviderKind::Together,
+            ProviderKind::Fireworks,
+            ProviderKind::Deepseek,
+            ProviderKind::Openrouter,
+            ProviderKind::Perplexity,
+            ProviderKind::Xai,
+            ProviderKind::Deepinfra,
+        ];
+        for kind in eligible {
+            assert!(kind.byok_eligible(), "{kind:?}");
+        }
+        for kind in [
+            ProviderKind::Azure,
+            ProviderKind::Bedrock,
+            ProviderKind::Google,
+            ProviderKind::VertexAi,
+            ProviderKind::Ollama,
+            ProviderKind::Tei,
+            ProviderKind::Vllm,
+            ProviderKind::Nvidia,
+            ProviderKind::Cloudflare,
+            ProviderKind::Huggingface,
+            ProviderKind::Mixedbread,
+            ProviderKind::Pinecone,
+            ProviderKind::Typesafe,
+        ] {
+            assert!(!kind.byok_eligible(), "{kind:?}");
+        }
+    }
 
     #[test]
     fn hosted_kinds_without_an_upstream_embeddings_api_report_it() {

@@ -12,6 +12,7 @@ pub mod app;
 pub mod auth;
 pub mod bandwidth;
 pub mod budget_flush;
+pub mod byok_admin;
 pub mod chat;
 pub mod config;
 pub mod config_edit;

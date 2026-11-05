@@ -178,7 +178,7 @@ pub async fn check_provider_key(
 }
 
 /// Map an auth-layer failure to an opaque 500 - never a misleading 401.
-fn internal(error: &lumen_auth::AuthError) -> ApiError {
+pub(crate) fn internal(error: &lumen_auth::AuthError) -> ApiError {
     GatewayError::Internal(error.to_string()).into()
 }
 
@@ -209,7 +209,7 @@ fn unknown_group(id: &str) -> ApiError {
     GatewayError::NotFound(format!("unknown group id '{id}'")).into()
 }
 
-fn runtime(state: &AppState) -> Result<&crate::auth::AuthRuntime, ApiError> {
+pub(crate) fn runtime(state: &AppState) -> Result<&crate::auth::AuthRuntime, ApiError> {
     state
         .auth
         .as_deref()
@@ -1819,7 +1819,7 @@ fn stale_config_error() -> ApiError {
 /// Map a [`ConfigSourceError`] from `load`/`persist` (I/O, DB, not-UTF-8) to
 /// an opaque 500: never a client mistake, and never safe to echo back
 /// (a filesystem or database detail).
-fn source_internal_error(error: &ConfigSourceError) -> ApiError {
+pub(crate) fn source_internal_error(error: &ConfigSourceError) -> ApiError {
     GatewayError::Internal(error.to_string()).into()
 }
 
@@ -1927,7 +1927,7 @@ fn describe_validation_rejection(error: &ConfigLoadError) -> ApiError {
 /// here can only mean the STORED document itself is corrupt - an internal
 /// inconsistency, never a client mistake, hence the opaque 500 rather than
 /// any `LM-1001`.
-fn config_from_document(text: &str) -> Result<Config, ApiError> {
+pub(crate) fn config_from_document(text: &str) -> Result<Config, ApiError> {
     toml::from_str::<Config>(text).map_err(|error| {
         tracing::error!(
             %error,
@@ -2108,6 +2108,23 @@ pub async fn delete_provider(
                 %error,
                 "provider deleted but its stored key could not be removed"
             );
+        }
+        // Team key pools and their fallback settings go with the provider
+        // too, still under the config lock, so a re-created provider of the
+        // same name starts with empty pools.
+        if let Err(error) = auth
+            .store
+            .delete_group_provider_data_for_provider(&name)
+            .await
+        {
+            tracing::warn!(
+                provider = %name,
+                %error,
+                "provider deleted but its team key pools could not be removed"
+            );
+        }
+        if let Some(trigger) = &state.reload_trigger {
+            trigger.notify_one();
         }
     }
     Ok(StatusCode::NO_CONTENT)
@@ -2511,7 +2528,7 @@ pub async fn put_config_section(
 /// honest answer, not a client error, because nothing the caller sent caused
 /// it; a 404 (`GatewayError::NotFound`) would blame the caller for a server
 /// that was simply built without one.
-fn config_ctx(state: &AppState) -> Result<Arc<ConfigContext>, ApiError> {
+pub(crate) fn config_ctx(state: &AppState) -> Result<Arc<ConfigContext>, ApiError> {
     state
         .config
         .clone()
