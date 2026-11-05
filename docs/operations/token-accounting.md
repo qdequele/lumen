@@ -100,7 +100,7 @@ Per-model prices feed cost accounting and hard budgets:
 
 ```toml
 [[providers.models]]
-id = "gpt-4o"
+id = "openai/gpt-4o"
 capabilities = ["chat"]
 cost_per_1m_input = 2.5
 cost_per_1m_output = 10.0
@@ -110,7 +110,7 @@ Rerank models price by search unit instead:
 
 ```toml
 [[providers.models]]
-id = "rerank-english"
+id = "cohere/rerank-english"
 capabilities = ["rerank"]
 cost_per_1k_searches = 2.0
 ```

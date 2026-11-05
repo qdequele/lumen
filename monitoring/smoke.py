@@ -252,7 +252,7 @@ def check_chat_vision(name: str, model: str) -> None:
 def check_vision_guard_lm2003() -> None:
     """An image part sent to a model without the image modality -> 400 LM-2003."""
     code, body = http("POST", "/v1/chat/completions",
-                      {"model": "mistral-small", "max_tokens": 64,
+                      {"model": "mistral/mistral-small", "max_tokens": 64,
                        "messages": vision_messages(TINY_PNG)})
     if code == 400 and err_code(body) == "LM-2003":
         report("PASS", "guard image-to-text-model", "(400 LM-2003, rejected before upstream)")
@@ -264,7 +264,7 @@ def check_vision_guard_lm2003() -> None:
 def check_vision_guard_lm2004() -> None:
     """A remote image URL routed to Gemini -> 400 LM-2004 (never-fetch rule)."""
     code, body = http("POST", "/v1/chat/completions",
-                      {"model": "gemini-flash", "max_tokens": 64,
+                      {"model": "google/gemini-flash", "max_tokens": 64,
                        "messages": vision_messages(REMOTE_IMAGE_URL)})
     if code == 400 and err_code(body) == "LM-2004":
         report("PASS", "guard remote-url-to-gemini", "(400 LM-2004, gateway never fetches URLs)")

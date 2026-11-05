@@ -61,7 +61,7 @@ fn config(typesafe: &str, luna: &str, decider: &str) -> Config {
         base_url = "{typesafe}"
         api_key_env = "LUMEN_TEST_PRIVACY_KEY_UNUSED"
         [[providers.models]]
-        id = "jev"
+        id = "typesafe/jev"
         upstream_id = "jev-latest"
         capabilities = ["decisions"]
 
@@ -71,7 +71,7 @@ fn config(typesafe: &str, luna: &str, decider: &str) -> Config {
         base_url = "{luna}/v1"
         api_key_env = "LUMEN_TEST_PRIVACY_KEY_UNUSED"
         [[providers.models]]
-        id = "luna"
+        id = "openai/luna"
         upstream_id = "gpt-6-luna"
         capabilities = ["decisions"]
         modalities = ["text", "image"]
@@ -82,15 +82,15 @@ fn config(typesafe: &str, luna: &str, decider: &str) -> Config {
         base_url = "{decider}"
         api_key_env = "LUMEN_TEST_PRIVACY_KEY_UNUSED"
         [[providers.models]]
-        id = "decider"
+        id = "perplexity/decider"
         upstream_id = "decider-1"
         capabilities = ["decisions"]
 
         [[virtual_models]]
-        id = "luna-first"
+        id = "lumen/luna-first"
         capability = "decisions"
         strategy = "fallback"
-        targets = [{{ model = "luna" }}, {{ model = "decider" }}]
+        targets = [{{ model = "openai/luna" }}, {{ model = "perplexity/decider" }}]
         "#
     );
     Figment::new()

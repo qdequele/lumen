@@ -11,7 +11,7 @@ see [Providers](../providers.md) for aliasing with `upstream_id`).
 curl -s http://localhost:8080/v1/chat/completions \
   -H 'content-type: application/json' \
   -d '{
-    "model": "gpt-4o",
+    "model": "openai/gpt-4o",
     "messages": [{"role": "user", "content": "Say hello in one word."}]
   }'
 ```

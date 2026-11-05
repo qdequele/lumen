@@ -66,7 +66,7 @@ fn config_text_with(a: &str, b: &str, kind_a: &str, extra_a: &str) -> String {
         base_url = "{a}"
         {extra_a}
         [[providers.models]]
-        id = "model-a"
+        id = "a/model-a"
         capabilities = ["chat", "embed"]
         cost_per_1m_input = 1000.0
         cost_per_1m_output = 2000.0
@@ -76,7 +76,7 @@ fn config_text_with(a: &str, b: &str, kind_a: &str, extra_a: &str) -> String {
         kind = "openai"
         base_url = "{b}"
         [[providers.models]]
-        id = "model-b"
+        id = "b/model-b"
         capabilities = ["chat"]
         cost_per_1m_input = 1000.0
         cost_per_1m_output = 2000.0
@@ -85,13 +85,13 @@ fn config_text_with(a: &str, b: &str, kind_a: &str, extra_a: &str) -> String {
         id = "acme/chat"
         capability = "chat"
         strategy = "fallback"
-        targets = [{{ model = "model-a" }}, {{ model = "model-b" }}]
+        targets = [{{ model = "a/model-a" }}, {{ model = "b/model-b" }}]
 
         [[virtual_models]]
         id = "acme/reverse"
         capability = "chat"
         strategy = "fallback"
-        targets = [{{ model = "model-b" }}, {{ model = "model-a" }}]
+        targets = [{{ model = "b/model-b" }}, {{ model = "a/model-a" }}]
         "#
     )
 }
@@ -433,7 +433,7 @@ async fn team_key_is_used_and_not_billed_tokens() {
     let h = harness(&a, &b).await;
     h.add_key(&h.group_a, "a", TEAM_1).await;
 
-    let (status, body) = h.chat(&h.key_a, "model-a").await;
+    let (status, body) = h.chat(&h.key_a, "a/model-a").await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(hits(&a, TEAM_1).await, 1);
     assert_eq!(hits(&a, PLATFORM).await, 0);
@@ -465,7 +465,7 @@ async fn team_key_serves_embeddings() {
         .post(
             "/v1/embeddings",
             &h.key_a,
-            &json!({ "model": "model-a", "input": "abcd" }),
+            &json!({ "model": "a/model-a", "input": "abcd" }),
         )
         .await;
     assert_eq!(status, 200, "{body}");
@@ -483,7 +483,7 @@ async fn no_pool_uses_platform_key_and_bills_tokens() {
     mount_ok(&a, PLATFORM).await;
     let h = harness(&a, &b).await;
 
-    let (status, body) = h.chat(&h.key_a, "model-a").await;
+    let (status, body) = h.chat(&h.key_a, "a/model-a").await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(hits(&a, PLATFORM).await, 1);
 
@@ -507,7 +507,7 @@ async fn team_key_never_used_for_another_group() {
 
     // Another team, and a key with no group at all: platform key only.
     for key in [&h.key_b, &h.key_solo] {
-        let (status, body) = h.chat(key, "model-a").await;
+        let (status, body) = h.chat(key, "a/model-a").await;
         assert_eq!(status, 200, "{body}");
     }
     assert_eq!(hits(&a, TEAM_1).await, 0, "a team key served another group");
@@ -517,13 +517,13 @@ async fn team_key_never_used_for_another_group() {
     assert_eq!(delta.units.byok_tokens_in, 0);
 
     // The owning group does use it.
-    let (status, _) = h.chat(&h.key_a, "model-a").await;
+    let (status, _) = h.chat(&h.key_a, "a/model-a").await;
     assert_eq!(status, 200);
     assert_eq!(hits(&a, TEAM_1).await, 1);
 
     // Group B's own pool for another provider does not unlock A's.
     h.add_key(&h.group_b, "b", TEAM_2).await;
-    let (status, _) = h.chat(&h.key_b, "model-a").await;
+    let (status, _) = h.chat(&h.key_b, "a/model-a").await;
     assert_eq!(status, 200);
     assert_eq!(hits(&a, TEAM_1).await, 1);
     assert_eq!(hits(&a, TEAM_2).await, 0);
@@ -548,7 +548,7 @@ async fn rate_limited_team_key_rotates_to_next() {
     // Two requests: whichever key the cursor starts on, round-robin makes the
     // rate-limited key come up once.
     for _ in 0..2 {
-        let (status, body) = h.chat(&h.key_a, "model-a").await;
+        let (status, body) = h.chat(&h.key_a, "a/model-a").await;
         assert_eq!(status, 200, "{body}");
     }
     assert_eq!(hits(&a, TEAM_1).await, 1, "a benched key is not retried");
@@ -571,7 +571,7 @@ async fn revoked_team_key_rotates_and_is_marked_failing() {
     let id_2 = h.add_key(&h.group_a, "a", TEAM_2).await;
 
     for _ in 0..2 {
-        let (status, body) = h.chat(&h.key_a, "model-a").await;
+        let (status, body) = h.chat(&h.key_a, "a/model-a").await;
         assert_eq!(status, 200, "{body}");
         assert!(!body.contains(TEAM_1) && !body.contains(TEAM_2));
     }
@@ -597,7 +597,7 @@ async fn exhausted_pool_without_fallback_fails_lm_3021() {
     h.add_key(&h.group_a, "a", TEAM_2).await;
 
     // The first request tries both keys upstream, then refuses.
-    let (status, body) = h.chat(&h.key_a, "model-a").await;
+    let (status, body) = h.chat(&h.key_a, "a/model-a").await;
     assert_eq!(status, 429, "{body}");
     let error: Value = serde_json::from_str(&body).expect("json");
     assert_eq!(error["error"]["code"], "LM-3021", "{body}");
@@ -615,7 +615,7 @@ async fn exhausted_pool_without_fallback_fails_lm_3021() {
     // Later requests while the keys are benched never reach the upstream,
     // so they bill no bandwidth.
     for _ in 0..6 {
-        let (status, body) = h.chat(&h.key_a, "model-a").await;
+        let (status, body) = h.chat(&h.key_a, "a/model-a").await;
         assert_eq!(status, 429, "{body}");
         assert!(body.contains("LM-3021"), "{body}");
     }
@@ -625,7 +625,7 @@ async fn exhausted_pool_without_fallback_fails_lm_3021() {
     assert_eq!(h.quiet_bytes("lab-a").await, (0, 0));
     // Not a provider fault: the breaker never opened.
     assert_eq!(
-        h.resilience.breakers.get("a", "model-a").state(),
+        h.resilience.breakers.get("a", "a/model-a").state(),
         CircuitState::Closed
     );
 }
@@ -669,7 +669,7 @@ async fn exhausted_pool_with_fallback_uses_platform_and_bills_tokens() {
     h.add_key(&h.group_a, "a", TEAM_1).await;
     h.set_fallback(&h.group_a, "a", true).await;
 
-    let (status, body) = h.chat(&h.key_a, "model-a").await;
+    let (status, body) = h.chat(&h.key_a, "a/model-a").await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(hits(&a, TEAM_1).await, 1);
     assert_eq!(hits(&a, PLATFORM).await, 1);
@@ -691,7 +691,7 @@ async fn zero_credit_byok_request_is_refused() {
     let h = harness(&a, &b).await;
     h.add_key(&h.group_poor, "a", TEAM_1).await;
 
-    let (status, body) = h.chat(&h.key_poor, "model-a").await;
+    let (status, body) = h.chat(&h.key_poor, "a/model-a").await;
     assert_eq!(status, 402, "{body}");
     assert!(body.contains("LM-4001"), "{body}");
     assert_eq!(a.received_requests().await.unwrap_or_default().len(), 0);
@@ -716,7 +716,7 @@ async fn deleted_team_key_is_not_used_after_delete() {
     // A request in flight on the key when it is deleted still finishes.
     let in_flight = {
         let h = Arc::clone(&h);
-        tokio::spawn(async move { h.chat(&h.key_a, "model-a").await })
+        tokio::spawn(async move { h.chat(&h.key_a, "a/model-a").await })
     };
     tokio::time::sleep(Duration::from_millis(150)).await;
     let (status, body) = h
@@ -732,7 +732,7 @@ async fn deleted_team_key_is_not_used_after_delete() {
     assert_eq!(status, 200, "{body}");
 
     // New requests never use it.
-    let (status, body) = h.chat(&h.key_a, "model-a").await;
+    let (status, body) = h.chat(&h.key_a, "a/model-a").await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(hits(&a, TEAM_1).await, 1);
     assert_eq!(hits(&a, PLATFORM).await, 1);
@@ -754,10 +754,10 @@ async fn pool_for_a_provider_whose_kind_became_ineligible_is_ignored() {
     h.registry.reload(specs(&config)).expect("registry reload");
 
     // Before and after the pools are rebuilt from the store.
-    let (status, body) = h.chat(&h.key_a, "model-a").await;
+    let (status, body) = h.chat(&h.key_a, "a/model-a").await;
     assert_eq!(status, 200, "{body}");
     h.reload().await;
-    let (status, body) = h.chat(&h.key_a, "model-a").await;
+    let (status, body) = h.chat(&h.key_a, "a/model-a").await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(
         hits(&a, TEAM_1).await,
@@ -817,7 +817,7 @@ async fn team_key_secret_never_logged() {
     // Rotation through a revoked and a rate-limited key, then LM-3021.
     let mut bodies = Vec::new();
     for _ in 0..2 {
-        let (status, body) = h.chat(&h.key_a, "model-a").await;
+        let (status, body) = h.chat(&h.key_a, "a/model-a").await;
         assert_eq!(status, 429, "{body}");
         bodies.push(body);
     }
@@ -894,7 +894,7 @@ async fn streaming_on_team_key_cancel_settles_once() {
         .post(format!("{}/v1/chat/completions", h.base))
         .bearer_auth(&h.key_a)
         .json(&json!({
-            "model": "model-a",
+            "model": "a/model-a",
             "messages": [{ "role": "user", "content": "hello there" }],
             "stream": true
         }))
@@ -1005,7 +1005,7 @@ async fn chain_after_open_circuit_on_team_link_never_reaches_platform() {
     let breaker = h
         .resilience
         .breakers
-        .get_scoped("a", Some(&h.group_a), "model-a");
+        .get_scoped("a", Some(&h.group_a), "a/model-a");
     for _ in 0..20 {
         breaker.on_failure(tokio::time::Instant::now());
     }
@@ -1045,7 +1045,7 @@ async fn team_key_usage_is_recorded_at_zero_cost() {
     h.add_key(&h.group_a, "a", TEAM_1).await;
 
     for key in [&h.key_a, &h.key_b] {
-        let (status, body) = h.chat(key, "model-a").await;
+        let (status, body) = h.chat(key, "a/model-a").await;
         assert_eq!(status, 200, "{body}");
     }
     let group = |listing: &Value, id: &str| {
@@ -1090,23 +1090,23 @@ async fn platform_rate_limits_do_not_block_a_team_with_its_own_keys() {
 
     // Five platform 429s (another team, no pool) open a's platform breaker.
     for _ in 0..5 {
-        let (status, body) = h.chat(&h.key_b, "model-a").await;
+        let (status, body) = h.chat(&h.key_b, "a/model-a").await;
         assert_eq!(status, 429, "{body}");
     }
     assert_eq!(
-        h.resilience.breakers.get("a", "model-a").state(),
+        h.resilience.breakers.get("a", "a/model-a").state(),
         CircuitState::Open
     );
-    let (_, body) = h.chat(&h.key_b, "model-a").await;
+    let (_, body) = h.chat(&h.key_b, "a/model-a").await;
     assert!(body.contains("LM-3020"), "{body}");
 
     // Group A, with its own key for a, is still served on it.
-    let (status, body) = h.chat(&h.key_a, "model-a").await;
+    let (status, body) = h.chat(&h.key_a, "a/model-a").await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(hits(&a, TEAM_1).await, 1);
     // And its success leaves the platform breaker open.
     assert_eq!(
-        h.resilience.breakers.get("a", "model-a").state(),
+        h.resilience.breakers.get("a", "a/model-a").state(),
         CircuitState::Open
     );
 }
@@ -1120,22 +1120,22 @@ async fn team_key_failures_never_open_the_platform_breaker() {
     h.add_key(&h.group_a, "a", TEAM_1).await;
 
     for _ in 0..5 {
-        let (status, body) = h.chat(&h.key_a, "model-a").await;
+        let (status, body) = h.chat(&h.key_a, "a/model-a").await;
         assert_eq!(status, 502, "{body}");
     }
     assert_eq!(
         h.resilience
             .breakers
-            .get_scoped("a", Some(&h.group_a), "model-a")
+            .get_scoped("a", Some(&h.group_a), "a/model-a")
             .state(),
         CircuitState::Open
     );
     assert_eq!(
-        h.resilience.breakers.get("a", "model-a").state(),
+        h.resilience.breakers.get("a", "a/model-a").state(),
         CircuitState::Closed
     );
     // A request without a pool is served on the platform key.
-    let (status, body) = h.chat(&h.key_b, "model-a").await;
+    let (status, body) = h.chat(&h.key_b, "a/model-a").await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(hits(&a, PLATFORM).await, 1);
 }
@@ -1170,9 +1170,9 @@ async fn platform_pool_rotates_instead_of_the_configured_key_and_bills_tokens() 
     h.add_platform_key("a", POOL_2).await;
 
     // No group, and a group without a team pool: both use the platform pool.
-    let (status, body) = h.chat(&h.key_solo, "model-a").await;
+    let (status, body) = h.chat(&h.key_solo, "a/model-a").await;
     assert_eq!(status, 200, "{body}");
-    let (status, body) = h.chat(&h.key_b, "model-a").await;
+    let (status, body) = h.chat(&h.key_b, "a/model-a").await;
     assert_eq!(status, 200, "{body}");
     let delta = h.settled("lab-b").await;
     assert!(
@@ -1190,7 +1190,7 @@ async fn platform_pool_rotates_instead_of_the_configured_key_and_bills_tokens() 
     );
     assert_eq!(h.pools.platform_status(&first).0, "rate_limited");
     assert_eq!(
-        h.resilience.breakers.get("a", "model-a").state(),
+        h.resilience.breakers.get("a", "a/model-a").state(),
         CircuitState::Closed,
         "a rotated 429 is not a provider fault"
     );
@@ -1204,7 +1204,7 @@ async fn exhausted_platform_pool_never_uses_the_configured_key() {
     let h = harness(&a, &b).await;
     let id = h.add_platform_key("a", POOL_1).await;
 
-    let (status, body) = h.chat(&h.key_solo, "model-a").await;
+    let (status, body) = h.chat(&h.key_solo, "a/model-a").await;
     assert_ne!(status, 200, "{body}");
     assert_eq!(hits(&a, POOL_1).await, 1);
     assert_eq!(hits(&a, PLATFORM).await, 0, "the env key is ignored");
@@ -1226,13 +1226,13 @@ async fn a_pool_of_disabled_keys_ignores_the_env_key_until_its_last_key_is_delet
         .expect("found");
     h.reload().await;
 
-    let (status, body) = h.chat(&h.key_solo, "model-a").await;
+    let (status, body) = h.chat(&h.key_solo, "a/model-a").await;
     assert_eq!(status, 503, "{body}");
     assert!(body.contains("LM-3022"), "{body}");
     assert_eq!(hits(&a, POOL_1).await, 0);
     assert_eq!(hits(&a, PLATFORM).await, 0, "the env key is ignored");
     assert_eq!(
-        h.resilience.breakers.get("a", "model-a").state(),
+        h.resilience.breakers.get("a", "a/model-a").state(),
         CircuitState::Closed,
         "a disabled pool is not a provider fault"
     );
@@ -1245,7 +1245,7 @@ async fn a_pool_of_disabled_keys_ignores_the_env_key_until_its_last_key_is_delet
         .await
         .expect("delete"));
     h.reload().await;
-    let (status, body) = h.chat(&h.key_solo, "model-a").await;
+    let (status, body) = h.chat(&h.key_solo, "a/model-a").await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(hits(&a, PLATFORM).await, 1);
 }
@@ -1263,7 +1263,7 @@ async fn fallback_off_team_never_reaches_the_platform_pool_even_via_chain() {
     h.add_platform_key("a", POOL_1).await;
     h.add_platform_key("b", POOL_1).await;
 
-    for model in ["model-a", "acme/chat"] {
+    for model in ["a/model-a", "acme/chat"] {
         let (status, body) = h.chat(&h.key_a, model).await;
         assert_eq!(status, 429, "{model}: {body}");
         assert!(body.contains("LM-3021"), "{body}");
@@ -1279,7 +1279,7 @@ async fn fallback_off_team_never_reaches_the_platform_pool_even_via_chain() {
 
     // Fallback on: the platform pool serves after the team keys.
     h.set_fallback(&h.group_a, "a", true).await;
-    let (status, body) = h.chat(&h.key_a, "model-a").await;
+    let (status, body) = h.chat(&h.key_a, "a/model-a").await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(hits(&a, POOL_1).await, 1);
     assert_eq!(hits(&a, PLATFORM).await, 0);
@@ -1304,7 +1304,7 @@ async fn platform_pool_secrets_never_logged() {
     h.add_platform_key("a", POOL_2).await;
 
     // Both keys rotated out: the pool's last error (the 401), never the env key.
-    let (status, body) = h.chat(&h.key_solo, "model-a").await;
+    let (status, body) = h.chat(&h.key_solo, "a/model-a").await;
     assert_eq!(status, 502, "{body}");
     let logs = String::from_utf8_lossy(&buffer.lock().expect("log buffer")).into_owned();
     assert!(!logs.is_empty(), "the subscriber captured nothing");

@@ -200,7 +200,7 @@ name = "openai"
 kind = "openai"
 
 [[providers.models]]
-id = "gpt-preseeded"
+id = "openai/gpt-preseeded"
 capabilities = ["chat"]
 "#;
     source
@@ -252,7 +252,7 @@ capabilities = ["chat"]
     let _ = child.wait();
 
     assert!(
-        ids.contains(&"gpt-preseeded"),
+        ids.contains(&"openai/gpt-preseeded"),
         "the model from the pre-seeded DB document must be routable at boot, got {ids:?}"
     );
 }

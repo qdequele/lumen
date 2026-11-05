@@ -12,7 +12,7 @@ echo "== index time: embed the corpus (OpenAI) =="
 curl -sf "$BASE_URL/v1/embeddings" \
   -H 'content-type: application/json' \
   -d '{
-    "model": "text-embedding-3-small",
+    "model": "openai/text-embedding-3-small",
     "input": [
       "Paris is the capital of France.",
       "Berlin is the capital of Germany.",
@@ -25,7 +25,7 @@ echo "== query time: rerank the shortlist against a query (Cohere), top_n=2 =="
 curl -sf "$BASE_URL/v1/rerank" \
   -H 'content-type: application/json' \
   -d '{
-    "model": "rerank-english",
+    "model": "cohere/rerank-english",
     "query": "What is the capital of France?",
     "documents": [
       "Paris is the capital of France.",

@@ -845,9 +845,52 @@ impl std::fmt::Debug for RerankCriteriaConfig {
 
 impl ModelConfig {
     /// The upstream model id to send to the provider (falls back to `id`).
+    /// Ignores the `provider/` prefix: see [`Self::upstream_for`].
     #[must_use]
     pub fn resolved_upstream_id(&self) -> &str {
         self.upstream_id.as_deref().unwrap_or(&self.id)
+    }
+
+    /// The upstream model id for this model on provider `provider`: the
+    /// explicit `upstream_id`, else `id` without its `provider/` prefix
+    /// (`openai/gpt-4o` sends `gpt-4o`).
+    #[must_use]
+    pub fn upstream_for(&self, provider: &str) -> &str {
+        self.upstream_id.as_deref().unwrap_or_else(|| {
+            self.id
+                .strip_prefix(provider)
+                .and_then(|rest| rest.strip_prefix('/'))
+                .filter(|rest| !rest.is_empty())
+                .unwrap_or(&self.id)
+        })
+    }
+}
+
+/// Why a foundation model id is not `<provider>/<model>`, or `None` when it is.
+#[must_use]
+pub fn foundation_id_problem(provider: &str, id: &str) -> Option<String> {
+    match id.split_once('/') {
+        Some((prefix, rest)) if prefix == provider && !rest.trim().is_empty() => None,
+        Some((prefix, rest)) if !rest.trim().is_empty() => Some(format!(
+            "model id '{id}' must start with its provider's name ('{prefix}' is not provider \
+             '{provider}'), here '{provider}/{id}'"
+        )),
+        _ => Some(format!(
+            "model id '{id}' must be '<provider>/<model>', here '{provider}/{}'",
+            id.trim_end_matches('/')
+        )),
+    }
+}
+
+/// Why a virtual model id is not `<namespace>/<model>`, or `None` when it is.
+#[must_use]
+pub fn virtual_id_problem(id: &str) -> Option<String> {
+    match id.split_once('/') {
+        Some((namespace, rest)) if !namespace.trim().is_empty() && !rest.trim().is_empty() => None,
+        _ => Some(format!(
+            "virtual model id '{id}' must be '<namespace>/<model>' (for example 'lumen/{}')",
+            id.trim_matches('/')
+        )),
     }
 }
 
@@ -1714,6 +1757,12 @@ impl Config {
                     }
                 }
                 self.reject_legacy_fields(provider, model, &err)?;
+                if let Some(problem) = foundation_id_problem(&provider.name, &model.id) {
+                    return Err(err(format!(
+                        "{problem}; run `lumen config migrate` to prefix every id (the old \
+                         bare ids keep working as hidden aliases)"
+                    )));
+                }
                 if let Some(first_owner) = model_owner.insert(model.id.as_str(), &provider.name) {
                     return Err(err(format!(
                         "duplicate model id '{}': declared by both provider '{}' and provider \
@@ -1725,8 +1774,89 @@ impl Config {
             }
         }
 
+        for vm in &self.virtual_models {
+            if let Some(problem) = virtual_id_problem(&vm.id) {
+                return Err(err(format!(
+                    "{problem}; run `lumen config migrate` to prefix every id (the old bare \
+                     ids keep working as hidden aliases)"
+                )));
+            }
+        }
+
         self.routing_table().map_err(|e| err(e.to_string()))?;
         Ok(())
+    }
+
+    /// The hidden deprecated aliases: each prefixed id's bare form (`gpt-4o`
+    /// for `openai/gpt-4o`, `rerank` for `lumen/rerank`) -> that id. They
+    /// keep pre-prefix clients working; they resolve but are never listed.
+    ///
+    /// A bare form that is itself a configured id is no alias. When two ids
+    /// share a bare form, a virtual model's wins over a foundation model's (a
+    /// migrated fallback chain kept its old client-facing id), and two of the
+    /// same kind get no alias at all (ambiguous), with a warning. A disabled
+    /// model's bare form is no alias either, and is never handed to another
+    /// model sharing it.
+    #[must_use]
+    pub fn model_aliases(&self) -> HashMap<String, String> {
+        let ids: HashSet<&str> = self
+            .providers
+            .iter()
+            .flat_map(|p| p.models.iter().map(|m| m.id.as_str()))
+            .chain(self.virtual_models.iter().map(|v| v.id.as_str()))
+            .collect();
+        let bare = |id: &str| -> Option<String> {
+            id.split_once('/')
+                .map(|(_, rest)| rest.to_owned())
+                .filter(|rest| !rest.is_empty() && !ids.contains(rest.as_str()))
+        };
+        // Per layer: bare form -> its ids. Virtual models first, so they win
+        // a bare form they share with a foundation model.
+        let layer = |ids: &mut dyn Iterator<Item = &str>| -> HashMap<String, Vec<String>> {
+            let mut forms: HashMap<String, Vec<String>> = HashMap::new();
+            for id in ids {
+                if let Some(alias) = bare(id) {
+                    forms.entry(alias).or_default().push(id.to_owned());
+                }
+            }
+            forms
+        };
+        let virtuals = layer(&mut self.virtual_models.iter().map(|v| v.id.as_str()));
+        let foundations = layer(
+            &mut self
+                .providers
+                .iter()
+                .flat_map(|p| p.models.iter().map(|m| m.id.as_str())),
+        );
+        // A disabled model is out of service, so its alias is dropped too. It
+        // still takes part in the ambiguity check above: disabling one model
+        // never hands its bare form to another provider's model.
+        let disabled: HashSet<&str> = self
+            .providers
+            .iter()
+            .flat_map(|p| p.models.iter().filter(|m| m.disabled))
+            .map(|m| m.id.as_str())
+            .collect();
+        let mut aliases: HashMap<String, String> = HashMap::new();
+        for (alias, ids) in virtuals.iter().chain(
+            foundations
+                .iter()
+                .filter(|(alias, _)| !virtuals.contains_key(*alias)),
+        ) {
+            if let [only] = ids.as_slice() {
+                if disabled.contains(only.as_str()) {
+                    continue;
+                }
+                aliases.insert(alias.clone(), only.clone());
+            } else {
+                tracing::warn!(
+                    alias = %alias,
+                    ids = ?ids,
+                    "several model ids share a bare form: no deprecated alias for it"
+                );
+            }
+        }
+        aliases
     }
 
     /// Reject the fields ADR 014 removed (per-model `fallbacks`, the
@@ -1849,7 +1979,7 @@ impl Config {
                     .filter(|m| !m.disabled)
                     .map(|m| ModelSpec {
                         id: m.id.clone(),
-                        upstream_id: m.resolved_upstream_id().to_owned(),
+                        upstream_id: m.upstream_for(&p.name).to_owned(),
                         capabilities: m.capabilities.clone(),
                         modalities: m.modalities.clone(),
                         release_date: m.release_date,
@@ -1968,12 +2098,12 @@ mod tests {
         api_key_env = "OPENAI_API_KEY"
 
         [[providers.models]]
-        id = "gpt-4o"
+        id = "openai-main/gpt-4o"
         upstream_id = "gpt-4o-2024-08-06"
         capabilities = ["chat"]
 
         [[providers.models]]
-        id = "text-embed"
+        id = "openai-main/text-embed"
         capabilities = ["embed"]
     "#;
 
@@ -1997,7 +2127,7 @@ mod tests {
         kind = "openai"
 
         [[providers.models]]
-        id = "gpt-4o"
+        id = "openai-main/gpt-4o"
         capabilities = ["chat"]
     "#;
 
@@ -2570,9 +2700,9 @@ mod tests {
         assert_eq!(cfg.server.body_limit, 10 * 1024 * 1024); // default applied
         assert_eq!(cfg.providers.len(), 1);
         let models = &cfg.providers[0].models;
-        assert_eq!(models[0].resolved_upstream_id(), "gpt-4o-2024-08-06");
-        // upstream_id defaults to id when omitted
-        assert_eq!(models[1].resolved_upstream_id(), "text-embed");
+        assert_eq!(models[0].upstream_for("openai-main"), "gpt-4o-2024-08-06");
+        // upstream_id defaults to the id without its provider prefix when omitted
+        assert_eq!(models[1].upstream_for("openai-main"), "text-embed");
     }
 
     #[test]
@@ -2658,29 +2788,25 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_model_id_across_providers_cites_both() {
+    fn duplicate_model_id_is_rejected_and_named() {
+        // Ids carry their provider's name, so two providers can no longer
+        // collide; a provider declaring one id twice still does.
         let toml = r#"
             [[providers]]
             name = "provider-one"
             kind = "openai"
             [[providers.models]]
-            id = "dup"
+            id = "provider-one/dup"
             capabilities = ["embed"]
-
-            [[providers]]
-            name = "provider-two"
-            kind = "cohere"
             [[providers.models]]
-            id = "dup"
-            capabilities = ["rerank"]
+            id = "provider-one/dup"
+            capabilities = ["chat"]
         "#;
         let err = load_str(toml).unwrap_err();
         let msg = err.to_string();
         assert!(matches!(err, ConfigError::Validation { .. }));
-        // The message names the colliding id AND both conflicting providers.
-        assert!(msg.contains("dup"), "{msg}");
-        assert!(msg.contains("provider-one"), "{msg}");
-        assert!(msg.contains("provider-two"), "{msg}");
+        assert!(msg.contains("provider-one/dup"), "{msg}");
+        assert!(msg.contains("duplicate model id"), "{msg}");
     }
 
     #[test]
@@ -2692,14 +2818,14 @@ mod tests {
             kind = "openai"
             api_key_env = "OPENAI_API_KEY"
             [[providers.models]]
-            id = "gpt-4o"
+            id = "openai/gpt-4o"
             capabilities = ["chat"]
             release_date = "2024-05-13"
             [[providers.models]]
-            id = "undated"
+            id = "openai/undated"
             capabilities = ["chat"]
             [[providers.models]]
-            id = "unquoted"
+            id = "openai/unquoted"
             capabilities = ["chat"]
             release_date = 2025-02-27
             "#,
@@ -2756,7 +2882,7 @@ mod tests {
                 kind = "openai"
                 api_key_env = "OPENAI_API_KEY"
                 [[providers.models]]
-                id = "gpt-4o"
+                id = "openai/gpt-4o"
                 capabilities = ["chat"]
                 release_date = {bad}
                 "#
@@ -2778,11 +2904,11 @@ mod tests {
             name = "openai"
             kind = "openai"
             [[providers.models]]
-            id = "fast-embed"
+            id = "openai/fast-embed"
             upstream_id = "text-embedding-3-small"
             capabilities = ["embed"]
             [[providers.models]]
-            id = "cheap-embed"
+            id = "openai/cheap-embed"
             upstream_id = "text-embedding-3-small"
             capabilities = ["embed"]
         "#;
@@ -2799,7 +2925,7 @@ mod tests {
             name = "a"
             kind = "openai"
             [[providers.models]]
-            id = "m"
+            id = "a/m"
             capabilities = []
         "#;
         let err = load_str(toml).unwrap_err();
@@ -2854,7 +2980,7 @@ mod tests {
             name = "openai"
             kind = "openai"
             [[providers.models]]
-            id = "gpt"
+            id = "openai/gpt"
             capabilities = ["chat"]
             cost_per_1m_input = 2.5
             cost_per_1m_output = 10.0
@@ -2946,29 +3072,31 @@ mod tests {
             name = "typesafe"
             kind = "typesafe"
             [[providers.models]]
-            id = "jev"
+            id = "typesafe/jev"
             capabilities = ["systemone"]
             [[virtual_models]]
-            id = "jev-vm"
+            id = "lumen/jev-vm"
             capability = "systemone"
             strategy = "single"
-            targets = [{ model = "jev" }]
+            targets = [{ model = "typesafe/jev" }]
             [[virtual_models]]
-            id = "rr"
+            id = "lumen/rr"
             capability = "rerank"
             strategy = "single"
-            targets = [{ model = "jev", remap = { strategy = "noul" } }]
+            targets = [{ model = "typesafe/jev", remap = { strategy = "noul" } }]
         "#,
         ));
         let found = legacy_spellings(&figment);
         assert_eq!(found.len(), 3, "{found:?}");
         assert!(found
             .iter()
-            .any(|s| s.contains("model 'jev'") && s.contains("\"decisions\"")));
-        assert!(found.iter().any(|s| s.contains("virtual model 'jev-vm'")));
+            .any(|s| s.contains("model 'typesafe/jev'") && s.contains("\"decisions\"")));
         assert!(found
             .iter()
-            .any(|s| s.contains("virtual model 'rr'") && s.contains("\"predicate\"")));
+            .any(|s| s.contains("virtual model 'lumen/jev-vm'")));
+        assert!(found
+            .iter()
+            .any(|s| s.contains("virtual model 'lumen/rr'") && s.contains("\"predicate\"")));
     }
 
     #[test]
@@ -2981,7 +3109,7 @@ mod tests {
             name = "typesafe"
             kind = "typesafe"
             [[providers.models]]
-            id = "jev"
+            id = "typesafe/jev"
             capabilities = ["decisions"]
             [providers.models.rerank]
             instructions = "SENTINEL-LEGACY"
@@ -2992,13 +3120,13 @@ mod tests {
             capability = "chat"
             strategy = "single"
             preset = { system_prompt = "SENTINEL-PROMPT" }
-            targets = [{ model = "gpt-4o" }]
+            targets = [{ model = "openai-main/gpt-4o" }]
 
             [[virtual_models]]
             id = "acme/rerank"
             capability = "rerank"
             strategy = "single"
-            targets = [{ model = "jev", remap = { context = "SENTINEL-CONTEXT", instructions = "SENTINEL-REMAP" } }]
+            targets = [{ model = "typesafe/jev", remap = { context = "SENTINEL-CONTEXT", instructions = "SENTINEL-REMAP" } }]
             "#,
         )
         .unwrap();
@@ -3052,11 +3180,11 @@ mod tests {
         name = "openai"
         kind = "openai"
         [[providers.models]]
-        id = "gpt-4o"
+        id = "openai/gpt-4o"
         capabilities = ["chat"]
         fallbacks = ["claude"]
         [[providers.models]]
-        id = "claude"
+        id = "openai/claude"
         capabilities = ["chat"]
     "#;
 
@@ -3082,7 +3210,7 @@ mod tests {
             kind = "typesafe"
             api_key_env = "TYPESAFE_API_KEY"
             [[providers.models]]
-            id = "jev-rerank"
+            id = "typesafe/jev-rerank"
             upstream_id = "jev-latest"
             capabilities = ["rerank"]
         "#,
@@ -3107,7 +3235,7 @@ mod tests {
                 kind = "{kind}"
                 api_key_env = "KEY"
                 [[providers.models]]
-                id = "m"
+                id = "p/m"
                 capabilities = {caps}
                 [providers.models.rerank]
                 instructions = "q"
@@ -3133,17 +3261,17 @@ mod tests {
             id = "openai/gpt-4o"
             capabilities = ["chat"]
             [[providers.models]]
-            id = "claude"
+            id = "openai/claude"
             capabilities = ["chat"]
             [[virtual_models]]
-            id = "gpt-4o"
+            id = "lumen/gpt-4o"
             capability = "chat"
             strategy = "fallback"
-            targets = [{ model = "openai/gpt-4o" }, { model = "claude" }]
+            targets = [{ model = "openai/gpt-4o" }, { model = "openai/claude" }]
         "#,
         )
         .unwrap();
-        assert!(cfg.routing_table().unwrap().0.get("gpt-4o").is_some());
+        assert!(cfg.routing_table().unwrap().0.get("lumen/gpt-4o").is_some());
     }
 
     #[test]
@@ -3155,12 +3283,15 @@ mod tests {
             first_token_timeout_ms = 60000
             total_timeout_ms = 120000
             [[providers.models]]
-            id = "gpt"
+            id = "slowvendor/gpt"
             capabilities = ["chat"]
         "#;
         let cfg = load_str(toml).unwrap();
         let overrides = cfg.model_timeout_overrides();
-        assert_eq!(overrides.get("gpt"), Some(&(Some(60_000), Some(120_000))));
+        assert_eq!(
+            overrides.get("slowvendor/gpt"),
+            Some(&(Some(60_000), Some(120_000)))
+        );
     }
 
     #[test]
@@ -3171,7 +3302,7 @@ mod tests {
             kind = "openai"
             connect_timeout_ms = 250
             [[providers.models]]
-            id = "gpt"
+            id = "flakyvendor/gpt"
             capabilities = ["chat"]
         "#;
         let cfg = load_str(toml).unwrap();
@@ -3188,7 +3319,7 @@ mod tests {
             kind = "openai"
             connect_timeout_ms = 0
             [[providers.models]]
-            id = "gpt"
+            id = "vendor/gpt"
             capabilities = ["chat"]
         "#;
         let err = load_str(toml).unwrap_err();
@@ -3204,7 +3335,7 @@ mod tests {
             base_url = "https://my-resource.openai.azure.com"
             api_version = "2025-01-01-preview"
             [[providers.models]]
-            id = "gpt"
+            id = "azure/gpt"
             capabilities = ["chat"]
         "#;
         let cfg = load_str(toml).unwrap();
@@ -3227,7 +3358,7 @@ mod tests {
             base_url = "https://my-resource.openai.azure.com?api-version=2023-05-15"
             api_version = "2025-01-01-preview"
             [[providers.models]]
-            id = "gpt"
+            id = "azure/gpt"
             capabilities = ["chat"]
         "#;
         let cfg = load_str(toml).unwrap();
@@ -3249,7 +3380,7 @@ mod tests {
             decisions_path = "/decisions/v1/systemone"
             forward_unknown_fields = false
             [[providers.models]]
-            id = "d1"
+            id = "liquid/d1"
             capabilities = ["decisions"]
         "#;
         let cfg = load_str(ok).unwrap();
@@ -3282,7 +3413,7 @@ mod tests {
             kind = "openai"
             api_version = "2025-01-01-preview"
             [[providers.models]]
-            id = "gpt"
+            id = "openai/gpt"
             capabilities = ["chat"]
         "#;
         let err = load_str(toml).unwrap_err();
@@ -3300,7 +3431,7 @@ mod tests {
             base_url = "https://my-resource.openai.azure.com"
             api_version = " "
             [[providers.models]]
-            id = "gpt"
+            id = "azure/gpt"
             capabilities = ["chat"]
         "#;
         let err = load_str(toml).unwrap_err();
@@ -3321,7 +3452,7 @@ mod tests {
                     base_url = "https://my-resource.openai.azure.com"
                     api_version = {padded:?}
                     [[providers.models]]
-                    id = "gpt"
+                    id = "azure/gpt"
                     capabilities = ["chat"]
                 "#
             );
@@ -3367,10 +3498,10 @@ mod tests {
             name = "openai"
             kind = "openai"
             [[providers.models]]
-            id = "gpt-4o"
+            id = "openai/gpt-4o"
             capabilities = ["chat"]
             [[providers.models]]
-            id = "gpt-3.5-turbo"
+            id = "openai/gpt-3.5-turbo"
             capabilities = ["chat"]
             disabled = true
             "#,
@@ -3382,9 +3513,9 @@ mod tests {
         // Not served: the registry is built without it.
         let specs = cfg.provider_specs();
         let ids: Vec<&str> = specs[0].models.iter().map(|m| m.id.as_str()).collect();
-        assert_eq!(ids, ["gpt-4o"]);
+        assert_eq!(ids, ["openai/gpt-4o"]);
         // Still a foundation model, so virtual models naming it stay valid.
-        assert!(cfg.foundation_index().contains("gpt-3.5-turbo"));
+        assert!(cfg.foundation_index().contains("openai/gpt-3.5-turbo"));
         // Round trip: `disabled` is written only when set.
         let json = serde_json::to_value(models).unwrap();
         assert!(json[0].get("disabled").is_none());
@@ -3397,7 +3528,7 @@ mod tests {
         let models = cfg.loaded_models();
         assert_eq!(models.len(), 2);
         assert_eq!(models[0].provider, "openai-main");
-        assert!(models.iter().any(|m| m.id == "gpt-4o"));
+        assert!(models.iter().any(|m| m.id == "openai-main/gpt-4o"));
     }
 
     // ---- Boot vs dynamic layer split (ADR 012, task 4) ---------------------
@@ -3612,7 +3743,7 @@ mod tests {
         id = "acme/chat"
         capability = "chat"
         strategy = "fallback"
-        targets = [{ model = "gpt-4o" }, { model = "gpt-4o" }]
+        targets = [{ model = "openai-main/gpt-4o" }, { model = "openai-main/gpt-4o" }]
     "#;
 
     #[test]
@@ -3627,8 +3758,8 @@ mod tests {
     #[test]
     fn an_invalid_virtual_model_fails_validation_naming_it() {
         let bad = VIRTUAL.replace(
-            "{ model = \"gpt-4o\" }, { model = \"gpt-4o\" }",
-            "{ model = \"ghost\" }, { model = \"gpt-4o\" }",
+            "{ model = \"openai-main/gpt-4o\" }, { model = \"openai-main/gpt-4o\" }",
+            "{ model = \"openai-main/ghost\" }, { model = \"openai-main/gpt-4o\" }",
         );
         let err = load_str(&format!("{VALID}\n{bad}"))
             .unwrap_err()
@@ -3641,10 +3772,174 @@ mod tests {
 
     #[test]
     fn a_virtual_id_may_not_shadow_a_foundation_id() {
-        let bad = VIRTUAL.replace("acme/chat", "gpt-4o");
+        let bad = VIRTUAL.replace("acme/chat", "openai-main/gpt-4o");
         let err = load_str(&format!("{VALID}\n{bad}"))
             .unwrap_err()
             .to_string();
         assert!(err.contains("collides with a foundation model"), "{err}");
+    }
+
+    // ---- Prefixed model ids -------------------------------------------------
+
+    fn one_provider(id: &str) -> String {
+        format!(
+            "[[providers]]\nname = \"openai\"\nkind = \"openai\"\n[[providers.models]]\n\
+             id = \"{id}\"\ncapabilities = [\"chat\"]\n"
+        )
+    }
+
+    #[test]
+    fn a_bare_foundation_id_is_rejected_with_the_migrate_hint() {
+        let err = load_str(&one_provider("gpt-4o")).unwrap_err().to_string();
+        assert!(err.contains("'openai/gpt-4o'"), "{err}");
+        assert!(err.contains("lumen config migrate"), "{err}");
+    }
+
+    #[test]
+    fn a_foundation_id_with_another_providers_prefix_is_rejected() {
+        let err = load_str(&one_provider("anthropic/claude"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("must start with its provider's name"), "{err}");
+        assert!(err.contains("'openai/anthropic/claude'"), "{err}");
+        assert!(err.contains("lumen config migrate"), "{err}");
+        // An empty model part is no id either.
+        assert!(load_str(&one_provider("openai/")).is_err());
+        assert!(load_str(&one_provider("openai/gpt-4o")).is_ok());
+    }
+
+    #[test]
+    fn a_bare_virtual_id_is_rejected_with_the_migrate_hint() {
+        let bad = VIRTUAL.replace("acme/chat", "chat");
+        let err = load_str(&format!("{VALID}\n{bad}"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("virtual model id 'chat'"), "{err}");
+        assert!(err.contains("<namespace>/<model>"), "{err}");
+        assert!(err.contains("lumen config migrate"), "{err}");
+    }
+
+    #[test]
+    fn upstream_for_strips_only_the_own_provider_prefix() {
+        let mut model = ModelConfig::minimal("openai/gpt-4o");
+        assert_eq!(model.upstream_for("openai"), "gpt-4o");
+        // A nested vendor path keeps everything after the provider name.
+        model.id = "openrouter/meta-llama/llama-3".to_owned();
+        assert_eq!(model.upstream_for("openrouter"), "meta-llama/llama-3");
+        // Another provider's prefix is not stripped.
+        assert_eq!(
+            model.upstream_for("openai"),
+            "openrouter/meta-llama/llama-3"
+        );
+        // An explicit upstream id always wins.
+        model.upstream_id = Some("pinned".to_owned());
+        assert_eq!(model.upstream_for("openrouter"), "pinned");
+    }
+
+    #[test]
+    fn model_aliases_map_each_bare_form_to_its_prefixed_id() {
+        let cfg = load_str(
+            r#"
+            [[providers]]
+            name = "openai"
+            kind = "openai"
+            [[providers.models]]
+            id = "openai/gpt-4o"
+            capabilities = ["chat"]
+            [[providers.models]]
+            id = "openai/shared"
+            capabilities = ["chat"]
+            [[providers.models]]
+            id = "openai/both"
+            capabilities = ["chat"]
+            [[providers]]
+            name = "taken"
+            kind = "openai"
+            base_url = "http://taken.test/v1"
+            [[providers.models]]
+            id = "taken/x"
+            capabilities = ["chat"]
+            [[providers]]
+            name = "azure"
+            kind = "openai"
+            base_url = "http://azure.test/v1"
+            [[providers.models]]
+            id = "azure/shared"
+            capabilities = ["chat"]
+            [[providers.models]]
+            id = "azure/taken/x"
+            capabilities = ["chat"]
+            [[virtual_models]]
+            id = "lumen/both"
+            capability = "chat"
+            strategy = "single"
+            targets = [{ model = "openai/both" }]
+            [[virtual_models]]
+            id = "lumen/gpt-5"
+            capability = "chat"
+            strategy = "single"
+            targets = [{ model = "openai/gpt-4o" }]
+            "#,
+        )
+        .unwrap();
+        let aliases = cfg.model_aliases();
+        assert_eq!(
+            aliases.get("gpt-4o").map(String::as_str),
+            Some("openai/gpt-4o")
+        );
+        assert_eq!(
+            aliases.get("gpt-5").map(String::as_str),
+            Some("lumen/gpt-5")
+        );
+        // A virtual model wins a bare form it shares with a foundation model.
+        assert_eq!(aliases.get("both").map(String::as_str), Some("lumen/both"));
+        // Two foundation models with one bare form: ambiguous, no alias.
+        assert!(!aliases.contains_key("shared"), "{aliases:?}");
+        // A bare form that is a configured id (`azure/taken/x` -> `taken/x`)
+        // is that id, never an alias.
+        assert!(!aliases.contains_key("taken/x"), "{aliases:?}");
+        assert_eq!(aliases.get("x").map(String::as_str), Some("taken/x"));
+        assert!(!aliases.contains_key("openai/gpt-4o"));
+        assert_eq!(aliases.len(), 4, "{aliases:?}");
+    }
+
+    #[test]
+    fn a_disabled_model_has_no_alias_and_keeps_its_bare_form_ambiguous() {
+        let cfg = load_str(
+            r#"
+            [[providers]]
+            name = "openai"
+            kind = "openai"
+            [[providers.models]]
+            id = "openai/gpt-4o"
+            capabilities = ["chat"]
+            disabled = true
+            [[providers.models]]
+            id = "openai/shared"
+            capabilities = ["chat"]
+            disabled = true
+            [[providers.models]]
+            id = "openai/gpt-4o-mini"
+            capabilities = ["chat"]
+            [[providers]]
+            name = "azure"
+            kind = "openai"
+            base_url = "http://azure.test/v1"
+            [[providers.models]]
+            id = "azure/shared"
+            capabilities = ["chat"]
+            "#,
+        )
+        .unwrap();
+        let aliases = cfg.model_aliases();
+        // Out of service: the bare form does not resolve.
+        assert!(!aliases.contains_key("gpt-4o"), "{aliases:?}");
+        // Disabling `openai/shared` does not hand `shared` to `azure/shared`.
+        assert!(!aliases.contains_key("shared"), "{aliases:?}");
+        assert_eq!(
+            aliases.get("gpt-4o-mini").map(String::as_str),
+            Some("openai/gpt-4o-mini")
+        );
+        assert_eq!(aliases.len(), 1, "{aliases:?}");
     }
 }

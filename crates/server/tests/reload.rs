@@ -53,7 +53,7 @@ fn write_config(dir: &Path, upstream: &str) -> PathBuf {
         kind = "cohere"
         base_url = "{upstream}"
         [[providers.models]]
-        id = "rr"
+        id = "cohere/rr"
         upstream_id = "rerank-v3.5"
         capabilities = ["rerank"]
         "#
@@ -119,7 +119,7 @@ async fn last_upstream_auth(upstream: &MockServer) -> String {
 async fn send_rerank(base: &str, client: &reqwest::Client) {
     let resp = client
         .post(format!("{base}/v1/rerank"))
-        .json(&json!({ "model": "rr", "query": "q", "documents": ["a"] }))
+        .json(&json!({ "model": "cohere/rr", "query": "q", "documents": ["a"] }))
         .send()
         .await
         .expect("send rerank");
@@ -281,7 +281,7 @@ const ONE_MODEL_CHAT: &str = r#"
     name = "openai"
     kind = "openai"
     [[providers.models]]
-    id = "gpt"
+    id = "openai/gpt"
     capabilities = ["chat"]
 "#;
 
@@ -290,10 +290,10 @@ const TWO_MODELS_CHAT_EMBED: &str = r#"
     name = "openai"
     kind = "openai"
     [[providers.models]]
-    id = "gpt"
+    id = "openai/gpt"
     capabilities = ["chat"]
     [[providers.models]]
-    id = "embed"
+    id = "openai/embed"
     capabilities = ["embed"]
 "#;
 
@@ -405,7 +405,7 @@ async fn spawn_config_reloader_survives_a_rename_replace_of_a_bare_filename_conf
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
-        if registry.embedding_route("embed").is_some() {
+        if registry.embedding_route("openai/embed").is_some() {
             break;
         }
         assert!(
@@ -431,7 +431,7 @@ fn webhook_config_body(upstream: &str, db: &Path, webhooks: Option<&str>) -> Str
         kind = "cohere"
         base_url = "{upstream}"
         [[providers.models]]
-        id = "rr"
+        id = "cohere/rr"
         upstream_id = "rerank-v3.5"
         capabilities = ["rerank"]
         {block}
@@ -802,7 +802,7 @@ async fn reading_the_config_file_does_not_start_a_reload_loop() {
 async fn a_real_config_change_still_triggers_exactly_one_reload() {
     let (dir, config_path, registry, metrics, handle) = armed_reloader().await;
     assert!(
-        registry.embedding_route("embed").is_none(),
+        registry.embedding_route("openai/embed").is_none(),
         "the embed model is not routable before the change"
     );
 
@@ -813,7 +813,7 @@ async fn a_real_config_change_still_triggers_exactly_one_reload() {
     // The swap must actually happen: hot reload still works.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
-        if registry.embedding_route("embed").is_some() {
+        if registry.embedding_route("openai/embed").is_some() {
             break;
         }
         assert!(

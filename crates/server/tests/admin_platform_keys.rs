@@ -31,7 +31,7 @@ name = "openai-main"
 kind = "openai"
 
 [[providers.models]]
-id = "gpt-4o"
+id = "openai-main/gpt-4o"
 capabilities = ["chat"]
 
 [[providers]]
@@ -40,7 +40,7 @@ kind = "azure"
 base_url = "https://example.openai.azure.com"
 
 [[providers.models]]
-id = "az-gpt"
+id = "azure-main/az-gpt"
 capabilities = ["chat"]
 "#;
 
@@ -163,7 +163,7 @@ async fn add_list_toggle_delete_platform_key() {
     assert_eq!(openai["kind"], "openai");
     assert_eq!(openai["eligible"], true);
     assert_eq!(openai["configured_key"], false);
-    assert_eq!(openai["models"], json!(["gpt-4o"]));
+    assert_eq!(openai["models"], json!(["openai-main/gpt-4o"]));
     assert_eq!(openai["keys"][0]["label"], "primary");
     assert_eq!(provider(&listing, "azure-main")["eligible"], false);
     assert_eq!(provider(&listing, "azure-main")["keys"], json!([]));

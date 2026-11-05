@@ -330,8 +330,16 @@ health_check_interval_ms = 30000  # probe cadence (must not be 0 when enabled)
 #
 # Each `[[providers.models]]` block declares a FOUNDATION model: one upstream
 # model on this provider, callable directly by its id.
-#   id            the id clients send (owned entirely by you)
-#   upstream_id   what LUMEN sends upstream (defaults to `id`)
+#   id            the id clients send as `model`: `<provider name>/<model>`,
+#                 prefixed with THIS provider's `name` (`openai/gpt-4o` on
+#                 provider "openai"). A bare id (`gpt-4o`) or another prefix is
+#                 rejected at load and on the admin API; `lumen config migrate`
+#                 prefixes an older config. The old bare ids keep resolving as
+#                 hidden deprecated aliases (never listed in GET /v1/models;
+#                 each use is logged and counted on
+#                 `lumen_deprecated_model_alias_total`).
+#   upstream_id   what LUMEN sends upstream (defaults to `id` without its
+#                 `<provider>/` prefix)
 #   capabilities  any of: "chat", "embed", "rerank", "decisions" (ADR 017; the
 #                 old spelling "systemone" is still accepted with a boot
 #                 warning, `lumen config migrate` rewrites it). A typesafe
@@ -390,7 +398,7 @@ cost_per_1m_input = 2.5
 cost_per_1m_output = 10.0
 
 [[providers.models]]
-id = "text-embedding-3-small"
+id = "openai/text-embedding-3-small"
 capabilities = ["embed"]
 
 # OpenAI decision model (POST /v1/decisions, public beta): typed answers with
@@ -398,7 +406,7 @@ capabilities = ["embed"]
 # docs/decisions/decisions.md. Needs a choice with at least 2 options and at
 # most 128 images per request.
 # [[providers.models]]
-# id = "gpt-6-luna"
+# id = "openai/gpt-6-luna"
 # capabilities = ["decisions"]
 # modalities = ["text", "image"]
 # cost_per_1m_input = 0.10
@@ -412,7 +420,7 @@ kind = "anthropic"
 api_key_env = "ANTHROPIC_API_KEY"
 
 [[providers.models]]
-id = "claude-sonnet-4-5"
+id = "anthropic/claude-sonnet-4-5"
 upstream_id = "claude-sonnet-4-5-20250929"
 capabilities = ["chat"]
 cost_per_1m_input = 3.0
@@ -428,11 +436,11 @@ cost_per_1m_output = 15.0
 # api_key_env = "GEMINI_API_KEY"
 #
 # [[providers.models]]
-# id = "gemini-2.0-flash"
+# id = "google/gemini-2.0-flash"
 # capabilities = ["chat"]
 #
 # [[providers.models]]
-# id = "gemini-embedding-001"
+# id = "google/gemini-embedding-001"
 # capabilities = ["embed"]
 
 # Google Vertex AI: chat + embeddings (Gemini models on GCP). Distinct from
@@ -453,12 +461,12 @@ cost_per_1m_output = 15.0
 # base_url = "us-central1"
 #
 # [[providers.models]]
-# id = "gemini-flash-vertex"
+# id = "vertex/gemini-flash-vertex"
 # upstream_id = "gemini-2.0-flash"
 # capabilities = ["chat"]
 #
 # [[providers.models]]
-# id = "gemini-embedding-vertex"
+# id = "vertex/gemini-embedding-vertex"
 # upstream_id = "gemini-embedding-001"
 # capabilities = ["embed"]
 
@@ -481,7 +489,7 @@ base_url = "https://bedrock-runtime.us-east-1.amazonaws.com"
 # api_key_env = "AWS_SECRET_ACCESS_KEY"   # optional: overrides the env secret
 
 [[providers.models]]
-id = "bedrock-claude-sonnet-4-5"
+id = "bedrock/bedrock-claude-sonnet-4-5"
 upstream_id = "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
 capabilities = ["chat"]
 modalities = ["text", "image"]
@@ -517,12 +525,12 @@ total_timeout_ms = 120000
 connect_timeout_ms = 10000        # own client: relaxed connect for a slow local link
 
 [[providers.models]]
-id = "local-llama"
+id = "ollama-local/local-llama"
 upstream_id = "llama3.2"
 capabilities = ["chat"]
 
 [[providers.models]]
-id = "nomic-embed"
+id = "ollama-local/nomic-embed"
 upstream_id = "nomic-embed-text"
 capabilities = ["embed"]
 
@@ -530,7 +538,7 @@ capabilities = ["embed"]
 # POST /v1/systemone. Free (cost 0). Choice and score questions take 2 to 26
 # options or levels. Only the `clef` and `clef-flash` models accept images.
 # [[providers.models]]
-# id = "nimble"
+# id = "ollama-local/nimble"
 # upstream_id = "nimble"
 # capabilities = ["decisions"]
 
@@ -552,7 +560,7 @@ cost_per_1k_searches = 2.0
 # Versioned aliasing: a stable public id pinned to a specific upstream version.
 # Bump `upstream_id` to roll the model forward without changing client code.
 [[providers.models]]
-id = "embed-multilingual"
+id = "cohere/embed-multilingual"
 upstream_id = "embed-v4.0"
 capabilities = ["embed", "rerank"]
 # embed-v4 is multimodal: declare "image" so /v1/embeddings accepts image
@@ -567,7 +575,7 @@ kind = "jina"
 api_key_env = "JINA_API_KEY"
 
 [[providers.models]]
-id = "jina-rerank"
+id = "jina/jina-rerank"
 upstream_id = "jina-reranker-v2-base-multilingual"
 capabilities = ["rerank"]
 
@@ -578,7 +586,7 @@ kind = "voyage"
 api_key_env = "VOYAGE_API_KEY"
 
 [[providers.models]]
-id = "voyage-rerank"
+id = "voyage/voyage-rerank"
 upstream_id = "rerank-2"
 capabilities = ["rerank"]
 
@@ -590,7 +598,7 @@ kind = "mixedbread"
 api_key_env = "MXBAI_API_KEY"
 
 [[providers.models]]
-id = "mxbai-rerank"
+id = "mixedbread/mxbai-rerank"
 upstream_id = "mixedbread-ai/mxbai-rerank-large-v1"
 capabilities = ["rerank"]
 
@@ -602,7 +610,7 @@ kind = "pinecone"
 api_key_env = "PINECONE_API_KEY"
 
 [[providers.models]]
-id = "pinecone-rerank"
+id = "pinecone/pinecone-rerank"
 upstream_id = "pinecone-rerank-v0"
 capabilities = ["rerank"]
 
@@ -625,13 +633,13 @@ api_key_env = "TYPESAFE_API_KEY"
 # forward_unknown_fields = true          # optional, default shown
 
 [[providers.models]]
-id = "jev"
+id = "typesafe/jev"
 upstream_id = "jev-latest"   # stable alias; also jev-preview, or a version
 capabilities = ["decisions"]
 # Jev bills input tokens only: no cost_per_1m_output needed.
 cost_per_1m_input = 0.042
 
-# A pinned version for reproducible answers. Clients call `jev-1.13.0`, the
+# A pinned version for reproducible answers. Clients call `lumen/jev-1.13.0`, the
 # virtual model below that falls back to the stable alias `jev`.
 [[providers.models]]
 id = "typesafe/jev-1.13.0"
@@ -652,7 +660,7 @@ cost_per_1m_input = 0.042
 # forward_unknown_fields = false
 # api_key_env = "LIQUID_API_KEY"
 # [[providers.models]]
-# id = "liquid-d1"
+# id = "liquid/liquid-d1"
 # upstream_id = "d1"
 # capabilities = ["decisions"]
 
@@ -666,7 +674,7 @@ cost_per_1m_input = 0.042
 # kind = "perplexity"
 # api_key_env = "PERPLEXITY_API_KEY"
 # [[providers.models]]
-# id = "pplx-decider"
+# id = "perplexity/pplx-decider"
 # upstream_id = "pplx-decider-v1.1-27b"
 # capabilities = ["decisions"]
 # modalities = ["text", "image"]
@@ -682,7 +690,7 @@ cost_per_1m_input = 0.042
 # api_key_env = "CLOUDFLARE_API_TOKEN"
 # base_url = "https://api.cloudflare.com/client/v4/accounts/YOUR_ACCOUNT_ID/ai/v1"
 # [[providers.models]]
-# id = "clef"
+# id = "cf/clef"
 # upstream_id = "clef"
 # capabilities = ["decisions"]
 # modalities = ["text", "image"]
@@ -698,7 +706,7 @@ base_url = "http://localhost:8000"
 # api_key_env = "NVIDIA_API_KEY"
 
 [[providers.models]]
-id = "nvidia-rerank"
+id = "nvidia-nim/nvidia-rerank"
 upstream_id = "nvidia/llama-3.2-nv-rerankqa-1b-v2"
 capabilities = ["rerank"]
 
@@ -710,7 +718,7 @@ kind = "together"
 api_key_env = "TOGETHER_API_KEY"
 
 [[providers.models]]
-id = "llama-rank"
+id = "together/llama-rank"
 upstream_id = "Salesforce/Llama-Rank-V1"
 capabilities = ["rerank"]
 
@@ -723,7 +731,7 @@ kind = "tei"
 base_url = "http://localhost:8081"
 
 [[providers.models]]
-id = "bge-reranker"
+id = "tei-local/bge-reranker"
 upstream_id = "BAAI/bge-reranker-large"
 capabilities = ["rerank"]
 
@@ -746,7 +754,7 @@ base_url = "https://my-resource.openai.azure.com"
 api_version = "2024-10-21"
 
 [[providers.models]]
-id = "azure-gpt-4o"
+id = "azure-openai/azure-gpt-4o"
 upstream_id = "my-gpt4o-deployment"   # the Azure deployment name
 capabilities = ["chat"]
 
@@ -758,8 +766,9 @@ capabilities = ["chat"]
 # lives in the dynamic config: it hot-reloads, and is editable through
 # /admin/config and /admin/config/virtual_models (ADR 012). Foundation
 # and virtual ids share ONE namespace: a collision is a validation error. Ids
-# are non-empty and use only the characters A-Z a-z 0-9 . _ : / -
-# (`company/model` is a convention, not a rule).
+# are non-empty and use only the characters A-Z a-z 0-9 . _ : / -, and a
+# virtual id is `<namespace>/<model>` (any namespace, e.g. `meilisearch/`,
+# `lumen/`, `acme/`): a bare virtual id is rejected.
 #
 # Fields of a `[[virtual_models]]` entry:
 #   id           the id clients send, e.g. "acme/legal-rerank" (required)
@@ -852,27 +861,27 @@ capabilities = ["chat"]
 # Fallback: `gpt-4o` is served by OpenAI, and by Claude when OpenAI fails
 # with a default trigger (5xx, 429, timeout, open circuit).
 [[virtual_models]]
-id = "gpt-4o"
+id = "lumen/gpt-4o"
 capability = "chat"
 strategy = "fallback"
-targets = [{ model = "openai/gpt-4o" }, { model = "claude-sonnet-4-5" }]
+targets = [{ model = "openai/gpt-4o" }, { model = "anthropic/claude-sonnet-4-5" }]
 
 # A multi-hop fallback across three rerank vendors: if Cohere is down, try
 # Jina, then Voyage, so a rerank request survives any single vendor outage.
 [[virtual_models]]
-id = "rerank-english"
+id = "lumen/rerank-english"
 capability = "rerank"
 strategy = "fallback"
-targets = [{ model = "cohere/rerank-english" }, { model = "jina-rerank" }, { model = "voyage-rerank" }]
+targets = [{ model = "cohere/rerank-english" }, { model = "jina/jina-rerank" }, { model = "voyage/voyage-rerank" }]
 
 # The pinned Jev version, falling back to the stable alias when it is
 # overloaded (TypeSafe 529, the `provider_error` trigger) or its circuit is
 # open.
 [[virtual_models]]
-id = "jev-1.13.0"
+id = "lumen/jev-1.13.0"
 capability = "decisions"
 strategy = "fallback"
-targets = [{ model = "typesafe/jev-1.13.0" }, { model = "jev" }]
+targets = [{ model = "typesafe/jev-1.13.0" }, { model = "typesafe/jev" }]
 
 # Cross-vendor fallback: Perplexity first (cheapest), then Jev, then OpenAI's
 # gpt-6-luna. Needs the `pplx-decider` and `gpt-6-luna` models, commented out
@@ -880,23 +889,23 @@ targets = [{ model = "typesafe/jev-1.13.0" }, { model = "jev" }]
 # choice for OpenAI) is skipped before any upstream call. Add
 # fallback_on = ["content_filter"] to also move on when a model refuses.
 # [[virtual_models]]
-# id = "cross"
+# id = "lumen/cross"
 # capability = "decisions"
 # strategy = "fallback"
-# targets = [{ model = "pplx-decider" }, { model = "jev" }, { model = "gpt-6-luna" }]
+# targets = [{ model = "perplexity/pplx-decider" }, { model = "typesafe/jev" }, { model = "openai/gpt-6-luna" }]
 
 # Jev as a reranker: POST /v1/rerank on `jev-rerank` is converted to decision
 # calls on `jev` whose state is the query and whose questions are one predicate
 # per document; the predicate probability is the relevance_score. Every remap
 # field is optional (the defaults are a generic relevance question).
 [[virtual_models]]
-id = "jev-rerank"
+id = "lumen/jev-rerank"
 capability = "rerank"
 strategy = "single"
 description = "Jev relevance reranking"
 
 [[virtual_models.targets]]
-model = "jev"
+model = "typesafe/jev"
 [virtual_models.targets.remap]
 strategy = "predicate"
 instructions = "Is `document` relevant to the query in the state, that is, does it answer the query or contain information that directly helps answer it?"
@@ -910,7 +919,7 @@ criteria.false = "The document is off-topic, or only shares keywords with the qu
 id = "acme/support-bot"
 capability = "chat"
 strategy = "fallback"
-targets = [{ model = "gpt-4o" }, { model = "claude-sonnet-4-5" }]
+targets = [{ model = "lumen/gpt-4o" }, { model = "anthropic/claude-sonnet-4-5" }]
 description = "Acme support assistant"
 preset = { system_prompt = "You are Acme's support assistant. Answer briefly and point to the documentation when relevant.", system_prompt_mode = "prepend", overrides = { default = { temperature = 0.2 }, set = { max_tokens = 800 } } }
 
@@ -922,7 +931,7 @@ capability = "rerank"
 strategy = "fallback"
 
 [[virtual_models.targets]]
-model = "jev"
+model = "typesafe/jev"
 [virtual_models.targets.remap]
 strategy = "composite"
 context = "US federal case law. Prefer holdings over dicta."
@@ -938,7 +947,7 @@ criteria.true = "It states the specific rule."
 criteria.false = "It only mentions related topics."
 
 [[virtual_models.targets]]
-model = "rerank-english"
+model = "lumen/rerank-english"
 
 # Split: 80% of `acme/chat-ab` goes to OpenAI and 20% to Azure OpenAI; a
 # failing pick moves to the other one. Uncomment to enable.
@@ -946,7 +955,7 @@ model = "rerank-english"
 # id = "acme/chat-ab"
 # capability = "chat"
 # strategy = "split"
-# targets = [{ model = "openai/gpt-4o", weight = 80 }, { model = "azure-gpt-4o", weight = 20 }]
+# targets = [{ model = "openai/gpt-4o", weight = 80 }, { model = "azure-openai/azure-gpt-4o", weight = 20 }]
 
 # Switch: route by budget group (matches only with auth enabled), by request
 # metadata and by request shape. Needs the `acme/chat-eu` and `gemini-long`
@@ -958,9 +967,9 @@ model = "rerank-english"
 # strategy = "switch"
 # targets = [
 #   { when = { group = "eu-customers" }, model = "acme/chat-eu" },
-#   { when = { "metadata.plan" = { in = ["pro"] }, input_tokens = { gt = 32000 } }, model = "gemini-long" },
-#   { when = { any = [{ has_images = true }, { has_tools = true }] }, model = "gpt-4o" },
-#   { model = "local-llama" },
+#   { when = { "metadata.plan" = { in = ["pro"] }, input_tokens = { gt = 32000 } }, model = "google/gemini-long" },
+#   { when = { any = [{ has_images = true }, { has_tools = true }] }, model = "lumen/gpt-4o" },
+#   { model = "ollama-local/local-llama" },
 # ]
 
 # ---------------------------------------------------------------------------

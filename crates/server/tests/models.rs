@@ -257,7 +257,7 @@ async fn virtual_models_are_listed_and_retrievable_unless_hidden() {
         name = "openai"
         kind = "openai"
         [[providers.models]]
-        id = "gpt-4o"
+        id = "openai/gpt-4o"
         capabilities = ["chat"]
         modalities = ["text", "image"]
 
@@ -273,7 +273,7 @@ async fn virtual_models_are_listed_and_retrievable_unless_hidden() {
         capability = "chat"
         strategy = "single"
         listed = false
-        targets = [{ model = "gpt-4o" }]
+        targets = [{ model = "openai/gpt-4o" }]
         "#,
         "test",
     )
@@ -303,7 +303,7 @@ async fn virtual_models_are_listed_and_retrievable_unless_hidden() {
         .iter()
         .map(|m| m["id"].as_str().unwrap())
         .collect();
-    assert_eq!(ids, vec!["gpt-4o", "acme/chat"]);
+    assert_eq!(ids, vec!["openai/gpt-4o", "acme/chat"]);
     let entry = &list["data"][1];
     assert_eq!(entry["virtual"], true);
     assert_eq!(entry["capabilities"], serde_json::json!(["chat"]));
@@ -331,10 +331,10 @@ async fn a_disabled_model_is_neither_listed_nor_served() {
         kind = "openai"
         api_key_env = "LUMEN_TEST_DISABLED_MODEL_KEY"
         [[providers.models]]
-        id = "gpt-4o"
+        id = "openai/gpt-4o"
         capabilities = ["chat"]
         [[providers.models]]
-        id = "gpt-3.5-turbo"
+        id = "openai/gpt-3.5-turbo"
         capabilities = ["chat"]
         disabled = true
 
@@ -343,7 +343,7 @@ async fn a_disabled_model_is_neither_listed_nor_served() {
         id = "acme/chat"
         capability = "chat"
         strategy = "fallback"
-        targets = [{ model = "gpt-3.5-turbo" }, { model = "gpt-4o" }]
+        targets = [{ model = "openai/gpt-3.5-turbo" }, { model = "openai/gpt-4o" }]
         "#,
         "test",
     )
@@ -373,23 +373,33 @@ async fn a_disabled_model_is_neither_listed_nor_served() {
         .iter()
         .map(|m| m["id"].as_str().unwrap())
         .collect();
-    assert_eq!(ids, vec!["gpt-4o", "acme/chat"]);
+    assert_eq!(ids, vec!["openai/gpt-4o", "acme/chat"]);
 
-    let one = reqwest::get(format!("{base}/v1/models/gpt-3.5-turbo"))
+    // Neither the prefixed id nor its deprecated bare alias is served, while
+    // an enabled model's alias still resolves.
+    for id in ["openai/gpt-3.5-turbo", "gpt-3.5-turbo"] {
+        let one = reqwest::get(format!("{base}/v1/models/{id}"))
+            .await
+            .unwrap();
+        assert_eq!(one.status(), 404, "{id}");
+
+        let chat = reqwest::Client::new()
+            .post(format!("{base}/v1/chat/completions"))
+            .json(&serde_json::json!({
+                "model": id,
+                "messages": [{ "role": "user", "content": "hi" }]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(chat.status(), 404, "{id}");
+        let body: Value = chat.json().await.unwrap();
+        assert_eq!(body["error"]["code"], "LM-2001", "{id}");
+    }
+    let alias = reqwest::get(format!("{base}/v1/models/gpt-4o"))
         .await
         .unwrap();
-    assert_eq!(one.status(), 404);
-
-    let chat = reqwest::Client::new()
-        .post(format!("{base}/v1/chat/completions"))
-        .json(&serde_json::json!({
-            "model": "gpt-3.5-turbo",
-            "messages": [{ "role": "user", "content": "hi" }]
-        }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(chat.status(), 404);
-    let body: Value = chat.json().await.unwrap();
-    assert_eq!(body["error"]["code"], "LM-2001");
+    assert_eq!(alias.status(), 200);
+    let entry: Value = alias.json().await.unwrap();
+    assert_eq!(entry["id"], "openai/gpt-4o");
 }

@@ -9,7 +9,7 @@ per model.
 
 ```json
 {
-  "model": "gpt-4o",
+  "model": "openai/gpt-4o",
   "messages": [{
     "role": "user",
     "content": [

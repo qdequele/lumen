@@ -46,7 +46,7 @@ fn config(jev: &str, cohere: &str, remap: &str) -> Config {
             base_url = "{jev}"
             api_key_env = "LUMEN_TEST_TYPESAFE_KEY_UNUSED"
             [[providers.models]]
-            id = "jev"
+            id = "typesafe/jev"
             upstream_id = "jev-latest"
             capabilities = ["decisions"]
             cost_per_1m_input = 0.042
@@ -57,7 +57,7 @@ fn config(jev: &str, cohere: &str, remap: &str) -> Config {
             base_url = "{cohere}"
             api_key_env = "LUMEN_TEST_COHERE_KEY_UNUSED"
             [[providers.models]]
-            id = "rerank-english"
+            id = "cohere/rerank-english"
             upstream_id = "rerank-v3.5"
             capabilities = ["rerank"]
 
@@ -65,7 +65,7 @@ fn config(jev: &str, cohere: &str, remap: &str) -> Config {
             id = "acme/rerank"
             capability = "rerank"
             strategy = "fallback"
-            targets = [{{ model = "jev", remap = {remap} }}, {{ model = "rerank-english" }}]
+            targets = [{{ model = "typesafe/jev", remap = {remap} }}, {{ model = "cohere/rerank-english" }}]
             "#
         ),
         "test",
@@ -120,8 +120,8 @@ async fn noul_remap_ranks_with_jev_and_reports_upstream_tokens() {
     .await;
     let resp = rerank(&base, &["a", "b"]).await;
     assert_eq!(resp.status(), 200);
-    assert_eq!(resp.headers()["x-lumen-model-used"], "jev");
-    assert_eq!(resp.headers()["x-lumen-route"], "acme/rerank>jev");
+    assert_eq!(resp.headers()["x-lumen-model-used"], "typesafe/jev");
+    assert_eq!(resp.headers()["x-lumen-route"], "acme/rerank>typesafe/jev");
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["results"][0]["index"], 1, "most relevant first");
     assert_eq!(body["usage"]["total_tokens"], 123);
@@ -139,7 +139,7 @@ async fn noul_remap_ranks_with_jev_and_reports_upstream_tokens() {
         .unwrap();
     assert!(
         metrics.contains(
-            r#"lumen_virtual_model_requests_total{model_used="jev",virtual_model="acme/rerank"} 1"#
+            r#"lumen_virtual_model_requests_total{model_used="typesafe/jev",virtual_model="acme/rerank"} 1"#
         ),
         "{metrics}"
     );
@@ -212,10 +212,13 @@ async fn jev_overload_falls_back_to_cohere() {
     let base = spawn(&config(&jev.uri(), &cohere.uri(), "{}")).await;
     let resp = rerank(&base, &["a"]).await;
     assert_eq!(resp.status(), 200);
-    assert_eq!(resp.headers()["x-lumen-model-used"], "rerank-english");
+    assert_eq!(
+        resp.headers()["x-lumen-model-used"],
+        "cohere/rerank-english"
+    );
     assert_eq!(
         resp.headers()["x-lumen-route"],
-        "acme/rerank>rerank-english"
+        "acme/rerank>cohere/rerank-english"
     );
 }
 
@@ -323,7 +326,7 @@ fn openai_config(luna: &str, cohere: &str, remap: &str) -> Config {
             base_url = "{luna}/v1"
             api_key_env = "LUMEN_TEST_OPENAI_KEY_UNUSED"
             [[providers.models]]
-            id = "luna"
+            id = "openai/luna"
             upstream_id = "gpt-6-luna"
             capabilities = ["decisions"]
 
@@ -333,7 +336,7 @@ fn openai_config(luna: &str, cohere: &str, remap: &str) -> Config {
             base_url = "{cohere}"
             api_key_env = "LUMEN_TEST_COHERE_KEY_UNUSED"
             [[providers.models]]
-            id = "rerank-english"
+            id = "cohere/rerank-english"
             upstream_id = "rerank-v3.5"
             capabilities = ["rerank"]
 
@@ -342,7 +345,7 @@ fn openai_config(luna: &str, cohere: &str, remap: &str) -> Config {
             capability = "rerank"
             strategy = "fallback"
             fallback_on = ["content_filter"]
-            targets = [{{ model = "luna", remap = {remap} }}, {{ model = "rerank-english" }}]
+            targets = [{{ model = "openai/luna", remap = {remap} }}, {{ model = "cohere/rerank-english" }}]
             "#
         ),
         "test",
@@ -375,7 +378,7 @@ async fn an_openai_remap_counts_refusals_and_never_returns_them() {
 
     let resp = rerank(&base, &["a", "b"]).await;
     assert_eq!(resp.status(), 200);
-    assert_eq!(resp.headers()["x-lumen-model-used"], "luna");
+    assert_eq!(resp.headers()["x-lumen-model-used"], "openai/luna");
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["results"][0]["index"], 1);
     assert_eq!(body["results"][1]["relevance_score"], 0.0);
@@ -394,7 +397,7 @@ async fn an_openai_remap_counts_refusals_and_never_returns_them() {
         .await
         .unwrap();
     assert!(
-        metrics.contains(r#"lumen_decision_refusals_total{model="luna"} 1"#),
+        metrics.contains(r#"lumen_decision_refusals_total{model="openai/luna"} 1"#),
         "{metrics}"
     );
 }
@@ -420,7 +423,10 @@ async fn a_refused_choice_falls_back_on_content_filter() {
 
     let resp = rerank(&base, &["a", "b"]).await;
     assert_eq!(resp.status(), 200);
-    assert_eq!(resp.headers()["x-lumen-model-used"], "rerank-english");
+    assert_eq!(
+        resp.headers()["x-lumen-model-used"],
+        "cohere/rerank-english"
+    );
     assert_eq!(luna.received_requests().await.unwrap().len(), 1);
 
     // The refused attempt is counted against the model that refused, even
@@ -432,11 +438,11 @@ async fn a_refused_choice_falls_back_on_content_filter() {
         .await
         .unwrap();
     assert!(
-        metrics.contains(r#"lumen_decision_refusals_total{model="luna"} 1"#),
+        metrics.contains(r#"lumen_decision_refusals_total{model="openai/luna"} 1"#),
         "{metrics}"
     );
     assert!(
-        !metrics.contains(r#"lumen_decision_refusals_total{model="rerank-english"}"#),
+        !metrics.contains(r#"lumen_decision_refusals_total{model="cohere/rerank-english"}"#),
         "{metrics}"
     );
 }
@@ -456,7 +462,7 @@ async fn a_refused_choice_without_fallback_is_a_400_lm_2013() {
             base_url = "{}/v1"
             api_key_env = "LUMEN_TEST_OPENAI_KEY_UNUSED"
             [[providers.models]]
-            id = "luna"
+            id = "openai/luna"
             upstream_id = "gpt-6-luna"
             capabilities = ["decisions"]
 
@@ -464,7 +470,7 @@ async fn a_refused_choice_without_fallback_is_a_400_lm_2013() {
             id = "acme/rerank"
             capability = "rerank"
             strategy = "single"
-            targets = [{{ model = "luna", remap = {{ strategy = "choice" }} }}]
+            targets = [{{ model = "openai/luna", remap = {{ strategy = "choice" }} }}]
             "#,
             luna.uri()
         ),

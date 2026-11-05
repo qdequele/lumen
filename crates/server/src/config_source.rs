@@ -685,7 +685,7 @@ mod tests {
         name = "nowhere"
         kind = "vllm"
         [[providers.models]]
-        id = "m"
+        id = "nowhere/m"
         capabilities = ["chat"]
     "#;
 
@@ -704,7 +704,7 @@ mod tests {
             name = "openai"
             kind = "openai"
             [[providers.models]]
-            id = "gpt"
+            id = "openai/gpt"
             capabilities = ["chat"]
             "#,
         )
@@ -735,7 +735,7 @@ mod tests {
             name = "openai"
             kind = "openai"
             [[providers.models]]
-            id = "gpt"
+            id = "openai/gpt"
             capabilities = ["chat"]
             "#,
         )

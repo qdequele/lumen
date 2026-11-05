@@ -143,7 +143,7 @@ api_key_env = "SIGNAL_SHUTDOWN_TEST_API_KEY"
 base_url = "{upstream_uri}"
 
 [[providers.models]]
-id = "gpt"
+id = "mock/gpt"
 upstream_id = "gpt"
 capabilities = ["chat"]
 "#,

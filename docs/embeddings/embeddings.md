@@ -10,7 +10,7 @@
 curl -s http://localhost:8080/v1/embeddings \
   -H 'content-type: application/json' \
   -d '{
-    "model": "text-embedding-3-small",
+    "model": "openai/text-embedding-3-small",
     "input": ["the quick brown fox", "a lazy dog"]
   }'
 ```

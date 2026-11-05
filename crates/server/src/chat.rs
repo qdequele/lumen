@@ -92,7 +92,8 @@ pub async fn chat(
     // that `switch` conditions read (ADR 014, ADR 003). It depends only on the
     // requested id, and is applied exactly once. Facts are dropped before any
     // `.await`.
-    let client_model = req.model.clone();
+    // A deprecated bare id (`gpt-4o`) resolves to its `provider/model` id.
+    let client_model = state.resilience.canonical_model(&req.model);
     let mut decision = {
         let (headers, key, req) = (&headers, key.as_deref(), &mut req);
         state

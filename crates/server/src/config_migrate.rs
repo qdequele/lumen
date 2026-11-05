@@ -1,7 +1,12 @@
 //! `lumen config migrate` (ADR 014): rewrite a config document that still
 //! uses per-model `fallbacks` or the Jev `[providers.models.rerank]` block
-//! into foundation models plus `[[virtual_models]]`. Format preserving
-//! outside the edited tables; the result is validated by the caller.
+//! into foundation models plus `[[virtual_models]]`, then give every model id
+//! its prefix: a foundation model becomes `<provider>/<id>` (its old id is
+//! pinned as `upstream_id`, so nothing changes upstream) and a virtual model
+//! `lumen/<id>`, with every target that named them rewritten. The old bare
+//! ids keep resolving as hidden deprecated aliases
+//! ([`Config::model_aliases`]). Format preserving outside the edited tables;
+//! the result is validated by the caller.
 
 use std::collections::{HashMap, HashSet};
 
@@ -12,7 +17,12 @@ use lumen_router::virtual_models::config::{
 };
 use toml_edit::{ArrayOfTables, DocumentMut, Item};
 
-use crate::config::{Config, ModelConfig, ProviderConfig};
+use crate::config::{
+    foundation_id_problem, virtual_id_problem, Config, ModelConfig, ProviderConfig,
+};
+
+/// The namespace `lumen config migrate` gives a bare virtual model id.
+pub const DEFAULT_VIRTUAL_NAMESPACE: &str = "lumen";
 use crate::config_edit::{normalize_to_array_of_tables, upsert_virtual_model, EditError};
 
 /// The result of a migration.
@@ -411,6 +421,180 @@ fn rename_legacy_spellings(document: &mut DocumentMut) -> Vec<String> {
 /// [`MigrateError`] when the document does not parse, a needed id exists,
 /// or an edit fails.
 pub fn migrate_document(doc: &str) -> Result<Migration, MigrateError> {
+    migrate_document_with(doc, DEFAULT_VIRTUAL_NAMESPACE)
+}
+
+/// [`migrate_document`], giving a bare virtual model id the namespace
+/// `namespace` (`meilisearch` on the hosted Gateway) instead of `lumen`.
+///
+/// # Errors
+/// As [`migrate_document`].
+pub fn migrate_document_with(doc: &str, namespace: &str) -> Result<Migration, MigrateError> {
+    let legacy = migrate_legacy(doc)?;
+    let mut document = legacy
+        .text
+        .parse::<DocumentMut>()
+        .map_err(|e| MigrateError::Parse(e.to_string()))?;
+    let prefix_notes = prefix_model_ids(&mut document, namespace)?;
+    if prefix_notes.is_empty() {
+        return Ok(legacy);
+    }
+    let mut notes = legacy.notes;
+    notes.extend(prefix_notes);
+    Ok(Migration {
+        text: document.to_string(),
+        changed: true,
+        notes,
+    })
+}
+
+/// Rename one target's `model` value through `renames`, keeping its decor.
+fn rename_target(target: &mut dyn toml_edit::TableLike, renames: &HashMap<String, String>) {
+    if let Some(value) = target.get_mut("model").and_then(Item::as_value_mut) {
+        if let Some(new) = value.as_str().and_then(|old| renames.get(old)).cloned() {
+            set_str_keep_decor(value, &new);
+        }
+    }
+}
+
+/// Rewrite every virtual model target that names a renamed id.
+fn rename_targets(document: &mut DocumentMut, renames: &HashMap<String, String>) {
+    if let Some(vms) = document.get_mut("virtual_models") {
+        for vm in vms
+            .as_array_of_tables_mut()
+            .into_iter()
+            .flat_map(ArrayOfTables::iter_mut)
+        {
+            let Some(targets) = vm.get_mut("targets") else {
+                continue;
+            };
+            if let Some(array) = targets.as_array_mut() {
+                for target in array.iter_mut() {
+                    if let Some(table) = target.as_inline_table_mut() {
+                        rename_target(table, renames);
+                    }
+                }
+            } else if let Some(tables) = targets.as_array_of_tables_mut() {
+                for table in tables.iter_mut() {
+                    rename_target(table, renames);
+                }
+            }
+        }
+    }
+}
+
+/// Prefix every model id that lacks its prefix (see the module docs) and
+/// rewrite the targets that named them. Returns the notes, empty when every
+/// id already had its prefix.
+fn prefix_model_ids(
+    document: &mut DocumentMut,
+    namespace: &str,
+) -> Result<Vec<String>, MigrateError> {
+    let mut existing: HashSet<String> = HashSet::new();
+    let mut planned: Vec<(String, String)> = Vec::new();
+    let mut foundation = 0usize;
+    let mut virtuals = 0usize;
+    if let Some(providers) = document.get_mut("providers") {
+        normalize_to_array_of_tables(providers);
+        for provider in providers
+            .as_array_of_tables_mut()
+            .into_iter()
+            .flat_map(ArrayOfTables::iter_mut)
+        {
+            let Some(name) = provider
+                .get("name")
+                .and_then(Item::as_str)
+                .map(str::to_owned)
+            else {
+                continue;
+            };
+            let Some(models) = provider.get_mut("models") else {
+                continue;
+            };
+            normalize_to_array_of_tables(models);
+            for model in models
+                .as_array_of_tables_mut()
+                .into_iter()
+                .flat_map(ArrayOfTables::iter_mut)
+            {
+                let Some(id) = model.get("id").and_then(Item::as_str).map(str::to_owned) else {
+                    continue;
+                };
+                existing.insert(id.clone());
+                if foundation_id_problem(&name, &id).is_none() {
+                    continue;
+                }
+                let new_id = format!("{name}/{id}");
+                // Without an explicit upstream id the old id was sent
+                // upstream; pin it so the rename changes nothing upstream.
+                if !model.contains_key("upstream_id") {
+                    model["upstream_id"] = toml_edit::value(id.as_str());
+                }
+                if let Some(value) = model.get_mut("id").and_then(Item::as_value_mut) {
+                    set_str_keep_decor(value, &new_id);
+                }
+                planned.push((id, new_id));
+                foundation += 1;
+            }
+        }
+    }
+    if let Some(vms) = document.get_mut("virtual_models") {
+        normalize_to_array_of_tables(vms);
+        for vm in vms
+            .as_array_of_tables_mut()
+            .into_iter()
+            .flat_map(ArrayOfTables::iter_mut)
+        {
+            let Some(id) = vm.get("id").and_then(Item::as_str).map(str::to_owned) else {
+                continue;
+            };
+            existing.insert(id.clone());
+            if virtual_id_problem(&id).is_none() {
+                continue;
+            }
+            let new_id = format!("{namespace}/{id}");
+            if let Some(value) = vm.get_mut("id").and_then(Item::as_value_mut) {
+                set_str_keep_decor(value, &new_id);
+            }
+            planned.push((id, new_id));
+            virtuals += 1;
+        }
+    }
+    if planned.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut taken = HashSet::new();
+    for (old, new) in &planned {
+        if existing.contains(new) || !taken.insert(new.clone()) {
+            return Err(MigrateError::Conflict(format!(
+                "prefixing '{old}' gives '{new}', which already exists"
+            )));
+        }
+    }
+    let renames: HashMap<String, String> = planned.into_iter().collect();
+    rename_targets(document, &renames);
+    let mut notes = Vec::new();
+    if foundation > 0 {
+        notes.push(format!(
+            "prefixed {foundation} foundation model id(s) with their provider name \
+             (`<provider>/<model>`); each old id is pinned as `upstream_id`"
+        ));
+    }
+    if virtuals > 0 {
+        notes.push(format!(
+            "prefixed {virtuals} virtual model id(s) with `{namespace}/`"
+        ));
+    }
+    notes.push(
+        "the old bare ids keep working as hidden deprecated aliases: move clients to the \
+         prefixed ids (`lumen_deprecated_model_alias_total` counts the ones still sent)"
+            .to_owned(),
+    );
+    Ok(notes)
+}
+
+/// The ADR 014 / ADR 017 part of [`migrate_document`].
+fn migrate_legacy(doc: &str) -> Result<Migration, MigrateError> {
     let mut document = doc
         .parse::<DocumentMut>()
         .map_err(|e| MigrateError::Parse(e.to_string()))?;
