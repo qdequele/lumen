@@ -6,6 +6,12 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-11-05
+
+First release with team provider key pools (BYOK) and bandwidth metering
+(ADR 018). The `v0.8.0` tag was cut without the workspace version bump, so its
+binary reported 0.7.0 and failed deploy health checks; use 0.8.1.
+
 ### Added
 
 - **Team key pools route requests (BYOK).** A request whose virtual key
@@ -2057,7 +2063,8 @@ This closes every remaining streaming criterion:
 - Docs: error-code reference (`docs/errors.md`), ADR 001 (crate/lib naming),
   and this changelog.
 
-[Unreleased]: https://github.com/qdequele/lumen/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/qdequele/lumen/compare/v0.8.1...HEAD
+[0.8.1]: https://github.com/qdequele/lumen/compare/v0.7.0...v0.8.1
 [0.7.0]: https://github.com/qdequele/lumen/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/qdequele/lumen/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/qdequele/lumen/compare/v0.5.0...v0.6.0
