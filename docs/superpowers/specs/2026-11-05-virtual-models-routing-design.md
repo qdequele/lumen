@@ -257,7 +257,7 @@ company's domain.
    `outlook.com`, `hotmail.com`, `yahoo.com`, `icloud.com`, `proton.me`,
    `gmx.*`, plus a maintained disposable-domain list. These teams choose a custom
    namespace with a fixed prefix, `u-<slug>` (for example `u-jdoe-tools`), so a
-   personal namespace can never look like a company. A custom slug is also
+   personal namespace can never look like a company. (Decided 2026-11-05: the `u-` prefix is accepted.) A custom slug is also
    refused when it matches the first label of a domain in a top-sites list (for
    example the Tranco top 100k), as an extra guard.
 6. **Disputes and overrides.** Staff (admin or owner of the Meilisearch team,
@@ -597,5 +597,3 @@ targets = [{ model = "openai/gpt-4o-mini" }, { model = "anthropic/claude-haiku-4
 3. **Staff identity.** The Lab team `93a9f14d-b6f1-438e-8cd2-263dc85df1d5` (writes
    for its admins and owners) is the gate being implemented. Keep it long-term, or
    move to an SSO group later?
-4. **Free-mail prefix.** Is `u-` acceptable as the prefix of free-mail teams'
-   custom namespaces?
