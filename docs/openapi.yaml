@@ -512,7 +512,7 @@ components:
         id: { type: string }
         name: { type: string }
         budget_max: { type: [number, "null"], description: "USD; null when unlimited." }
-        bandwidth_micro_usd_per_gb: { type: integer, minimum: 0, description: "Bandwidth rate charged to the pool, micro-USD per 10^9 bytes (the Lab pushes it already divided by its markup); 0 = not charged. Spent only, never settled. A pool at or past its cap refuses every request with `LM-4001`, even one that costs nothing in tokens." }
+        bandwidth_micro_usd_per_gb: { type: integer, minimum: 0, description: "Bandwidth charged against this group's budget, in micro-USD per 10^9 bytes (request plus response). 0 disables the charge. A group at or past its cap refuses every request with `LM-4001`, even one that costs nothing in tokens." }
         budget_spent: { type: number, description: "USD, as last flushed." }
         created_at: { type: integer }
         deleted_at: { type: [integer, "null"] }
