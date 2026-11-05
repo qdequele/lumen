@@ -16,6 +16,7 @@ use lumen_auth::crypto::MasterKey;
 use lumen_auth::key::hash_key;
 use lumen_auth::state::AuthState;
 use lumen_auth::store::{KeyStore, NewGroup, NewKey};
+use lumen_auth::usage::{spawn_usage_writer, UsageWriterConfig};
 use lumen_providers::{http, Registry};
 use lumen_router::circuit::CircuitState;
 use lumen_server::auth::AuthRuntime;
@@ -45,8 +46,13 @@ fn master() -> MasterKey {
 }
 
 /// Two OpenAI-kind providers (one per mock server), priced so platform
-/// traffic has a visible cost, and a fallback virtual model a -> b.
+/// traffic has a visible cost, and fallback virtual models a -> b and b -> a.
 fn config_text(a: &str, b: &str, kind_a: &str) -> String {
+    config_text_with(a, b, kind_a, "")
+}
+
+/// [`config_text`] with extra keys on provider `a` (e.g. a timeout).
+fn config_text_with(a: &str, b: &str, kind_a: &str, extra_a: &str) -> String {
     format!(
         r#"
         [resilience]
@@ -58,6 +64,7 @@ fn config_text(a: &str, b: &str, kind_a: &str) -> String {
         name = "a"
         kind = "{kind_a}"
         base_url = "{a}"
+        {extra_a}
         [[providers.models]]
         id = "model-a"
         capabilities = ["chat", "embed"]
@@ -79,6 +86,12 @@ fn config_text(a: &str, b: &str, kind_a: &str) -> String {
         capability = "chat"
         strategy = "fallback"
         targets = [{{ model = "model-a" }}, {{ model = "model-b" }}]
+
+        [[virtual_models]]
+        id = "acme/reverse"
+        capability = "chat"
+        strategy = "fallback"
+        targets = [{{ model = "model-b" }}, {{ model = "model-a" }}]
         "#
     )
 }
@@ -113,7 +126,11 @@ struct Harness {
 }
 
 async fn harness(a: &MockServer, b: &MockServer) -> Harness {
-    let text = config_text(&a.uri(), &b.uri(), "openai");
+    harness_with(a, b, "").await
+}
+
+async fn harness_with(a: &MockServer, b: &MockServer, extra_a: &str) -> Harness {
+    let text = config_text_with(&a.uri(), &b.uri(), "openai", extra_a);
     let config = Config::load_text(&text, "test").expect("valid config");
     let dir = TempDir::new().expect("temp dir");
     let config_path = dir.path().join("lumen.toml");
@@ -180,7 +197,16 @@ async fn harness(a: &MockServer, b: &MockServer) -> Harness {
     let latency = LatencyMetrics::register(&metrics).expect("latency");
     let pools = Arc::new(TeamPools::default());
     let resilience = Arc::new(ResilienceRuntime::from_config(&config, None));
+    let (logger, _writer) = spawn_usage_writer(
+        runtime.store.clone(),
+        UsageWriterConfig {
+            capacity: 64,
+            batch_max: 500,
+            flush_interval: Duration::from_millis(25),
+        },
+    );
     let state = AppState::new(metrics, Arc::clone(&registry), tokens, latency)
+        .with_usage(logger)
         .with_pricing(CostTable::from_config(&config))
         .with_resilience(Arc::clone(&resilience))
         .with_auth(Arc::clone(&runtime))
@@ -700,8 +726,8 @@ async fn deleted_team_key_is_not_used_after_delete() {
             ACCOUNT_A,
         )
         .await;
+    // No manual reload: the delete route itself evicts the key.
     assert_eq!(status, 204, "{body}");
-    h.reload().await;
     let (status, body) = in_flight.await.expect("join");
     assert_eq!(status, 200, "{body}");
 
@@ -895,5 +921,137 @@ async fn streaming_on_team_key_cancel_settles_once() {
     assert!(
         h.take("lab-a").iter().all(|d| d.units.requests == 0),
         "the stream settled twice"
+    );
+}
+
+/// Chain a -> b, a team pool for `a` with the fallback off, no pool for `b`:
+/// whatever stops link `a`, link `b` refuses (LM-3021) and b's platform key
+/// is never used.
+async fn assert_chain_refused(h: &Harness, b: &MockServer) {
+    let (status, body) = h.chat(&h.key_a, "acme/chat").await;
+    assert_eq!(status, 429, "{body}");
+    assert!(body.contains("LM-3021"), "{body}");
+    assert_eq!(
+        hits(b, PLATFORM).await,
+        0,
+        "the chain reached b's platform key"
+    );
+}
+
+#[tokio::test]
+async fn chain_after_team_key_5xx_never_reaches_platform() {
+    let (a, b) = servers().await;
+    mount_status(&a, TEAM_1, 500).await;
+    mount_ok(&a, PLATFORM).await;
+    mount_ok(&b, PLATFORM).await;
+    let h = harness(&a, &b).await;
+    h.add_key(&h.group_a, "a", TEAM_1).await;
+
+    assert_chain_refused(&h, &b).await;
+    assert_eq!(hits(&a, TEAM_1).await, 1);
+    assert_eq!(hits(&a, PLATFORM).await, 0);
+}
+
+#[tokio::test]
+async fn chain_after_team_key_first_token_timeout_never_reaches_platform() {
+    let (a, b) = servers().await;
+    mount(
+        &a,
+        "/chat/completions",
+        TEAM_1,
+        ResponseTemplate::new(200)
+            .set_delay(Duration::from_secs(3))
+            .set_body_json(chat_body()),
+    )
+    .await;
+    mount_ok(&a, PLATFORM).await;
+    mount_ok(&b, PLATFORM).await;
+    let h = harness_with(&a, &b, "first_token_timeout_ms = 200").await;
+    h.add_key(&h.group_a, "a", TEAM_1).await;
+
+    assert_chain_refused(&h, &b).await;
+    assert_eq!(hits(&a, PLATFORM).await, 0);
+}
+
+#[tokio::test]
+async fn chain_after_open_circuit_on_team_link_never_reaches_platform() {
+    let (a, b) = servers().await;
+    mount_ok(&a, TEAM_1).await;
+    mount_ok(&a, PLATFORM).await;
+    mount_ok(&b, PLATFORM).await;
+    let h = harness(&a, &b).await;
+    h.add_key(&h.group_a, "a", TEAM_1).await;
+    let breaker = h.resilience.breakers.get("a", "model-a");
+    for _ in 0..20 {
+        breaker.on_failure(tokio::time::Instant::now());
+    }
+    assert_eq!(breaker.state(), CircuitState::Open);
+
+    assert_chain_refused(&h, &b).await;
+    assert_eq!(hits(&a, TEAM_1).await, 0, "the open circuit skipped link a");
+    assert_eq!(hits(&a, PLATFORM).await, 0);
+}
+
+#[tokio::test]
+async fn platform_link_before_the_team_link_still_serves() {
+    let (a, b) = servers().await;
+    mount_ok(&a, TEAM_1).await;
+    mount_ok(&b, PLATFORM).await;
+    let h = harness(&a, &b).await;
+    h.add_key(&h.group_a, "a", TEAM_1).await;
+
+    // Chain b -> a: b comes before the team link, so it keeps its platform key.
+    let (status, body) = h.chat(&h.key_a, "acme/reverse").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(hits(&b, PLATFORM).await, 1);
+    assert_eq!(hits(&a, TEAM_1).await, 0);
+    let delta = h.settled("lab-a").await;
+    assert!(
+        delta.cost_micro > 0,
+        "platform traffic is billed: {delta:?}"
+    );
+}
+
+#[tokio::test]
+async fn team_key_usage_is_recorded_at_zero_cost() {
+    let (a, b) = servers().await;
+    mount_ok(&a, TEAM_1).await;
+    mount_ok(&a, PLATFORM).await;
+    let h = harness(&a, &b).await;
+    h.add_key(&h.group_a, "a", TEAM_1).await;
+
+    for key in [&h.key_a, &h.key_b] {
+        let (status, body) = h.chat(key, "model-a").await;
+        assert_eq!(status, 200, "{body}");
+    }
+    let group = |listing: &Value, id: &str| {
+        listing["groups"]
+            .as_array()
+            .and_then(|g| g.iter().find(|row| row["group"] == id))
+            .cloned()
+    };
+    let mut listing = Value::Null;
+    for _ in 0..100 {
+        let resp = reqwest::Client::new()
+            .get(format!("{}/admin/usage?group_by=group_id", h.base))
+            .bearer_auth(ADMIN)
+            .send()
+            .await
+            .expect("send");
+        assert_eq!(resp.status(), 200);
+        listing = resp.json().await.expect("json");
+        if group(&listing, &h.group_a).is_some() && group(&listing, &h.group_b).is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let team = group(&listing, &h.group_a).unwrap_or_else(|| panic!("no team row: {listing}"));
+    assert_eq!(team["cost"].as_f64(), Some(0.0), "{team}");
+    assert_eq!(team["tokens_in"], 5, "{team}");
+    assert_eq!(team["tokens_out"], 3, "{team}");
+    let platform = group(&listing, &h.group_b).unwrap_or_else(|| panic!("no row: {listing}"));
+    assert!(
+        platform["cost"].as_f64().is_some_and(|c| c > 0.0),
+        "{platform}"
     );
 }

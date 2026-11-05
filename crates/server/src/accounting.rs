@@ -340,6 +340,9 @@ impl Accounting {
         // froze the latency at response time via `mark_completed`.
         let elapsed = self.completed.unwrap_or_else(|| self.started.elapsed());
         let metadata_json = self.metadata.as_ref().map(RequestMetadata::to_json);
+        // A team (BYOK) key paid the provider: no platform cost is recorded
+        // (usage log line, usage_log row); the tokens still are.
+        let cost = if outcome.billable { outcome.cost } else { 0.0 };
 
         // ADR 002 sink 1, log half: the full metadata rides the structured
         // usage event (labels only - never prompt or response content).
@@ -356,7 +359,7 @@ impl Accounting {
             media_count = outcome.media.count,
             media_bytes = outcome.media.bytes,
             estimated = outcome.estimated,
-            cost = outcome.cost,
+            cost,
             latency_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
             status = outcome.status,
             metadata = metadata_json.as_deref().unwrap_or("{}"),
@@ -433,7 +436,7 @@ impl Accounting {
             self.tokens
                 .inc_virtual_request(&self.model, &self.model_used);
         }
-        self.enqueue_usage(outcome, elapsed, metadata_json);
+        self.enqueue_usage(outcome, cost, elapsed, metadata_json);
     }
 
     /// Build and enqueue the usage-log row for a finished request. Non-blocking
@@ -441,6 +444,7 @@ impl Accounting {
     fn enqueue_usage(
         &self,
         outcome: &Outcome,
+        cost: f64,
         elapsed: std::time::Duration,
         metadata_json: Option<String>,
     ) {
@@ -466,7 +470,7 @@ impl Accounting {
             media_count: i64::try_from(outcome.media.count).unwrap_or(i64::MAX),
             media_bytes: i64::try_from(outcome.media.bytes).unwrap_or(i64::MAX),
             estimated: outcome.estimated,
-            cost: outcome.cost,
+            cost,
             latency_ms: i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX),
             status: outcome.status,
             metadata: metadata_json,

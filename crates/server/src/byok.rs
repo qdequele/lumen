@@ -235,6 +235,47 @@ impl TeamPools {
         }
     }
 
+    /// Drop one key from the live pools now, without waiting for the
+    /// reloader (which stays the reconciler): a deleted key serves no new
+    /// request once the delete has answered. A request already holding a
+    /// snapshot finishes on it. A pool left without keys goes away.
+    pub fn remove(&self, group_id: &str, provider: &str, key_id: &str) {
+        self.pools.rcu(|current| {
+            let mut next = GroupPools::clone(current);
+            let Some(providers) = current.get(group_id) else {
+                return next;
+            };
+            let mut providers = HashMap::clone(providers);
+            if let Some(pool) = providers.get(provider) {
+                let keys: Vec<_> = pool
+                    .keys
+                    .iter()
+                    .filter(|k| k.id != key_id)
+                    .cloned()
+                    .collect();
+                if keys.is_empty() {
+                    providers.remove(provider);
+                } else {
+                    let cursor = pool.cursor.load(Ordering::Relaxed) % keys.len();
+                    providers.insert(
+                        provider.to_owned(),
+                        Arc::new(Pool {
+                            keys,
+                            fallback: pool.fallback,
+                            cursor: AtomicUsize::new(cursor),
+                        }),
+                    );
+                }
+            }
+            if providers.is_empty() {
+                next.remove(group_id);
+            } else {
+                next.insert(group_id.to_owned(), Arc::new(providers));
+            }
+            next
+        });
+    }
+
     fn group(&self, group_id: &str) -> Option<Arc<HashMap<String, Arc<Pool>>>> {
         self.pools.load().get(group_id).cloned()
     }
@@ -274,9 +315,13 @@ pub async fn refresh_pools(
 #[derive(Debug)]
 pub struct RequestKeys {
     pools: Option<Arc<HashMap<String, Arc<Pool>>>>,
-    /// The provider whose exhausted pool (fallback off) stopped this request:
-    /// later links of the chain without a pool refuse instead of using the
-    /// platform key.
+    /// The first link of the chain (index, provider) served by a team pool
+    /// with the fallback off, decided up front from chain order: every later
+    /// link without a team pool refuses, whatever happened to that link (an
+    /// error, a first-token timeout, an open circuit that skipped it).
+    chain_lock: Option<(usize, String)>,
+    /// The provider whose team pool (fallback off) failed this request: a
+    /// later link without a pool refuses instead of using the platform key.
     locked: Mutex<Option<String>>,
 }
 
@@ -290,8 +335,26 @@ impl RequestKeys {
             .and_then(|group| pools.group(&group));
         Self {
             pools,
+            chain_lock: None,
             locked: Mutex::new(None),
         }
+    }
+
+    /// Fix the chain this request runs, in link order (`providers[i]` is
+    /// link `i`'s provider), so [`attempt`](Self::attempt) can refuse every
+    /// link after the first one served by a team pool with the fallback off.
+    #[must_use]
+    pub fn for_chain<'a>(
+        mut self,
+        registry: &Registry,
+        providers: impl IntoIterator<Item = &'a str>,
+    ) -> Self {
+        self.chain_lock = providers.into_iter().enumerate().find_map(|(i, p)| {
+            self.team_pool(registry, p)
+                .filter(|pool| !pool.fallback)
+                .map(|_| (i, p.to_owned()))
+        });
+        self
     }
 
     /// Whether the group has a pool for `provider` with a key not benched
@@ -307,17 +370,40 @@ impl RequestKeys {
         self.pools.as_ref()?.get(provider)
     }
 
-    /// Run one attempt for `provider`: `keyed` with each usable team key's
-    /// provider instances, or `platform` with the platform key, per the
-    /// module rules. `platform` is called at most once.
+    /// The group's pool for `provider`, if the live registry still has the
+    /// provider with a kind that takes a team key (rows are filtered at load,
+    /// and checked again here: a reload may have changed the kind).
+    fn team_pool(&self, registry: &Registry, provider: &str) -> Option<&Arc<Pool>> {
+        let eligible = registry
+            .provider_kind(provider)
+            .is_some_and(ProviderKind::byok_eligible);
+        self.pool(provider).filter(|_| eligible)
+    }
+
+    /// Why a link without a team pool must refuse, if it must.
+    fn refusal(&self, link: usize) -> Option<String> {
+        if let Some((first, provider)) = &self.chain_lock {
+            if link > *first {
+                return Some(provider.clone());
+            }
+        }
+        lock(&self.locked).clone()
+    }
+
+    /// Run one attempt for link `link` of the chain, served by `provider`:
+    /// `keyed` with each usable team key's provider instances, or `platform`
+    /// with the platform key, per the module rules. `platform` is called at
+    /// most once, and never on a refused link.
     ///
     /// # Errors
     /// The attempt's own error, or [`ProviderError::TeamKeysExhausted`] when
-    /// the pool has no usable key and the fallback is off (or an earlier link
-    /// of this request was stopped that way and `provider` has no pool).
+    /// the pool has no usable key and the fallback is off, or when `provider`
+    /// has no pool and the link comes after one served by a pool with the
+    /// fallback off (see [`for_chain`](Self::for_chain)).
     pub async fn attempt<T, P, PF, K, KF>(
         &self,
         registry: &Registry,
+        link: usize,
         provider: &str,
         platform: P,
         mut keyed: K,
@@ -328,17 +414,18 @@ impl RequestKeys {
         K: FnMut(Arc<ProviderSet>) -> KF,
         KF: Future<Output = Result<T, ProviderError>>,
     {
-        // Rows are filtered at load, and checked again against the live
-        // registry here: a reload may have changed the provider's kind.
-        let eligible = registry
-            .provider_kind(provider)
-            .is_some_and(ProviderKind::byok_eligible);
-        let Some(pool) = self.pool(provider).filter(|_| eligible) else {
-            if let Some(locked) = lock(&self.locked).clone() {
+        let Some(pool) = self.team_pool(registry, provider) else {
+            if let Some(locked) = self.refusal(link) {
                 return Err(ProviderError::TeamKeysExhausted { provider: locked });
             }
             return platform().await.map(|value| (value, Served::Platform));
         };
+        // A pool with the fallback off locks the rest of the request before
+        // any key is tried: every error from it (and a drop mid-rotation, on a
+        // first-token timeout) leaves later pool-less links refusing.
+        if !pool.fallback {
+            *lock(&self.locked) = Some(provider.to_owned());
+        }
 
         let count = pool.keys.len();
         let start = pool.cursor.load(Ordering::Relaxed);
@@ -386,7 +473,6 @@ impl RequestKeys {
         if pool.fallback {
             return platform().await.map(|value| (value, Served::Platform));
         }
-        *lock(&self.locked) = Some(provider.to_owned());
         Err(ProviderError::TeamKeysExhausted {
             provider: provider.to_owned(),
         })
@@ -456,6 +542,7 @@ mod tests {
     fn keys_for(pools: &TeamPools, group: &str) -> RequestKeys {
         RequestKeys {
             pools: pools.group(group),
+            chain_lock: None,
             locked: Mutex::new(None),
         }
     }
@@ -479,6 +566,7 @@ mod tests {
         let ((), served) = keys
             .attempt(
                 &reg,
+                0,
                 "p",
                 || async { Ok::<_, ProviderError>(()) },
                 |_| {
@@ -508,6 +596,7 @@ mod tests {
         let ((), served) = keys
             .attempt(
                 &reg,
+                0,
                 "p",
                 || async { Ok::<_, ProviderError>(()) },
                 |_| async { Ok(()) },
@@ -535,7 +624,7 @@ mod tests {
             async { Ok::<_, ProviderError>(()) }
         };
         let err = keys
-            .attempt(&reg, "p", platform, |_| async { Err(rate_limited()) })
+            .attempt(&reg, 0, "p", platform, |_| async { Err(rate_limited()) })
             .await
             .unwrap_err();
         assert!(
@@ -546,6 +635,7 @@ mod tests {
         let err = keys
             .attempt(
                 &reg,
+                1,
                 "other",
                 || {
                     platform_calls.fetch_add(1, Ordering::SeqCst);
@@ -571,6 +661,7 @@ mod tests {
         let ((), served) = keys
             .attempt(
                 &reg,
+                0,
                 "p",
                 || async { Ok::<_, ProviderError>(()) },
                 |_| async { Ok(()) },
@@ -590,6 +681,7 @@ mod tests {
         let err = keys
             .attempt(
                 &reg,
+                0,
                 "p",
                 || async { Ok::<_, ProviderError>(()) },
                 |_| {
@@ -627,6 +719,7 @@ mod tests {
         let ((), served) = keys
             .attempt(
                 &vllm,
+                0,
                 "p",
                 || async { Ok::<_, ProviderError>(()) },
                 |_| async { Err(rate_limited()) },
@@ -634,6 +727,128 @@ mod tests {
             .await
             .expect("served");
         assert_eq!(served, Served::Platform);
+    }
+
+    #[tokio::test]
+    async fn chain_order_decides_the_lock_up_front() {
+        let reg = registry(ProviderKind::Openai);
+        let pools = TeamPools::default();
+        pools.replace(vec![record("k1", "g")], &[]);
+        let platform_calls = AtomicUsize::new(0);
+        let platform = || {
+            platform_calls.fetch_add(1, Ordering::SeqCst);
+            async { Ok::<_, ProviderError>(()) }
+        };
+
+        // Chain p -> other: link 1 refuses although link 0 never ran (an
+        // open circuit skipped it, or a timeout dropped it).
+        let keys = keys_for(&pools, "g").for_chain(&reg, ["p", "other"]);
+        let err = keys
+            .attempt(&reg, 1, "other", platform, |_| async { Ok(()) })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ProviderError::TeamKeysExhausted { ref provider } if provider == "p")
+        );
+        assert_eq!(platform_calls.load(Ordering::SeqCst), 0);
+
+        // Chain other -> p: the platform-keyed link before the team link runs.
+        let keys = keys_for(&pools, "g").for_chain(&reg, ["other", "p"]);
+        let ((), served) = keys
+            .attempt(
+                &reg,
+                0,
+                "other",
+                || async { Ok::<_, ProviderError>(()) },
+                |_| async { Ok(()) },
+            )
+            .await
+            .expect("served");
+        assert_eq!(served, Served::Platform);
+
+        // With the fallback on, nothing locks.
+        pools.replace(vec![record("k1", "g")], &[("g".into(), "p".into(), true)]);
+        let keys = keys_for(&pools, "g").for_chain(&reg, ["p", "other"]);
+        let ((), served) = keys
+            .attempt(
+                &reg,
+                1,
+                "other",
+                || async { Ok::<_, ProviderError>(()) },
+                |_| async { Ok(()) },
+            )
+            .await
+            .expect("served");
+        assert_eq!(served, Served::Platform);
+    }
+
+    #[tokio::test]
+    async fn any_team_key_error_without_fallback_locks_later_links() {
+        let reg = registry(ProviderKind::Openai);
+        let pools = TeamPools::default();
+        pools.replace(vec![record("k1", "g")], &[]);
+        // No chain given: the dynamic lock alone covers it.
+        let keys = keys_for(&pools, "g");
+        let err = keys
+            .attempt(
+                &reg,
+                0,
+                "p",
+                || async { Ok::<_, ProviderError>(()) },
+                |_| async {
+                    Err::<(), _>(ProviderError::Upstream {
+                        provider: "p".into(),
+                        status: 503,
+                        retryable: true,
+                    })
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ProviderError::Upstream { status: 503, .. }));
+        let err = keys
+            .attempt(
+                &reg,
+                1,
+                "other",
+                || async { Ok::<_, ProviderError>(()) },
+                |_| async { Ok(()) },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ProviderError::TeamKeysExhausted { .. }));
+    }
+
+    #[tokio::test]
+    async fn removed_key_is_gone_for_new_requests() {
+        let reg = registry(ProviderKind::Openai);
+        let pools = TeamPools::default();
+        pools.replace(vec![record("k1", "g"), record("k2", "g")], &[]);
+        let before = keys_for(&pools, "g");
+        pools.remove("g", "p", "k1");
+        for _ in 0..3 {
+            let ((), served) = keys_for(&pools, "g")
+                .attempt(
+                    &reg,
+                    0,
+                    "p",
+                    || async { Ok::<_, ProviderError>(()) },
+                    |_| async { Ok(()) },
+                )
+                .await
+                .expect("served");
+            assert_eq!(
+                served,
+                Served::Team {
+                    key_id: "k2".into()
+                }
+            );
+        }
+        // A snapshot taken before the delete still holds both keys.
+        assert_eq!(before.pool("p").map(|p| p.keys.len()), Some(2));
+        pools.remove("g", "p", "k2");
+        assert!(!keys_for(&pools, "g").has_usable_pool("p"));
+        pools.remove("nope", "p", "k2");
     }
 
     #[test]

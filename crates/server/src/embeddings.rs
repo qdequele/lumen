@@ -112,7 +112,10 @@ pub async fn embeddings(
     // One consistent price snapshot for the whole request (a mid-request hot
     // reload can't shift prices between estimate and settlement).
     // A primary served by the group's own keys (BYOK) reserves no cost.
-    let keys = RequestKeys::new(&state.team_pools, key.as_deref());
+    let keys = RequestKeys::new(&state.team_pools, key.as_deref()).for_chain(
+        &state.registry,
+        chain.iter().map(|l| l.route.provider_name.as_str()),
+    );
     let pricing = state.pricing();
     let estimated_input = tokens::estimate_embed_input(&req);
     let estimated_cost = if keys.has_usable_pool(&chain[0].route.provider_name) {
@@ -188,6 +191,7 @@ pub async fn embeddings(
                 };
                 keys.attempt(
                     registry,
+                    i,
                     &provider_name,
                     || call(Some(platform)),
                     |set| call(set.embed.clone()),

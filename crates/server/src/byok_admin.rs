@@ -280,6 +280,9 @@ pub async fn delete_team_key(
     if !deleted {
         return Err(GatewayError::NotFound(format!("unknown team key id '{key_id}'")).into());
     }
+    // Evicted from the live pools before answering, so no new request uses
+    // the key once the delete returns; the reload below reconciles the rest.
+    state.team_pools.remove(&id, &provider, &key_id);
     request_reload(&state);
     tracing::info!(group_id = %id, %provider, %key_id, "team provider key deleted");
     Ok(StatusCode::NO_CONTENT)

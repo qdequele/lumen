@@ -76,7 +76,10 @@ async fn handle(
     let pricing = state.pricing();
     let estimated_input = tokens::estimate_decisions(&req);
     // A primary served by the group's own keys (BYOK) reserves no cost.
-    let keys = RequestKeys::new(&state.team_pools, key);
+    let keys = RequestKeys::new(&state.team_pools, key).for_chain(
+        &state.registry,
+        chain.iter().map(|l| l.route.provider_name.as_str()),
+    );
     let estimated_cost = if keys.has_usable_pool(&first.route.provider_name) {
         0.0
     } else {
@@ -124,6 +127,7 @@ async fn handle(
                 };
                 keys.attempt(
                     registry,
+                    i,
                     &provider_name,
                     || call(Some(platform)),
                     |set| call(set.decide.clone()),

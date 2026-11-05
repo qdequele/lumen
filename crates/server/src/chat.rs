@@ -120,7 +120,10 @@ pub async fn chat(
     // The reservation is settled to the real usage afterwards.
     // A primary served by the group's own keys (BYOK) reserves no token
     // cost; a fallback to the platform key settles at its real cost.
-    let keys = RequestKeys::new(&state.team_pools, key.as_deref());
+    let keys = RequestKeys::new(&state.team_pools, key.as_deref()).for_chain(
+        &state.registry,
+        chain.iter().map(|l| l.route.provider_name.as_str()),
+    );
     let pricing = state.pricing();
     let estimated_input = tokens::estimate_chat_prompt(&req);
     let reserved_output = reserved_output_tokens(&decision, &req);
@@ -334,6 +337,7 @@ async fn chat_streaming(
                 };
                 keys.attempt(
                     registry,
+                    i,
                     &provider_name,
                     || open(Some(platform)),
                     |set| open(set.chat.clone()),
@@ -417,6 +421,7 @@ async fn chat_non_streaming(
                 };
                 keys.attempt(
                     registry,
+                    i,
                     &provider_name,
                     || call(Some(platform)),
                     |set| call(set.chat.clone()),
