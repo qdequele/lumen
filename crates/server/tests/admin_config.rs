@@ -1041,6 +1041,41 @@ async fn put_provider_with_fresh_hash_applies_and_lists_it() {
     assert!(text.contains("\"second\""));
 }
 
+/// A model PUT with `disabled: true` keeps it in the provider, and the GET
+/// returns the flag; re-enabling is a PUT without it. (That a disabled model
+/// is not served is `tests/models.rs`.)
+#[tokio::test]
+async fn put_provider_can_disable_and_re_enable_a_model() {
+    let h = spawn_admin(registry()).await;
+    let provider = |disabled: bool| {
+        let mut model = serde_json::json!({"id": "gpt-4o-mini", "capabilities": ["chat"]});
+        if disabled {
+            model["disabled"] = Value::Bool(true);
+        }
+        serde_json::json!({"name": "second", "kind": "openai", "models": [model]})
+    };
+
+    for disabled in [true, false] {
+        let hash = h.current_hash().await;
+        let response = h
+            .put_json("/admin/config/providers/second", &provider(disabled), &hash)
+            .await;
+        assert_eq!(response.status(), 204);
+        let doc: Value = h
+            .get("/admin/config/providers/second")
+            .await
+            .json()
+            .await
+            .expect("json");
+        let flag = doc["models"][0].get("disabled");
+        if disabled {
+            assert_eq!(flag, Some(&Value::Bool(true)), "{doc}");
+        } else {
+            assert!(flag.is_none(), "{doc}");
+        }
+    }
+}
+
 /// (b) A stale `If-Match` on a provider `PUT` is `412` `LM-1004`; a missing
 /// one is `400` `LM-1001` - the same distinction the whole-document `PUT`
 /// makes.

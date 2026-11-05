@@ -742,7 +742,31 @@ components:
         models:
           type: array
           description: "`[[providers.models]]` tables (`id`, `capabilities`, ...)."
-          items: { type: object, additionalProperties: true }
+          items: { $ref: "#/components/schemas/ModelConfig" }
+    ModelConfig:
+      type: object
+      description: >-
+        One `[[providers.models]]` table as JSON (a foundation model). Fields
+        not listed here are kept as they are.
+      required: [id, capabilities]
+      additionalProperties: true
+      properties:
+        id: { type: string }
+        upstream_id: { type: string }
+        capabilities:
+          type: array
+          items: { $ref: "#/components/schemas/Capability" }
+        modalities: { type: array, items: { type: string } }
+        cost_per_1m_input: { type: number, minimum: 0 }
+        cost_per_1m_output: { type: number, minimum: 0 }
+        cost_per_1k_searches: { type: number, minimum: 0 }
+        release_date: { type: string, format: date }
+        disabled:
+          type: boolean
+          default: false
+          description: >-
+            Out of service: kept in the config, but not listed on `GET /v1/models`
+            and refused like an unknown id (`LM-2001`). Omitted when false.
     ProviderDocument:
       allOf:
         - $ref: "#/components/schemas/ProviderConfig"

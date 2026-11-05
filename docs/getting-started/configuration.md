@@ -36,7 +36,8 @@ optional; see `config.example.toml` for the full set. Details in
 upstream (`id`, `upstream_id`, `capabilities`, `modalities`, costs,
 and an optional `release_date` ISO date that
 `GET /v1/models` returns as `release_date` and as the OpenAI integer
-`created`, so clients can sort models by release). See [Providers](../providers.md) for the full
+`created`, so clients can sort models by release), and an optional
+`disabled = true` that takes a model out of service without deleting it. See [Providers](../providers.md) for the full
 provider matrix and per-provider notes. These are the **foundation models**:
 plain upstream bindings. Fallback, split and conditional routing no longer
 live on them (the per-model `fallbacks` field was removed).

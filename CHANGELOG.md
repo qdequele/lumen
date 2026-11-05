@@ -6,6 +6,17 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **`disabled` on a foundation model.** `disabled = true` on a
+  `[[providers.models]]` entry (the model's `disabled` field in
+  `PUT /admin/config/providers/{name}`) takes it out of service without
+  deleting it: it is not listed on `GET /v1/models`, a request for it is
+  `404` `LM-2001`, and a virtual model skips it like any target the gateway
+  does not serve. Its prices and the virtual models naming it stay valid, so
+  re-enabling it is removing the flag. The Meilisearch Lab's staff Admin area
+  uses it to take a hosted model out of the catalog.
+
 ## [0.8.1] - 2026-11-05
 
 First release with team provider key pools (BYOK) and bandwidth metering

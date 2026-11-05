@@ -19,6 +19,7 @@ id = "gpt-4o"             # the id clients send (owned entirely by you)
 upstream_id = "gpt-4o-2024-08-06"   # what LUMEN sends upstream (defaults to `id`)
 capabilities = ["chat"]   # any of "chat", "embed", "rerank", "decisions"
 release_date = "2024-08-06"   # optional; lets clients sort GET /v1/models by release
+# disabled = true         # optional; takes the model out of service without deleting it
 ```
 
 Rules that apply to every provider:
@@ -32,6 +33,13 @@ Rules that apply to every provider:
   returns it as `release_date` and as the OpenAI integer `created` (Unix
   seconds, midnight UTC); both are omitted for an undated model. It never
   affects routing.
+- **`disabled = true` takes a model out of service** without deleting it. It
+  stays in the config (prices, and virtual models naming it, stay valid), but
+  it is not listed on `GET /v1/models` and a request for it is `404`
+  `LM-2001`, like an unknown id. A virtual model skips it like any target the
+  gateway does not serve. Re-enable it by removing the field (or setting it to
+  `false`). Through the admin API it is the model's `disabled` field in
+  `PUT /admin/config/providers/{name}`.
 - **Model ids are globally unique** across all providers. A collision aborts
   startup and names both offending providers. Several ids may map to one
   `upstream_id` (versioned aliasing).
