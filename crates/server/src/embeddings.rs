@@ -99,7 +99,7 @@ pub async fn embeddings(
         })?;
     let chain = lumen_router::resolve_embedding_decision(&state.registry, &mut decision)?;
     let primary = decision.primary_model().to_owned();
-    let links = lumen_router::decision_links(
+    let mut links = lumen_router::decision_links(
         &decision,
         chain.iter().map(|l| l.route.provider_name.as_str()),
     );
@@ -116,6 +116,8 @@ pub async fn embeddings(
         &state.registry,
         chain.iter().map(|l| l.route.provider_name.as_str()),
     );
+    // Links served from a team pool get their own breaker (ADR 018).
+    keys.scope_links(&state.registry, &mut links);
     let pricing = state.pricing();
     let estimated_input = tokens::estimate_embed_input(&req);
     let estimated_cost = if keys.has_usable_pool(&chain[0].route.provider_name) {

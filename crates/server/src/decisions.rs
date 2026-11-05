@@ -66,7 +66,7 @@ async fn handle(
         return Err(lumen_core::GatewayError::Internal("empty decisions chain".to_owned()).into());
     };
     let primary = decision.primary_model().to_owned();
-    let links = lumen_router::decision_links(
+    let mut links = lumen_router::decision_links(
         &decision,
         chain.iter().map(|l| l.route.provider_name.as_str()),
     );
@@ -80,6 +80,8 @@ async fn handle(
         &state.registry,
         chain.iter().map(|l| l.route.provider_name.as_str()),
     );
+    // Links served from a team pool get their own breaker (ADR 018).
+    keys.scope_links(&state.registry, &mut links);
     let estimated_cost = if keys.has_usable_pool(&first.route.provider_name) {
         0.0
     } else {

@@ -37,6 +37,7 @@ use lumen_auth::store::{GroupProviderKeyRecord, KeyStore};
 use lumen_auth::AuthError;
 use lumen_core::ProviderError;
 use lumen_providers::{ProviderKind, ProviderSet, Registry};
+use lumen_router::executor::Link;
 use zeroize::Zeroizing;
 
 use crate::auth::AuthedKey;
@@ -314,6 +315,8 @@ pub async fn refresh_pools(
 /// group, snapshotted at the start of the request.
 #[derive(Debug)]
 pub struct RequestKeys {
+    /// The authenticated key's budget group, when it has any pool.
+    group: Option<String>,
     pools: Option<Arc<HashMap<String, Arc<Pool>>>>,
     /// The first link of the chain (index, provider) served by a team pool
     /// with the fallback off, decided up front from chain order: every later
@@ -330,10 +333,10 @@ impl RequestKeys {
     /// authenticated key or the key has no group.
     #[must_use]
     pub fn new(pools: &Arc<TeamPools>, key: Option<&AuthedKey>) -> Self {
-        let pools = key
-            .and_then(|AuthedKey(entry)| entry.group_id())
-            .and_then(|group| pools.group(&group));
+        let group = key.and_then(|AuthedKey(entry)| entry.group_id());
+        let pools = group.as_deref().and_then(|group| pools.group(group));
         Self {
+            group: group.filter(|_| pools.is_some()),
             pools,
             chain_lock: None,
             locked: Mutex::new(None),
@@ -355,6 +358,20 @@ impl RequestKeys {
                 .map(|_| (i, p.to_owned()))
         });
         self
+    }
+
+    /// Give each link the request serves from a team pool its own circuit
+    /// breaker scope (the group, ADR 018): a link whose provider has a
+    /// usable team pool (see [`has_usable_pool`](Self::has_usable_pool)) of
+    /// an eligible kind. Every other link keeps the platform breaker.
+    pub fn scope_links(&self, registry: &Registry, links: &mut [Link]) {
+        let now = now_ms();
+        for link in links {
+            let usable = self
+                .team_pool(registry, &link.provider_name)
+                .is_some_and(|pool| pool.keys.iter().any(|k| !k.benched(now)));
+            link.breaker_scope = self.group.clone().filter(|_| usable);
+        }
     }
 
     /// Whether the group has a pool for `provider` with a key not benched
@@ -541,6 +558,7 @@ mod tests {
 
     fn keys_for(pools: &TeamPools, group: &str) -> RequestKeys {
         RequestKeys {
+            group: Some(group.to_owned()),
             pools: pools.group(group),
             chain_lock: None,
             locked: Mutex::new(None),
@@ -859,5 +877,46 @@ mod tests {
             !dbg.contains("sk-very-secret") && dbg.contains("<redacted>"),
             "{dbg}"
         );
+    }
+
+    #[test]
+    fn only_links_with_a_usable_team_pool_get_a_breaker_scope() {
+        let reg = registry(ProviderKind::Openai);
+        let pools = Arc::new(TeamPools::default());
+        pools.replace(vec![record("k1", "g")], &[]);
+        let link = |provider: &str| Link {
+            provider_name: provider.to_owned(),
+            model_id: "m".to_owned(),
+            escapes: Vec::new(),
+            breaker_scope: None,
+        };
+        let mut links = vec![link("p"), link("other")];
+        keys_for(&pools, "g").scope_links(&reg, &mut links);
+        assert_eq!(links[0].breaker_scope.as_deref(), Some("g"));
+        assert_eq!(links[1].breaker_scope, None);
+
+        // No group, or another group: platform scope everywhere.
+        let mut links = vec![link("p")];
+        RequestKeys::new(&pools, None).scope_links(&reg, &mut links);
+        assert_eq!(links[0].breaker_scope, None);
+        keys_for(&pools, "h").scope_links(&reg, &mut links);
+        assert_eq!(links[0].breaker_scope, None);
+
+        // An ineligible kind: the pool is ignored, so is the scope.
+        let mut links = vec![link("p")];
+        keys_for(&pools, "g").scope_links(&registry(ProviderKind::Vllm), &mut links);
+        assert_eq!(links[0].breaker_scope, None);
+
+        // Every key benched: the link runs on the platform key, or refuses.
+        if let Some(pool) = pools.group("g").and_then(|g| g.get("p").cloned()) {
+            for key in &pool.keys {
+                key.set_health(Health::RateLimited {
+                    until_ms: now_ms() + 60_000,
+                });
+            }
+        }
+        let mut links = vec![link("p")];
+        keys_for(&pools, "g").scope_links(&reg, &mut links);
+        assert_eq!(links[0].breaker_scope, None);
     }
 }

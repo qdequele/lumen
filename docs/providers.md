@@ -1234,5 +1234,11 @@ keyless kinds are not.
   reaches the platform's keys.
 - Team-served requests carry no token cost; the gateway bills bandwidth
   instead (request plus response bytes, only when an upstream call was sent).
-- Circuit breakers stay shared per (provider, model) across team and platform
-  traffic.
+- A link served from a group's team keys has its own circuit breaker, keyed
+  by (provider, model, group): platform-key failures (say a run of 429s on
+  the platform key) never stop a team served on its own keys, and a team's
+  failing keys never open the breaker for platform traffic. The
+  `lumen_circuit_state` gauge reports platform breakers only.
+- When an earlier link of a chain failed upstream and a later link is refused
+  because the fallback is off, the client gets the earlier error, not
+  `LM-3021`.

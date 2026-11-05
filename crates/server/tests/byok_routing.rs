@@ -925,12 +925,32 @@ async fn streaming_on_team_key_cancel_settles_once() {
 }
 
 /// Chain a -> b, a team pool for `a` with the fallback off, no pool for `b`:
-/// whatever stops link `a`, link `b` refuses (LM-3021) and b's platform key
-/// is never used.
+/// when link `a` never ran upstream (its circuit is open), link `b` refuses
+/// (LM-3021) and b's platform key is never used.
 async fn assert_chain_refused(h: &Harness, b: &MockServer) {
     let (status, body) = h.chat(&h.key_a, "acme/chat").await;
     assert_eq!(status, 429, "{body}");
     assert!(body.contains("LM-3021"), "{body}");
+    assert_eq!(
+        hits(b, PLATFORM).await,
+        0,
+        "the chain reached b's platform key"
+    );
+}
+
+/// Chain a -> b as in [`assert_chain_refused`], where link `a` failed
+/// upstream: link `b` still refuses, but the client sees a's own error
+/// (`code`), not the refusal that would hide it.
+async fn assert_chain_surfaces(h: &Harness, b: &MockServer, code: &str) {
+    let (status, body) = h.chat(&h.key_a, "acme/chat").await;
+    let error: Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(error["error"]["code"], code, "{status} {body}");
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("'a'")),
+        "{body}"
+    );
     assert_eq!(
         hits(b, PLATFORM).await,
         0,
@@ -947,7 +967,7 @@ async fn chain_after_team_key_5xx_never_reaches_platform() {
     let h = harness(&a, &b).await;
     h.add_key(&h.group_a, "a", TEAM_1).await;
 
-    assert_chain_refused(&h, &b).await;
+    assert_chain_surfaces(&h, &b, "LM-3003").await;
     assert_eq!(hits(&a, TEAM_1).await, 1);
     assert_eq!(hits(&a, PLATFORM).await, 0);
 }
@@ -969,7 +989,7 @@ async fn chain_after_team_key_first_token_timeout_never_reaches_platform() {
     let h = harness_with(&a, &b, "first_token_timeout_ms = 200").await;
     h.add_key(&h.group_a, "a", TEAM_1).await;
 
-    assert_chain_refused(&h, &b).await;
+    assert_chain_surfaces(&h, &b, "LM-3011").await;
     assert_eq!(hits(&a, PLATFORM).await, 0);
 }
 
@@ -981,7 +1001,11 @@ async fn chain_after_open_circuit_on_team_link_never_reaches_platform() {
     mount_ok(&b, PLATFORM).await;
     let h = harness(&a, &b).await;
     h.add_key(&h.group_a, "a", TEAM_1).await;
-    let breaker = h.resilience.breakers.get("a", "model-a");
+    // Link a is served from group A's pool: its own breaker scope.
+    let breaker = h
+        .resilience
+        .breakers
+        .get_scoped("a", Some(&h.group_a), "model-a");
     for _ in 0..20 {
         breaker.on_failure(tokio::time::Instant::now());
     }
@@ -1054,4 +1078,64 @@ async fn team_key_usage_is_recorded_at_zero_cost() {
         platform["cost"].as_f64().is_some_and(|c| c > 0.0),
         "{platform}"
     );
+}
+
+#[tokio::test]
+async fn platform_rate_limits_do_not_block_a_team_with_its_own_keys() {
+    let (a, b) = servers().await;
+    mount_status(&a, PLATFORM, 429).await;
+    mount_ok(&a, TEAM_1).await;
+    let h = harness(&a, &b).await;
+    h.add_key(&h.group_a, "a", TEAM_1).await;
+
+    // Five platform 429s (another team, no pool) open a's platform breaker.
+    for _ in 0..5 {
+        let (status, body) = h.chat(&h.key_b, "model-a").await;
+        assert_eq!(status, 429, "{body}");
+    }
+    assert_eq!(
+        h.resilience.breakers.get("a", "model-a").state(),
+        CircuitState::Open
+    );
+    let (_, body) = h.chat(&h.key_b, "model-a").await;
+    assert!(body.contains("LM-3020"), "{body}");
+
+    // Group A, with its own key for a, is still served on it.
+    let (status, body) = h.chat(&h.key_a, "model-a").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(hits(&a, TEAM_1).await, 1);
+    // And its success leaves the platform breaker open.
+    assert_eq!(
+        h.resilience.breakers.get("a", "model-a").state(),
+        CircuitState::Open
+    );
+}
+
+#[tokio::test]
+async fn team_key_failures_never_open_the_platform_breaker() {
+    let (a, b) = servers().await;
+    mount_status(&a, TEAM_1, 500).await;
+    mount_ok(&a, PLATFORM).await;
+    let h = harness(&a, &b).await;
+    h.add_key(&h.group_a, "a", TEAM_1).await;
+
+    for _ in 0..5 {
+        let (status, body) = h.chat(&h.key_a, "model-a").await;
+        assert_eq!(status, 502, "{body}");
+    }
+    assert_eq!(
+        h.resilience
+            .breakers
+            .get_scoped("a", Some(&h.group_a), "model-a")
+            .state(),
+        CircuitState::Open
+    );
+    assert_eq!(
+        h.resilience.breakers.get("a", "model-a").state(),
+        CircuitState::Closed
+    );
+    // A request without a pool is served on the platform key.
+    let (status, body) = h.chat(&h.key_b, "model-a").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(hits(&a, PLATFORM).await, 1);
 }

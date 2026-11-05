@@ -43,6 +43,11 @@ pub struct Link {
     /// Where to continue on a failure, innermost first (ADR 014). Empty for
     /// the last link: a failure there is final.
     pub escapes: Vec<crate::triggers::Escape>,
+    /// The budget group whose team key pool serves this link (ADR 018), or
+    /// `None` for the platform's own key. A scoped link has its own circuit
+    /// breaker ([`CircuitBreakers::get_scoped`]), so team and platform
+    /// failures never open each other's.
+    pub breaker_scope: Option<String>,
 }
 
 /// Resilience knobs for one execution.
@@ -124,10 +129,17 @@ where
     Fut: Future<Output = Result<T, ProviderError>>,
 {
     let mut last_error: Option<GatewayError> = None;
+    // The latest provider-fault failure of an earlier link: surfaced instead
+    // of a later link's chain-lock refusal (ADR 018), which would hide it.
+    let mut upstream_failure: Option<GatewayError> = None;
     let mut index = 0;
 
     while let Some(link) = links.get(index) {
-        let breaker = breakers.get(&link.provider_name, &link.model_id);
+        let breaker = breakers.get_scoped(
+            &link.provider_name,
+            link.breaker_scope.as_deref(),
+            &link.model_id,
+        );
         if let Admission::Rejected { retry_after } = breaker.admit(Instant::now()) {
             // Circuit open: never touches the upstream. Moves on only through
             // an escape that lists `circuit_open`.
@@ -142,6 +154,7 @@ where
             {
                 Some(escape) if escape.next > index => {
                     last_error = Some(error);
+                    upstream_failure = None;
                     index = escape.next;
                     continue;
                 }
@@ -176,10 +189,31 @@ where
                 });
             }
             Err(error) => {
-                if error.is_provider_fault() {
+                let mapped = if error.is_provider_fault() {
                     breaker.on_failure(Instant::now());
-                }
-                let mapped = GatewayError::from_provider(&link.provider_name, error.clone());
+                    let mapped = GatewayError::from_provider(&link.provider_name, error.clone());
+                    upstream_failure = Some(mapped.clone());
+                    mapped
+                } else {
+                    // No verdict on the provider, but a half-open probe this
+                    // call took is handed back.
+                    breaker.on_neutral();
+                    match (&error, &upstream_failure) {
+                        // Refused by the chain lock of another provider's
+                        // pool (an exhausted pool is reported under its own
+                        // link's name): the earlier upstream failure is the
+                        // real answer.
+                        (ProviderError::TeamKeysExhausted { provider }, Some(earlier))
+                            if *provider != link.provider_name =>
+                        {
+                            earlier.clone()
+                        }
+                        _ => {
+                            upstream_failure = None;
+                            GatewayError::from_provider(&link.provider_name, error.clone())
+                        }
+                    }
+                };
                 match link.escapes.iter().find(|e| e.on.allows(&error)) {
                     // `next > index` guarantees termination whatever the caller built.
                     Some(escape) if escape.next > index => {
@@ -218,8 +252,34 @@ mod tests {
                 provider_name: (*p).to_owned(),
                 model_id: (*m).to_owned(),
                 escapes: crate::triggers::linear_escapes(i, n),
+                breaker_scope: None,
             })
             .collect()
+    }
+
+    /// `links` with link `i` served from the team pool of group `g`.
+    fn scoped(mut chain: Vec<Link>, i: usize, group: &str) -> Vec<Link> {
+        chain[i].breaker_scope = Some(group.to_owned());
+        chain
+    }
+
+    fn rate_limited() -> ProviderError {
+        ProviderError::RateLimited {
+            provider: "openai".to_owned(),
+            retry_after: None,
+        }
+    }
+
+    /// Open the breaker that `chain`'s first link uses with `threshold`
+    /// failed requests.
+    async fn open_with(chain: &[Link], cb: &CircuitBreakers, error: fn() -> ProviderError) {
+        let cancel = CancellationToken::new();
+        for _ in 0..BreakerConfig::default().failure_threshold {
+            let _ = execute(chain, cb, &config(1), &cancel, |_| async move {
+                Err::<(), _>(error())
+            })
+            .await;
+        }
     }
 
     fn config(max_attempts: u32) -> ExecConfig {
@@ -469,6 +529,7 @@ mod tests {
             Link {
                 provider_name: "pa".into(),
                 model_id: "a".into(),
+                breaker_scope: None,
                 escapes: vec![Escape {
                     on: Triggers::DEFAULT,
                     next: 2,
@@ -478,11 +539,13 @@ mod tests {
                 provider_name: "pb".into(),
                 model_id: "b".into(),
                 escapes: vec![],
+                breaker_scope: None,
             },
             Link {
                 provider_name: "pc".into(),
                 model_id: "c".into(),
                 escapes: vec![],
+                breaker_scope: None,
             },
         ];
         let out = execute(
@@ -510,6 +573,7 @@ mod tests {
             Link {
                 provider_name: "pa".into(),
                 model_id: "a".into(),
+                breaker_scope: None,
                 escapes: vec![Escape {
                     on: Triggers::from_list(&[Trigger::RateLimited]),
                     next: 1,
@@ -519,6 +583,7 @@ mod tests {
                 provider_name: "pb".into(),
                 model_id: "b".into(),
                 escapes: vec![],
+                breaker_scope: None,
             },
         ];
         let calls = AtomicUsize::new(0);
@@ -550,6 +615,7 @@ mod tests {
         let chain = vec![Link {
             provider_name: "pa".into(),
             model_id: "a".into(),
+            breaker_scope: None,
             escapes: vec![Escape {
                 on: Triggers::DEFAULT,
                 next: 0,
@@ -606,6 +672,212 @@ mod tests {
                 provider: "openai".into(),
             })
         })
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), "LM-3021");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn platform_rate_limits_do_not_open_a_team_scoped_breaker() {
+        let cb = breakers();
+        let platform = links(&[("openai", "gpt-4o")]);
+        open_with(&platform, &cb, rate_limited).await;
+        assert_eq!(
+            cb.get("openai", "gpt-4o").state(),
+            crate::circuit::CircuitState::Open
+        );
+        let cancel = CancellationToken::new();
+        // A request without a pool is short-circuited...
+        let err = execute(&platform, &cb, &config(1), &cancel, |_| async {
+            Ok::<_, ProviderError>("platform")
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), "LM-3020");
+        // ...but a team with its own pool for the provider is still served.
+        let team = scoped(links(&[("openai", "gpt-4o")]), 0, "g1");
+        let calls = AtomicUsize::new(0);
+        let out = execute(&team, &cb, &config(1), &cancel, |_| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async { Ok::<_, ProviderError>("team") }
+        })
+        .await
+        .unwrap();
+        assert_eq!(out.value, "team");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn team_key_failures_never_open_the_platform_breaker() {
+        let cb = breakers();
+        let team = scoped(links(&[("openai", "gpt-4o")]), 0, "g1");
+        open_with(&team, &cb, upstream_500).await;
+        assert_eq!(
+            cb.get_scoped("openai", Some("g1"), "gpt-4o").state(),
+            crate::circuit::CircuitState::Open
+        );
+        assert_eq!(
+            cb.get("openai", "gpt-4o").state(),
+            crate::circuit::CircuitState::Closed
+        );
+        // Another group's pool has its own breaker too.
+        assert_eq!(
+            cb.get_scoped("openai", Some("g2"), "gpt-4o").state(),
+            crate::circuit::CircuitState::Closed
+        );
+        let platform = links(&[("openai", "gpt-4o")]);
+        let out = execute(
+            &platform,
+            &cb,
+            &config(1),
+            &CancellationToken::new(),
+            |_| async { Ok::<_, ProviderError>("platform") },
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.value, "platform");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_team_key_success_does_not_close_the_platform_breaker() {
+        let cb = breakers();
+        let platform = links(&[("openai", "gpt-4o")]);
+        open_with(&platform, &cb, rate_limited).await;
+        // Past the cooldown, so a platform request would be the probe.
+        tokio::time::advance(BreakerConfig::default().cooldown + Duration::from_secs(1)).await;
+        let team = scoped(links(&[("openai", "gpt-4o")]), 0, "g1");
+        execute(
+            &team,
+            &cb,
+            &config(1),
+            &CancellationToken::new(),
+            |_| async { Ok::<_, ProviderError>(()) },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            cb.get("openai", "gpt-4o").state(),
+            crate::circuit::CircuitState::Open,
+            "the team success must neither close nor probe the platform breaker"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_link_releases_the_half_open_probe() {
+        let cb = breakers();
+        let platform = links(&[("openai", "gpt-4o")]);
+        open_with(&platform, &cb, upstream_500).await;
+        tokio::time::advance(BreakerConfig::default().cooldown + Duration::from_secs(1)).await;
+        let cancel = CancellationToken::new();
+        // The half-open breaker admits this link, which the chain lock
+        // refuses without calling upstream: no verdict on the provider.
+        let err = execute(&platform, &cb, &config(1), &cancel, |_| async {
+            Err::<(), _>(ProviderError::TeamKeysExhausted {
+                provider: "anthropic".into(),
+            })
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), "LM-3021");
+        assert_eq!(
+            cb.get("openai", "gpt-4o").state(),
+            crate::circuit::CircuitState::HalfOpen
+        );
+        // The next platform request is admitted as the probe right away.
+        let calls = AtomicUsize::new(0);
+        execute(&platform, &cb, &config(1), &cancel, |_| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async { Ok::<_, ProviderError>(()) }
+        })
+        .await
+        .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            cb.get("openai", "gpt-4o").state(),
+            crate::circuit::CircuitState::Closed
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_lock_refusal_surfaces_the_earlier_upstream_error() {
+        // Team link a (fallback off) fails 503, platform link b is refused by
+        // the lock: the client sees a's 503, not LM-3021.
+        let chain = scoped(
+            links(&[("openai", "gpt-4o"), ("anthropic", "claude")]),
+            0,
+            "g1",
+        );
+        let err = execute(
+            &chain,
+            &breakers(),
+            &config(1),
+            &CancellationToken::new(),
+            |i| async move {
+                if i == 0 {
+                    Err::<(), _>(ProviderError::Upstream {
+                        provider: "openai".into(),
+                        status: 503,
+                        retryable: true,
+                    })
+                } else {
+                    Err(ProviderError::TeamKeysExhausted {
+                        provider: "openai".into(),
+                    })
+                }
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&err, GatewayError::Upstream { provider, status: 503 } if provider == "openai"),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_exhausted_pool_then_a_lock_refusal_is_lm_3021() {
+        // Platform x fails 503, team a's pool is exhausted, b is refused:
+        // the exhausted pool is the latest answer, LM-3021.
+        let chain = scoped(
+            links(&[("x", "mx"), ("openai", "gpt-4o"), ("anthropic", "claude")]),
+            1,
+            "g1",
+        );
+        let err = execute(
+            &chain,
+            &breakers(),
+            &config(1),
+            &CancellationToken::new(),
+            |i| async move {
+                if i == 0 {
+                    Err::<(), _>(upstream_500())
+                } else {
+                    Err(ProviderError::TeamKeysExhausted {
+                        provider: "openai".into(),
+                    })
+                }
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), "LM-3021");
+
+        let chain = scoped(
+            links(&[("openai", "gpt-4o"), ("anthropic", "claude")]),
+            0,
+            "g1",
+        );
+        let err = execute(
+            &chain,
+            &breakers(),
+            &config(1),
+            &CancellationToken::new(),
+            |_| async {
+                Err::<(), _>(ProviderError::TeamKeysExhausted {
+                    provider: "openai".into(),
+                })
+            },
+        )
         .await
         .unwrap_err();
         assert_eq!(err.code(), "LM-3021");
