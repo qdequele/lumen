@@ -1250,3 +1250,26 @@ keyless kinds are not.
 - When an earlier link of a chain failed upstream and a later link is refused
   because the fallback is off, the client gets the earlier error, not
   `LM-3021`.
+
+## Platform provider key pools
+
+The platform's own keys (Meilisearch's, on the hosted gateway) can also be a
+pool per provider ([ADR 019](adr/019-platform-provider-key-pools.md)), managed
+under `/admin/platform-keys` (platform-only: master key, no
+`X-Lumen-Account-Ref`). The same kinds are eligible as for team keys.
+
+- A provider holds up to 20 platform keys, each with a label and an
+  `enabled` flag. Keys are sealed at rest; only `label`, `last4`, `enabled`
+  and status are ever returned.
+- Wherever the platform key served a request before (no team pool, or a team
+  pool with the fallback on and no usable team key), the pool's enabled keys
+  are tried round-robin with the team-key rules: a 429 benches a key for
+  `max(Retry-After, 30s)`, a 401/403 marks it failing for 10 minutes.
+- When no pool key is usable, the provider's configured key (`api_key_env` or
+  `PUT /admin/provider-keys/{name}`) serves the request if it has one;
+  otherwise the request ends with the last pool error (a 429 when every key is
+  benched).
+- A team whose fallback is off never reaches the platform pool, directly or
+  through a fallback chain (`LM-3021`, as above).
+- Pool-served requests are platform requests: tokens are billed and the
+  platform circuit breaker applies.

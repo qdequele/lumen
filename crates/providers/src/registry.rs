@@ -422,6 +422,23 @@ impl Registry {
             .map(|(spec, _)| spec.kind)
     }
 
+    /// Whether the provider named `provider_name` was built with an API key
+    /// of its own (its `api_key_env` variable or the stored
+    /// `provider_keys` row): the last resort behind a platform key pool
+    /// (ADR 019). `false` for an unknown name or a keyless provider.
+    #[must_use]
+    pub fn has_api_key(&self, provider_name: &str) -> bool {
+        self.inner
+            .load()
+            .specs
+            .get(provider_name)
+            .is_some_and(|(spec, _)| {
+                spec.api_key
+                    .as_deref()
+                    .is_some_and(|k| !k.trim().is_empty())
+            })
+    }
+
     /// Build the provider named `provider_name` again with `api_key` in place
     /// of its configured key: same kind, base URL, options and HTTP client.
     /// `None` when no provider has that name, when its kind does not take a

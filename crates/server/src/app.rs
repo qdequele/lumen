@@ -2,7 +2,7 @@
 
 use crate::{
     admin, admin_scope, auth, byok_admin, chat, decisions, embeddings, health, models, openapi,
-    rerank, routes, state::AppState,
+    platform_keys_admin, rerank, routes, state::AppState,
 };
 use axum::extract::{MatchedPath, Request, State};
 use axum::http::{header, HeaderValue, StatusCode};
@@ -265,6 +265,25 @@ fn make_request_span<B>(request: &axum::http::Request<B>) -> tracing::Span {
     )
 }
 
+/// Platform provider key pools (ADR 019), mounted with the platform routes
+/// of [`admin_routes`] (so under its `platform_only` layer).
+fn platform_key_routes() -> Router<AppState> {
+    Router::new()
+        .route(
+            "/admin/platform-keys",
+            get(platform_keys_admin::list_platform_keys),
+        )
+        .route(
+            "/admin/platform-keys/{provider}/keys",
+            post(platform_keys_admin::add_platform_key),
+        )
+        .route(
+            "/admin/platform-keys/{provider}/keys/{key_id}",
+            patch(platform_keys_admin::patch_platform_key)
+                .delete(platform_keys_admin::delete_platform_key),
+        )
+}
+
 /// The master-key-protected `/admin` surface (mounted only when auth is
 /// enabled). Split out of [`build_app`] to keep that function readable.
 ///
@@ -314,6 +333,7 @@ fn admin_routes(state: &AppState) -> Router<AppState> {
         .route("/admin/usage/export", get(admin::usage_export));
     let platform = Router::new()
         .route("/admin/provider-keys/{name}", put(admin::put_provider_key))
+        .merge(platform_key_routes())
         .route(
             "/admin/providers/{name}/check",
             post(admin::check_provider_key),

@@ -555,6 +555,45 @@ components:
       properties:
         key: { type: string, minLength: 16, maxLength: 1024, description: "The provider API key, 16 characters to 1024 bytes after trimming. Sealed at rest, never returned or logged." }
         label: { type: string, minLength: 1, maxLength: 64 }
+    PlatformKeyView:
+      type: object
+      required: [id, label, last4, enabled, status, status_detail, created_at]
+      properties:
+        id: { type: string, description: "`ppk_` + random hex." }
+        label: { type: string }
+        last4: { type: string, description: Last 4 characters of the key; the only readable part. }
+        enabled: { type: boolean, description: Whether the key is in the live pool. }
+        status: { type: string, enum: [unused, ok, rate_limited, failing], description: "Live key health on the request path: `unused` until a request uses the key (and while disabled), `rate_limited` while benched after a 429, `failing` after the provider rejected it (401/403)." }
+        status_detail: { type: [string, "null"] }
+        created_at: { type: integer }
+    PlatformProvider:
+      type: object
+      required: [name, kind, eligible, configured_key, models, keys]
+      properties:
+        name: { type: string }
+        kind: { type: string }
+        eligible: { type: boolean, description: Whether the kind takes a pool key (plain API key kinds only). }
+        configured_key: { type: boolean, description: "Whether the live provider also has a configured key (`api_key_env` or `PUT /admin/provider-keys/{name}`), used only when no pool key is usable." }
+        models: { type: array, items: { type: string } }
+        keys: { type: array, items: { $ref: "#/components/schemas/PlatformKeyView" } }
+    PlatformProviders:
+      type: object
+      required: [providers]
+      properties:
+        providers: { type: array, items: { $ref: "#/components/schemas/PlatformProvider" } }
+    AddPlatformKeyBody:
+      type: object
+      required: [key, label]
+      additionalProperties: false
+      properties:
+        key: { type: string, minLength: 16, maxLength: 1024, description: "The provider API key, 16 characters to 1024 bytes after trimming. Sealed at rest, never returned or logged." }
+        label: { type: string, minLength: 1, maxLength: 64 }
+    PatchPlatformKeyBody:
+      type: object
+      required: [enabled]
+      additionalProperties: false
+      properties:
+        enabled: { type: boolean }
     GroupView:
       allOf:
         - $ref: "#/components/schemas/Group"
@@ -1342,6 +1381,83 @@ paths:
       responses:
         "204": { $ref: "#/components/responses/NoContent" }
         "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "500": { $ref: "#/components/responses/Error" }
+  /admin/platform-keys:
+    parameters:
+      - $ref: "#/components/parameters/AccountRef"
+    get:
+      summary: List the providers of the config with the platform's key pools
+      description: |
+        Platform provider key pools (ADR 019): the gateway's own keys per
+        provider, rotated on a rate limit or a rejection wherever the platform
+        key serves (never for a team whose fallback is off). Every provider of
+        the current config document is listed; only `eligible` ones accept
+        keys. Keys are never returned, only `label` and `last4`. Platform-only:
+        403 `LM-4005` with `X-Lumen-Account-Ref`.
+      operationId: listPlatformKeys
+      security: [{ masterKey: [] }]
+      responses:
+        "200": { description: The providers and their platform pools., content: { application/json: { schema: { $ref: "#/components/schemas/PlatformProviders" } } } }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "500": { $ref: "#/components/responses/Error" }
+  /admin/platform-keys/{provider}/keys:
+    parameters:
+      - $ref: "#/components/parameters/AccountRef"
+      - { name: provider, in: path, required: true, schema: { type: string } }
+    post:
+      summary: Add a key to a provider's platform pool
+      description: |
+        The key is sealed with the master key, never returned, and enabled. At
+        most 20 keys per provider; the 21st is 400 `LM-1001`, as are a provider
+        whose kind does not take a pool key (Azure, Bedrock, Google/Vertex,
+        keyless kinds), a key shorter than 16 characters or longer than 1024
+        bytes after trimming, and a label outside 1 to 64 characters. An
+        unknown provider is 404 `LM-1003`.
+      operationId: addPlatformKey
+      security: [{ masterKey: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json: { schema: { $ref: "#/components/schemas/AddPlatformKeyBody" } }
+      responses:
+        "201": { description: The stored key (label and last4 only)., content: { application/json: { schema: { $ref: "#/components/schemas/PlatformKeyView" } } } }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "500": { $ref: "#/components/responses/Error" }
+  /admin/platform-keys/{provider}/keys/{key_id}:
+    parameters:
+      - $ref: "#/components/parameters/AccountRef"
+      - { name: provider, in: path, required: true, schema: { type: string } }
+      - { name: key_id, in: path, required: true, schema: { type: string } }
+    patch:
+      summary: Enable or disable a platform key
+      description: A disabled key leaves the live pool before the response. An unknown key is 404 `LM-1003`.
+      operationId: patchPlatformKey
+      security: [{ masterKey: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json: { schema: { $ref: "#/components/schemas/PatchPlatformKeyBody" } }
+      responses:
+        "200": { description: The updated key., content: { application/json: { schema: { $ref: "#/components/schemas/PlatformKeyView" } } } }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "500": { $ref: "#/components/responses/Error" }
+    delete:
+      summary: Delete a platform key
+      description: The key leaves the live pool before the response. An unknown key is 404 `LM-1003`.
+      operationId: deletePlatformKey
+      security: [{ masterKey: [] }]
+      responses:
+        "204": { description: Deleted. }
         "401": { $ref: "#/components/responses/Error" }
         "403": { $ref: "#/components/responses/Error" }
         "404": { $ref: "#/components/responses/Error" }

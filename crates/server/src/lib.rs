@@ -29,6 +29,7 @@ pub mod lifecycle;
 pub mod metadata;
 pub mod models;
 pub mod openapi;
+pub mod platform_keys_admin;
 pub mod pricing;
 pub mod reload;
 pub mod rerank;

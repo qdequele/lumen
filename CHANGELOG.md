@@ -17,6 +17,18 @@ All notable changes to LUMEN are documented here. The format is based on
   re-enabling it is removing the flag. The Meilisearch Lab's staff Admin area
   uses it to take a hosted model out of the catalog.
 
+- **Platform provider key pools (ADR 019).** The platform's own provider
+  keys can now be a pool per provider (up to 20 keys, each with a label and
+  an `enabled` flag), managed at runtime with the platform-only
+  `GET /admin/platform-keys`, `POST /admin/platform-keys/{provider}/keys`,
+  `PATCH` and `DELETE .../keys/{key_id}`. Wherever the platform key served
+  before, the pool's keys are used round-robin with the BYOK rotation rules
+  (429 benches, 401/403 marks failing), then the configured key
+  (`api_key_env` / `PUT /admin/provider-keys`) as the last resort. A team
+  with the fallback off never reaches the pool. Keys are sealed at rest and
+  never returned or logged; disable and delete evict the key before
+  answering.
+
 ## [0.8.1] - 2026-11-05
 
 First release with team provider key pools (BYOK) and bandwidth metering
