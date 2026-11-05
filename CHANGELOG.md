@@ -17,6 +17,12 @@ All notable changes to LUMEN are documented here. The format is based on
   Team-key traffic is reported as `byok_tokens_in/out` with no token cost,
   bandwidth is billed only when an upstream call is actually sent, and
   `GET /admin/groups/{id}/byok` shows each key's live status.
+  A link served from team keys has its own circuit breaker (per provider,
+  model and group), so platform-key failures never block a team on its own
+  keys and the reverse. A link the gateway refuses hands back a half-open
+  probe, and a chain-lock refusal after an upstream failure surfaces that
+  failure instead of `LM-3021`. Team keys must be at least 16 characters
+  (400 `LM-1001`), since `last4` of a shorter key reveals most of it.
 
 - **`openrouter` providers serve embeddings.** OpenRouter now exposes an
   OpenAI-format `POST /embeddings` endpoint (catalog at

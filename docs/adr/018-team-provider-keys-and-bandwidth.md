@@ -66,11 +66,34 @@ Lab bills the bandwidth instead.
 
 ## Consequences
 
-- **Circuit breakers stay shared** per (provider, model) across team and
-  platform traffic. A team's failing key can open a breaker that also affects
-  platform traffic for that model, and the reverse. Accepted as a known
-  trade-off; per-key breakers are a possible follow-up.
-- Bandwidth is metered at the HTTP layer, so it includes headers-free body
-  bytes only, not TLS or header overhead.
-- Supersedes decision 7 of ADR 015 ("per-account provider keys" out of
-  scope): it is now in scope for plain-key providers.
+- **Circuit breakers are scoped by who serves the link.** A link the request
+  serves from a team pool (its provider has a usable pool of an eligible
+  kind when the request starts) uses its own breaker, keyed
+  `"{provider}#group:{group_id}"` with the same model id; every other link
+  keeps the platform breaker keyed by (provider, model). Platform 429s or 5xx
+  therefore never open the breaker for a team served on its own keys, a
+  team's failing keys never open it for platform traffic, and a team-key
+  success never closes (or takes the probe of) a breaker the platform
+  opened. Keys of one pool still share their group's breaker; per-key
+  breakers remain a possible follow-up. A team-scoped link that ends on the
+  platform key (fallback on, every team key benched mid-request) is charged
+  to the team scope. Scoped breakers stay out of the `lumen_circuit_state`
+  gauge, which would otherwise grow one series per group.
+- A link refused by the chain lock, or any other result that says nothing
+  about the provider (a cancellation, a client fault), hands back a half-open
+  probe it took, so the next request probes without waiting a cooldown.
+- When the chain lock refuses a link after an earlier link of the same
+  request failed upstream, the client gets that earlier error rather than
+  `LM-3021`; a team link whose own pool is exhausted still answers `LM-3021`.
+- Bandwidth is metered at the HTTP layer, so it counts body bytes only (no
+  headers or TLS).
+- Narrows ADR 015 decision 7 (out-of-scope list): "per-account provider
+  keys" is now in scope for plain-key providers.
+
+## Rollback
+
+Migrations 0015 and 0016 are additive. sqlx refuses to boot an older binary
+on a migrated database. If one is forced to run, it ignores the pools: BYOK
+teams would be served on the platform's keys and billed tokens. So roll back
+by disabling BYOK (the per-pool fallback flag cannot help), rather than by
+downgrading the binary.
