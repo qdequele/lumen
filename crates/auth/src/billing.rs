@@ -37,6 +37,15 @@ pub struct UsageUnits {
     /// Tokens (in plus out) of the requests whose counts were local
     /// estimates (ADR 003), so the Lab can tell exact from estimated.
     pub tokens_estimated: i64,
+    /// Request body bytes read from clients (billable bandwidth in).
+    pub bytes_in: i64,
+    /// Response body bytes written to clients (billable bandwidth out).
+    pub bytes_out: i64,
+    /// Input tokens of requests served on a team (BYOK) key; not in
+    /// `tokens_in`, which covers platform-key traffic only.
+    pub byok_tokens_in: i64,
+    /// Output tokens of requests served on a team (BYOK) key.
+    pub byok_tokens_out: i64,
 }
 
 /// One billable key's spend since its last billed flush, in micro-USD.
@@ -48,7 +57,8 @@ pub struct UsageDelta {
     pub account_ref: String,
     /// The key's `external_ref` (the Lab key id), if any.
     pub external_ref: Option<String>,
-    /// Spend since the watermark; always positive.
+    /// Spend since the watermark; zero for a window with only bandwidth or
+    /// BYOK units.
     pub cost_micro: i64,
     /// Unit counts since the last billed flush (informational).
     pub units: UsageUnits,
@@ -205,6 +215,10 @@ mod tests {
                 tokens_in: 90_000,
                 tokens_out: 6_120,
                 tokens_estimated: 0,
+                bytes_in: 2_048,
+                bytes_out: 8_192,
+                byok_tokens_in: 11,
+                byok_tokens_out: 22,
             },
             window_start_ms: 1_000_000_000_000,
             window_end_ms: 1_000_000_010_000,
@@ -263,6 +277,10 @@ mod tests {
         assert_eq!(v["data"]["units"]["tokens_in"], 90_000);
         assert_eq!(v["data"]["units"]["tokens_out"], 6_120);
         assert_eq!(v["data"]["units"]["tokens_estimated"], 0);
+        assert_eq!(v["data"]["units"]["bytes_in"], 2_048);
+        assert_eq!(v["data"]["units"]["bytes_out"], 8_192);
+        assert_eq!(v["data"]["units"]["byok_tokens_in"], 11);
+        assert_eq!(v["data"]["units"]["byok_tokens_out"], 22);
         assert_eq!(
             v["data"]["description"],
             "key k1 2001-09-09T01:46:40.000Z..2001-09-09T01:46:50.000Z"

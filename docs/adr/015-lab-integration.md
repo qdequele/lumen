@@ -5,6 +5,7 @@
 - Builds on: ADR 009, ADR 010, ADR 011
 - Amends: ADR 011 §2 (billing events only)
 - Amended: 2026-10-10 (platform contract v2)
+- Amended: 2026-11-05 (bandwidth and BYOK units, ADR 018)
 
 ## Context
 
@@ -154,3 +155,11 @@ implemented in LUMEN 0.7.0:
 
 The operator view of all of this is
 [Lab integration](../operations/lab-integration.md).
+
+## Amendment 2026-11-05: bandwidth and BYOK units
+
+Per-account provider keys are no longer out of scope, and usage events gain
+the units `bytes_in`, `bytes_out`, `byok_tokens_in` and `byok_tokens_out`.
+Bandwidth is charged to `spent_micro` at the group's rate, never to the
+settled-cost counter billing reads. See
+[ADR 018](018-team-provider-keys-and-bandwidth.md).

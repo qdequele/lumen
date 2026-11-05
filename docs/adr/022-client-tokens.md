@@ -1,16 +1,16 @@
-# ADR 019 - Client tokens for browser and mobile callers
+# ADR 022 - Client tokens for browser and mobile callers
 
 - Status: proposed
 - Date: 2026-10-07
 - Builds on: ADR 008, ADR 009
-- Required by: ADR 018 (live transcription from browsers)
+- Required by: ADR 021 (live transcription from browsers)
 
 ## Context
 
 Every LUMEN credential today is a virtual key (`fg-` plus 32 random bytes)
 meant to live on a backend. Browser and mobile front ends now need to call
 LUMEN directly, first to stream microphone audio into a live transcription
-session (ADR 018), then to upload a recording. Two things block that:
+session (ADR 021), then to upload a recording. Two things block that:
 
 - **A virtual key in a front end is public.** Anyone can copy it and spend
   its whole budget on every model.
@@ -173,7 +173,7 @@ Without a `[client_tokens]` block, the minting route answers `LM-1003`
 - A leaked token is usable by anyone until it expires (60 s by default), but
   only within its models, session length and per-session cost cap, from
   allowed origins in a browser, and against the parent key's budget and
-  session limits (ADR 018). Revoking the parent key stops it immediately.
+  session limits (ADR 021). Revoking the parent key stops it immediately.
 - Tokens are multi-use until expiry, like OpenAI's. `max_cost_usd` caps each
   session or upload, not the total across a token's sessions; the per-key
   session limit and the short TTL bound the total.

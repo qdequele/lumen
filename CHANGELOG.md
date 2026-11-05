@@ -6,7 +6,29 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-11-05
+
+First release with team provider key pools (BYOK) and bandwidth metering
+(ADR 018). The `v0.8.0` tag was cut without the workspace version bump, so its
+binary reported 0.7.0 and failed deploy health checks; use 0.8.1.
+
 ### Added
+
+- **Team key pools route requests (BYOK).** A request whose virtual key
+  belongs to a budget group with its own keys for the provider is sent with
+  those keys, round-robin; a rate-limited key is benched and a key the
+  provider rejects (401/403) is marked failing, and the next key is tried.
+  An exhausted pool fails `LM-3021` (429) unless the group turned on the
+  fallback to the platform's keys, including through virtual-model chains.
+  Team-key traffic is reported as `byok_tokens_in/out` with no token cost,
+  bandwidth is billed only when an upstream call is actually sent, and
+  `GET /admin/groups/{id}/byok` shows each key's live status.
+  A link served from team keys has its own circuit breaker (per provider,
+  model and group), so platform-key failures never block a team on its own
+  keys and the reverse. A link the gateway refuses hands back a half-open
+  probe, and a chain-lock refusal after an upstream failure surfaces that
+  failure instead of `LM-3021`. Team keys must be at least 16 characters
+  (400 `LM-1001`), since `last4` of a shorter key reveals most of it.
 
 - **`openrouter` providers serve embeddings.** OpenRouter now exposes an
   OpenAI-format `POST /embeddings` endpoint (catalog at
@@ -2041,7 +2063,8 @@ This closes every remaining streaming criterion:
 - Docs: error-code reference (`docs/errors.md`), ADR 001 (crate/lib naming),
   and this changelog.
 
-[Unreleased]: https://github.com/qdequele/lumen/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/qdequele/lumen/compare/v0.8.1...HEAD
+[0.8.1]: https://github.com/qdequele/lumen/compare/v0.7.0...v0.8.1
 [0.7.0]: https://github.com/qdequele/lumen/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/qdequele/lumen/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/qdequele/lumen/compare/v0.5.0...v0.6.0

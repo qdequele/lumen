@@ -37,4 +37,9 @@ pub enum AuthError {
     /// the caller named the id, so naming it back leaks nothing.
     #[error("'{0}' has no budget cap to grant to (budget_max is unlimited)")]
     NoBudgetCap(String),
+
+    /// A team provider key pool already holds its maximum number of keys.
+    /// Client error (400 `LM-1001`): the caller named the pool.
+    #[error("the team key pool is full ({0} keys per provider at most)")]
+    PoolFull(usize),
 }

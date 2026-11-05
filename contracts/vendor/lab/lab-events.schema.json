@@ -55,7 +55,7 @@
     },
     "units": {
       "type": "object",
-      "description": "Raw units by name. The Lab prices the names in saas/config/pricing.yml; unknown names are kept and ignored.",
+      "description": "Raw units by name. The Lab prices the names in saas/config/pricing.yml; unknown names are kept and ignored. Lumen sends requests, tokens_in, tokens_out, tokens_estimated, bytes_in, bytes_out, byok_tokens_in, byok_tokens_out.",
       "additionalProperties": { "type": "integer", "minimum": 0 }
     },
     "usageData": {

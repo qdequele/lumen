@@ -218,6 +218,19 @@ impl CircuitBreaker {
         }
     }
 
+    /// Record a call that says nothing about the provider's health (a
+    /// cancellation, a client fault, or a link the gateway refused before
+    /// calling upstream). Leaves the state and the failure streak alone, but
+    /// releases a half-open probe this call held, so the next caller can
+    /// probe right away instead of waiting for the probe to go stale.
+    pub fn on_neutral(&self) {
+        let mut inner = self.lock();
+        if inner.state == CircuitState::HalfOpen {
+            inner.probe_in_flight = false;
+            inner.probe_admitted_at = None;
+        }
+    }
+
     /// The current state (for snapshots / observability).
     pub fn state(&self) -> CircuitState {
         self.lock().state
@@ -246,15 +259,39 @@ impl CircuitBreakers {
     /// The breaker for a (provider, model), created on first use.
     #[must_use]
     pub fn get(&self, provider: &str, model: &str) -> Arc<CircuitBreaker> {
-        let key = (provider.to_owned(), model.to_owned());
+        self.get_scoped(provider, None, model)
+    }
+
+    /// The breaker for a (provider, model) as served by `scope`: `None` is
+    /// the platform's own key (the [`get`](Self::get) breaker); `Some(group)`
+    /// is that budget group's team key pool (ADR 018), keyed
+    /// `"{provider}#group:{group}"` so a team's failures and the platform's
+    /// never trip each other. A scoped breaker does not feed the
+    /// `lumen_circuit_state` gauge (one series per group would be unbounded).
+    #[must_use]
+    pub fn get_scoped(
+        &self,
+        provider: &str,
+        scope: Option<&str>,
+        model: &str,
+    ) -> Arc<CircuitBreaker> {
+        let name = scope.map_or_else(
+            || provider.to_owned(),
+            |group| format!("{provider}#group:{group}"),
+        );
+        let key = (name, model.to_owned());
         if let Some(existing) = self.map.get(&key) {
             return Arc::clone(existing.value());
         }
         let breaker = Arc::new(CircuitBreaker::new(
-            provider.to_owned(),
+            key.0.clone(),
             model.to_owned(),
             self.config,
-            self.metrics.clone(),
+            if scope.is_some() {
+                None
+            } else {
+                self.metrics.clone()
+            },
         ));
         // `entry` keeps creation atomic against a racing insert of the same key.
         Arc::clone(self.map.entry(key).or_insert(breaker).value())
@@ -429,5 +466,50 @@ mod tests {
         let c = breakers.get("openai", "gpt-4o-mini");
         assert_eq!(c.state(), CircuitState::Closed);
         assert_eq!(breakers.snapshot().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_neutral_result_releases_the_probe_without_a_verdict() {
+        let b = breaker();
+        let t0 = Instant::now();
+        for _ in 0..5 {
+            b.on_failure(t0);
+        }
+        let after = t0 + Duration::from_secs(31);
+        assert_eq!(b.admit(after), Admission::Allowed); // probe
+        b.on_neutral();
+        assert_eq!(b.state(), CircuitState::HalfOpen, "no verdict");
+        assert_eq!(b.admit(after), Admission::Allowed, "probe released");
+        // While closed it touches nothing: the streak survives.
+        let c = breaker();
+        for _ in 0..4 {
+            c.on_failure(t0);
+        }
+        c.on_neutral();
+        c.on_failure(t0);
+        assert_eq!(c.state(), CircuitState::Open);
+    }
+
+    #[tokio::test]
+    async fn scoped_breakers_are_independent_of_the_platform_one() {
+        let breakers = CircuitBreakers::new(config(), None);
+        let now = Instant::now();
+        for _ in 0..5 {
+            breakers
+                .get_scoped("openai", Some("g1"), "gpt-4o")
+                .on_failure(now);
+        }
+        assert_eq!(
+            breakers.get_scoped("openai", Some("g1"), "gpt-4o").state(),
+            CircuitState::Open
+        );
+        assert_eq!(
+            breakers.get("openai", "gpt-4o").state(),
+            CircuitState::Closed
+        );
+        assert!(Arc::ptr_eq(
+            &breakers.get_scoped("openai", None, "gpt-4o"),
+            &breakers.get("openai", "gpt-4o")
+        ));
     }
 }
