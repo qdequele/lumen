@@ -282,6 +282,14 @@ pub struct KeyEntry {
     tokens_out: AtomicI64,
     /// Tokens of locally estimated requests since the last billed flush.
     tokens_estimated: AtomicI64,
+    /// Request body bytes since the last billed flush.
+    bytes_in: AtomicI64,
+    /// Response body bytes since the last billed flush.
+    bytes_out: AtomicI64,
+    /// Input tokens of team-key (BYOK) requests since the last billed flush.
+    byok_tokens_in: AtomicI64,
+    /// Output tokens of team-key (BYOK) requests since the last billed flush.
+    byok_tokens_out: AtomicI64,
 }
 
 // Compile-time guard: the `repr(align)` attributes above must match
@@ -314,6 +322,10 @@ impl KeyEntry {
             tokens_in: AtomicI64::new(0),
             tokens_out: AtomicI64::new(0),
             tokens_estimated: AtomicI64::new(0),
+            bytes_in: AtomicI64::new(0),
+            bytes_out: AtomicI64::new(0),
+            byok_tokens_in: AtomicI64::new(0),
+            byok_tokens_out: AtomicI64::new(0),
         };
         entry.apply_limits(record);
         entry
@@ -576,6 +588,10 @@ pub struct SettledUsage {
     pub tokens_out: i64,
     /// Whether the token counts were a local estimate (ADR 003).
     pub estimated: bool,
+    /// `false` when the request was served on a team (BYOK) key: the cost
+    /// and tokens are then not platform spend, and only the BYOK token units
+    /// are counted.
+    pub billable: bool,
 }
 
 impl Reservation {
@@ -599,13 +615,15 @@ impl Reservation {
             tokens_in: actual_tokens,
             tokens_out: 0,
             estimated: false,
+            billable: true,
         });
     }
 
     /// [`settle`](Self::settle) with the full usage breakdown the billing
     /// units need (ADR 015, platform contract v2).
     pub fn settle_usage(mut self, usage: SettledUsage) {
-        let actual_cost_micro = usage.cost_micro;
+        // A team-key request spends nothing from the platform budget.
+        let actual_cost_micro = if usage.billable { usage.cost_micro } else { 0 };
         let tokens_in = usage.tokens_in.max(0);
         let tokens_out = usage.tokens_out.max(0);
         let actual_tokens = tokens_in.saturating_add(tokens_out);
@@ -628,14 +646,23 @@ impl Reservation {
             .settled_micro
             .fetch_add(actual_cost_micro.max(0), Ordering::Relaxed);
         self.entry.requests.fetch_add(1, Ordering::Relaxed);
-        self.entry.tokens_in.fetch_add(tokens_in, Ordering::Relaxed);
-        self.entry
-            .tokens_out
-            .fetch_add(tokens_out, Ordering::Relaxed);
-        if usage.estimated {
+        if usage.billable {
+            self.entry.tokens_in.fetch_add(tokens_in, Ordering::Relaxed);
             self.entry
-                .tokens_estimated
-                .fetch_add(actual_tokens, Ordering::Relaxed);
+                .tokens_out
+                .fetch_add(tokens_out, Ordering::Relaxed);
+            if usage.estimated {
+                self.entry
+                    .tokens_estimated
+                    .fetch_add(actual_tokens, Ordering::Relaxed);
+            }
+        } else {
+            self.entry
+                .byok_tokens_in
+                .fetch_add(tokens_in, Ordering::Relaxed);
+            self.entry
+                .byok_tokens_out
+                .fetch_add(tokens_out, Ordering::Relaxed);
         }
         self.entry.dirty.store(true, Ordering::SeqCst);
         self.settled = true;
@@ -1083,6 +1110,16 @@ impl AuthState {
                 item.entry
                     .tokens_estimated
                     .fetch_add(u.tokens_estimated, Ordering::Relaxed);
+                item.entry.bytes_in.fetch_add(u.bytes_in, Ordering::Relaxed);
+                item.entry
+                    .bytes_out
+                    .fetch_add(u.bytes_out, Ordering::Relaxed);
+                item.entry
+                    .byok_tokens_in
+                    .fetch_add(u.byok_tokens_in, Ordering::Relaxed);
+                item.entry
+                    .byok_tokens_out
+                    .fetch_add(u.byok_tokens_out, Ordering::Relaxed);
             }
         }
     }
@@ -1184,7 +1221,22 @@ impl KeyEntry {
             tokens_in: self.tokens_in.swap(0, Ordering::Relaxed),
             tokens_out: self.tokens_out.swap(0, Ordering::Relaxed),
             tokens_estimated: self.tokens_estimated.swap(0, Ordering::Relaxed),
+            bytes_in: self.bytes_in.swap(0, Ordering::Relaxed),
+            bytes_out: self.bytes_out.swap(0, Ordering::Relaxed),
+            byok_tokens_in: self.byok_tokens_in.swap(0, Ordering::Relaxed),
+            byok_tokens_out: self.byok_tokens_out.swap(0, Ordering::Relaxed),
         }
+    }
+
+    /// Count client-facing body bytes for billable bandwidth. Marks the key
+    /// dirty so a bandwidth-only window is still flushed; budget charging is
+    /// not done here.
+    pub fn add_bytes(&self, bytes_in: u64, bytes_out: u64) {
+        let clamp = |n: u64| i64::try_from(n).unwrap_or(i64::MAX);
+        self.bytes_in.fetch_add(clamp(bytes_in), Ordering::Relaxed);
+        self.bytes_out
+            .fetch_add(clamp(bytes_out), Ordering::Relaxed);
+        self.dirty.store(true, Ordering::SeqCst);
     }
 
     /// Build this key's flush item under the billing rule (ADR 015). The
@@ -1216,7 +1268,11 @@ impl KeyEntry {
             self.take_units();
             return item(settled, None);
         };
-        if settled <= billed {
+        // Take the units first: a window with only bandwidth or BYOK units is
+        // still reported (cost 0). When nothing is emitted the taken units
+        // are all zero, so there is nothing to give back.
+        let units = self.take_units();
+        if settled <= billed && units == UsageUnits::default() {
             // Nothing new settled (only reachable at equality).
             return item(billed, None);
         }
@@ -1224,8 +1280,8 @@ impl KeyEntry {
             key_id: self.id.clone(),
             account_ref: account.as_str().to_owned(),
             external_ref: self.external_ref.load_full().map(|r| r.as_str().to_owned()),
-            cost_micro: settled - billed,
-            units: self.take_units(),
+            cost_micro: (settled - billed).max(0),
+            units,
             window_start_ms: self.last_billed_ms.load(Ordering::SeqCst),
             window_end_ms: now_ms,
         };

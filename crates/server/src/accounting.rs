@@ -326,6 +326,7 @@ impl Accounting {
                 tokens_in: i64::try_from(outcome.tokens_in).unwrap_or(i64::MAX),
                 tokens_out: i64::try_from(outcome.tokens_out).unwrap_or(i64::MAX),
                 estimated: outcome.estimated,
+                billable: true,
             });
         }
 

@@ -251,6 +251,7 @@ fn units_split_tokens_and_count_estimates() {
             tokens_in: 30,
             tokens_out: 10,
             estimated: false,
+            billable: true,
         },
     );
     // No upstream usage: the local estimate is flagged (ADR 003).
@@ -261,6 +262,7 @@ fn units_split_tokens_and_count_estimates() {
             tokens_in: 7,
             tokens_out: 3,
             estimated: true,
+            billable: true,
         },
     );
     let batch = s.drain_flush(2_000);
@@ -273,6 +275,98 @@ fn units_split_tokens_and_count_estimates() {
             tokens_in: 37,
             tokens_out: 13,
             tokens_estimated: 10,
+            ..lumen_auth::billing::UsageUnits::default()
         }
     );
+}
+
+fn byok_usage() -> lumen_auth::state::SettledUsage {
+    lumen_auth::state::SettledUsage {
+        cost_micro: 500,
+        tokens_in: 10,
+        tokens_out: 20,
+        estimated: false,
+        billable: false,
+    }
+}
+
+#[test]
+fn settle_non_billable_counts_byok_tokens_only() {
+    let s = state(Some(ACCOUNT), Some("g"), true);
+    spend_usage(&s, byok_usage());
+    let entry = s.authenticate("sk", NOW).unwrap();
+    assert_eq!(entry.spent_micro(), 0, "no platform spend");
+    assert_eq!(s.group("g").unwrap().spent_micro(), 0);
+    let batch = s.drain_flush(2_000);
+    let d = batch.deltas()[0];
+    assert_eq!(d.cost_micro, 0, "settled_micro is unchanged");
+    assert_eq!(
+        (
+            d.units.byok_tokens_in,
+            d.units.byok_tokens_out,
+            d.units.tokens_in,
+            d.units.tokens_out,
+            d.units.requests
+        ),
+        (10, 20, 0, 0, 1)
+    );
+}
+
+#[test]
+fn byok_only_window_emits_event() {
+    let s = state(Some(ACCOUNT), Some("g"), true);
+    spend_usage(&s, byok_usage());
+    s.authenticate("sk", NOW).unwrap().add_bytes(100, 900);
+    let batch = s.drain_flush(2_000);
+    assert_eq!(batch.deltas().len(), 1);
+    let inserts = batch.outbox_inserts(2_000).unwrap();
+    assert_eq!(inserts.len(), 1);
+    let body: serde_json::Value = serde_json::from_str(&inserts[0].body).unwrap();
+    assert_eq!(body["data"]["provider_cost_micro_usd"], 0);
+    assert_eq!(
+        body["data"]["units"],
+        serde_json::json!({
+            "requests": 1,
+            "tokens_in": 0,
+            "tokens_out": 0,
+            "tokens_estimated": 0,
+            "bytes_in": 100,
+            "bytes_out": 900,
+            "byok_tokens_in": 10,
+            "byok_tokens_out": 20,
+        })
+    );
+}
+
+#[test]
+fn idle_window_emits_nothing() {
+    let s = state(Some(ACCOUNT), Some("g"), true);
+    spend(&s, 100, 1);
+    let first = s.drain_flush(2_000);
+    s.commit_flush(first);
+    let idle = s.drain_flush(3_000);
+    assert_eq!(idle.deltas(), [] as [&lumen_auth::billing::UsageDelta; 0]);
+}
+
+#[test]
+fn rollback_restores_bytes_and_byok_units() {
+    let s = state(Some(ACCOUNT), Some("g"), true);
+    spend_usage(&s, byok_usage());
+    s.authenticate("sk", NOW).unwrap().add_bytes(100, 900);
+    let failed = s.drain_flush(2_000);
+    let units = failed.deltas()[0].units;
+    s.rollback_flush(failed);
+    let retry = s.drain_flush(3_000);
+    assert_eq!(retry.deltas()[0].units, units);
+    assert_eq!(units.bytes_in, 100);
+    assert_eq!(units.byok_tokens_out, 20);
+}
+
+#[test]
+fn bytes_alone_make_the_key_flush() {
+    let s = state(Some(ACCOUNT), Some("g"), true);
+    s.authenticate("sk", NOW).unwrap().add_bytes(5, 7);
+    let d = s.drain_flush(2_000);
+    let u = d.deltas()[0].units;
+    assert_eq!((u.bytes_in, u.bytes_out, u.requests), (5, 7, 0));
 }
