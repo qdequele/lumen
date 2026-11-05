@@ -1036,6 +1036,10 @@ impl AuthState {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter()
             .map(|entry| {
+                // Clear first: bytes credited after this point (a response
+                // body ending late) re-dirty the key, so `commit_flush` keeps
+                // it listed for one more flush instead of dropping them.
+                entry.dirty.store(false, Ordering::SeqCst);
                 let mut item = entry.flush_item(billing_on, now_ms);
                 item.retired = true;
                 item
@@ -1055,7 +1059,8 @@ impl AuthState {
     /// those that can still earn money. A retired key stays listed while a
     /// request admitted before its delete still holds the entry (an in-flight
     /// `Reservation`: its settle lands after this commit and must still be
-    /// billed) or while settled cost is not yet billed.
+    /// billed), while settled cost is not yet billed, or while units landed
+    /// since its drain (`dirty`: late bandwidth).
     pub fn commit_flush(&self, batch: FlushBatch) {
         let mut committed_retired: Vec<*const KeyEntry> = Vec::new();
         for item in batch.items {
@@ -1088,6 +1093,7 @@ impl AuthState {
                     std::sync::atomic::fence(Ordering::Acquire);
                     entry.settled_micro.load(Ordering::SeqCst)
                         != entry.billed_micro.load(Ordering::SeqCst)
+                        || entry.dirty.load(Ordering::SeqCst)
                 });
         }
     }

@@ -17,6 +17,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::accounting::{Accounting, Outcome, Target, TokenBreakdown};
 use crate::auth::AuthedKey;
+use crate::bandwidth::UpstreamMark;
 use crate::error::ApiError;
 use crate::facts::Facts;
 use crate::resilience::routing_headers;
@@ -67,10 +68,14 @@ fn enforce_image_support(
 }
 
 /// Handle an embeddings request.
+// One straight-line request pipeline; the upstream-mark extractor tipped it
+// one line over the limit.
+#[allow(clippy::too_many_lines)]
 pub async fn embeddings(
     State(state): State<AppState>,
     headers: HeaderMap,
     key: Option<Extension<AuthedKey>>,
+    Extension(mark): Extension<UpstreamMark>,
     payload: Result<Json<lumen_core::EmbedRequest>, JsonRejection>,
 ) -> Result<Response, ApiError> {
     // Malformed request body → LM-1001 in our standard envelope (not axum's
@@ -145,6 +150,7 @@ pub async fn embeddings(
     // link's upstream id.
     let executed =
         lumen_router::executor::execute(&links, &state.resilience.breakers, &exec, &cancel, |i| {
+            mark.mark();
             let provider = chain[i].route.provider.clone();
             let cancel = cancel.clone();
             let mut attempt_req = req.clone();

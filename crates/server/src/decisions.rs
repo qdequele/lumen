@@ -20,6 +20,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::accounting::{Accounting, Outcome, Target, TokenBreakdown};
 use crate::auth::AuthedKey;
+use crate::bandwidth::UpstreamMark;
 use crate::error::ApiError;
 use crate::facts::Facts;
 use crate::resilience::routing_headers;
@@ -30,15 +31,17 @@ pub async fn decisions_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
     key: Option<Extension<AuthedKey>>,
+    Extension(mark): Extension<UpstreamMark>,
     body: Bytes,
 ) -> Result<Response, ApiError> {
-    handle(state, &headers, key.as_deref(), &body).await
+    handle(state, &headers, key.as_deref(), &mark, &body).await
 }
 
 async fn handle(
     state: AppState,
     headers: &HeaderMap,
     key: Option<&AuthedKey>,
+    mark: &UpstreamMark,
     body: &[u8],
 ) -> Result<Response, ApiError> {
     // Malformed JSON, an undetectable format or a contract violation →
@@ -89,6 +92,7 @@ async fn handle(
 
     let executed =
         lumen_router::executor::execute(&links, &state.resilience.breakers, &exec, &cancel, |i| {
+            mark.mark();
             let provider = chain[i].route.provider.clone();
             let cancel = cancel.clone();
             // A refcount bump: the request body is shared.

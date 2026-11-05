@@ -19,6 +19,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::accounting::{Accounting, Outcome, Target, TokenBreakdown};
 use crate::auth::AuthedKey;
+use crate::bandwidth::UpstreamMark;
 use crate::error::ApiError;
 use crate::facts::Facts;
 use crate::resilience::routing_headers;
@@ -33,6 +34,7 @@ pub async fn rerank_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
     key: Option<Extension<AuthedKey>>,
+    Extension(mark): Extension<UpstreamMark>,
     payload: Result<Json<lumen_core::RerankRequest>, JsonRejection>,
 ) -> Result<Response, ApiError> {
     // Malformed body → LM-1001 in our envelope (not axum's plain-text default).
@@ -88,6 +90,7 @@ pub async fn rerank_handler(
 
     let executed =
         lumen_router::executor::execute(&links, &state.resilience.breakers, &exec, &cancel, |i| {
+            mark.mark();
             let provider = chain[i].route.provider.clone();
             let cancel = cancel.clone();
             let mut attempt_req = req.clone();

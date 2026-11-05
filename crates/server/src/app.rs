@@ -86,6 +86,9 @@ pub fn build_app(state: AppState) -> Router {
         .route("/v1/embeddings", post(embeddings::embeddings))
         .route("/v1/rerank", post(rerank::rerank_handler))
         .route("/v1/decisions", post(decisions::decisions_handler))
+        // Added before the auth layer so it runs inside it: it needs the
+        // `AuthedKey` extension to credit the key's bandwidth.
+        .route_layer(middleware::from_fn(crate::bandwidth::count_bandwidth))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth::require_virtual_key,

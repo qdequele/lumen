@@ -43,6 +43,7 @@ use tokio_util::sync::{CancellationToken, DropGuard};
 
 use crate::accounting::{Accounting, Outcome, StreamAccounting, Target, TokenBreakdown};
 use crate::auth::AuthedKey;
+use crate::bandwidth::UpstreamMark;
 use crate::error::ApiError;
 use crate::facts::Facts;
 use crate::pricing::DEFAULT_RESERVED_OUTPUT_TOKENS;
@@ -62,6 +63,7 @@ pub async fn chat(
     State(state): State<AppState>,
     headers: HeaderMap,
     key: Option<Extension<AuthedKey>>,
+    Extension(mark): Extension<UpstreamMark>,
     payload: Result<Json<ChatRequest>, JsonRejection>,
 ) -> Result<Response, ApiError> {
     // Malformed body → LM-1001 in our envelope (not axum's plain-text default).
@@ -142,6 +144,7 @@ pub async fn chat(
         cancel: &cancel,
         req: &req,
         estimated_input,
+        mark: &mark,
     };
     if req.stream {
         chat_streaming(&ctx, guard, accounting).await
@@ -262,6 +265,7 @@ struct ChatExec<'a> {
     cancel: &'a CancellationToken,
     req: &'a ChatRequest,
     estimated_input: u64,
+    mark: &'a UpstreamMark,
 }
 
 /// Streaming path: open the upstream byte stream and peek its first frame with
@@ -281,6 +285,7 @@ async fn chat_streaming(
         &ctx.exec,
         ctx.cancel,
         |i| {
+            ctx.mark.mark();
             let provider = ctx.chain[i].route.provider.clone();
             let provider_name = ctx.chain[i].route.provider_name.clone();
             let cancel = ctx.cancel.clone();
@@ -353,6 +358,7 @@ async fn chat_non_streaming(
         &ctx.exec,
         ctx.cancel,
         |i| {
+            ctx.mark.mark();
             let provider = ctx.chain[i].route.provider.clone();
             let cancel = ctx.cancel.clone();
             let mut attempt_req = ctx.req.clone();

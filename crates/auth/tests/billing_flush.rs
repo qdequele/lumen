@@ -198,6 +198,29 @@ fn a_retired_key_with_a_request_in_flight_stays_until_it_settles() {
     );
 }
 
+#[test]
+fn a_retired_key_keeps_bytes_credited_between_drain_and_commit() {
+    let s = state(Some(ACCOUNT), Some("g"), true);
+    let entry = s.authenticate("sk", NOW).unwrap();
+    let evicted = s.remove("k").unwrap();
+    s.retire(evicted);
+    // Bandwidth lands after the drain (a response body ending late) but
+    // before the commit, on a key with no pending cost.
+    let batch = s.drain_flush(2_000);
+    entry.add_bytes(10, 20);
+    drop(entry);
+    s.commit_flush(batch);
+    let next = s.drain_flush(3_000);
+    let deltas = next.deltas();
+    assert_eq!(deltas.len(), 1, "late bytes must still be offered");
+    assert_eq!(
+        (deltas[0].units.bytes_in, deltas[0].units.bytes_out),
+        (10, 20)
+    );
+    s.commit_flush(next);
+    assert!(s.drain_flush(4_000).is_empty(), "flushed: forgotten");
+}
+
 #[tokio::test]
 async fn a_flush_guard_serializes_flushers() {
     let s = state(Some(ACCOUNT), Some("g"), true);

@@ -10,6 +10,7 @@ pub mod admin;
 pub mod admin_scope;
 pub mod app;
 pub mod auth;
+pub mod bandwidth;
 pub mod budget_flush;
 pub mod chat;
 pub mod config;
