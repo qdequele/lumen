@@ -11,12 +11,15 @@ use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
-use lumen_core::{tokens, Capability, GatewayError};
+use lumen_core::{tokens, Capability, GatewayError, ProviderError};
 use lumen_providers::batch;
+use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 use crate::accounting::{Accounting, Outcome, Target, TokenBreakdown};
 use crate::auth::AuthedKey;
+use crate::bandwidth::UpstreamMark;
+use crate::byok::{RequestKeys, Served};
 use crate::error::ApiError;
 use crate::facts::Facts;
 use crate::resilience::routing_headers;
@@ -67,10 +70,14 @@ fn enforce_image_support(
 }
 
 /// Handle an embeddings request.
+// One straight-line request pipeline; the upstream-mark extractor tipped it
+// one line over the limit.
+#[allow(clippy::too_many_lines)]
 pub async fn embeddings(
     State(state): State<AppState>,
     headers: HeaderMap,
     key: Option<Extension<AuthedKey>>,
+    Extension(mark): Extension<UpstreamMark>,
     payload: Result<Json<lumen_core::EmbedRequest>, JsonRejection>,
 ) -> Result<Response, ApiError> {
     // Malformed request body → LM-1001 in our standard envelope (not axum's
@@ -92,7 +99,7 @@ pub async fn embeddings(
         })?;
     let chain = lumen_router::resolve_embedding_decision(&state.registry, &mut decision)?;
     let primary = decision.primary_model().to_owned();
-    let links = lumen_router::decision_links(
+    let mut links = lumen_router::decision_links(
         &decision,
         chain.iter().map(|l| l.route.provider_name.as_str()),
     );
@@ -104,9 +111,20 @@ pub async fn embeddings(
     // label is corrected to the one that actually serves (M6) after execution.
     // One consistent price snapshot for the whole request (a mid-request hot
     // reload can't shift prices between estimate and settlement).
+    // A primary served by the group's own keys (BYOK) reserves no cost.
+    let keys = RequestKeys::new(&state.team_pools, key.as_deref()).for_chain(
+        &state.registry,
+        chain.iter().map(|l| l.route.provider_name.as_str()),
+    );
+    // Links served from a team pool get their own breaker (ADR 018).
+    keys.scope_links(&state.registry, &mut links);
     let pricing = state.pricing();
     let estimated_input = tokens::estimate_embed_input(&req);
-    let estimated_cost = pricing.token_cost(&primary, estimated_input, 0);
+    let estimated_cost = if keys.has_usable_pool(&chain[0].route.provider_name) {
+        0.0
+    } else {
+        pricing.token_cost(&primary, estimated_input, 0)
+    };
     let mut accounting = Accounting::begin(
         &state,
         &headers,
@@ -145,7 +163,8 @@ pub async fn embeddings(
     // link's upstream id.
     let executed =
         lumen_router::executor::execute(&links, &state.resilience.breakers, &exec, &cancel, |i| {
-            let provider = chain[i].route.provider.clone();
+            let platform = chain[i].route.provider.clone();
+            let provider_name = chain[i].route.provider_name.clone();
             let cancel = cancel.clone();
             let mut attempt_req = req.clone();
             decision.attempts[i].apply(&mut attempt_req);
@@ -153,12 +172,31 @@ pub async fn embeddings(
                 .route
                 .upstream_id
                 .clone_into(&mut attempt_req.model);
+            let (keys, registry, mark) = (&keys, &*state.registry, &mark);
             async move {
-                batch::embed_batched(
-                    provider.as_ref(),
-                    attempt_req,
-                    &cancel,
-                    batch::DEFAULT_CONCURRENCY,
+                // Marked only when an upstream call is actually sent.
+                let call = |provider: Option<Arc<dyn lumen_core::EmbeddingProvider>>| {
+                    let (req, cancel, name) =
+                        (attempt_req.clone(), cancel.clone(), provider_name.clone());
+                    async move {
+                        let provider =
+                            provider.ok_or(ProviderError::Unavailable { provider: name })?;
+                        mark.mark();
+                        batch::embed_batched(
+                            provider.as_ref(),
+                            req,
+                            &cancel,
+                            batch::DEFAULT_CONCURRENCY,
+                        )
+                        .await
+                    }
+                };
+                keys.attempt(
+                    registry,
+                    i,
+                    &provider_name,
+                    || call(Some(platform)),
+                    |set| call(set.embed.clone()),
                 )
                 .await
             }
@@ -166,7 +204,7 @@ pub async fn embeddings(
         .await?;
     // (an early return above drops `accounting`, refunding the reservation)
 
-    let mut response = executed.value;
+    let (mut response, served) = executed.value;
     accounting.served_by(&executed.model_used, &executed.provider_used);
     let route = decision.route_of(executed.index);
     accounting.set_route(route);
@@ -191,8 +229,8 @@ pub async fn embeddings(
         &pricing,
         &executed.model_used,
         &req,
-        tokens_in,
-        estimated,
+        (tokens_in, estimated),
+        matches!(served, Served::Platform),
     );
 
     // Honor the requested output encoding (OpenAI `encoding_format`), as the
@@ -225,8 +263,8 @@ fn finish_embed(
     pricing: &std::sync::Arc<crate::pricing::CostTable>,
     model_used: &str,
     req: &lumen_core::EmbedRequest,
-    tokens_in: u64,
-    estimated: bool,
+    (tokens_in, estimated): (u64, bool),
+    billable: bool,
 ) {
     // M9: media accounting. `req.input`'s image parts are now `data:` URIs
     // (resolved before execution), so this measures decoded bytes with no I/O.
@@ -253,6 +291,7 @@ fn finish_embed(
                 media,
                 cost,
                 status: 200,
+                billable,
             });
         });
     } else {
@@ -266,6 +305,7 @@ fn finish_embed(
             media,
             cost,
             status: 200,
+            billable,
         });
     }
 }

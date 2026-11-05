@@ -173,6 +173,7 @@ async fn rotating_a_db_provider_key_takes_effect_on_reload_without_restart() {
         image_fetch: None,
         token_counter: None,
         health: None,
+        team_pools: None,
     });
     reload_once(&ctx(&path), &targets).await;
 
@@ -253,6 +254,7 @@ async fn reload_makes_an_offline_group_and_member_key_live_and_group_enforced() 
         image_fetch: None,
         token_counter: None,
         health: None,
+        team_pools: None,
     });
     reload_once(&ctx(&path), &targets).await;
 
@@ -323,6 +325,7 @@ fn reload_targets(registry: Arc<Registry>, metrics: ReloadMetrics) -> ReloadTarg
         image_fetch: None,
         token_counter: None,
         health: None,
+        team_pools: None,
     }
 }
 
@@ -541,6 +544,7 @@ async fn reload_retargets_and_retunes_webhooks_without_dropping_the_queue() {
         image_fetch: None,
         token_counter: None,
         health: None,
+        team_pools: None,
     });
 
     // Reload with a new URL and a new event/threshold set.
@@ -639,6 +643,7 @@ async fn a_stored_webhook_row_wins_over_the_config_block_across_reloads() {
         image_fetch: None,
         token_counter: None,
         health: None,
+        team_pools: None,
     });
 
     // With no stored row, the file wins.

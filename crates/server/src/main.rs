@@ -722,6 +722,23 @@ fn run(config_path: PathBuf) -> anyhow::Result<()> {
 
         let (client, registry) = build_http_stack(&config, provider_specs)?;
 
+        // Team key pools (BYOK): loaded once here, then rebuilt by the
+        // reloader after every pool write and config reload. A load failure
+        // boots with empty pools (platform keys only) rather than refusing
+        // to start; the next reload retries.
+        let team_pools = Arc::new(lumen_server::byok::TeamPools::default());
+        let boot_pool_targets = auth_runtime
+            .as_ref()
+            .and_then(|runtime| runtime.master.as_ref().map(|master| (runtime, master)));
+        if let Some((runtime, master)) = boot_pool_targets {
+            if let Err(error) =
+                lumen_server::byok::refresh_pools(&team_pools, &runtime.store, master, &registry)
+                    .await
+            {
+                tracing::warn!(%error, "team key pools could not be loaded at boot");
+            }
+        }
+
         // Billing usage events (ADR 015). Strictly opt-in: with no
         // [usage_events] block nothing below runs and no metric is registered.
         let usage_events_cancel = CancellationToken::new();
@@ -767,6 +784,7 @@ fn run(config_path: PathBuf) -> anyhow::Result<()> {
             image_fetch: Some(Arc::clone(&image_fetch)),
             token_counter: Some(Arc::clone(&token_counter)),
             health: Some(Arc::clone(&health)),
+            team_pools: auth_runtime.as_ref().map(|_| Arc::clone(&team_pools)),
         };
         // Cloned before the move into `arm_config_reload`: the admin config
         // routes read and write through the same context the reloader
@@ -783,7 +801,8 @@ fn run(config_path: PathBuf) -> anyhow::Result<()> {
             .with_body_limit(config.server.body_limit)
             .with_image_fetch_cell(image_fetch)
             .with_token_counter_cell(token_counter)
-            .with_config_context(ctx_for_state);
+            .with_config_context(ctx_for_state)
+            .with_team_pools(team_pools);
         // Expose the reload trigger only when the reloader is actually armed.
         let state = attach_optional(
             state,

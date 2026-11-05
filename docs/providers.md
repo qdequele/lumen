@@ -1212,3 +1212,33 @@ targets = [{ model = "openai/gpt-4o" }, { model = "claude-sonnet-4-5" }]   # dif
 See [`docs/adr/005-resilience-execution.md`](adr/005-resilience-execution.md)
 for the resolution and circuit-breaker details, and `config.example.toml` for a
 fully worked multi-provider setup including a three-vendor rerank fallback chain.
+
+## Team provider keys (BYOK)
+
+On the hosted gateway a budget group (one Lab account) can bring its own API
+keys for a provider ([ADR 018](adr/018-team-provider-keys-and-bandwidth.md)).
+Only kinds that take a plain API key on the vendor URL are eligible: openai,
+anthropic, mistral, cohere, jina, voyage, groq, together, fireworks, deepseek,
+openrouter, perplexity, xai, deepinfra. Azure, Bedrock, Google/Vertex and
+keyless kinds are not.
+
+- A group holds up to 10 keys per provider, managed under
+  `/admin/groups/{id}/byok` (keys are sealed at rest and only `label`, `last4`
+  and status are ever returned).
+- Keys are used round-robin. A 429 benches a key for `max(Retry-After, 30s)`;
+  a 401/403 marks it failing for 10 minutes.
+- When no team key is usable, the request goes to the platform's key only if
+  the provider's `fallback` is on (default off); otherwise it fails with
+  `LM-3021` (429) without calling upstream. With fallback off, later links of
+  a fallback chain that have no team pool also refuse, so a chain never
+  reaches the platform's keys.
+- Team-served requests carry no token cost; the gateway bills bandwidth
+  instead (request plus response bytes, only when an upstream call was sent).
+- A link served from a group's team keys has its own circuit breaker, keyed
+  by (provider, model, group): platform-key failures (say a run of 429s on
+  the platform key) never stop a team served on its own keys, and a team's
+  failing keys never open the breaker for platform traffic. The
+  `lumen_circuit_state` gauge reports platform breakers only.
+- When an earlier link of a chain failed upstream and a later link is refused
+  because the fallback is off, the client gets the earlier error, not
+  `LM-3021`.

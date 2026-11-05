@@ -214,6 +214,11 @@ pub struct ReloadTargets {
     /// with the new provider list (added ones listed, removed ones dropped)
     /// and swaps the background probe's targets.
     pub health: Option<Arc<ProviderHealth>>,
+    /// The team key pools (BYOK) the request path reads
+    /// ([`AppState::team_pools`](crate::AppState::team_pools)); rebuilt from
+    /// the store after every reload, against the routing table just applied.
+    /// `Some` only when auth is enabled.
+    pub team_pools: Option<Arc<crate::byok::TeamPools>>,
 }
 
 /// Atomically swap the routing table, price table, resilience policy, auth
@@ -583,13 +588,32 @@ pub async fn reload_once(ctx: &Arc<ConfigContext>, targets: &Arc<ReloadTargets>)
             ),
         }
     }
-    let targets = Arc::clone(targets);
+    let apply_targets = Arc::clone(targets);
     let joined = tokio::task::spawn_blocking(move || {
-        let _ = apply_reload(&config, &targets);
+        let _ = apply_reload(&config, &apply_targets);
     })
     .await;
     if let Err(error) = joined {
         tracing::warn!(%error, "config reload task panicked");
+    }
+    // Team key pools last, filtered against the routing table now live: a
+    // provider dropped or turned into an ineligible kind loses its pool.
+    refresh_team_pools(targets).await;
+}
+
+/// Rebuild the team key pools (BYOK) from the store. A store or decryption
+/// error keeps the current pools (a sick DB never strips working keys).
+pub async fn refresh_team_pools(targets: &ReloadTargets) {
+    let (Some(pools), Some(runtime)) = (&targets.team_pools, &targets.auth_runtime) else {
+        return;
+    };
+    let Some(master) = runtime.master.as_ref() else {
+        return;
+    };
+    if let Err(error) =
+        crate::byok::refresh_pools(pools, &runtime.store, master, &targets.registry).await
+    {
+        tracing::warn!(%error, "team key pool refresh failed; keeping the current pools");
     }
 }
 
@@ -703,6 +727,7 @@ mod tests {
             image_fetch: None,
             token_counter: None,
             health: None,
+            team_pools: None,
         }
     }
 
@@ -943,6 +968,7 @@ mod tests {
             image_fetch: None,
             token_counter: None,
             health: None,
+            team_pools: None,
         });
 
         // Rotate the DB key, then run one reload through the real entry point.
@@ -1098,6 +1124,70 @@ mod tests {
                 .is_some(),
             "a config reload must make the offline-created key live, no restart"
         );
+    }
+
+    #[tokio::test]
+    async fn reload_rebuilds_team_pools_against_the_new_routing_table() {
+        use crate::auth::AuthRuntime;
+        use lumen_auth::crypto::MasterKey;
+        use lumen_auth::key::hash_key;
+        use lumen_auth::state::AuthState;
+        use lumen_auth::store::{KeyStore, NewGroup};
+
+        let dir = tempdir();
+        let path = write_config(&dir, ONE_MODEL);
+        let registry = registry_from(&path);
+        let store = KeyStore::in_memory().await.expect("store");
+        let master = MasterKey::from_env_value(&"c".repeat(64)).expect("master");
+        let group = store
+            .create_group(NewGroup {
+                name: "team".to_owned(),
+                budget_max: None,
+                account_ref: None,
+            })
+            .await
+            .expect("group");
+        let record = store
+            .add_group_provider_key(&group.id, "openai", "k", "sk-team-reload", &master)
+            .await
+            .expect("key");
+        let runtime = Arc::new(AuthRuntime {
+            keys: AuthState::load(Vec::new(), Vec::new()),
+            store,
+            admin_token_hash: hash_key("admin"),
+            master: Some(master),
+        });
+        let pools = Arc::new(crate::byok::TeamPools::default());
+        let mut t = targets(
+            Arc::clone(&registry),
+            ReloadMetrics::register(&Metrics::new()).unwrap(),
+        );
+        t.auth_runtime = Some(runtime);
+        t.team_pools = Some(Arc::clone(&pools));
+        let t = Arc::new(t);
+        let held = |pools: &crate::byok::TeamPools| !format!("{pools:?}").contains("groups: 0");
+
+        reload_once(&ctx(&path), &t).await;
+        assert!(held(&pools), "the pool was loaded");
+        assert_eq!(pools.status(&group.id, &record.id).0, "unused");
+
+        // The provider turns into a kind that takes no team key: its pool goes.
+        std::fs::write(
+            &path,
+            r#"
+            [[providers]]
+            name = "openai"
+            kind = "vllm"
+            base_url = "http://localhost:8000/v1"
+            [[providers.models]]
+            id = "gpt"
+            capabilities = ["chat"]
+            "#,
+        )
+        .expect("rewrite config");
+        reload_once(&ctx(&path), &t).await;
+        assert_eq!(registry.generation(), 2, "both reloads swapped the table");
+        assert!(!held(&pools), "the ineligible pool was dropped");
     }
 
     // A `Config`-level failure (parse or validation) now surfaces through

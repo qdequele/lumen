@@ -227,6 +227,7 @@ async fn spawn_admin_with_reloader() -> Harness {
         image_fetch: None,
         token_counter: None,
         health: Some(Arc::clone(&health)),
+        team_pools: None,
     };
     spawn_config_reloader(Arc::clone(&ctx), targets, Arc::clone(&trigger))
         .expect("arm the reloader");

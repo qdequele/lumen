@@ -261,6 +261,7 @@ mod tests {
             created_at: 0,
             deleted_at: None,
             account_ref: account_ref.map(str::to_owned),
+            bandwidth_micro_usd_per_gb: 0,
         };
         let scoped = AccountScope(Some(A.to_owned()));
         assert!(scoped.allows_group(&group(Some(A))));
