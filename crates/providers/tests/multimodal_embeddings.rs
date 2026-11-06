@@ -220,6 +220,105 @@ async fn voyage_text_only_uses_openai_embeddings_endpoint() {
     assert_eq!(body["input"][0], "hello");
 }
 
+/// Voyage's multimodal models answer 400 on `/embeddings`, even for plain
+/// text: text-only input to one of them goes to `/multimodalembeddings`, one
+/// text item per input, in order.
+#[tokio::test]
+async fn voyage_multimodal_model_text_only_uses_multimodal_endpoint() {
+    let upstream = MockServer::start().await;
+    let provider: Arc<dyn EmbeddingProvider> = Arc::new(VoyageProvider::new(
+        http::build_client(),
+        "voyage-test",
+        Some(upstream.uri()),
+        Some("sk-x".to_owned()),
+    ));
+
+    for (input, texts) in [
+        (EmbedInput::Single("hello".to_owned()), vec!["hello"]),
+        (
+            EmbedInput::Batch(vec!["a".to_owned(), "b".to_owned()]),
+            vec!["a", "b"],
+        ),
+    ] {
+        upstream.reset().await;
+        Mock::given(method("POST"))
+            .and(path("/multimodalembeddings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": texts.iter().map(|_| json!({ "embedding": [0.1] })).collect::<Vec<_>>(),
+                "usage": { "total_tokens": 4 }
+            })))
+            .mount(&upstream)
+            .await;
+
+        let req = EmbedRequest {
+            model: "voyage-multimodal-3.5".to_owned(),
+            input,
+            encoding_format: None,
+            dimensions: None,
+            user: None,
+            extra: serde_json::Map::new(),
+        };
+        let resp = provider
+            .embed(req, CancellationToken::new())
+            .await
+            .expect("embed ok");
+        assert_eq!(resp.data.len(), texts.len());
+
+        let body = sent_body(&upstream).await;
+        assert_eq!(body["model"], "voyage-multimodal-3.5");
+        let inputs = body["inputs"].as_array().expect("inputs array");
+        assert_eq!(inputs.len(), texts.len());
+        for (input, text) in inputs.iter().zip(&texts) {
+            assert_eq!(input["content"][0]["type"], "text");
+            assert_eq!(input["content"][0]["text"], *text);
+        }
+    }
+}
+
+/// `dimensions` reaches `/multimodalembeddings` as Voyage's
+/// `output_dimension` (never silently dropped), and is omitted when unset.
+#[tokio::test]
+async fn voyage_multimodal_forwards_dimensions_as_output_dimension() {
+    let upstream = MockServer::start().await;
+    let provider: Arc<dyn EmbeddingProvider> = Arc::new(VoyageProvider::new(
+        http::build_client(),
+        "voyage-test",
+        Some(upstream.uri()),
+        Some("sk-x".to_owned()),
+    ));
+
+    for dimensions in [Some(512), None] {
+        upstream.reset().await;
+        Mock::given(method("POST"))
+            .and(path("/multimodalembeddings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{ "embedding": [0.1] }],
+                "usage": { "total_tokens": 1 }
+            })))
+            .mount(&upstream)
+            .await;
+
+        let req = EmbedRequest {
+            model: "voyage-multimodal-3.5".to_owned(),
+            input: EmbedInput::Single("hello".to_owned()),
+            encoding_format: None,
+            dimensions,
+            user: None,
+            extra: serde_json::Map::new(),
+        };
+        provider
+            .embed(req, CancellationToken::new())
+            .await
+            .expect("embed ok");
+
+        let body = sent_body(&upstream).await;
+        match dimensions {
+            Some(d) => assert_eq!(body["output_dimension"], d),
+            None => assert!(body.get("output_dimension").is_none()),
+        }
+    }
+}
+
 #[tokio::test]
 async fn jina_multimodal_uses_input_object_array() {
     let upstream = MockServer::start().await;
