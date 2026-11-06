@@ -93,6 +93,7 @@ async fn harness(registry: Arc<Registry>) -> Harness {
             name: "lease".to_owned(),
             budget_max: Some(1000.0),
             account_ref: Some(ACCOUNT.to_owned()),
+            parent_id: None,
         })
         .await
         .expect("group");

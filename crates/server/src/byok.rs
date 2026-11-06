@@ -460,7 +460,8 @@ impl RequestKeys {
     /// authenticated key or the key has no group.
     #[must_use]
     pub fn new(pools: &Arc<TeamPools>, key: Option<&AuthedKey>) -> Self {
-        let group = key.and_then(|AuthedKey(entry)| entry.group_id());
+        // A sub-group's keys use the team keys of its parent (ADR 020).
+        let group = key.and_then(|AuthedKey(entry)| entry.root_group_id());
         let platform = pools.platform.load_full();
         let pools = group.as_deref().and_then(|group| pools.group(group));
         Self {

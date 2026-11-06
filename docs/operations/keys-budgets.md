@@ -88,10 +88,10 @@ together, so they take effect immediately with no restart.
 | `DELETE` | `/admin/keys/{id}` | Soft-delete a key (tombstone; stops authenticating immediately). |
 | `POST` | `/admin/keys/{id}/rotate` | Mint a new secret for an existing key (one-time plaintext, identity and spend preserved). |
 | `POST` | `/admin/keys/{id}/grant` | Atomically add to a key's budget cap (concurrency-safe top-up). |
-| `POST` | `/admin/groups` | Create a budget group - a shared pool member keys draw from. |
+| `POST` | `/admin/groups` | Create a budget group - a shared pool member keys draw from. With `parent_id`, a [sub-group](#sub-groups) of a top-level group. |
 | `GET` | `/admin/groups` | List active groups. `?include_deleted=true` adds tombstones; `?account_ref=...` filters. |
 | `PATCH` | `/admin/groups/{id}` | Adjust a group's name or shared budget (pool spend preserved). |
-| `DELETE` | `/admin/groups/{id}` | Soft-delete a group. Refused while it still has active member keys. |
+| `DELETE` | `/admin/groups/{id}` | Soft-delete a group. Refused while it still has active member keys or live sub-groups. |
 | `POST` | `/admin/groups/{id}/grant` | Atomically add to a group's shared budget cap (concurrency-safe top-up). |
 | `PUT` | `/admin/provider-keys/{name}` | Store a provider API key encrypted at rest. |
 | `GET` | `/admin/platform-keys` | List each provider's platform key pool (ADR 019). |
@@ -202,6 +202,44 @@ refused (400) while the group still has active member keys: move them out
 Silently dropping members out of pool enforcement would be worse than the
 error. The tombstone keeps `usage_log` attribution, and its final pool
 spend is flushed on removal.
+
+#### Sub-groups
+
+A group can be split into **sub-groups**
+([ADR 020](../adr/020-team-sub-groups.md)): pools of their own that still
+draw from the parent. Create one with `parent_id`:
+
+```bash
+curl -s http://localhost:8080/admin/groups \
+  -H "Authorization: Bearer $LUMEN_MASTER_KEY" \
+  -H 'content-type: application/json' \
+  -d '{"name": "acme-staging", "budget_max": 20.0, "parent_id": "<group id>"}'
+```
+
+A key in a sub-group must fit its own budget, the sub-group's **and** the
+parent's. The parent always binds, so a sub-group's cap can only narrow
+what its keys spend: a $100 sub-group under a parent with $10 left stops
+at $10. A refusal by the parent is `LM-4001` with "budget exceeded for this
+key's parent group". The parent's spend includes every sub-group's.
+`budget_max` left out makes a sub-group that only attributes usage, still
+bounded by its parent.
+
+The rules:
+
+- **One level deep.** The parent must be a live top-level group.
+- **The parent never changes.** `parent_id` on a `PATCH` is 400. To move
+  pools, create a new sub-group and move the keys.
+- **Billing is the parent's.** A sub-group takes the parent's `account_ref`
+  (it cannot set one), is charged bandwidth at the parent's rate (it cannot
+  set one either) and uses the parent's team provider keys (its own team
+  key routes are 404). A parent with live sub-groups cannot change its
+  `account_ref`.
+- **Delete sub-groups first.** A parent with live sub-groups cannot be
+  deleted.
+
+`GET /admin/groups?parent_id=<id>` lists one group's sub-groups, and every
+group record carries `parent_id` (`null` for a top-level group). Usage rows
+record the key's own group, so `group_by=group_id` reports per sub-group.
 
 **Attribution.** Every `usage_log` row - successes and 402/429 refusal
 rows alike - carries the key's group id (when it has one), so per-customer

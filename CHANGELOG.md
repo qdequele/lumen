@@ -6,6 +6,23 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **Sub-groups ([ADR 020](docs/adr/020-team-sub-groups.md)).** A budget
+  group can be created under a top-level group with `parent_id` on
+  `POST /admin/groups`. A key in a sub-group must fit its own budget, the
+  sub-group's and the parent's, so the parent always binds: on the hosted
+  gateway a team can split its credit lease into pools without being able to
+  spend past it. A refusal by the parent is `LM-4001` with the message
+  "budget exceeded for this key's parent group". Sub-groups nest one level
+  deep and never change parent. They bill to the parent's `account_ref`, are
+  charged bandwidth at the parent's rate and use the parent's team provider
+  keys; their own team key routes are 404. A group with live sub-groups
+  cannot be deleted or change `account_ref`. `GET /admin/groups` takes
+  `?parent_id=`, and every group record now has `parent_id`. Migration
+  `0018_group_parent.sql` is additive: existing groups are top-level and
+  behave as before.
+
 ### Fixed
 
 - **Text embeddings on Voyage's multimodal models.** A plain-text `input` to

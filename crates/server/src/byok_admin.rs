@@ -161,7 +161,7 @@ pub async fn list_team_providers(
     scope: AccountScope,
 ) -> Result<Json<TeamProviders>, ApiError> {
     let auth = runtime(&state)?;
-    scope.require_group(&auth.store, &id).await?;
+    scope.require_top_level_group(&auth.store, &id).await?;
     let configured = document_providers(&state).await?;
     let mut keys = auth
         .store
@@ -217,7 +217,7 @@ pub async fn add_team_key(
     payload: Result<Json<AddTeamKeyBody>, JsonRejection>,
 ) -> Result<(StatusCode, Json<TeamKeyView>), ApiError> {
     let auth = runtime(&state)?;
-    scope.require_group(&auth.store, &id).await?;
+    scope.require_top_level_group(&auth.store, &id).await?;
     // JsonRejection text describes the shape, never echoes field values.
     let Json(body) = payload.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
     let key = body.key.trim();
@@ -280,7 +280,7 @@ pub async fn delete_team_key(
     scope: AccountScope,
 ) -> Result<StatusCode, ApiError> {
     let auth = runtime(&state)?;
-    scope.require_group(&auth.store, &id).await?;
+    scope.require_top_level_group(&auth.store, &id).await?;
     let deleted = auth
         .store
         .delete_group_provider_key(&id, &provider, &key_id)
@@ -309,7 +309,7 @@ pub async fn put_team_provider(
     payload: Result<Json<TeamProviderBody>, JsonRejection>,
 ) -> Result<StatusCode, ApiError> {
     let auth = runtime(&state)?;
-    scope.require_group(&auth.store, &id).await?;
+    scope.require_top_level_group(&auth.store, &id).await?;
     let Json(body) = payload.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
     let _guard = state.config_apply_lock.lock().await;
     let configured = document_providers(&state).await?;

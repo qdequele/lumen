@@ -9,7 +9,7 @@ use crate::crypto::MasterKey;
 use crate::events::WebhookSettings;
 use crate::key::{generate, hash_key, random_id, PlaintextKey};
 use crate::{now_unix, AuthError};
-use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteConnection, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
 use std::str::FromStr;
 use std::time::Duration;
@@ -138,6 +138,19 @@ pub struct GroupRecord {
     /// Bandwidth rate in micro-USD per 10^9 bytes (billing: the Lab pushes it
     /// already divided by its markup); 0 = bandwidth is not charged.
     pub bandwidth_micro_usd_per_gb: i64,
+    /// The top-level group this sub-group draws from (ADR 020); `None` = a
+    /// top-level group. Set at creation and never changed. A sub-group's
+    /// `account_ref` is its parent's, and its bandwidth is charged at the
+    /// parent's rate.
+    pub parent_id: Option<String>,
+}
+
+impl GroupRecord {
+    /// Whether this is a sub-group (it has a parent, ADR 020).
+    #[must_use]
+    pub fn is_sub_group(&self) -> bool {
+        self.parent_id.is_some()
+    }
 }
 
 /// Parameters for creating a budget group.
@@ -147,8 +160,11 @@ pub struct NewGroup {
     pub name: String,
     /// Shared hard budget in USD; `None` = unlimited.
     pub budget_max: Option<f64>,
-    /// Opaque control-plane account reference (ADR 015).
+    /// Opaque control-plane account reference (ADR 015). Refused on a
+    /// sub-group, which takes its parent's.
     pub account_ref: Option<String>,
+    /// Create a sub-group of this top-level group (ADR 020).
+    pub parent_id: Option<String>,
 }
 
 /// A partial group update: `None` fields are left unchanged.
@@ -165,6 +181,10 @@ pub struct GroupPatch {
     pub account_ref: Option<Option<String>>,
     /// New bandwidth rate in micro-USD per 10^9 bytes (>= 0).
     pub bandwidth_micro_usd_per_gb: Option<i64>,
+    /// Read only to refuse it: a group's parent never changes (ADR 020).
+    #[allow(clippy::option_option)]
+    #[serde(default, deserialize_with = "double_option")]
+    pub parent_id: Option<Option<String>>,
 }
 
 /// The outcome of a [`KeyStore::delete_group`] call. A group with live
@@ -176,6 +196,9 @@ pub enum DeleteGroupOutcome {
     Deleted(GroupRecord),
     /// The group still has this many active member keys; nothing changed.
     HasMembers(i64),
+    /// The group still has this many live sub-groups (ADR 020); nothing
+    /// changed.
+    HasSubGroups(i64),
     /// No active group with that id exists (unknown or already deleted).
     NotFound,
 }
@@ -345,6 +368,11 @@ impl NewGroup {
     /// A message naming the offending field.
     pub fn validate(&self) -> Result<(), String> {
         validate_name(&self.name)?;
+        if self.parent_id.is_some() && self.account_ref.is_some() {
+            return Err(
+                "`account_ref` cannot be set on a sub-group: it is the parent's".to_owned(),
+            );
+        }
         validate_limits(self.budget_max, None, None, None)
     }
 }
@@ -360,6 +388,9 @@ impl GroupPatch {
         }
         if self.bandwidth_micro_usd_per_gb.is_some_and(|rate| rate < 0) {
             return Err("`bandwidth_micro_usd_per_gb` must be >= 0".to_owned());
+        }
+        if self.parent_id.is_some() {
+            return Err("`parent_id` cannot change after a group is created".to_owned());
         }
         validate_limits(self.budget_max, None, None, None)
     }
@@ -681,7 +712,7 @@ macro_rules! key_columns {
 macro_rules! group_columns {
     () => {
         "id, name, budget_max, budget_spent, created_at, deleted_at, account_ref, \
-         bandwidth_micro_usd_per_gb"
+         bandwidth_micro_usd_per_gb, parent_id"
     };
 }
 
@@ -1215,7 +1246,39 @@ impl KeyStore {
 
     /// Create a budget group. Groups have no secret: the record is the whole
     /// story.
+    ///
+    /// With `parent_id` the group is a sub-group (ADR 020): the parent must
+    /// be a live top-level group ([`AuthError::UnknownGroup`] otherwise, or
+    /// [`AuthError::SubGroupRule`] when it is itself a sub-group), and the
+    /// sub-group takes the parent's `account_ref`. The parent is read and
+    /// the row written in one IMMEDIATE transaction: the read cannot race a
+    /// concurrent delete of the parent, and the write lock is taken up front
+    /// (see [`insert_config_version`](Self::insert_config_version) for why a
+    /// deferred read-then-write fails under the flushers).
     pub async fn create_group(&self, params: NewGroup) -> Result<GroupRecord, AuthError> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let account_ref = match params.parent_id.as_deref() {
+            None => params
+                .account_ref
+                .map(crate::billing::canonical_account_ref),
+            Some(parent_id) => {
+                let parent = sqlx::query_as::<_, GroupRecord>(concat!(
+                    "SELECT ",
+                    group_columns!(),
+                    " FROM budget_groups WHERE id = ? AND deleted_at IS NULL"
+                ))
+                .bind(parent_id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or_else(|| AuthError::UnknownGroup(parent_id.to_owned()))?;
+                if parent.is_sub_group() {
+                    return Err(AuthError::SubGroupRule(format!(
+                        "group '{parent_id}' is a sub-group: sub-groups nest one level deep"
+                    )));
+                }
+                parent.account_ref
+            }
+        };
         let record = GroupRecord {
             id: random_id(),
             name: params.name,
@@ -1223,14 +1286,14 @@ impl KeyStore {
             budget_spent: 0.0,
             created_at: now_unix(),
             deleted_at: None,
-            account_ref: params
-                .account_ref
-                .map(crate::billing::canonical_account_ref),
+            account_ref,
             bandwidth_micro_usd_per_gb: 0,
+            parent_id: params.parent_id,
         };
         sqlx::query(
-            "INSERT INTO budget_groups (id, name, budget_max, budget_spent, created_at, account_ref) \
-             VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO budget_groups \
+               (id, name, budget_max, budget_spent, created_at, account_ref, parent_id) \
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&record.id)
         .bind(&record.name)
@@ -1238,9 +1301,77 @@ impl KeyStore {
         .bind(record.budget_spent)
         .bind(record.created_at)
         .bind(&record.account_ref)
-        .execute(&self.pool)
+        .bind(&record.parent_id)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(record)
+    }
+
+    /// How many live sub-groups `id` has (ADR 020).
+    async fn live_sub_groups(conn: &mut SqliteConnection, id: &str) -> Result<i64, AuthError> {
+        let count: i64 = sqlx::query(
+            "SELECT COUNT(*) AS n FROM budget_groups \
+             WHERE parent_id = ? AND deleted_at IS NULL",
+        )
+        .bind(id)
+        .fetch_one(conn)
+        .await?
+        .try_get("n")?;
+        Ok(count)
+    }
+
+    /// The sub-group rules of a group patch (ADR 020), read on `conn`.
+    /// `Ok(false)` when the group is not live (the caller's 404).
+    async fn sub_group_patch_rules(
+        conn: &mut SqliteConnection,
+        id: &str,
+        patch: &GroupPatch,
+    ) -> Result<bool, AuthError> {
+        if patch.account_ref.is_none() && patch.bandwidth_micro_usd_per_gb.is_none() {
+            return Ok(true);
+        }
+        let current = sqlx::query_as::<_, GroupRecord>(concat!(
+            "SELECT ",
+            group_columns!(),
+            " FROM budget_groups WHERE id = ? AND deleted_at IS NULL"
+        ))
+        .bind(id)
+        .fetch_optional(&mut *conn)
+        .await?;
+        let Some(current) = current else {
+            return Ok(false);
+        };
+        if current.is_sub_group() {
+            return Err(AuthError::SubGroupRule(
+                "a sub-group takes `account_ref` and `bandwidth_micro_usd_per_gb` \
+                 from its parent"
+                    .to_owned(),
+            ));
+        }
+        if patch.account_ref.is_some() {
+            let subs = Self::live_sub_groups(conn, id).await?;
+            if subs > 0 {
+                return Err(AuthError::SubGroupRule(format!(
+                    "group '{id}' has {subs} live sub-group(s): its `account_ref` \
+                     cannot change"
+                )));
+            }
+        }
+        Ok(true)
+    }
+
+    /// Check a group patch against the sub-group rules without writing, so a
+    /// caller can refuse it before work the write needs first (the billing
+    /// flush ahead of an `account_ref` change). `Ok(false)` when the group is
+    /// not live. [`update_group`](Self::update_group) checks again, inside
+    /// its write transaction.
+    ///
+    /// # Errors
+    /// [`AuthError::SubGroupRule`], or [`AuthError::Db`].
+    pub async fn check_group_patch(&self, id: &str, patch: &GroupPatch) -> Result<bool, AuthError> {
+        let mut conn = self.pool.acquire().await?;
+        Self::sub_group_patch_rules(&mut conn, id, patch).await
     }
 
     /// Every active group - for the admin API. Pass `include_deleted = true`
@@ -1290,11 +1421,23 @@ impl KeyStore {
 
     /// Apply a partial update; returns the updated record, or `None` when
     /// the id does not exist (or was deleted - tombstones reject updates).
+    ///
+    /// Sub-group rules (ADR 020), [`AuthError::SubGroupRule`]: a sub-group
+    /// takes `account_ref` and the bandwidth rate from its parent, so it
+    /// cannot set either, and a group with live sub-groups cannot change its
+    /// `account_ref` (the pool and its sub-groups would bill to different
+    /// accounts).
     pub async fn update_group(
         &self,
         id: &str,
         patch: GroupPatch,
     ) -> Result<Option<GroupRecord>, AuthError> {
+        // One IMMEDIATE transaction: a sub-group created between the rule
+        // check and the write would otherwise keep the old `account_ref`.
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        if !Self::sub_group_patch_rules(&mut tx, id, &patch).await? {
+            return Ok(None);
+        }
         let ref_change = patch.account_ref.is_some();
         let ref_value = patch
             .account_ref
@@ -1314,12 +1457,13 @@ impl KeyStore {
         .bind(ref_value)
         .bind(patch.bandwidth_micro_usd_per_gb)
         .bind(id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?
         .rows_affected();
         if changed == 0 {
             return Ok(None);
         }
+        tx.commit().await?;
         self.fetch_group(id).await
     }
 
@@ -1350,8 +1494,15 @@ impl KeyStore {
             }
         }
         // The tombstone and the pool rows go together: a deleted group must
-        // not leave sealed team keys behind.
-        let mut tx = self.pool.begin().await?;
+        // not leave sealed team keys behind. IMMEDIATE, so no sub-group can be
+        // created between the check below and the tombstone.
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        // A parent refuses deletion while sub-groups draw from it (ADR 020):
+        // their keys would lose the pool that bounds them.
+        let subs = Self::live_sub_groups(&mut tx, id).await?;
+        if subs > 0 {
+            return Ok(DeleteGroupOutcome::HasSubGroups(subs));
+        }
         let changed = sqlx::query(
             "UPDATE budget_groups SET deleted_at = ? WHERE id = ? AND deleted_at IS NULL",
         )
@@ -2541,6 +2692,7 @@ mod input_validation_tests {
             name: "g".to_owned(),
             budget_max: Some(-5.0),
             account_ref: None,
+            parent_id: None,
         };
         assert!(group.validate().is_err());
         let patch = GroupPatch {

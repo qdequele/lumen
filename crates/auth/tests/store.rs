@@ -1032,6 +1032,7 @@ async fn group_provider_keys_are_sealed_limited_and_removed_with_the_group() {
             name: "team".to_owned(),
             budget_max: None,
             account_ref: None,
+            parent_id: None,
         })
         .await
         .expect("group");

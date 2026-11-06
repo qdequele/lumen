@@ -17,6 +17,7 @@ fn new_group(name: &str) -> NewGroup {
         name: name.to_owned(),
         budget_max: Some(25.0),
         account_ref: None,
+        parent_id: None,
     }
 }
 
@@ -56,6 +57,7 @@ async fn a_group_without_a_budget_is_a_pure_attribution_container() {
             name: "tracking-only".to_owned(),
             budget_max: None,
             account_ref: None,
+            parent_id: None,
         })
         .await
         .expect("create group");
@@ -520,6 +522,7 @@ async fn sequential_grants_accumulate_on_the_same_row() {
             name: "pool-accumulator".to_owned(),
             budget_max: Some(10.0),
             account_ref: None,
+            parent_id: None,
         })
         .await
         .expect("create group");
@@ -628,6 +631,7 @@ async fn grant_group_budget_to_an_uncapped_group_is_refused_and_writes_nothing()
             name: "tracking-only".to_owned(),
             budget_max: None,
             account_ref: None,
+            parent_id: None,
         })
         .await
         .expect("create group");
@@ -697,4 +701,182 @@ async fn bandwidth_charge_is_flushed_to_key_and_group_rows() {
         .expect("group");
     assert_eq!(stored_group.budget_spent, 0.1);
     assert_eq!(stored_group.bandwidth_micro_usd_per_gb, 100_000);
+}
+
+// ---- Sub-groups (ADR 020) ---------------------------------------------------
+
+const ACCOUNT: &str = "0192f3c1-7c2e-7b1a-9f00-3c9d2e4a5b61";
+
+fn sub_group(name: &str, parent_id: &str) -> NewGroup {
+    NewGroup {
+        parent_id: Some(parent_id.to_owned()),
+        ..new_group(name)
+    }
+}
+
+#[tokio::test]
+async fn a_sub_group_takes_its_parents_account_and_round_trips_parent_id() {
+    let store = KeyStore::in_memory().await.expect("open store");
+    let team = store
+        .create_group(NewGroup {
+            account_ref: Some(ACCOUNT.to_owned()),
+            ..new_group("team")
+        })
+        .await
+        .expect("team");
+    let sub = store
+        .create_group(sub_group("staging", &team.id))
+        .await
+        .expect("sub-group");
+    assert_eq!(sub.parent_id.as_deref(), Some(team.id.as_str()));
+    assert_eq!(sub.account_ref.as_deref(), Some(ACCOUNT));
+    let read = store.get_group(&sub.id).await.expect("get").expect("live");
+    assert_eq!(read, sub);
+    assert!(read.is_sub_group() && !team.is_sub_group());
+}
+
+#[tokio::test]
+async fn sub_groups_nest_one_level_deep() {
+    let store = KeyStore::in_memory().await.expect("open store");
+    let team = store.create_group(new_group("team")).await.expect("team");
+    let sub = store
+        .create_group(sub_group("sub", &team.id))
+        .await
+        .expect("sub");
+    let nested = store.create_group(sub_group("deeper", &sub.id)).await;
+    assert!(
+        matches!(nested, Err(AuthError::SubGroupRule(_))),
+        "{nested:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_or_deleted_parent_is_an_unknown_group() {
+    let store = KeyStore::in_memory().await.expect("open store");
+    let missing = store.create_group(sub_group("sub", "nope")).await;
+    assert!(matches!(missing, Err(AuthError::UnknownGroup(id)) if id == "nope"));
+
+    let gone = store.create_group(new_group("gone")).await.expect("group");
+    store.delete_group(&gone.id).await.expect("delete");
+    let tombstoned = store.create_group(sub_group("sub", &gone.id)).await;
+    assert!(matches!(tombstoned, Err(AuthError::UnknownGroup(_))));
+}
+
+#[test]
+fn a_sub_group_cannot_name_an_account_and_a_patch_cannot_move_a_group() {
+    let with_ref = NewGroup {
+        account_ref: Some(ACCOUNT.to_owned()),
+        ..sub_group("sub", "team")
+    };
+    assert!(with_ref.validate().is_err());
+    let reparent = GroupPatch {
+        parent_id: Some(Some("other".to_owned())),
+        ..GroupPatch::default()
+    };
+    assert!(reparent.validate().is_err());
+    let detach = GroupPatch {
+        parent_id: Some(None),
+        ..GroupPatch::default()
+    };
+    assert!(detach.validate().is_err());
+}
+
+#[tokio::test]
+async fn billing_fields_are_the_parents() {
+    let store = KeyStore::in_memory().await.expect("open store");
+    let team = store
+        .create_group(NewGroup {
+            account_ref: Some(ACCOUNT.to_owned()),
+            ..new_group("team")
+        })
+        .await
+        .expect("team");
+    let sub = store
+        .create_group(sub_group("sub", &team.id))
+        .await
+        .expect("sub");
+
+    for patch in [
+        GroupPatch {
+            account_ref: Some(None),
+            ..GroupPatch::default()
+        },
+        GroupPatch {
+            bandwidth_micro_usd_per_gb: Some(1),
+            ..GroupPatch::default()
+        },
+    ] {
+        let refused = store.update_group(&sub.id, patch).await;
+        assert!(
+            matches!(refused, Err(AuthError::SubGroupRule(_))),
+            "{refused:?}"
+        );
+    }
+    // The parent cannot re-point its account while a sub-group bills to it...
+    let moved = store
+        .update_group(
+            &team.id,
+            GroupPatch {
+                account_ref: Some(None),
+                ..GroupPatch::default()
+            },
+        )
+        .await;
+    assert!(
+        matches!(moved, Err(AuthError::SubGroupRule(_))),
+        "{moved:?}"
+    );
+    // ...but its budget and rate stay the control plane's to set.
+    let updated = store
+        .update_group(
+            &team.id,
+            GroupPatch {
+                budget_max: Some(40.0),
+                bandwidth_micro_usd_per_gb: Some(5),
+                ..GroupPatch::default()
+            },
+        )
+        .await
+        .expect("update")
+        .expect("live");
+    assert_eq!(updated.budget_max, Some(40.0));
+    // A sub-group's own name and budget are freely editable.
+    let renamed = store
+        .update_group(
+            &sub.id,
+            GroupPatch {
+                name: Some("staging".to_owned()),
+                budget_max: Some(3.0),
+                ..GroupPatch::default()
+            },
+        )
+        .await
+        .expect("update")
+        .expect("live");
+    assert_eq!(
+        (renamed.name.as_str(), renamed.budget_max),
+        ("staging", Some(3.0))
+    );
+}
+
+#[tokio::test]
+async fn a_parent_with_live_sub_groups_cannot_be_deleted() {
+    let store = KeyStore::in_memory().await.expect("open store");
+    let team = store.create_group(new_group("team")).await.expect("team");
+    let sub = store
+        .create_group(sub_group("sub", &team.id))
+        .await
+        .expect("sub");
+    assert_eq!(
+        store.delete_group(&team.id).await.expect("delete"),
+        DeleteGroupOutcome::HasSubGroups(1)
+    );
+    assert!(matches!(
+        store.delete_group(&sub.id).await.expect("delete sub"),
+        DeleteGroupOutcome::Deleted(_)
+    ));
+    assert!(matches!(
+        store.delete_group(&team.id).await.expect("delete team"),
+        DeleteGroupOutcome::Deleted(_)
+    ));
 }

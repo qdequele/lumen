@@ -531,11 +531,7 @@ pub async fn reload_once(ctx: &Arc<ConfigContext>, targets: &Arc<ReloadTargets>)
     // never locks anyone out).
     if let Some(runtime) = &targets.auth_runtime {
         match runtime.store.load_groups().await {
-            Ok(groups) => {
-                for record in &groups {
-                    runtime.keys.upsert_group(record);
-                }
-            }
+            Ok(groups) => runtime.keys.upsert_groups(&groups),
             Err(error) => tracing::warn!(
                 %error,
                 "budget-group refresh failed; keeping the current in-memory group table"
@@ -1147,6 +1143,7 @@ mod tests {
                 name: "team".to_owned(),
                 budget_max: None,
                 account_ref: None,
+                parent_id: None,
             })
             .await
             .expect("group");

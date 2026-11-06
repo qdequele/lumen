@@ -38,6 +38,13 @@ pub enum AuthError {
     #[error("'{0}' has no budget cap to grant to (budget_max is unlimited)")]
     NoBudgetCap(String),
 
+    /// A group create or patch breaks a sub-group rule (ADR 020): a parent
+    /// that is itself a sub-group, a billing field set on a sub-group, or an
+    /// `account_ref` change on a group with sub-groups. Client error (400
+    /// `LM-1001`); the message names the rule.
+    #[error("{0}")]
+    SubGroupRule(String),
+
     /// A team provider key pool already holds its maximum number of keys.
     /// Client error (400 `LM-1001`): the caller named the pool.
     #[error("the team key pool is full ({0} keys per provider at most)")]

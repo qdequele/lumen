@@ -195,6 +195,9 @@ fn store_error(error: lumen_auth::AuthError) -> ApiError {
              set one with a PATCH first"
         ))
         .into(),
+        lumen_auth::AuthError::SubGroupRule(message) => {
+            GatewayError::InvalidRequest(message).into()
+        }
         other => internal(&other),
     }
 }
@@ -480,9 +483,14 @@ pub async fn create_group(
     let Json(mut params) = payload.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
     params.validate().map_err(GatewayError::InvalidRequest)?;
     let auth = runtime(&state)?;
-    // A scoped group belongs to the header's account (platform contract v2
-    // section 8.3): forced when absent, refused when it names another one.
-    if let Some(account) = scope.account() {
+    // A sub-group (ADR 020) takes its parent's account: on a scoped call the
+    // parent must be the account's (a foreign one is the unknown-id 404),
+    // and the store copies its `account_ref`.
+    if let Some(parent_id) = params.parent_id.as_deref() {
+        scope.guard_group(&auth.store, parent_id).await?;
+    } else if let Some(account) = scope.account() {
+        // A scoped group belongs to the header's account (platform contract
+        // v2 section 8.3): forced when absent, refused when it names another.
         match params.account_ref.as_deref() {
             // The header is canonical lowercase; store that form.
             None => params.account_ref = Some(account.to_owned()),
@@ -502,11 +510,7 @@ pub async fn create_group(
         params.account_ref.as_deref(),
         auth.keys.billing_enabled(),
     )?;
-    let record = auth
-        .store
-        .create_group(params)
-        .await
-        .map_err(|e| internal(&e))?;
+    let record = auth.store.create_group(params).await.map_err(store_error)?;
     // Make the group joinable and enforced immediately, no restart.
     auth.keys.upsert_group(&record);
     Ok((StatusCode::CREATED, Json(record)))
@@ -521,6 +525,9 @@ pub struct ListGroupsParams {
     /// Only groups with this `account_ref` (ADR 015).
     #[serde(default)]
     pub account_ref: Option<String>,
+    /// Only the sub-groups of this group (ADR 020).
+    #[serde(default)]
+    pub parent_id: Option<String>,
 }
 
 /// List every active budget group; `?include_deleted=true` adds tombstones.
@@ -540,6 +547,9 @@ pub async fn list_groups(
         // Stored refs are canonical (a UUID is lowercase): compare that form.
         let want = lumen_auth::billing::canonical_account_ref(want);
         groups.retain(|g| g.account_ref.as_deref() == Some(want.as_str()));
+    }
+    if let Some(parent) = params.parent_id {
+        groups.retain(|g| g.parent_id.as_deref() == Some(parent.as_str()));
     }
     // Applied on top of the query filter, so `?account_ref=<other>` on a
     // scoped call narrows to nothing rather than widening the scope.
@@ -616,13 +626,23 @@ pub async fn patch_group(
     // to: bill what is already settled under the account in force when it was
     // spent.
     if patch.account_ref.is_some() {
+        // Refuse a patch the sub-group rules forbid (ADR 020) before forcing
+        // a billing flush for nothing.
+        if !auth
+            .store
+            .check_group_patch(&id, &patch)
+            .await
+            .map_err(store_error)?
+        {
+            return Err(unknown_group(&id));
+        }
         flush_before_billability_change(shared).await?;
     }
     let updated = auth
         .store
         .update_group(&id, patch)
         .await
-        .map_err(|e| internal(&e))?
+        .map_err(store_error)?
         .ok_or_else(|| unknown_group(&id))?;
     auth.keys.apply_group(&updated);
     Ok(Json(updated))
@@ -667,6 +687,10 @@ pub async fn delete_group(
         }
         DeleteGroupOutcome::HasMembers(count) => Err(GatewayError::InvalidRequest(format!(
             "group '{id}' still has {count} active member key(s); move or delete them first"
+        ))
+        .into()),
+        DeleteGroupOutcome::HasSubGroups(count) => Err(GatewayError::InvalidRequest(format!(
+            "group '{id}' still has {count} live sub-group(s); delete them first"
         ))
         .into()),
         DeleteGroupOutcome::NotFound => Err(unknown_group(&id)),
