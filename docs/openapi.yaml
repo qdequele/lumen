@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: LUMEN gateway API
-  version: 0.8.1
+  version: 0.9.0
   description: |
     The HTTP contract of a LUMEN gateway: the OpenAI-compatible `/v1` surface
     (chat completions, embeddings, Cohere-style rerank, typed decisions,
