@@ -85,7 +85,8 @@ jobs:
 
       - name: Extract this version's CHANGELOG section
         run: |
-          version="${GITHUB_REF_NAME#v}"
+          # RELEASE_TAG, not GITHUB_REF_NAME: under workflow_call the ref is the PR merge ref.
+          version="${RELEASE_TAG#v}"
           awk -v ver="$version" '
             index($0, "## [" ver "]") == 1 { found = 1; next }
             /^## \[/ { found = 0 }
