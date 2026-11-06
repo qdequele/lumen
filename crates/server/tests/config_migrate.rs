@@ -1,7 +1,9 @@
 //! ADR 014 migration: old `fallbacks` / Jev `rerank` configs become virtual models.
 
 use lumen_server::config::Config;
-use lumen_server::config_migrate::{hint_for, migrate_document, MigrateError};
+use lumen_server::config_migrate::{
+    hint_for, migrate_document, migrate_document_with, MigrateError,
+};
 
 fn loads(text: &str) -> Config {
     Config::load_text(text, "migrated")
@@ -34,10 +36,21 @@ capabilities = ["chat"]
     let vm = cfg
         .virtual_models
         .iter()
-        .find(|v| v.id == "gpt-4o")
+        .find(|v| v.id == "lumen/gpt-4o")
         .unwrap();
     let targets: Vec<&str> = vm.targets.iter().map(|t| t.model.as_str()).collect();
-    assert_eq!(targets, vec!["openai/gpt-4o", "claude"]);
+    assert_eq!(targets, vec!["openai/gpt-4o", "anthropic/claude"]);
+    // The fallback target, a plain model, is prefixed too, its old id pinned.
+    assert_eq!(cfg.providers[1].models[0].id, "anthropic/claude");
+    assert_eq!(
+        cfg.providers[1].models[0].upstream_id.as_deref(),
+        Some("claude")
+    );
+    // The old client-facing id keeps reaching the fallback chain.
+    assert_eq!(
+        cfg.model_aliases().get("gpt-4o").map(String::as_str),
+        Some("lumen/gpt-4o")
+    );
     assert!(cfg.providers[0]
         .models
         .iter()
@@ -109,8 +122,8 @@ fallbacks = ["a"]
             .map(|t| t.model.clone())
             .collect()
     };
-    assert_eq!(targets("a"), vec!["p/a", "p/b"]);
-    assert_eq!(targets("b"), vec!["p/b", "p/a"]);
+    assert_eq!(targets("lumen/a"), vec!["p/a", "p/b"]);
+    assert_eq!(targets("lumen/b"), vec!["p/b", "p/a"]);
 }
 
 #[test]
@@ -141,9 +154,9 @@ instructions = "Could `document` be the cited precedent?"
     let vm = cfg
         .virtual_models
         .iter()
-        .find(|v| v.id == "jev-rerank")
+        .find(|v| v.id == "lumen/jev-rerank")
         .unwrap();
-    assert_eq!(vm.targets[0].model, "jev");
+    assert_eq!(vm.targets[0].model, "typesafe/jev");
     let remap = vm.targets[0].remap.as_ref().unwrap();
     assert_eq!(
         remap.instructions.as_deref(),
@@ -259,7 +272,7 @@ instructions = "Is `document` relevant?"
     let vm = cfg
         .virtual_models
         .iter()
-        .find(|v| v.id == "rerank-v3")
+        .find(|v| v.id == "lumen/rerank-v3")
         .unwrap();
     assert_eq!(vm.targets[0].model, "cohere/rerank-v3");
     assert!(vm.targets[0].remap.is_none());
@@ -332,7 +345,11 @@ instructions = "Question B?"
     assert_eq!(created.len(), 1);
     assert_eq!(cfg.providers[0].models.len(), 1, "both rerankers are gone");
     for id in ["rerank-a", "rerank-b"] {
-        let vm = cfg.virtual_models.iter().find(|v| v.id == id).unwrap();
+        let vm = cfg
+            .virtual_models
+            .iter()
+            .find(|v| v.id == format!("lumen/{id}"))
+            .unwrap();
         assert_eq!(vm.targets[0].model, "typesafe/jev-latest");
     }
     assert!(
@@ -367,7 +384,7 @@ capabilities = ["systemone"]
     let vm = cfg
         .virtual_models
         .iter()
-        .find(|v| v.id == "jev-rerank")
+        .find(|v| v.id == "lumen/jev-rerank")
         .unwrap();
     assert_eq!(vm.targets[0].model, "typesafe/jev");
     assert!(vm.targets[0].remap.is_some());
@@ -388,11 +405,19 @@ capabilities = ["systemone", "rerank"]
 "#,
     );
     let cfg = loads(&migrate_document(&doc).unwrap().text);
-    let s = cfg.virtual_models.iter().find(|v| v.id == "s").unwrap();
+    let s = cfg
+        .virtual_models
+        .iter()
+        .find(|v| v.id == "lumen/s")
+        .unwrap();
     let targets: Vec<&str> = s.targets.iter().map(|t| t.model.as_str()).collect();
     assert_eq!(targets, vec!["typesafe/s", "typesafe/jev"]);
     assert!(s.targets.iter().all(|t| t.remap.is_none()));
-    let jev = cfg.virtual_models.iter().find(|v| v.id == "jev").unwrap();
+    let jev = cfg
+        .virtual_models
+        .iter()
+        .find(|v| v.id == "lumen/jev")
+        .unwrap();
     assert_eq!(jev.targets[0].model, "typesafe/jev");
     assert!(jev.targets[0].remap.is_some());
 }
@@ -415,7 +440,11 @@ cost_per_1k_searches = 2.5
     assert_eq!(created.cost_per_1m_input, Some(0.042));
     assert_eq!(created.cost_per_1m_output, Some(0.1));
     assert_eq!(created.cost_per_1k_searches, Some(2.5));
-    assert!(m.notes.is_empty(), "nothing was lost: {:?}", m.notes);
+    assert!(
+        m.notes.iter().all(|n| !n.contains("prices")),
+        "nothing was lost: {:?}",
+        m.notes
+    );
 }
 
 #[test]
@@ -744,4 +773,132 @@ instructions = "q?"
 fn a_config_without_legacy_spellings_is_unchanged() {
     let doc = "[[providers]]\nname = \"o\"\nkind = \"openai\"\n";
     assert!(!migrate_document(doc).unwrap().changed);
+}
+
+// ---- Prefixed model ids ----------------------------------------------------
+
+const BARE: &str = r#"# hosted gateway
+[[providers]]
+name = "openai"
+kind = "openai"
+[[providers.models]]
+id = "gpt-4o-mini"   # the cheap one
+capabilities = ["chat"]
+[[providers.models]]
+id = "embed"
+upstream_id = "text-embedding-3-small"
+capabilities = ["embed"]
+[[providers.models]]
+id = "openai/gpt-4o"
+capabilities = ["chat"]
+
+[[virtual_models]]
+id = "chat"
+capability = "chat"
+strategy = "fallback"
+targets = [{ model = "gpt-4o-mini" }, { model = "openai/gpt-4o" }]
+"#;
+
+#[test]
+fn bare_ids_are_prefixed_with_their_provider_and_targets_follow() {
+    let m = migrate_document(BARE).unwrap();
+    assert!(m.changed);
+    assert!(m.text.starts_with("# hosted gateway"));
+    assert!(
+        m.text.contains("# the cheap one"),
+        "decor survives:\n{}",
+        m.text
+    );
+    let cfg = loads(&m.text);
+    let models = &cfg.providers[0].models;
+    let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+    assert_eq!(ids, ["openai/gpt-4o-mini", "openai/embed", "openai/gpt-4o"]);
+    // The old id is pinned so nothing changes upstream; an explicit
+    // upstream id is kept; an already-prefixed id is left alone.
+    assert_eq!(models[0].upstream_id.as_deref(), Some("gpt-4o-mini"));
+    assert_eq!(
+        models[1].upstream_id.as_deref(),
+        Some("text-embedding-3-small")
+    );
+    assert_eq!(models[2].upstream_id, None);
+    assert_eq!(cfg.virtual_models[0].id, "lumen/chat");
+    let targets: Vec<&str> = cfg.virtual_models[0]
+        .targets
+        .iter()
+        .map(|t| t.model.as_str())
+        .collect();
+    assert_eq!(targets, ["openai/gpt-4o-mini", "openai/gpt-4o"]);
+    assert!(
+        m.notes
+            .iter()
+            .any(|n| n.contains("hidden deprecated aliases")),
+        "{:?}",
+        m.notes
+    );
+    // The old ids keep resolving.
+    let aliases = cfg.model_aliases();
+    assert_eq!(
+        aliases.get("gpt-4o-mini").map(String::as_str),
+        Some("openai/gpt-4o-mini")
+    );
+    assert_eq!(aliases.get("chat").map(String::as_str), Some("lumen/chat"));
+}
+
+#[test]
+fn the_virtual_namespace_is_configurable() {
+    let m = migrate_document_with(BARE, "meilisearch").unwrap();
+    let cfg = loads(&m.text);
+    assert_eq!(cfg.virtual_models[0].id, "meilisearch/chat");
+    assert!(
+        m.notes.iter().any(|n| n.contains("`meilisearch/`")),
+        "{:?}",
+        m.notes
+    );
+}
+
+#[test]
+fn prefixing_is_idempotent() {
+    let once = migrate_document(BARE).unwrap();
+    let twice = migrate_document(&once.text).unwrap();
+    assert!(!twice.changed, "{:?}", twice.notes);
+    assert_eq!(twice.text, once.text);
+}
+
+#[test]
+fn a_wrong_provider_prefix_gets_the_right_one_in_front() {
+    let doc = r#"
+[[providers]]
+name = "cohere-prod"
+kind = "cohere"
+[[providers.models]]
+id = "cohere/rerank-english"
+capabilities = ["rerank"]
+"#;
+    let cfg = loads(&migrate_document(doc).unwrap().text);
+    let model = &cfg.providers[0].models[0];
+    assert_eq!(model.id, "cohere-prod/cohere/rerank-english");
+    assert_eq!(model.upstream_id.as_deref(), Some("cohere/rerank-english"));
+}
+
+#[test]
+fn a_prefixed_id_that_already_exists_is_a_conflict() {
+    let doc = r#"
+[[providers]]
+name = "openai"
+kind = "openai"
+[[providers.models]]
+id = "gpt-4o"
+capabilities = ["chat"]
+[[virtual_models]]
+id = "openai/gpt-4o"
+capability = "chat"
+strategy = "single"
+targets = [{ model = "gpt-4o" }]
+"#;
+    match migrate_document(doc) {
+        Err(MigrateError::Conflict(message)) => {
+            assert!(message.contains("'openai/gpt-4o'"), "{message}");
+        }
+        other => panic!("expected a conflict, got {other:?}"),
+    }
 }

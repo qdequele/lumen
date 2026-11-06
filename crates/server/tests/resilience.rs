@@ -115,7 +115,7 @@ fn single_provider_config(url: &str) -> String {
         kind = "openai"
         base_url = "{url}"
         [[providers.models]]
-        id = "gpt"
+        id = "primary/gpt"
         capabilities = ["chat"]
         "#
     )
@@ -145,7 +145,7 @@ fn fallback_config(
         kind = "openai"
         base_url = "{primary}"
         [[providers.models]]
-        id = "primary-gpt"
+        id = "primary/primary-gpt"
         upstream_id = "gpt"
         capabilities = ["chat"]
 
@@ -154,14 +154,14 @@ fn fallback_config(
         kind = "openai"
         base_url = "{fallback}"
         [[providers.models]]
-        id = "claude-fb"
+        id = "fallback/claude-fb"
         capabilities = ["chat"]
 
         [[virtual_models]]
-        id = "gpt"
+        id = "lumen/gpt"
         capability = "chat"
         strategy = "fallback"
-        targets = [{{ model = "primary-gpt" }}, {{ model = "claude-fb" }}]
+        targets = [{{ model = "primary/primary-gpt" }}, {{ model = "fallback/claude-fb" }}]
         "#
     )
 }
@@ -183,7 +183,7 @@ fn image_capable_primary_with_gemini_fallback_config(primary: &str, fallback: &s
         kind = "openai"
         base_url = "{primary}"
         [[providers.models]]
-        id = "primary-gpt"
+        id = "primary/primary-gpt"
         upstream_id = "gpt"
         capabilities = ["chat"]
         modalities = ["text", "image"]
@@ -193,15 +193,15 @@ fn image_capable_primary_with_gemini_fallback_config(primary: &str, fallback: &s
         kind = "google"
         base_url = "{fallback}"
         [[providers.models]]
-        id = "gemini-fb"
+        id = "fallback/gemini-fb"
         capabilities = ["chat"]
         modalities = ["text", "image"]
 
         [[virtual_models]]
-        id = "gpt"
+        id = "lumen/gpt"
         capability = "chat"
         strategy = "fallback"
-        targets = [{{ model = "primary-gpt" }}, {{ model = "gemini-fb" }}]
+        targets = [{{ model = "primary/primary-gpt" }}, {{ model = "fallback/gemini-fb" }}]
         "#
     )
 }
@@ -290,7 +290,7 @@ async fn falls_back_to_second_provider_and_advertises_it() {
         resp.headers()
             .get("x-lumen-model-used")
             .and_then(|v| v.to_str().ok()),
-        Some("claude-fb"),
+        Some("fallback/claude-fb"),
         "response should name the fallback that served it"
     );
     // Primary tried twice (its retry budget), fallback once.
@@ -457,7 +457,7 @@ async fn streaming_failure_after_first_chunk_is_not_retried() {
         resp.headers()
             .get("x-lumen-model-used")
             .and_then(|v| v.to_str().ok()),
-        Some("primary-gpt")
+        Some("primary/primary-gpt")
     );
     let body = resp.text().await.unwrap();
     // Both chunks forwarded, then a clean LM-3010 terminal error frame.
@@ -615,7 +615,7 @@ async fn streaming_empty_first_frame_falls_over_and_penalises_the_breaker() {
         resp.headers()
             .get("x-lumen-model-used")
             .and_then(|v| v.to_str().ok()),
-        Some("claude-fb"),
+        Some("fallback/claude-fb"),
         "the peek must fall over to the fallback"
     );
     let body = resp.text().await.unwrap();
@@ -631,7 +631,7 @@ async fn streaming_empty_first_frame_falls_over_and_penalises_the_breaker() {
         resp.headers()
             .get("x-lumen-model-used")
             .and_then(|v| v.to_str().ok()),
-        Some("claude-fb")
+        Some("fallback/claude-fb")
     );
 
     assert_eq!(
@@ -689,7 +689,7 @@ async fn streaming_silent_upstream_first_token_times_out_then_falls_over() {
         kind = "openai"
         base_url = "{}"
         [[providers.models]]
-        id = "primary-gpt"
+        id = "primary/primary-gpt"
         upstream_id = "gpt"
         capabilities = ["chat"]
 
@@ -698,14 +698,14 @@ async fn streaming_silent_upstream_first_token_times_out_then_falls_over() {
         kind = "openai"
         base_url = "{}"
         [[providers.models]]
-        id = "claude-fb"
+        id = "fallback/claude-fb"
         capabilities = ["chat"]
 
         [[virtual_models]]
-        id = "gpt"
+        id = "lumen/gpt"
         capability = "chat"
         strategy = "fallback"
-        targets = [{{ model = "primary-gpt" }}, {{ model = "claude-fb" }}]
+        targets = [{{ model = "primary/primary-gpt" }}, {{ model = "fallback/claude-fb" }}]
         "#,
         primary.uri(),
         fallback.uri()
@@ -728,7 +728,7 @@ async fn streaming_silent_upstream_first_token_times_out_then_falls_over() {
         resp.headers()
             .get("x-lumen-model-used")
             .and_then(|v| v.to_str().ok()),
-        Some("claude-fb"),
+        Some("fallback/claude-fb"),
         "the silent primary must fail over on the first_token timeout"
     );
     let body = resp.text().await.unwrap();
@@ -778,7 +778,7 @@ async fn health_stays_fast_under_upstream_429_storm() {
         kind = "openai"
         base_url = "{}"
         [[providers.models]]
-        id = "gpt"
+        id = "primary/gpt"
         capabilities = ["chat"]
         "#,
         upstream.uri()

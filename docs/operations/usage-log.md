@@ -146,7 +146,7 @@ curl http://localhost:8080/v1/chat/completions \
   -H "Authorization: Bearer $LUMEN_KEY" \
   -H 'content-type: application/json' \
   -H 'x-lumen-metadata: {"org_id":"acme","team_id":"rag","project_id":"docs-chat"}' \
-  -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}'
+  -d '{"model":"openai/gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}'
 ```
 
 ```toml

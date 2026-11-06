@@ -96,12 +96,12 @@ mod tests {
         name = "openai"
         kind = "openai"
         [[providers.models]]
-        id = "gpt"
+        id = "openai/gpt"
         capabilities = ["chat"]
         cost_per_1m_input = 2.0
         cost_per_1m_output = 10.0
         [[providers.models]]
-        id = "rr"
+        id = "openai/rr"
         capabilities = ["rerank"]
         cost_per_1k_searches = 2.0
     "#;
@@ -110,14 +110,14 @@ mod tests {
     fn chat_cost_combines_both_directions() {
         let t = table(PRICED);
         // 1M in at $2 + 100k out at $10 = 2 + 1 = 3.
-        let cost = t.token_cost("gpt", 1_000_000, 100_000);
+        let cost = t.token_cost("openai/gpt", 1_000_000, 100_000);
         assert!((cost - 3.0).abs() < 1e-9, "{cost}");
     }
 
     #[test]
     fn rerank_cost_uses_search_units() {
         let t = table(PRICED);
-        let cost = t.search_cost("rr", 500);
+        let cost = t.search_cost("openai/rr", 500);
         assert!((cost - 1.0).abs() < 1e-9, "{cost}");
     }
 

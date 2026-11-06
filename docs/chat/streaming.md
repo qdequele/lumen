@@ -8,7 +8,7 @@ becomes `text/event-stream`: a series of `data: {...}` frames (each a
 curl -s http://localhost:8080/v1/chat/completions \
   -H 'content-type: application/json' \
   -d '{
-    "model": "gpt-4o",
+    "model": "openai/gpt-4o",
     "messages": [{"role": "user", "content": "Count to 3."}],
     "stream": true
   }'

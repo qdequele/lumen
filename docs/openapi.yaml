@@ -136,7 +136,10 @@ components:
       type: object
       required: [id, object, owned_by, capabilities, modalities, virtual]
       properties:
-        id: { type: string }
+        id:
+          type: string
+          description: "The complete model id, exactly what a request sends as `model`: `<provider>/<model>` for a foundation model (the prefix is its provider's name), `<namespace>/<model>` for a virtual model. Deprecated bare ids (`gpt-4o-mini`) still resolve but are never listed."
+          example: openai/gpt-4o-mini
         object: { type: string, const: model }
         created: { type: integer, description: "Unix seconds at midnight UTC of `release_date`; absent when undated." }
         owned_by: { type: string, description: "The provider name, or `lumen` for a virtual model." }
@@ -790,7 +793,10 @@ components:
       required: [id, capabilities]
       additionalProperties: true
       properties:
-        id: { type: string }
+        id:
+          type: string
+          description: "`<provider>/<model>`: the prefix is the provider's name."
+          example: openai/gpt-4o-mini
         upstream_id: { type: string }
         capabilities:
           type: array

@@ -672,7 +672,7 @@ async fn openai_family_forwards_image_parts_verbatim() {
         kind = "openai"
         base_url = "{}"
         [[providers.models]]
-        id = "gpt"
+        id = "openai/gpt"
         capabilities = ["chat"]
         modalities = ["text", "image"]
         "#,
@@ -681,7 +681,7 @@ async fn openai_family_forwards_image_parts_verbatim() {
     let base = spawn(&config_from(&cfg)).await;
 
     let body = json!({
-        "model": "gpt",
+        "model": "openai/gpt",
         "messages": [{"role":"user","content":[
             {"type":"text","text":"what is this?"},
             {"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}
@@ -2000,7 +2000,7 @@ async fn oversized_body_returns_lm_1002_envelope() {
         kind = "openai"
         base_url = "{}"
         [[providers.models]]
-        id = "gpt"
+        id = "openai/gpt"
         capabilities = ["chat"]
         "#,
         upstream.uri()

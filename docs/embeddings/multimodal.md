@@ -4,7 +4,7 @@ An embed model opts into image input by declaring the `image` modality:
 
 ```toml
 [[providers.models]]
-id = "embed-multilingual"
+id = "cohere/embed-multilingual"
 capabilities = ["embed"]
 modalities = ["text", "image"]
 ```

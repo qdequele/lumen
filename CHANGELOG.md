@@ -32,6 +32,28 @@ All notable changes to LUMEN are documented here. The format is based on
   never returned or logged; disable and delete evict the key before
   answering.
 
+### Changed
+
+- **Every model id is prefixed (breaking config change).** A foundation model
+  id is `<provider name>/<model>` (`openai/gpt-4o-mini` on provider `openai`)
+  and a virtual model id `<namespace>/<model>` (`meilisearch/rerank`). A bare
+  id, or a foundation id whose prefix is not its provider's name, fails
+  validation at boot, on reload and on the admin config routes (`LM-1001`).
+  Run `lumen config migrate` (file or DB mode, `--dry-run` to preview,
+  `--virtual-namespace NS` for virtual ids, default `lumen`) before upgrading:
+  it prefixes every id, pins the old id as `upstream_id` and rewrites virtual
+  model targets. A foundation model's `upstream_id` now defaults to its id
+  without the `<provider>/` prefix.
+
+### Deprecated
+
+- **Bare model ids are hidden aliases.** A request naming a model by its old
+  bare id (`gpt-4o-mini`) still resolves to the prefixed one, which usage,
+  `x-lumen-model-used` and metrics then report. Aliases are never listed in
+  `GET /v1/models`; each use logs a warning and increments
+  `lumen_deprecated_model_alias_total{alias,model}`. A disabled model's alias
+  does not resolve. They will be removed once that counter stays at zero.
+
 ## [0.8.1] - 2026-11-05
 
 First release with team provider key pools (BYOK) and bandwidth metering

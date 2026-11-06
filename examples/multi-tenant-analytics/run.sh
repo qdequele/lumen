@@ -22,7 +22,7 @@ curl -sf "$BASE_URL/v1/chat/completions" \
   -H "Authorization: Bearer $virtual_key" \
   -H 'content-type: application/json' \
   -H 'x-lumen-metadata: {"org_id":"acme","team_id":"search","project_id":"docs"}' \
-  -d '{"model":"gpt-4o","messages":[{"role":"user","content":"Say hello in one word."}]}'
+  -d '{"model":"openai/gpt-4o","messages":[{"role":"user","content":"Say hello in one word."}]}'
 echo
 
 echo "== chat #2 as tenant 'acme' =="
@@ -30,7 +30,7 @@ curl -sf "$BASE_URL/v1/chat/completions" \
   -H "Authorization: Bearer $virtual_key" \
   -H 'content-type: application/json' \
   -H 'x-lumen-metadata: {"org_id":"acme","team_id":"search","project_id":"docs"}' \
-  -d '{"model":"gpt-4o","messages":[{"role":"user","content":"Count to three."}]}'
+  -d '{"model":"openai/gpt-4o","messages":[{"role":"user","content":"Count to three."}]}'
 echo
 
 echo "== metrics: tokens attributed to org_id=acme =="

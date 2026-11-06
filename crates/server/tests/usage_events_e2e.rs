@@ -241,7 +241,7 @@ api_key_env = "E2E_UPSTREAM_KEY"
 base_url = "{upstream}"
 
 [[providers.models]]
-id = "gpt"
+id = "mock/gpt"
 upstream_id = "gpt"
 capabilities = ["chat"]
 cost_per_1m_input = 1000.0

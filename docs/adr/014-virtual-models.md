@@ -209,6 +209,9 @@ virtual model naming it skips it at request time exactly like a leaf the
 registry no longer knows (decision 8). This lets an operator (the Lab's staff
 Admin area for the hosted gateway) take a model out of service, and back, in
 one provider write, without breaking the virtual models that reference it.
+Its deprecated bare alias (the prefixed-ids change) does not resolve either, and
+a disabled model still counts when deciding whether a bare form is ambiguous, so
+disabling one model never hands its bare form to another provider's model.
 
 ## Amendment (2026-10-08, ADR 017)
 

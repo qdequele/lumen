@@ -114,7 +114,7 @@ ids in the header:
 curl http://localhost:8080/v1/chat/completions \
   -H 'content-type: application/json' \
   -H 'x-lumen-metadata: {"org_id":"acme","team_id":"rag","project_id":"docs-chat"}' \
-  -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}'
+  -d '{"model":"openai/gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}'
 ```
 
 Keep the value sets bounded: every distinct org/team/project combination is a

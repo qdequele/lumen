@@ -28,7 +28,7 @@ fn check_config_exits_zero_and_prints_ok_for_a_valid_config() {
         kind = "openai"
 
         [[providers.models]]
-        id = "gpt-4o"
+        id = "openai-main/gpt-4o"
         capabilities = ["chat"]
         "#,
     );
@@ -84,7 +84,7 @@ fn check_config_exits_non_zero_for_a_provider_missing_its_required_base_url() {
         kind = "vllm"
 
         [[providers.models]]
-        id = "local-model"
+        id = "self-hosted/local-model"
         capabilities = ["chat"]
         "#,
     );
@@ -158,7 +158,7 @@ fn check_config_succeeds_with_lumen_master_key_set_and_auth_enabled() {
         kind = "openai"
 
         [[providers.models]]
-        id = "gpt-4o"
+        id = "openai-main/gpt-4o"
         capabilities = ["chat"]
         "#,
     );
