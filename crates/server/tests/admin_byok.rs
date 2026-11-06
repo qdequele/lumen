@@ -511,6 +511,8 @@ async fn team_key_secret_never_logged_on_admin_writes() {
         .with_max_level(tracing::Level::TRACE)
         .finish();
     let _guard = tracing::subscriber::set_default(subscriber);
+    // Another test may have cached "never" for these callsites first.
+    tracing::callsite::rebuild_interest_cache();
 
     let h = spawn(CONFIG_TOML).await;
     let group = h.group(ACCOUNT_A).await;

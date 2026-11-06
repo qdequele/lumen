@@ -800,6 +800,8 @@ async fn team_key_secret_never_logged() {
         .with_max_level(tracing::Level::TRACE)
         .finish();
     let _guard = tracing::subscriber::set_default(subscriber);
+    // Another test may have cached "never" for these callsites first.
+    tracing::callsite::rebuild_interest_cache();
 
     let (a, b) = servers().await;
     mount_status(&a, TEAM_1, 401).await;
@@ -1294,6 +1296,8 @@ async fn platform_pool_secrets_never_logged() {
         .with_max_level(tracing::Level::TRACE)
         .finish();
     let _guard = tracing::subscriber::set_default(subscriber);
+    // Another test may have cached "never" for these callsites first.
+    tracing::callsite::rebuild_interest_cache();
 
     let (a, b) = servers().await;
     mount_status(&a, POOL_1, 429).await;
@@ -1303,9 +1307,11 @@ async fn platform_pool_secrets_never_logged() {
     h.add_platform_key("a", POOL_1).await;
     h.add_platform_key("a", POOL_2).await;
 
-    // Both keys rotated out: the pool's last error (the 401), never the env key.
+    // Both keys rotated out: the pool's last error, never the env key. The
+    // rotation's starting key varies, so the last error is the 401 (502) or
+    // the 429.
     let (status, body) = h.chat(&h.key_solo, "a/model-a").await;
-    assert_eq!(status, 502, "{body}");
+    assert!(matches!(status, 429 | 502), "status {status}: {body}");
     let logs = String::from_utf8_lossy(&buffer.lock().expect("log buffer")).into_owned();
     assert!(!logs.is_empty(), "the subscriber captured nothing");
     for secret in [POOL_1, POOL_2, "-POOL-one", "-POOL-two"] {
