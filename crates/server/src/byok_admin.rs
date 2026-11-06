@@ -26,12 +26,12 @@ use lumen_core::GatewayError;
 use serde::{Deserialize, Serialize};
 
 /// Longest accepted label, in characters.
-const MAX_LABEL_CHARS: usize = 64;
+pub(crate) const MAX_LABEL_CHARS: usize = 64;
 /// Longest accepted key, in bytes (real provider keys are far shorter).
-const MAX_KEY_BYTES: usize = 1024;
+pub(crate) const MAX_KEY_BYTES: usize = 1024;
 /// Shortest accepted key, in characters: `last4` of a shorter key would
 /// reveal too much of it.
-const MIN_KEY_CHARS: usize = 16;
+pub(crate) const MIN_KEY_CHARS: usize = 16;
 
 /// `POST .../keys` body.
 #[derive(Deserialize)]
@@ -119,7 +119,7 @@ pub struct TeamProviders {
 
 /// The providers of the persisted config document (not the routing table: a
 /// provider added a moment ago is in the document before its hot reload).
-async fn document_providers(state: &AppState) -> Result<Vec<ProviderConfig>, ApiError> {
+pub(crate) async fn document_providers(state: &AppState) -> Result<Vec<ProviderConfig>, ApiError> {
     let ctx = config_ctx(state)?;
     let doc = ctx
         .source
@@ -129,11 +129,11 @@ async fn document_providers(state: &AppState) -> Result<Vec<ProviderConfig>, Api
     Ok(config_from_document(&doc.toml)?.providers)
 }
 
-fn unknown_provider(name: &str) -> ApiError {
+pub(crate) fn unknown_provider(name: &str) -> ApiError {
     GatewayError::NotFound(format!("unknown provider '{name}'")).into()
 }
 
-fn ineligible(provider: &ProviderConfig) -> ApiError {
+pub(crate) fn ineligible(provider: &ProviderConfig) -> ApiError {
     GatewayError::InvalidRequest(format!(
         "provider '{}' (kind '{}') does not take a team API key",
         provider.name,
@@ -143,7 +143,7 @@ fn ineligible(provider: &ProviderConfig) -> ApiError {
 }
 
 /// Ping the reloader so the pools are rebuilt from the store.
-fn request_reload(state: &AppState) {
+pub(crate) fn request_reload(state: &AppState) {
     if let Some(trigger) = &state.reload_trigger {
         trigger.notify_one();
     } else {

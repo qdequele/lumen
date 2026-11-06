@@ -1139,3 +1139,177 @@ async fn team_key_failures_never_open_the_platform_breaker() {
     assert_eq!(status, 200, "{body}");
     assert_eq!(hits(&a, PLATFORM).await, 1);
 }
+
+// ---- Platform key pools (ADR 019) -------------------------------------------
+
+const POOL_1: &str = "sk-platform-POOL-one-3333";
+const POOL_2: &str = "sk-platform-POOL-two-4444";
+
+impl Harness {
+    /// Seal a platform key for `provider` and reload. Returns the key id.
+    async fn add_platform_key(&self, provider: &str, secret: &str) -> String {
+        let record = self
+            .runtime
+            .store
+            .add_platform_provider_key(provider, "platform", secret, &master())
+            .await
+            .expect("add platform key");
+        self.reload().await;
+        record.id
+    }
+}
+
+#[tokio::test]
+async fn platform_pool_rotates_instead_of_the_configured_key_and_bills_tokens() {
+    let (a, b) = servers().await;
+    mount_status(&a, POOL_1, 429).await;
+    mount_ok(&a, POOL_2).await;
+    mount_ok(&a, PLATFORM).await;
+    let h = harness(&a, &b).await;
+    let first = h.add_platform_key("a", POOL_1).await;
+    h.add_platform_key("a", POOL_2).await;
+
+    // No group, and a group without a team pool: both use the platform pool.
+    let (status, body) = h.chat(&h.key_solo, "model-a").await;
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = h.chat(&h.key_b, "model-a").await;
+    assert_eq!(status, 200, "{body}");
+    let delta = h.settled("lab-b").await;
+    assert!(
+        delta.cost_micro > 0,
+        "platform pool tokens are billed: {delta:?}"
+    );
+    assert_eq!(delta.units.tokens_in, 5);
+    assert_eq!(delta.units.byok_tokens_in, 0);
+    assert_eq!(hits(&a, POOL_1).await, 1, "benched after its 429");
+    assert_eq!(hits(&a, POOL_2).await, 2);
+    assert_eq!(
+        hits(&a, PLATFORM).await,
+        0,
+        "the configured key is ignored once a pool exists"
+    );
+    assert_eq!(h.pools.platform_status(&first).0, "rate_limited");
+    assert_eq!(
+        h.resilience.breakers.get("a", "model-a").state(),
+        CircuitState::Closed,
+        "a rotated 429 is not a provider fault"
+    );
+}
+
+#[tokio::test]
+async fn exhausted_platform_pool_never_uses_the_configured_key() {
+    let (a, b) = servers().await;
+    mount_status(&a, POOL_1, 401).await;
+    mount_ok(&a, PLATFORM).await;
+    let h = harness(&a, &b).await;
+    let id = h.add_platform_key("a", POOL_1).await;
+
+    let (status, body) = h.chat(&h.key_solo, "model-a").await;
+    assert_ne!(status, 200, "{body}");
+    assert_eq!(hits(&a, POOL_1).await, 1);
+    assert_eq!(hits(&a, PLATFORM).await, 0, "the env key is ignored");
+    assert_eq!(h.pools.platform_status(&id).0, "failing");
+}
+
+#[tokio::test]
+async fn a_pool_of_disabled_keys_ignores_the_env_key_until_its_last_key_is_deleted() {
+    let (a, b) = servers().await;
+    mount_ok(&a, POOL_1).await;
+    mount_ok(&a, PLATFORM).await;
+    let h = harness(&a, &b).await;
+    let id = h.add_platform_key("a", POOL_1).await;
+    h.runtime
+        .store
+        .set_platform_provider_key_enabled("a", &id, false)
+        .await
+        .expect("disable")
+        .expect("found");
+    h.reload().await;
+
+    let (status, body) = h.chat(&h.key_solo, "model-a").await;
+    assert_eq!(status, 503, "{body}");
+    assert!(body.contains("LM-3022"), "{body}");
+    assert_eq!(hits(&a, POOL_1).await, 0);
+    assert_eq!(hits(&a, PLATFORM).await, 0, "the env key is ignored");
+    assert_eq!(
+        h.resilience.breakers.get("a", "model-a").state(),
+        CircuitState::Closed,
+        "a disabled pool is not a provider fault"
+    );
+
+    // No platform key left: the env key serves again.
+    assert!(h
+        .runtime
+        .store
+        .delete_platform_provider_key("a", &id)
+        .await
+        .expect("delete"));
+    h.reload().await;
+    let (status, body) = h.chat(&h.key_solo, "model-a").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(hits(&a, PLATFORM).await, 1);
+}
+
+#[tokio::test]
+async fn fallback_off_team_never_reaches_the_platform_pool_even_via_chain() {
+    let (a, b) = servers().await;
+    mount_status(&a, TEAM_1, 429).await;
+    for server in [&a, &b] {
+        mount_ok(server, POOL_1).await;
+        mount_ok(server, PLATFORM).await;
+    }
+    let h = harness(&a, &b).await;
+    h.add_key(&h.group_a, "a", TEAM_1).await;
+    h.add_platform_key("a", POOL_1).await;
+    h.add_platform_key("b", POOL_1).await;
+
+    for model in ["model-a", "acme/chat"] {
+        let (status, body) = h.chat(&h.key_a, model).await;
+        assert_eq!(status, 429, "{model}: {body}");
+        assert!(body.contains("LM-3021"), "{body}");
+    }
+    for server in [&a, &b] {
+        assert_eq!(
+            hits(server, POOL_1).await,
+            0,
+            "a platform pool key was used"
+        );
+        assert_eq!(hits(server, PLATFORM).await, 0);
+    }
+
+    // Fallback on: the platform pool serves after the team keys.
+    h.set_fallback(&h.group_a, "a", true).await;
+    let (status, body) = h.chat(&h.key_a, "model-a").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(hits(&a, POOL_1).await, 1);
+    assert_eq!(hits(&a, PLATFORM).await, 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn platform_pool_secrets_never_logged() {
+    let buffer = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(BufMakeWriter(buffer.clone()))
+        .with_ansi(false)
+        .with_max_level(tracing::Level::TRACE)
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let (a, b) = servers().await;
+    mount_status(&a, POOL_1, 429).await;
+    mount_status(&a, POOL_2, 401).await;
+    mount_ok(&a, PLATFORM).await;
+    let h = harness(&a, &b).await;
+    h.add_platform_key("a", POOL_1).await;
+    h.add_platform_key("a", POOL_2).await;
+
+    // Both keys rotated out: the pool's last error (the 401), never the env key.
+    let (status, body) = h.chat(&h.key_solo, "model-a").await;
+    assert_eq!(status, 502, "{body}");
+    let logs = String::from_utf8_lossy(&buffer.lock().expect("log buffer")).into_owned();
+    assert!(!logs.is_empty(), "the subscriber captured nothing");
+    for secret in [POOL_1, POOL_2, "-POOL-one", "-POOL-two"] {
+        assert!(!logs.contains(secret), "a platform key reached the logs");
+        assert!(!body.contains(secret), "a platform key reached a response");
+    }
+}
