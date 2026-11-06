@@ -200,6 +200,16 @@ The goals are:
   capabilities other than chat; per-key model allow-lists and per-tenant
   BYOK.
 
+## Amendment (2026-11-05): disabled foundation models
+
+A foundation model may carry `disabled = true`: it stays in the config and in
+the foundation index that virtual-model validation reads, but the registry is
+built without it. It is therefore neither listed nor served (`LM-2001`), and a
+virtual model naming it skips it at request time exactly like a leaf the
+registry no longer knows (decision 8). This lets an operator (the Lab's staff
+Admin area for the hosted gateway) take a model out of service, and back, in
+one provider write, without breaking the virtual models that reference it.
+
 ## Amendment (2026-10-08, ADR 017)
 
 A rerank `remap` targets any model serving `decisions`, not only Jev. The

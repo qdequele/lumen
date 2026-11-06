@@ -761,6 +761,14 @@ pub struct ModelConfig {
     /// Metadata only: it never affects routing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub release_date: Option<ReleaseDate>,
+    /// Taken out of service by the operator without deleting it: the model
+    /// stays in the config (its id, prices and the virtual models naming it
+    /// stay valid) but the registry is built without it, so it is neither
+    /// listed on `GET /v1/models` nor served (`LM-2001`), and a virtual
+    /// model skips it like any leaf the registry does not know (ADR 014
+    /// decision 8). Omitted when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub disabled: bool,
 }
 
 impl ModelConfig {
@@ -778,6 +786,7 @@ impl ModelConfig {
             fallbacks: Vec::new(),
             rerank: None,
             release_date: None,
+            disabled: false,
         }
     }
 }
@@ -1837,6 +1846,7 @@ impl Config {
                 models: p
                     .models
                     .iter()
+                    .filter(|m| !m.disabled)
                     .map(|m| ModelSpec {
                         id: m.id.clone(),
                         upstream_id: m.resolved_upstream_id().to_owned(),
@@ -3347,6 +3357,38 @@ mod tests {
             load_str("[tokenizer]\nmode = \"exact\"\n").unwrap_err(),
             ConfigError::Parse { .. }
         ));
+    }
+
+    #[test]
+    fn a_disabled_model_stays_in_the_config_but_leaves_the_registry() {
+        let cfg = load_str(
+            r#"
+            [[providers]]
+            name = "openai"
+            kind = "openai"
+            [[providers.models]]
+            id = "gpt-4o"
+            capabilities = ["chat"]
+            [[providers.models]]
+            id = "gpt-3.5-turbo"
+            capabilities = ["chat"]
+            disabled = true
+            "#,
+        )
+        .unwrap();
+        let models = &cfg.providers[0].models;
+        assert!(!models[0].disabled);
+        assert!(models[1].disabled);
+        // Not served: the registry is built without it.
+        let specs = cfg.provider_specs();
+        let ids: Vec<&str> = specs[0].models.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, ["gpt-4o"]);
+        // Still a foundation model, so virtual models naming it stay valid.
+        assert!(cfg.foundation_index().contains("gpt-3.5-turbo"));
+        // Round trip: `disabled` is written only when set.
+        let json = serde_json::to_value(models).unwrap();
+        assert!(json[0].get("disabled").is_none());
+        assert_eq!(json[1]["disabled"], true);
     }
 
     #[test]
