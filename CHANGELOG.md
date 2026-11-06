@@ -32,6 +32,17 @@ All notable changes to LUMEN are documented here. The format is based on
   never returned or logged; disable and delete evict the key before
   answering.
 
+- **Automated releases.** `scripts/prepare-release.sh` bumps the workspace
+  version in `Cargo.toml`, `Cargo.lock` and `docs/openapi.yaml` and folds
+  `[Unreleased]` into a dated CHANGELOG section in one idempotent step (with
+  no argument it suggests the bump from the conventional commits since the
+  last tag). The "Prepare release" workflow runs it and opens the
+  `chore(release): vX.Y.Z` PR; merging that PR tags the merge commit and runs
+  `release.yml` (`release-on-merge.yml`), which can now also be called as a
+  reusable workflow and optionally notifies `meilisearch/lab` to re-vendor the
+  OpenAPI document (`LAB_DISPATCH_TOKEN`). A new CI job, `version sync`, fails
+  when the three version copies disagree. See CONTRIBUTING.md.
+
 ### Changed
 
 - **Every model id is prefixed (breaking config change).** A foundation model
