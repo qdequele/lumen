@@ -1,0 +1,88 @@
+name: Prepare release
+
+# First half of the automated release (see CONTRIBUTING.md, "Cutting a
+# release"): run scripts/prepare-release.sh on main and open (or refresh) the
+# release PR `chore(release): vX.Y.Z`, whose body is the new CHANGELOG
+# section. Merging it hands over to release-on-merge.yml, which tags the merge
+# commit and runs release.yml.
+#
+# Needs the repository setting "Allow GitHub Actions to create and approve
+# pull requests" (Settings > Actions > General). A PR opened with
+# GITHUB_TOKEN gets no `pull_request` CI run, so this workflow dispatches
+# ci.yml on the release branch: its checks report on the PR's head commit.
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "auto (from the conventional commits since the last tag), patch, minor or major"
+        type: choice
+        options: [auto, patch, minor, major]
+        default: auto
+      version:
+        description: "Exact X.Y.Z instead of a bump (optional)"
+        type: string
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: prepare-release
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: open the release PR
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # push the release branch
+      pull-requests: write # open or edit the release PR
+      actions: write # dispatch ci.yml on the release branch
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0 # the bump is computed from the last tag
+          fetch-tags: true
+
+      - name: Prepare the release
+        id: prepare
+        env:
+          BUMP: ${{ inputs.bump }}
+          VERSION: ${{ inputs.version }}
+        run: scripts/prepare-release.sh "${VERSION:-$BUMP}"
+
+      - name: Commit, push and open or update the PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.prepare.outputs.version }}
+          TAG: ${{ steps.prepare.outputs.tag }}
+        run: |
+          branch="release/$TAG"
+          title="chore(release): $TAG"
+          scripts/prepare-release.sh --notes "$VERSION" > "$RUNNER_TEMP/body.md"
+          {
+            echo
+            echo "---"
+            echo "Opened by the Prepare release workflow. Merging this PR tags the merge commit \`$TAG\` and runs the release (release-on-merge.yml)."
+          } >> "$RUNNER_TEMP/body.md"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -C "$branch"
+          git add Cargo.toml Cargo.lock docs/openapi.yaml CHANGELOG.md
+          git commit -m "$title" -m "Version $VERSION in Cargo.toml, Cargo.lock and docs/openapi.yaml; CHANGELOG section for $VERSION."
+          # The branch is rebuilt from main on every run: force is safe here.
+          git push --force origin "$branch"
+
+          pr=$(gh pr list --head "$branch" --base main --state open --json number --jq '.[0].number // empty')
+          if [ -n "$pr" ]; then
+            gh pr edit "$pr" --title "$title" --body-file "$RUNNER_TEMP/body.md"
+            echo "updated PR #$pr"
+          else
+            gh pr create --base main --head "$branch" --title "$title" --body-file "$RUNNER_TEMP/body.md"
+          fi
+
+          gh workflow run ci.yml --ref "$branch"
+          echo "### Release PR for $TAG is open; CI was dispatched on $branch" >> "$GITHUB_STEP_SUMMARY"
