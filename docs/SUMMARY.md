@@ -78,6 +78,7 @@
 - [016 - The developer role and upstream error detail](adr/016-developer-role-and-upstream-error-detail.md)
 - [017 - Decisions capability](adr/017-decisions-capability.md)
 - [018 - Team provider keys and bandwidth billing](adr/018-team-provider-keys-and-bandwidth.md)
+- [020 - Multi-vector embeddings](adr/020-multi-vector-embeddings.md)
 
 # Project
 
