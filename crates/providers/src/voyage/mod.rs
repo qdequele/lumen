@@ -58,10 +58,13 @@ impl VoyageProvider {
     /// Embed a multimodal (content-parts) batch via Voyage's
     /// `/multimodalembeddings` endpoint. Each item becomes one `inputs` entry
     /// with an ordered `content` array of text / inline-base64-image parts.
+    /// A requested `dimensions` is sent as Voyage's `output_dimension`, so an
+    /// unsupported size fails upstream instead of being silently ignored.
     async fn embed_multimodal(
         &self,
         model: &str,
         items: &[EmbedItem],
+        dimensions: Option<u32>,
         cancel: &CancellationToken,
     ) -> Result<EmbedResponse, ProviderError> {
         let inputs: Vec<VoyageInput> = items
@@ -74,7 +77,11 @@ impl VoyageProvider {
                 VoyageInput { content }
             })
             .collect();
-        let body = VoyageMultiRequest { model, inputs };
+        let body = VoyageMultiRequest {
+            model,
+            inputs,
+            output_dimension: dimensions,
+        };
 
         let url = format!("{}/multimodalembeddings", self.base_url);
         let bytes = post_json(
@@ -118,6 +125,9 @@ impl VoyageProvider {
 struct VoyageMultiRequest<'a> {
     model: &'a str,
     inputs: Vec<VoyageInput<'a>>,
+    /// Voyage's name for `dimensions`; omitted when the client sets none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_dimension: Option<u32>,
 }
 
 #[derive(Serialize)]
@@ -152,6 +162,12 @@ struct VoyageMultiData {
 struct VoyageMultiUsage {
     #[serde(default)]
     total_tokens: u32,
+}
+
+/// Whether `model` is one of Voyage's multimodal models (`voyage-multimodal-3`,
+/// `voyage-multimodal-3.5`, …), served only on `/multimodalembeddings`.
+fn is_multimodal_model(model: &str) -> bool {
+    model.starts_with("voyage-multimodal")
 }
 
 /// Translate one content part to Voyage's shape (dispatch by field presence).
@@ -194,7 +210,25 @@ impl EmbeddingProvider for VoyageProvider {
         // `/multimodalembeddings` endpoint; text-only requests stay on the
         // OpenAI-compatible near-passthrough path.
         if let EmbedInput::Multi(items) = &req.input {
-            return self.embed_multimodal(&req.model, items, &cancel).await;
+            return self
+                .embed_multimodal(&req.model, items, req.dimensions, &cancel)
+                .await;
+        }
+        // Voyage serves its multimodal models only on `/multimodalembeddings`:
+        // `/embeddings` answers 400 for them even with plain text. Text-only
+        // input to one of them goes there too, one text item per input.
+        if is_multimodal_model(&req.model) {
+            let items: Vec<EmbedItem> = match &req.input {
+                EmbedInput::Single(s) => vec![EmbedItem::Text(s.clone())],
+                EmbedInput::Batch(texts) => texts.iter().cloned().map(EmbedItem::Text).collect(),
+                // Token inputs were rejected above; `Multi` returned above.
+                _ => Vec::new(),
+            };
+            if !items.is_empty() {
+                return self
+                    .embed_multimodal(&req.model, &items, req.dimensions, &cancel)
+                    .await;
+            }
         }
         let url = format!("{}/embeddings", self.base_url);
         let bytes = post_json(

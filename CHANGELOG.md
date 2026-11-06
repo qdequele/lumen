@@ -6,6 +6,15 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **Text embeddings on Voyage's multimodal models.** A plain-text `input` to
+  a `voyage-multimodal-*` model (any provider of kind `voyage`) went to
+  Voyage's `/embeddings`, which answers 400 for those models. It now goes to
+  `/multimodalembeddings`, one text item per input. On that endpoint a
+  requested `dimensions` is now sent as `output_dimension` instead of being
+  dropped.
+
 ## [0.9.0] - 2026-11-06
 
 ### Added
