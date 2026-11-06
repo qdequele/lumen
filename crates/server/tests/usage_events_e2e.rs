@@ -481,6 +481,7 @@ async fn a_non_uuid_account_ref_refuses_to_boot_with_usage_events() {
             name: "legacy".to_owned(),
             budget_max: None,
             account_ref: Some("acme".to_owned()),
+            parent_id: None,
         })
         .await
         .expect("create group");

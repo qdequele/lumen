@@ -510,9 +510,10 @@ components:
         external_ref: { type: [string, "null"], minLength: 1, maxLength: 128 }
     Group:
       type: object
-      required: [id, name, budget_max, budget_spent, created_at, deleted_at, account_ref, bandwidth_micro_usd_per_gb]
+      required: [id, name, budget_max, budget_spent, created_at, deleted_at, account_ref, bandwidth_micro_usd_per_gb, parent_id]
       properties:
         id: { type: string }
+        parent_id: { type: [string, "null"], description: "The top-level group this sub-group draws from (ADR 020); null for a top-level group. A key in a sub-group must fit its own budget, the sub-group's and the parent's (`LM-4001` names which). A sub-group bills to its parent's `account_ref`, is charged bandwidth at the parent's rate and uses the parent's team provider keys." }
         name: { type: string }
         budget_max: { type: [number, "null"], description: "USD; null when unlimited." }
         bandwidth_micro_usd_per_gb: { type: integer, minimum: 0, description: "Bandwidth charged against this group's budget, in micro-USD per 10^9 bytes (request plus response). 0 disables the charge. A group at or past its cap refuses every request with `LM-4001`, even one that costs nothing in tokens." }
@@ -611,10 +612,11 @@ components:
       properties:
         name: { type: string, minLength: 1 }
         budget_max: { type: number, minimum: 0, maximum: 1000000000000 }
-        account_ref: { type: string, minLength: 1, maxLength: 128, description: "Forced to the header's account on a scoped call (any other value is 400 `LM-1001`); a UUID while [usage_events] is on." }
+        account_ref: { type: string, minLength: 1, maxLength: 128, description: "Forced to the header's account on a scoped call (any other value is 400 `LM-1001`); a UUID while [usage_events] is on. Not allowed with `parent_id`: a sub-group takes its parent's (400 `LM-1001`)." }
+        parent_id: { type: string, description: "Create a sub-group of this live top-level group (ADR 020). On a scoped call the parent must be the account's (another account's is 404 `LM-1003`); an unknown parent or a parent that is itself a sub-group is 400 `LM-1001`. Never changes after creation." }
     GroupPatch:
       type: object
-      description: Absent fields are unchanged; `account_ref` accepts `null` to clear (flushes first while billing is on) and cannot change on a scoped call.
+      description: Absent fields are unchanged; `account_ref` accepts `null` to clear (flushes first while billing is on) and cannot change on a scoped call. Sub-group rules (ADR 020), each 400 `LM-1001`; `parent_id` cannot change, a sub-group cannot set `account_ref` or `bandwidth_micro_usd_per_gb` (they are its parent's); a group with live sub-groups cannot change `account_ref`.
       properties:
         name: { type: string, minLength: 1 }
         budget_max: { type: number, minimum: 0, maximum: 1000000000000 }
@@ -1176,6 +1178,10 @@ paths:
           in: query
           schema: { type: string }
           description: Only groups with this `account_ref`; on a scoped call it narrows within the account, never widens it.
+        - name: parent_id
+          in: query
+          schema: { type: string }
+          description: Only the sub-groups of this group (ADR 020).
       responses:
         "200": { description: Groups., content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/Group" } } } } }
         "400": { $ref: "#/components/responses/Error" }
@@ -1223,7 +1229,7 @@ paths:
         "404": { $ref: "#/components/responses/Error" }
         "500": { $ref: "#/components/responses/Error" }
     delete:
-      summary: Soft-delete a group (refused with 400 while it has active member keys)
+      summary: Soft-delete a group (refused with 400 while it has active member keys or live sub-groups)
       operationId: deleteGroup
       security: [{ masterKey: [] }]
       responses:
@@ -1257,6 +1263,9 @@ paths:
     get:
       summary: List the providers of the config with the group's team keys
       description: |
+        Team keys belong to a top-level group and also serve its sub-groups
+        (ADR 020); every team key route of a sub-group is 404 `LM-1003`.
+
         Team provider key pools (bring your own key). Every provider of the
         current config document is listed; only `eligible` ones accept keys.
         Keys are never returned, only `label` and `last4`.

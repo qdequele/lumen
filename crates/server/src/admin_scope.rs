@@ -91,6 +91,26 @@ impl AccountScope {
             .ok_or_else(|| unknown_group(id))
     }
 
+    /// [`require_group`](Self::require_group) for the team provider key
+    /// routes: team keys belong to a top-level group, so a sub-group (ADR
+    /// 020) is the same 404 as an unknown id, scoped or not.
+    ///
+    /// # Errors
+    /// `LM-1003`, or `LM-5001` on a store failure.
+    pub async fn require_top_level_group(
+        &self,
+        store: &KeyStore,
+        id: &str,
+    ) -> Result<GroupRecord, ApiError> {
+        let group = store
+            .get_group(id)
+            .await
+            .map_err(|e| internal(&e))?
+            .filter(|group| self.allows_group(group) && !group.is_sub_group())
+            .ok_or_else(|| unknown_group(id))?;
+        Ok(group)
+    }
+
     /// [`require_group`](Self::require_group) on a scoped call; a no-op
     /// (no store read, so the unscoped behaviour is untouched) otherwise.
     ///
@@ -262,6 +282,7 @@ mod tests {
             deleted_at: None,
             account_ref: account_ref.map(str::to_owned),
             bandwidth_micro_usd_per_gb: 0,
+            parent_id: None,
         };
         let scoped = AccountScope(Some(A.to_owned()));
         assert!(scoped.allows_group(&group(Some(A))));

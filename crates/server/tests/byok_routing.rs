@@ -129,6 +129,7 @@ async fn harness(a: &MockServer, b: &MockServer) -> Harness {
     harness_with(a, b, "").await
 }
 
+#[allow(clippy::too_many_lines)] // one linear fixture: stores, state, server
 async fn harness_with(a: &MockServer, b: &MockServer, extra_a: &str) -> Harness {
     let text = config_text_with(&a.uri(), &b.uri(), "openai", extra_a);
     let config = Config::load_text(&text, "test").expect("valid config");
@@ -156,6 +157,7 @@ async fn harness_with(a: &MockServer, b: &MockServer, extra_a: &str) -> Harness 
                 name: account.to_owned(),
                 budget_max: budget,
                 account_ref: Some(account.to_owned()),
+                parent_id: None,
             })
             .await
             .expect("group");
@@ -1318,4 +1320,45 @@ async fn platform_pool_secrets_never_logged() {
         assert!(!logs.contains(secret), "a platform key reached the logs");
         assert!(!body.contains(secret), "a platform key reached a response");
     }
+}
+
+#[tokio::test]
+async fn a_sub_group_key_uses_its_parents_team_key_and_bills_its_account() {
+    // ADR 020: team keys and billing resolve through the top-level group.
+    let (a, b) = servers().await;
+    mount_ok(&a, TEAM_1).await;
+    mount_ok(&a, PLATFORM).await;
+    let h = harness(&a, &b).await;
+    h.add_key(&h.group_a, "a", TEAM_1).await;
+
+    let store = &h.runtime.store;
+    let sub = store
+        .create_group(NewGroup {
+            name: "staging".to_owned(),
+            budget_max: Some(10.0),
+            account_ref: None,
+            parent_id: Some(h.group_a.clone()),
+        })
+        .await
+        .expect("sub-group");
+    h.runtime.keys.upsert_group(&sub);
+    let (plain, record) = store
+        .create_key(NewKey {
+            name: "sub".to_owned(),
+            group_id: Some(sub.id.clone()),
+            external_ref: Some("lab-sub".to_owned()),
+            ..NewKey::default()
+        })
+        .await
+        .expect("key");
+    h.runtime.keys.upsert(hash_key(plain.reveal()), &record);
+
+    let (status, body) = h.chat(plain.reveal(), "a/model-a").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(hits(&a, TEAM_1).await, 1, "the parent's team key served it");
+    assert_eq!(hits(&a, PLATFORM).await, 0);
+    let delta = h.settled("lab-sub").await;
+    assert_eq!(delta.account_ref, ACCOUNT_A);
+    assert_eq!(delta.cost_micro, 0);
+    assert_eq!(delta.units.byok_tokens_in, 5);
 }

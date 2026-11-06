@@ -121,7 +121,7 @@ upstream call - a rejected request never leaks spend to a provider.
 
 | Code      | HTTP | Meaning                                                        |
 |-----------|------|----------------------------------------------------------------|
-| `LM-4001` | 402  | A hard budget the key is subject to is exhausted: either the key's own `budget_max` or its budget group's shared pool ([ADR 009](adr/009-shared-parent-budgets.md)). Same code and status for both; the message text discloses the scope ("budget exceeded for this key" vs "budget exceeded for this key's group"). |
+| `LM-4001` | 402  | A hard budget the key is subject to is exhausted: the key's own `budget_max` or its budget group's shared pool ([ADR 009](adr/009-shared-parent-budgets.md)). For a key in a sub-group, also its parent group's pool ([ADR 020](adr/020-team-sub-groups.md)). Same code and status for all of them; the message text discloses the scope ("budget exceeded for this key", "budget exceeded for this key's group" or "budget exceeded for this key's parent group"). |
 | `LM-4002` | 429  | The key's requests-per-minute quota was exceeded.              |
 | `LM-4003` | 429  | The key's tokens-per-minute quota was exceeded.                |
 | `LM-4004` | 401  | Missing or invalid virtual key. Deliberately does not say *why* (unknown, disabled and expired are indistinguishable) so callers cannot probe key state. |

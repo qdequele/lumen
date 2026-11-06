@@ -28,6 +28,14 @@ in [ADR 015](../adr/015-lab-integration.md) and its 2026-10-09 amendment.
 - A key is **billable** when it has a group and that group has an
   `account_ref`. Every other key is an operator key: never billed, behaving
   exactly as today.
+- **Sub-groups of the lease** ([ADR 020](../adr/020-team-sub-groups.md))
+  let a team split its lease into pools: `POST /admin/groups` with
+  `parent_id` set to the lease. A sub-group takes the lease's
+  `account_ref`, so its keys bill to the same account, and the lease binds
+  every request of its keys, so no sub-group write can spend past the
+  credits. The lease's `spent_micro` includes every sub-group's spend: the
+  lease sync needs no change. The Lab keeps the lease itself platform-only
+  and lets teams manage only its sub-groups.
 
 The Lab's loop, using routes that already exist:
 

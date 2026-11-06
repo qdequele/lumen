@@ -672,6 +672,7 @@ async fn create_live_group(h: &Harness, budget_max: Option<f64>) -> String {
             name: "pool".to_owned(),
             budget_max,
             account_ref: None,
+            parent_id: None,
         })
         .await
         .expect("create group");

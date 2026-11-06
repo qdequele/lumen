@@ -41,6 +41,7 @@ fn entry(in_group: bool) -> Arc<KeyEntry> {
                     name: "lease".to_owned(),
                     budget_max: Some(1e9),
                     account_ref: None,
+                    parent_id: None,
                 })
                 .await
                 .expect("create group");

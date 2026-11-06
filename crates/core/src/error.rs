@@ -265,6 +265,9 @@ pub enum BudgetScope {
     Key,
     /// The budget group (shared parent pool) the key belongs to.
     Group,
+    /// The parent pool of the key's sub-group (ADR 020); on the hosted
+    /// gateway, the team's credit lease.
+    ParentGroup,
 }
 
 impl std::fmt::Display for BudgetScope {
@@ -272,6 +275,7 @@ impl std::fmt::Display for BudgetScope {
         f.write_str(match self {
             BudgetScope::Key => "key",
             BudgetScope::Group => "key's group",
+            BudgetScope::ParentGroup => "key's parent group",
         })
     }
 }
@@ -976,6 +980,20 @@ mod tests {
             }
             .to_string(),
             "budget exceeded for this key's group"
+        );
+        assert_eq!(
+            GatewayError::BudgetExceeded {
+                scope: BudgetScope::ParentGroup
+            }
+            .to_string(),
+            "budget exceeded for this key's parent group"
+        );
+        assert_eq!(
+            GatewayError::BudgetExceeded {
+                scope: BudgetScope::ParentGroup
+            }
+            .code(),
+            "LM-4001"
         );
         assert_eq!(
             GatewayError::QuotaExceeded {

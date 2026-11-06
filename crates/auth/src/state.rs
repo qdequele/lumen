@@ -30,7 +30,7 @@ use arc_swap::{ArcSwap, ArcSwapOption};
 use dashmap::DashMap;
 use lumen_core::{BudgetScope, GatewayError, QuotaKind};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 /// Sentinel meaning "no limit" for the atomic limit fields.
@@ -136,11 +136,21 @@ pub struct GroupEntry {
     /// Bandwidth rate in micro-USD per 10^9 bytes (Lab-pushed, markup already
     /// divided out); 0 = bandwidth is not charged to the pool.
     bandwidth_micro_per_gb: AtomicI64,
+    /// The parent pool's id for a sub-group (ADR 020); `None` for a
+    /// top-level group. Never changes.
+    parent_id: Option<String>,
+    /// The live parent pool, set once it resolves (ADR 020): a read-only
+    /// load on the hot path. Empty on a sub-group means the parent is not in
+    /// memory yet (an out-of-band DB edit, a reload race); its keys are then
+    /// refused, never served unbounded, until a later upsert links it.
+    parent: OnceLock<Arc<GroupEntry>>,
 }
 
 impl GroupEntry {
     fn from_record(record: &GroupRecord, signals: Arc<SignalCell>) -> Self {
         Self {
+            parent_id: record.parent_id.clone(),
+            parent: OnceLock::new(),
             id: record.id.clone(),
             name: ArcSwap::from_pointee(record.name.clone()),
             budget_max_micro: AtomicI64::new(record.budget_max.map_or(UNLIMITED, usd_to_micro)),
@@ -224,6 +234,25 @@ impl GroupEntry {
     pub fn budget_max_micro(&self) -> Option<i64> {
         let max = self.budget_max_micro.load(Ordering::SeqCst);
         (max != UNLIMITED).then_some(max)
+    }
+
+    /// The live parent pool of a sub-group (ADR 020); `None` for a
+    /// top-level group or a sub-group whose parent is missing.
+    #[must_use]
+    pub fn parent(&self) -> Option<&Arc<GroupEntry>> {
+        self.parent.get()
+    }
+
+    /// A sub-group whose parent is not linked yet: admission fails closed.
+    fn parent_unresolved(&self) -> bool {
+        self.parent_id.is_some() && self.parent.get().is_none()
+    }
+
+    /// The top-level group billing and team provider keys resolve through
+    /// (ADR 020): the parent of a sub-group, else the group itself.
+    #[must_use]
+    pub fn billing_root(self: &Arc<Self>) -> &Arc<Self> {
+        self.parent().unwrap_or(self)
     }
 }
 
@@ -354,6 +383,17 @@ impl KeyEntry {
     #[must_use]
     pub fn group_id(&self) -> Option<String> {
         self.group.load().as_ref().map(|g| g.id.clone())
+    }
+
+    /// The id of the top-level group this key's group resolves to (ADR 020):
+    /// the parent when the key is in a sub-group, else its own group. Team
+    /// provider keys are looked up by this id.
+    #[must_use]
+    pub fn root_group_id(&self) -> Option<String> {
+        self.group
+            .load()
+            .as_ref()
+            .map(|g| g.billing_root().id.clone())
     }
 
     /// Overwrite the adjustable fields from an (admin-updated) record. The
@@ -547,6 +587,42 @@ impl KeyEntry {
                 });
             }
             group.dirty.store(true, Ordering::SeqCst);
+
+            // The parent pool of a sub-group last (ADR 020): it always binds,
+            // so a sub-group's own cap can only narrow what its keys spend.
+            // A refusal unwinds the sub-group and key reservations too.
+            let refusal = if let Some(parent) = group.parent() {
+                let parent_max = parent.budget_max_micro.load(Ordering::SeqCst);
+                if reserve_micro(&parent.spent_micro, parent_max, reserve, true) {
+                    parent.dirty.store(true, Ordering::SeqCst);
+                    None
+                } else {
+                    parent.with_signals(|signals, state, subject| {
+                        state.on_refusal(signals, subject);
+                    });
+                    Some(GatewayError::BudgetExceeded {
+                        scope: BudgetScope::ParentGroup,
+                    })
+                }
+            } else if group.parent_unresolved() {
+                // Fail closed, as an internal error: the team is not out of
+                // budget, the gateway cannot see the pool that bounds it.
+                Some(GatewayError::Internal(format!(
+                    "budget group '{}' has no live parent group",
+                    group.id
+                )))
+            } else {
+                None
+            };
+            if let Some(error) = refusal {
+                // Same reason as the group unwind above: leave both dirty.
+                group.spent_micro.fetch_sub(reserve, Ordering::SeqCst);
+                group.dirty.store(true, Ordering::SeqCst);
+                self.spent_micro.fetch_sub(reserve, Ordering::SeqCst);
+                self.dirty.store(true, Ordering::SeqCst);
+                unwind_windows(self);
+                return Err(error);
+            }
         }
         self.dirty.store(true, Ordering::SeqCst);
 
@@ -641,9 +717,14 @@ impl Reservation {
         let delta = actual_cost_micro.max(0) - self.reserved_micro;
         self.entry.spent_micro.fetch_add(delta, Ordering::SeqCst);
         if let Some(group) = &self.group {
-            // The pool sees the same real cost as the key (ADR 009).
+            // The pool sees the same real cost as the key (ADR 009), and so
+            // does a sub-group's parent (ADR 020).
             group.spent_micro.fetch_add(delta, Ordering::SeqCst);
             group.dirty.store(true, Ordering::SeqCst);
+            if let Some(parent) = group.parent() {
+                parent.spent_micro.fetch_add(delta, Ordering::SeqCst);
+                parent.dirty.store(true, Ordering::SeqCst);
+            }
         }
         if let Some(debited) = self.tpm_debit {
             let token_delta = actual_tokens - debited;
@@ -687,6 +768,9 @@ impl Reservation {
             .with_signals(|signals, state, subject| state.on_settle(signals, subject));
         if let Some(group) = &self.group {
             group.with_signals(|signals, state, subject| state.on_settle(signals, subject));
+            if let Some(parent) = group.parent() {
+                parent.with_signals(|signals, state, subject| state.on_settle(signals, subject));
+            }
         }
     }
 }
@@ -706,6 +790,12 @@ impl Drop for Reservation {
                     .spent_micro
                     .fetch_sub(self.reserved_micro, Ordering::SeqCst);
                 group.dirty.store(true, Ordering::SeqCst);
+                if let Some(parent) = group.parent() {
+                    parent
+                        .spent_micro
+                        .fetch_sub(self.reserved_micro, Ordering::SeqCst);
+                    parent.dirty.store(true, Ordering::SeqCst);
+                }
             }
         }
     }
@@ -740,8 +830,10 @@ impl AuthState {
     #[must_use]
     pub fn load(groups: Vec<GroupRecord>, entries: Vec<(String, VirtualKeyRecord)>) -> Self {
         let state = Self::default();
-        for record in groups {
-            state.upsert_group(&record);
+        // Top-level groups first, so every sub-group finds its parent.
+        let (roots, subs): (Vec<_>, Vec<_>) = groups.into_iter().partition(|g| !g.is_sub_group());
+        for record in roots.iter().chain(&subs) {
+            state.upsert_group(record);
         }
         for (hash, record) in entries {
             state.upsert(hash, &record);
@@ -921,15 +1013,59 @@ impl AuthState {
     /// Insert or refresh a budget group (admin create / boot load / reload).
     /// An existing entry only has its limits re-applied and keeps its
     /// in-memory pool spend, mirroring key upserts.
+    ///
+    /// A new sub-group resolves its parent here (ADR 020), so the parent must
+    /// already be live: use [`upsert_groups`](Self::upsert_groups) for a
+    /// batch. An existing entry keeps its parent link (`parent_id` never
+    /// changes).
     pub fn upsert_group(&self, record: &GroupRecord) {
-        match self.groups.entry(record.id.clone()) {
-            dashmap::Entry::Occupied(existing) => existing.get().apply_limits(record),
-            dashmap::Entry::Vacant(slot) => {
-                slot.insert(Arc::new(GroupEntry::from_record(
-                    record,
-                    Arc::clone(&self.signals),
-                )));
+        let entry = match self.groups.entry(record.id.clone()) {
+            dashmap::Entry::Occupied(existing) => {
+                existing.get().apply_limits(record);
+                Arc::clone(existing.get())
             }
+            dashmap::Entry::Vacant(slot) => {
+                let entry = Arc::new(GroupEntry::from_record(record, Arc::clone(&self.signals)));
+                slot.insert(Arc::clone(&entry));
+                entry
+            }
+        };
+        // Link a sub-group to its parent (ADR 020) once the parent is live.
+        // After the slot guard is dropped: the parent is another map entry,
+        // and holding one DashMap guard while reading another shard can
+        // deadlock. A link that did not resolve before heals here, on the
+        // next upsert (a reload) that finds the parent.
+        let Some(parent_id) = entry.parent_id.as_deref() else {
+            return;
+        };
+        if entry.parent.get().is_some() {
+            return;
+        }
+        if let Some(parent) = self
+            .group(parent_id)
+            .filter(|parent| !Arc::ptr_eq(parent, &entry))
+        {
+            // An `Err` means a concurrent upsert linked it first, to the
+            // same parent entry: nothing to do.
+            let _ = entry.parent.set(parent);
+        } else {
+            tracing::warn!(
+                group_id = %record.id,
+                parent_id = %parent_id,
+                "sub-group references an unknown parent group; its keys are refused"
+            );
+        }
+    }
+
+    /// [`upsert_group`](Self::upsert_group) for a batch (boot load, hot
+    /// reload): top-level groups first, so every sub-group finds its parent
+    /// whatever order the records came in.
+    pub fn upsert_groups(&self, records: &[GroupRecord]) {
+        for record in records.iter().filter(|r| !r.is_sub_group()) {
+            self.upsert_group(record);
+        }
+        for record in records.iter().filter(|r| r.is_sub_group()) {
+            self.upsert_group(record);
         }
     }
 
@@ -1261,12 +1397,21 @@ impl KeyEntry {
         self.bytes_out
             .fetch_add(clamp(bytes_out), Ordering::Relaxed);
         if let Some(group) = self.group.load_full() {
-            let rate = group.bandwidth_micro_per_gb.load(Ordering::SeqCst);
+            // A sub-group is charged at its parent's rate (ADR 020), and the
+            // charge lands on the parent too.
+            let rate = group
+                .billing_root()
+                .bandwidth_micro_per_gb
+                .load(Ordering::SeqCst);
             let charge = bandwidth_charge_micro(bytes_in, bytes_out, rate);
             if charge > 0 {
                 saturating_add_micro(&self.spent_micro, charge);
                 saturating_add_micro(&group.spent_micro, charge);
                 group.dirty.store(true, Ordering::SeqCst);
+                if let Some(parent) = group.parent() {
+                    saturating_add_micro(&parent.spent_micro, charge);
+                    parent.dirty.store(true, Ordering::SeqCst);
+                }
             }
         }
         self.dirty.store(true, Ordering::SeqCst);
@@ -1290,12 +1435,10 @@ impl KeyEntry {
             .then(|| self.group.load_full())
             .flatten()
             .and_then(|group| {
-                group
-                    .account_ref
-                    .load_full()
-                    .map(|account| (group, account))
+                // A sub-group bills to its parent's account (ADR 020).
+                group.billing_root().account_ref.load_full()
             });
-        let Some((_group, account)) = billable else {
+        let Some(account) = billable else {
             // Not billed: keep the watermark caught up so the key never bills
             // this cost if it becomes billable later; units are discarded.
             self.take_units();
@@ -1513,6 +1656,7 @@ mod tests {
             deleted_at: None,
             account_ref: None,
             bandwidth_micro_usd_per_gb: rate,
+            parent_id: None,
         };
         let key = VirtualKeyRecord {
             id: "k".to_owned(),

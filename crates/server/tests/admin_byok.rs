@@ -547,3 +547,44 @@ async fn team_key_secret_never_logged_on_admin_writes() {
         "part of the team key reached the logs"
     );
 }
+
+#[tokio::test]
+async fn a_sub_group_has_no_team_key_routes() {
+    // ADR 020: team keys live on the top-level group and serve every
+    // sub-group; a sub-group's own team key routes are the unknown-id 404.
+    let h = spawn(CONFIG_TOML).await;
+    let team = h.group(ACCOUNT_A).await;
+    let (status, sub) = h
+        .call(
+            reqwest::Method::POST,
+            "/admin/groups",
+            Some(ACCOUNT_A),
+            Some(json!({"name": "sub", "parent_id": team})),
+        )
+        .await;
+    assert_eq!(status, 201, "{sub}");
+    let sub = sub["id"].as_str().expect("id");
+
+    for scope in [None, Some(ACCOUNT_A)] {
+        let (status, body) = h
+            .call(
+                reqwest::Method::GET,
+                &format!("/admin/groups/{sub}/byok"),
+                scope,
+                None,
+            )
+            .await;
+        assert_eq!(status, 404, "{body}");
+        let (status, body) = h
+            .call(
+                reqwest::Method::POST,
+                &format!("/admin/groups/{sub}/byok/openai-main/keys"),
+                scope,
+                Some(json!({"key": SECRET, "label": "x"})),
+            )
+            .await;
+        assert_eq!(status, 404, "{body}");
+    }
+    let (status, body) = h.list(&team).await;
+    assert_eq!(status, 200, "{body}");
+}
