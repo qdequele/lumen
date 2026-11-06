@@ -11,12 +11,12 @@ first_token_timeout_ms = 60000      # first call may load the model into VRAM
 total_timeout_ms = 120000
 
 [[providers.models]]
-id = "llama"
+id = "ollama/llama"
 upstream_id = "llama3.2"
 capabilities = ["chat"]
 
 [[providers.models]]
-id = "nomic-embed"
+id = "ollama/nomic-embed"
 upstream_id = "nomic-embed-text"
 capabilities = ["embed"]
 
@@ -26,6 +26,6 @@ kind = "tei"
 base_url = "http://localhost:8081"
 
 [[providers.models]]
-id = "bge-reranker"
+id = "tei/bge-reranker"
 upstream_id = "BAAI/bge-reranker-large"
 capabilities = ["rerank"]

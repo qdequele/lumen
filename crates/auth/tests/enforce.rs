@@ -588,6 +588,7 @@ fn group(id: &str, budget_max: Option<f64>) -> GroupRecord {
         created_at: 0,
         deleted_at: None,
         account_ref: None,
+        bandwidth_micro_usd_per_gb: 0,
     }
 }
 

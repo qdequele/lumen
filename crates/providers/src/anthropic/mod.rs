@@ -329,7 +329,7 @@ fn translate_request(req: &ChatRequest, stream: bool) -> AnthropicRequest {
 
     AnthropicRequest {
         model: req.model.clone(),
-        max_tokens: req.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
+        max_tokens: req.effective_max_tokens().unwrap_or(DEFAULT_MAX_TOKENS),
         messages,
         system: if system_parts.is_empty() {
             None
@@ -1378,5 +1378,26 @@ mod tests {
         };
         let body = serde_json::to_value(translate_request(&req, false)).unwrap();
         assert_eq!(body["messages"][0]["content"], "hello");
+    }
+
+    #[test]
+    fn anthropic_maps_max_completion_tokens() {
+        let mut req = ChatRequest {
+            model: "claude-x".to_owned(),
+            messages: vec![msg("user", "hi")],
+            temperature: None,
+            top_p: None,
+            max_tokens: None,
+            n: None,
+            stop: None,
+            stream: false,
+            extra: serde_json::Map::new(),
+        };
+        req.extra.insert("max_completion_tokens".into(), json!(500));
+        assert_eq!(translate_request(&req, false).max_tokens, 500);
+        assert_eq!(translate_request(&req, true).max_tokens, 500);
+        // `max_tokens` wins when both are set.
+        req.max_tokens = Some(100);
+        assert_eq!(translate_request(&req, false).max_tokens, 100);
     }
 }

@@ -13,6 +13,7 @@ use lumen_core::{
     Capability, ChatProvider, DecisionProvider, EmbeddingProvider, ReleaseDate, RerankProvider,
 };
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -312,6 +313,37 @@ struct Inner {
     /// provider name -> its key checker, built from the same spec (and so the
     /// same live credentials) as its routes.
     probers: HashMap<String, (ProviderKind, Arc<KeyProber>)>,
+    /// provider name -> its spec and the HTTP client its instances use, so a
+    /// team key can rebuild the same provider with only the key swapped
+    /// ([`Registry::rekeyed`]).
+    specs: HashMap<String, (ProviderSpec, reqwest::Client)>,
+}
+
+/// One provider's capability instances, built for a team (BYOK) key: the
+/// same kind and base URL as the configured provider, only the API key
+/// differs (see [`Registry::rekeyed`]). A field is `None` when the kind has
+/// no implementation for that capability.
+#[derive(Clone)]
+pub struct ProviderSet {
+    /// The chat provider, if the kind serves chat.
+    pub chat: Option<Arc<dyn ChatProvider>>,
+    /// The embedding provider, if the kind serves embeddings.
+    pub embed: Option<Arc<dyn EmbeddingProvider>>,
+    /// The rerank provider, if the kind serves rerank.
+    pub rerank: Option<Arc<dyn RerankProvider>>,
+    /// The decision provider, if the kind serves decisions (ADR 017).
+    pub decide: Option<Arc<dyn DecisionProvider>>,
+}
+
+impl std::fmt::Debug for ProviderSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProviderSet")
+            .field("chat", &self.chat.is_some())
+            .field("embed", &self.embed.is_some())
+            .field("rerank", &self.rerank.is_some())
+            .field("decide", &self.decide.is_some())
+            .finish()
+    }
 }
 
 /// Concrete provider instances built for one spec. A single provider type may
@@ -334,6 +366,9 @@ pub struct Registry {
     /// shared client's backstop so an overriding provider only changes its
     /// connect timeout, nothing else. Retained for hot-reload rebuilds.
     overall_backstop: Duration,
+    /// Bumped on every successful [`reload`](Self::reload), so a cache of
+    /// [`rekeyed`](Self::rekeyed) instances can tell it is stale.
+    generation: AtomicU64,
 }
 
 impl Registry {
@@ -354,6 +389,7 @@ impl Registry {
             inner: ArcSwap::from_pointee(inner),
             client,
             overall_backstop,
+            generation: AtomicU64::new(0),
         })
     }
 
@@ -364,7 +400,74 @@ impl Registry {
     pub fn reload(&self, specs: Vec<ProviderSpec>) -> Result<(), RegistryError> {
         let inner = build_inner(&specs, &self.client, self.overall_backstop)?;
         self.inner.store(Arc::new(inner));
+        self.generation.fetch_add(1, Ordering::SeqCst);
         Ok(())
+    }
+
+    /// The routing-table generation: 0 at build, +1 on every successful
+    /// [`reload`](Self::reload). A [`rekeyed`](Self::rekeyed) instance built
+    /// under an older generation may carry a stale kind or base URL.
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
+    }
+
+    /// The kind of a configured provider, if any provider has that name.
+    #[must_use]
+    pub fn provider_kind(&self, provider_name: &str) -> Option<ProviderKind> {
+        self.inner
+            .load()
+            .specs
+            .get(provider_name)
+            .map(|(spec, _)| spec.kind)
+    }
+
+    /// Whether the provider named `provider_name` was built with an API key
+    /// of its own (its `api_key_env` variable or the stored
+    /// `provider_keys` row). The admin API reports it; a provider with a
+    /// platform key pool ignores it (ADR 019). `false` for an unknown name
+    /// or a keyless provider.
+    #[must_use]
+    pub fn has_api_key(&self, provider_name: &str) -> bool {
+        self.inner
+            .load()
+            .specs
+            .get(provider_name)
+            .is_some_and(|(spec, _)| {
+                spec.api_key
+                    .as_deref()
+                    .is_some_and(|k| !k.trim().is_empty())
+            })
+    }
+
+    /// Build the provider named `provider_name` again with `api_key` in place
+    /// of its configured key: same kind, base URL, options and HTTP client.
+    /// `None` when no provider has that name, when its kind does not take a
+    /// team key ([`ProviderKind::byok_eligible`]), or when the build fails.
+    /// Not cached here: callers cache it against [`generation`](Self::generation).
+    #[must_use]
+    pub fn rekeyed(&self, provider_name: &str, api_key: &str) -> Option<Arc<ProviderSet>> {
+        let inner = self.inner.load();
+        let (spec, client) = inner.specs.get(provider_name)?;
+        if !spec.kind.byok_eligible() {
+            return None;
+        }
+        let mut spec = spec.clone();
+        spec.api_key = Some(api_key.to_owned());
+        match build_providers(&spec, client) {
+            Ok(built) => Some(Arc::new(ProviderSet {
+                chat: built.chat,
+                embed: built.embed,
+                rerank: built.rerank,
+                decide: built.decisions,
+            })),
+            Err(error) => {
+                // Unreachable in practice (the same spec built at reload);
+                // the error text is secret-free.
+                tracing::warn!(provider = %provider_name, %error, "team key provider build failed");
+                None
+            }
+        }
     }
 
     /// Resolve a model id to a chat route, if one serves it.
@@ -469,6 +572,9 @@ fn build_inner(
         // One instance per provider, shared across all of its models via `Arc`.
         let built = build_providers(spec, provider_client)?;
         insert_prober(&mut inner, spec, provider_client)?;
+        inner
+            .specs
+            .insert(spec.name.clone(), (spec.clone(), provider_client.clone()));
 
         for model in &spec.models {
             if let Some(first) = owner.insert(model.id.as_str(), spec.name.as_str()) {
@@ -1352,6 +1458,103 @@ mod tests {
         );
     }
 
+    #[test]
+    fn rekeyed_rebuilds_eligible_providers_only_and_reload_bumps_the_generation() {
+        let reg = Registry::build(
+            vec![
+                spec(
+                    ProviderKind::Openai,
+                    "openai",
+                    None,
+                    vec![model("gpt", &[Capability::Chat, Capability::Embed])],
+                ),
+                spec(
+                    ProviderKind::Vllm,
+                    "vllm",
+                    Some("http://localhost:8000/v1"),
+                    vec![model("local", &[Capability::Chat])],
+                ),
+            ],
+            reqwest::Client::new(),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(reg.generation(), 0);
+        assert_eq!(reg.provider_kind("openai"), Some(ProviderKind::Openai));
+        assert_eq!(reg.provider_kind("nope"), None);
+
+        let set = reg.rekeyed("openai", "sk-team").expect("eligible kind");
+        assert!(set.chat.is_some() && set.embed.is_some());
+        assert!(set.rerank.is_none());
+        assert!(!format!("{set:?}").contains("sk-team"));
+        assert!(reg.rekeyed("vllm", "sk-team").is_none(), "ineligible kind");
+        assert!(reg.rekeyed("nope", "sk-team").is_none(), "unknown provider");
+
+        reg.reload(Vec::new()).unwrap();
+        assert_eq!(reg.generation(), 1);
+        assert!(
+            reg.rekeyed("openai", "sk-team").is_none(),
+            "provider removed"
+        );
+        // A failed reload keeps the table and the generation.
+        let bad = spec(ProviderKind::Vllm, "v", None, Vec::new());
+        assert!(reg.reload(vec![bad]).is_err());
+        assert_eq!(reg.generation(), 1);
+    }
+
+    #[tokio::test]
+    async fn rekeyed_instance_sends_the_team_key_to_the_same_base_url() {
+        use lumen_core::ChatRequest;
+        use tokio_util::sync::CancellationToken;
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(header("authorization", "Bearer sk-team"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "c", "object": "chat.completion", "created": 1, "model": "m",
+                "choices": [{ "index": 0, "message": { "role": "assistant", "content": "ok" },
+                              "finish_reason": "stop" }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let reg = Registry::build(
+            vec![spec(
+                ProviderKind::Openai,
+                "openai",
+                Some(&server.uri()),
+                vec![model("m", &[Capability::Chat])],
+            )],
+            reqwest::Client::new(),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        let chat = reg
+            .rekeyed("openai", "sk-team")
+            .and_then(|set| set.chat.clone())
+            .expect("chat");
+        let out = chat
+            .chat(
+                ChatRequest {
+                    model: "m".to_owned(),
+                    messages: Vec::new(),
+                    temperature: None,
+                    top_p: None,
+                    max_tokens: None,
+                    n: None,
+                    stop: None,
+                    stream: false,
+                    extra: serde_json::Map::new(),
+                },
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(out.is_ok(), "{out:?}");
+    }
+
     fn model(id: &str, caps: &[Capability]) -> ModelSpec {
         ModelSpec {
             id: id.to_owned(),
@@ -1477,15 +1680,13 @@ mod tests {
 
     #[test]
     fn embed_on_a_hosted_kind_with_no_upstream_embeddings_api_is_a_build_error() {
-        // Groq, DeepSeek, OpenRouter, Perplexity and xAI have no upstream
-        // /embeddings endpoint: an embed model there (with no base_url
-        // override, i.e. pointing at the vendor's own API) could only ever
-        // 404 at request time, so the registry rejects it at build time
-        // (issue #74).
+        // Groq, DeepSeek, Perplexity and xAI have no upstream /embeddings
+        // endpoint: an embed model there (with no base_url override, i.e.
+        // pointing at the vendor's own API) could only ever 404 at request
+        // time, so the registry rejects it at build time (issue #74).
         for kind in [
             ProviderKind::Groq,
             ProviderKind::Deepseek,
-            ProviderKind::Openrouter,
             ProviderKind::Perplexity,
             ProviderKind::Xai,
         ] {

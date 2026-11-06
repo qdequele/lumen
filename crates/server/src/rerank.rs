@@ -13,12 +13,15 @@ use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
-use lumen_core::{tokens, Capability, GatewayError};
+use lumen_core::{tokens, Capability, GatewayError, ProviderError};
 use lumen_providers::rerank;
+use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 use crate::accounting::{Accounting, Outcome, Target, TokenBreakdown};
 use crate::auth::AuthedKey;
+use crate::bandwidth::UpstreamMark;
+use crate::byok::{RequestKeys, Served};
 use crate::error::ApiError;
 use crate::facts::Facts;
 use crate::resilience::routing_headers;
@@ -29,10 +32,14 @@ use crate::state::AppState;
 const DOCS_PER_SEARCH_UNIT: usize = 100;
 
 /// Handle a rerank request.
+// One straight-line request pipeline; the team-key routing of each attempt
+// (BYOK) tipped it over the limit.
+#[allow(clippy::too_many_lines)]
 pub async fn rerank_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
     key: Option<Extension<AuthedKey>>,
+    Extension(mark): Extension<UpstreamMark>,
     payload: Result<Json<lumen_core::RerankRequest>, JsonRejection>,
 ) -> Result<Response, ApiError> {
     // Malformed body → LM-1001 in our envelope (not axum's plain-text default).
@@ -43,7 +50,8 @@ pub async fn rerank_handler(
         return Err(GatewayError::EmptyDocuments.into());
     }
 
-    let client_model = req.model.clone();
+    // A deprecated bare id (`gpt-4o`) resolves to its `provider/model` id.
+    let client_model = state.resilience.canonical_model(&req.model);
     // Facts are only built for a virtual model (ADR 014).
     let mut decision = state
         .resilience
@@ -53,7 +61,7 @@ pub async fn rerank_handler(
     let refusals = Some(&state.decision_metrics); // refused remap attempts (ADR 017)
     let chain = lumen_router::resolve_rerank_decision(&state.registry, &mut decision, refusals)?;
     let primary = decision.primary_model().to_owned();
-    let links = lumen_router::decision_links(
+    let mut links = lumen_router::decision_links(
         &decision,
         chain.iter().map(|l| l.route.provider_name.as_str()),
     );
@@ -65,8 +73,19 @@ pub async fn rerank_handler(
     let estimated_units = estimate_search_units(req.documents.len());
     // Search-unit price plus, for token-billed rerankers (Jev, and any model
     // pricing `cost_per_1m_input`), the token price.
-    let estimated_cost = pricing.search_cost(&primary, estimated_units)
-        + pricing.token_cost(&primary, estimated_tokens, 0);
+    // A primary served by the group's own keys (BYOK) reserves no cost.
+    let keys = RequestKeys::new(&state.team_pools, key.as_deref()).for_chain(
+        &state.registry,
+        chain.iter().map(|l| l.route.provider_name.as_str()),
+    );
+    // Links served from a team pool get their own breaker (ADR 018).
+    keys.scope_links(&state.registry, &mut links);
+    let estimated_cost = if keys.has_usable_pool(&chain[0].route.provider_name) {
+        0.0
+    } else {
+        pricing.search_cost(&primary, estimated_units)
+            + pricing.token_cost(&primary, estimated_tokens, 0)
+    };
     let mut accounting = Accounting::begin(
         &state,
         &headers,
@@ -88,7 +107,8 @@ pub async fn rerank_handler(
 
     let executed =
         lumen_router::executor::execute(&links, &state.resilience.breakers, &exec, &cancel, |i| {
-            let provider = chain[i].route.provider.clone();
+            let platform = chain[i].route.provider.clone();
+            let provider_name = chain[i].route.provider_name.clone();
             let cancel = cancel.clone();
             let mut attempt_req = req.clone();
             decision.attempts[i].apply(&mut attempt_req);
@@ -96,12 +116,34 @@ pub async fn rerank_handler(
                 .route
                 .upstream_id
                 .clone_into(&mut attempt_req.model);
-            async move { rerank::rerank(provider.as_ref(), attempt_req, &cancel).await }
+            let (keys, registry, mark) = (&keys, &*state.registry, &mark);
+            async move {
+                // Marked only when an upstream call is actually sent.
+                let call = |provider: Option<Arc<dyn lumen_core::RerankProvider>>| {
+                    let (req, cancel, name) =
+                        (attempt_req.clone(), cancel.clone(), provider_name.clone());
+                    async move {
+                        let provider =
+                            provider.ok_or(ProviderError::Unavailable { provider: name })?;
+                        mark.mark();
+                        rerank::rerank(provider.as_ref(), req, &cancel).await
+                    }
+                };
+                keys.attempt(
+                    registry,
+                    i,
+                    &provider_name,
+                    || call(Some(platform)),
+                    |set| call(set.rerank.clone()),
+                )
+                .await
+            }
         })
         .await?;
     // (an early return above drops `accounting`, refunding the reservation)
 
-    let mut response = executed.value;
+    let (mut response, served) = executed.value;
+    let billable = matches!(served, Served::Platform);
     accounting.served_by(&executed.model_used, &executed.provider_used);
     // Refusals in a served remap response (ADR 017); 0 for native rerankers.
     state
@@ -146,6 +188,7 @@ pub async fn rerank_handler(
                 media: lumen_core::MediaUsage::default(),
                 cost,
                 status: 200,
+                billable,
             });
         });
     } else {
@@ -158,6 +201,7 @@ pub async fn rerank_handler(
             media: lumen_core::MediaUsage::default(),
             cost,
             status: 200,
+            billable,
         });
     }
 

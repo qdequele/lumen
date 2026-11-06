@@ -84,8 +84,16 @@ impl Triggers {
                 retryable: true, ..
             }
             | ProviderError::Unavailable { .. }
-            | ProviderError::EmptyStream { .. } => self.contains(Trigger::ProviderError),
-            ProviderError::RateLimited { .. } => self.contains(Trigger::RateLimited),
+            | ProviderError::EmptyStream { .. }
+            // A platform pool with every key disabled: this provider cannot
+            // serve, another link of the chain may.
+            | ProviderError::PlatformKeysDisabled { .. } => self.contains(Trigger::ProviderError),
+            // An exhausted team key pool moves on like a rate limit; the next
+            // link refuses on its own unless the team serves it with its own
+            // keys (BYOK), so this never reaches the platform's keys.
+            ProviderError::RateLimited { .. } | ProviderError::TeamKeysExhausted { .. } => {
+                self.contains(Trigger::RateLimited)
+            }
             ProviderError::Timeout { .. }
             | ProviderError::ConnectTimeout { .. }
             | ProviderError::FirstTokenTimeout { .. } => self.contains(Trigger::Timeout),
@@ -205,5 +213,16 @@ mod tests {
         );
         let got = linear_escapes(2, 3);
         assert!(got.is_empty(), "{got:?}");
+    }
+
+    #[test]
+    fn team_keys_exhausted_moves_on_like_a_rate_limit() {
+        let exhausted = ProviderError::TeamKeysExhausted {
+            provider: "p".into(),
+        };
+        assert!(Triggers::DEFAULT.allows(&exhausted));
+        assert!(Triggers::from_list(&[Trigger::RateLimited]).allows(&exhausted));
+        assert!(!Triggers::from_list(&[Trigger::ProviderError]).allows(&exhausted));
+        assert!(!Triggers::NONE.allows(&exhausted));
     }
 }

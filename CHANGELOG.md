@@ -6,6 +6,146 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-11-06
+
+### Added
+
+- **`disabled` on a foundation model.** `disabled = true` on a
+  `[[providers.models]]` entry (the model's `disabled` field in
+  `PUT /admin/config/providers/{name}`) takes it out of service without
+  deleting it: it is not listed on `GET /v1/models`, a request for it is
+  `404` `LM-2001`, and a virtual model skips it like any target the gateway
+  does not serve. Its prices and the virtual models naming it stay valid, so
+  re-enabling it is removing the flag. The Meilisearch Lab's staff Admin area
+  uses it to take a hosted model out of the catalog.
+
+- **Platform provider key pools (ADR 019).** The platform's own provider
+  keys can now be a pool per provider (up to 20 keys, each with a label and
+  an `enabled` flag), managed at runtime with the platform-only
+  `GET /admin/platform-keys`, `POST /admin/platform-keys/{provider}/keys`,
+  `PATCH` and `DELETE .../keys/{key_id}`. Wherever the platform key served
+  before, the pool's keys are used round-robin with the BYOK rotation rules
+  (429 benches, 401/403 marks failing). Once a provider has a platform key,
+  enabled or not, its configured key (`api_key_env` /
+  `PUT /admin/provider-keys`) is ignored: an exhausted pool returns its last
+  error, and a pool whose keys are all disabled fails `LM-3022` (503)
+  without calling upstream. Deleting the last platform key brings the
+  configured key back. A team with the fallback off never reaches the pool. Keys are sealed at rest and
+  never returned or logged; disable and delete evict the key before
+  answering.
+
+- **Automated releases.** `scripts/prepare-release.sh` bumps the workspace
+  version in `Cargo.toml`, `Cargo.lock` and `docs/openapi.yaml` and folds
+  `[Unreleased]` into a dated CHANGELOG section in one idempotent step (with
+  no argument it suggests the bump from the conventional commits since the
+  last tag). The "Prepare release" workflow runs it and opens the
+  `chore(release): vX.Y.Z` PR; merging that PR tags the merge commit and runs
+  `release.yml` (`release-on-merge.yml`), which can now also be called as a
+  reusable workflow and optionally notifies `meilisearch/lab` to re-vendor the
+  OpenAPI document (`LAB_DISPATCH_TOKEN`). A new CI job, `version sync`, fails
+  when the three version copies disagree. See CONTRIBUTING.md.
+
+### Changed
+
+- **Every model id is prefixed (breaking config change).** A foundation model
+  id is `<provider name>/<model>` (`openai/gpt-4o-mini` on provider `openai`)
+  and a virtual model id `<namespace>/<model>` (`meilisearch/rerank`). A bare
+  id, or a foundation id whose prefix is not its provider's name, fails
+  validation at boot, on reload and on the admin config routes (`LM-1001`).
+  Run `lumen config migrate` (file or DB mode, `--dry-run` to preview,
+  `--virtual-namespace NS` for virtual ids, default `lumen`) before upgrading:
+  it prefixes every id, pins the old id as `upstream_id` and rewrites virtual
+  model targets. A foundation model's `upstream_id` now defaults to its id
+  without the `<provider>/` prefix.
+
+### Deprecated
+
+- **Bare model ids are hidden aliases.** A request naming a model by its old
+  bare id (`gpt-4o-mini`) still resolves to the prefixed one, which usage,
+  `x-lumen-model-used` and metrics then report. Aliases are never listed in
+  `GET /v1/models`; each use logs a warning and increments
+  `lumen_deprecated_model_alias_total{alias,model}`. A disabled model's alias
+  does not resolve. They will be removed once that counter stays at zero.
+
+## [0.8.1] - 2026-11-05
+
+First release with team provider key pools (BYOK) and bandwidth metering
+(ADR 018). The `v0.8.0` tag was cut without the workspace version bump, so its
+binary reported 0.7.0 and failed deploy health checks; use 0.8.1.
+
+### Added
+
+- **Team key pools route requests (BYOK).** A request whose virtual key
+  belongs to a budget group with its own keys for the provider is sent with
+  those keys, round-robin; a rate-limited key is benched and a key the
+  provider rejects (401/403) is marked failing, and the next key is tried.
+  An exhausted pool fails `LM-3021` (429) unless the group turned on the
+  fallback to the platform's keys, including through virtual-model chains.
+  Team-key traffic is reported as `byok_tokens_in/out` with no token cost,
+  bandwidth is billed only when an upstream call is actually sent, and
+  `GET /admin/groups/{id}/byok` shows each key's live status.
+  A link served from team keys has its own circuit breaker (per provider,
+  model and group), so platform-key failures never block a team on its own
+  keys and the reverse. A link the gateway refuses hands back a half-open
+  probe, and a chain-lock refusal after an upstream failure surfaces that
+  failure instead of `LM-3021`. Team keys must be at least 16 characters
+  (400 `LM-1001`), since `last4` of a shorter key reveals most of it.
+
+- **`openrouter` providers serve embeddings.** OpenRouter now exposes an
+  OpenAI-format `POST /embeddings` endpoint (catalog at
+  `/api/v1/embeddings/models`), so a model declaring `embed` on an
+  `openrouter` provider is no longer rejected at config load with
+  `NoUpstreamEmbeddings`. It routes through the shared OpenAI embed path, and
+  token counts come from the upstream `usage`. The 2026-07 check behind
+  issue #74 predates the endpoint; `groq`, `deepseek`, `perplexity` and `xai`
+  are still embed-less.
+
+### Security
+
+- **TLS and crypto dependencies bumped for the October 2026 RustSec
+  advisories.** `rustls` 0.23.45 -> 0.23.46 (RUSTSEC-2026-0346, -0347, -0348,
+  -0349: TLS secrets in `Debug` output, data sent after an ECH rejection,
+  unbounded Brotli certificate decompression, a key-exchange downgrade),
+  `rustls-webpki` 0.103.15 -> 0.103.16 (RUSTSEC-2026-0382, distrusted
+  intermediates accepted), `webpki-roots` 1.0.9 -> 1.0.11 (RUSTSEC-2026-0381,
+  distrusted emSign root removed), `ctutils` 0.4.3 -> 0.4.7
+  (RUSTSEC-2026-0385, non-constant-time masks) and `tokio` 1.53.2 -> 1.54.1
+  (RUSTSEC-2026-0386, unsound `AsyncFd` constructors). The lockfile also takes
+  the other patch bumps from the dependabot minor-and-patch group
+  (`tokio-util`, `serde_json`, `notify`, `arc-swap`, `sha2`, `libc`). Two
+  advisories without a compatible fix are ignored in `deny.toml` and CI with
+  a dated rationale: RUSTSEC-2026-0387 (`crypto-bigint` 0.5, reachable only
+  through jsonwebtoken's ECDSA code, which LUMEN never calls: Vertex AI
+  signing is RS256) and RUSTSEC-2024-0449 (`unsafe-libyaml` unmaintained,
+  used only to parse the compiled-in `docs/openapi.yaml`). The stale
+  RUSTSEC-2024-0384 ignore is dropped (`instant` is gone from the graph), and
+  the RUSTSEC-2023-0071 rationale is corrected: `rsa` is compiled in for
+  RS256 signing, which offers no remote timing oracle.
+
+### Added
+
+- **Model release watcher.** A daily GitHub Actions workflow
+  (`.github/workflows/model-watch.yml`, standard-library Python under
+  `scripts/model-watch/`) diffs models.dev, LiteLLM's price JSON and
+  OpenRouter's model lists against a committed snapshot, and classifies each
+  addition against `ProviderKind` and the `docs/providers.md` capability
+  tables: config-only (new model on a supported provider, batched into one
+  rolling issue), OpenAI-compatible provider (candidate `ProviderKind`
+  variant), or provider needing a real connector (one issue per provider).
+  Repository tooling only, nothing changes in the gateway. See
+  `docs/operations/model-watch.md`.
+
+### Fixed
+
+- **`max_completion_tokens` is now honoured on non-OpenAI providers.** OpenAI
+  reasoning models reject `max_tokens` and require `max_completion_tokens`, so
+  clients such as Scrapix send only the latter. The Anthropic, Bedrock, Google
+  and Cohere translations read only `max_tokens`, so the cap was silently
+  dropped (Anthropic fell back to its 4096 default). They now read the cap
+  through `ChatRequest::effective_max_tokens()`, which falls back to
+  `max_completion_tokens` when `max_tokens` is absent; `max_tokens` wins when
+  both are set. OpenAI-kind providers already forwarded the body unchanged.
+
 ## [0.7.0] - 2026-10-11
 
 ### Security
@@ -1984,7 +2124,9 @@ This closes every remaining streaming criterion:
 - Docs: error-code reference (`docs/errors.md`), ADR 001 (crate/lib naming),
   and this changelog.
 
-[Unreleased]: https://github.com/qdequele/lumen/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/qdequele/lumen/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/qdequele/lumen/compare/v0.8.1...v0.9.0
+[0.8.1]: https://github.com/qdequele/lumen/compare/v0.7.0...v0.8.1
 [0.7.0]: https://github.com/qdequele/lumen/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/qdequele/lumen/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/qdequele/lumen/compare/v0.5.0...v0.6.0

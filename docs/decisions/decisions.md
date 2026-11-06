@@ -30,7 +30,7 @@ kind = "typesafe"
 api_key_env = "TYPESAFE_API_KEY"
 
 [[providers.models]]
-id = "jev"
+id = "typesafe/jev"
 upstream_id = "jev-latest"
 capabilities = ["decisions"]
 cost_per_1m_input = 0.042
@@ -65,7 +65,7 @@ verbatim, including unknown fields.
 curl -s http://localhost:8080/v1/decisions \
   -H 'content-type: application/json' \
   -d '{
-    "model": "jev",
+    "model": "typesafe/jev",
     "state": "Help! My payouts have been failing for 3 days.",
     "questions": {
       "is_urgent": {
@@ -118,7 +118,7 @@ every capability.
 curl -s http://localhost:8080/v1/decisions \
   -H 'content-type: application/json' \
   -d '{
-    "model": "gpt-6-luna",
+    "model": "openai/gpt-6-luna",
     "input": "Help! My payouts have been failing for 3 days.",
     "questions": [
       {
@@ -182,7 +182,7 @@ from openai import OpenAI
 client = OpenAI(base_url="http://localhost:8080/v1", api_key="sk-lumen-...")  # any value when auth is off
 
 response = client.decisions.create(
-    model="gpt-6-luna",
+    model="openai/gpt-6-luna",
     input="Help! My payouts have been failing for 3 days.",
     questions=[
         {"type": "predicate", "name": "is_urgent", "instructions": "Does this message convey urgency?"},
@@ -233,7 +233,7 @@ For example, an empty `choice`:
 curl -s http://localhost:8080/v1/decisions \
   -H 'content-type: application/json' \
   -d '{
-    "model": "jev",
+    "model": "typesafe/jev",
     "state": "Help! My payouts have been failing for 3 days.",
     "questions": { "department": { "type": "choice", "instructions": "Which team?", "criteria": {} } }
   }'
@@ -261,7 +261,7 @@ default is `["text"]`, so nothing changes silently):
 
 ```toml
 [[providers.models]]
-id = "gpt-6-luna"
+id = "openai/gpt-6-luna"
 capabilities = ["decisions"]
 modalities = ["text", "image"]
 cost_per_1m_input = 0.10
@@ -305,7 +305,7 @@ name = "perplexity"
 kind = "perplexity"
 api_key_env = "PERPLEXITY_API_KEY"
 [[providers.models]]
-id = "pplx-decider"
+id = "perplexity/pplx-decider"
 upstream_id = "pplx-decider-v1.1-27b"
 capabilities = ["decisions"]
 modalities = ["text", "image"]
@@ -316,7 +316,7 @@ name = "typesafe"
 kind = "typesafe"
 api_key_env = "TYPESAFE_API_KEY"
 [[providers.models]]
-id = "jev"
+id = "typesafe/jev"
 upstream_id = "jev-latest"
 capabilities = ["decisions"]
 cost_per_1m_input = 0.042
@@ -326,19 +326,19 @@ name = "openai"
 kind = "openai"
 api_key_env = "OPENAI_API_KEY"
 [[providers.models]]
-id = "gpt-6-luna"
+id = "openai/gpt-6-luna"
 capabilities = ["decisions"]
 modalities = ["text", "image"]
 cost_per_1m_input = 0.10
 
 [[virtual_models]]
-id = "cross"
+id = "lumen/cross"
 capability = "decisions"
 strategy = "fallback"
-targets = [{ model = "pplx-decider" }, { model = "jev" }, { model = "gpt-6-luna" }]
+targets = [{ model = "perplexity/pplx-decider" }, { model = "typesafe/jev" }, { model = "openai/gpt-6-luna" }]
 ```
 
-Clients send `"model": "cross"` in either format. Before any upstream call,
+Clients send `"model": "lumen/cross"` in either format. Before any upstream call,
 each target of the chain is checked against the request, and an incompatible
 one is **skipped**: it is not an attempt for metrics or `usage_log`, never
 counts as a circuit-breaker failure, and is logged at `debug` without content.
@@ -423,7 +423,7 @@ kind = "ollama"
 base_url = "http://localhost:11434"   # the server root, no /v1
 
 [[providers.models]]
-id = "nimble"
+id = "ollama-local/nimble"
 upstream_id = "nimble"
 capabilities = ["decisions"]
 ```

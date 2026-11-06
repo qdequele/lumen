@@ -92,6 +92,31 @@ impl ProviderKind {
         }
     }
 
+    /// Whether a team may bring its own key for this kind (BYOK): kinds that
+    /// take a plain API key on the vendor's own URL. Cloud-credential kinds
+    /// (Azure, Bedrock, Google, Vertex), self-hosted and keyless kinds are
+    /// not.
+    #[must_use]
+    pub const fn byok_eligible(self) -> bool {
+        matches!(
+            self,
+            ProviderKind::Openai
+                | ProviderKind::Anthropic
+                | ProviderKind::Mistral
+                | ProviderKind::Cohere
+                | ProviderKind::Jina
+                | ProviderKind::Voyage
+                | ProviderKind::Groq
+                | ProviderKind::Together
+                | ProviderKind::Fireworks
+                | ProviderKind::Deepseek
+                | ProviderKind::Openrouter
+                | ProviderKind::Perplexity
+                | ProviderKind::Xai
+                | ProviderKind::Deepinfra
+        )
+    }
+
     /// Whether this kind is served by the OpenAI provider (OpenAI-compatible
     /// `/chat/completions` + `/embeddings`).
     #[must_use]
@@ -136,10 +161,12 @@ impl ProviderKind {
     ///
     /// `false` only for hosted OpenAI-compatible kinds that share the OpenAI
     /// embed wiring but whose upstream exposes no `/embeddings` endpoint
-    /// (Groq, DeepSeek, OpenRouter, Perplexity, xAI, checked against vendor
-    /// API docs 2026-07; the xAI entry could not be corroborated by
-    /// unauthenticated probing, since api.x.ai answers 401 rather than 404 on
-    /// `/v1/embeddings`, so it rests on the docs alone). An embed model
+    /// (Groq, DeepSeek, Perplexity, xAI, checked against vendor API docs
+    /// 2026-07; the xAI entry could not be corroborated by unauthenticated
+    /// probing, since api.x.ai answers 401 rather than 404 on
+    /// `/v1/embeddings`, so it rests on the docs alone). OpenRouter was on
+    /// this list until it shipped an OpenAI-format `/embeddings` endpoint
+    /// (re-checked 2026-10-31). An embed model
     /// declared there could only ever 404 at request time, so the registry
     /// rejects it at build time instead. The check applies only when the
     /// provider uses the kind's default base URL: a custom `base_url` (an
@@ -162,7 +189,6 @@ impl ProviderKind {
             self,
             ProviderKind::Groq
                 | ProviderKind::Deepseek
-                | ProviderKind::Openrouter
                 | ProviderKind::Perplexity
                 | ProviderKind::Xai
         )
@@ -194,6 +220,46 @@ mod tests {
     use super::*;
 
     #[test]
+    fn byok_eligible_is_exactly_the_plain_api_key_kinds() {
+        let eligible = [
+            ProviderKind::Openai,
+            ProviderKind::Anthropic,
+            ProviderKind::Mistral,
+            ProviderKind::Cohere,
+            ProviderKind::Jina,
+            ProviderKind::Voyage,
+            ProviderKind::Groq,
+            ProviderKind::Together,
+            ProviderKind::Fireworks,
+            ProviderKind::Deepseek,
+            ProviderKind::Openrouter,
+            ProviderKind::Perplexity,
+            ProviderKind::Xai,
+            ProviderKind::Deepinfra,
+        ];
+        for kind in eligible {
+            assert!(kind.byok_eligible(), "{kind:?}");
+        }
+        for kind in [
+            ProviderKind::Azure,
+            ProviderKind::Bedrock,
+            ProviderKind::Google,
+            ProviderKind::VertexAi,
+            ProviderKind::Ollama,
+            ProviderKind::Tei,
+            ProviderKind::Vllm,
+            ProviderKind::Nvidia,
+            ProviderKind::Cloudflare,
+            ProviderKind::Huggingface,
+            ProviderKind::Mixedbread,
+            ProviderKind::Pinecone,
+            ProviderKind::Typesafe,
+        ] {
+            assert!(!kind.byok_eligible(), "{kind:?}");
+        }
+    }
+
+    #[test]
     fn hosted_kinds_without_an_upstream_embeddings_api_report_it() {
         // Verified against upstream API docs (issue #74): these hosted
         // OpenAI-compatible kinds serve chat only - no /embeddings endpoint -
@@ -201,7 +267,6 @@ mod tests {
         for kind in [
             ProviderKind::Groq,
             ProviderKind::Deepseek,
-            ProviderKind::Openrouter,
             ProviderKind::Perplexity,
             ProviderKind::Xai,
         ] {
@@ -209,9 +274,11 @@ mod tests {
         }
         // Hosts that genuinely serve embeddings, plus self-hosted or
         // catalog-dependent kinds where the operator controls what is served,
-        // stay permissive.
+        // stay permissive. OpenRouter gained an OpenAI-format /embeddings
+        // endpoint after the issue #74 check (re-verified 2026-10-31).
         for kind in [
             ProviderKind::Openai,
+            ProviderKind::Openrouter,
             ProviderKind::Together,
             ProviderKind::Fireworks,
             ProviderKind::Deepinfra,

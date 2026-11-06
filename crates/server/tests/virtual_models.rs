@@ -72,7 +72,7 @@ fn two_providers(a: &str, b: &str, virtual_models: &str) -> String {
         kind = "openai"
         base_url = "{a}"
         [[providers.models]]
-        id = "model-a"
+        id = "a/model-a"
         capabilities = ["chat"]
 
         [[providers]]
@@ -80,7 +80,7 @@ fn two_providers(a: &str, b: &str, virtual_models: &str) -> String {
         kind = "openai"
         base_url = "{b}"
         [[providers.models]]
-        id = "model-b"
+        id = "b/model-b"
         capabilities = ["chat", "embed"]
 
         {virtual_models}
@@ -116,7 +116,7 @@ async fn fallback_virtual_model_serves_from_second_target_and_reports_route() {
         id = "acme/chat"
         capability = "chat"
         strategy = "fallback"
-        targets = [{ model = "model-a" }, { model = "model-b" }]
+        targets = [{ model = "a/model-a" }, { model = "b/model-b" }]
     "#,
     ));
     let base = spawn(&cfg, &cfg).await;
@@ -127,8 +127,8 @@ async fn fallback_virtual_model_serves_from_second_target_and_reports_route() {
     )
     .await;
     assert_eq!(resp.status(), 200);
-    assert_eq!(header(&resp, "x-lumen-model-used"), Some("model-b"));
-    assert_eq!(header(&resp, "x-lumen-route"), Some("acme/chat>model-b"));
+    assert_eq!(header(&resp, "x-lumen-model-used"), Some("b/model-b"));
+    assert_eq!(header(&resp, "x-lumen-route"), Some("acme/chat>b/model-b"));
 
     let metrics = reqwest::get(format!("{base}/metrics"))
         .await
@@ -138,7 +138,7 @@ async fn fallback_virtual_model_serves_from_second_target_and_reports_route() {
         .expect("text");
     assert!(
         metrics.contains(
-            r#"lumen_virtual_model_requests_total{model_used="model-b",virtual_model="acme/chat"}"#
+            r#"lumen_virtual_model_requests_total{model_used="b/model-b",virtual_model="acme/chat"}"#
         ),
         "routed request is counted: {metrics}"
     );
@@ -176,7 +176,7 @@ async fn split_fails_over_to_the_other_target() {
         id = "acme/split"
         capability = "chat"
         strategy = "split"
-        targets = [{ model = "model-a", weight = 50 }, { model = "model-b", weight = 50 }]
+        targets = [{ model = "a/model-a", weight = 50 }, { model = "b/model-b", weight = 50 }]
     "#,
     ));
     let base = spawn(&cfg, &cfg).await;
@@ -188,7 +188,7 @@ async fn split_fails_over_to_the_other_target() {
         )
         .await;
         assert_eq!(resp.status(), 200);
-        assert_eq!(header(&resp, "x-lumen-model-used"), Some("model-b"));
+        assert_eq!(header(&resp, "x-lumen-model-used"), Some("b/model-b"));
     }
 }
 
@@ -207,9 +207,9 @@ async fn switch_on_metadata_and_request_facts() {
         capability = "chat"
         strategy = "switch"
         targets = [
-          { when = { "metadata.plan" = "pro" }, model = "model-b" },
-          { when = { has_tools = true }, model = "model-b" },
-          { model = "model-a" },
+          { when = { "metadata.plan" = "pro" }, model = "b/model-b" },
+          { when = { has_tools = true }, model = "b/model-b" },
+          { model = "a/model-a" },
         ]
     "#,
     ));
@@ -221,14 +221,14 @@ async fn switch_on_metadata_and_request_facts() {
         &[("x-lumen-metadata", r#"{"plan":"pro"}"#)],
     )
     .await;
-    assert_eq!(header(&pro, "x-lumen-model-used"), Some("model-b"));
+    assert_eq!(header(&pro, "x-lumen-model-used"), Some("b/model-b"));
     let free = post(
         &base,
         json!({ "model": "acme/switch", "messages": msg }),
         &[("x-lumen-metadata", r#"{"plan":"free"}"#)],
     )
     .await;
-    assert_eq!(header(&free, "x-lumen-model-used"), Some("model-a"));
+    assert_eq!(header(&free, "x-lumen-model-used"), Some("a/model-a"));
     let tools = post(
         &base,
         json!({ "model": "acme/switch", "messages": msg,
@@ -236,7 +236,7 @@ async fn switch_on_metadata_and_request_facts() {
         &[],
     )
     .await;
-    assert_eq!(header(&tools, "x-lumen-model-used"), Some("model-b"));
+    assert_eq!(header(&tools, "x-lumen-model-used"), Some("b/model-b"));
 }
 
 #[tokio::test]
@@ -254,7 +254,7 @@ async fn preset_and_overrides_reach_the_upstream_body() {
         capability = "chat"
         strategy = "single"
         preset = { system_prompt = "PRESET-PROMPT", overrides = { default = { temperature = 0.2 } } }
-        targets = [{ model = "model-b", overrides = { set = { max_tokens = 77 }, drop = ["seed"] } }]
+        targets = [{ model = "b/model-b", overrides = { set = { max_tokens = 77 }, drop = ["seed"] } }]
     "#,
     ));
     let base = spawn(&cfg, &cfg).await;
@@ -303,13 +303,13 @@ async fn an_encoding_format_override_sets_the_response_encoding() {
         id = "acme/b64"
         capability = "embed"
         strategy = "single"
-        targets = [{ model = "model-b", overrides = { set = { encoding_format = "base64" } } }]
+        targets = [{ model = "b/model-b", overrides = { set = { encoding_format = "base64" } } }]
 
         [[virtual_models]]
         id = "acme/float"
         capability = "embed"
         strategy = "single"
-        targets = [{ model = "model-b", overrides = { drop = ["encoding_format"] } }]
+        targets = [{ model = "b/model-b", overrides = { drop = ["encoding_format"] } }]
     "#,
     ));
     let base = spawn(&cfg, &cfg).await;
@@ -384,7 +384,7 @@ async fn a_virtual_model_on_the_wrong_endpoint_is_lm_2002() {
         id = "acme/chat"
         capability = "chat"
         strategy = "single"
-        targets = [{ model = "model-b" }]
+        targets = [{ model = "b/model-b" }]
     "#,
     ));
     let base = spawn(&cfg, &cfg).await;
@@ -413,11 +413,11 @@ async fn missing_fallback_leaf_is_skipped() {
         id = "acme/chat"
         capability = "chat"
         strategy = "fallback"
-        targets = [{ model = "model-a" }, { model = "model-b" }]
+        targets = [{ model = "a/model-a" }, { model = "b/model-b" }]
     "#;
     let routing = load(&two_providers(&a.uri(), &b.uri(), vm));
     let registry_only_a = load(
-        &two_providers(&a.uri(), &b.uri(), "").replace("id = \"model-b\"", "id = \"model-z\""),
+        &two_providers(&a.uri(), &b.uri(), "").replace("id = \"b/model-b\"", "id = \"b/model-z\""),
     );
     let base = spawn(&routing, &registry_only_a).await;
     let resp = post(
@@ -453,13 +453,13 @@ async fn streaming_fails_over_before_the_first_byte_and_carries_the_route() {
         id = "acme/chat"
         capability = "chat"
         strategy = "fallback"
-        targets = [{ model = "model-a" }, { model = "model-b" }]
+        targets = [{ model = "a/model-a" }, { model = "b/model-b" }]
     "#,
     ));
     let base = spawn(&cfg, &cfg).await;
     let resp = post(&base, json!({ "model": "acme/chat", "stream": true, "messages": [{ "role": "user", "content": "hi" }] }), &[]).await;
     assert_eq!(resp.status(), 200);
-    assert_eq!(header(&resp, "x-lumen-route"), Some("acme/chat>model-b"));
+    assert_eq!(header(&resp, "x-lumen-route"), Some("acme/chat>b/model-b"));
     let text = resp.text().await.unwrap();
     assert!(text.contains("[DONE]"));
 }
@@ -481,8 +481,8 @@ async fn preset_prompt_counts_toward_input_tokens_when_routing() {
         strategy = "switch"
         preset = {{ system_prompt = "{prompt}" }}
         targets = [
-          {{ when = {{ input_tokens = {{ gt = 1000 }} }}, model = "model-b" }},
-          {{ model = "model-a" }},
+          {{ when = {{ input_tokens = {{ gt = 1000 }} }}, model = "b/model-b" }},
+          {{ model = "a/model-a" }},
         ]
     "#
     );
@@ -495,7 +495,7 @@ async fn preset_prompt_counts_toward_input_tokens_when_routing() {
     )
     .await;
     assert_eq!(resp.status(), 200);
-    assert_eq!(header(&resp, "x-lumen-model-used"), Some("model-b"));
+    assert_eq!(header(&resp, "x-lumen-model-used"), Some("b/model-b"));
     let sent: Value =
         serde_json::from_slice(&b.received_requests().await.unwrap()[0].body).unwrap();
     let systems = sent["messages"]
@@ -519,4 +519,85 @@ fn the_shipped_example_config_has_no_legacy_fields_and_loads() {
         "config.example.toml still uses per-model fallbacks"
     );
     assert!(!text.contains("[providers.models.rerank]"));
+}
+
+/// A pre-prefix client sending the bare id (`model-b` for `b/model-b`) is
+/// still served, through a hidden deprecated alias: the response reports the
+/// canonical id, `GET /v1/models` never lists the alias, and every use is
+/// counted on `lumen_deprecated_model_alias_total`.
+#[tokio::test]
+async fn a_bare_id_resolves_through_a_hidden_counted_alias() {
+    let (a, b) = (
+        upstream(200, "model-a").await,
+        upstream(200, "model-b").await,
+    );
+    let cfg = load(&two_providers(&a.uri(), &b.uri(), ""));
+    let registry = Arc::new(
+        Registry::build(
+            cfg.provider_specs(),
+            http::build_client(),
+            Duration::from_secs(300),
+        )
+        .expect("registry builds"),
+    );
+    let metrics = lumen_telemetry::Metrics::new();
+    let gauges = lumen_telemetry::ResilienceMetrics::register(&metrics).expect("register");
+    let state = common::base_state(registry)
+        .with_resilience(Arc::new(ResilienceRuntime::from_config(&cfg, Some(gauges))));
+    let base = common::spawn_state(state, LIMIT).await;
+
+    let resp = post(
+        &base,
+        json!({ "model": "model-b", "messages": [{ "role": "user", "content": "hi" }] }),
+        &[],
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(header(&resp, "x-lumen-model-used"), Some("b/model-b"));
+    // The upstream got the id without its provider prefix.
+    let sent: Value = b.received_requests().await.unwrap()[0].body_json().unwrap();
+    assert_eq!(sent["model"], "model-b");
+
+    let list: Value = reqwest::get(format!("{base}/v1/models"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let ids: Vec<&str> = list["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec!["a/model-a", "b/model-b"]);
+    // Retrieving the alias serves the entry of the id it aliases.
+    let one: Value = reqwest::get(format!("{base}/v1/models/model-a"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(one["id"], "a/model-a");
+
+    let out = metrics.encode_text();
+    assert!(
+        out.contains("lumen_deprecated_model_alias_total{alias=\"model-b\",model=\"b/model-b\"} 1"),
+        "{out}"
+    );
+    assert!(
+        out.contains("lumen_deprecated_model_alias_total{alias=\"model-a\",model=\"a/model-a\"} 1"),
+        "{out}"
+    );
+    // The prefixed id itself is never counted.
+    let resp = post(
+        &base,
+        json!({ "model": "b/model-b", "messages": [{ "role": "user", "content": "hi" }] }),
+        &[],
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    assert!(metrics
+        .encode_text()
+        .contains("lumen_deprecated_model_alias_total{alias=\"model-b\",model=\"b/model-b\"} 1"));
 }

@@ -18,12 +18,12 @@ kind = "openai"
 api_key_env = "OPENAI_API_KEY"
 
 [[providers.models]]
-id = "gpt-4o"
+id = "openai/gpt-4o"
 upstream_id = "gpt-4o-2024-08-06"
 capabilities = ["chat"]
 
 [[providers.models]]
-id = "text-embedding-3-small"
+id = "openai/text-embedding-3-small"
 capabilities = ["embed"]
 
 [[providers]]
@@ -32,7 +32,7 @@ kind = "cohere"
 api_key_env = "COHERE_API_KEY"
 
 [[providers.models]]
-id = "rerank-english"
+id = "cohere/rerank-english"
 upstream_id = "rerank-v3.5"
 capabilities = ["rerank"]
 ```
@@ -72,7 +72,7 @@ auth database, before the server is ever started. See
 curl -s http://localhost:8080/v1/chat/completions \
   -H 'content-type: application/json' \
   -d '{
-    "model": "gpt-4o",
+    "model": "openai/gpt-4o",
     "messages": [{"role": "user", "content": "Say hello in one word."}]
   }'
 ```
@@ -86,7 +86,7 @@ object with the token count.
 curl -s http://localhost:8080/v1/embeddings \
   -H 'content-type: application/json' \
   -d '{
-    "model": "text-embedding-3-small",
+    "model": "openai/text-embedding-3-small",
     "input": ["the quick brown fox", "a lazy dog"]
   }'
 ```
@@ -100,7 +100,7 @@ object.
 curl -s http://localhost:8080/v1/rerank \
   -H 'content-type: application/json' \
   -d '{
-    "model": "rerank-english",
+    "model": "cohere/rerank-english",
     "query": "What is the capital of France?",
     "documents": ["Paris is the capital of France.", "Berlin is in Germany."],
     "top_n": 2

@@ -1,0 +1,37 @@
+{
+  "_comment": [
+    "Maps catalog provider ids to LUMEN provider kinds (crates/providers/src/kind.rs).",
+    "Ids are compared after normalization (lowercase, separators removed), so",
+    "'together_ai' and 'togetherai' are the same key. A catalog id that already",
+    "equals a kind name, or whose base URL equals a kind's default_base_url,",
+    "needs no entry here. Prefix aliases match LiteLLM's suffixed ids such as",
+    "'vertex_ai-language-models'. extra_capabilities lists what a kind serves",
+    "beyond the docs/providers.md tables (prose-only notes there)."
+  ],
+  "aliases": {
+    "amazon-bedrock": "bedrock",
+    "azure_text": "azure",
+    "bedrock_converse": "bedrock",
+    "cloudflare-workers-ai": "cloudflare",
+    "cohere_chat": "cohere",
+    "fireworks-ai": "fireworks",
+    "gemini": "google",
+    "google-vertex": "vertex_ai",
+    "jina_ai": "jina",
+    "nvidia_nim": "nvidia",
+    "text-completion-openai": "openai",
+    "together_ai": "together"
+  },
+  "prefix_aliases": {
+    "fireworks_ai-": "fireworks",
+    "vertex_ai-": "vertex_ai"
+  },
+  "extra_capabilities": {
+    "cloudflare": [
+      "rerank"
+    ],
+    "together": [
+      "rerank"
+    ]
+  }
+}

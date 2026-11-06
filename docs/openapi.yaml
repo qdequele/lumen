@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: LUMEN gateway API
-  version: 0.7.0
+  version: 0.9.0
   description: |
     The HTTP contract of a LUMEN gateway: the OpenAI-compatible `/v1` surface
     (chat completions, embeddings, Cohere-style rerank, typed decisions,
@@ -136,7 +136,10 @@ components:
       type: object
       required: [id, object, owned_by, capabilities, modalities, virtual]
       properties:
-        id: { type: string }
+        id:
+          type: string
+          description: "The complete model id, exactly what a request sends as `model`: `<provider>/<model>` for a foundation model (the prefix is its provider's name), `<namespace>/<model>` for a virtual model. Deprecated bare ids (`gpt-4o-mini`) still resolve but are never listed."
+          example: openai/gpt-4o-mini
         object: { type: string, const: model }
         created: { type: integer, description: "Unix seconds at midnight UTC of `release_date`; absent when undated." }
         owned_by: { type: string, description: "The provider name, or `lumen` for a virtual model." }
@@ -507,15 +510,93 @@ components:
         external_ref: { type: [string, "null"], minLength: 1, maxLength: 128 }
     Group:
       type: object
-      required: [id, name, budget_max, budget_spent, created_at, deleted_at, account_ref]
+      required: [id, name, budget_max, budget_spent, created_at, deleted_at, account_ref, bandwidth_micro_usd_per_gb]
       properties:
         id: { type: string }
         name: { type: string }
         budget_max: { type: [number, "null"], description: "USD; null when unlimited." }
+        bandwidth_micro_usd_per_gb: { type: integer, minimum: 0, description: "Bandwidth charged against this group's budget, in micro-USD per 10^9 bytes (request plus response). 0 disables the charge. A group at or past its cap refuses every request with `LM-4001`, even one that costs nothing in tokens." }
         budget_spent: { type: number, description: "USD, as last flushed." }
         created_at: { type: integer }
         deleted_at: { type: [integer, "null"] }
         account_ref: { type: [string, "null"], description: "The Lab account id this lease belongs to (ADR 015); a UUID while [usage_events] is on." }
+    TeamKeyView:
+      type: object
+      required: [id, label, last4, status, status_detail, created_at]
+      properties:
+        id: { type: string, description: "`gpk_` + random hex." }
+        label: { type: string }
+        last4: { type: string, description: Last 4 characters of the key; the only readable part. }
+        status: { type: string, enum: [unused, ok, rate_limited, failing], description: "Live key health on the request path: `unused` until a request uses the key, `rate_limited` while benched after a 429, `failing` after the provider rejected it (401/403)." }
+        status_detail: { type: [string, "null"] }
+        created_at: { type: integer }
+    TeamProvider:
+      type: object
+      required: [name, kind, eligible, models, fallback, keys]
+      properties:
+        name: { type: string }
+        kind: { type: string }
+        eligible: { type: boolean, description: Whether a team may bring its own key for this kind. }
+        models: { type: array, items: { type: string } }
+        fallback: { type: boolean, description: Fall back to the platform's keys when every team key is rate-limited or failing. }
+        keys: { type: array, items: { $ref: "#/components/schemas/TeamKeyView" } }
+    TeamProviders:
+      type: object
+      required: [providers]
+      properties:
+        providers: { type: array, items: { $ref: "#/components/schemas/TeamProvider" } }
+    TeamProviderBody:
+      type: object
+      required: [fallback]
+      additionalProperties: false
+      properties:
+        fallback: { type: boolean }
+    AddTeamKeyBody:
+      type: object
+      required: [key, label]
+      additionalProperties: false
+      properties:
+        key: { type: string, minLength: 16, maxLength: 1024, description: "The provider API key, 16 characters to 1024 bytes after trimming. Sealed at rest, never returned or logged." }
+        label: { type: string, minLength: 1, maxLength: 64 }
+    PlatformKeyView:
+      type: object
+      required: [id, label, last4, enabled, status, status_detail, created_at]
+      properties:
+        id: { type: string, description: "`ppk_` + random hex." }
+        label: { type: string }
+        last4: { type: string, description: Last 4 characters of the key; the only readable part. }
+        enabled: { type: boolean, description: Whether the key is in the live pool. }
+        status: { type: string, enum: [unused, ok, rate_limited, failing], description: "Live key health on the request path: `unused` until a request uses the key (and while disabled), `rate_limited` while benched after a 429, `failing` after the provider rejected it (401/403)." }
+        status_detail: { type: [string, "null"] }
+        created_at: { type: integer }
+    PlatformProvider:
+      type: object
+      required: [name, kind, eligible, configured_key, models, keys]
+      properties:
+        name: { type: string }
+        kind: { type: string }
+        eligible: { type: boolean, description: Whether the kind takes a pool key (plain API key kinds only). }
+        configured_key: { type: boolean, description: "Whether the live provider also has a configured key (`api_key_env` or `PUT /admin/provider-keys/{name}`). It serves only while `keys` is empty: once the provider has a platform key, enabled or not, the configured key is ignored." }
+        models: { type: array, items: { type: string } }
+        keys: { type: array, items: { $ref: "#/components/schemas/PlatformKeyView" } }
+    PlatformProviders:
+      type: object
+      required: [providers]
+      properties:
+        providers: { type: array, items: { $ref: "#/components/schemas/PlatformProvider" } }
+    AddPlatformKeyBody:
+      type: object
+      required: [key, label]
+      additionalProperties: false
+      properties:
+        key: { type: string, minLength: 16, maxLength: 1024, description: "The provider API key, 16 characters to 1024 bytes after trimming. Sealed at rest, never returned or logged." }
+        label: { type: string, minLength: 1, maxLength: 64 }
+    PatchPlatformKeyBody:
+      type: object
+      required: [enabled]
+      additionalProperties: false
+      properties:
+        enabled: { type: boolean }
     GroupView:
       allOf:
         - $ref: "#/components/schemas/Group"
@@ -538,6 +619,7 @@ components:
         name: { type: string, minLength: 1 }
         budget_max: { type: number, minimum: 0, maximum: 1000000000000 }
         account_ref: { type: [string, "null"], minLength: 1, maxLength: 128 }
+        bandwidth_micro_usd_per_gb: { type: integer, minimum: 0, description: "Bandwidth rate in micro-USD per 10^9 bytes; negative is 400 `LM-1001`." }
     Grant:
       type: object
       required: [amount]
@@ -702,7 +784,34 @@ components:
         models:
           type: array
           description: "`[[providers.models]]` tables (`id`, `capabilities`, ...)."
-          items: { type: object, additionalProperties: true }
+          items: { $ref: "#/components/schemas/ModelConfig" }
+    ModelConfig:
+      type: object
+      description: >-
+        One `[[providers.models]]` table as JSON (a foundation model). Fields
+        not listed here are kept as they are.
+      required: [id, capabilities]
+      additionalProperties: true
+      properties:
+        id:
+          type: string
+          description: "`<provider>/<model>`: the prefix is the provider's name."
+          example: openai/gpt-4o-mini
+        upstream_id: { type: string }
+        capabilities:
+          type: array
+          items: { $ref: "#/components/schemas/Capability" }
+        modalities: { type: array, items: { type: string } }
+        cost_per_1m_input: { type: number, minimum: 0 }
+        cost_per_1m_output: { type: number, minimum: 0 }
+        cost_per_1k_searches: { type: number, minimum: 0 }
+        release_date: { type: string, format: date }
+        disabled:
+          type: boolean
+          default: false
+          description: >-
+            Out of service: kept in the config, but not listed on `GET /v1/models`
+            and refused like an unknown id (`LM-2001`). Omitted when false.
     ProviderDocument:
       allOf:
         - $ref: "#/components/schemas/ProviderConfig"
@@ -1141,6 +1250,87 @@ paths:
         "401": { $ref: "#/components/responses/Error" }
         "404": { $ref: "#/components/responses/Error" }
         "500": { $ref: "#/components/responses/Error" }
+  /admin/groups/{id}/byok:
+    parameters:
+      - $ref: "#/components/parameters/AccountRef"
+      - $ref: "#/components/parameters/GroupId"
+    get:
+      summary: List the providers of the config with the group's team keys
+      description: |
+        Team provider key pools (bring your own key). Every provider of the
+        current config document is listed; only `eligible` ones accept keys.
+        Keys are never returned, only `label` and `last4`.
+      operationId: listTeamProviders
+      security: [{ masterKey: [] }]
+      responses:
+        "200": { description: The providers and the group's pools., content: { application/json: { schema: { $ref: "#/components/schemas/TeamProviders" } } } }
+        "401": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "500": { $ref: "#/components/responses/Error" }
+  /admin/groups/{id}/byok/{provider}:
+    parameters:
+      - $ref: "#/components/parameters/AccountRef"
+      - $ref: "#/components/parameters/GroupId"
+      - { name: provider, in: path, required: true, schema: { type: string } }
+    put:
+      summary: Turn the platform-key fallback on or off for one pool
+      description: |
+        A provider whose kind does not take a team key (Azure, Bedrock,
+        Google/Vertex, keyless kinds) is 400 `LM-1001`. An unknown provider
+        is 404 `LM-1003`.
+      operationId: putTeamProvider
+      security: [{ masterKey: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json: { schema: { $ref: "#/components/schemas/TeamProviderBody" } }
+      responses:
+        "204": { description: Saved. }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "500": { $ref: "#/components/responses/Error" }
+  /admin/groups/{id}/byok/{provider}/keys:
+    parameters:
+      - $ref: "#/components/parameters/AccountRef"
+      - $ref: "#/components/parameters/GroupId"
+      - { name: provider, in: path, required: true, schema: { type: string } }
+    post:
+      summary: Add a team key to a provider pool
+      description: |
+        The key is sealed with the master key and never returned. At most 10
+        keys per (group, provider); the 11th is 400 `LM-1001`, as are a
+        provider whose kind does not take a team key (Azure, Bedrock,
+        Google/Vertex, keyless kinds), a key shorter than 16 characters or
+        longer than 1024 bytes after trimming, and a label outside 1 to 64
+        characters. An unknown provider is 404 `LM-1003`.
+      operationId: addTeamKey
+      security: [{ masterKey: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json: { schema: { $ref: "#/components/schemas/AddTeamKeyBody" } }
+      responses:
+        "201": { description: The stored key (label and last4 only)., content: { application/json: { schema: { $ref: "#/components/schemas/TeamKeyView" } } } }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "500": { $ref: "#/components/responses/Error" }
+  /admin/groups/{id}/byok/{provider}/keys/{key_id}:
+    parameters:
+      - $ref: "#/components/parameters/AccountRef"
+      - $ref: "#/components/parameters/GroupId"
+      - { name: provider, in: path, required: true, schema: { type: string } }
+      - { name: key_id, in: path, required: true, schema: { type: string } }
+    delete:
+      summary: Delete a team key
+      operationId: deleteTeamKey
+      security: [{ masterKey: [] }]
+      responses:
+        "204": { description: Deleted. }
+        "401": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "500": { $ref: "#/components/responses/Error" }
   /admin/usage:
     parameters:
       - $ref: "#/components/parameters/AccountRef"
@@ -1197,6 +1387,83 @@ paths:
       responses:
         "204": { $ref: "#/components/responses/NoContent" }
         "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "500": { $ref: "#/components/responses/Error" }
+  /admin/platform-keys:
+    parameters:
+      - $ref: "#/components/parameters/AccountRef"
+    get:
+      summary: List the providers of the config with the platform's key pools
+      description: |
+        Platform provider key pools (ADR 019): the gateway's own keys per
+        provider, rotated on a rate limit or a rejection wherever the platform
+        key serves (never for a team whose fallback is off). Every provider of
+        the current config document is listed; only `eligible` ones accept
+        keys. Keys are never returned, only `label` and `last4`. Platform-only:
+        403 `LM-4005` with `X-Lumen-Account-Ref`.
+      operationId: listPlatformKeys
+      security: [{ masterKey: [] }]
+      responses:
+        "200": { description: The providers and their platform pools., content: { application/json: { schema: { $ref: "#/components/schemas/PlatformProviders" } } } }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "500": { $ref: "#/components/responses/Error" }
+  /admin/platform-keys/{provider}/keys:
+    parameters:
+      - $ref: "#/components/parameters/AccountRef"
+      - { name: provider, in: path, required: true, schema: { type: string } }
+    post:
+      summary: Add a key to a provider's platform pool
+      description: |
+        The key is sealed with the master key, never returned, and enabled. At
+        most 20 keys per provider; the 21st is 400 `LM-1001`, as are a provider
+        whose kind does not take a pool key (Azure, Bedrock, Google/Vertex,
+        keyless kinds), a key shorter than 16 characters or longer than 1024
+        bytes after trimming, and a label outside 1 to 64 characters. An
+        unknown provider is 404 `LM-1003`.
+      operationId: addPlatformKey
+      security: [{ masterKey: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json: { schema: { $ref: "#/components/schemas/AddPlatformKeyBody" } }
+      responses:
+        "201": { description: The stored key (label and last4 only)., content: { application/json: { schema: { $ref: "#/components/schemas/PlatformKeyView" } } } }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "500": { $ref: "#/components/responses/Error" }
+  /admin/platform-keys/{provider}/keys/{key_id}:
+    parameters:
+      - $ref: "#/components/parameters/AccountRef"
+      - { name: provider, in: path, required: true, schema: { type: string } }
+      - { name: key_id, in: path, required: true, schema: { type: string } }
+    patch:
+      summary: Enable or disable a platform key
+      description: A disabled key leaves the live pool before the response. An unknown key is 404 `LM-1003`.
+      operationId: patchPlatformKey
+      security: [{ masterKey: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json: { schema: { $ref: "#/components/schemas/PatchPlatformKeyBody" } }
+      responses:
+        "200": { description: The updated key., content: { application/json: { schema: { $ref: "#/components/schemas/PlatformKeyView" } } } }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "500": { $ref: "#/components/responses/Error" }
+    delete:
+      summary: Delete a platform key
+      description: The key leaves the live pool before the response. An unknown key is 404 `LM-1003`.
+      operationId: deletePlatformKey
+      security: [{ masterKey: [] }]
+      responses:
+        "204": { description: Deleted. }
         "401": { $ref: "#/components/responses/Error" }
         "403": { $ref: "#/components/responses/Error" }
         "404": { $ref: "#/components/responses/Error" }

@@ -51,7 +51,7 @@ USAGE:
     lumen [--config <PATH>]
     lumen --check-config [--config <PATH>]
     lumen keys <create|list> [OPTIONS]
-    lumen config migrate [--config <PATH>] [--dry-run]
+    lumen config migrate [--config <PATH>] [--dry-run] [--virtual-namespace <NS>]
 
 OPTIONS:
     -c, --config <PATH>    Path to the TOML config file [default: config.toml]
@@ -66,9 +66,13 @@ SUBCOMMANDS:
                             (offline bootstrap - no running server needed).
     keys list              List virtual keys (records only, never secrets).
     config migrate         Rewrite a pre-0.6 config (per-model `fallbacks`,
-                            `[providers.models.rerank]`) into virtual models.
-                            File mode backs up to <file>.bak; DB mode writes a
-                            new config version. --dry-run prints the result.
+                            `[providers.models.rerank]`) into virtual models,
+                            and prefix every model id: `<provider>/<model>`,
+                            and `<NS>/<model>` for virtual models
+                            (--virtual-namespace, default `lumen`). Old bare
+                            ids keep working as hidden aliases. File mode
+                            backs up to <file>.bak; DB mode writes a new
+                            config version. --dry-run prints the result.
 
 Run `lumen keys --help` for the key-management options.
 ";
@@ -125,8 +129,12 @@ fn main() -> ExitCode {
         Action::Help => return ExitCode::SUCCESS,
         Action::CheckConfig(path) => return run_check_config(&path),
         Action::Keys(keys) => return run_keys(keys),
-        Action::ConfigMigrate { config, dry_run } => {
-            return run_config_migrate(&config, dry_run);
+        Action::ConfigMigrate {
+            config,
+            dry_run,
+            virtual_namespace,
+        } => {
+            return run_config_migrate(&config, dry_run, &virtual_namespace);
         }
         Action::Serve(path) => path,
     };
@@ -172,6 +180,8 @@ enum Action {
         config: PathBuf,
         /// Print the migrated document instead of writing it.
         dry_run: bool,
+        /// The namespace a bare virtual model id gets.
+        virtual_namespace: String,
     },
     /// `-h`/`--help`: help was already printed.
     Help,
@@ -269,6 +279,7 @@ fn parse_config_args(mut args: impl Iterator<Item = String>) -> Result<Action, S
     }
     let mut config = PathBuf::from("config.toml");
     let mut dry_run = false;
+    let mut virtual_namespace = lumen_server::config_migrate::DEFAULT_VIRTUAL_NAMESPACE.to_owned();
     while let Some(arg) = args.next() {
         let (flag, inline) = match arg.split_once('=') {
             Some((f, v)) if f.starts_with("--") => (f.to_owned(), Some(v.to_owned())),
@@ -279,6 +290,12 @@ fn parse_config_args(mut args: impl Iterator<Item = String>) -> Result<Action, S
                 config = PathBuf::from(flag_value("--config", inline, &mut args)?);
             }
             "--dry-run" => dry_run = true,
+            "--virtual-namespace" => {
+                virtual_namespace = flag_value("--virtual-namespace", inline, &mut args)?;
+                if virtual_namespace.is_empty() || virtual_namespace.contains('/') {
+                    return Err("--virtual-namespace must be non-empty, without '/'".to_owned());
+                }
+            }
             "-h" | "--help" => {
                 print!("{HELP}");
                 return Ok(Action::Help);
@@ -286,7 +303,11 @@ fn parse_config_args(mut args: impl Iterator<Item = String>) -> Result<Action, S
             other => return Err(format!("unexpected argument '{other}'")),
         }
     }
-    Ok(Action::ConfigMigrate { config, dry_run })
+    Ok(Action::ConfigMigrate {
+        config,
+        dry_run,
+        virtual_namespace,
+    })
 }
 
 /// The value of a `--flag`: the inline `--flag=value` part when present,
@@ -722,6 +743,23 @@ fn run(config_path: PathBuf) -> anyhow::Result<()> {
 
         let (client, registry) = build_http_stack(&config, provider_specs)?;
 
+        // Team key pools (BYOK): loaded once here, then rebuilt by the
+        // reloader after every pool write and config reload. A load failure
+        // boots with empty pools (platform keys only) rather than refusing
+        // to start; the next reload retries.
+        let team_pools = Arc::new(lumen_server::byok::TeamPools::default());
+        let boot_pool_targets = auth_runtime
+            .as_ref()
+            .and_then(|runtime| runtime.master.as_ref().map(|master| (runtime, master)));
+        if let Some((runtime, master)) = boot_pool_targets {
+            if let Err(error) =
+                lumen_server::byok::refresh_pools(&team_pools, &runtime.store, master, &registry)
+                    .await
+            {
+                tracing::warn!(%error, "team key pools could not be loaded at boot");
+            }
+        }
+
         // Billing usage events (ADR 015). Strictly opt-in: with no
         // [usage_events] block nothing below runs and no metric is registered.
         let usage_events_cancel = CancellationToken::new();
@@ -767,6 +805,7 @@ fn run(config_path: PathBuf) -> anyhow::Result<()> {
             image_fetch: Some(Arc::clone(&image_fetch)),
             token_counter: Some(Arc::clone(&token_counter)),
             health: Some(Arc::clone(&health)),
+            team_pools: auth_runtime.as_ref().map(|_| Arc::clone(&team_pools)),
         };
         // Cloned before the move into `arm_config_reload`: the admin config
         // routes read and write through the same context the reloader
@@ -783,7 +822,8 @@ fn run(config_path: PathBuf) -> anyhow::Result<()> {
             .with_body_limit(config.server.body_limit)
             .with_image_fetch_cell(image_fetch)
             .with_token_counter_cell(token_counter)
-            .with_config_context(ctx_for_state);
+            .with_config_context(ctx_for_state)
+            .with_team_pools(team_pools);
         // Expose the reload trigger only when the reloader is actually armed.
         let state = attach_optional(
             state,
@@ -1364,8 +1404,8 @@ async fn boot_auth_stack(
 
 /// `config migrate`: rewrite the dynamic config document (ADR 014). Errors go
 /// to stderr; nothing here logs config content.
-fn run_config_migrate(path: &Path, dry_run: bool) -> ExitCode {
-    match run_config_migrate_inner(path, dry_run) {
+fn run_config_migrate(path: &Path, dry_run: bool, namespace: &str) -> ExitCode {
+    match run_config_migrate_inner(path, dry_run, namespace) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("error: {err:#}");
@@ -1459,9 +1499,9 @@ fn replace_file_in_place(path: &Path, text: &str) -> anyhow::Result<()> {
 /// The fallible body of [`run_config_migrate`]: file mode rewrites the boot
 /// file (backup first, then staging file + rename); DB mode rewrites the
 /// stored document through the compare-and-swap `persist`.
-fn run_config_migrate_inner(path: &Path, dry_run: bool) -> anyhow::Result<()> {
+fn run_config_migrate_inner(path: &Path, dry_run: bool, namespace: &str) -> anyhow::Result<()> {
     use lumen_server::config::boot_view;
-    use lumen_server::config_migrate::migrate_document;
+    use lumen_server::config_migrate::migrate_document_with;
 
     let label = path.display().to_string();
     let boot_text =
@@ -1469,7 +1509,7 @@ fn run_config_migrate_inner(path: &Path, dry_run: bool) -> anyhow::Result<()> {
     let boot = boot_view(&boot_text, &label)?;
     match boot.config_source {
         ConfigSourceKind::File => {
-            let migration = migrate_document(&boot_text)?;
+            let migration = migrate_document_with(&boot_text, namespace)?;
             if !migration.changed {
                 println!("nothing to migrate in '{label}'");
                 return Ok(());
@@ -1502,22 +1542,27 @@ fn run_config_migrate_inner(path: &Path, dry_run: bool) -> anyhow::Result<()> {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?;
-            runtime.block_on(migrate_db_config(path, &auth.db_url(), dry_run))
+            runtime.block_on(migrate_db_config(path, &auth.db_url(), dry_run, namespace))
         }
     }
 }
 
 /// DB-mode body of `config migrate`: load the stored document, migrate and
 /// validate it against the boot file, then persist it as a new version.
-async fn migrate_db_config(path: &Path, db_url: &str, dry_run: bool) -> anyhow::Result<()> {
-    use lumen_server::config_migrate::migrate_document;
+async fn migrate_db_config(
+    path: &Path,
+    db_url: &str,
+    dry_run: bool,
+    namespace: &str,
+) -> anyhow::Result<()> {
+    use lumen_server::config_migrate::migrate_document_with;
 
     let store = KeyStore::connect(db_url)
         .await
         .context("failed to open the auth database")?;
     let source = DbSource::new(store);
     let current = source.load().await?;
-    let migration = migrate_document(&current.toml)?;
+    let migration = migrate_document_with(&current.toml, namespace)?;
     if !migration.changed {
         println!("nothing to migrate in the database config");
         return Ok(());
@@ -1867,7 +1912,8 @@ mod tests {
             action,
             Action::ConfigMigrate {
                 config: PathBuf::from("prod.toml"),
-                dry_run: true
+                dry_run: true,
+                virtual_namespace: "lumen".to_owned(),
             }
         );
         let action = parse_args_from(args(&["config", "migrate"])).unwrap();
@@ -1875,7 +1921,8 @@ mod tests {
             action,
             Action::ConfigMigrate {
                 config: PathBuf::from("config.toml"),
-                dry_run: false
+                dry_run: false,
+                virtual_namespace: "lumen".to_owned(),
             }
         );
         let action = parse_args_from(args(&["config", "migrate", "--config=x.toml"])).unwrap();
@@ -1883,9 +1930,26 @@ mod tests {
             action,
             Action::ConfigMigrate {
                 config: PathBuf::from("x.toml"),
-                dry_run: false
+                dry_run: false,
+                virtual_namespace: "lumen".to_owned(),
             }
         );
+        let action = parse_args_from(args(&[
+            "config",
+            "migrate",
+            "--virtual-namespace",
+            "meilisearch",
+        ]))
+        .unwrap();
+        assert_eq!(
+            action,
+            Action::ConfigMigrate {
+                config: PathBuf::from("config.toml"),
+                dry_run: false,
+                virtual_namespace: "meilisearch".to_owned(),
+            }
+        );
+        assert!(parse_args_from(args(&["config", "migrate", "--virtual-namespace=a/b"])).is_err());
         assert!(parse_args_from(args(&["config"])).is_err());
         assert!(parse_args_from(args(&["config", "explode"])).is_err());
         assert!(parse_args_from(args(&["config", "migrate", "--bogus"])).is_err());

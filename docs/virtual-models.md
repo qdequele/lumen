@@ -22,8 +22,31 @@ stay on one line, so long targets use `[[virtual_models.targets]]` sub-tables.
 | Can carry routing logic | No | Yes |
 
 Both layers share **one id namespace**. Ids are non-empty and use only the
-characters `A-Z a-z 0-9 . _ : / -`; `company/model` is a convention, not a
-rule. A collision between a foundation id and a virtual id is a validation
+characters `A-Z a-z 0-9 . _ : / -`, and every id carries a prefix:
+
+| Kind | Form | Example |
+|---|---|---|
+| Foundation model | `<provider name>/<model>`, the prefix equal to its provider's `name` | `openai/gpt-4o`, `typesafe/jev`, `cohere/rerank-v3.5` |
+| Virtual model | `<namespace>/<model>`, any namespace | `meilisearch/rerank`, `lumen/chat-fast`, `acme/support-bot` |
+
+The id is exactly what a client sends as `model`. A bare id (`gpt-4o`), or a
+foundation id whose prefix is not its provider's name, is rejected at load,
+on reload and on the admin API (`LM-1001`); `lumen config migrate` prefixes
+an older config (section 10). A foundation model's `upstream_id` defaults to
+its id without the `<provider>/` prefix.
+
+**Deprecated bare aliases.** So existing clients keep working, each prefixed
+id's bare form (`gpt-4o` for `openai/gpt-4o`) still resolves to it. These
+aliases are hidden: `GET /v1/models` never lists them, usage and metrics
+record the prefixed id, and every use logs a warning and increments
+`lumen_deprecated_model_alias_total{alias,model}`, so you know when nobody
+sends them any more. A bare form that is itself a configured id is no alias;
+when a virtual model and a foundation model share a bare form, the virtual
+model gets it (a migrated fallback chain keeps its old client-facing id);
+two of the same kind get none. The aliases will be removed in a future
+release.
+
+A collision between a foundation id and a virtual id is a validation
 error naming both. A virtual model serves exactly **one capability** (`chat`,
 `embed`, `rerank` or `decisions`; `systemone` is accepted as an alias of
 `decisions`); to offer the same product name for two
@@ -42,12 +65,12 @@ model can reach. Foundation entries carry `"virtual": false`. Set
 
 ```toml
 [[virtual_models]]
-id = "gpt-4o"
+id = "lumen/gpt-4o"
 capability = "chat"
 strategy = "fallback"
 description = "GPT-4o with a Claude backup"
 listed = true
-targets = [{ model = "openai/gpt-4o" }, { model = "claude-sonnet-4-5" }]
+targets = [{ model = "openai/gpt-4o" }, { model = "anthropic/claude-sonnet-4-5" }]
 ```
 
 Calling an id that is neither kind is `LM-2001`; calling a virtual model on
@@ -75,7 +98,7 @@ Field placement is enforced: `weight` only under `split`, `when` only under
 id = "acme/chat-ab"
 capability = "chat"
 strategy = "split"
-targets = [{ model = "openai/gpt-4o", weight = 80 }, { model = "azure-gpt-4o", weight = 20 }]
+targets = [{ model = "openai/gpt-4o", weight = 80 }, { model = "azure-openai/azure-gpt-4o", weight = 20 }]
 ```
 
 ### Composition and limits
@@ -141,7 +164,7 @@ id = "acme/long-context"
 capability = "chat"
 strategy = "fallback"
 fallback_on = ["provider_error", "timeout", "context_length"]
-targets = [{ model = "openai/gpt-4o" }, { model = "gemini-long" }]
+targets = [{ model = "openai/gpt-4o" }, { model = "google/gemini-long" }]
 ```
 
 ## 4. `switch` conditions
@@ -180,9 +203,9 @@ capability = "chat"
 strategy = "switch"
 targets = [
   { when = { group = "eu-customers" }, model = "acme/chat-eu" },
-  { when = { "metadata.plan" = { in = ["pro"] }, input_tokens = { gt = 32000 } }, model = "gemini-long" },
-  { when = { any = [{ has_images = true }, { has_tools = true }] }, model = "gpt-4o" },
-  { model = "local-llama" },
+  { when = { "metadata.plan" = { in = ["pro"] }, input_tokens = { gt = 32000 } }, model = "google/gemini-long" },
+  { when = { any = [{ has_images = true }, { has_tools = true }] }, model = "lumen/gpt-4o" },
+  { model = "ollama-local/local-llama" },
 ]
 ```
 
@@ -201,6 +224,9 @@ targets = [{ model = "openai/gpt-4o", overrides = { set = { max_tokens = 4096 },
 
 - `set` always applies; `default` applies only when the client did not send the
   field; `drop` removes it.
+- On translated providers (Anthropic, Bedrock, Google, Cohere) a client-sent
+  `max_tokens` wins over `max_completion_tokens`. To cap output tokens there
+  with an override, `set` `max_tokens`.
 - Overrides act on the parsed request, not on JSON paths, and each capability
   has an allow-list of fields:
 
@@ -228,7 +254,7 @@ sampling defaults:
 id = "acme/support-bot"
 capability = "chat"
 strategy = "fallback"
-targets = [{ model = "gpt-4o" }, { model = "claude-sonnet-4-5" }]
+targets = [{ model = "lumen/gpt-4o" }, { model = "anthropic/claude-sonnet-4-5" }]
 description = "Acme support assistant"
 preset = { system_prompt = "You are Acme's support assistant. Answer briefly and point to the documentation when relevant.", system_prompt_mode = "prepend", overrides = { default = { temperature = 0.2 }, set = { max_tokens = 800 } } }
 ```
@@ -315,7 +341,7 @@ capability = "rerank"
 strategy = "fallback"
 
 [[virtual_models.targets]]
-model = "jev"
+model = "typesafe/jev"
 [virtual_models.targets.remap]
 strategy = "composite"
 context = "US federal case law. Prefer holdings over dicta."
@@ -341,7 +367,7 @@ Per-tenant relevance rules combine `remap` with `switch` on the budget group:
 id = "acme/rerank"
 capability = "rerank"
 strategy = "switch"
-targets = [{ when = { group = "law-firm" }, model = "acme/legal-rerank" }, { model = "jev-rerank" }]
+targets = [{ when = { group = "law-firm" }, model = "acme/legal-rerank" }, { model = "lumen/jev-rerank" }]
 ```
 
 The other strategies in one line each:
@@ -353,7 +379,7 @@ capability = "rerank"
 strategy = "single"
 
 [[virtual_models.targets]]
-model = "jev"
+model = "typesafe/jev"
 remap = { strategy = "score", instructions = "How well does `document` answer the query?", levels = ["off topic", "related", "partial answer", "full answer"] }
 
 [[virtual_models]]
@@ -362,7 +388,7 @@ capability = "rerank"
 strategy = "single"
 
 [[virtual_models.targets]]
-model = "jev"
+model = "typesafe/jev"
 remap = { strategy = "choice", instructions = "Which document best answers the query?" }
 ```
 
@@ -414,7 +440,7 @@ dependent. Every write is validated with the same rules as boot, so an invalid
 virtual model (a cycle, a missing reference, a bad `when`) is `LM-1001` naming
 the model and the reason.
 
-## 10. Migrating from `fallbacks`
+## 10. Migrating from `fallbacks` and bare ids
 
 Per-model `fallbacks`, the `[providers.models.rerank]` block, and the `rerank`
 capability on `typesafe` models are removed. A config that still uses one
@@ -425,7 +451,15 @@ lumen config migrate -c config.toml --dry-run   # print the result, change nothi
 lumen config migrate -c config.toml             # rewrite (file mode keeps config.toml.bak)
 ```
 
-`lumen config migrate [-c PATH] [--dry-run]` rewrites the document. In file
+Every model id also gets its prefix (section 1): a foundation model `M` on
+provider `P` becomes `P/M`, with `upstream_id = "M"` pinned when it had none
+(nothing changes upstream), and a virtual model `V` becomes `lumen/V`
+(`--virtual-namespace meilisearch` on the hosted Gateway). Every target that
+named a renamed id is rewritten. Clients that still send `M` or `V` keep
+working through the deprecated bare aliases. Running the migrator twice
+changes nothing the second time.
+
+`lumen config migrate [-c PATH] [--dry-run] [--virtual-namespace NS]` rewrites the document. In file
 mode it backs the file up to `<file>.bak` and replaces it atomically; in DB
 mode it writes a new `config_versions` row. Formatting and comments outside
 the edited tables are kept, and the result is validated before anything is
@@ -481,10 +515,10 @@ upstream_id = "gpt-4o"
 capabilities = ["chat"]
 
 [[virtual_models]]
-id = "gpt-4o"
+id = "lumen/gpt-4o"
 capability = "chat"
 strategy = "fallback"
-targets = [{ model = "openai/gpt-4o" }, { model = "claude-sonnet-4-5" }]
+targets = [{ model = "openai/gpt-4o" }, { model = "anthropic/claude-sonnet-4-5" }]
 ```
 
 See also [ADR 014](adr/014-virtual-models.md) and the [Error

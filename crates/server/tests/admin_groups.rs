@@ -47,7 +47,7 @@ fn chat_registry(upstream: &str) -> Arc<Registry> {
         strict: false,
         connect_timeout_ms: None,
         models: vec![ModelSpec {
-            id: "gpt".to_owned(),
+            id: "openai/gpt".to_owned(),
             upstream_id: "gpt-4o-2024-08-06".to_owned(),
             capabilities: vec![Capability::Chat],
             modalities: vec!["text".to_owned()],
@@ -72,7 +72,7 @@ fn dollar_pricing() -> CostTable {
         name = "openai"
         kind = "openai"
         [[providers.models]]
-        id = "gpt"
+        id = "openai/gpt"
         capabilities = ["chat"]
         cost_per_1m_input = 1000000.0
         cost_per_1m_output = 1000000.0
@@ -163,7 +163,7 @@ impl Harness {
             .post(format!("{}/v1/chat/completions", self.base))
             .bearer_auth(key)
             .json(&json!({
-                "model": "gpt",
+                "model": "openai/gpt",
                 "messages": [{ "role": "user", "content": "hi" }],
                 "max_tokens": 5
             }))
@@ -711,4 +711,70 @@ async fn admin_key_and_group_writes_reject_negative_limits_and_blank_names() {
     let stored_group = &h.store.list_groups(false).await.expect("list groups")[0];
     assert_eq!(stored_group.budget_max, Some(0.0));
     assert_eq!(stored_group.name, "zero");
+}
+
+#[tokio::test]
+async fn patch_group_sets_bandwidth_rate() {
+    let upstream = MockServer::start().await;
+    let h = spawn_groups(chat_registry(&upstream.uri())).await;
+    let account = "0192f3c1-7c2e-7b1a-9f00-3c9d2e4a5b61";
+    let created: Value = h
+        .create_group(&json!({ "name": "acme", "budget_max": 25.0, "account_ref": account }))
+        .await
+        .json()
+        .await
+        .expect("json");
+    let id = created["id"].as_str().expect("id").to_owned();
+    assert_eq!(created["bandwidth_micro_usd_per_gb"], 0, "defaults to off");
+    let url = format!("{}/admin/groups/{id}", h.base);
+
+    // A scoped PATCH sets the rate.
+    let patched = h
+        .client
+        .patch(&url)
+        .bearer_auth(master())
+        .header("X-Lumen-Account-Ref", account)
+        .json(&json!({ "bandwidth_micro_usd_per_gb": 83_333 }))
+        .send()
+        .await
+        .expect("patch");
+    assert_eq!(patched.status(), 200);
+
+    // GET shows it, and the budget fields are untouched.
+    let view: Value = h
+        .client
+        .get(&url)
+        .bearer_auth(master())
+        .header("X-Lumen-Account-Ref", account)
+        .send()
+        .await
+        .expect("get")
+        .json()
+        .await
+        .expect("json");
+    assert_eq!(view["bandwidth_micro_usd_per_gb"], 83_333);
+    assert_eq!(view["budget_max"], 25.0);
+
+    // Negative is 400 LM-1001 and changes nothing.
+    let bad = h
+        .client
+        .patch(&url)
+        .bearer_auth(master())
+        .header("X-Lumen-Account-Ref", account)
+        .json(&json!({ "bandwidth_micro_usd_per_gb": -1 }))
+        .send()
+        .await
+        .expect("patch");
+    assert_eq!(bad.status(), 400);
+    let body: Value = bad.json().await.expect("json");
+    assert_eq!(body["error"]["code"], "LM-1001");
+
+    // Survives a restart: the stored row (what boot reloads) has it.
+    let stored = h.store.get_group(&id).await.expect("get").expect("group");
+    assert_eq!(stored.bandwidth_micro_usd_per_gb, 83_333);
+    let reloaded = lumen_auth::state::AuthState::load(
+        h.store.load_groups().await.expect("groups"),
+        Vec::new(),
+    );
+    assert!(reloaded.group(&id).is_some());
 }

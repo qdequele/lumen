@@ -8,13 +8,26 @@ version = 2
 yanked = "warn"
 # Advisories consciously accepted, each transitive and not exploitable here:
 ignore = [
-    # `rsa` Marvin timing side-channel. `rsa` is a Cargo.lock-only artifact of
-    # sqlx's macro crate (MySQL path); it is NOT in our compiled graph
-    # (`cargo tree -i rsa` finds nothing) and LUMEN performs no RSA/MySQL ops.
+    # `rsa` Marvin timing side-channel; no patched release exists. `rsa` is
+    # compiled in through jsonwebtoken's `rust_crypto` backend for the Vertex AI
+    # RS256 service-account assertion. LUMEN never decrypts with RSA, and it only
+    # signs a JWT it builds itself (no attacker-chosen input), about once per
+    # token lifetime, sent only to Google's token endpoint: there is no remote
+    # timing oracle. Re-checked 2026-10-31.
     "RUSTSEC-2023-0071",
-    # `instant` unmaintained - transitive via `notify` (config file-watch);
-    # used only for coarse timers. Bumps land when `notify` moves to `web-time`.
-    "RUSTSEC-2024-0384",
+    # `crypto-bigint` 0.5 non-constant-time ops (fixed only in 0.7.6, a
+    # semver-incompatible jump). Pulled in by elliptic-curve 0.13 via p256/p384,
+    # which jsonwebtoken 11.1.0 (latest as of 2026-10-31) compiles in for
+    # ES256/ES384. LUMEN only uses `EncodingKey::from_rsa_pem` + RS256
+    # (crates/providers/src/google/vertex/auth.rs), so no EC code runs. Drop
+    # this once jsonwebtoken moves to elliptic-curve 0.14. Added 2026-10-31.
+    "RUSTSEC-2026-0387",
+    # `unsafe-libyaml` unmaintained (archived, no patched release), via
+    # serde_yaml_ng. It only parses docs/openapi.yaml, compiled in with
+    # `include_str!` (crates/server/src/openapi.rs): repo-owned input, never
+    # runtime or client YAML. Replace serde_yaml_ng with a maintained parser to
+    # drop this. Added 2026-10-31.
+    "RUSTSEC-2024-0449",
 ]
 
 [licenses]

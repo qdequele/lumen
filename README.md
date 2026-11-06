@@ -77,12 +77,12 @@ kind = "openai"
 api_key_env = "OPENAI_API_KEY"
 
 [[providers.models]]
-id = "gpt-4o"
+id = "openai/gpt-4o"
 upstream_id = "gpt-4o-2024-08-06"
 capabilities = ["chat"]
 
 [[providers.models]]
-id = "text-embedding-3-small"
+id = "openai/text-embedding-3-small"
 capabilities = ["embed"]
 
 [[providers]]
@@ -91,7 +91,7 @@ kind = "cohere"
 api_key_env = "COHERE_API_KEY"
 
 [[providers.models]]
-id = "rerank-english"
+id = "cohere/rerank-english"
 upstream_id = "rerank-v3.5"
 capabilities = ["rerank"]
 ```
@@ -130,7 +130,7 @@ By default auth is **off**, so these requests need no `Authorization` header.
 curl -s http://localhost:8080/v1/chat/completions \
   -H 'content-type: application/json' \
   -d '{
-    "model": "gpt-4o",
+    "model": "openai/gpt-4o",
     "messages": [{"role": "user", "content": "Say hello in one word."}]
   }'
 ```
@@ -144,7 +144,7 @@ with `data: {…}` frames and a terminal `data: [DONE]`.
 curl -s http://localhost:8080/v1/embeddings \
   -H 'content-type: application/json' \
   -d '{
-    "model": "text-embedding-3-small",
+    "model": "openai/text-embedding-3-small",
     "input": ["the quick brown fox", "a lazy dog"]
   }'
 ```
@@ -155,7 +155,7 @@ curl -s http://localhost:8080/v1/embeddings \
 curl -s http://localhost:8080/v1/rerank \
   -H 'content-type: application/json' \
   -d '{
-    "model": "rerank-english",
+    "model": "cohere/rerank-english",
     "query": "What is the capital of France?",
     "documents": ["Paris is the capital of France.", "Berlin is in Germany."],
     "top_n": 2
@@ -201,7 +201,7 @@ built-in base URL): `groq`, `together`, `fireworks`, `deepseek`, `openrouter`,
 `cloudflare` (Workers AI - `base_url` carries your account id), and `vllm` (any
 self-hosted OpenAI-compatible server: vLLM, llama.cpp, LM Studio, …). Anything
 else that speaks the OpenAI format works via `kind = "openai"` + a `base_url`.
-Note that `groq`, `deepseek`, `openrouter`, `perplexity` and `xai` serve chat
+Note that `groq`, `deepseek`, `perplexity` and `xai` serve chat
 only (no upstream embeddings API): declaring `embed` on them is rejected at
 config load, unless a custom `base_url` fronts the host with an
 embedding-capable proxy. Two of the OpenAI-compatible hosts additionally serve
@@ -265,10 +265,10 @@ prompt and sampling defaults), and **Jev as a reranker**, all declared in
 
 ```toml
 [[virtual_models]]
-id = "gpt-4o"
+id = "lumen/gpt-4o"
 capability = "chat"
 strategy = "fallback"
-targets = [{ model = "openai/gpt-4o" }, { model = "claude-sonnet-4-5" }]
+targets = [{ model = "openai/gpt-4o" }, { model = "anthropic/claude-sonnet-4-5" }]
 ```
 
 An older config that uses per-model `fallbacks` is migrated with

@@ -1,0 +1,90 @@
+name: Release on merge
+
+# Second half of the automated release (see CONTRIBUTING.md, "Cutting a
+# release"). When a `chore(release): vX.Y.Z` PR opened by prepare-release.yml
+# merges to main, tag the merge commit `vX.Y.Z` and run release.yml on it.
+#
+# Why release.yml is called here instead of firing on the tag push: a tag
+# pushed with the default GITHUB_TOKEN does not trigger other workflows (no
+# `push: tags` run). Calling release.yml as a reusable workflow keeps the whole
+# flow on GITHUB_TOKEN, with no PAT or app secret. Pushing a tag by hand still
+# triggers release.yml directly, as before.
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-on-merge
+  cancel-in-progress: false
+
+jobs:
+  tag:
+    name: tag the release commit
+    # Only merged release PRs from this repository's own release/* branches.
+    if: >-
+      github.event.pull_request.merged == true &&
+      startsWith(github.event.pull_request.title, 'chore(release): v') &&
+      startsWith(github.event.pull_request.head.ref, 'release/v') &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # push the tag
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Check the merged tree is a consistent release
+        id: version
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          scripts/prepare-release.sh --check
+          version=$(awk '/^\[workspace\.package\]/{p=1;next} /^\[/{p=0} p && /^version[ \t]*=/{gsub(/"/,"",$3); print $3; exit}' Cargo.toml)
+          if [ "$PR_TITLE" != "chore(release): v$version" ]; then
+            echo "::error::PR title '$PR_TITLE' does not match the merged crate version $version; tag it by hand once fixed" >&2
+            exit 1
+          fi
+          scripts/prepare-release.sh --notes "$version" >/dev/null
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+
+      - name: Create and push the tag
+        id: tag
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+          SHA: ${{ github.event.pull_request.merge_commit_sha }}
+        run: |
+          if existing=$(git rev-parse -q --verify "refs/tags/$TAG^{commit}"); then
+            if [ "$existing" != "$SHA" ]; then
+              echo "::error::tag $TAG already exists on $existing, not on the merge commit $SHA" >&2
+              exit 1
+            fi
+            echo "::notice::tag $TAG already points at $SHA (re-run); releasing it"
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git tag -a "$TAG" -m "LUMEN $TAG: see CHANGELOG.md for the full list" "$SHA"
+            git push origin "refs/tags/$TAG"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+  release:
+    name: release
+    needs: tag
+    uses: ./.github/workflows/release.yml
+    with:
+      tag: ${{ needs.tag.outputs.tag }}
+    permissions:
+      contents: write
+      packages: write
+    # LAB_DISPATCH_TOKEN (optional) for the Lab notification.
+    secrets: inherit

@@ -1020,3 +1020,178 @@ async fn usage_summary_capability_filter_matches_both_decisions_spellings() {
         assert_eq!(total, 2, "filter {spelling}");
     }
 }
+
+const TEAM_KEY: &str = "sk-team-store-key-9f3a";
+
+#[tokio::test]
+async fn group_provider_keys_are_sealed_limited_and_removed_with_the_group() {
+    let store = KeyStore::in_memory().await.expect("open store");
+    let master = MasterKey::from_env_value(&"a".repeat(64)).expect("master key");
+    let group = store
+        .create_group(lumen_auth::store::NewGroup {
+            name: "team".to_owned(),
+            budget_max: None,
+            account_ref: None,
+        })
+        .await
+        .expect("group");
+
+    let record = store
+        .add_group_provider_key(
+            &group.id,
+            "openai",
+            "prod",
+            &format!("  {TEAM_KEY}\n"),
+            &master,
+        )
+        .await
+        .expect("add");
+    assert!(record.id.starts_with("gpk_"));
+    assert_eq!(record.last4, "9f3a");
+    assert!(!store.debug_dump().await.expect("dump").contains(TEAM_KEY));
+
+    let loaded = store.load_group_provider_keys(&master).await.expect("load");
+    assert_eq!(loaded.len(), 1);
+    assert_eq!(loaded[0].0, record);
+    assert_eq!(loaded[0].1.as_str(), TEAM_KEY, "the key is stored trimmed");
+    let wrong = MasterKey::from_env_value(&"b".repeat(64)).expect("master key");
+    assert!(store.load_group_provider_keys(&wrong).await.is_err());
+
+    for n in 1..10 {
+        store
+            .add_group_provider_key(&group.id, "openai", "k", &format!("sk-{n:04}"), &master)
+            .await
+            .expect("add up to the limit");
+    }
+    assert!(matches!(
+        store
+            .add_group_provider_key(&group.id, "openai", "k", "sk-over", &master)
+            .await,
+        Err(lumen_auth::AuthError::PoolFull(10))
+    ));
+    // The limit is per (group, provider).
+    store
+        .add_group_provider_key(&group.id, "anthropic", "k", "sk-ant-1", &master)
+        .await
+        .expect("another provider has its own pool");
+
+    store
+        .set_group_provider_fallback(&group.id, "openai", true)
+        .await
+        .expect("fallback");
+    assert_eq!(
+        store.group_provider_settings().await.expect("settings"),
+        vec![(group.id.clone(), "openai".to_owned(), true)]
+    );
+
+    // Provider removal clears that provider only.
+    store
+        .delete_group_provider_data_for_provider("anthropic")
+        .await
+        .expect("provider data");
+    assert_eq!(
+        store
+            .list_group_provider_keys(&group.id)
+            .await
+            .expect("list")
+            .len(),
+        10
+    );
+
+    // The group's deletion clears the rest.
+    store.delete_group(&group.id).await.expect("delete group");
+    let left = store.load_group_provider_keys(&master).await.expect("load");
+    assert_eq!(left.len(), 0);
+    let settings = store.group_provider_settings().await.expect("settings");
+    assert_eq!(settings.len(), 0);
+}
+
+const PLATFORM_KEY: &str = "sk-platform-store-key-7c1e";
+
+#[tokio::test]
+async fn platform_provider_keys_are_sealed_limited_toggled_and_removed_with_the_provider() {
+    let store = KeyStore::in_memory().await.expect("open store");
+    let master = MasterKey::from_env_value(&"a".repeat(64)).expect("master key");
+
+    let record = store
+        .add_platform_provider_key("openai", "primary", &format!(" {PLATFORM_KEY}\n"), &master)
+        .await
+        .expect("add");
+    assert!(record.id.starts_with("ppk_"));
+    assert_eq!(record.last4, "7c1e");
+    assert!(record.enabled, "a new key is enabled");
+    assert!(!store
+        .debug_dump()
+        .await
+        .expect("dump")
+        .contains(PLATFORM_KEY));
+
+    let loaded = store
+        .load_platform_provider_keys(&master)
+        .await
+        .expect("load");
+    assert_eq!(loaded.len(), 1);
+    assert_eq!(loaded[0].0, record);
+    assert_eq!(
+        loaded[0].1.as_str(),
+        PLATFORM_KEY,
+        "the key is stored trimmed"
+    );
+    let wrong = MasterKey::from_env_value(&"b".repeat(64)).expect("master key");
+    assert!(store.load_platform_provider_keys(&wrong).await.is_err());
+
+    // Toggle: the record comes back updated; an unknown id is None.
+    let off = store
+        .set_platform_provider_key_enabled("openai", &record.id, false)
+        .await
+        .expect("toggle")
+        .expect("known key");
+    assert!(!off.enabled);
+    assert!(
+        store
+            .set_platform_provider_key_enabled("anthropic", &record.id, false)
+            .await
+            .expect("toggle")
+            .is_none(),
+        "the provider is part of the key's address"
+    );
+    assert!(
+        !store.list_platform_provider_keys().await.expect("list")[0].enabled,
+        "the flag is persisted"
+    );
+
+    for n in 1..lumen_auth::store::MAX_PLATFORM_PROVIDER_KEYS {
+        store
+            .add_platform_provider_key("openai", "k", &format!("sk-{n:04}"), &master)
+            .await
+            .expect("add up to the limit");
+    }
+    assert!(matches!(
+        store
+            .add_platform_provider_key("openai", "k", "sk-over", &master)
+            .await,
+        Err(lumen_auth::AuthError::PoolFull(20))
+    ));
+    store
+        .add_platform_provider_key("anthropic", "k", "sk-ant-1", &master)
+        .await
+        .expect("another provider has its own pool");
+
+    assert!(store
+        .delete_platform_provider_key("openai", &record.id)
+        .await
+        .expect("delete"));
+    assert!(!store
+        .delete_platform_provider_key("openai", &record.id)
+        .await
+        .expect("delete twice"));
+
+    // Removing a provider from the config clears its platform pool too.
+    store
+        .delete_group_provider_data_for_provider("anthropic")
+        .await
+        .expect("provider data");
+    let left = store.list_platform_provider_keys().await.expect("list");
+    assert_eq!(left.len(), 19);
+    assert!(left.iter().all(|k| k.provider == "openai"));
+}

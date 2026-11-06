@@ -7,7 +7,7 @@
 //! never has to depend on `router`.
 
 use crate::metrics::Metrics;
-use prometheus::{IntGaugeVec, Opts};
+use prometheus::{IntCounterVec, IntGaugeVec, Opts};
 
 /// Circuit-breaker state, as exported on `lumen_circuit_state`.
 pub const CIRCUIT_CLOSED: i64 = 0;
@@ -23,6 +23,7 @@ pub const CIRCUIT_HALF_OPEN: i64 = 2;
 pub struct ResilienceMetrics {
     circuit_state: IntGaugeVec,
     provider_up: IntGaugeVec,
+    deprecated_alias: IntCounterVec,
 }
 
 impl ResilienceMetrics {
@@ -47,12 +48,23 @@ impl ResilienceMetrics {
             ),
             &["provider"],
         )?;
+        // Bounded by the configured models: one alias per prefixed id at most.
+        let deprecated_alias = IntCounterVec::new(
+            Opts::new(
+                "lumen_deprecated_model_alias_total",
+                "Requests that named a model by its deprecated bare id (no `provider/` prefix), \
+                 per (alias, model). Drop the aliases once this stays at zero.",
+            ),
+            &["alias", "model"],
+        )?;
         let registry = metrics.registry();
         registry.register(Box::new(circuit_state.clone()))?;
         registry.register(Box::new(provider_up.clone()))?;
+        registry.register(Box::new(deprecated_alias.clone()))?;
         Ok(Self {
             circuit_state,
             provider_up,
+            deprecated_alias,
         })
     }
 
@@ -69,6 +81,13 @@ impl ResilienceMetrics {
         self.provider_up
             .with_label_values(&[provider])
             .set(i64::from(up));
+    }
+
+    /// Count one request that named `model` by its deprecated bare `alias`.
+    pub fn inc_deprecated_alias(&self, alias: &str, model: &str) {
+        self.deprecated_alias
+            .with_label_values(&[alias, model])
+            .inc();
     }
 
     /// Drop a provider's `lumen_provider_up` series (the provider was removed
@@ -96,6 +115,18 @@ mod tests {
         r.set_circuit_state("openai", "gpt-4o", CIRCUIT_CLOSED);
         let out = metrics.encode_text();
         assert!(out.contains("lumen_circuit_state{model=\"gpt-4o\",provider=\"openai\"} 0"));
+    }
+
+    #[test]
+    fn deprecated_alias_counter_counts_per_alias_and_model() {
+        let metrics = Metrics::new();
+        let r = ResilienceMetrics::register(&metrics).unwrap();
+        r.inc_deprecated_alias("gpt-4o", "openai/gpt-4o");
+        r.inc_deprecated_alias("gpt-4o", "openai/gpt-4o");
+        let out = metrics.encode_text();
+        assert!(out.contains(
+            "lumen_deprecated_model_alias_total{alias=\"gpt-4o\",model=\"openai/gpt-4o\"} 2"
+        ));
     }
 
     #[test]

@@ -232,6 +232,7 @@ pub fn decision_links<'a>(
             provider_name: provider.to_owned(),
             model_id: a.model_id.clone(),
             escapes: a.escapes.clone(),
+            breaker_scope: None,
         })
         .collect()
 }

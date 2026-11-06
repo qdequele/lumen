@@ -53,7 +53,7 @@ fn write_config(dir: &Path, upstream: &str) -> PathBuf {
         kind = "cohere"
         base_url = "{upstream}"
         [[providers.models]]
-        id = "rr"
+        id = "cohere/rr"
         upstream_id = "rerank-v3.5"
         capabilities = ["rerank"]
         "#
@@ -119,7 +119,7 @@ async fn last_upstream_auth(upstream: &MockServer) -> String {
 async fn send_rerank(base: &str, client: &reqwest::Client) {
     let resp = client
         .post(format!("{base}/v1/rerank"))
-        .json(&json!({ "model": "rr", "query": "q", "documents": ["a"] }))
+        .json(&json!({ "model": "cohere/rr", "query": "q", "documents": ["a"] }))
         .send()
         .await
         .expect("send rerank");
@@ -173,6 +173,7 @@ async fn rotating_a_db_provider_key_takes_effect_on_reload_without_restart() {
         image_fetch: None,
         token_counter: None,
         health: None,
+        team_pools: None,
     });
     reload_once(&ctx(&path), &targets).await;
 
@@ -253,6 +254,7 @@ async fn reload_makes_an_offline_group_and_member_key_live_and_group_enforced() 
         image_fetch: None,
         token_counter: None,
         health: None,
+        team_pools: None,
     });
     reload_once(&ctx(&path), &targets).await;
 
@@ -279,7 +281,7 @@ const ONE_MODEL_CHAT: &str = r#"
     name = "openai"
     kind = "openai"
     [[providers.models]]
-    id = "gpt"
+    id = "openai/gpt"
     capabilities = ["chat"]
 "#;
 
@@ -288,10 +290,10 @@ const TWO_MODELS_CHAT_EMBED: &str = r#"
     name = "openai"
     kind = "openai"
     [[providers.models]]
-    id = "gpt"
+    id = "openai/gpt"
     capabilities = ["chat"]
     [[providers.models]]
-    id = "embed"
+    id = "openai/embed"
     capabilities = ["embed"]
 "#;
 
@@ -323,6 +325,7 @@ fn reload_targets(registry: Arc<Registry>, metrics: ReloadMetrics) -> ReloadTarg
         image_fetch: None,
         token_counter: None,
         health: None,
+        team_pools: None,
     }
 }
 
@@ -402,7 +405,7 @@ async fn spawn_config_reloader_survives_a_rename_replace_of_a_bare_filename_conf
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
-        if registry.embedding_route("embed").is_some() {
+        if registry.embedding_route("openai/embed").is_some() {
             break;
         }
         assert!(
@@ -428,7 +431,7 @@ fn webhook_config_body(upstream: &str, db: &Path, webhooks: Option<&str>) -> Str
         kind = "cohere"
         base_url = "{upstream}"
         [[providers.models]]
-        id = "rr"
+        id = "cohere/rr"
         upstream_id = "rerank-v3.5"
         capabilities = ["rerank"]
         {block}
@@ -541,6 +544,7 @@ async fn reload_retargets_and_retunes_webhooks_without_dropping_the_queue() {
         image_fetch: None,
         token_counter: None,
         health: None,
+        team_pools: None,
     });
 
     // Reload with a new URL and a new event/threshold set.
@@ -639,6 +643,7 @@ async fn a_stored_webhook_row_wins_over_the_config_block_across_reloads() {
         image_fetch: None,
         token_counter: None,
         health: None,
+        team_pools: None,
     });
 
     // With no stored row, the file wins.
@@ -797,7 +802,7 @@ async fn reading_the_config_file_does_not_start_a_reload_loop() {
 async fn a_real_config_change_still_triggers_exactly_one_reload() {
     let (dir, config_path, registry, metrics, handle) = armed_reloader().await;
     assert!(
-        registry.embedding_route("embed").is_none(),
+        registry.embedding_route("openai/embed").is_none(),
         "the embed model is not routable before the change"
     );
 
@@ -808,7 +813,7 @@ async fn a_real_config_change_still_triggers_exactly_one_reload() {
     // The swap must actually happen: hot reload still works.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
-        if registry.embedding_route("embed").is_some() {
+        if registry.embedding_route("openai/embed").is_some() {
             break;
         }
         assert!(

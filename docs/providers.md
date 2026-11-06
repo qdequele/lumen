@@ -15,13 +15,20 @@ api_key_env = "OPENAI_API_KEY"   # NAME of the env var holding the key
 # base_url = "https://…"  # optional override (required for self-hosted kinds)
 
 [[providers.models]]
-id = "gpt-4o"             # the id clients send (owned entirely by you)
-upstream_id = "gpt-4o-2024-08-06"   # what LUMEN sends upstream (defaults to `id`)
+id = "my-openai/gpt-4o"             # the id clients send: `<provider name>/<model>`
+upstream_id = "gpt-4o-2024-08-06"   # what LUMEN sends upstream (defaults to `id` without `my-openai/`)
 capabilities = ["chat"]   # any of "chat", "embed", "rerank", "decisions"
 release_date = "2024-08-06"   # optional; lets clients sort GET /v1/models by release
+# disabled = true         # optional; takes the model out of service without deleting it
 ```
 
 Rules that apply to every provider:
+
+- **Model ids are `<provider name>/<model>`.** The prefix is the provider's
+  `name` (here `my-openai`), so the id says where a request goes. A bare id or
+  another prefix is rejected at load and on the admin API; `lumen config
+  migrate` prefixes an older config, and the old bare ids keep resolving as
+  hidden deprecated aliases (see [virtual models](virtual-models.md#1-foundation-models-vs-virtual-models)).
 
 - **API keys are never in the config.** `api_key_env` names an environment
   variable; LUMEN reads it only when a request actually routes to that
@@ -32,6 +39,13 @@ Rules that apply to every provider:
   returns it as `release_date` and as the OpenAI integer `created` (Unix
   seconds, midnight UTC); both are omitted for an undated model. It never
   affects routing.
+- **`disabled = true` takes a model out of service** without deleting it. It
+  stays in the config (prices, and virtual models naming it, stay valid), but
+  it is not listed on `GET /v1/models` and a request for it is `404`
+  `LM-2001`, like an unknown id; so is its deprecated bare alias. A virtual
+  model skips it like any target the gateway does not serve. Re-enable it by removing the field (or setting it to
+  `false`). Through the admin API it is the model's `disabled` field in
+  `PUT /admin/config/providers/{name}`.
 - **Model ids are globally unique** across all providers. A collision aborts
   startup and names both offending providers. Several ids may map to one
   `upstream_id` (versioned aliasing).
@@ -82,7 +96,7 @@ The `together` kind (in the OpenAI-compatible table below) additionally serves
 
 OpenAI-compatible hosts (chat + embed via the OpenAI path). The Embed column
 reflects what each host actually serves upstream: `groq`, `deepseek`,
-`openrouter`, `perplexity` and `xai` expose no `/embeddings` endpoint (`perplexity`
+`perplexity` and `xai` expose no `/embeddings` endpoint (`perplexity`
 and `cloudflare` do serve `decisions`, see [Decisions by provider
 kind](#decisions-by-provider-kind)), so a
 model declaring `embed` on those kinds is **rejected at config load** (it
@@ -96,7 +110,7 @@ embeddings:
 | `together`    |  ✅  |  ✅   | required      | optional     | `https://api.together.xyz/v1`             |
 | `fireworks`   |  ✅  |  ✅   | required      | optional     | `https://api.fireworks.ai/inference/v1`   |
 | `deepseek`    |  ✅  |  no   | required      | optional     | `https://api.deepseek.com/v1`             |
-| `openrouter`  |  ✅  |  no   | required      | optional     | `https://openrouter.ai/api/v1`            |
+| `openrouter`  |  ✅  |  ✅   | required      | optional     | `https://openrouter.ai/api/v1`            |
 | `perplexity`  |  ✅  |  no   | required      | optional     | `https://api.perplexity.ai`               |
 | `xai`         |  ✅  |  no   | required      | optional     | `https://api.x.ai/v1`                     |
 | `deepinfra`   |  ✅  |  ✅   | required      | optional     | `https://api.deepinfra.com/v1/openai`     |
@@ -141,16 +155,16 @@ kind = "openai"
 api_key_env = "OPENAI_API_KEY"
 
 [[providers.models]]
-id = "gpt-4o"
+id = "openai/gpt-4o"
 upstream_id = "gpt-4o-2024-08-06"
 capabilities = ["chat"]
 
 [[providers.models]]
-id = "text-embedding-3-small"
+id = "openai/text-embedding-3-small"
 capabilities = ["embed"]
 
 [[providers.models]]
-id = "gpt-6-luna"
+id = "openai/gpt-6-luna"
 capabilities = ["decisions"]
 modalities = ["text", "image"]
 cost_per_1m_input = 0.10
@@ -170,7 +184,7 @@ kind = "mistral"
 api_key_env = "MISTRAL_API_KEY"
 
 [[providers.models]]
-id = "mistral-small"
+id = "mistral/mistral-small"
 upstream_id = "mistral-small-latest"
 capabilities = ["chat"]
 ```
@@ -196,7 +210,7 @@ kind = "anthropic"
 api_key_env = "ANTHROPIC_API_KEY"
 
 [[providers.models]]
-id = "claude-sonnet-4-5"
+id = "anthropic/claude-sonnet-4-5"
 upstream_id = "claude-sonnet-4-5-20250929"
 capabilities = ["chat"]
 ```
@@ -230,12 +244,12 @@ kind = "google"
 api_key_env = "GEMINI_API_KEY"
 
 [[providers.models]]
-id = "gemini-2.0-flash"
+id = "google/gemini-2.0-flash"
 upstream_id = "gemini-2.0-flash"
 capabilities = ["chat"]
 
 [[providers.models]]
-id = "gemini-embedding-001"
+id = "google/gemini-embedding-001"
 capabilities = ["embed"]
 ```
 
@@ -284,12 +298,12 @@ api_key_env = "VERTEX_SA_JSON"
 base_url = "us-central1"   # GCP region
 
 [[providers.models]]
-id = "gemini-flash-vertex"
+id = "vertex/gemini-flash-vertex"
 upstream_id = "gemini-2.0-flash"
 capabilities = ["chat"]
 
 [[providers.models]]
-id = "gemini-embedding-vertex"
+id = "vertex/gemini-embedding-vertex"
 upstream_id = "gemini-embedding-001"
 capabilities = ["embed"]
 ```
@@ -362,18 +376,18 @@ base_url = "https://bedrock-runtime.us-east-1.amazonaws.com"
 # api_key_env = "AWS_SECRET_ACCESS_KEY"   # optional secret override
 
 [[providers.models]]
-id = "bedrock-claude-sonnet-4-5"
+id = "bedrock/bedrock-claude-sonnet-4-5"
 upstream_id = "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
 capabilities = ["chat"]
 modalities = ["text", "image"]
 
 [[providers.models]]
-id = "bedrock-titan-embed"
+id = "bedrock/bedrock-titan-embed"
 upstream_id = "amazon.titan-embed-text-v2:0"
 capabilities = ["embed"]
 
 [[providers.models]]
-id = "bedrock-cohere-embed"
+id = "bedrock/bedrock-cohere-embed"
 upstream_id = "cohere.embed-english-v3"
 capabilities = ["embed"]
 ```
@@ -411,7 +425,7 @@ capabilities = ["embed"]
   and the gateway cannot know query-vs-document intent, so it defaults to
   `search_document` (the indexing case). Set `input_type` as an extra field on
   the `/v1/embeddings` request body to override it per request, e.g.
-  `{"model": "embed-multilingual", "input": "...", "input_type": "search_query"}`.
+  `{"model": "cohere/embed-multilingual", "input": "...", "input_type": "search_query"}`.
   Allowed values: `search_document`, `search_query`, `classification`,
   `clustering`. An unrecognized value is rejected with `LM-1001` before any
   upstream call. The field is consumed at the gateway: only the Cohere
@@ -426,18 +440,18 @@ kind = "cohere"
 api_key_env = "COHERE_API_KEY"
 
 [[providers.models]]
-id = "command-r-plus"
+id = "cohere/command-r-plus"
 upstream_id = "command-r-plus-08-2024"
 capabilities = ["chat"]
 
 [[providers.models]]
-id = "rerank-english"
+id = "cohere/rerank-english"
 upstream_id = "rerank-v3.5"
 capabilities = ["rerank"]
 cost_per_1k_searches = 2.0
 
 [[providers.models]]
-id = "embed-multilingual"
+id = "cohere/embed-multilingual"
 upstream_id = "embed-v4.0"
 capabilities = ["embed", "rerank"]
 ```
@@ -455,7 +469,7 @@ kind = "jina"
 api_key_env = "JINA_API_KEY"
 
 [[providers.models]]
-id = "jina-rerank"
+id = "jina/jina-rerank"
 upstream_id = "jina-reranker-v2-base-multilingual"
 capabilities = ["rerank"]
 ```
@@ -473,7 +487,7 @@ kind = "voyage"
 api_key_env = "VOYAGE_API_KEY"
 
 [[providers.models]]
-id = "voyage-rerank"
+id = "voyage/voyage-rerank"
 upstream_id = "rerank-2"
 capabilities = ["rerank"]
 ```
@@ -497,7 +511,7 @@ kind = "mixedbread"
 api_key_env = "MXBAI_API_KEY"
 
 [[providers.models]]
-id = "mxbai-rerank"
+id = "mixedbread/mxbai-rerank"
 upstream_id = "mixedbread-ai/mxbai-rerank-large-v1"
 capabilities = ["rerank"]
 ```
@@ -522,7 +536,7 @@ kind = "pinecone"
 api_key_env = "PINECONE_API_KEY"
 
 [[providers.models]]
-id = "pinecone-rerank"
+id = "pinecone/pinecone-rerank"
 upstream_id = "pinecone-rerank-v0"
 capabilities = ["rerank"]
 ```
@@ -577,7 +591,7 @@ kind = "typesafe"
 api_key_env = "TYPESAFE_API_KEY"
 
 [[providers.models]]
-id = "jev"
+id = "typesafe/jev"
 upstream_id = "jev-latest"
 capabilities = ["decisions"]
 cost_per_1m_input = 0.042
@@ -592,21 +606,21 @@ cost_per_1m_input = 0.042
 # Clients call `jev-1.13.0`; it falls back to the stable alias when the pinned
 # version is overloaded (529) or its circuit is open.
 [[virtual_models]]
-id = "jev-1.13.0"
+id = "lumen/jev-1.13.0"
 capability = "decisions"
 strategy = "fallback"
-targets = [{ model = "typesafe/jev-1.13.0" }, { model = "jev" }]
+targets = [{ model = "typesafe/jev-1.13.0" }, { model = "typesafe/jev" }]
 
 # Jev as a reranker: plain /v1/rerank, one predicate question per document. A
 # `typesafe` model cannot declare `rerank` itself; a virtual model's `remap`
 # does the conversion (see docs/virtual-models.md).
 [[virtual_models]]
-id = "jev-rerank"
+id = "lumen/jev-rerank"
 capability = "rerank"
 strategy = "single"
 
 [[virtual_models.targets]]
-model = "jev"
+model = "typesafe/jev"
 remap = { strategy = "predicate" }
 ```
 
@@ -628,7 +642,7 @@ decisions_path = "/decisions/v1/systemone"
 forward_unknown_fields = false
 api_key_env = "LIQUID_API_KEY"
 [[providers.models]]
-id = "liquid-d1"
+id = "liquid/liquid-d1"
 upstream_id = "d1"
 capabilities = ["decisions"]
 
@@ -640,7 +654,7 @@ base_url = "https://api.inceptionlabs.ai"
 decisions_path = "/v1/decisions"
 api_key_env = "INCEPTION_API_KEY"
 [[providers.models]]
-id = "mercury-decide"
+id = "inception/mercury-decide"
 upstream_id = "mercury-decide"
 capabilities = ["decisions"]
 
@@ -650,7 +664,7 @@ name = "kev"
 kind = "typesafe"
 base_url = "http://localhost:8000"
 [[providers.models]]
-id = "kev"
+id = "kev/kev"
 upstream_id = "kev"
 capabilities = ["decisions"]
 ```
@@ -718,7 +732,7 @@ base_url = "http://localhost:8000"
 # api_key_env = "NVIDIA_API_KEY"   # only for the hosted API
 
 [[providers.models]]
-id = "nvidia-rerank"
+id = "nvidia-nim/nvidia-rerank"
 upstream_id = "nvidia/llama-3.2-nv-rerankqa-1b-v2"
 capabilities = ["rerank"]
 ```
@@ -738,7 +752,7 @@ kind = "together"
 api_key_env = "TOGETHER_API_KEY"
 
 [[providers.models]]
-id = "llama-rank"
+id = "together/llama-rank"
 upstream_id = "Salesforce/Llama-Rank-V1"
 capabilities = ["rerank"]
 ```
@@ -759,7 +773,7 @@ kind = "tei"
 base_url = "http://localhost:8081"
 
 [[providers.models]]
-id = "bge-reranker"
+id = "tei-local/bge-reranker"
 upstream_id = "BAAI/bge-reranker-large"
 capabilities = ["rerank"]
 ```
@@ -803,17 +817,17 @@ total_timeout_ms = 120000
 connect_timeout_ms = 10000  # optional: own client, relaxed connect deadline
 
 [[providers.models]]
-id = "local-llama"
+id = "ollama-local/local-llama"
 upstream_id = "llama3.2"
 capabilities = ["chat"]
 
 [[providers.models]]
-id = "nomic-embed"
+id = "ollama-local/nomic-embed"
 upstream_id = "nomic-embed-text"
 capabilities = ["embed"]
 
 [[providers.models]]
-id = "nimble"
+id = "ollama-local/nimble"
 upstream_id = "nimble"
 capabilities = ["decisions"]
 ```
@@ -852,12 +866,12 @@ base_url = "https://my-resource.openai.azure.com"
 api_version = "2024-10-21"
 
 [[providers.models]]
-id = "gpt-4o"
+id = "azure-openai/gpt-4o"
 upstream_id = "my-gpt4o-deployment"   # the Azure deployment name
 capabilities = ["chat"]
 
 [[providers.models]]
-id = "azure-embed"
+id = "azure-openai/azure-embed"
 upstream_id = "my-embedding-deployment"
 capabilities = ["embed"]
 ```
@@ -877,9 +891,28 @@ name = "groq"
 kind = "groq"
 api_key_env = "GROQ_API_KEY"
 [[providers.models]]
-id = "fast"
+id = "groq/fast"
 upstream_id = "llama-3.3-70b-versatile"
 capabilities = ["chat"]
+```
+
+### openrouter
+
+Chat and embeddings, both through OpenRouter's OpenAI-format API
+(`/chat/completions` and `/embeddings`). `upstream_id` is OpenRouter's
+`vendor/model` id; the embedding catalog is listed at
+`https://openrouter.ai/api/v1/embeddings/models`. Token counts come from the
+upstream `usage` (OpenRouter's extra `usage.cost` fields are ignored).
+
+```toml
+[[providers]]
+name = "openrouter"
+kind = "openrouter"
+api_key_env = "OPENROUTER_API_KEY"
+[[providers.models]]
+id = "openrouter/titan-embed"
+upstream_id = "amazon/titan-embed-text-v2"
+capabilities = ["embed"]
 ```
 
 ### huggingface
@@ -894,7 +927,7 @@ name = "hf"
 kind = "huggingface"
 api_key_env = "HF_TOKEN"
 [[providers.models]]
-id = "qwen"
+id = "hf/qwen"
 upstream_id = "Qwen/Qwen2.5-72B-Instruct"
 capabilities = ["chat"]
 ```
@@ -926,15 +959,15 @@ kind = "cloudflare"
 api_key_env = "CLOUDFLARE_API_TOKEN"
 base_url = "https://api.cloudflare.com/client/v4/accounts/YOUR_ACCOUNT_ID/ai/v1"
 [[providers.models]]
-id = "cf-llama"
+id = "cf/cf-llama"
 upstream_id = "@cf/meta/llama-3.1-8b-instruct"
 capabilities = ["chat"]
 [[providers.models]]
-id = "cf-rerank"
+id = "cf/cf-rerank"
 upstream_id = "@cf/baai/bge-reranker-base"
 capabilities = ["rerank"]
 [[providers.models]]
-id = "clef"
+id = "cf/clef"
 upstream_id = "clef"
 capabilities = ["decisions"]
 modalities = ["text", "image"]
@@ -956,10 +989,10 @@ name = "perplexity"
 kind = "perplexity"
 api_key_env = "PERPLEXITY_API_KEY"
 [[providers.models]]
-id = "sonar"
+id = "perplexity/sonar"
 capabilities = ["chat"]
 [[providers.models]]
-id = "pplx-decider"
+id = "perplexity/pplx-decider"
 upstream_id = "pplx-decider-v1.1-27b"
 capabilities = ["decisions"]
 modalities = ["text", "image"]
@@ -981,7 +1014,7 @@ name = "local"
 kind = "vllm"
 base_url = "http://localhost:8000/v1"
 [[providers.models]]
-id = "local-llama"
+id = "local/local-llama"
 upstream_id = "meta-llama/Llama-3.1-8B-Instruct"
 capabilities = ["chat", "embed"]
 ```
@@ -1072,7 +1105,7 @@ user message can carry text and image parts in one array:
 
 ```json
 {
-  "model": "gpt-4o",
+  "model": "openai/gpt-4o",
   "messages": [{
     "role": "user",
     "content": [
@@ -1091,7 +1124,7 @@ declares the `image` modality (default is `["text"]`):
 
 ```toml
 [[providers.models]]
-id = "gpt-4o"
+id = "openai/gpt-4o"
 capabilities = ["chat"]
 modalities = ["text", "image"]   # opts this model into vision
 ```
@@ -1184,12 +1217,68 @@ upstream_id = "gpt-4o"
 capabilities = ["chat"]
 
 [[virtual_models]]
-id = "gpt-4o"
+id = "lumen/gpt-4o"
 capability = "chat"
 strategy = "fallback"
-targets = [{ model = "openai/gpt-4o" }, { model = "claude-sonnet-4-5" }]   # different vendor, same capability
+targets = [{ model = "openai/gpt-4o" }, { model = "anthropic/claude-sonnet-4-5" }]   # different vendor, same capability
 ```
 
 See [`docs/adr/005-resilience-execution.md`](adr/005-resilience-execution.md)
 for the resolution and circuit-breaker details, and `config.example.toml` for a
 fully worked multi-provider setup including a three-vendor rerank fallback chain.
+
+## Team provider keys (BYOK)
+
+On the hosted gateway a budget group (one Lab account) can bring its own API
+keys for a provider ([ADR 018](adr/018-team-provider-keys-and-bandwidth.md)).
+Only kinds that take a plain API key on the vendor URL are eligible: openai,
+anthropic, mistral, cohere, jina, voyage, groq, together, fireworks, deepseek,
+openrouter, perplexity, xai, deepinfra. Azure, Bedrock, Google/Vertex and
+keyless kinds are not.
+
+- A group holds up to 10 keys per provider, managed under
+  `/admin/groups/{id}/byok` (keys are sealed at rest and only `label`, `last4`
+  and status are ever returned).
+- Keys are used round-robin. A 429 benches a key for `max(Retry-After, 30s)`;
+  a 401/403 marks it failing for 10 minutes.
+- When no team key is usable, the request goes to the platform's key only if
+  the provider's `fallback` is on (default off); otherwise it fails with
+  `LM-3021` (429) without calling upstream. With fallback off, later links of
+  a fallback chain that have no team pool also refuse, so a chain never
+  reaches the platform's keys.
+- Team-served requests carry no token cost; the gateway bills bandwidth
+  instead (request plus response bytes, only when an upstream call was sent).
+- A link served from a group's team keys has its own circuit breaker, keyed
+  by (provider, model, group): platform-key failures (say a run of 429s on
+  the platform key) never stop a team served on its own keys, and a team's
+  failing keys never open the breaker for platform traffic. The
+  `lumen_circuit_state` gauge reports platform breakers only.
+- When an earlier link of a chain failed upstream and a later link is refused
+  because the fallback is off, the client gets the earlier error, not
+  `LM-3021`.
+
+## Platform provider key pools
+
+The platform's own keys (Meilisearch's, on the hosted gateway) can also be a
+pool per provider ([ADR 019](adr/019-platform-provider-key-pools.md)), managed
+under `/admin/platform-keys` (platform-only: master key, no
+`X-Lumen-Account-Ref`). The same kinds are eligible as for team keys.
+
+- A provider holds up to 20 platform keys, each with a label and an
+  `enabled` flag. Keys are sealed at rest; only `label`, `last4`, `enabled`
+  and status are ever returned.
+- Wherever the platform key served a request before (no team pool, or a team
+  pool with the fallback on and no usable team key), the pool's enabled keys
+  are tried round-robin with the team-key rules: a 429 benches a key for
+  `max(Retry-After, 30s)`, a 401/403 marks it failing for 10 minutes.
+- A provider with at least one platform key, enabled or not, has a pool, and
+  its configured key (`api_key_env` or `PUT /admin/provider-keys/{name}`) is
+  then ignored. When no pool key is usable, the request ends with the last
+  pool error (a 429 when every key is benched). When every key is disabled,
+  it fails `LM-3022` (503) without calling upstream.
+- Only once the provider's last platform key is deleted does its configured
+  key serve again.
+- A team whose fallback is off never reaches the platform pool, directly or
+  through a fallback chain (`LM-3021`, as above).
+- Pool-served requests are platform requests: tokens are billed and the
+  platform circuit breaker applies.

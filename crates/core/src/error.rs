@@ -145,6 +145,28 @@ pub enum ProviderError {
         /// The upstream `Retry-After`, if provided.
         retry_after: Option<Duration>,
     },
+
+    /// Every team (BYOK) key of the request's group for this provider is
+    /// rate-limited or failing, and the group did not turn on the fallback
+    /// to the platform's keys. Decided by the gateway: never retried, never
+    /// a provider fault (the breaker is untouched); a fallback chain may move
+    /// on under its `rate_limited` trigger. Maps to LM-3021.
+    #[error("every team key for provider '{provider}' is rate-limited or failing")]
+    TeamKeysExhausted {
+        /// The provider whose team pool is exhausted.
+        provider: String,
+    },
+
+    /// The provider has a platform key pool (ADR 019) but every key of it is
+    /// disabled. The pool replaces the deployment's configured key, so no
+    /// key is left to serve the request. Decided by the gateway: never
+    /// retried, never a provider fault (the breaker is untouched); a fallback
+    /// chain may move on under its `provider_error` trigger. Maps to LM-3022.
+    #[error("every platform key for provider '{provider}' is disabled")]
+    PlatformKeysDisabled {
+        /// The provider whose platform pool has no enabled key.
+        provider: String,
+    },
 }
 
 impl ProviderError {
@@ -170,7 +192,9 @@ impl ProviderError {
             | ProviderError::UnsupportedField { .. }
             | ProviderError::UnsupportedInput { .. }
             | ProviderError::ContextLengthExceeded { .. }
-            | ProviderError::ContentFiltered { .. } => false,
+            | ProviderError::ContentFiltered { .. }
+            | ProviderError::TeamKeysExhausted { .. }
+            | ProviderError::PlatformKeysDisabled { .. } => false,
         }
     }
 
@@ -194,7 +218,9 @@ impl ProviderError {
             | ProviderError::UnsupportedField { .. }
             | ProviderError::UnsupportedInput { .. }
             | ProviderError::ContextLengthExceeded { .. }
-            | ProviderError::ContentFiltered { .. } => false,
+            | ProviderError::ContentFiltered { .. }
+            | ProviderError::TeamKeysExhausted { .. }
+            | ProviderError::PlatformKeysDisabled { .. } => false,
         }
     }
 
@@ -429,6 +455,22 @@ pub enum GatewayError {
         retry_after: Option<Duration>,
     },
 
+    /// Every team (BYOK) key of the caller's group for the provider is
+    /// rate-limited or failing and the platform fallback is off. Decided
+    /// before any further upstream call; the message tells the team how to
+    /// recover and never names a key.
+    #[error(
+        "All of your team's API keys for provider '{provider}' are rate-limited or failing. \
+         Add a key or turn on fallback to Meilisearch's keys."
+    )]
+    TeamKeysExhausted { provider: String },
+
+    /// The provider's platform key pool (ADR 019) has no enabled key, and the
+    /// pool replaces the configured key: an operator must enable or add a
+    /// key. Never names a key.
+    #[error("No key is enabled for provider '{provider}' on this gateway.")]
+    PlatformKeysDisabled { provider: String },
+
     // ---- Auth / budget errors (LM-4xxx, codes pinned by the M5 spec) --------
     /// A hard budget the key is subject to is exhausted: its own
     /// `budget_max`, or its budget group's shared pool (ADR 009). Enforced
@@ -503,6 +545,8 @@ impl GatewayError {
             GatewayError::UpstreamConnectTimeout { .. } => "LM-3012",
             GatewayError::UpstreamTotalTimeout { .. } => "LM-3013",
             GatewayError::CircuitOpen { .. } => "LM-3020",
+            GatewayError::TeamKeysExhausted { .. } => "LM-3021",
+            GatewayError::PlatformKeysDisabled { .. } => "LM-3022",
             GatewayError::BudgetExceeded { .. } => "LM-4001",
             GatewayError::QuotaExceeded {
                 quota: QuotaKind::Rpm,
@@ -544,7 +588,9 @@ impl GatewayError {
             | GatewayError::NotFound(_) => 404,
             GatewayError::PayloadTooLarge { .. } => 413,
             GatewayError::ConfigStale(_) => 412,
-            GatewayError::QuotaExceeded { .. } | GatewayError::UpstreamRateLimited { .. } => 429,
+            GatewayError::QuotaExceeded { .. }
+            | GatewayError::UpstreamRateLimited { .. }
+            | GatewayError::TeamKeysExhausted { .. } => 429,
             // Nonstandard, but the conventional "client closed request" status
             // (nginx 499): the client is normally already gone, so this status
             // exists for logs/metrics, not for anything the client reads. Not
@@ -555,7 +601,9 @@ impl GatewayError {
             | GatewayError::UpstreamInvalidResponse { .. }
             | GatewayError::UpstreamStreamInterrupted { .. }
             | GatewayError::ImageFetchFailed => 502,
-            GatewayError::UpstreamUnavailable { .. } | GatewayError::CircuitOpen { .. } => 503,
+            GatewayError::UpstreamUnavailable { .. }
+            | GatewayError::CircuitOpen { .. }
+            | GatewayError::PlatformKeysDisabled { .. } => 503,
             GatewayError::UpstreamTimeout { .. }
             | GatewayError::UpstreamFirstTokenTimeout { .. }
             | GatewayError::UpstreamConnectTimeout { .. }
@@ -597,6 +645,8 @@ impl GatewayError {
             | GatewayError::UpstreamConnectTimeout { .. }
             | GatewayError::UpstreamTotalTimeout { .. }
             | GatewayError::CircuitOpen { .. }
+            | GatewayError::TeamKeysExhausted { .. }
+            | GatewayError::PlatformKeysDisabled { .. }
             | GatewayError::UpstreamRateLimited { .. } => ErrorType::UpstreamError,
             GatewayError::Internal(_) => ErrorType::Internal,
             GatewayError::ClientCancelled => ErrorType::ClientCancelled,
@@ -732,6 +782,14 @@ impl GatewayError {
             // LM-6001 / 499, so it never inflates `internal`/5xx metrics or
             // alerts the way `GatewayError::Internal` would (issue #11).
             ProviderError::Cancelled => GatewayError::ClientCancelled,
+            ProviderError::TeamKeysExhausted { provider: p } => GatewayError::TeamKeysExhausted {
+                provider: p_or(provider, p),
+            },
+            ProviderError::PlatformKeysDisabled { provider: p } => {
+                GatewayError::PlatformKeysDisabled {
+                    provider: p_or(provider, p),
+                }
+            }
         }
     }
 }
@@ -1008,6 +1066,39 @@ mod tests {
             GatewayError::UpstreamConnectTimeout { provider } => assert_eq!(&provider, "openai"),
             other => panic!("expected UpstreamConnectTimeout, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn platform_keys_disabled_is_an_lm_3022_503_that_never_retries() {
+        let err = ProviderError::PlatformKeysDisabled {
+            provider: "openai".into(),
+        };
+        assert!(!err.is_retryable());
+        assert!(!err.is_provider_fault(), "the breaker must ignore it");
+        let ge = GatewayError::from_provider("ignored", err);
+        assert_eq!(ge.code(), "LM-3022");
+        assert_eq!(ge.http_status(), 503);
+        assert_eq!(
+            ge.public_message(),
+            "No key is enabled for provider 'openai' on this gateway."
+        );
+    }
+
+    #[test]
+    fn team_keys_exhausted_is_an_lm_3021_429_that_never_retries() {
+        let err = ProviderError::TeamKeysExhausted {
+            provider: "openai".into(),
+        };
+        assert!(!err.is_retryable());
+        assert!(!err.is_provider_fault(), "the breaker must ignore it");
+        let ge = GatewayError::from_provider("ignored", err);
+        assert_eq!(ge.code(), "LM-3021");
+        assert_eq!(ge.http_status(), 429);
+        assert_eq!(
+            ge.public_message(),
+            "All of your team's API keys for provider 'openai' are rate-limited or failing. \
+             Add a key or turn on fallback to Meilisearch's keys."
+        );
     }
 
     #[test]

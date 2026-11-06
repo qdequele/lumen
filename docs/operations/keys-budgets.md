@@ -94,6 +94,10 @@ together, so they take effect immediately with no restart.
 | `DELETE` | `/admin/groups/{id}` | Soft-delete a group. Refused while it still has active member keys. |
 | `POST` | `/admin/groups/{id}/grant` | Atomically add to a group's shared budget cap (concurrency-safe top-up). |
 | `PUT` | `/admin/provider-keys/{name}` | Store a provider API key encrypted at rest. |
+| `GET` | `/admin/platform-keys` | List each provider's platform key pool (ADR 019). |
+| `POST` | `/admin/platform-keys/{provider}/keys` | Add a key to a provider's platform pool. |
+| `PATCH` | `/admin/platform-keys/{provider}/keys/{key_id}` | Enable or disable a platform pool key. |
+| `DELETE` | `/admin/platform-keys/{provider}/keys/{key_id}` | Delete a platform pool key. |
 | `POST` | `/admin/providers/{name}/check` | Check a provider's live credentials without spending tokens. |
 | `GET` | `/admin/usage` | Aggregated usage and spend from the usage log. |
 

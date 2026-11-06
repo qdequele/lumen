@@ -111,7 +111,7 @@ kind = "typesafe"
 api_key_env = "TYPESAFE_API_KEY"
 
   [[providers.models]]
-  id = "jev"
+  id = "typesafe/jev"
   upstream_id = "jev-latest"
   capabilities = ["systemone"]
   cost_per_1m_input = 0.042
@@ -122,23 +122,23 @@ kind = "cohere"
 api_key_env = "COHERE_API_KEY"
 
   [[providers.models]]
-  id = "cohere-rerank"
+  id = "cohere/cohere-rerank"
   upstream_id = "rerank-v3.5"
   capabilities = ["rerank"]
 
 # Decided form (ADR 014): a rerank virtual model whose target carries the
 # mapping as a `remap`, with a classic reranker as its fallback.
 [[virtual_models]]
-id = "legal-rerank"                # what clients send as `model`
+id = "lumen/legal-rerank"                # what clients send as `model`
 capability = "rerank"
 strategy = "fallback"
 
   [[virtual_models.targets]]
-  model = "jev"
+  model = "typesafe/jev"
   remap = { strategy = "noul", instructions = "Could `document` be the precedent cited in the query?", context = "US federal case law. Prefer holdings over dicta.", criteria = { true = "The document states the specific rule the query cites.", false = "The document is only on a similar topic." } }
 
   [[virtual_models.targets]]
-  model = "cohere-rerank"          # a Jev-backed rerank can fall back to Cohere
+  model = "cohere/cohere-rerank"          # a Jev-backed rerank can fall back to Cohere
 ```
 
 The client picks the mapping by picking the model. Per-tenant mappings are

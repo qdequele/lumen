@@ -38,11 +38,17 @@ use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
 use bytes::Bytes;
 use futures::stream::{BoxStream, StreamExt};
-use lumen_core::{tokens, Capability, ChatRequest, GatewayError, ProviderError, Usage};
+use std::sync::Arc;
+
+use lumen_core::{
+    tokens, Capability, ChatProvider, ChatRequest, GatewayError, ProviderError, Usage,
+};
 use tokio_util::sync::{CancellationToken, DropGuard};
 
 use crate::accounting::{Accounting, Outcome, StreamAccounting, Target, TokenBreakdown};
 use crate::auth::AuthedKey;
+use crate::bandwidth::UpstreamMark;
+use crate::byok::{RequestKeys, Served};
 use crate::error::ApiError;
 use crate::facts::Facts;
 use crate::pricing::DEFAULT_RESERVED_OUTPUT_TOKENS;
@@ -62,6 +68,7 @@ pub async fn chat(
     State(state): State<AppState>,
     headers: HeaderMap,
     key: Option<Extension<AuthedKey>>,
+    Extension(mark): Extension<UpstreamMark>,
     payload: Result<Json<ChatRequest>, JsonRejection>,
 ) -> Result<Response, ApiError> {
     // Malformed body → LM-1001 in our envelope (not axum's plain-text default).
@@ -85,7 +92,8 @@ pub async fn chat(
     // that `switch` conditions read (ADR 014, ADR 003). It depends only on the
     // requested id, and is applied exactly once. Facts are dropped before any
     // `.await`.
-    let client_model = req.model.clone();
+    // A deprecated bare id (`gpt-4o`) resolves to its `provider/model` id.
+    let client_model = state.resilience.canonical_model(&req.model);
     let mut decision = {
         let (headers, key, req) = (&headers, key.as_deref(), &mut req);
         state
@@ -101,7 +109,7 @@ pub async fn chat(
     let chain = lumen_router::resolve_chat_decision(&state.registry, &mut decision)?;
     let primary = decision.primary_model().to_owned();
     enforce_image_support(&state, &primary, &chain, &req)?;
-    let links = lumen_router::decision_links(
+    let mut links = lumen_router::decision_links(
         &decision,
         chain.iter().map(|l| l.route.provider_name.as_str()),
     );
@@ -111,10 +119,22 @@ pub async fn chat(
     // estimate (prompt heuristic + `max_tokens`, or a default output
     // reservation) against the key's budget; TPM counts the same estimate.
     // The reservation is settled to the real usage afterwards.
+    // A primary served by the group's own keys (BYOK) reserves no token
+    // cost; a fallback to the platform key settles at its real cost.
+    let keys = RequestKeys::new(&state.team_pools, key.as_deref()).for_chain(
+        &state.registry,
+        chain.iter().map(|l| l.route.provider_name.as_str()),
+    );
+    // Links served from a team pool get their own breaker (ADR 018).
+    keys.scope_links(&state.registry, &mut links);
     let pricing = state.pricing();
     let estimated_input = tokens::estimate_chat_prompt(&req);
     let reserved_output = reserved_output_tokens(&decision, &req);
-    let estimated_cost = pricing.token_cost(&primary, estimated_input, reserved_output);
+    let estimated_cost = if keys.has_usable_pool(&chain[0].route.provider_name) {
+        0.0
+    } else {
+        pricing.token_cost(&primary, estimated_input, reserved_output)
+    };
     let accounting = Accounting::begin(
         &state,
         &headers,
@@ -142,6 +162,8 @@ pub async fn chat(
         cancel: &cancel,
         req: &req,
         estimated_input,
+        mark: &mark,
+        keys: &keys,
     };
     if req.stream {
         chat_streaming(&ctx, guard, accounting).await
@@ -262,6 +284,8 @@ struct ChatExec<'a> {
     cancel: &'a CancellationToken,
     req: &'a ChatRequest,
     estimated_input: u64,
+    mark: &'a UpstreamMark,
+    keys: &'a RequestKeys,
 }
 
 /// Streaming path: open the upstream byte stream and peek its first frame with
@@ -281,7 +305,7 @@ async fn chat_streaming(
         &ctx.exec,
         ctx.cancel,
         |i| {
-            let provider = ctx.chain[i].route.provider.clone();
+            let platform = ctx.chain[i].route.provider.clone();
             let provider_name = ctx.chain[i].route.provider_name.clone();
             let cancel = ctx.cancel.clone();
             let mut attempt_req = ctx.req.clone();
@@ -291,6 +315,7 @@ async fn chat_streaming(
                 .route
                 .upstream_id
                 .clone_into(&mut attempt_req.model);
+            let (keys, registry, mark) = (ctx.keys, &*ctx.state.registry, ctx.mark);
             async move {
                 // Open, then PEEK the first frame before committing (ADR 005,
                 // 2026-07-15 amendment). An upstream that opens 200 then errors
@@ -299,16 +324,34 @@ async fn chat_streaming(
                 // error. The whole open + peek is bounded by the executor's
                 // per-attempt first_token timeout, so a silent upstream fails
                 // over too. Once a content frame arrives we commit and the M4
-                // frame guards own the rest (no mid-stream retry).
-                let stream = provider
-                    .chat_stream_bytes(attempt_req, cancel.clone())
-                    .await?;
-                lumen_router::peek::peek_first_frame(stream, &provider_name, &cancel).await
+                // frame guards own the rest (no mid-stream retry). Marked only
+                // when an upstream call is actually sent (platform or team key).
+                let open = |provider: Option<Arc<dyn ChatProvider>>| {
+                    let (req, cancel, name) =
+                        (attempt_req.clone(), cancel.clone(), provider_name.clone());
+                    async move {
+                        let provider = provider.ok_or(ProviderError::Unavailable {
+                            provider: name.clone(),
+                        })?;
+                        mark.mark();
+                        let stream = provider.chat_stream_bytes(req, cancel.clone()).await?;
+                        lumen_router::peek::peek_first_frame(stream, &name, &cancel).await
+                    }
+                };
+                keys.attempt(
+                    registry,
+                    i,
+                    &provider_name,
+                    || open(Some(platform)),
+                    |set| open(set.chat.clone()),
+                )
+                .await
             }
         },
     )
     .await?;
     // (an early return above drops `accounting`, refunding the reservation)
+    let (stream, served) = executed.value;
     accounting.served_by(&executed.model_used, &executed.provider_used);
     let route = ctx.decision.route_of(executed.index);
     accounting.set_route(route);
@@ -319,9 +362,13 @@ async fn chat_streaming(
     // M4 frame guards (LM-3010/3011, heartbeat) own the stream from here - no
     // more retries.
     let deadline = tokio::time::Instant::now() + ctx.exec.first_token;
-    let stream_accounting = StreamAccounting::new(accounting, ctx.estimated_input);
+    let stream_accounting = StreamAccounting::new(
+        accounting,
+        ctx.estimated_input,
+        matches!(served, Served::Platform),
+    );
     let body = Body::from_stream(to_event_stream(
-        executed.value,
+        stream,
         executed.provider_used.clone(),
         guard,
         ctx.state.guards,
@@ -353,7 +400,8 @@ async fn chat_non_streaming(
         &ctx.exec,
         ctx.cancel,
         |i| {
-            let provider = ctx.chain[i].route.provider.clone();
+            let platform = ctx.chain[i].route.provider.clone();
+            let provider_name = ctx.chain[i].route.provider_name.clone();
             let cancel = ctx.cancel.clone();
             let mut attempt_req = ctx.req.clone();
             ctx.decision.attempts[i].apply(&mut attempt_req);
@@ -361,7 +409,28 @@ async fn chat_non_streaming(
                 .route
                 .upstream_id
                 .clone_into(&mut attempt_req.model);
-            async move { provider.chat(attempt_req, cancel).await }
+            let (keys, registry, mark) = (ctx.keys, &*ctx.state.registry, ctx.mark);
+            async move {
+                // Marked only when an upstream call is actually sent.
+                let call = |provider: Option<Arc<dyn ChatProvider>>| {
+                    let (req, cancel, name) =
+                        (attempt_req.clone(), cancel.clone(), provider_name.clone());
+                    async move {
+                        let provider =
+                            provider.ok_or(ProviderError::Unavailable { provider: name })?;
+                        mark.mark();
+                        provider.chat(req, cancel).await
+                    }
+                };
+                keys.attempt(
+                    registry,
+                    i,
+                    &provider_name,
+                    || call(Some(platform)),
+                    |set| call(set.chat.clone()),
+                )
+                .await
+            }
         },
     )
     .await?;
@@ -369,9 +438,10 @@ async fn chat_non_streaming(
     accounting.served_by(&executed.model_used, &executed.provider_used);
     let route = ctx.decision.route_of(executed.index);
     accounting.set_route(route);
-    let mut response = executed.value;
+    let (mut response, served) = executed.value;
     let served_model = executed.model_used.clone();
-    settle_non_streaming(ctx, accounting, &served_model, &mut response);
+    let billable = matches!(served, Served::Platform);
+    settle_non_streaming(ctx, accounting, &served_model, &mut response, billable);
     Ok((routing_headers(&served_model, route), Json(response)).into_response())
 }
 
@@ -391,6 +461,7 @@ fn settle_non_streaming(
     accounting: Accounting,
     client_model: &str,
     response: &mut lumen_core::ChatResponse,
+    billable: bool,
 ) {
     let reported = response
         .usage
@@ -416,6 +487,7 @@ fn settle_non_streaming(
             media: lumen_core::MediaUsage::default(),
             cost,
             status: 200,
+            billable,
         });
         return;
     }
@@ -450,6 +522,7 @@ fn settle_non_streaming(
             client_model,
             (tokens_in, tokens_out),
             response,
+            billable,
         );
         return;
     }
@@ -466,6 +539,7 @@ fn settle_non_streaming(
         media: lumen_core::MediaUsage::default(),
         cost,
         status: 200,
+        billable,
     });
 }
 
@@ -480,6 +554,7 @@ fn defer_chat_refinement(
     client_model: &str,
     heuristic: (u64, u64),
     response: &lumen_core::ChatResponse,
+    billable: bool,
 ) {
     accounting.mark_completed();
     let counter = ctx.state.token_counter();
@@ -519,6 +594,7 @@ fn defer_chat_refinement(
             media: lumen_core::MediaUsage::default(),
             cost,
             status: 200,
+            billable,
         });
     });
 }

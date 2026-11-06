@@ -85,7 +85,7 @@ kind = "openai"
 api_key_env = "TEST_PROVIDER_API_KEY"
 
 [[providers.models]]
-id = "gpt-4o"
+id = "test-provider/gpt-4o"
 capabilities = ["chat"]
 "#;
 
@@ -227,6 +227,7 @@ async fn spawn_admin_with_reloader() -> Harness {
         image_fetch: None,
         token_counter: None,
         health: Some(Arc::clone(&health)),
+        team_pools: None,
     };
     spawn_config_reloader(Arc::clone(&ctx), targets, Arc::clone(&trigger))
         .expect("arm the reloader");
@@ -464,7 +465,7 @@ port = 7777
 name = "nowhere"
 kind = "vllm"
 [[providers.models]]
-id = "m"
+id = "nowhere/m"
 capabilities = ["chat"]
 "#;
     let response = h.put_config(bad, &hash).await;
@@ -672,14 +673,14 @@ port = 7777
 name = "dup"
 kind = "openai"
 [[providers.models]]
-id = "a"
+id = "dup/a"
 capabilities = ["chat"]
 
 [[providers]]
 name = "dup"
 kind = "openai"
 [[providers.models]]
-id = "b"
+id = "dup/b"
 capabilities = ["chat"]
 "#;
     let response = h.put_config(bad, &hash).await;
@@ -748,7 +749,7 @@ async fn put_config_accepts_an_unchanged_boot_layer_with_a_new_provider() {
     let hash = h.current_hash().await;
 
     let updated = format!(
-        "{}\n[[providers]]\nname = \"second\"\nkind = \"openai\"\n[[providers.models]]\nid = \"m2\"\ncapabilities = [\"chat\"]\n",
+        "{}\n[[providers]]\nname = \"second\"\nkind = \"openai\"\n[[providers.models]]\nid = \"second/m2\"\ncapabilities = [\"chat\"]\n",
         h.valid_config()
     );
     let response = h.put_config(&updated, &hash).await;
@@ -846,7 +847,7 @@ const DB_MODE_VALID_DOC: &str = r#"
 name = "db-provider"
 kind = "openai"
 [[providers.models]]
-id = "gpt-4o"
+id = "db-provider/gpt-4o"
 capabilities = ["chat"]
 "#;
 
@@ -983,15 +984,62 @@ name = "backup"
 kind = "openai"
 
 [[providers.models]]
-id = "backup-model"
+id = "backup/backup-model"
 capabilities = ["chat"]
 
 [[virtual_models]]
-id = "primary-model"
+id = "lumen/primary-model"
 capability = "chat"
 strategy = "fallback"
-targets = [{ model = "primary/primary-model" }, { model = "backup-model" }]
+targets = [{ model = "primary/primary-model" }, { model = "backup/backup-model" }]
 "#;
+
+/// The `/admin` model routes enforce the `<provider>/<model>` rule: a bare
+/// model id, or one with another provider's prefix, is `LM-1001` naming the
+/// expected id, and nothing is applied.
+#[tokio::test]
+async fn put_provider_with_an_unprefixed_model_id_is_lm_1001() {
+    let h = spawn_admin(registry()).await;
+    let hash = h.current_hash().await;
+    for (id, expected) in [
+        ("gpt-4o-mini", "second/gpt-4o-mini"),
+        ("openai/gpt-4o-mini", "second/openai/gpt-4o-mini"),
+    ] {
+        let provider = serde_json::json!({
+            "name": "second",
+            "kind": "openai",
+            "models": [{"id": id, "capabilities": ["chat"]}]
+        });
+        let response = h
+            .put_json("/admin/config/providers/second", &provider, &hash)
+            .await;
+        assert_eq!(response.status(), 400, "{id}");
+        let body: Value = response.json().await.expect("json");
+        assert_eq!(body["error"]["code"], "LM-1001");
+        let message = body["error"]["message"].as_str().expect("message");
+        assert!(message.contains(expected), "{message}");
+        assert!(message.contains("lumen config migrate"), "{message}");
+    }
+    assert_eq!(h.current_hash().await, hash, "nothing was applied");
+
+    // A bare virtual model id is refused the same way.
+    let vm = serde_json::json!({
+        "id": "chat", "capability": "chat", "strategy": "single",
+        "targets": [{ "model": "test-provider/gpt-4o" }]
+    });
+    let response = h
+        .put_json("/admin/config/virtual_models/chat", &vm, &hash)
+        .await;
+    assert_eq!(response.status(), 400);
+    let body: Value = response.json().await.expect("json");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("<namespace>/<model>"),
+        "{body}"
+    );
+}
 
 /// (a) A `PUT` with a fresh hash applies (204); the new provider then shows
 /// up in `GET /admin/config/providers`; and the whole-document `GET` still
@@ -1006,7 +1054,7 @@ async fn put_provider_with_fresh_hash_applies_and_lists_it() {
         "name": "second",
         "kind": "openai",
         "models": [
-            {"id": "gpt-4o-mini", "capabilities": ["chat"]}
+            {"id": "second/gpt-4o-mini", "capabilities": ["chat"]}
         ]
     });
     let response = h
@@ -1038,6 +1086,41 @@ async fn put_provider_with_fresh_hash_applies_and_lists_it() {
         "a granular edit must preserve comments: {text}"
     );
     assert!(text.contains("\"second\""));
+}
+
+/// A model PUT with `disabled: true` keeps it in the provider, and the GET
+/// returns the flag; re-enabling is a PUT without it. (That a disabled model
+/// is not served is `tests/models.rs`.)
+#[tokio::test]
+async fn put_provider_can_disable_and_re_enable_a_model() {
+    let h = spawn_admin(registry()).await;
+    let provider = |disabled: bool| {
+        let mut model = serde_json::json!({"id": "second/gpt-4o-mini", "capabilities": ["chat"]});
+        if disabled {
+            model["disabled"] = Value::Bool(true);
+        }
+        serde_json::json!({"name": "second", "kind": "openai", "models": [model]})
+    };
+
+    for disabled in [true, false] {
+        let hash = h.current_hash().await;
+        let response = h
+            .put_json("/admin/config/providers/second", &provider(disabled), &hash)
+            .await;
+        assert_eq!(response.status(), 204);
+        let doc: Value = h
+            .get("/admin/config/providers/second")
+            .await
+            .json()
+            .await
+            .expect("json");
+        let flag = doc["models"][0].get("disabled");
+        if disabled {
+            assert_eq!(flag, Some(&Value::Bool(true)), "{doc}");
+        } else {
+            assert!(flag.is_none(), "{doc}");
+        }
+    }
 }
 
 /// (b) A stale `If-Match` on a provider `PUT` is `412` `LM-1004`; a missing
@@ -1121,7 +1204,7 @@ async fn delete_provider_still_referenced_by_a_fallback_is_rejected() {
     assert_eq!(body["error"]["code"].as_str().expect("code"), "LM-1001");
     let message = body["error"]["message"].as_str().expect("message");
     assert!(
-        message.contains("virtual model 'primary-model'"),
+        message.contains("virtual model 'lumen/primary-model'"),
         "the rejection must name the dependent virtual model: {message}"
     );
 
@@ -1452,7 +1535,7 @@ async fn put_then_get_virtual_model_with_slash_in_id() {
     let hash = h.current_hash().await;
     let body = serde_json::json!({
         "id": "acme/chat", "capability": "chat", "strategy": "single",
-        "targets": [{ "model": "gpt-4o" }]
+        "targets": [{ "model": "test-provider/gpt-4o" }]
     });
     let put = h
         .put_json("/admin/config/virtual_models/acme%2Fchat", &body, &hash)
@@ -1475,7 +1558,7 @@ async fn put_then_get_virtual_model_with_slash_in_id() {
         .await
         .unwrap();
     assert_eq!(plan["plan"]["targets"][0]["virtual"], false);
-    assert_eq!(plan["plan"]["targets"][0]["model"], "gpt-4o");
+    assert_eq!(plan["plan"]["targets"][0]["model"], "test-provider/gpt-4o");
 
     let list: Value = h
         .get("/admin/config/virtual_models")
@@ -1495,9 +1578,9 @@ async fn put_then_get_virtual_model_with_slash_in_id() {
 async fn invalid_virtual_models_and_dangling_deletes_are_lm_1001() {
     let h = spawn_admin(registry()).await;
     let hash = h.current_hash().await;
-    let bad = serde_json::json!({ "id": "v", "capability": "chat", "strategy": "single", "targets": [{ "model": "ghost" }] });
+    let bad = serde_json::json!({ "id": "lumen/v", "capability": "chat", "strategy": "single", "targets": [{ "model": "test-provider/ghost" }] });
     let resp = h
-        .put_json("/admin/config/virtual_models/v", &bad, &hash)
+        .put_json("/admin/config/virtual_models/lumen%2Fv", &bad, &hash)
         .await;
     assert_eq!(resp.status(), 400);
     let body: Value = resp.json().await.unwrap();
@@ -1507,15 +1590,15 @@ async fn invalid_virtual_models_and_dangling_deletes_are_lm_1001() {
         "{body}"
     );
 
-    let good = serde_json::json!({ "id": "v", "capability": "chat", "strategy": "single", "targets": [{ "model": "gpt-4o" }] });
+    let good = serde_json::json!({ "id": "lumen/v", "capability": "chat", "strategy": "single", "targets": [{ "model": "test-provider/gpt-4o" }] });
     assert_eq!(
-        h.put_json("/admin/config/virtual_models/v", &good, &hash)
+        h.put_json("/admin/config/virtual_models/lumen%2Fv", &good, &hash)
             .await
             .status(),
         204
     );
 
-    // Deleting the provider that owns `gpt-4o` would orphan `v`.
+    // Deleting the provider that owns `test-provider/gpt-4o` would orphan `lumen/v`.
     let hash = h.current_hash().await;
     let resp = h
         .delete("/admin/config/providers/test-provider", &hash)
@@ -1526,7 +1609,7 @@ async fn invalid_virtual_models_and_dangling_deletes_are_lm_1001() {
         body["error"]["message"]
             .as_str()
             .unwrap()
-            .contains("virtual model 'v'"),
+            .contains("virtual model 'lumen/v'"),
         "{body}"
     );
 

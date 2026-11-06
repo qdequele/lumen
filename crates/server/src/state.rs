@@ -115,6 +115,9 @@ pub struct AppState {
     /// webhook routes read and reconfigure the delivery pipeline through it.
     /// `None` = no auth, so no `/admin` surface either.
     pub webhooks: Option<Arc<crate::webhooks::WebhookController>>,
+    /// Every group's team provider key pools (BYOK), rebuilt by the reloader
+    /// from the store; empty until auth loads them.
+    pub team_pools: Arc<crate::byok::TeamPools>,
 }
 
 impl AppState {
@@ -153,7 +156,15 @@ impl AppState {
             config_apply_lock: Arc::new(tokio::sync::Mutex::new(())),
             token_counter: Arc::new(ArcSwap::from_pointee(TokenCounter::Heuristic)),
             webhooks: None,
+            team_pools: Arc::new(crate::byok::TeamPools::default()),
         }
+    }
+
+    /// Attach the team key pools the reloader maintains (builder style).
+    #[must_use]
+    pub fn with_team_pools(mut self, pools: Arc<crate::byok::TeamPools>) -> Self {
+        self.team_pools = pools;
+        self
     }
 
     /// Attach the outbound-webhook controller (builder style).

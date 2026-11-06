@@ -13,6 +13,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
 use std::str::FromStr;
 use std::time::Duration;
+use zeroize::Zeroizing;
 
 /// One virtual-key row, as loaded from the database. Never carries the
 /// plaintext key - only its hash identifies it, and even that stays private
@@ -70,6 +71,47 @@ pub struct StoredWebhookConfig {
     pub updated_at: i64,
 }
 
+/// Most keys one group may hold for one provider.
+pub const MAX_GROUP_PROVIDER_KEYS: usize = 10;
+
+/// Most platform keys one provider may hold (ADR 019).
+pub const MAX_PLATFORM_PROVIDER_KEYS: usize = 20;
+
+/// One platform provider key (ADR 019), as listed: everything except the
+/// secret.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, sqlx::FromRow)]
+pub struct PlatformProviderKeyRecord {
+    /// `ppk_` + random hex.
+    pub id: String,
+    /// The configured provider instance name the key is for.
+    pub provider: String,
+    /// Human label, 1 to 64 characters.
+    pub label: String,
+    /// Last 4 characters of the trimmed key: the only readable part.
+    pub last4: String,
+    /// Whether the key is in the live pool.
+    pub enabled: bool,
+    /// Creation time, unix seconds.
+    pub created_at: i64,
+}
+
+/// One team provider key, as listed: everything except the secret.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, sqlx::FromRow)]
+pub struct GroupProviderKeyRecord {
+    /// `gpk_` + random hex.
+    pub id: String,
+    /// The budget group (hosted Lab account) that owns the key.
+    pub group_id: String,
+    /// The configured provider instance name the key is for.
+    pub provider: String,
+    /// Human label, 1 to 64 characters.
+    pub label: String,
+    /// Last 4 characters of the trimmed key: the only readable part.
+    pub last4: String,
+    /// Creation time, unix seconds.
+    pub created_at: i64,
+}
+
 /// One budget-group row (ADR 009): a shared budget pool any number of
 /// virtual keys can belong to. Groups have no secret - there is no hash and
 /// no plaintext, only the record.
@@ -93,6 +135,9 @@ pub struct GroupRecord {
     /// e.g. the Lab account id. Keys in a group with an `account_ref` are
     /// billable when `[usage_events]` is configured.
     pub account_ref: Option<String>,
+    /// Bandwidth rate in micro-USD per 10^9 bytes (billing: the Lab pushes it
+    /// already divided by its markup); 0 = bandwidth is not charged.
+    pub bandwidth_micro_usd_per_gb: i64,
 }
 
 /// Parameters for creating a budget group.
@@ -118,6 +163,8 @@ pub struct GroupPatch {
     #[allow(clippy::option_option)]
     #[serde(default, deserialize_with = "double_option")]
     pub account_ref: Option<Option<String>>,
+    /// New bandwidth rate in micro-USD per 10^9 bytes (>= 0).
+    pub bandwidth_micro_usd_per_gb: Option<i64>,
 }
 
 /// The outcome of a [`KeyStore::delete_group`] call. A group with live
@@ -310,6 +357,9 @@ impl GroupPatch {
     pub fn validate(&self) -> Result<(), String> {
         if let Some(name) = &self.name {
             validate_name(name)?;
+        }
+        if self.bandwidth_micro_usd_per_gb.is_some_and(|rate| rate < 0) {
+            return Err("`bandwidth_micro_usd_per_gb` must be >= 0".to_owned());
         }
         validate_limits(self.budget_max, None, None, None)
     }
@@ -630,7 +680,8 @@ macro_rules! key_columns {
 /// Every `budget_groups` column a [`GroupRecord`] reads.
 macro_rules! group_columns {
     () => {
-        "id, name, budget_max, budget_spent, created_at, deleted_at, account_ref"
+        "id, name, budget_max, budget_spent, created_at, deleted_at, account_ref, \
+         bandwidth_micro_usd_per_gb"
     };
 }
 
@@ -1175,6 +1226,7 @@ impl KeyStore {
             account_ref: params
                 .account_ref
                 .map(crate::billing::canonical_account_ref),
+            bandwidth_micro_usd_per_gb: 0,
         };
         sqlx::query(
             "INSERT INTO budget_groups (id, name, budget_max, budget_spent, created_at, account_ref) \
@@ -1252,13 +1304,15 @@ impl KeyStore {
             "UPDATE budget_groups SET \
                name = COALESCE(?, name), \
                budget_max = COALESCE(?, budget_max), \
-               account_ref = CASE WHEN ? THEN ? ELSE account_ref END \
+               account_ref = CASE WHEN ? THEN ? ELSE account_ref END, \
+               bandwidth_micro_usd_per_gb = COALESCE(?, bandwidth_micro_usd_per_gb) \
              WHERE id = ? AND deleted_at IS NULL",
         )
         .bind(patch.name)
         .bind(patch.budget_max)
         .bind(ref_change)
         .bind(ref_value)
+        .bind(patch.bandwidth_micro_usd_per_gb)
         .bind(id)
         .execute(&self.pool)
         .await?
@@ -1295,17 +1349,29 @@ impl KeyStore {
                 return Ok(DeleteGroupOutcome::HasMembers(members));
             }
         }
+        // The tombstone and the pool rows go together: a deleted group must
+        // not leave sealed team keys behind.
+        let mut tx = self.pool.begin().await?;
         let changed = sqlx::query(
             "UPDATE budget_groups SET deleted_at = ? WHERE id = ? AND deleted_at IS NULL",
         )
         .bind(now_unix())
         .bind(id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?
         .rows_affected();
         if changed == 0 {
             return Ok(DeleteGroupOutcome::NotFound);
         }
+        sqlx::query("DELETE FROM group_provider_keys WHERE group_id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM group_provider_settings WHERE group_id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
         match self.fetch_group(id).await? {
             Some(record) => Ok(DeleteGroupOutcome::Deleted(record)),
             None => Ok(DeleteGroupOutcome::NotFound),
@@ -1691,6 +1757,373 @@ impl KeyStore {
             .map_err(|_| AuthError::Decrypt)
     }
 
+    // ---- Team provider key pools (BYOK) -------------------------------------
+
+    /// Seal and store a team key for `(group_id, provider)`. The key is
+    /// trimmed first; `last4` is its last 4 characters. At most
+    /// [`MAX_GROUP_PROVIDER_KEYS`] per pool, enforced inside the INSERT so two
+    /// concurrent adds cannot both take the last slot.
+    ///
+    /// # Errors
+    ///
+    /// [`AuthError::PoolFull`] when the pool is full; a seal or database
+    /// error.
+    pub async fn add_group_provider_key(
+        &self,
+        group_id: &str,
+        provider: &str,
+        label: &str,
+        plaintext: &str,
+        master: &MasterKey,
+    ) -> Result<GroupProviderKeyRecord, AuthError> {
+        let key = plaintext.trim();
+        let last4: String = {
+            let mut tail: Vec<char> = key.chars().rev().take(4).collect();
+            tail.reverse();
+            tail.into_iter().collect()
+        };
+        let sealed = master.seal(key.as_bytes())?;
+        let record = GroupProviderKeyRecord {
+            id: format!("gpk_{}", random_id()),
+            group_id: group_id.to_owned(),
+            provider: provider.to_owned(),
+            label: label.to_owned(),
+            last4,
+            created_at: now_unix(),
+        };
+        let inserted = sqlx::query(
+            "INSERT INTO group_provider_keys \
+             (id, group_id, provider, label, last4, ciphertext, created_at) \
+             SELECT ?, ?, ?, ?, ?, ?, ? \
+             WHERE (SELECT COUNT(*) FROM group_provider_keys \
+                    WHERE group_id = ? AND provider = ?) < ?",
+        )
+        .bind(&record.id)
+        .bind(&record.group_id)
+        .bind(&record.provider)
+        .bind(&record.label)
+        .bind(&record.last4)
+        .bind(sealed)
+        .bind(record.created_at)
+        .bind(group_id)
+        .bind(provider)
+        .bind(i64::try_from(MAX_GROUP_PROVIDER_KEYS).unwrap_or(i64::MAX))
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        if inserted == 0 {
+            return Err(AuthError::PoolFull(MAX_GROUP_PROVIDER_KEYS));
+        }
+        Ok(record)
+    }
+
+    /// Delete one team key. Returns whether it existed.
+    ///
+    /// # Errors
+    ///
+    /// A database error.
+    pub async fn delete_group_provider_key(
+        &self,
+        group_id: &str,
+        provider: &str,
+        key_id: &str,
+    ) -> Result<bool, AuthError> {
+        let done = sqlx::query(
+            "DELETE FROM group_provider_keys WHERE id = ? AND group_id = ? AND provider = ?",
+        )
+        .bind(key_id)
+        .bind(group_id)
+        .bind(provider)
+        .execute(&self.pool)
+        .await?;
+        Ok(done.rows_affected() > 0)
+    }
+
+    /// A group's team keys, oldest first. Never decrypts anything.
+    ///
+    /// # Errors
+    ///
+    /// A database error.
+    pub async fn list_group_provider_keys(
+        &self,
+        group_id: &str,
+    ) -> Result<Vec<GroupProviderKeyRecord>, AuthError> {
+        let rows = sqlx::query_as::<_, GroupProviderKeyRecord>(
+            "SELECT id, group_id, provider, label, last4, created_at \
+             FROM group_provider_keys WHERE group_id = ? ORDER BY created_at, id",
+        )
+        .bind(group_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Every team key of every group with its decrypted secret, for the
+    /// runtime pools. The plaintexts zeroize on drop. A key that cannot be
+    /// opened (wrong master key / corruption) is an error, not a skipped row.
+    ///
+    /// # Errors
+    ///
+    /// A database error, or [`AuthError::Decrypt`].
+    pub async fn load_group_provider_keys(
+        &self,
+        master: &MasterKey,
+    ) -> Result<Vec<(GroupProviderKeyRecord, Zeroizing<String>)>, AuthError> {
+        let rows = sqlx::query(
+            "SELECT id, group_id, provider, label, last4, created_at, ciphertext \
+             FROM group_provider_keys ORDER BY created_at, id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let sealed: Vec<u8> = row.try_get("ciphertext")?;
+            let plain = Zeroizing::new(master.open(&sealed)?);
+            let text = std::str::from_utf8(&plain).map_err(|_| AuthError::Decrypt)?;
+            let secret = Zeroizing::new(text.to_owned());
+            out.push((
+                GroupProviderKeyRecord {
+                    id: row.try_get("id")?,
+                    group_id: row.try_get("group_id")?,
+                    provider: row.try_get("provider")?,
+                    label: row.try_get("label")?,
+                    last4: row.try_get("last4")?,
+                    created_at: row.try_get("created_at")?,
+                },
+                secret,
+            ));
+        }
+        Ok(out)
+    }
+
+    /// Turn "fall back to the platform's keys" on or off for one pool.
+    ///
+    /// # Errors
+    ///
+    /// A database error.
+    pub async fn set_group_provider_fallback(
+        &self,
+        group_id: &str,
+        provider: &str,
+        fallback: bool,
+    ) -> Result<(), AuthError> {
+        sqlx::query(
+            "INSERT INTO group_provider_settings (group_id, provider, fallback) VALUES (?, ?, ?) \
+             ON CONFLICT (group_id, provider) DO UPDATE SET fallback = excluded.fallback",
+        )
+        .bind(group_id)
+        .bind(provider)
+        .bind(i64::from(fallback))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Every `(group_id, provider, fallback)` setting row.
+    ///
+    /// # Errors
+    ///
+    /// A database error.
+    pub async fn group_provider_settings(&self) -> Result<Vec<(String, String, bool)>, AuthError> {
+        let mut out = Vec::new();
+        for row in sqlx::query(
+            "SELECT group_id, provider, fallback FROM group_provider_settings \
+             ORDER BY group_id, provider",
+        )
+        .fetch_all(&self.pool)
+        .await?
+        {
+            out.push((
+                row.try_get("group_id")?,
+                row.try_get("provider")?,
+                row.try_get::<i64, _>("fallback")? != 0,
+            ));
+        }
+        Ok(out)
+    }
+
+    /// Forget every group's keys and settings, and the platform keys
+    /// (ADR 019), for a provider that was removed from the config, so one
+    /// recreated under the same name starts with empty pools.
+    ///
+    /// # Errors
+    ///
+    /// A database error.
+    pub async fn delete_group_provider_data_for_provider(
+        &self,
+        provider: &str,
+    ) -> Result<(), AuthError> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM group_provider_keys WHERE provider = ?")
+            .bind(provider)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM group_provider_settings WHERE provider = ?")
+            .bind(provider)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM platform_provider_keys WHERE provider = ?")
+            .bind(provider)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    // ---- Platform provider key pools (ADR 019) ------------------------------
+
+    /// Seal and store a platform key for `provider`, enabled. The key is
+    /// trimmed first; `last4` is its last 4 characters. At most
+    /// [`MAX_PLATFORM_PROVIDER_KEYS`] per provider, enforced inside the
+    /// INSERT so two concurrent adds cannot both take the last slot.
+    ///
+    /// # Errors
+    ///
+    /// [`AuthError::PoolFull`] when the pool is full; a seal or database
+    /// error.
+    pub async fn add_platform_provider_key(
+        &self,
+        provider: &str,
+        label: &str,
+        plaintext: &str,
+        master: &MasterKey,
+    ) -> Result<PlatformProviderKeyRecord, AuthError> {
+        let key = plaintext.trim();
+        let last4: String = {
+            let mut tail: Vec<char> = key.chars().rev().take(4).collect();
+            tail.reverse();
+            tail.into_iter().collect()
+        };
+        let sealed = master.seal(key.as_bytes())?;
+        let record = PlatformProviderKeyRecord {
+            id: format!("ppk_{}", random_id()),
+            provider: provider.to_owned(),
+            label: label.to_owned(),
+            last4,
+            enabled: true,
+            created_at: now_unix(),
+        };
+        let inserted = sqlx::query(
+            "INSERT INTO platform_provider_keys \
+             (id, provider, label, last4, enabled, ciphertext, created_at) \
+             SELECT ?, ?, ?, ?, 1, ?, ? \
+             WHERE (SELECT COUNT(*) FROM platform_provider_keys WHERE provider = ?) < ?",
+        )
+        .bind(&record.id)
+        .bind(&record.provider)
+        .bind(&record.label)
+        .bind(&record.last4)
+        .bind(sealed)
+        .bind(record.created_at)
+        .bind(provider)
+        .bind(i64::try_from(MAX_PLATFORM_PROVIDER_KEYS).unwrap_or(i64::MAX))
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        if inserted == 0 {
+            return Err(AuthError::PoolFull(MAX_PLATFORM_PROVIDER_KEYS));
+        }
+        Ok(record)
+    }
+
+    /// Turn one platform key on or off. Returns the updated record, or
+    /// `None` when `(provider, key_id)` names no key.
+    ///
+    /// # Errors
+    ///
+    /// A database error.
+    pub async fn set_platform_provider_key_enabled(
+        &self,
+        provider: &str,
+        key_id: &str,
+        enabled: bool,
+    ) -> Result<Option<PlatformProviderKeyRecord>, AuthError> {
+        let row = sqlx::query_as::<_, PlatformProviderKeyRecord>(
+            "UPDATE platform_provider_keys SET enabled = ? WHERE id = ? AND provider = ? \
+             RETURNING id, provider, label, last4, enabled, created_at",
+        )
+        .bind(i64::from(enabled))
+        .bind(key_id)
+        .bind(provider)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    /// Delete one platform key. Returns whether it existed.
+    ///
+    /// # Errors
+    ///
+    /// A database error.
+    pub async fn delete_platform_provider_key(
+        &self,
+        provider: &str,
+        key_id: &str,
+    ) -> Result<bool, AuthError> {
+        let done = sqlx::query("DELETE FROM platform_provider_keys WHERE id = ? AND provider = ?")
+            .bind(key_id)
+            .bind(provider)
+            .execute(&self.pool)
+            .await?;
+        Ok(done.rows_affected() > 0)
+    }
+
+    /// Every platform key, oldest first. Never decrypts anything.
+    ///
+    /// # Errors
+    ///
+    /// A database error.
+    pub async fn list_platform_provider_keys(
+        &self,
+    ) -> Result<Vec<PlatformProviderKeyRecord>, AuthError> {
+        let rows = sqlx::query_as::<_, PlatformProviderKeyRecord>(
+            "SELECT id, provider, label, last4, enabled, created_at \
+             FROM platform_provider_keys ORDER BY created_at, id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Every platform key (enabled or not) with its decrypted secret, for
+    /// the runtime pools. The plaintexts zeroize on drop. A key that cannot
+    /// be opened (wrong master key / corruption) is an error, not a skipped
+    /// row.
+    ///
+    /// # Errors
+    ///
+    /// A database error, or [`AuthError::Decrypt`].
+    pub async fn load_platform_provider_keys(
+        &self,
+        master: &MasterKey,
+    ) -> Result<Vec<(PlatformProviderKeyRecord, Zeroizing<String>)>, AuthError> {
+        let rows = sqlx::query(
+            "SELECT id, provider, label, last4, enabled, created_at, ciphertext \
+             FROM platform_provider_keys ORDER BY created_at, id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let sealed: Vec<u8> = row.try_get("ciphertext")?;
+            let plain = Zeroizing::new(master.open(&sealed)?);
+            let text = std::str::from_utf8(&plain).map_err(|_| AuthError::Decrypt)?;
+            let secret = Zeroizing::new(text.to_owned());
+            out.push((
+                PlatformProviderKeyRecord {
+                    id: row.try_get("id")?,
+                    provider: row.try_get("provider")?,
+                    label: row.try_get("label")?,
+                    last4: row.try_get("last4")?,
+                    enabled: row.try_get("enabled")?,
+                    created_at: row.try_get("created_at")?,
+                },
+                secret,
+            ));
+        }
+        Ok(out)
+    }
+
     // ---- Webhook configuration (ADR 011 amendment) --------------------------
 
     /// Load the stored webhook configuration, if an operator has ever written
@@ -1950,6 +2383,33 @@ impl KeyStore {
                 dump.push_str(&r);
                 dump.push('\n');
             }
+        }
+        for row in sqlx::query(
+            "SELECT id, group_id, provider, label, last4, ciphertext FROM group_provider_keys",
+        )
+        .fetch_all(&self.pool)
+        .await?
+        {
+            let blob: Vec<u8> = row.try_get("ciphertext")?;
+            for column in ["id", "group_id", "provider", "label", "last4"] {
+                dump.push_str(&row.try_get::<String, _>(column)?);
+                dump.push('|');
+            }
+            dump.push_str(&String::from_utf8_lossy(&blob));
+            dump.push('\n');
+        }
+        for row in
+            sqlx::query("SELECT id, provider, label, last4, ciphertext FROM platform_provider_keys")
+                .fetch_all(&self.pool)
+                .await?
+        {
+            let blob: Vec<u8> = row.try_get("ciphertext")?;
+            for column in ["id", "provider", "label", "last4"] {
+                dump.push_str(&row.try_get::<String, _>(column)?);
+                dump.push('|');
+            }
+            dump.push_str(&String::from_utf8_lossy(&blob));
+            dump.push('\n');
         }
         // Provider-key blobs: decode the raw stored bytes as (lossy) text so a
         // plaintext accidentally stored unencrypted WOULD be caught by greps.

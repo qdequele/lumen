@@ -33,3 +33,6 @@ examples-multi-tenant.db
 /docs/superpowers/
 /ROADMAP.md
 /specs/
+
+# Python bytecode from scripts/ (model watcher tests)
+__pycache__/
