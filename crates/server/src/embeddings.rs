@@ -90,7 +90,8 @@ pub async fn embeddings(
 
     validate_input_type(&req)?;
 
-    let client_model = req.model.clone();
+    // A deprecated bare id (`gpt-4o`) resolves to its `provider/model` id.
+    let client_model = state.resilience.canonical_model(&req.model);
     // Facts are only built for a virtual model (ADR 014).
     let mut decision = state
         .resilience

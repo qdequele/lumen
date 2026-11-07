@@ -27,7 +27,7 @@ The non-streaming request returns the OpenAI chat completion envelope:
 {
   "id": "chatcmpl-...",
   "object": "chat.completion",
-  "model": "gpt-4o",
+  "model": "openai/gpt-4o",
   "choices": [
     { "index": 0, "message": { "role": "assistant", "content": "Hello!" }, "finish_reason": "stop" }
   ],

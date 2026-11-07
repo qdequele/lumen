@@ -53,11 +53,11 @@ fallback fired.
 
 ```toml
 [[virtual_models]]
-id = "gpt-4o"
+id = "lumen/gpt-4o"
 capability = "chat"
 strategy = "fallback"
 fallback_on = ["provider_error", "rate_limited", "timeout", "circuit_open"]
-targets = [{ model = "openai/gpt-4o" }, { model = "claude-sonnet-4-5" }]
+targets = [{ model = "openai/gpt-4o" }, { model = "anthropic/claude-sonnet-4-5" }]
 ```
 
 ## Circuit breaker

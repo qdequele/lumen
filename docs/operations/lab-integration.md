@@ -28,6 +28,14 @@ in [ADR 015](../adr/015-lab-integration.md) and its 2026-10-09 amendment.
 - A key is **billable** when it has a group and that group has an
   `account_ref`. Every other key is an operator key: never billed, behaving
   exactly as today.
+- **Sub-groups of the lease** ([ADR 020](../adr/020-team-sub-groups.md))
+  let a team split its lease into pools: `POST /admin/groups` with
+  `parent_id` set to the lease. A sub-group takes the lease's
+  `account_ref`, so its keys bill to the same account, and the lease binds
+  every request of its keys, so no sub-group write can spend past the
+  credits. The lease's `spent_micro` includes every sub-group's spend: the
+  lease sync needs no change. The Lab keeps the lease itself platform-only
+  and lets teams manage only its sub-groups.
 
 The Lab's loop, using routes that already exist:
 
@@ -158,7 +166,7 @@ while a ref that is not a UUID is kept exactly as written. With that header:
 | `PATCH`, `DELETE`, `rotate` and `grant` on a key; `GET`, `PATCH`, `DELETE` and `grant` on a group: when the key or group belongs to another account, or the key has no group | `404 LM-1003`, the same envelope an unknown id gets, so a scoped caller cannot tell a foreign id from one that never existed. |
 | `POST /admin/keys` | `group_id` is required and must name a group of the account (`400 LM-1001` without one, `404 LM-1003` for another account's group). A scoped `PATCH` cannot clear `group_id` (`400 LM-1001`) or move the key to another account's group (`404 LM-1003`). |
 | `POST /admin/groups` | `account_ref` is set to the header's value when absent; a different value (compared ignoring case) is `400 LM-1001`. A scoped `PATCH` that carries `account_ref` at all is `400 LM-1001`. |
-| `/admin/provider-keys/*`, `/admin/providers/{name}/check`, `/admin/webhooks*`, `/admin/config*`, `/openapi.json`, `/health/providers`, `/metrics` | `403 LM-4005`: platform-only, whatever the header's value. `/health/providers` and `/metrics` need no key without the header, but they describe the whole platform (provider names and health, metric labels across every account), so a scoped call never sees them. `/health` stays open. |
+| `/admin/provider-keys/*`, `/admin/platform-keys*`, `/admin/providers/{name}/check`, `/admin/webhooks*`, `/admin/config*`, `/openapi.json`, `/health/providers`, `/metrics` | `403 LM-4005`: platform-only, whatever the header's value. `/health/providers` and `/metrics` need no key without the header, but they describe the whole platform (provider names and health, metric labels across every account), so a scoped call never sees them. `/health` stays open. |
 
 - **Webhooks are platform-only rather than filtered.** The budget webhook
   receiver is one gateway-wide setting that carries every account's budget

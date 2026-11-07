@@ -73,6 +73,9 @@ struct ResiliencePolicy {
     /// Compiled virtual models (ADR 014), swapped with the rest of the policy
     /// on reload.
     routing: Arc<RoutingTable>,
+    /// Deprecated bare id -> its `provider/model` (or `namespace/model`) id,
+    /// from the same config snapshot as `routing`. Hidden: never listed.
+    aliases: Arc<HashMap<String, String>>,
 }
 
 impl ResiliencePolicy {
@@ -118,6 +121,7 @@ impl ResiliencePolicy {
             default_timeouts,
             model_timeouts,
             routing: Arc::new(routing),
+            aliases: Arc::new(config.model_aliases()),
         }
     }
 
@@ -130,6 +134,7 @@ impl ResiliencePolicy {
             },
             model_timeouts: HashMap::new(),
             routing: Arc::new(RoutingTable::default()),
+            aliases: Arc::new(HashMap::new()),
         }
     }
 }
@@ -143,6 +148,8 @@ pub struct ResilienceRuntime {
     /// Per-(provider, model) circuit breakers - never rebuilt on reload.
     pub breakers: CircuitBreakers,
     policy: arc_swap::ArcSwap<ResiliencePolicy>,
+    /// Counts deprecated-alias requests (`lumen_deprecated_model_alias_total`).
+    metrics: Option<ResilienceMetrics>,
 }
 
 impl ResilienceRuntime {
@@ -156,8 +163,9 @@ impl ResilienceRuntime {
             cooldown: Duration::from_millis(r.circuit_cooldown_ms),
         };
         Self {
-            breakers: CircuitBreakers::new(breaker_config, metrics),
+            breakers: CircuitBreakers::new(breaker_config, metrics.clone()),
             policy: arc_swap::ArcSwap::from_pointee(ResiliencePolicy::from_config(config)),
+            metrics,
         }
     }
 
@@ -168,6 +176,7 @@ impl ResilienceRuntime {
         Self {
             breakers: CircuitBreakers::new(BreakerConfig::default(), None),
             policy: arc_swap::ArcSwap::from_pointee(ResiliencePolicy::defaults()),
+            metrics: None,
         }
     }
 
@@ -199,6 +208,28 @@ impl ResilienceRuntime {
     #[must_use]
     pub fn with_retry(self, retry: RetryPolicy) -> Self {
         self.map_policy(|p| p.retry = retry)
+    }
+
+    /// The id a request's `model` names: itself, or, for a deprecated bare id
+    /// (`gpt-4o` for `openai/gpt-4o`), the prefixed id it aliases. An alias
+    /// resolves but is never listed; each use is logged and counted on
+    /// `lumen_deprecated_model_alias_total` so the aliases can be dropped once
+    /// nobody sends them.
+    #[must_use]
+    pub fn canonical_model(&self, requested: &str) -> String {
+        let policy = self.policy.load();
+        let Some(canonical) = policy.aliases.get(requested) else {
+            return requested.to_owned();
+        };
+        tracing::warn!(
+            alias = %requested,
+            model = %canonical,
+            "deprecated bare model id: send the `provider/model` id instead"
+        );
+        if let Some(metrics) = &self.metrics {
+            metrics.inc_deprecated_alias(requested, canonical);
+        }
+        canonical.clone()
     }
 
     /// Decide the attempts for `model` (ADR 014) from ONE routing snapshot: a
@@ -281,23 +312,23 @@ mod tests {
             kind = "openai"
             first_token_timeout_ms = 90000
             [[providers.models]]
-            id = "gpt"
+            id = "slow/gpt"
             capabilities = ["chat"]
             [[providers]]
             name = "fast"
             kind = "anthropic"
             [[providers.models]]
-            id = "claude"
+            id = "fast/claude"
             capabilities = ["chat"]
         "#,
         );
         let rt = ResilienceRuntime::from_config(&cfg, None);
         // Overridden first-token, default total.
-        let slow = rt.exec_config("gpt");
+        let slow = rt.exec_config("slow/gpt");
         assert_eq!(slow.first_token, Duration::from_secs(90));
         assert_eq!(slow.total, Duration::from_secs(600));
         // No override → global default.
-        let fast = rt.exec_config("claude");
+        let fast = rt.exec_config("fast/claude");
         assert_eq!(fast.first_token, Duration::from_secs(30));
     }
 
@@ -334,37 +365,37 @@ mod tests {
             name = "a"
             kind = "openai"
             [[providers.models]]
-            id = "gpt"
+            id = "a/gpt"
             capabilities = ["chat"]
             [[providers.models]]
-            id = "claude"
+            id = "a/claude"
             capabilities = ["chat"]
 
             [[virtual_models]]
-            id = "v"
+            id = "lumen/v"
             capability = "chat"
             strategy = "fallback"
-            targets = [{ model = "claude" }, { model = "gpt" }]
+            targets = [{ model = "a/claude" }, { model = "a/gpt" }]
 
             [[virtual_models]]
-            id = "p"
+            id = "lumen/p"
             capability = "chat"
             strategy = "single"
             preset = { system_prompt = "be brief" }
-            targets = [{ model = "gpt" }]
+            targets = [{ model = "a/gpt" }]
             "#,
         )
         .unwrap();
         let rt = ResilienceRuntime::from_config(&cfg, None);
         let mut saw_preset = None;
         let d = rt
-            .decide(Capability::Chat, "v", |preset| {
+            .decide(Capability::Chat, "lumen/v", |preset| {
                 saw_preset = Some(preset.is_some());
                 NoFacts
             })
             .unwrap();
-        assert_eq!(d.virtual_model.as_deref(), Some("v"));
-        assert_eq!(d.primary_model(), "claude");
+        assert_eq!(d.virtual_model.as_deref(), Some("lumen/v"));
+        assert_eq!(d.primary_model(), "a/claude");
         assert_eq!(
             saw_preset,
             Some(false),
@@ -372,7 +403,7 @@ mod tests {
         );
         // The preset handed to the facts builder comes from the same snapshot.
         let mut saw_preset = false;
-        rt.decide(Capability::Chat, "p", |preset| {
+        rt.decide(Capability::Chat, "lumen/p", |preset| {
             saw_preset = preset.is_some();
             NoFacts
         })
@@ -381,7 +412,7 @@ mod tests {
         // A foundation id is a direct single attempt, with no virtual model,
         // and its facts are never built.
         let direct = rt
-            .decide(Capability::Chat, "gpt", |_| -> NoFacts {
+            .decide(Capability::Chat, "a/gpt", |_| -> NoFacts {
                 panic!("facts built for a foundation id")
             })
             .unwrap();
@@ -391,8 +422,35 @@ mod tests {
             .iter()
             .map(|a| a.model_id.as_str())
             .collect();
-        assert_eq!(ids, vec!["gpt"]);
-        assert!(rt.routing().get("v").is_some());
+        assert_eq!(ids, vec!["a/gpt"]);
+        assert!(rt.routing().get("lumen/v").is_some());
+    }
+
+    #[test]
+    fn canonical_model_resolves_a_bare_alias_and_counts_it() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [[providers]]
+            name = "openai"
+            kind = "openai"
+            [[providers.models]]
+            id = "openai/gpt-4o"
+            capabilities = ["chat"]
+            "#,
+        )
+        .unwrap();
+        let metrics = lumen_telemetry::Metrics::new();
+        let gauges = ResilienceMetrics::register(&metrics).unwrap();
+        let rt = ResilienceRuntime::from_config(&cfg, Some(gauges));
+        assert_eq!(rt.canonical_model("openai/gpt-4o"), "openai/gpt-4o");
+        assert_eq!(rt.canonical_model("unknown"), "unknown");
+        assert!(!metrics
+            .encode_text()
+            .contains("lumen_deprecated_model_alias_total{"));
+        assert_eq!(rt.canonical_model("gpt-4o"), "openai/gpt-4o");
+        assert!(metrics.encode_text().contains(
+            "lumen_deprecated_model_alias_total{alias=\"gpt-4o\",model=\"openai/gpt-4o\"} 1"
+        ));
     }
 
     #[test]

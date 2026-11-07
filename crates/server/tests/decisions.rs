@@ -92,12 +92,12 @@ fn config(up: &Upstreams<'_>) -> Config {
         base_url = "{primary}"
         api_key_env = "LUMEN_TEST_TYPESAFE_KEY_UNUSED"
         [[providers.models]]
-        id = "jev"
+        id = "typesafe/jev"
         upstream_id = "jev-latest"
         capabilities = ["decisions"]
         cost_per_1m_input = 0.042
         [[providers.models]]
-        id = "jev-pinned-leaf"
+        id = "typesafe/jev-pinned-leaf"
         upstream_id = "jev-1.13.0"
         capabilities = ["decisions"]
 
@@ -107,7 +107,7 @@ fn config(up: &Upstreams<'_>) -> Config {
         base_url = "{fallback}"
         api_key_env = "LUMEN_TEST_TYPESAFE_KEY_UNUSED"
         [[providers.models]]
-        id = "jev-fb"
+        id = "typesafe-backup/jev-fb"
         upstream_id = "jev-latest"
         capabilities = ["decisions"]
 
@@ -117,10 +117,10 @@ fn config(up: &Upstreams<'_>) -> Config {
         base_url = "{luna}/v1"
         api_key_env = "LUMEN_TEST_TYPESAFE_KEY_UNUSED"
         [[providers.models]]
-        id = "gpt"
+        id = "openai/gpt"
         capabilities = ["chat"]
         [[providers.models]]
-        id = "luna"
+        id = "openai/luna"
         upstream_id = "gpt-6-luna"
         capabilities = ["decisions"]
         modalities = ["text", "image"]
@@ -132,34 +132,34 @@ fn config(up: &Upstreams<'_>) -> Config {
         base_url = "{decider}"
         api_key_env = "LUMEN_TEST_TYPESAFE_KEY_UNUSED"
         [[providers.models]]
-        id = "decider"
+        id = "perplexity/decider"
         upstream_id = "decider-1"
         capabilities = ["decisions"]
         cost_per_1m_input = 0.02
 
         [[virtual_models]]
-        id = "jev-pinned"
+        id = "lumen/jev-pinned"
         capability = "decisions"
         strategy = "fallback"
-        targets = [{{ model = "jev-pinned-leaf" }}, {{ model = "jev-fb" }}]
+        targets = [{{ model = "typesafe/jev-pinned-leaf" }}, {{ model = "typesafe-backup/jev-fb" }}]
 
         [[virtual_models]]
-        id = "cross"
+        id = "lumen/cross"
         capability = "decisions"
         strategy = "fallback"
-        targets = [{{ model = "decider" }}, {{ model = "jev" }}, {{ model = "luna" }}]
+        targets = [{{ model = "perplexity/decider" }}, {{ model = "typesafe/jev" }}, {{ model = "openai/luna" }}]
 
         [[virtual_models]]
-        id = "cross-luna-first"
+        id = "lumen/cross-luna-first"
         capability = "decisions"
         strategy = "fallback"
-        targets = [{{ model = "luna" }}, {{ model = "decider" }}, {{ model = "jev" }}]
+        targets = [{{ model = "openai/luna" }}, {{ model = "perplexity/decider" }}, {{ model = "typesafe/jev" }}]
 
         [[virtual_models]]
-        id = "jev-rerank"
+        id = "lumen/jev-rerank"
         capability = "rerank"
         strategy = "single"
-        targets = [{{ model = "jev", remap = {{ instructions = "Could `document` be the cited precedent?", criteria.true = "States the cited rule." }} }}]
+        targets = [{{ model = "typesafe/jev", remap = {{ instructions = "Could `document` be the cited precedent?", criteria.true = "States the cited rule." }} }}]
         "#
     );
     Figment::new()
@@ -243,7 +243,7 @@ async fn happy_path_passes_the_wire_through_and_resolves_the_alias() {
         resp.headers()
             .get("x-lumen-model-used")
             .and_then(|v| v.to_str().ok()),
-        Some("jev")
+        Some("typesafe/jev")
     );
     let text = resp.text().await.expect("body");
     // Upstream-reported usage is unflagged, so the body is byte-identical.
@@ -475,7 +475,7 @@ async fn overloaded_529_falls_back_and_the_header_names_the_fallback() {
         resp.headers()
             .get("x-lumen-model-used")
             .and_then(|v| v.to_str().ok()),
-        Some("jev-fb")
+        Some("typesafe-backup/jev-fb")
     );
 
     let sent = primary.received_requests().await.expect("recorded");
@@ -500,7 +500,7 @@ async fn models_list_advertises_the_decisions_capability() {
         .as_array()
         .expect("list")
         .iter()
-        .find(|m| m["id"] == "jev")
+        .find(|m| m["id"] == "typesafe/jev")
         .expect("jev listed");
     assert_eq!(jev["capabilities"], json!(["decisions"]));
     assert_eq!(jev["owned_by"], "typesafe");
@@ -597,7 +597,7 @@ async fn jev_serves_v1_rerank_through_a_virtual_model_remap() {
         resp.headers()
             .get("x-lumen-model-used")
             .and_then(|v| v.to_str().ok()),
-        Some("jev"),
+        Some("typesafe/jev"),
         "the leaf that served the virtual reranker"
     );
     let body: Value = resp.json().await.expect("json");
@@ -722,7 +722,7 @@ async fn openai_format_to_openai_upstream_renders_openai_shape() {
 
     let resp = post(&base, OPENAI_REQUEST).await;
     assert_eq!(resp.status(), 200);
-    assert_eq!(model_used(&resp).as_deref(), Some("luna"));
+    assert_eq!(model_used(&resp).as_deref(), Some("openai/luna"));
     assert_eq!(
         resp.headers()
             .get("content-type")
@@ -796,7 +796,7 @@ async fn typesafe_format_falls_back_across_vendors_both_directions() {
     )
     .await;
     assert_eq!(resp.status(), 200);
-    assert_eq!(model_used(&resp).as_deref(), Some("jev"));
+    assert_eq!(model_used(&resp).as_deref(), Some("typesafe/jev"));
     assert_eq!(resp.text().await.expect("body"), ANSWERS);
     // Perplexity got the TypeSafe wire, at its own upstream id.
     let sent = decider.received_requests().await.expect("recorded");
@@ -845,7 +845,7 @@ async fn typesafe_format_falls_back_across_vendors_both_directions() {
     )
     .await;
     assert_eq!(resp.status(), 200);
-    assert_eq!(model_used(&resp).as_deref(), Some("luna"));
+    assert_eq!(model_used(&resp).as_deref(), Some("openai/luna"));
     assert_eq!(
         resp.headers()
             .get("x-lumen-route")
@@ -916,7 +916,7 @@ async fn image_request_skips_jev_and_lm_2003_when_nothing_is_left() {
     )
     .await;
     assert_eq!(resp.status(), 200);
-    assert_eq!(model_used(&resp).as_deref(), Some("luna"));
+    assert_eq!(model_used(&resp).as_deref(), Some("openai/luna"));
     let body: Value = resp.json().await.expect("json");
     assert_eq!(body["answers"][0]["probability"], 0.7);
     let sent = luna.received_requests().await.expect("recorded");
@@ -955,7 +955,7 @@ async fn an_incompatible_skip_is_not_an_attempt() {
     for _ in 0..3 {
         let resp = post(&base, ONE_OPTION_REQUEST).await;
         assert_eq!(resp.status(), 200);
-        assert_eq!(model_used(&resp).as_deref(), Some("decider"));
+        assert_eq!(model_used(&resp).as_deref(), Some("perplexity/decider"));
         assert_eq!(
             resp.headers()
                 .get("x-lumen-route")
@@ -997,12 +997,12 @@ async fn an_incompatible_skip_is_not_an_attempt() {
     assert!(
         !metrics
             .lines()
-            .any(|l| l.starts_with("lumen_tokens_total{") && l.contains(r#"model="luna""#)),
+            .any(|l| l.starts_with("lumen_tokens_total{") && l.contains(r#"model="openai/luna""#)),
         "{metrics}"
     );
     let resp = post(&base, OPENAI_REQUEST).await;
     assert_eq!(resp.status(), 200);
-    assert_eq!(model_used(&resp).as_deref(), Some("luna"));
+    assert_eq!(model_used(&resp).as_deref(), Some("openai/luna"));
     luna.verify().await;
 }
 
@@ -1096,7 +1096,7 @@ async fn refusals_are_counted() {
     assert_eq!(resp.status(), 200);
     let metrics = scrape(&base).await;
     assert!(
-        metrics.contains(r#"lumen_decision_refusals_total{model="luna"} 1"#),
+        metrics.contains(r#"lumen_decision_refusals_total{model="openai/luna"} 1"#),
         "{metrics}"
     );
 }

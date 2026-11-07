@@ -257,7 +257,7 @@ async fn virtual_models_are_listed_and_retrievable_unless_hidden() {
         name = "openai"
         kind = "openai"
         [[providers.models]]
-        id = "gpt-4o"
+        id = "openai/gpt-4o"
         capabilities = ["chat"]
         modalities = ["text", "image"]
 
@@ -273,7 +273,7 @@ async fn virtual_models_are_listed_and_retrievable_unless_hidden() {
         capability = "chat"
         strategy = "single"
         listed = false
-        targets = [{ model = "gpt-4o" }]
+        targets = [{ model = "openai/gpt-4o" }]
         "#,
         "test",
     )
@@ -303,7 +303,7 @@ async fn virtual_models_are_listed_and_retrievable_unless_hidden() {
         .iter()
         .map(|m| m["id"].as_str().unwrap())
         .collect();
-    assert_eq!(ids, vec!["gpt-4o", "acme/chat"]);
+    assert_eq!(ids, vec!["openai/gpt-4o", "acme/chat"]);
     let entry = &list["data"][1];
     assert_eq!(entry["virtual"], true);
     assert_eq!(entry["capabilities"], serde_json::json!(["chat"]));
@@ -320,4 +320,86 @@ async fn virtual_models_are_listed_and_retrievable_unless_hidden() {
         .await
         .unwrap();
     assert_eq!(hidden.status(), 404);
+}
+
+#[tokio::test]
+async fn a_disabled_model_is_neither_listed_nor_served() {
+    let cfg = lumen_server::config::Config::load_text(
+        r#"
+        [[providers]]
+        name = "openai"
+        kind = "openai"
+        api_key_env = "LUMEN_TEST_DISABLED_MODEL_KEY"
+        [[providers.models]]
+        id = "openai/gpt-4o"
+        capabilities = ["chat"]
+        [[providers.models]]
+        id = "openai/gpt-3.5-turbo"
+        capabilities = ["chat"]
+        disabled = true
+
+        # A virtual model may still name a disabled model: its leaf is skipped.
+        [[virtual_models]]
+        id = "acme/chat"
+        capability = "chat"
+        strategy = "fallback"
+        targets = [{ model = "openai/gpt-3.5-turbo" }, { model = "openai/gpt-4o" }]
+        "#,
+        "test",
+    )
+    .unwrap();
+    let registry = Arc::new(
+        Registry::build(
+            cfg.provider_specs(),
+            http::build_client(),
+            std::time::Duration::from_secs(300),
+        )
+        .unwrap(),
+    );
+    let state = common::base_state(registry).with_resilience(Arc::new(
+        lumen_server::resilience::ResilienceRuntime::from_config(&cfg, None),
+    ));
+    let base = common::spawn_state(state, LIMIT).await;
+
+    let list: Value = reqwest::get(format!("{base}/v1/models"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let ids: Vec<&str> = list["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec!["openai/gpt-4o", "acme/chat"]);
+
+    // Neither the prefixed id nor its deprecated bare alias is served, while
+    // an enabled model's alias still resolves.
+    for id in ["openai/gpt-3.5-turbo", "gpt-3.5-turbo"] {
+        let one = reqwest::get(format!("{base}/v1/models/{id}"))
+            .await
+            .unwrap();
+        assert_eq!(one.status(), 404, "{id}");
+
+        let chat = reqwest::Client::new()
+            .post(format!("{base}/v1/chat/completions"))
+            .json(&serde_json::json!({
+                "model": id,
+                "messages": [{ "role": "user", "content": "hi" }]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(chat.status(), 404, "{id}");
+        let body: Value = chat.json().await.unwrap();
+        assert_eq!(body["error"]["code"], "LM-2001", "{id}");
+    }
+    let alias = reqwest::get(format!("{base}/v1/models/gpt-4o"))
+        .await
+        .unwrap();
+    assert_eq!(alias.status(), 200);
+    let entry: Value = alias.json().await.unwrap();
+    assert_eq!(entry["id"], "openai/gpt-4o");
 }

@@ -108,6 +108,41 @@ cargo run -p server -- --config config.example.toml
 cargo bench                           # benchmarks (criterion)
 ```
 
+## Versioning, releases and deployment
+One version, in four places that must agree: `[workspace.package] version`
+in `Cargo.toml`, the workspace crates in `Cargo.lock`, `info.version` in
+`docs/openapi.yaml` (the Gateway contract the Lab vendors), and the newest
+`CHANGELOG.md` section. CI's `version sync` job (`scripts/prepare-release.sh --check`) enforces it.
+
+- **Every PR**: add its entries under `## [Unreleased]` in `CHANGELOG.md`, in
+  the same PR as the change. Leave every version alone: only
+  `scripts/prepare-release.sh` writes them.
+- **Release**: run the "Prepare release" workflow (bump `auto`, or
+  `patch`/`minor`/`major`/`X.Y.Z`), then merge the `chore(release): vX.Y.Z`
+  PR it opens. The merge tags `vX.Y.Z`, runs `release.yml` (test gate,
+  binaries, `ghcr.io/qdequele/lumen:vX.Y.Z`) and sends `lumen-released` to
+  the Lab. Tags come only from that merge: never push or move one by hand.
+  Details: CONTRIBUTING.md, "Cutting a release".
+- **Contract change** (`docs/openapi.yaml`): merge it here, release, then the
+  Lab's Contracts sync PR re-vendors it (or re-vendor in the Lab in the same
+  cross-repo task, same branch name, linked PRs). The Lab ships code that
+  uses the new contract only after the release is out.
+- **Deploy**: production (`lumen.meilisearch.com`, the Lab's hosted
+  Gateway) follows the newest *published* `vX.Y.Z` release, not `main`:
+  qdq-server's `qdq-autodeploy` backs up `lumen.db` and the binary, builds
+  the tag, runs `lumen --check-config` on `/etc/lumen/config.toml` before
+  any restart, and rolls back if `verify.sh` fails. SQLite migrations run at
+  boot and are forward-only (`docs/operations/upgrades.md`).
+- **Release that needs an operator step** (a config rewrite such as
+  `lumen config migrate`, a new required config key or env var): the
+  autodeploy refuses or rolls it back. Say so in the CHANGELOG entry
+  (upgrade note) and in the PR description, and land the matching qdq-server
+  change (`lumen/5x-upgrade-*.sh`, `/etc/lumen/lumen.env`) with
+  `lumen` paused (`touch /etc/qdq/autodeploy-lumen.paused`) before the
+  release publishes.
+- **PR description**: a "Deploy notes" section listing config or env
+  changes, migrations and the rollout order, or "none".
+
 ## Available subagents (.claude/agents/)
 - `provider-integrator`: adds a new provider (repeatable pattern)
 - `test-writer`: writes the tests before the implementation

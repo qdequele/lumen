@@ -29,6 +29,7 @@ pub mod lifecycle;
 pub mod metadata;
 pub mod models;
 pub mod openapi;
+pub mod platform_keys_admin;
 pub mod pricing;
 pub mod reload;
 pub mod rerank;
@@ -180,7 +181,7 @@ mod tests {
             kind = "openai"
             api_key_env = "BOOT_LOG_TEST_SECRET"
             [[providers.models]]
-            id = "gpt-4o"
+            id = "openai-main/gpt-4o"
             capabilities = ["chat"]
         "#;
         let figment = Figment::new().merge(Toml::string(toml));
@@ -239,11 +240,11 @@ mod tests {
             kind = "openai"
 
             [[providers.models]]
-            id = "gpt-4o"
+            id = "openai-main/gpt-4o"
             capabilities = ["chat"]
 
             [[providers.models]]
-            id = "text-embed"
+            id = "openai-main/text-embed"
             capabilities = ["embed"]
             "#,
         );
@@ -286,7 +287,7 @@ mod tests {
             kind = "groq"
 
             [[providers.models]]
-            id = "groq-embed"
+            id = "groq-main/groq-embed"
             capabilities = ["embed"]
             "#,
         );
@@ -314,7 +315,7 @@ mod tests {
             kind = "vllm"
 
             [[providers.models]]
-            id = "local-model"
+            id = "self-hosted/local-model"
             capabilities = ["chat"]
             "#,
         );

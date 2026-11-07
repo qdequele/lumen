@@ -47,7 +47,7 @@ cost_per_1m_output = 0.6
 upstream_id = "gpt-4o-mini"
 
 [[providers.models]]
-id = "text-embedding-3-small"
+id = "openai/text-embedding-3-small"
 capabilities = ["embed"]
 cost_per_1m_input = 0.02
 
@@ -60,7 +60,7 @@ kind = "anthropic"
 api_key_env = "ANTHROPIC_API_KEY"
 
 [[providers.models]]
-id = "claude-haiku-4-5"
+id = "anthropic/claude-haiku-4-5"
 upstream_id = "claude-haiku-4-5-20251001"
 capabilities = ["chat"]
 modalities = ["text", "image"]
@@ -76,14 +76,14 @@ kind = "mistral"
 api_key_env = "MISTRAL_API_KEY"
 
 [[providers.models]]
-id = "mistral-small"
+id = "mistral/mistral-small"
 upstream_id = "mistral-small-latest"
 capabilities = ["chat"]
 cost_per_1m_input = 0.1
 cost_per_1m_output = 0.3
 
 [[providers.models]]
-id = "mistral-embed"
+id = "mistral/mistral-embed"
 capabilities = ["embed"]
 cost_per_1m_input = 0.1
 
@@ -100,7 +100,7 @@ api_key_env = "GEMINI_API_KEY"
 # a remote http(s) image URL routed here is rejected with LM-2004 (the gateway
 # never fetches user-supplied URLs itself; see docs/providers.md).
 [[providers.models]]
-id = "gemini-flash"
+id = "google/gemini-flash"
 upstream_id = "gemini-flash-latest"
 capabilities = ["chat"]
 modalities = ["text", "image"]
@@ -116,7 +116,7 @@ kind = "cohere"
 api_key_env = "COHERE_API_KEY"
 
 [[providers.models]]
-id = "cohere-embed"
+id = "cohere/cohere-embed"
 upstream_id = "embed-v4.0"
 capabilities = ["embed"]
 # embed-v4 is multimodal: accept image content parts (data: URIs) on
@@ -139,13 +139,13 @@ kind = "jina"
 api_key_env = "JINA_API_KEY"
 
 [[providers.models]]
-id = "jina-embed"
+id = "jina/jina-embed"
 upstream_id = "jina-embeddings-v3"
 capabilities = ["embed"]
 cost_per_1m_input = 0.02
 
 [[providers.models]]
-id = "jina-rerank"
+id = "jina/jina-rerank"
 upstream_id = "jina-reranker-v2-base-multilingual"
 capabilities = ["rerank"]
 cost_per_1k_searches = 0.02
@@ -159,13 +159,13 @@ kind = "voyage"
 api_key_env = "VOYAGE_API_KEY"
 
 [[providers.models]]
-id = "voyage-embed"
+id = "voyage/voyage-embed"
 upstream_id = "voyage-3-lite"
 capabilities = ["embed"]
 cost_per_1m_input = 0.02
 
 [[providers.models]]
-id = "voyage-rerank"
+id = "voyage/voyage-rerank"
 upstream_id = "rerank-2"
 capabilities = ["rerank"]
 cost_per_1k_searches = 0.05
@@ -181,12 +181,12 @@ api_key_env = "CLOUDFLARE_API_TOKEN"
 base_url = "https://api.cloudflare.com/client/v4/accounts/YOUR_CLOUDFLARE_ACCOUNT_ID/ai/v1"
 
 [[providers.models]]
-id = "cf-llama"
+id = "cloudflare/cf-llama"
 upstream_id = "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
 capabilities = ["chat"]
 
 [[providers.models]]
-id = "cf-embed"
+id = "cloudflare/cf-embed"
 upstream_id = "@cf/baai/bge-m3"
 capabilities = ["embed"]
 
@@ -196,14 +196,14 @@ capabilities = ["embed"]
 
 # Cross-vendor chat fallback chain: OpenAI -> Anthropic -> Mistral.
 [[virtual_models]]
-id = "gpt-4o-mini"
+id = "lumen/gpt-4o-mini"
 capability = "chat"
 strategy = "fallback"
-targets = [{ model = "openai/gpt-4o-mini" }, { model = "claude-haiku-4-5" }, { model = "mistral-small" }]
+targets = [{ model = "openai/gpt-4o-mini" }, { model = "anthropic/claude-haiku-4-5" }, { model = "mistral/mistral-small" }]
 
 # Three-vendor rerank fallback chain.
 [[virtual_models]]
-id = "cohere-rerank"
+id = "lumen/cohere-rerank"
 capability = "rerank"
 strategy = "fallback"
-targets = [{ model = "cohere/cohere-rerank" }, { model = "jina-rerank" }, { model = "voyage-rerank" }]
+targets = [{ model = "cohere/cohere-rerank" }, { model = "jina/jina-rerank" }, { model = "voyage/voyage-rerank" }]

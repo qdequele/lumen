@@ -6,6 +6,93 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **Sub-groups ([ADR 020](docs/adr/020-team-sub-groups.md)).** A budget
+  group can be created under a top-level group with `parent_id` on
+  `POST /admin/groups`. A key in a sub-group must fit its own budget, the
+  sub-group's and the parent's, so the parent always binds: on the hosted
+  gateway a team can split its credit lease into pools without being able to
+  spend past it. A refusal by the parent is `LM-4001` with the message
+  "budget exceeded for this key's parent group". Sub-groups nest one level
+  deep and never change parent. They bill to the parent's `account_ref`, are
+  charged bandwidth at the parent's rate and use the parent's team provider
+  keys; their own team key routes are 404. A group with live sub-groups
+  cannot be deleted or change `account_ref`. `GET /admin/groups` takes
+  `?parent_id=`, and every group record now has `parent_id`. Migration
+  `0018_group_parent.sql` is additive: existing groups are top-level and
+  behave as before.
+
+### Fixed
+
+- **Text embeddings on Voyage's multimodal models.** A plain-text `input` to
+  a `voyage-multimodal-*` model (any provider of kind `voyage`) went to
+  Voyage's `/embeddings`, which answers 400 for those models. It now goes to
+  `/multimodalembeddings`, one text item per input. On that endpoint a
+  requested `dimensions` is now sent as `output_dimension` instead of being
+  dropped.
+
+## [0.9.0] - 2026-11-06
+
+### Added
+
+- **`disabled` on a foundation model.** `disabled = true` on a
+  `[[providers.models]]` entry (the model's `disabled` field in
+  `PUT /admin/config/providers/{name}`) takes it out of service without
+  deleting it: it is not listed on `GET /v1/models`, a request for it is
+  `404` `LM-2001`, and a virtual model skips it like any target the gateway
+  does not serve. Its prices and the virtual models naming it stay valid, so
+  re-enabling it is removing the flag. The Meilisearch Lab's staff Admin area
+  uses it to take a hosted model out of the catalog.
+
+- **Platform provider key pools (ADR 019).** The platform's own provider
+  keys can now be a pool per provider (up to 20 keys, each with a label and
+  an `enabled` flag), managed at runtime with the platform-only
+  `GET /admin/platform-keys`, `POST /admin/platform-keys/{provider}/keys`,
+  `PATCH` and `DELETE .../keys/{key_id}`. Wherever the platform key served
+  before, the pool's keys are used round-robin with the BYOK rotation rules
+  (429 benches, 401/403 marks failing). Once a provider has a platform key,
+  enabled or not, its configured key (`api_key_env` /
+  `PUT /admin/provider-keys`) is ignored: an exhausted pool returns its last
+  error, and a pool whose keys are all disabled fails `LM-3022` (503)
+  without calling upstream. Deleting the last platform key brings the
+  configured key back. A team with the fallback off never reaches the pool. Keys are sealed at rest and
+  never returned or logged; disable and delete evict the key before
+  answering.
+
+- **Automated releases.** `scripts/prepare-release.sh` bumps the workspace
+  version in `Cargo.toml`, `Cargo.lock` and `docs/openapi.yaml` and folds
+  `[Unreleased]` into a dated CHANGELOG section in one idempotent step (with
+  no argument it suggests the bump from the conventional commits since the
+  last tag). The "Prepare release" workflow runs it and opens the
+  `chore(release): vX.Y.Z` PR; merging that PR tags the merge commit and runs
+  `release.yml` (`release-on-merge.yml`), which can now also be called as a
+  reusable workflow and optionally notifies `meilisearch/lab` to re-vendor the
+  OpenAPI document (`LAB_DISPATCH_TOKEN`). A new CI job, `version sync`, fails
+  when the three version copies disagree. See CONTRIBUTING.md.
+
+### Changed
+
+- **Every model id is prefixed (breaking config change).** A foundation model
+  id is `<provider name>/<model>` (`openai/gpt-4o-mini` on provider `openai`)
+  and a virtual model id `<namespace>/<model>` (`meilisearch/rerank`). A bare
+  id, or a foundation id whose prefix is not its provider's name, fails
+  validation at boot, on reload and on the admin config routes (`LM-1001`).
+  Run `lumen config migrate` (file or DB mode, `--dry-run` to preview,
+  `--virtual-namespace NS` for virtual ids, default `lumen`) before upgrading:
+  it prefixes every id, pins the old id as `upstream_id` and rewrites virtual
+  model targets. A foundation model's `upstream_id` now defaults to its id
+  without the `<provider>/` prefix.
+
+### Deprecated
+
+- **Bare model ids are hidden aliases.** A request naming a model by its old
+  bare id (`gpt-4o-mini`) still resolves to the prefixed one, which usage,
+  `x-lumen-model-used` and metrics then report. Aliases are never listed in
+  `GET /v1/models`; each use logs a warning and increments
+  `lumen_deprecated_model_alias_total{alias,model}`. A disabled model's alias
+  does not resolve. They will be removed once that counter stays at zero.
+
 ## [0.8.1] - 2026-11-05
 
 First release with team provider key pools (BYOK) and bandwidth metering
@@ -2063,7 +2150,8 @@ This closes every remaining streaming criterion:
 - Docs: error-code reference (`docs/errors.md`), ADR 001 (crate/lib naming),
   and this changelog.
 
-[Unreleased]: https://github.com/qdequele/lumen/compare/v0.8.1...HEAD
+[Unreleased]: https://github.com/qdequele/lumen/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/qdequele/lumen/compare/v0.8.1...v0.9.0
 [0.8.1]: https://github.com/qdequele/lumen/compare/v0.7.0...v0.8.1
 [0.7.0]: https://github.com/qdequele/lumen/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/qdequele/lumen/compare/v0.6.0...v0.6.1

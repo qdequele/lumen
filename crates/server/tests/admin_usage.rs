@@ -275,8 +275,8 @@ async fn each_filter_narrows_the_result() {
     other_key.key_id = Some("key-b".to_owned());
     let mut embed = row(now - 2);
     embed.capability = "embed".to_owned();
-    embed.model = "embed-small".to_owned();
-    embed.model_used = "embed-small".to_owned();
+    embed.model = "openai/embed-small".to_owned();
+    embed.model_used = "openai/embed-small".to_owned();
     let mut rerank = row(now - 3);
     rerank.capability = "rerank".to_owned();
     rerank.model = "rerank-fast".to_owned();
@@ -509,7 +509,7 @@ async fn gateway_requests_show_up_with_their_provider() {
                 connect_timeout_ms: None,
                 api_version: None,
                 models: vec![ModelSpec {
-                    id: "embed-small".to_owned(),
+                    id: "openai/embed-small".to_owned(),
                     upstream_id: "text-embedding-3-small".to_owned(),
                     capabilities: vec![Capability::Embed],
                     modalities: vec!["text".to_owned()],
@@ -530,7 +530,7 @@ async fn gateway_requests_show_up_with_their_provider() {
         .client
         .post(format!("{}/v1/embeddings", h.base))
         .bearer_auth(&key)
-        .json(&json!({ "model": "embed-small", "input": "abcd" }))
+        .json(&json!({ "model": "openai/embed-small", "input": "abcd" }))
         .send()
         .await
         .expect("send");
@@ -571,7 +571,7 @@ fn dollar_embed_pricing() -> CostTable {
         name = "openai"
         kind = "openai"
         [[providers.models]]
-        id = "embed-small"
+        id = "openai/embed-small"
         capabilities = ["embed"]
         cost_per_1m_input = 1000000.0
     "#;
@@ -595,7 +595,7 @@ fn embed_registry(upstream: &str) -> Arc<Registry> {
                 strict: false,
                 connect_timeout_ms: None,
                 models: vec![ModelSpec {
-                    id: "embed-small".to_owned(),
+                    id: "openai/embed-small".to_owned(),
                     upstream_id: "text-embedding-3-small".to_owned(),
                     capabilities: vec![Capability::Embed],
                     modalities: vec!["text".to_owned()],
@@ -672,6 +672,7 @@ async fn create_live_group(h: &Harness, budget_max: Option<f64>) -> String {
             name: "pool".to_owned(),
             budget_max,
             account_ref: None,
+            parent_id: None,
         })
         .await
         .expect("create group");
@@ -700,7 +701,7 @@ async fn embed(h: &Harness, key: &str) -> u16 {
     h.client
         .post(format!("{}/v1/embeddings", h.base))
         .bearer_auth(key)
-        .json(&json!({ "model": "embed-small", "input": "abcd" }))
+        .json(&json!({ "model": "openai/embed-small", "input": "abcd" }))
         .send()
         .await
         .expect("send")

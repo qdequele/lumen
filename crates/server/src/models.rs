@@ -124,6 +124,8 @@ pub async fn model(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<ModelEntry>, ApiError> {
+    // A deprecated bare id is served as the entry of the id it aliases.
+    let id = state.resilience.canonical_model(&id);
     state
         .registry
         .model(&id)

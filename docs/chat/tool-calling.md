@@ -19,7 +19,7 @@ falls back to `auto`).
 
 ```json
 {
-  "model": "gpt-4o",
+  "model": "openai/gpt-4o",
   "messages": [{ "role": "user", "content": "What is the weather in Paris?" }],
   "tools": [{
     "type": "function",
@@ -56,7 +56,7 @@ role message with the result:
 
 ```json
 {
-  "model": "gpt-4o",
+  "model": "openai/gpt-4o",
   "messages": [
     { "role": "user", "content": "What is the weather in Paris?" },
     { "role": "assistant", "content": null, "tool_calls": [ /* as above */ ] },

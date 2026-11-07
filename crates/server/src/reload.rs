@@ -531,11 +531,7 @@ pub async fn reload_once(ctx: &Arc<ConfigContext>, targets: &Arc<ReloadTargets>)
     // never locks anyone out).
     if let Some(runtime) = &targets.auth_runtime {
         match runtime.store.load_groups().await {
-            Ok(groups) => {
-                for record in &groups {
-                    runtime.keys.upsert_group(record);
-                }
-            }
+            Ok(groups) => runtime.keys.upsert_groups(&groups),
             Err(error) => tracing::warn!(
                 %error,
                 "budget-group refresh failed; keeping the current in-memory group table"
@@ -670,7 +666,7 @@ mod tests {
         name = "openai"
         kind = "openai"
         [[providers.models]]
-        id = "gpt"
+        id = "openai/gpt"
         capabilities = ["chat"]
     "#;
 
@@ -679,10 +675,10 @@ mod tests {
         name = "openai"
         kind = "openai"
         [[providers.models]]
-        id = "gpt"
+        id = "openai/gpt"
         capabilities = ["chat"]
         [[providers.models]]
-        id = "embed"
+        id = "openai/embed"
         capabilities = ["embed"]
     "#;
 
@@ -736,8 +732,8 @@ mod tests {
         let dir = tempdir();
         let path = write_config(&dir, ONE_MODEL);
         let registry = registry_from(&path);
-        assert!(registry.chat_route("gpt").is_some());
-        assert!(registry.embedding_route("embed").is_none());
+        assert!(registry.chat_route("openai/gpt").is_some());
+        assert!(registry.embedding_route("openai/embed").is_none());
 
         let metrics = ReloadMetrics::register(&Metrics::new()).unwrap();
         let t = targets(Arc::clone(&registry), metrics);
@@ -745,8 +741,8 @@ mod tests {
         apply_reload(&load(&path), &t).expect("valid reload");
 
         // The new model is now routable - the swap took effect.
-        assert!(registry.embedding_route("embed").is_some());
-        assert!(registry.knows_model("gpt"));
+        assert!(registry.embedding_route("openai/embed").is_some());
+        assert!(registry.knows_model("openai/gpt"));
     }
 
     #[test]
@@ -818,12 +814,12 @@ mod tests {
         };
 
         // Baseline: model unpriced, no virtual model.
-        assert_eq!(t.pricing.load().token_cost("gpt", 1_000_000, 0), 0.0);
-        assert!(t.resilience.routing().get("chat").is_none());
-        assert_eq!(attempt_ids("gpt"), vec!["gpt"]);
+        assert_eq!(t.pricing.load().token_cost("openai/gpt", 1_000_000, 0), 0.0);
+        assert!(t.resilience.routing().get("lumen/chat").is_none());
+        assert_eq!(attempt_ids("openai/gpt"), vec!["openai/gpt"]);
 
         // Trip the breaker for (openai, gpt) so we can prove it survives reload.
-        let breaker = t.resilience.breakers.get("openai", "gpt");
+        let breaker = t.resilience.breakers.get("openai", "openai/gpt");
         let now = tokio::time::Instant::now();
         // Default threshold is 5 consecutive failures.
         for _ in 0..5 {
@@ -839,27 +835,30 @@ mod tests {
             name = "openai"
             kind = "openai"
             [[providers.models]]
-            id = "gpt"
+            id = "openai/gpt"
             capabilities = ["chat"]
             cost_per_1m_input = 2.5
             [[providers.models]]
-            id = "backup"
+            id = "openai/backup"
             capabilities = ["chat"]
             [[virtual_models]]
-            id = "chat"
+            id = "lumen/chat"
             capability = "chat"
             strategy = "fallback"
-            targets = [{ model = "gpt" }, { model = "backup" }]
+            targets = [{ model = "openai/gpt" }, { model = "openai/backup" }]
             "#,
         );
         apply_reload(&load(&path), &t).expect("valid reload");
 
         // Pricing + resilience policy swapped...
-        assert_eq!(t.pricing.load().token_cost("gpt", 1_000_000, 0), 2.5);
-        assert_eq!(attempt_ids("chat"), vec!["gpt", "backup"]);
+        assert_eq!(t.pricing.load().token_cost("openai/gpt", 1_000_000, 0), 2.5);
+        assert_eq!(
+            attempt_ids("lumen/chat"),
+            vec!["openai/gpt", "openai/backup"]
+        );
         // ...but the breaker's live state was preserved across the swap.
         assert_eq!(
-            t.resilience.breakers.get("openai", "gpt").state(),
+            t.resilience.breakers.get("openai", "openai/gpt").state(),
             CircuitState::Open,
             "reload must not reset circuit-breaker state"
         );
@@ -878,7 +877,7 @@ mod tests {
             name = "openai"
             kind = "openai"
             [[providers.models]]
-            id = "gpt"
+            id = "openai/gpt"
             capabilities = ["chat"]
         "#;
         let path = write_config(&dir, boot);
@@ -906,7 +905,7 @@ mod tests {
             name = "openai"
             kind = "openai"
             [[providers.models]]
-            id = "gpt"
+            id = "openai/gpt"
             capabilities = ["chat"]
             "#,
         );
@@ -929,7 +928,7 @@ mod tests {
             name = "cohere"
             kind = "cohere"
             [[providers.models]]
-            id = "rr"
+            id = "cohere/rr"
             capabilities = ["rerank"]
         "#;
         let path = write_config(&dir, body);
@@ -986,7 +985,7 @@ mod tests {
             "reload must re-read the rotated DB key without a restart"
         );
         assert!(
-            registry.rerank_route("rr").is_some(),
+            registry.rerank_route("cohere/rr").is_some(),
             "registry still routes"
         );
     }
@@ -1029,7 +1028,7 @@ mod tests {
             name = \"late\"
             kind = \"cohere\"
             [[providers.models]]
-            id = \"rr\"
+            id = \"late/rr\"
             capabilities = [\"rerank\"]
             "
         );
@@ -1040,7 +1039,7 @@ mod tests {
             Some("late-key"),
             "a provider added after boot must get its stored key on reload"
         );
-        assert!(registry.rerank_route("rr").is_some());
+        assert!(registry.rerank_route("late/rr").is_some());
     }
 
     #[tokio::test]
@@ -1060,7 +1059,7 @@ mod tests {
             kind = "tei"
             base_url = "http://tei:8080"
             [[providers.models]]
-            id = "embed"
+            id = "tei/embed"
             capabilities = ["embed"]
             "#,
         )
@@ -1144,6 +1143,7 @@ mod tests {
                 name: "team".to_owned(),
                 budget_max: None,
                 account_ref: None,
+                parent_id: None,
             })
             .await
             .expect("group");
@@ -1180,7 +1180,7 @@ mod tests {
             kind = "vllm"
             base_url = "http://localhost:8000/v1"
             [[providers.models]]
-            id = "gpt"
+            id = "openai/gpt"
             capabilities = ["chat"]
             "#,
         )
@@ -1201,7 +1201,7 @@ mod tests {
         let dir = tempdir();
         let path = write_config(&dir, TWO_MODELS);
         let registry = registry_from(&path);
-        assert!(registry.embedding_route("embed").is_some());
+        assert!(registry.embedding_route("openai/embed").is_some());
 
         let metrics = Metrics::new();
         let reload = ReloadMetrics::register(&metrics).unwrap();
@@ -1213,13 +1213,10 @@ mod tests {
             name = "a"
             kind = "openai"
             [[providers.models]]
-            id = "dup"
+            id = "a/dup"
             capabilities = ["chat"]
-            [[providers]]
-            name = "b"
-            kind = "openai"
             [[providers.models]]
-            id = "dup"
+            id = "a/dup"
             capabilities = ["chat"]
             "#,
         );
@@ -1227,8 +1224,8 @@ mod tests {
         reload_once(&ctx(&path), &t).await;
 
         // Old routing table intact: the pre-reload models still resolve.
-        assert!(registry.embedding_route("embed").is_some());
-        assert!(registry.chat_route("gpt").is_some());
+        assert!(registry.embedding_route("openai/embed").is_some());
+        assert!(registry.chat_route("openai/gpt").is_some());
         // Failure counted, no success.
         let out = metrics.encode_text();
         assert!(out.contains("lumen_config_reload_failures_total 1"));
@@ -1245,7 +1242,7 @@ mod tests {
         let dir = tempdir();
         let path = write_config(&dir, TWO_MODELS);
         let registry = registry_from(&path);
-        assert!(registry.embedding_route("embed").is_some());
+        assert!(registry.embedding_route("openai/embed").is_some());
 
         let metrics = Metrics::new();
         let reload = ReloadMetrics::register(&metrics).unwrap();
@@ -1256,7 +1253,7 @@ mod tests {
             name = "groq"
             kind = "groq"
             [[providers.models]]
-            id = "groq-embed"
+            id = "groq/groq-embed"
             capabilities = ["embed"]
             "#,
         );
@@ -1272,9 +1269,9 @@ mod tests {
 
         // Old routing table intact: the pre-reload models still resolve, and
         // the rejected model never appeared.
-        assert!(registry.embedding_route("embed").is_some());
-        assert!(registry.chat_route("gpt").is_some());
-        assert!(registry.embedding_route("groq-embed").is_none());
+        assert!(registry.embedding_route("openai/embed").is_some());
+        assert!(registry.chat_route("openai/gpt").is_some());
+        assert!(registry.embedding_route("groq/groq-embed").is_none());
     }
 
     #[tokio::test]
@@ -1289,7 +1286,10 @@ mod tests {
         let t = Arc::new(targets(Arc::clone(&registry), reload));
         reload_once(&ctx(&path), &t).await;
 
-        assert!(registry.chat_route("gpt").is_some(), "old table kept");
+        assert!(
+            registry.chat_route("openai/gpt").is_some(),
+            "old table kept"
+        );
         assert!(metrics
             .encode_text()
             .contains("lumen_config_reload_failures_total 1"));
@@ -1330,7 +1330,7 @@ mod tests {
             kind = "openai"
             base_url = "{}"
             [[providers.models]]
-            id = "gpt"
+            id = "openai/gpt"
             capabilities = ["chat"]
             "#,
             upstream.uri()
@@ -1359,7 +1359,7 @@ mod tests {
 
         reload_once(&ctx, &t).await;
         assert!(
-            registry.chat_route("gpt").is_some(),
+            registry.chat_route("openai/gpt").is_some(),
             "the persisted DB document's model is routable after one reload"
         );
 
@@ -1372,7 +1372,7 @@ mod tests {
 
         reload_once(&ctx, &t).await;
         assert!(
-            registry.chat_route("gpt").is_some(),
+            registry.chat_route("openai/gpt").is_some(),
             "a broken DB source must keep the previous, working registry"
         );
         assert!(

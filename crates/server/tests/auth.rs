@@ -52,14 +52,14 @@ fn full_registry(upstream: &str) -> Arc<Registry> {
             connect_timeout_ms: None,
             models: vec![
                 ModelSpec {
-                    id: "gpt".to_owned(),
+                    id: "openai/gpt".to_owned(),
                     upstream_id: "gpt-4o-2024-08-06".to_owned(),
                     capabilities: vec![Capability::Chat],
                     modalities: vec!["text".to_owned()],
                     release_date: None,
                 },
                 ModelSpec {
-                    id: "embed-small".to_owned(),
+                    id: "openai/embed-small".to_owned(),
                     upstream_id: "text-embedding-3-small".to_owned(),
                     capabilities: vec![Capability::Embed],
                     modalities: vec!["text".to_owned()],
@@ -78,7 +78,7 @@ fn full_registry(upstream: &str) -> Arc<Registry> {
             strict: false,
             connect_timeout_ms: None,
             models: vec![ModelSpec {
-                id: "rerank-fast".to_owned(),
+                id: "cohere/rerank-fast".to_owned(),
                 upstream_id: "rerank-v3.5".to_owned(),
                 capabilities: vec![Capability::Rerank],
                 modalities: vec!["text".to_owned()],
@@ -96,7 +96,7 @@ fn full_registry(upstream: &str) -> Arc<Registry> {
             strict: false,
             connect_timeout_ms: None,
             models: vec![ModelSpec {
-                id: "jev".to_owned(),
+                id: "typesafe/jev".to_owned(),
                 upstream_id: "jev-latest".to_owned(),
                 capabilities: vec![Capability::Decisions],
                 modalities: vec!["text".to_owned()],
@@ -114,7 +114,7 @@ fn full_registry(upstream: &str) -> Arc<Registry> {
             strict: false,
             connect_timeout_ms: None,
             models: vec![ModelSpec {
-                id: "tei-embed".to_owned(),
+                id: "tei/tei-embed".to_owned(),
                 upstream_id: "tei-model".to_owned(),
                 capabilities: vec![Capability::Embed],
                 modalities: vec!["text".to_owned()],
@@ -141,12 +141,12 @@ fn dollar_pricing() -> CostTable {
         name = "openai"
         kind = "openai"
         [[providers.models]]
-        id = "gpt"
+        id = "openai/gpt"
         capabilities = ["chat"]
         cost_per_1m_input = 1000000.0
         cost_per_1m_output = 1000000.0
         [[providers.models]]
-        id = "embed-small"
+        id = "openai/embed-small"
         capabilities = ["embed"]
         cost_per_1m_input = 1000000.0
 
@@ -154,7 +154,7 @@ fn dollar_pricing() -> CostTable {
         name = "cohere"
         kind = "cohere"
         [[providers.models]]
-        id = "rerank-fast"
+        id = "cohere/rerank-fast"
         capabilities = ["rerank"]
         cost_per_1k_searches = 1000.0
 
@@ -162,7 +162,7 @@ fn dollar_pricing() -> CostTable {
         name = "typesafe"
         kind = "typesafe"
         [[providers.models]]
-        id = "jev"
+        id = "typesafe/jev"
         capabilities = ["decisions"]
         # Input-only pricing, like Jev itself: output tokens are free.
         cost_per_1m_input = 1000000.0
@@ -371,7 +371,7 @@ async fn mount_typesafe(upstream: &MockServer, input_tokens: u32) {
 
 fn typesafe_decisions_body() -> Value {
     json!({
-        "model": "jev",
+        "model": "typesafe/jev",
         "state": "abcd",
         "questions": { "q": { "type": "noul", "instructions": "?" } }
     })
@@ -379,7 +379,7 @@ fn typesafe_decisions_body() -> Value {
 
 fn embed_body() -> Value {
     // "abcd" = 4 bytes → exactly 1 estimated token → $1 at test pricing.
-    json!({ "model": "embed-small", "input": "abcd" })
+    json!({ "model": "openai/embed-small", "input": "abcd" })
 }
 
 // ---- Authentication ---------------------------------------------------------
@@ -445,7 +445,7 @@ async fn model_retrieve_sits_behind_virtual_key_auth() {
     // No key: 401 with the standard auth envelope, like every /v1 route.
     let resp = h
         .client
-        .get(format!("{}/v1/models/gpt", h.base))
+        .get(format!("{}/v1/models/openai/gpt", h.base))
         .send()
         .await
         .expect("send");
@@ -472,14 +472,14 @@ async fn model_retrieve_sits_behind_virtual_key_auth() {
     let key = h.create_key(None, None, None).await;
     let resp = h
         .client
-        .get(format!("{}/v1/models/gpt", h.base))
+        .get(format!("{}/v1/models/openai/gpt", h.base))
         .bearer_auth(&key)
         .send()
         .await
         .expect("send");
     assert_eq!(resp.status(), 200);
     let body: Value = resp.json().await.expect("json");
-    assert_eq!(body["id"], "gpt");
+    assert_eq!(body["id"], "openai/gpt");
     assert_eq!(body["object"], "model");
 }
 
@@ -593,7 +593,7 @@ async fn decisions_usage_row_records_tokens_and_input_only_cost() {
     // Columns: model|model_used|capability|tokens_in|tokens_out|search_units|
     // cached|reasoning|cache_write|estimated|cost.
     assert!(
-        dump.contains("'jev'|'jev'|'decisions'|5|20|NULL|NULL|NULL|NULL|0|5.0|"),
+        dump.contains("'typesafe/jev'|'typesafe/jev'|'decisions'|5|20|NULL|NULL|NULL|NULL|0|5.0|"),
         "dump:\n{dump}"
     );
     // The request content never reaches the usage log.
@@ -624,13 +624,13 @@ async fn jev_rerank_is_billed_per_input_token() {
         name = "typesafe"
         kind = "typesafe"
         [[providers.models]]
-        id = "jev"
+        id = "typesafe/jev"
         capabilities = ["decisions"]
         [[virtual_models]]
-        id = "jev-rerank"
+        id = "lumen/jev-rerank"
         capability = "rerank"
         strategy = "single"
-        targets = [{ model = "jev", remap = { instructions = "Relevant?" } }]
+        targets = [{ model = "typesafe/jev", remap = { instructions = "Relevant?" } }]
         "#,
     )
     .expect("valid routing config");
@@ -658,7 +658,7 @@ async fn jev_rerank_is_billed_per_input_token() {
     // tokens_in=5 (upstream), one derived search unit priced at 0, $5 of
     // tokens at `jev`'s price (the leaf that served).
     assert!(
-        dump.contains("'jev-rerank'|'jev'|'rerank'|5|0|1|NULL|NULL|NULL|0|5.0|"),
+        dump.contains("'lumen/jev-rerank'|'typesafe/jev'|'rerank'|5|0|1|NULL|NULL|NULL|0|5.0|"),
         "dump:\n{dump}"
     );
 }
@@ -697,7 +697,7 @@ async fn decisions_reservation_is_refunded_on_upstream_error_and_disconnect() {
         .and(path("/v1/systemone"))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_json(json!({ "model": "jev", "answers": {} }))
+                .set_body_json(json!({ "model": "typesafe/jev", "answers": {} }))
                 .set_delay(Duration::from_secs(3)),
         )
         .mount(&slow)
@@ -936,7 +936,7 @@ async fn successful_requests_land_in_the_usage_log_with_cost() {
     h.wait_usage_rows(1).await;
     let dump = h.store.debug_dump().await.expect("dump");
     // model, capability, tokens_in=3 (upstream), cost $3, status 200.
-    assert!(dump.contains("'embed-small'"), "dump:\n{dump}");
+    assert!(dump.contains("'openai/embed-small'"), "dump:\n{dump}");
     assert!(dump.contains("'embed'"));
     assert!(dump.contains("|3|0|"), "tokens_in=3, tokens_out=0:\n{dump}");
     assert!(dump.contains("3.0"), "cost at $1/token:\n{dump}");
@@ -965,7 +965,7 @@ async fn rejected_requests_land_in_the_usage_log_with_the_rejection_status() {
     h.wait_usage_rows(1).await;
     let dump = h.store.debug_dump().await.expect("dump");
     // The refused capability/model, status 402, and zero tokens are recorded.
-    assert!(dump.contains("'embed-small'"), "dump:\n{dump}");
+    assert!(dump.contains("'openai/embed-small'"), "dump:\n{dump}");
     assert!(dump.contains("'embed'"), "dump:\n{dump}");
     assert!(dump.contains("|402|"), "status 402 recorded:\n{dump}");
     assert!(
@@ -1072,7 +1072,7 @@ async fn tei_embeddings_without_upstream_usage_are_estimated_never_zero() {
         .client
         .post(format!("{}/v1/embeddings", h.base))
         .bearer_auth(&key)
-        .json(&json!({ "model": "tei-embed", "input": "twelve bytes" }))
+        .json(&json!({ "model": "tei/tei-embed", "input": "twelve bytes" }))
         .send()
         .await
         .expect("send");
@@ -1084,7 +1084,7 @@ async fn tei_embeddings_without_upstream_usage_are_estimated_never_zero() {
 
     let metrics = h.metrics_text().await;
     assert!(metrics.contains(r#"estimated="true""#), "{metrics}");
-    assert!(metrics.contains(r#"model="tei-embed""#));
+    assert!(metrics.contains(r#"model="tei/tei-embed""#));
     // The dedicated estimation counter moved too.
     assert!(!metrics.contains("lumen_tokens_estimated_total 0"));
 
@@ -1136,7 +1136,7 @@ async fn every_capability_feeds_the_token_counters_with_its_own_labels() {
         .post(format!("{}/v1/chat/completions", h.base))
         .bearer_auth(&key)
         .json(&json!({
-            "model": "gpt",
+            "model": "openai/gpt",
             "messages": [{ "role": "user", "content": "hi" }],
             "max_tokens": 50
         }))
@@ -1160,7 +1160,7 @@ async fn every_capability_feeds_the_token_counters_with_its_own_labels() {
         .post(format!("{}/v1/rerank", h.base))
         .bearer_auth(&key)
         .json(&json!({
-            "model": "rerank-fast",
+            "model": "cohere/rerank-fast",
             "query": "q",
             "documents": ["a", "b"]
         }))
@@ -1177,7 +1177,7 @@ async fn every_capability_feeds_the_token_counters_with_its_own_labels() {
         r#"direction="input""#,
         r#"direction="output""#,
         "lumen_rerank_search_units_total",
-        r#"model="rerank-fast""#,
+        r#"model="cohere/rerank-fast""#,
     ] {
         assert!(metrics.contains(needle), "missing {needle} in:\n{metrics}");
     }
@@ -1213,7 +1213,7 @@ async fn streaming_chat_reads_usage_from_the_final_chunk() {
         .post(format!("{}/v1/chat/completions", h.base))
         .bearer_auth(&key)
         .json(&json!({
-            "model": "gpt",
+            "model": "openai/gpt",
             "messages": [{ "role": "user", "content": "hi" }],
             "max_tokens": 40,
             "stream": true

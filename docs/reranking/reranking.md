@@ -10,7 +10,7 @@
 curl -s http://localhost:8080/v1/rerank \
   -H 'content-type: application/json' \
   -d '{
-    "model": "rerank-english",
+    "model": "cohere/rerank-english",
     "query": "What is the capital of France?",
     "documents": ["Paris is the capital of France.", "Berlin is in Germany."],
     "top_n": 2
@@ -47,7 +47,7 @@ model's `[[providers.models]]` block to price the search-unit case:
 
 ```toml
 [[providers.models]]
-id = "rerank-english"
+id = "cohere/rerank-english"
 upstream_id = "rerank-v3.5"
 capabilities = ["rerank"]
 cost_per_1k_searches = 2.0
@@ -74,7 +74,7 @@ upstream model supports both, for example Cohere's `embed-v4.0`:
 
 ```toml
 [[providers.models]]
-id = "embed-multilingual"
+id = "cohere/embed-multilingual"
 upstream_id = "embed-v4.0"
 capabilities = ["embed", "rerank"]
 ```
@@ -92,10 +92,10 @@ upstream_id = "rerank-v3.5"
 capabilities = ["rerank"]
 
 [[virtual_models]]
-id = "rerank-english"
+id = "lumen/rerank-english"
 capability = "rerank"
 strategy = "fallback"
-targets = [{ model = "cohere/rerank-english" }, { model = "jina-rerank" }, { model = "voyage-rerank" }]
+targets = [{ model = "cohere/rerank-english" }, { model = "jina/jina-rerank" }, { model = "voyage/voyage-rerank" }]
 ```
 
 The foundation model that actually served the request (primary or a fallback)
@@ -123,7 +123,7 @@ kind = "typesafe"
 api_key_env = "TYPESAFE_API_KEY"
 
 [[providers.models]]
-id = "jev"
+id = "typesafe/jev"
 upstream_id = "jev-latest"
 capabilities = ["decisions"]
 cost_per_1m_input = 0.042
@@ -131,12 +131,12 @@ cost_per_1m_input = 0.042
 # Optional remap fields: the question asked about every document. Unset
 # fields default to a generic relevance question.
 [[virtual_models]]
-id = "jev-rerank"
+id = "lumen/jev-rerank"
 capability = "rerank"
 strategy = "single"
 
 [[virtual_models.targets]]
-model = "jev"
+model = "typesafe/jev"
 [virtual_models.targets.remap]
 strategy = "predicate"
 instructions = "Could `document` be the precedent cited in the query?"

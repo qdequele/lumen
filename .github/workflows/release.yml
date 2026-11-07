@@ -20,12 +20,23 @@ on:
   push:
     tags:
       - "v*"
+  # release-on-merge.yml calls this workflow right after it pushes the tag of a
+  # merged `chore(release): vX.Y.Z` PR: a tag pushed with the default
+  # GITHUB_TOKEN does not trigger `push` workflows, so the call replaces it.
+  workflow_call:
+    inputs:
+      tag:
+        description: "The vX.Y.Z tag to release (already pushed)"
+        type: string
+        required: true
 
 permissions:
   contents: write # attach binaries to the release
   packages: write # push the image to GHCR
 
 env:
+  # The tag being released: the pushed tag, or the caller's input.
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
 
@@ -37,6 +48,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.RELEASE_TAG }}
 
       - name: Install stable toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -67,10 +80,13 @@ jobs:
       published: ${{ steps.state.outputs.published }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.RELEASE_TAG }}
 
       - name: Extract this version's CHANGELOG section
         run: |
-          version="${GITHUB_REF_NAME#v}"
+          # RELEASE_TAG, not GITHUB_REF_NAME: under workflow_call the ref is the PR merge ref.
+          version="${RELEASE_TAG#v}"
           awk -v ver="$version" '
             index($0, "## [" ver "]") == 1 { found = 1; next }
             /^## \[/ { found = 0 }
@@ -95,9 +111,9 @@ jobs:
         # "not published" would rewrite the notes of an immutable release and
         # then fail on the asset upload, far from the real error.
         run: |
-          if view="$(gh release view "$GITHUB_REF_NAME" --json isDraft --jq .isDraft 2>&1)"; then
+          if view="$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft 2>&1)"; then
             if [ "$view" = "false" ]; then
-              echo "::notice::release $GITHUB_REF_NAME is already published; skipping notes and binaries, pushing the image only"
+              echo "::notice::release $RELEASE_TAG is already published; skipping notes and binaries, pushing the image only"
               echo "published=true" >> "$GITHUB_OUTPUT"
             else
               echo "published=false" >> "$GITHUB_OUTPUT"
@@ -105,7 +121,7 @@ jobs:
           elif printf '%s\n' "$view" | grep -qi 'release not found'; then
             echo "published=false" >> "$GITHUB_OUTPUT"
           else
-            echo "::error::could not look up release $GITHUB_REF_NAME: $view" >&2
+            echo "::error::could not look up release $RELEASE_TAG: $view" >&2
             exit 1
           fi
 
@@ -114,9 +130,9 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create "$GITHUB_REF_NAME" --draft --verify-tag \
-            --title "$GITHUB_REF_NAME" --notes-file RELEASE_NOTES.md 2>/dev/null \
-            || gh release edit "$GITHUB_REF_NAME" --notes-file RELEASE_NOTES.md
+          gh release create "$RELEASE_TAG" --draft --verify-tag \
+            --title "$RELEASE_TAG" --notes-file RELEASE_NOTES.md 2>/dev/null \
+            || gh release edit "$RELEASE_TAG" --notes-file RELEASE_NOTES.md
 
   binaries:
     name: static binary (${{ matrix.target }})
@@ -131,6 +147,8 @@ jobs:
           - aarch64-unknown-linux-musl
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.RELEASE_TAG }}
 
       - name: Install stable toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -160,7 +178,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release upload "$GITHUB_REF_NAME" --clobber \
+          gh release upload "$RELEASE_TAG" --clobber \
             "lumen-${{ matrix.target }}.tar.gz" \
             "lumen-${{ matrix.target }}.tar.gz.sha256"
 
@@ -173,6 +191,8 @@ jobs:
     needs: gate
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.RELEASE_TAG }}
 
       - name: Set up QEMU (for arm64 emulation)
         uses: docker/setup-qemu-action@v4
@@ -193,7 +213,7 @@ jobs:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: ghcr.io/${{ github.repository }}:${{ github.ref_name }}
+          tags: ghcr.io/${{ github.repository }}:${{ env.RELEASE_TAG }}
 
   # Publish LAST, once every binary is attached and the image is pushed. From
   # this moment the release is immutable: no asset can be added or changed.
@@ -204,17 +224,19 @@ jobs:
     if: needs.release-notes.outputs.published != 'true'
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.RELEASE_TAG }}
 
       - name: Verify assets and publish
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          count=$(gh release view "$GITHUB_REF_NAME" --json assets --jq '.assets | length')
+          count=$(gh release view "$RELEASE_TAG" --json assets --jq '.assets | length')
           if [ "$count" -ne 4 ]; then
             echo "::error::expected 4 assets (2 tarballs + 2 checksums), found $count; leaving the release as a draft." >&2
             exit 1
           fi
-          gh release edit "$GITHUB_REF_NAME" --draft=false --latest
+          gh release edit "$RELEASE_TAG" --draft=false --latest
 
   # `latest` points at a published release only: after `publish` succeeded,
   # or when the release was already published and the image has just been
@@ -236,4 +258,37 @@ jobs:
         run: |
           docker buildx imagetools create \
             -t "ghcr.io/$GITHUB_REPOSITORY:latest" \
-            "ghcr.io/$GITHUB_REPOSITORY:$GITHUB_REF_NAME"
+            "ghcr.io/$GITHUB_REPOSITORY:$RELEASE_TAG"
+
+  # Tell the Lab (meilisearch/lab) a release is out, so its contracts
+  # workflow re-vendors docs/openapi.yaml right away instead of at its daily
+  # run. Optional: it needs LAB_DISPATCH_TOKEN (a fine-grained token with
+  # Contents read and write on meilisearch/lab, which repository_dispatch
+  # requires); without it the job skips with a notice and the Lab still
+  # catches up on its daily schedule. A failed dispatch never fails a release
+  # that is already published.
+  notify-lab:
+    name: notify the Lab
+    runs-on: ubuntu-latest
+    needs: [release-notes, publish]
+    if: always() && (needs.publish.result == 'success' || (needs.publish.result == 'skipped' && needs.release-notes.outputs.published == 'true'))
+    permissions: {}
+    steps:
+      - name: Send repository_dispatch lumen-released to meilisearch/lab
+        env:
+          LAB_DISPATCH_TOKEN: ${{ secrets.LAB_DISPATCH_TOKEN }}
+        run: |
+          if [ -z "$LAB_DISPATCH_TOKEN" ]; then
+            echo "::notice::LAB_DISPATCH_TOKEN is not set; skipping the Lab notification (its daily contracts run will pick up $RELEASE_TAG)"
+            exit 0
+          fi
+          payload=$(printf '{"event_type":"lumen-released","client_payload":{"tag":"%s","version":"%s"}}' "$RELEASE_TAG" "${RELEASE_TAG#v}")
+          code=$(curl -sS -o /tmp/dispatch.out -w '%{http_code}' -X POST \
+            -H "Authorization: Bearer $LAB_DISPATCH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/meilisearch/lab/dispatches -d "$payload" || true)
+          if [ "$code" = "204" ]; then
+            echo "notified meilisearch/lab of $RELEASE_TAG"
+          else
+            echo "::warning::could not notify meilisearch/lab (HTTP ${code:-none}): $(head -c 300 /tmp/dispatch.out 2>/dev/null)"
+          fi

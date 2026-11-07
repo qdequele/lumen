@@ -143,19 +143,49 @@ that isn't tied to a single capability.
 
 ## Cutting a release (maintainers)
 
-1. **Release PR**: fold `[Unreleased]` in `CHANGELOG.md` into a new
-   `## [X.Y.Z] - YYYY-MM-DD` section (leave a fresh empty `[Unreleased]`,
-   update the compare-link footer), bump the workspace `version` in
-   `Cargo.toml`, and refresh `Cargo.lock` (`cargo update --workspace`).
-   Run the full validation gate, open the PR, merge on green.
-2. **Tag the merge commit** on `main` and push it:
-   `git tag -a vX.Y.Z -m "LUMEN vX.Y.Z: see CHANGELOG.md for the full list" && git push origin vX.Y.Z`.
-3. The tag push triggers `release.yml`: the full test gate runs on the tagged
-   commit, a **draft** release is created from the tag's CHANGELOG section
-   (the job fails if the section is missing), both musl tarballs and their
-   `.sha256` checksums attach to the draft, the multi-arch image goes to
-   GHCR, and a final `publish` job verifies all four assets before flipping
-   the draft public.
+Releases are automated; nobody edits a version by hand.
+
+1. **Fill `[Unreleased]`** in `CHANGELOG.md` as you merge work (the release
+   refuses an empty section).
+2. **Run the "Prepare release" workflow** (Actions > Prepare release > Run
+   workflow) with a bump: `auto` (the default) picks it from the conventional
+   commits since the last tag (`type!:` or a `BREAKING CHANGE` footer: major;
+   any `feat`: minor; otherwise patch), or choose `patch`, `minor`, `major`, or
+   an exact `X.Y.Z`. It runs `scripts/prepare-release.sh`, which in one step
+   bumps `[workspace.package] version` in `Cargo.toml`, the workspace crates
+   in `Cargo.lock`, `info.version` in `docs/openapi.yaml`, and folds
+   `[Unreleased]` into `## [X.Y.Z] - YYYY-MM-DD` (with the compare-link
+   footer). It then opens or refreshes the PR `chore(release): vX.Y.Z` from
+   `release/vX.Y.Z`, with the new CHANGELOG section as its body, and dispatches
+   CI on that branch.
+3. **Merge the release PR** on green. `release-on-merge.yml` tags the merge
+   commit `vX.Y.Z` and runs `release.yml` on it: the full test gate runs on
+   the tagged commit, a **draft** release is created from the tag's CHANGELOG
+   section (the job fails if the section is missing), both musl tarballs and
+   their `.sha256` checksums attach to the draft, the multi-arch image goes to
+   GHCR, a final `publish` job verifies all four assets before flipping the
+   draft public, and `notify-lab` sends `lumen-released` to `meilisearch/lab`
+   so it re-vendors `docs/openapi.yaml` (only when `LAB_DISPATCH_TOKEN` is set;
+   otherwise the Lab's daily contracts run picks it up).
+
+Locally, `scripts/prepare-release.sh` with no argument prints the suggested
+bump without changing anything; `scripts/prepare-release.sh patch` (or
+`minor`, `major`, `auto`, `X.Y.Z`) prepares the same commit the workflow makes,
+and re-running it is safe (bumps count from the last tag).
+`scripts/prepare-release.sh --check` is the CI `version sync` job: it fails
+when `Cargo.toml`, `Cargo.lock` and `docs/openapi.yaml` disagree.
+
+Why the tag is pushed and released by one workflow: a tag pushed with the
+default `GITHUB_TOKEN` does not trigger other workflows, so
+`release-on-merge.yml` calls `release.yml` as a reusable workflow instead of
+relying on the tag push. No PAT is needed. Pushing a `vX.Y.Z` tag by hand still
+triggers `release.yml` directly (for a release PR merged while the automation
+was broken, for example).
+
+Repository setup: Settings > Actions > General > "Allow GitHub Actions to
+create and approve pull requests" must be on for the release PR. The optional
+`LAB_DISPATCH_TOKEN` secret is a fine-grained token with Contents read and
+write on `meilisearch/lab`.
 
 **Releases are immutable.** Two consequences, both learned the hard way:
 

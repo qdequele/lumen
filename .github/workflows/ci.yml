@@ -4,6 +4,9 @@ on:
   push:
     branches: [main]
   pull_request:
+  # prepare-release.yml dispatches CI on the release branch: a PR opened with
+  # GITHUB_TOKEN gets no pull_request run of its own.
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -63,6 +66,22 @@ jobs:
         env:
           RUSTUP_TOOLCHAIN: "1.94"
         run: cargo check --workspace --locked
+
+  # Fast guard for the release invariant: docs/openapi.yaml info.version and
+  # the workspace crates in Cargo.lock must equal the [workspace.package]
+  # version (the 0.8.1 release shipped without the OpenAPI bump and broke
+  # the_spec_version_is_the_crate_version on main). The test still covers it;
+  # this fails in seconds and names the file to fix.
+  version-sync:
+    name: version sync
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Cargo.toml, Cargo.lock and docs/openapi.yaml agree on the version
+        run: scripts/prepare-release.sh --check
 
   no-em-dashes:
     name: no em-dashes

@@ -58,7 +58,7 @@ fn chat_registry(upstream: &str) -> Arc<Registry> {
         strict: false,
         connect_timeout_ms: None,
         models: vec![ModelSpec {
-            id: "gpt".to_owned(),
+            id: "openai/gpt".to_owned(),
             upstream_id: "gpt-4o-2024-08-06".to_owned(),
             capabilities: vec![Capability::Chat],
             modalities: vec!["text".to_owned()],
@@ -82,7 +82,7 @@ fn dollar_pricing() -> CostTable {
         name = "openai"
         kind = "openai"
         [[providers.models]]
-        id = "gpt"
+        id = "openai/gpt"
         capabilities = ["chat"]
         cost_per_1m_input = 1000000.0
         cost_per_1m_output = 1000000.0
@@ -193,7 +193,7 @@ impl Harness {
             .post(format!("{}/v1/chat/completions", self.base))
             .bearer_auth(key)
             .json(&json!({
-                "model": "gpt",
+                "model": "openai/gpt",
                 "messages": [{ "role": "user", "content": "hi" }],
                 "max_tokens": 5
             }))
@@ -933,7 +933,7 @@ async fn a_gateway_without_a_webhooks_block_calls_nothing() {
         .post(format!("{base}/v1/chat/completions"))
         .bearer_auth(&key)
         .json(&json!({
-            "model": "gpt",
+            "model": "openai/gpt",
             "messages": [{ "role": "user", "content": "hi" }],
             "max_tokens": 5
         }))

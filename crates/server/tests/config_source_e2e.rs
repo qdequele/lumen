@@ -239,14 +239,19 @@ async fn admin_config_hash(client: &reqwest::Client, base: &str) -> String {
     doc["hash"].as_str().expect("hash").to_owned()
 }
 
-/// `POST /v1/chat/completions` for model `"gpt"`, with `key` as the bearer
+/// `POST /v1/chat/completions` for `model`, with `key` as the bearer
 /// virtual key.
-async fn send_gpt_chat(client: &reqwest::Client, base: &str, key: &str) -> reqwest::Response {
+async fn send_gpt_chat(
+    client: &reqwest::Client,
+    base: &str,
+    key: &str,
+    model: &str,
+) -> reqwest::Response {
     client
         .post(format!("{base}/v1/chat/completions"))
         .bearer_auth(key)
         .json(&json!({
-            "model": "gpt",
+            "model": model,
             "messages": [{ "role": "user", "content": "hi" }]
         }))
         .send()
@@ -286,7 +291,7 @@ kind = "openai"
 base_url = "{a}"
 
 [[providers.models]]
-id = "gpt"
+id = "test-provider/gpt"
 capabilities = ["chat"]
 "#,
             db = db_path.display(),
@@ -308,7 +313,7 @@ capabilities = ["chat"]
         "name": "test-provider",
         "kind": "openai",
         "base_url": upstream_b.uri(),
-        "models": [{ "id": "gpt", "capabilities": ["chat"] }]
+        "models": [{ "id": "test-provider/gpt", "capabilities": ["chat"] }]
     });
     let response = client
         .put(format!("{base}/admin/config/providers/test-provider"))
@@ -335,7 +340,7 @@ capabilities = ["chat"]
 
     // Exactly one chat request, sent only after the reload is known to have
     // landed.
-    let resp = send_gpt_chat(&client, &base, plaintext.reveal()).await;
+    let resp = send_gpt_chat(&client, &base, plaintext.reveal(), "test-provider/gpt").await;
     assert_eq!(resp.status(), 200);
     let body: Value = resp.json().await.expect("chat json");
     assert_eq!(body["choices"][0]["message"]["content"], "reached-B");
@@ -417,7 +422,7 @@ db_path = "{db}"
     // No providers exist yet (the stored document is empty): a chat request
     // for any model is a 404 naming an unknown model, not any kind of
     // provider/upstream failure.
-    let cold_chat = send_gpt_chat(&client, &base, plaintext.reveal()).await;
+    let cold_chat = send_gpt_chat(&client, &base, plaintext.reveal(), "db-provider/gpt").await;
     assert_eq!(cold_chat.status(), 404);
     let cold_body: Value = cold_chat.json().await.expect("cold chat json");
     assert_eq!(cold_body["error"]["code"], "LM-2001");
@@ -439,7 +444,7 @@ kind = "openai"
 base_url = "{upstream}"
 
 [[providers.models]]
-id = "gpt"
+id = "db-provider/gpt"
 capabilities = ["chat"]
 "#,
         upstream = upstream.uri(),
@@ -460,7 +465,7 @@ capabilities = ["chat"]
     let landed = wait_for_reload_past(&base, baseline_reloads, Duration::from_secs(5)).await;
     assert!(landed > baseline_reloads);
 
-    let warm_chat = send_gpt_chat(&client, &base, plaintext.reveal()).await;
+    let warm_chat = send_gpt_chat(&client, &base, plaintext.reveal(), "db-provider/gpt").await;
     assert_eq!(
         warm_chat.status(),
         200,
@@ -544,7 +549,7 @@ kind = "openai"
 base_url = "http://127.0.0.1:1"
 
 [[providers.models]]
-id = "gpt"
+id = "restart-provider/gpt"
 capabilities = ["chat"]
 "#;
     let response = client
@@ -779,7 +784,7 @@ async fn db_mode_stale_write_after_apply_is_refused_with_412() {
 name = "db-provider"
 kind = "openai"
 [[providers.models]]
-id = "gpt"
+id = "db-provider/gpt"
 capabilities = ["chat"]
 "#;
     let applied = h.put_config(doc, &hash_1).await;
@@ -910,7 +915,7 @@ kind = "openai"
 api_key_env = "{SECRET_ENV}"
 
 [[providers.models]]
-id = "gpt"
+id = "leaky-provider/gpt"
 capabilities = ["chat"]
 "#
     );
@@ -925,7 +930,7 @@ capabilities = ["chat"]
         "name": "leaky-provider-2",
         "kind": "openai",
         "api_key_env": SECRET_ENV,
-        "models": [{ "id": "gpt-2", "capabilities": ["chat"] }]
+        "models": [{ "id": "leaky-provider-2/gpt-2", "capabilities": ["chat"] }]
     });
     let granular = h
         .put_json(

@@ -38,14 +38,14 @@ fn registry(upstream: &str) -> Arc<Registry> {
         connect_timeout_ms: None,
         models: vec![
             ModelSpec {
-                id: "gpt".to_owned(),
+                id: "openai/gpt".to_owned(),
                 upstream_id: "gpt-4o".to_owned(),
                 capabilities: vec![Capability::Chat],
                 modalities: vec!["text".to_owned()],
                 release_date: None,
             },
             ModelSpec {
-                id: "embed-small".to_owned(),
+                id: "openai/embed-small".to_owned(),
                 upstream_id: "text-embedding-3-small".to_owned(),
                 capabilities: vec![Capability::Embed],
                 modalities: vec!["text".to_owned()],
@@ -68,7 +68,7 @@ fn dollar_pricing() -> CostTable {
         name = "openai"
         kind = "openai"
         [[providers.models]]
-        id = "embed-small"
+        id = "openai/embed-small"
         capabilities = ["embed"]
         cost_per_1m_input = 1000000.0
     "#;
@@ -93,6 +93,7 @@ async fn harness(registry: Arc<Registry>) -> Harness {
             name: "lease".to_owned(),
             budget_max: Some(1000.0),
             account_ref: Some(ACCOUNT.to_owned()),
+            parent_id: None,
         })
         .await
         .expect("group");
@@ -173,7 +174,7 @@ impl Harness {
 }
 
 fn embed_bytes() -> Vec<u8> {
-    serde_json::to_vec(&json!({ "model": "embed-small", "input": "abcd" })).expect("json")
+    serde_json::to_vec(&json!({ "model": "openai/embed-small", "input": "abcd" })).expect("json")
 }
 
 async fn mount_embeddings(upstream: &MockServer, status: u16) {
@@ -237,7 +238,7 @@ async fn bandwidth_counts_streamed_response() {
     let h = harness(registry(&upstream.uri())).await;
 
     let body = serde_json::to_vec(&json!({
-        "model": "gpt",
+        "model": "openai/gpt",
         "messages": [{ "role": "user", "content": "hi" }],
         "stream": true
     }))
@@ -300,7 +301,7 @@ async fn bandwidth_counts_yielded_bytes_on_client_cancel() {
     let h = harness(registry(&upstream)).await;
 
     let body = serde_json::to_vec(&json!({
-        "model": "gpt",
+        "model": "openai/gpt",
         "messages": [{ "role": "user", "content": "hi" }],
         "stream": true
     }))

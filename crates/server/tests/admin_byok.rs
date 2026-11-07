@@ -34,7 +34,7 @@ kind = "openai"
 api_key_env = "TEST_BYOK_PROVIDER_KEY"
 
 [[providers.models]]
-id = "gpt-4o"
+id = "openai-main/gpt-4o"
 capabilities = ["chat"]
 
 [[providers]]
@@ -43,7 +43,7 @@ kind = "azure"
 base_url = "https://example.openai.azure.com"
 
 [[providers.models]]
-id = "az-gpt"
+id = "azure-main/az-gpt"
 capabilities = ["chat"]
 
 [[providers]]
@@ -51,7 +51,7 @@ name = "bedrock-main"
 kind = "bedrock"
 
 [[providers.models]]
-id = "br-claude"
+id = "bedrock-main/br-claude"
 capabilities = ["chat"]
 "#;
 
@@ -64,7 +64,7 @@ kind = "openai"
 api_key_env = "TEST_BYOK_PROVIDER_KEY"
 
 [[providers.models]]
-id = "gpt-4o"
+id = "openai-main/gpt-4o"
 capabilities = ["chat"]
 
 [[providers]]
@@ -73,7 +73,7 @@ kind = "groq"
 api_key_env = "TEST_BYOK_PROVIDER_KEY"
 
 [[providers.models]]
-id = "llama"
+id = "groq-extra/llama"
 capabilities = ["chat"]
 "#;
 
@@ -226,7 +226,7 @@ async fn add_list_delete_team_key() {
     assert_eq!(openai["kind"], "openai");
     assert_eq!(openai["eligible"], true);
     assert_eq!(openai["fallback"], false);
-    assert_eq!(openai["models"], json!(["gpt-4o"]));
+    assert_eq!(openai["models"], json!(["openai-main/gpt-4o"]));
     assert_eq!(openai["keys"][0]["label"], "prod");
     assert_eq!(openai["keys"][0]["last4"], "0042");
     // Every provider of the document is listed, eligible or not.
@@ -511,6 +511,8 @@ async fn team_key_secret_never_logged_on_admin_writes() {
         .with_max_level(tracing::Level::TRACE)
         .finish();
     let _guard = tracing::subscriber::set_default(subscriber);
+    // Another test may have cached "never" for these callsites first.
+    tracing::callsite::rebuild_interest_cache();
 
     let h = spawn(CONFIG_TOML).await;
     let group = h.group(ACCOUNT_A).await;
@@ -544,4 +546,45 @@ async fn team_key_secret_never_logged_on_admin_writes() {
         !logs.contains("-SECRET-"),
         "part of the team key reached the logs"
     );
+}
+
+#[tokio::test]
+async fn a_sub_group_has_no_team_key_routes() {
+    // ADR 020: team keys live on the top-level group and serve every
+    // sub-group; a sub-group's own team key routes are the unknown-id 404.
+    let h = spawn(CONFIG_TOML).await;
+    let team = h.group(ACCOUNT_A).await;
+    let (status, sub) = h
+        .call(
+            reqwest::Method::POST,
+            "/admin/groups",
+            Some(ACCOUNT_A),
+            Some(json!({"name": "sub", "parent_id": team})),
+        )
+        .await;
+    assert_eq!(status, 201, "{sub}");
+    let sub = sub["id"].as_str().expect("id");
+
+    for scope in [None, Some(ACCOUNT_A)] {
+        let (status, body) = h
+            .call(
+                reqwest::Method::GET,
+                &format!("/admin/groups/{sub}/byok"),
+                scope,
+                None,
+            )
+            .await;
+        assert_eq!(status, 404, "{body}");
+        let (status, body) = h
+            .call(
+                reqwest::Method::POST,
+                &format!("/admin/groups/{sub}/byok/openai-main/keys"),
+                scope,
+                Some(json!({"key": SECRET, "label": "x"})),
+            )
+            .await;
+        assert_eq!(status, 404, "{body}");
+    }
+    let (status, body) = h.list(&team).await;
+    assert_eq!(status, 200, "{body}");
 }

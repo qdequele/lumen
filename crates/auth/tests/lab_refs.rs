@@ -54,6 +54,7 @@ async fn group_account_ref_round_trips_and_clears() {
             name: "acme".to_owned(),
             budget_max: Some(10.0),
             account_ref: Some("0192f3c1-7c2e-7b1a-9f00-3c9d2e4a5b61".to_owned()),
+            parent_id: None,
         })
         .await
         .unwrap();
