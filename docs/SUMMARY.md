@@ -79,6 +79,8 @@
 - [017 - Decisions capability](adr/017-decisions-capability.md)
 - [018 - Team provider keys and bandwidth billing](adr/018-team-provider-keys-and-bandwidth.md)
 - [020 - Sub-groups under a team's lease](adr/020-team-sub-groups.md)
+- [021 - Speech-to-text](adr/021-speech-to-text.md)
+- [022 - Client tokens](adr/022-client-tokens.md)
 
 # Project
 
