@@ -9,7 +9,8 @@
 //! All state is in-memory; nothing here touches a database.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::http::{HeaderMap, HeaderName, HeaderValue};
@@ -17,9 +18,12 @@ use lumen_core::{Capability, GatewayError};
 use lumen_router::circuit::{BreakerConfig, CircuitBreakers};
 use lumen_router::executor::{ExecConfig, Link};
 use lumen_router::retry::RetryPolicy;
-use lumen_router::virtual_models::{Decision, FactSource, Preset, RoutingTable};
+use lumen_router::virtual_models::{
+    Decision, FactSource, FoundationIndex, Preset, RoutingTable, VirtualModelConfig,
+};
 use lumen_telemetry::ResilienceMetrics;
 
+use crate::account_models::{AccountModels, ParsedRow};
 use crate::config::Config;
 
 /// The `x-lumen-model-used` response header name (M6 §6.2).
@@ -76,6 +80,9 @@ struct ResiliencePolicy {
     /// Compiled virtual models (ADR 014), swapped with the rest of the policy
     /// on reload.
     routing: Arc<RoutingTable>,
+    /// The foundation models `routing` was compiled against; account tables
+    /// (ADR 022) compile against the same snapshot.
+    foundation: Arc<FoundationIndex>,
     /// Deprecated bare id -> its `provider/model` (or `namespace/model`) id,
     /// from the same config snapshot as `routing`. Hidden: never listed.
     aliases: Arc<HashMap<String, String>>,
@@ -150,6 +157,7 @@ impl ResiliencePolicy {
             default_timeouts,
             model_timeouts,
             routing: Arc::new(routing),
+            foundation: Arc::new(config.foundation_index()),
             aliases: Arc::new(config.model_aliases()),
         }
     }
@@ -164,6 +172,7 @@ impl ResiliencePolicy {
             },
             model_timeouts: HashMap::new(),
             routing: Arc::new(RoutingTable::default()),
+            foundation: Arc::new(FoundationIndex::default()),
             aliases: Arc::new(HashMap::new()),
         }
     }
@@ -180,6 +189,15 @@ pub struct ResilienceRuntime {
     policy: arc_swap::ArcSwap<ResiliencePolicy>,
     /// Counts deprecated-alias requests (`lumen_deprecated_model_alias_total`).
     metrics: Option<ResilienceMetrics>,
+    /// Each account's own virtual models (ADR 022), compiled over the
+    /// platform policy; read lock-free on the request path.
+    accounts: arc_swap::ArcSwap<HashMap<String, Arc<AccountModels>>>,
+    /// Serialises the writers of `accounts` (admin writes, the refresher, a
+    /// platform reload), so none of them loses another's update. Held only
+    /// for an in-memory compile, never across an `.await`.
+    accounts_write: Mutex<()>,
+    /// The highest store generation installed into `accounts`.
+    account_generation: AtomicI64,
 }
 
 impl ResilienceRuntime {
@@ -196,6 +214,9 @@ impl ResilienceRuntime {
             breakers: CircuitBreakers::new(breaker_config, metrics.clone()),
             policy: arc_swap::ArcSwap::from_pointee(ResiliencePolicy::from_config(config)),
             metrics,
+            accounts: arc_swap::ArcSwap::from_pointee(HashMap::new()),
+            accounts_write: Mutex::new(()),
+            account_generation: AtomicI64::new(0),
         }
     }
 
@@ -207,6 +228,9 @@ impl ResilienceRuntime {
             breakers: CircuitBreakers::new(BreakerConfig::default(), None),
             policy: arc_swap::ArcSwap::from_pointee(ResiliencePolicy::defaults()),
             metrics: None,
+            accounts: arc_swap::ArcSwap::from_pointee(HashMap::new()),
+            accounts_write: Mutex::new(()),
+            account_generation: AtomicI64::new(0),
         }
     }
 
@@ -216,6 +240,9 @@ impl ResilienceRuntime {
     pub fn reload_policy(&self, config: &Config) {
         self.policy
             .store(Arc::new(ResiliencePolicy::from_config(config)));
+        // Account tables hold compiled platform nodes: rebuild them over the
+        // new platform snapshot (ADR 022).
+        self.recompile_accounts();
     }
 
     /// Mutate the current policy in place (builder helper for tests + overrides).
@@ -247,6 +274,19 @@ impl ResilienceRuntime {
     /// nobody sends them.
     #[must_use]
     pub fn canonical_model(&self, requested: &str) -> String {
+        self.canonical_model_for(None, requested)
+    }
+
+    /// [`canonical_model`](Self::canonical_model) for a key of `account`:
+    /// an id of the account's own virtual models (ADR 022) is never
+    /// rewritten, so the account's model wins over a platform alias.
+    #[must_use]
+    pub fn canonical_model_for(&self, account: Option<&str>, requested: &str) -> String {
+        if let Some(models) = account.and_then(|a| self.account_models(a)) {
+            if models.table.get(requested).is_some() || models.table.is_disabled(requested) {
+                return requested.to_owned();
+            }
+        }
         let policy = self.policy.load();
         let Some(canonical) = policy.aliases.get(requested) else {
             return requested.to_owned();
@@ -281,14 +321,148 @@ impl ResilienceRuntime {
         model: &str,
         facts: impl FnOnce(Option<&Preset>) -> F,
     ) -> Result<Decision, GatewayError> {
+        self.decide_for(capability, None, model, facts)
+    }
+
+    /// [`decide`](Self::decide) for a key of `account` (ADR 022): the
+    /// account's own virtual models are looked up first, then the platform
+    /// as before. A key without an account sees the platform only. One map
+    /// lookup more than `decide`, no I/O.
+    ///
+    /// # Errors
+    /// `LM-2002` when `model` is a virtual model serving another capability;
+    /// `LM-2001` for a disabled account model, or one whose every target
+    /// reached by this request was skipped.
+    pub fn decide_for<F: FactSource>(
+        &self,
+        capability: Capability,
+        account: Option<&str>,
+        model: &str,
+        facts: impl FnOnce(Option<&Preset>) -> F,
+    ) -> Result<Decision, GatewayError> {
         use rand::Rng as _;
+        let mut draw = || rand::rng().next_u64();
+        if let Some(models) = account.and_then(|a| self.account_models(a)) {
+            if let Some(vm) = models.table.get(model) {
+                let facts = facts(vm.preset().map(AsRef::as_ref));
+                return vm.decide(capability, &facts, &mut draw);
+            }
+            if models.table.is_disabled(model) {
+                return Err(GatewayError::ModelNotFound(model.to_owned()));
+            }
+        }
         let policy = self.policy.load();
         let Some(vm) = policy.routing.get(model) else {
             return Ok(Decision::direct(model));
         };
         let facts = facts(vm.preset().map(AsRef::as_ref));
-        let mut draw = || rand::rng().next_u64();
         vm.decide(capability, &facts, &mut draw)
+    }
+
+    /// One account's virtual models (ADR 022), when it has any stored.
+    #[must_use]
+    pub fn account_models(&self, account: &str) -> Option<Arc<AccountModels>> {
+        self.accounts.load().get(account).cloned()
+    }
+
+    /// The store generation the refresher has read up to (it polls past it).
+    #[must_use]
+    pub fn account_generation(&self) -> i64 {
+        self.account_generation.load(Ordering::SeqCst)
+    }
+
+    /// Move the refresher's watermark to `generation` (never backwards).
+    pub fn advance_account_generation(&self, generation: i64) {
+        self.account_generation
+            .fetch_max(generation, Ordering::SeqCst);
+    }
+
+    /// Compile `configs` as `account`'s table over the current platform
+    /// snapshot, without installing it: the admin write path checks the
+    /// result before storing.
+    #[must_use]
+    pub fn compile_account(&self, configs: &[VirtualModelConfig]) -> RoutingTable {
+        let policy = self.policy.load();
+        RoutingTable::compile_account(configs, &policy.foundation, &policy.routing)
+    }
+
+    /// Whether `id` is a platform id: a foundation model (disabled ones
+    /// included), a platform virtual model or a deprecated bare alias. An
+    /// account may not save a model under one (ADR 022).
+    #[must_use]
+    pub fn is_platform_id(&self, id: &str) -> bool {
+        let policy = self.policy.load();
+        policy.foundation.contains(id)
+            || policy.routing.get(id).is_some()
+            || policy.aliases.contains_key(id)
+    }
+
+    /// Compile and install stored account documents. A row older than what
+    /// is installed for its account (a refresher racing an admin write) is
+    /// ignored. Only the refresher passes `advance_watermark`: an admin
+    /// write installs its own row without moving the watermark, or the
+    /// refresher would skip rows other processes wrote before it.
+    pub fn install_accounts(&self, rows: Vec<ParsedRow>, advance_watermark: bool) {
+        let _guard = self
+            .accounts_write
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let policy = self.policy.load();
+        let mut map = HashMap::clone(&self.accounts.load());
+        for (account, configs, hash, generation) in rows {
+            if map.get(&account).is_some_and(|m| m.generation > generation) {
+                continue;
+            }
+            let table =
+                RoutingTable::compile_account(&configs, &policy.foundation, &policy.routing);
+            if advance_watermark {
+                self.advance_account_generation(generation);
+            }
+            map.insert(
+                account,
+                Arc::new(AccountModels {
+                    configs,
+                    hash,
+                    generation,
+                    table,
+                }),
+            );
+        }
+        self.accounts.store(Arc::new(map));
+    }
+
+    /// Recompile every account table over the current platform snapshot
+    /// (after a platform reload).
+    pub fn recompile_accounts(&self) {
+        let _guard = self
+            .accounts_write
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let current = self.accounts.load_full();
+        if current.is_empty() {
+            return;
+        }
+        let policy = self.policy.load();
+        let map = current
+            .iter()
+            .map(|(account, models)| {
+                let table = RoutingTable::compile_account(
+                    &models.configs,
+                    &policy.foundation,
+                    &policy.routing,
+                );
+                (
+                    account.clone(),
+                    Arc::new(AccountModels {
+                        configs: models.configs.clone(),
+                        hash: models.hash.clone(),
+                        generation: models.generation,
+                        table,
+                    }),
+                )
+            })
+            .collect();
+        self.accounts.store(Arc::new(map));
     }
 
     /// The current compiled virtual models (for `GET /v1/models` and the

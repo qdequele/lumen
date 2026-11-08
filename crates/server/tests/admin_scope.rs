@@ -359,9 +359,6 @@ async fn platform_routes_are_403_with_the_header() {
         (M::PUT, "/admin/config"),
         (M::GET, "/admin/config/providers"),
         (M::GET, "/admin/config/providers/openai"),
-        (M::GET, "/admin/config/virtual_models"),
-        (M::GET, "/admin/config/virtual_models/x"),
-        (M::GET, "/admin/config/virtual_models/x/plan"),
         (M::GET, "/admin/config/resilience"),
     ] {
         let (status, body) = call(&base, method.clone(), path, Some(A), None).await;

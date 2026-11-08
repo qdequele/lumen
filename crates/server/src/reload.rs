@@ -595,6 +595,12 @@ pub async fn reload_once(ctx: &Arc<ConfigContext>, targets: &Arc<ReloadTargets>)
     // Team key pools last, filtered against the routing table now live: a
     // provider dropped or turned into an ineligible kind loses its pool.
     refresh_team_pools(targets).await;
+    // Account virtual models (ADR 022): `apply_reload` recompiled them over
+    // the new platform; also pick up rows written out of band since the
+    // last refresh. A store error keeps the current tables.
+    if let Some(runtime) = &targets.auth_runtime {
+        crate::account_models::refresh(&runtime.store, &targets.resilience).await;
+    }
 }
 
 /// Rebuild the team key pools (BYOK) from the store. A store or decryption

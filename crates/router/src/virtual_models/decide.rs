@@ -81,6 +81,8 @@ pub struct Decision {
     pub preset: Option<Arc<Preset>>,
     /// Ordered attempts; never empty.
     pub attempts: Vec<Attempt>,
+    /// The requested virtual model belongs to one account (ADR 022).
+    pub account: bool,
 }
 
 impl Decision {
@@ -91,6 +93,7 @@ impl Decision {
             virtual_model: None,
             preset: None,
             attempts: vec![Attempt::plain(model.to_owned())],
+            account: false,
         }
     }
 
@@ -106,6 +109,7 @@ impl Decision {
             virtual_model: None,
             preset: None,
             attempts,
+            account: false,
         }
     }
 
@@ -225,11 +229,27 @@ impl VirtualModel {
             .and_then(|p| p.overrides().cloned())
             .into_iter()
             .collect();
-        let attempts = flatten_model(self, facts, rng, "", &base);
+        let mut attempts = flatten_model(self, facts, rng, "", &base);
+        if self.account {
+            if attempts.is_empty() {
+                // Every target this request reached was skipped (ADR 022):
+                // the first missing one is the routing error, as the
+                // primary's miss is for any virtual model.
+                return Err(GatewayError::ModelNotFound(
+                    first_missing(self).unwrap_or(self.id()).to_owned(),
+                ));
+            }
+            // A skipped last target leaves escapes pointing past the end.
+            let n = attempts.len();
+            for attempt in &mut attempts {
+                attempt.escapes.retain(|e| e.next < n);
+            }
+        }
         Ok(Decision {
             virtual_model: Some(self.id().to_owned()),
             preset: self.preset.clone(),
             attempts,
+            account: self.account,
         })
     }
 }
@@ -358,7 +378,19 @@ fn flatten_target(
             escapes: Vec::new(),
         }],
         Node::Virtual(child) => flatten_model(child, facts, rng, path, &overrides),
+        // A skipped account target (ADR 022) yields no attempt.
+        Node::Missing(_) => Vec::new(),
     }
+}
+
+/// The first skipped target reachable from `vm`, depth first: the id a request
+/// whose every attempt was skipped reports as unknown (ADR 022). Cold path.
+fn first_missing(vm: &VirtualModel) -> Option<&str> {
+    vm.targets.iter().find_map(|t| match &t.node {
+        Node::Missing(id) => Some(id.as_str()),
+        Node::Virtual(child) => first_missing(child),
+        Node::Foundation(_) => None,
+    })
 }
 
 #[cfg(test)]
@@ -625,5 +657,50 @@ mod tests {
         let mut d = Decision::linear(["a", "b"].map(str::to_owned));
         d.retain_compatible(&[false, false]);
         assert_eq!(ids(&d), vec!["a", "b"], "a mask keeping nothing is ignored");
+    }
+
+    #[test]
+    fn skipped_account_leaves_yield_no_attempt_and_all_skipped_is_lm_2001() {
+        #[derive(serde::Deserialize)]
+        struct Doc {
+            virtual_models: Vec<VirtualModelConfig>,
+        }
+        let doc: Doc = toml::from_str(
+            r#"
+            [[virtual_models]]
+            id = "team/x"
+            capability = "chat"
+            strategy = "fallback"
+            targets = [ { model = "gone" }, { model = "a" }, { model = "also-gone" } ]
+
+            [[virtual_models]]
+            id = "team/none"
+            capability = "chat"
+            strategy = "single"
+            targets = [ { model = "gone" } ]
+        "#,
+        )
+        .unwrap();
+        let mut f = FoundationIndex::default();
+        f.insert("a", vec![Capability::Chat], vec!["text".into()]);
+        let t = RoutingTable::compile_account(&doc.virtual_models, &f, &RoutingTable::default());
+        let d = decide(&t, "team/x", None, 0);
+        assert_eq!(ids(&d), ["a"]);
+        assert!(d.account);
+        // The trailing skipped target leaves no escape past the end.
+        assert_eq!(d.attempts[0].escapes.len(), 0);
+        let mut rng = || 0;
+        let err = t
+            .decide(
+                Capability::Chat,
+                "team/none",
+                &NoFacts { group: None },
+                &mut rng,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, GatewayError::ModelNotFound(ref id) if id == "gone"),
+            "{err:?}"
+        );
     }
 }

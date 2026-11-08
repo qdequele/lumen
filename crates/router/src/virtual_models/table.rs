@@ -3,7 +3,7 @@
 //! boot, a hot reload and an admin write all reject the same configs with
 //! the same messages.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use lumen_core::decisions::format::typesafe::MAX_SCORE_LEVELS;
@@ -66,6 +66,33 @@ impl FoundationIndex {
     pub fn contains(&self, id: &str) -> bool {
         self.models.contains_key(id)
     }
+
+    /// Every foundation id.
+    pub fn ids(&self) -> impl Iterator<Item = &str> {
+        self.models.keys().map(String::as_str)
+    }
+}
+
+/// What kind of problem an account virtual model has (ADR 022).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProblemKind {
+    /// A target no longer resolves; it is skipped at request time.
+    Missing,
+    /// The model breaks a rule (a limit, a capability) and is not served.
+    Disabled,
+    /// The id equals a platform id; the account's model wins for its keys.
+    Shadows,
+    /// Informational (a preset ignored through composition).
+    Note,
+}
+
+/// One problem of an account virtual model, reported on the admin routes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Problem {
+    /// Its kind; every kind but [`ProblemKind::Note`] refuses a save.
+    pub kind: ProblemKind,
+    /// A human message (never preset or remap text).
+    pub message: String,
 }
 
 /// A virtual-model config that failed validation.
@@ -91,6 +118,8 @@ pub struct VirtualModel {
     /// Most attempts a request to this model flattens into (at most
     /// [`MAX_ATTEMPTS`]).
     attempts: usize,
+    /// Owned by one account (ADR 022), not by the platform.
+    pub(crate) account: bool,
 }
 
 impl std::fmt::Debug for VirtualModel {
@@ -137,6 +166,11 @@ impl VirtualModel {
     pub fn modalities(&self) -> &[String] {
         &self.modalities
     }
+    /// Whether one account owns it (ADR 022).
+    #[must_use]
+    pub fn is_account(&self) -> bool {
+        self.account
+    }
 }
 
 pub(crate) enum Strategy {
@@ -157,6 +191,9 @@ pub(crate) struct Target {
 pub(crate) enum Node {
     Foundation(String),
     Virtual(Arc<VirtualModel>),
+    /// An account model's target that no longer resolves (ADR 022): it
+    /// yields no attempt.
+    Missing(String),
 }
 
 /// Every virtual model, compiled.
@@ -164,6 +201,11 @@ pub(crate) enum Node {
 pub struct RoutingTable {
     pub(crate) models: HashMap<String, Arc<VirtualModel>>,
     order: Vec<Arc<VirtualModel>>,
+    /// Account tables only: the problems of each model (ADR 022).
+    problems: HashMap<String, Vec<Problem>>,
+    /// Account tables only: ids that are declared but disabled, so a request
+    /// for one never falls through to a platform model of the same id.
+    disabled: HashSet<String>,
 }
 
 impl RoutingTable {
@@ -192,9 +234,13 @@ impl RoutingTable {
                 return Err(err("is declared twice".to_owned()));
             }
         }
+        let dead = HashSet::new();
         let mut compiler = Compiler {
             by_id: &by_id,
             foundation,
+            platform: None,
+            dead: &dead,
+            missing: Vec::new(),
             done: HashMap::new(),
             stack: Vec::new(),
         };
@@ -202,12 +248,152 @@ impl RoutingTable {
         for config in configs {
             order.push(compiler.compile(&config.id)?);
         }
-        let warnings = preset_warnings(&order);
+        let warnings = preset_warnings(&order)
+            .into_iter()
+            .map(|(_, w)| w)
+            .collect();
         let models = order
             .iter()
             .map(|m| (m.config.id.clone(), m.clone()))
             .collect();
-        Ok((Self { models, order }, warnings))
+        Ok((
+            Self {
+                models,
+                order,
+                ..Self::default()
+            },
+            warnings,
+        ))
+    }
+
+    /// Compile one account's virtual models (ADR 022) over the platform:
+    /// targets resolve to the account's own models first, then `platform`'s
+    /// virtual models, then `foundation`. Never fails: a target that does
+    /// not resolve (or no longer serves the capability) becomes a skipped
+    /// leaf, and a model that breaks a rule is left out and reported
+    /// [`ProblemKind::Disabled`]. Every problem is reported per model
+    /// ([`problems`](Self::problems)); the admin write path refuses the
+    /// ones a save introduces.
+    #[must_use]
+    pub fn compile_account(
+        configs: &[VirtualModelConfig],
+        foundation: &FoundationIndex,
+        platform: &RoutingTable,
+    ) -> Self {
+        let mut problems: HashMap<String, Vec<Problem>> = HashMap::new();
+        let mut push = |id: &str, kind: ProblemKind, message: String| {
+            problems
+                .entry(id.to_owned())
+                .or_default()
+                .push(Problem { kind, message });
+        };
+        // Ids that cannot be compiled at all: a bad id or a duplicate.
+        let mut dead: HashSet<String> = HashSet::new();
+        let mut seen: HashSet<&str> = HashSet::new();
+        for config in configs {
+            if let Err(message) = validate_id(&config.id) {
+                push(&config.id, ProblemKind::Disabled, message);
+                dead.insert(config.id.clone());
+            } else if !seen.insert(config.id.as_str()) {
+                // Only reachable through an out-of-band edit: the first copy
+                // keeps being served.
+                push(
+                    &config.id,
+                    ProblemKind::Note,
+                    "is declared twice; only the first declaration is served".to_owned(),
+                );
+            }
+            if foundation.contains(&config.id) || platform.get(&config.id).is_some() {
+                push(
+                    &config.id,
+                    ProblemKind::Shadows,
+                    format!(
+                        "has the id of a platform model; this account's keys get this \
+                         virtual model under '{}', every other key the platform's",
+                        config.id
+                    ),
+                );
+            }
+        }
+        // Compile; on an error, disable the model it names and start over.
+        // An account holds a few dozen models at most, so the passes are
+        // cheap, and each one disables a model, so they terminate.
+        let (order, missing) = loop {
+            let mut by_id: HashMap<&str, &VirtualModelConfig> = HashMap::new();
+            for config in configs {
+                if !dead.contains(&config.id) {
+                    by_id.entry(config.id.as_str()).or_insert(config);
+                }
+            }
+            let mut compiler = Compiler {
+                by_id: &by_id,
+                foundation,
+                platform: Some(platform),
+                dead: &dead,
+                missing: Vec::new(),
+                done: HashMap::new(),
+                stack: Vec::new(),
+            };
+            let mut order = Vec::with_capacity(by_id.len());
+            let mut failed = None;
+            for config in configs {
+                if !by_id
+                    .get(config.id.as_str())
+                    .is_some_and(|c| std::ptr::eq(*c, config))
+                {
+                    continue;
+                }
+                match compiler.compile(&config.id) {
+                    Ok(model) => order.push(model),
+                    Err(error) => {
+                        failed = Some(error);
+                        break;
+                    }
+                }
+            }
+            match failed {
+                None => break (order, compiler.missing),
+                Some(error) if by_id.contains_key(error.model.as_str()) => {
+                    push(&error.model, ProblemKind::Disabled, error.message);
+                    dead.insert(error.model);
+                }
+                // Unreachable (every error names a model being compiled);
+                // serve nothing rather than loop.
+                Some(error) => {
+                    push(&error.model, ProblemKind::Disabled, error.message);
+                    break (Vec::new(), Vec::new());
+                }
+            }
+        };
+        for (id, message) in missing {
+            push(&id, ProblemKind::Missing, message);
+        }
+        for (id, message) in preset_warnings(&order) {
+            push(&id, ProblemKind::Note, message);
+        }
+        let models = order
+            .iter()
+            .map(|m| (m.config.id.clone(), m.clone()))
+            .collect();
+        Self {
+            models,
+            order,
+            problems,
+            disabled: dead,
+        }
+    }
+
+    /// The problems of account model `id` (ADR 022); empty for a platform
+    /// table or a clean model.
+    #[must_use]
+    pub fn problems(&self, id: &str) -> &[Problem] {
+        self.problems.get(id).map_or(&[], Vec::as_slice)
+    }
+
+    /// Whether `id` is declared in this account table but disabled.
+    #[must_use]
+    pub fn is_disabled(&self, id: &str) -> bool {
+        self.disabled.contains(id)
     }
 
     /// A virtual model by id.
@@ -228,6 +414,8 @@ impl RoutingTable {
     }
 
     /// The fully resolved tree of `id`, for `GET /admin/config/virtual_models/{id}/plan`.
+    /// In an account table a platform virtual target is a reference, never
+    /// expanded (its presets and remaps are the platform's).
     #[must_use]
     pub fn plan(&self, id: &str) -> Option<Value> {
         self.models.get(id).map(|m| plan_of(m))
@@ -237,6 +425,13 @@ impl RoutingTable {
 struct Compiler<'a> {
     by_id: &'a HashMap<&'a str, &'a VirtualModelConfig>,
     foundation: &'a FoundationIndex,
+    /// Account compile only (ADR 022): the platform's virtual models.
+    platform: Option<&'a RoutingTable>,
+    /// Account compile only: disabled account ids (a target naming one is
+    /// skipped).
+    dead: &'a HashSet<String>,
+    /// Account compile only: `(model, message)` per skipped target.
+    missing: Vec<(String, String)>,
     done: HashMap<String, Arc<VirtualModel>>,
     stack: Vec<String>,
 }
@@ -281,10 +476,13 @@ impl Compiler<'_> {
         let mut modalities: Option<Vec<String>> = None;
         for target in &config.targets {
             let (compiled, mods) = self.target(config, target)?;
-            modalities = Some(match modalities {
-                None => mods,
-                Some(acc) => acc.into_iter().filter(|m| mods.contains(m)).collect(),
-            });
+            // A skipped target constrains nothing.
+            if let Some(mods) = mods {
+                modalities = Some(match modalities {
+                    None => mods,
+                    Some(acc) => acc.into_iter().filter(|m| mods.contains(m)).collect(),
+                });
+            }
             targets.push(compiled);
         }
         self.stack.pop();
@@ -295,7 +493,7 @@ impl Compiler<'_> {
             .iter()
             .filter_map(|t| match &t.node {
                 Node::Virtual(child) => Some(child.height),
-                Node::Foundation(_) => None,
+                Node::Foundation(_) | Node::Missing(_) => None,
             })
             .max()
             .unwrap_or(0);
@@ -339,6 +537,7 @@ impl Compiler<'_> {
             modalities: modalities.unwrap_or_default(),
             height,
             attempts,
+            account: self.platform.is_some(),
         });
         self.done.insert(id.to_owned(), model.clone());
         Ok(model)
@@ -346,31 +545,30 @@ impl Compiler<'_> {
 
     /// Compile one target of `parent`: a virtual child (compiled recursively, same
     /// capability required) or a foundation model (must serve the capability, or systemone
-    /// with a remap on a rerank model). Returns it with its input modalities.
-    fn target(
-        &mut self,
-        parent: &VirtualModelConfig,
-        t: &TargetConfig,
-    ) -> Result<(Target, Vec<String>), RoutingConfigError> {
+    /// with a remap on a rerank model). Returns it with its input modalities (`None` for
+    /// a skipped target of an account model).
+    fn target(&mut self, parent: &VirtualModelConfig, t: &TargetConfig) -> TargetResult {
         let capability = parent.capability;
         let err = |message: String| RoutingConfigError {
             model: parent.id.clone(),
             message: format!("target '{}': {message}", t.model),
         };
-        let when = t
-            .when
-            .as_ref()
-            .map(|w| Condition::compile(w, capability))
-            .transpose()
-            .map_err(err)?;
-        let overrides = t
-            .overrides
-            .as_ref()
-            .map(|o| Overrides::compile(o, capability))
-            .transpose()
-            .map_err(err)?
-            .map(Arc::new);
-        let weight = u64::from(t.weight.unwrap_or(0));
+        let parts = Parts {
+            weight: u64::from(t.weight.unwrap_or(0)),
+            when: t
+                .when
+                .as_ref()
+                .map(|w| Condition::compile(w, capability))
+                .transpose()
+                .map_err(err)?,
+            overrides: t
+                .overrides
+                .as_ref()
+                .map(|o| Overrides::compile(o, capability))
+                .transpose()
+                .map_err(err)?
+                .map(Arc::new),
+        };
 
         if self.by_id.contains_key(t.model.as_str()) {
             if t.remap.is_some() {
@@ -385,20 +583,78 @@ impl Compiler<'_> {
                     child.capability()
                 )));
             }
-            let mods = child.modalities.clone();
-            return Ok((
-                Target {
-                    node: Node::Virtual(child),
-                    weight,
-                    when,
-                    overrides,
-                    remap: None,
-                },
-                mods,
+            return Ok(parts.virtual_target(child));
+        }
+        if self.platform.is_some() {
+            if let Some(result) = self.platform_target(parent, t, &parts) {
+                return result;
+            }
+        }
+        self.foundation_target(parent, t, parts)
+    }
+
+    /// Account compile (ADR 022): a target naming a disabled account model or
+    /// a platform virtual model. What the platform owns may change under the
+    /// account, so a platform target that no longer fits is skipped
+    /// (reported), never an error. `None` when it is neither.
+    fn platform_target(
+        &mut self,
+        parent: &VirtualModelConfig,
+        t: &TargetConfig,
+        parts: &Parts,
+    ) -> Option<TargetResult> {
+        if self.dead.contains(&t.model) {
+            return Some(self.skipped(
+                parent,
+                t,
+                parts,
+                "is a disabled virtual model of this account; it is skipped",
             ));
         }
+        let child = self.platform.and_then(|p| p.get(&t.model))?;
+        let capability = parent.capability;
+        Some(if t.remap.is_some() {
+            self.skipped(
+                parent,
+                t,
+                parts,
+                "is a platform virtual model, and a remap must point at a foundation model; \
+                 it is skipped",
+            )
+        } else if child.capability() != capability {
+            let message = format!(
+                "serves {} but this virtual model serves {capability}; it is skipped",
+                child.capability()
+            );
+            self.skipped(parent, t, parts, &message)
+        } else {
+            Ok(parts.clone().virtual_target(child.clone()))
+        })
+    }
 
+    /// A foundation target: it must exist and serve the capability (or
+    /// `decisions` under a remap). In an account compile a miss is skipped.
+    fn foundation_target(
+        &mut self,
+        parent: &VirtualModelConfig,
+        t: &TargetConfig,
+        parts: Parts,
+    ) -> TargetResult {
+        let capability = parent.capability;
+        let account = self.platform.is_some();
+        let err = |message: String| RoutingConfigError {
+            model: parent.id.clone(),
+            message: format!("target '{}': {message}", t.model),
+        };
         let Some(found) = self.foundation.models.get(&t.model) else {
+            if account {
+                return self.skipped(
+                    parent,
+                    t,
+                    &parts,
+                    "does not exist; it is skipped at request time",
+                );
+            }
             return Err(RoutingConfigError {
                 model: parent.id.clone(),
                 message: format!(
@@ -414,12 +670,24 @@ impl Compiler<'_> {
                 ));
             }
             if !found.capabilities.contains(&Capability::Decisions) {
+                if account {
+                    return self.skipped(
+                        parent,
+                        t,
+                        &parts,
+                        "does not serve decisions (needed by its remap); it is skipped",
+                    );
+                }
                 return Err(err("a remap target must serve decisions".to_owned()));
             }
             let template = compile_remap(remap).map_err(err)?;
             (Some(Arc::new(template)), vec!["text".to_owned()])
         } else {
             if !found.capabilities.contains(&capability) {
+                if account {
+                    let message = format!("does not serve {capability}; it is skipped");
+                    return self.skipped(parent, t, &parts, &message);
+                }
                 return Err(err(format!("does not serve {capability}")));
             }
             (None, found.modalities.clone())
@@ -427,13 +695,64 @@ impl Compiler<'_> {
         Ok((
             Target {
                 node: Node::Foundation(t.model.clone()),
-                weight,
-                when,
-                overrides,
+                weight: parts.weight,
+                when: parts.when,
+                overrides: parts.overrides,
                 remap,
             },
-            mods,
+            Some(mods),
         ))
+    }
+
+    /// A skipped account target (ADR 022): no attempt, reported on `parent`.
+    #[allow(clippy::unnecessary_wraps)] // every caller returns it as a `TargetResult`
+    fn skipped(
+        &mut self,
+        parent: &VirtualModelConfig,
+        t: &TargetConfig,
+        parts: &Parts,
+        message: &str,
+    ) -> TargetResult {
+        self.missing
+            .push((parent.id.clone(), format!("target '{}' {message}", t.model)));
+        Ok((
+            Target {
+                node: Node::Missing(t.model.clone()),
+                weight: parts.weight,
+                when: parts.when.clone(),
+                overrides: parts.overrides.clone(),
+                remap: None,
+            },
+            None,
+        ))
+    }
+}
+
+/// A compiled target plus its input modalities (`None` when skipped).
+type TargetResult = Result<(Target, Option<Vec<String>>), RoutingConfigError>;
+
+/// The parts of a target compiled before its model is resolved.
+#[derive(Clone)]
+struct Parts {
+    weight: u64,
+    when: Option<Condition>,
+    overrides: Option<Arc<Overrides>>,
+}
+
+impl Parts {
+    /// A target on the virtual model `child`.
+    fn virtual_target(self, child: Arc<VirtualModel>) -> (Target, Option<Vec<String>>) {
+        let mods = child.modalities.clone();
+        (
+            Target {
+                node: Node::Virtual(child),
+                weight: self.weight,
+                when: self.when,
+                overrides: self.overrides,
+                remap: None,
+            },
+            Some(mods),
+        )
     }
 }
 
@@ -443,6 +762,7 @@ fn attempt_count(strategy: StrategyKind, targets: &[Target]) -> usize {
     let each = targets.iter().map(|t| match &t.node {
         Node::Foundation(_) => 1,
         Node::Virtual(child) => child.attempts,
+        Node::Missing(_) => 0,
     });
     match strategy {
         StrategyKind::Switch => each.max().unwrap_or(0),
@@ -641,19 +961,23 @@ fn compile_remap(r: &RemapConfig) -> Result<RerankTemplate, String> {
     })
 }
 
-/// One warning per virtual model whose preset is ignored because another virtual
-/// model reaches it as a target (presets apply only to the requested id).
-fn preset_warnings(order: &[Arc<VirtualModel>]) -> Vec<String> {
+/// One `(model, warning)` per virtual model whose preset is ignored because another
+/// virtual model reaches it as a target (presets apply only to the requested id).
+fn preset_warnings(order: &[Arc<VirtualModel>]) -> Vec<(String, String)> {
     let mut warnings = Vec::new();
     for parent in order {
         for target in &parent.targets {
             if let Node::Virtual(child) = &target.node {
-                if child.preset.is_some() {
-                    warnings.push(format!(
+                // A platform model's preset is the platform's business.
+                if child.preset.is_some() && child.account == parent.account {
+                    warnings.push((
+                        child.id().to_owned(),
+                        format!(
                         "the preset on virtual model '{}' is ignored when it is reached through \
                          '{}' (presets apply only to the requested id)",
                         child.id(),
                         parent.id()
+                    ),
                     ));
                 }
             }
@@ -676,12 +1000,21 @@ fn plan_of(model: &VirtualModel) -> Value {
             let mut entry = serde_json::to_value(cfg).unwrap_or(Value::Null);
             if let Value::Object(map) = &mut entry {
                 match &compiled.node {
+                    // An account never sees a platform model's tree (ADR 022).
+                    Node::Virtual(child) if model.account && !child.account => {
+                        map.insert("virtual".to_owned(), Value::Bool(true));
+                        map.insert("platform".to_owned(), Value::Bool(true));
+                    }
                     Node::Virtual(child) => {
                         map.insert("virtual".to_owned(), Value::Bool(true));
                         map.insert("plan".to_owned(), plan_of(child));
                     }
                     Node::Foundation(_) => {
                         map.insert("virtual".to_owned(), Value::Bool(false));
+                    }
+                    Node::Missing(_) => {
+                        map.insert("virtual".to_owned(), Value::Bool(false));
+                        map.insert("missing".to_owned(), Value::Bool(true));
                     }
                 }
             }
@@ -1063,5 +1396,171 @@ mod tests {
             serde_json::json!("gpt-4o")
         );
         assert_eq!(plan["targets"][1]["virtual"], serde_json::json!(false));
+    }
+
+    fn configs(toml_text: &str) -> Vec<VirtualModelConfig> {
+        #[derive(serde::Deserialize)]
+        struct Doc {
+            virtual_models: Vec<VirtualModelConfig>,
+        }
+        toml::from_str::<Doc>(toml_text).unwrap().virtual_models
+    }
+
+    fn platform() -> RoutingTable {
+        compile(
+            r#"
+            [[virtual_models]]
+            id = "lumen/chat"
+            capability = "chat"
+            strategy = "fallback"
+            targets = [ { model = "gpt-4o" }, { model = "claude" } ]
+            preset = { system_prompt = "platform secret prompt" }
+        "#,
+        )
+        .unwrap()
+        .0
+    }
+
+    fn kinds(table: &RoutingTable, id: &str) -> Vec<ProblemKind> {
+        table.problems(id).iter().map(|p| p.kind).collect()
+    }
+
+    #[test]
+    fn an_account_model_targets_its_own_platform_and_foundation_models() {
+        let platform = platform();
+        let table = RoutingTable::compile_account(
+            &configs(
+                r#"
+                [[virtual_models]]
+                id = "team/fast"
+                capability = "chat"
+                strategy = "fallback"
+                targets = [ { model = "team/inner" }, { model = "lumen/chat" }, { model = "gpt-4o" } ]
+
+                [[virtual_models]]
+                id = "team/inner"
+                capability = "chat"
+                strategy = "single"
+                targets = [ { model = "claude" } ]
+            "#,
+            ),
+            &foundation(),
+            &platform,
+        );
+        let fast = table.get("team/fast").unwrap();
+        assert!(fast.is_account());
+        assert_eq!(table.problems("team/fast"), []);
+        // The platform tree is a reference: its preset never shows.
+        let plan = table.plan("team/fast").unwrap();
+        assert_eq!(plan["targets"][1]["platform"], true);
+        assert!(plan["targets"][1].get("plan").is_none());
+        assert!(!plan.to_string().contains("platform secret prompt"));
+        // Its own child is expanded.
+        assert_eq!(plan["targets"][0]["plan"]["id"], "team/inner");
+        // Platform attempts count: 1 + 2 + 1.
+        assert_eq!(fast.attempts, 4);
+    }
+
+    #[test]
+    fn a_vanished_platform_target_is_a_skipped_leaf_not_an_error() {
+        let table = RoutingTable::compile_account(
+            &configs(
+                r#"
+                [[virtual_models]]
+                id = "team/fast"
+                capability = "chat"
+                strategy = "fallback"
+                targets = [ { model = "gone/model" }, { model = "lumen/gone" }, { model = "gpt-4o" } ]
+
+                [[virtual_models]]
+                id = "team/rr"
+                capability = "rerank"
+                strategy = "single"
+                targets = [ { model = "gpt-4o" } ]
+            "#,
+            ),
+            &foundation(),
+            &platform(),
+        );
+        assert_eq!(
+            kinds(&table, "team/fast"),
+            [ProblemKind::Missing, ProblemKind::Missing]
+        );
+        // A target that no longer serves the capability is skipped too.
+        assert_eq!(kinds(&table, "team/rr"), [ProblemKind::Missing]);
+        let plan = table.plan("team/fast").unwrap();
+        assert_eq!(plan["targets"][0]["missing"], true);
+        assert_eq!(plan["targets"][2]["virtual"], false);
+        assert!(plan["targets"][2].get("missing").is_none());
+    }
+
+    #[test]
+    fn a_platform_id_is_shadowed_and_reported() {
+        let table = RoutingTable::compile_account(
+            &configs(
+                r#"
+                [[virtual_models]]
+                id = "lumen/chat"
+                capability = "chat"
+                strategy = "single"
+                targets = [ { model = "claude" } ]
+            "#,
+            ),
+            &foundation(),
+            &platform(),
+        );
+        assert_eq!(kinds(&table, "lumen/chat"), [ProblemKind::Shadows]);
+        assert!(table.get("lumen/chat").unwrap().is_account());
+    }
+
+    #[test]
+    fn a_rule_broken_by_the_platform_disables_only_that_model() {
+        // 40 attempts on the platform; the account model doubles it.
+        let wide: Vec<String> = (0..40)
+            .map(|_| "{ model = \"gpt-4o\" }".to_owned())
+            .collect();
+        let platform = compile(&format!(
+            r#"
+            [[virtual_models]]
+            id = "lumen/wide"
+            capability = "chat"
+            strategy = "fallback"
+            targets = [ {} ]
+        "#,
+            wide.join(", ")
+        ))
+        .unwrap()
+        .0;
+        let table = RoutingTable::compile_account(
+            &configs(
+                r#"
+                [[virtual_models]]
+                id = "team/double"
+                capability = "chat"
+                strategy = "fallback"
+                targets = [ { model = "lumen/wide" }, { model = "lumen/wide" } ]
+
+                [[virtual_models]]
+                id = "team/uses-double"
+                capability = "chat"
+                strategy = "fallback"
+                targets = [ { model = "team/double" }, { model = "claude" } ]
+
+                [[virtual_models]]
+                id = "team/ok"
+                capability = "chat"
+                strategy = "single"
+                targets = [ { model = "claude" } ]
+            "#,
+            ),
+            &foundation(),
+            &platform,
+        );
+        assert_eq!(kinds(&table, "team/double"), [ProblemKind::Disabled]);
+        assert!(table.get("team/double").is_none());
+        assert!(table.is_disabled("team/double"));
+        assert_eq!(kinds(&table, "team/uses-double"), [ProblemKind::Missing]);
+        assert!(table.get("team/uses-double").is_some());
+        assert_eq!(table.problems("team/ok"), []);
     }
 }

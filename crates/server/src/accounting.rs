@@ -109,6 +109,8 @@ pub struct Accounting {
     /// The route of a virtual-model request (ADR 014), set by the handler
     /// after execution; `None` for a foundation model called directly.
     route: Option<String>,
+    /// The requested virtual model belongs to one account (ADR 022).
+    account_model: bool,
     provider: String,
     key_id: Option<String>,
     /// The key's budget group at admission (ADR 009), for usage attribution.
@@ -198,6 +200,7 @@ impl Accounting {
             model: target.model.to_owned(),
             model_used: target.model.to_owned(),
             route: None,
+            account_model: false,
             provider: target.provider.to_owned(),
             key_id,
             group_id,
@@ -280,9 +283,12 @@ impl Accounting {
     }
 
     /// Record the route the request took through a virtual model (ADR 014).
-    /// `None` for a foundation model called directly.
-    pub fn set_route(&mut self, route: Option<&str>) {
+    /// `None` for a foundation model called directly. `account_model` marks a
+    /// virtual model owned by one account (ADR 022): its id is never a
+    /// Prometheus label value.
+    pub fn set_route(&mut self, route: Option<&str>, account_model: bool) {
         self.route = route.map(str::to_owned);
+        self.account_model = account_model;
     }
 
     /// The model that served the request (for the caller's cost calculation).
@@ -433,8 +439,12 @@ impl Accounting {
         }
 
         if self.route.is_some() {
-            self.tokens
-                .inc_virtual_request(&self.model, &self.model_used);
+            let label = if self.account_model {
+                crate::account_models::METRIC_LABEL
+            } else {
+                &self.model
+            };
+            self.tokens.inc_virtual_request(label, &self.model_used);
         }
         self.enqueue_usage(outcome, cost, elapsed, metadata_json);
     }
@@ -709,6 +719,7 @@ mod tests {
             model: "gpt".to_owned(),
             model_used: "gpt".to_owned(),
             route: None,
+            account_model: false,
             provider: "openai".to_owned(),
             key_id: None,
             group_id: None,

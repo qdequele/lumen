@@ -91,13 +91,17 @@ pub async fn embeddings(
     validate_input_type(&req)?;
 
     // A deprecated bare id (`gpt-4o`) resolves to its `provider/model` id.
-    let client_model = state.resilience.canonical_model(&req.model);
+    // An account key also resolves its account's own virtual models (ADR 022).
+    let account = key.as_deref().and_then(|k| k.0.account_ref());
+    let account = account.as_deref().map(String::as_str);
+    let client_model = state.resilience.canonical_model_for(account, &req.model);
     // Facts are only built for a virtual model (ADR 014).
-    let mut decision = state
-        .resilience
-        .decide(Capability::Embed, &client_model, |_| {
-            Facts::embed(&headers, key.as_deref(), &req)
-        })?;
+    let mut decision =
+        state
+            .resilience
+            .decide_for(Capability::Embed, account, &client_model, |_| {
+                Facts::embed(&headers, key.as_deref(), &req)
+            })?;
     let chain = lumen_router::resolve_embedding_decision(&state.registry, &mut decision)?;
     let primary = decision.primary_model().to_owned();
     let mut links = lumen_router::decision_links(
@@ -210,7 +214,7 @@ pub async fn embeddings(
     let (mut response, served) = executed.value;
     accounting.served_by(&executed.model_used, &executed.provider_used);
     let route = decision.route_of(executed.index);
-    accounting.set_route(route);
+    accounting.set_route(route, decision.account);
 
     // ADR 003: upstream usage when reported, else the local estimate - never
     // a silent zero (e.g. TEI reports nothing). The response envelope always

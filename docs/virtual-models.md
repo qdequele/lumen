@@ -404,7 +404,7 @@ errors.
 | `x-lumen-route` response header | The path taken, for example `acme/chat>acme/chat-eu>mistral-large`. Set when a virtual model was requested. |
 | `usage_log.model` / `model_used` | The requested id / the foundation model that served. |
 | `usage_log.route` | The same path as the header (nullable; empty for a direct foundation call). See the [usage log](operations/usage-log.md). |
-| `lumen_virtual_model_requests_total{virtual_model, model_used}` | Counter of requests served through a virtual model. Virtual ids are operator-defined, so cardinality is bounded. See [metrics](operations/metrics.md). |
+| `lumen_virtual_model_requests_total{virtual_model, model_used}` | Counter of requests served through a virtual model. Virtual ids are operator-defined, so cardinality is bounded; an account's own models all count under `virtual_model="account"`. See [metrics](operations/metrics.md). |
 | Tracing | `virtual_model` and `route` span fields. Never prompts, presets or remap text. |
 
 Tokens and cost are booked to the foundation model that served, so a fallback
@@ -439,6 +439,43 @@ model that another virtual model still references is `LM-1001`, naming the
 dependent. Every write is validated with the same rules as boot, so an invalid
 virtual model (a cycle, a missing reference, a bad `when`) is `LM-1001` naming
 the model and the reason.
+
+### Account virtual models
+
+On a gateway shared by several Lab accounts, each account can own virtual
+models of its own ([ADR 022](adr/022-account-virtual-models.md)). The same
+routes serve them when the call carries `X-Lumen-Account-Ref: <account uuid>`:
+
+| | Platform (no header) | Account (with the header) |
+|---|---|---|
+| Stored in | the config document | the auth database, one document per account |
+| `hash` / `If-Match` | the config document's | the account's own; other accounts and the platform never make it stale |
+| Resolved for | every key | that account's keys only (the key's group's `account_ref`, or its parent's) |
+| Listed by `GET /v1/models` | every key, `owned_by: "lumen"` | that account's keys, `owned_by: "account"` |
+
+Rules for an account model:
+
+- Its id follows the same grammar and may not equal a current platform id
+  (foundation, platform virtual model or deprecated alias). If the platform
+  adds that id later, the account's model keeps winning for its own keys and
+  the list reports it in `warnings`.
+- Its targets may be the account's own virtual models, platform virtual
+  models and foundation models, never another account's.
+- At most 32 models and 256 KiB per account, plus every limit above. Depth
+  and attempts count through platform targets.
+- The platform is never blocked by it. When staff delete or change a model it
+  targets, that target is skipped at request time (`fallback` and `split`
+  move on), and the list entry and `/plan` carry a `warning`. A model a
+  platform change pushes over a limit stops being served until fixed.
+- A save must leave the saved model clean and may not break another model of
+  the account. A delete is refused while another model of the account targets
+  it.
+- `/plan` never expands a platform virtual model (`"platform": true`), so an
+  account never sees the platform's presets or remaps.
+
+Other processes sharing the database pick up an account write within 5
+seconds. In metrics, account models count under
+`virtual_model="account"`.
 
 ## 10. Migrating from `fallbacks` and bare ids
 

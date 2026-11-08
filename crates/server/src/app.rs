@@ -287,8 +287,9 @@ fn platform_key_routes() -> Router<AppState> {
 /// The master-key-protected `/admin` surface (mounted only when auth is
 /// enabled). Split out of [`build_app`] to keep that function readable.
 ///
-/// Two halves: the account routes (keys, groups, usage), which a control
-/// plane may scope to one account with `X-Lumen-Account-Ref`, and the
+/// Two halves: the account routes (keys, groups, usage, team provider keys,
+/// virtual models), which a control plane may scope to one account with
+/// `X-Lumen-Account-Ref`, and the
 /// platform routes (provider keys and checks, webhooks, config,
 /// `/openapi.json`), which
 /// refuse a scoped call with `403 LM-4005` (platform contract v2 section
@@ -330,7 +331,24 @@ fn admin_routes(state: &AppState) -> Router<AppState> {
             delete(byok_admin::delete_team_key),
         )
         .route("/admin/usage", get(admin::usage_report))
-        .route("/admin/usage/export", get(admin::usage_export));
+        .route("/admin/usage/export", get(admin::usage_export))
+        // Virtual models (ADR 014): the platform's without the header, the
+        // account's own with it (ADR 022). Static segments, so matchit
+        // prefers them over the platform-only `/admin/config/{section}`.
+        .route(
+            "/admin/config/virtual_models",
+            get(admin::list_virtual_models),
+        )
+        .route(
+            "/admin/config/virtual_models/{id}",
+            get(admin::get_virtual_model)
+                .put(admin::put_virtual_model)
+                .delete(admin::delete_virtual_model),
+        )
+        .route(
+            "/admin/config/virtual_models/{id}/plan",
+            get(admin::get_virtual_model_plan),
+        );
     let platform = Router::new()
         .route("/admin/provider-keys/{name}", put(admin::put_provider_key))
         .merge(platform_key_routes())
@@ -365,20 +383,6 @@ fn admin_routes(state: &AppState) -> Router<AppState> {
             get(admin::get_provider)
                 .put(admin::put_provider)
                 .delete(admin::delete_provider),
-        )
-        .route(
-            "/admin/config/virtual_models",
-            get(admin::list_virtual_models),
-        )
-        .route(
-            "/admin/config/virtual_models/{id}",
-            get(admin::get_virtual_model)
-                .put(admin::put_virtual_model)
-                .delete(admin::delete_virtual_model),
-        )
-        .route(
-            "/admin/config/virtual_models/{id}/plan",
-            get(admin::get_virtual_model_plan),
         )
         .route(
             "/admin/config/{section}",

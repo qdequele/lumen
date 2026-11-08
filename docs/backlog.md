@@ -5,6 +5,15 @@ Ideas surfaced during development that are intentionally out of scope for v1
 Recorded here so they are not lost, and so we don't gold-plate the current
 milestone.
 
+## Noted while building ADR 022 (account virtual models)
+
+- Purge the `account_virtual_models` row of an account whose groups are all
+  deleted (today the row stays and resolves for no key).
+- Push-based refresh across processes (a notify channel) instead of the
+  5-second generation poll, if a deployment needs faster convergence.
+- An account-level view of the platform models a team may target (today the
+  Lab reads `GET /v1/models` with a key of the account).
+
 ## Noted while building ADR 009 (shared parent budgets)
 
 - **Grant routes are not idempotent** (ADR 009 amendment). A timed-out

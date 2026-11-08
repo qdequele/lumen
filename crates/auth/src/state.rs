@@ -385,6 +385,18 @@ impl KeyEntry {
         self.group.load().as_ref().map(|g| g.id.clone())
     }
 
+    /// The Lab account this key belongs to: the `account_ref` of its group's
+    /// billing root (ADR 015, ADR 020), or `None` for a key without a group
+    /// or a group without an account. Lock-free; read on the request path to
+    /// resolve the account's own virtual models (ADR 022).
+    #[must_use]
+    pub fn account_ref(&self) -> Option<Arc<String>> {
+        self.group
+            .load()
+            .as_ref()
+            .and_then(|g| g.billing_root().account_ref.load_full())
+    }
+
     /// The id of the top-level group this key's group resolves to (ADR 020):
     /// the parent when the key is in a sub-group, else its own group. Team
     /// provider keys are looked up by this id.

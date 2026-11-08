@@ -8,6 +8,25 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ### Added
 
+- **Account virtual models ([ADR 022](docs/adr/022-account-virtual-models.md)).**
+  Each Lab account on a shared gateway can now own virtual models. The
+  `/admin/config/virtual_models` routes (list, `GET`/`PUT`/`DELETE {id}`,
+  `{id}/plan`) accept `X-Lumen-Account-Ref`: with it they read and write that
+  account's own document, stored in the auth database with its own `hash` for
+  `If-Match`; without it they behave as before. The routes no longer answer
+  `403 LM-4005` to a scoped call. An account model resolves only for keys of
+  that account (and `GET /v1/models` lists it only for them, `owned_by:
+  "account"`), may target the account's own, platform virtual and
+  foundation models, and may not take a current platform id. A platform
+  delete or change is never blocked by account models: a target that
+  disappears is skipped at request time and reported in the new `warnings`
+  field of the list entry and of `/plan`. Limits: 32 models and 256 KiB per
+  account. Compiled tables live in memory (no database on the request
+  path); other processes sharing the database pick up a write within 5
+  seconds. Account models count under `virtual_model="account"` in
+  `lumen_virtual_model_requests_total`. Migration
+  `0019_account_virtual_models.sql` is additive.
+
 - **Per-call cost header.** A non-streaming `POST /v1/chat/completions`
   response carries `x-lumen-cost-micro-usd`, the provider cost the call
   settled in integer micro-USD (what the key's budget is charged, bandwidth

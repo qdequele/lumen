@@ -53,13 +53,17 @@ async fn handle(
     // LM-1001; empty questions → LM-2011; all before any routing.
     let (format, req) = format::parse(body)?;
     // A deprecated bare id (`gpt-4o`) resolves to its `provider/model` id.
-    let client_model = state.resilience.canonical_model(&req.model);
+    // An account key also resolves its account's own virtual models (ADR 022).
+    let account = key.and_then(|k| k.0.account_ref());
+    let account = account.as_deref().map(String::as_str);
+    let client_model = state.resilience.canonical_model_for(account, &req.model);
     // Facts are only built for a virtual model (ADR 014).
-    let mut decision = state
-        .resilience
-        .decide(Capability::Decisions, &client_model, |_| {
-            Facts::decisions(headers, key)
-        })?;
+    let mut decision =
+        state
+            .resilience
+            .decide_for(Capability::Decisions, account, &client_model, |_| {
+                Facts::decisions(headers, key)
+            })?;
     // Incompatible targets leave the decision here, before admission: they
     // are not attempts (spec 7.3).
     let chain = lumen_router::resolve_decisions(&state.registry, &mut decision, &req)?;
@@ -146,7 +150,7 @@ async fn handle(
     let (mut response, served) = executed.value;
     accounting.served_by(&executed.model_used, &executed.provider_used);
     let route = decision.route_of(executed.index);
-    accounting.set_route(route);
+    accounting.set_route(route, decision.account);
 
     // ADR 003: upstream-reported usage wins; otherwise the gateway's input
     // estimate, flagged - never a silent zero.

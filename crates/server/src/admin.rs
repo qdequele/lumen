@@ -91,7 +91,9 @@
 //!
 //! A call carrying `X-Lumen-Account-Ref: <uuid>` is scoped to that account
 //! (platform contract v2 section 8.3, see [`crate::admin_scope`]): the key,
-//! group and usage routes see and touch only that account's rows, and the
+//! group and usage routes see and touch only that account's rows, the
+//! `/admin/config/virtual_models` routes read and write that account's own
+//! virtual models (ADR 022, [`crate::account_models_admin`]), and the other
 //! provider, webhook and config routes answer `403 LM-4005`.
 
 use crate::admin_scope::AccountScope;
@@ -2163,6 +2165,11 @@ pub struct VirtualModelSummary {
     pub capability: &'static str,
     /// Its strategy.
     pub strategy: &'static str,
+    /// Account models only (ADR 022): what is wrong with it now, such as a
+    /// target the platform removed (skipped at request time). Omitted when
+    /// empty, so the platform list is unchanged.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 /// `GET /admin/config/virtual_models` response.
@@ -2174,10 +2181,15 @@ pub struct VirtualModelsList {
     pub hash: String,
 }
 
-/// List every virtual model (ADR 014).
+/// List every virtual model (ADR 014), or with `X-Lumen-Account-Ref` the
+/// account's own (ADR 022).
 pub async fn list_virtual_models(
     State(state): State<AppState>,
+    scope: AccountScope,
 ) -> Result<Json<VirtualModelsList>, ApiError> {
+    if let Some(account) = scope.account() {
+        return crate::account_models_admin::list(&state, account).await;
+    }
     let ctx = config_ctx(&state)?;
     let doc = ctx
         .source
@@ -2193,6 +2205,7 @@ pub async fn list_virtual_models(
                 id: v.id.clone(),
                 capability: v.capability.as_str(),
                 strategy: v.strategy.as_str(),
+                warnings: Vec::new(),
             })
             .collect(),
         hash: doc.hash,
@@ -2216,8 +2229,12 @@ pub struct VirtualModelDocument {
 /// `LM-1003` when absent.
 pub async fn get_virtual_model(
     State(state): State<AppState>,
+    scope: AccountScope,
     Path(id): Path<String>,
 ) -> Result<Json<VirtualModelDocument>, ApiError> {
+    if let Some(account) = scope.account() {
+        return crate::account_models_admin::get(&state, account, &id).await;
+    }
     let ctx = config_ctx(&state)?;
     let doc = ctx
         .source
@@ -2241,6 +2258,7 @@ pub async fn get_virtual_model(
 /// the virtual model on any rule of ADR 014).
 pub async fn put_virtual_model(
     State(state): State<AppState>,
+    scope: AccountScope,
     Path(id): Path<String>,
     headers: axum::http::HeaderMap,
     payload: Result<Json<lumen_router::virtual_models::VirtualModelConfig>, JsonRejection>,
@@ -2255,6 +2273,12 @@ pub async fn put_virtual_model(
         .into());
     }
     reject_json_nulls(&vm)?;
+    if let Some(account) = scope.account() {
+        if let Some(problem) = crate::config::virtual_id_problem(&vm.id) {
+            return Err(GatewayError::InvalidRequest(problem).into());
+        }
+        return crate::account_models_admin::put(&state, account, &if_match, vm).await;
+    }
     apply_document(&state, &if_match, move |current| {
         // The only input is the client body, so a value TOML cannot spell
         // (an integer above i64::MAX, say) is a client error, not a 500.
@@ -2348,10 +2372,14 @@ fn reject_json_nulls(
 /// references it (the message names the dependent).
 pub async fn delete_virtual_model(
     State(state): State<AppState>,
+    scope: AccountScope,
     Path(id): Path<String>,
     headers: axum::http::HeaderMap,
 ) -> Result<StatusCode, ApiError> {
     let if_match = require_if_match(&headers)?;
+    if let Some(account) = scope.account() {
+        return crate::account_models_admin::delete(&state, account, &if_match, &id).await;
+    }
     apply_document(&state, &if_match, move |current| {
         config_edit::delete_virtual_model(current, &id)
             .map_err(|e| edit_internal_error(&e))?
@@ -2369,6 +2397,9 @@ pub struct VirtualModelPlan {
     pub plan: serde_json::Value,
     /// See [`ProvidersList::hash`].
     pub hash: String,
+    /// Account models only (ADR 022), as on [`VirtualModelSummary`].
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 /// The resolved routing tree of one virtual model, compiled from the
@@ -2380,8 +2411,12 @@ pub struct VirtualModelPlan {
 /// `LM-1003` when absent.
 pub async fn get_virtual_model_plan(
     State(state): State<AppState>,
+    scope: AccountScope,
     Path(id): Path<String>,
 ) -> Result<Json<VirtualModelPlan>, ApiError> {
+    if let Some(account) = scope.account() {
+        return crate::account_models_admin::plan(&state, account, &id).await;
+    }
     let ctx = config_ctx(&state)?;
     let doc = ctx
         .source
@@ -2396,6 +2431,7 @@ pub async fn get_virtual_model_plan(
     Ok(Json(VirtualModelPlan {
         plan,
         hash: doc.hash,
+        warnings: Vec::new(),
     }))
 }
 

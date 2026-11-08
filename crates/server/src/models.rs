@@ -7,13 +7,20 @@
 //! snapshots. Both routes reflect ONLY the local configuration - the gateway
 //! never introspects upstreams (spec 3.3), so they touch no provider and do no
 //! I/O. A virtual model with `listed = false` is hidden from both routes.
+//!
+//! A key of a Lab account also sees that account's own listed virtual models
+//! (ADR 022, `"owned_by": "account"`), and an account model hides a platform
+//! virtual model of the same id from that key. Other keys see the platform
+//! only.
 
 use axum::extract::{Path, State};
-use axum::Json;
+use axum::{Extension, Json};
 use lumen_core::{GatewayError, ReleaseDate};
 use lumen_providers::LoadedModelSummary;
 use serde::Serialize;
 
+use crate::account_models::AccountModels;
+use crate::auth::AuthedKey;
 use crate::error::ApiError;
 use crate::state::AppState;
 
@@ -71,7 +78,7 @@ impl From<&lumen_router::virtual_models::VirtualModel> for ModelEntry {
             id: m.id().to_owned(),
             object: "model",
             created: None,
-            owned_by: "lumen".to_owned(),
+            owned_by: if m.is_account() { "account" } else { "lumen" }.to_owned(),
             capabilities: vec![m.capability().as_str()],
             modalities: m.modalities().to_vec(),
             release_date: None,
@@ -90,13 +97,35 @@ pub struct ModelList {
     pub data: Vec<ModelEntry>,
 }
 
+/// The calling key's account models (ADR 022), when it has an account with
+/// models stored.
+fn account_models(
+    state: &AppState,
+    key: Option<&Extension<AuthedKey>>,
+) -> Option<std::sync::Arc<AccountModels>> {
+    let account = key.and_then(|k| k.0 .0.account_ref())?;
+    state.resilience.account_models(&account)
+}
+
+/// Whether `id` is declared by the account (served or disabled), so the
+/// platform model of the same id is hidden from its keys.
+fn shadowed(account: Option<&AccountModels>, id: &str) -> bool {
+    account.is_some_and(|a| a.table.get(id).is_some() || a.table.is_disabled(id))
+}
+
 /// Handle a model-discovery request.
 #[allow(clippy::unused_async)] // axum handlers are async; this one just reads state.
-pub async fn models(State(state): State<AppState>) -> Json<ModelList> {
+pub async fn models(
+    State(state): State<AppState>,
+    key: Option<Extension<AuthedKey>>,
+) -> Json<ModelList> {
+    let account = account_models(&state, key.as_ref());
+    let account = account.as_deref();
     let mut data: Vec<ModelEntry> = state
         .registry
         .list_models()
         .into_iter()
+        .filter(|m| !shadowed(account, &m.id))
         .map(ModelEntry::from)
         .collect();
     data.extend(
@@ -104,8 +133,12 @@ pub async fn models(State(state): State<AppState>) -> Json<ModelList> {
             .resilience
             .routing()
             .listed()
+            .filter(|m| !shadowed(account, m.id()))
             .map(|m| ModelEntry::from(m.as_ref())),
     );
+    if let Some(account) = account {
+        data.extend(account.table.listed().map(|m| ModelEntry::from(m.as_ref())));
+    }
 
     Json(ModelList {
         object: "list",
@@ -122,10 +155,33 @@ pub async fn models(State(state): State<AppState>) -> Json<ModelList> {
 #[allow(clippy::unused_async)] // axum handlers are async; this one just reads state.
 pub async fn model(
     State(state): State<AppState>,
+    key: Option<Extension<AuthedKey>>,
     Path(id): Path<String>,
 ) -> Result<Json<ModelEntry>, ApiError> {
-    // A deprecated bare id is served as the entry of the id it aliases.
+    // The account's own model wins (ADR 022); a disabled or unlisted one is
+    // a 404 like an unknown id, never the platform model it shadows.
+    if let Some(account) = account_models(&state, key.as_ref()) {
+        if shadowed(Some(&account), &id) {
+            return account
+                .table
+                .get(&id)
+                .filter(|m| m.listed())
+                .map(|m| Json(ModelEntry::from(m.as_ref())))
+                .ok_or_else(|| ApiError::from(GatewayError::ModelNotFound(id)));
+        }
+    }
+    // A deprecated bare id is served as the entry of the id it aliases,
+    // unless the account declares that id (as the request path resolves it).
+    let account = account_models(&state, key.as_ref());
     let id = state.resilience.canonical_model(&id);
+    if let Some(account) = account.filter(|a| shadowed(Some(a), &id)) {
+        return account
+            .table
+            .get(&id)
+            .filter(|m| m.listed())
+            .map(|m| Json(ModelEntry::from(m.as_ref())))
+            .ok_or_else(|| ApiError::from(GatewayError::ModelNotFound(id)));
+    }
     state
         .registry
         .model(&id)
