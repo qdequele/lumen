@@ -285,6 +285,22 @@ impl Harness {
         .await
     }
 
+    /// [`Self::chat`], returning the `x-lumen-cost-micro-usd` header too.
+    async fn chat_cost(&self, key: &str, model: &str) -> (u16, Option<String>) {
+        let resp = reqwest::Client::new()
+            .post(format!("{}/v1/chat/completions", self.base))
+            .bearer_auth(key)
+            .json(&json!({ "model": model, "messages": [{ "role": "user", "content": "hello there" }] }))
+            .send()
+            .await
+            .expect("send");
+        let cost = resp
+            .headers()
+            .get("x-lumen-cost-micro-usd")
+            .map(|v| v.to_str().expect("ascii").to_owned());
+        (resp.status().as_u16(), cost)
+    }
+
     async fn admin(&self, method: reqwest::Method, route: &str, account: &str) -> (u16, String) {
         let resp = reqwest::Client::new()
             .request(method, format!("{}{route}", self.base))
@@ -497,6 +513,37 @@ async fn no_pool_uses_platform_key_and_bills_tokens() {
     assert_eq!(delta.units.tokens_in, 5);
     assert_eq!(delta.units.tokens_out, 3);
     assert_eq!(delta.units.byok_tokens_in, 0);
+}
+
+/// The cost header reports what the call settled: the platform cost, which
+/// is what the group is billed for it (5 in x $1000/1M + 3 out x $2000/1M).
+#[tokio::test]
+async fn platform_call_reports_its_settled_cost_in_a_header() {
+    let (a, b) = servers().await;
+    mount_ok(&a, PLATFORM).await;
+    let h = harness(&a, &b).await;
+
+    let (status, cost) = h.chat_cost(&h.key_a, "a/model-a").await;
+    assert_eq!(status, 200);
+    assert_eq!(cost.as_deref(), Some("11000"));
+    let delta = h.settled("lab-a").await;
+    assert_eq!(
+        delta.cost_micro, 11000,
+        "the header matches the settled cost"
+    );
+}
+
+/// A team key paid the provider: nothing is billed, the header says 0.
+#[tokio::test]
+async fn team_key_call_reports_a_zero_cost_header() {
+    let (a, b) = servers().await;
+    mount_ok(&a, TEAM_1).await;
+    let h = harness(&a, &b).await;
+    h.add_key(&h.group_a, "a", TEAM_1).await;
+
+    let (status, cost) = h.chat_cost(&h.key_a, "a/model-a").await;
+    assert_eq!(status, 200);
+    assert_eq!(cost.as_deref(), Some("0"));
 }
 
 #[tokio::test]

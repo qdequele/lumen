@@ -8,6 +8,12 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ### Added
 
+- **Per-call cost header.** A non-streaming `POST /v1/chat/completions`
+  response carries `x-lumen-cost-micro-usd`, the provider cost the call
+  settled in integer micro-USD (what the key's budget is charged, bandwidth
+  excluded; `0` on a team key). Callers such as the hosted crawler use it to
+  show what an AI job cost.
+
 - **Sub-groups ([ADR 020](docs/adr/020-team-sub-groups.md)).** A budget
   group can be created under a top-level group with `parent_id` on
   `POST /admin/groups`. A key in a sub-group must fit its own budget, the

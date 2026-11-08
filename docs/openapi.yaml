@@ -92,6 +92,9 @@ components:
     Route:
       description: The path a virtual-model request took through its targets (ADR 014); absent for a direct call.
       schema: { type: string }
+    CostMicroUsd:
+      description: "Non-streaming chat only: the provider cost this call settled, in integer micro-USD (what the key's budget is charged for it, bandwidth excluded). 0 when a team (BYOK) key paid the provider."
+      schema: { type: integer, minimum: 0 }
     RequestId:
       description: The request id (the client's `x-request-id`, or a generated UUID).
       schema: { type: string }
@@ -970,6 +973,7 @@ paths:
           headers:
             x-lumen-model-used: { $ref: "#/components/headers/ModelUsed" }
             x-lumen-route: { $ref: "#/components/headers/Route" }
+            x-lumen-cost-micro-usd: { $ref: "#/components/headers/CostMicroUsd" }
             x-request-id: { $ref: "#/components/headers/RequestId" }
           content:
             application/json: { schema: { $ref: "#/components/schemas/ChatCompletionResponse" } }

@@ -38,6 +38,7 @@ use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
 use bytes::Bytes;
 use futures::stream::{BoxStream, StreamExt};
+use lumen_auth::state::usd_to_micro;
 use std::sync::Arc;
 
 use lumen_core::{
@@ -443,8 +444,10 @@ async fn chat_non_streaming(
     let (mut response, served) = executed.value;
     let served_model = executed.model_used.clone();
     let billable = matches!(served, Served::Platform);
-    settle_non_streaming(ctx, accounting, &served_model, &mut response, billable);
-    Ok((routing_headers(&served_model, route), Json(response)).into_response())
+    let cost = settle_non_streaming(ctx, accounting, &served_model, &mut response, billable);
+    let mut headers = routing_headers(&served_model, route);
+    insert_cost_header(&mut headers, cost, billable);
+    Ok((headers, Json(response)).into_response())
 }
 
 /// Close the books on a non-streaming completion (ADR 003): upstream usage
@@ -464,7 +467,7 @@ fn settle_non_streaming(
     client_model: &str,
     response: &mut lumen_core::ChatResponse,
     billable: bool,
-) {
+) -> f64 {
     let reported = response
         .usage
         .filter(|u| u.prompt_tokens > 0 || u.completion_tokens > 0);
@@ -491,7 +494,7 @@ fn settle_non_streaming(
             status: 200,
             billable,
         });
-        return;
+        return cost;
     }
 
     // Upstream reported nothing: the envelope gets the inline heuristic.
@@ -517,7 +520,12 @@ fn settle_non_streaming(
         completion_tokens_details: None,
     });
 
+    let cost = accounting
+        .pricing()
+        .token_cost(client_model, tokens_in, tokens_out);
     if ctx.state.token_counter().refines(client_model) {
+        // The header carries the heuristic cost; the background recount may
+        // settle the books a little differently.
         defer_chat_refinement(
             ctx,
             accounting,
@@ -526,12 +534,9 @@ fn settle_non_streaming(
             response,
             billable,
         );
-        return;
+        return cost;
     }
 
-    let cost = accounting
-        .pricing()
-        .token_cost(client_model, tokens_in, tokens_out);
     accounting.finish(&Outcome {
         tokens_in,
         tokens_out,
@@ -543,6 +548,25 @@ fn settle_non_streaming(
         status: 200,
         billable,
     });
+    cost
+}
+
+/// The `x-lumen-cost-micro-usd` response header: the provider cost this call
+/// settled, in integer micro-USD (what the key's budget is charged, before
+/// any bandwidth). `0` when a team (BYOK) key paid the provider.
+pub const COST_HEADER: &str = "x-lumen-cost-micro-usd";
+
+/// Add [`COST_HEADER`] for a settled non-streaming call.
+fn insert_cost_header(headers: &mut HeaderMap, cost_usd: f64, billable: bool) {
+    let micro = if billable {
+        usd_to_micro(cost_usd).max(0)
+    } else {
+        0
+    };
+    headers.insert(
+        axum::http::HeaderName::from_static(COST_HEADER),
+        axum::http::HeaderValue::from(micro),
+    );
 }
 
 /// Defer the accounting close to a background refinement task (opt-in accurate
