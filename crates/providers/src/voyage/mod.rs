@@ -240,8 +240,16 @@ impl EmbeddingProvider for VoyageProvider {
             &cancel,
         )
         .await?;
-        serde_json::from_slice::<EmbedResponse>(&bytes)
-            .map_err(|e| ProviderError::Translation(format!("voyage embeddings response: {e}")))
+        let mut resp = serde_json::from_slice::<EmbedResponse>(&bytes)
+            .map_err(|e| ProviderError::Translation(format!("voyage embeddings response: {e}")))?;
+        // Voyage reports `usage: {"total_tokens": N}` only, with no
+        // `prompt_tokens`; for embeddings every token is an input token, so
+        // the reported count is the prompt count (ADR 003: settle on the
+        // upstream figure, never a local estimate when one was reported).
+        if resp.usage.prompt_tokens == 0 {
+            resp.usage.prompt_tokens = resp.usage.total_tokens;
+        }
+        Ok(resp)
     }
 
     fn max_batch_size(&self) -> usize {

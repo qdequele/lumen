@@ -19,6 +19,13 @@ All notable changes to LUMEN are documented here. The format is based on
   still dropped (refused with `strict = true`). See the chat-extras matrix in
   `docs/providers.md`.
 
+- **Voyage embeddings are billed on the upstream token count.** Voyage (and
+  MongoDB's Voyage endpoint) reports embedding usage as `total_tokens` only,
+  and the gateway read `prompt_tokens`, so every Voyage embedding settled on
+  the local estimate, flagged `estimated`, in the response, `usage_log` and
+  the key's budget (2,500 tokens charged for an input Voyage counts at about
+  2,000). The reported count is now used.
+
 ## [0.10.0] - 2026-11-08
 
 ### Added
