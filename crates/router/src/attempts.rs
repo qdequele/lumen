@@ -233,6 +233,7 @@ pub fn decision_links<'a>(
             model_id: a.model_id.clone(),
             escapes: a.escapes.clone(),
             breaker_scope: None,
+            retry: None,
         })
         .collect()
 }

@@ -1362,3 +1362,52 @@ async fn a_sub_group_key_uses_its_parents_team_key_and_bills_its_account() {
     assert_eq!(delta.cost_micro, 0);
     assert_eq!(delta.units.byok_tokens_in, 5);
 }
+
+/// ADR 021: a cold-start 503 retried on the provider's own policy (the
+/// global one is a single attempt here) bills exactly one request with the
+/// usage of the attempt that succeeded, never one per attempt.
+#[tokio::test]
+async fn cold_start_retry_on_the_provider_policy_bills_once() {
+    let (a, b) = servers().await;
+    // First-mounted wins until the 503 is used up.
+    Mock::given(method("POST"))
+        .and(path("/embeddings"))
+        .respond_with(ResponseTemplate::new(503).set_body_json(json!({
+            "error": "Model BAAI/bge-m3 is currently loading",
+            "estimated_time": 0.05
+        })))
+        .up_to_n_times(1)
+        .mount(&a)
+        .await;
+    mount(
+        &a,
+        "/embeddings",
+        PLATFORM,
+        ResponseTemplate::new(200).set_body_json(json!({
+            "object": "list",
+            "data": [{ "object": "embedding", "index": 0, "embedding": [0.1, 0.2] }],
+            "model": "bge-m3",
+            "usage": { "prompt_tokens": 4, "total_tokens": 4 }
+        })),
+    )
+    .await;
+    let h = harness_with(&a, &b, "retry_max_attempts = 3\nretry_base_ms = 10").await;
+
+    let (status, body) = h
+        .post(
+            "/v1/embeddings",
+            &h.key_a,
+            &json!({ "model": "a/model-a", "input": "abcd" }),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(hits(&a, PLATFORM).await, 2, "503 then 200");
+
+    let delta = h.settled("lab-a").await;
+    assert_eq!(delta.units.requests, 1, "one billed request: {delta:?}");
+    assert_eq!(delta.units.tokens_in, 4, "the success's usage only");
+    // Nothing else settles later for this request.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let late: i64 = h.take("lab-a").iter().map(|d| d.units.requests).sum();
+    assert_eq!(late, 0, "no second settle");
+}

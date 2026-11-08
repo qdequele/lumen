@@ -932,6 +932,13 @@ upstream_id = "Qwen/Qwen2.5-72B-Instruct"
 capabilities = ["chat"]
 ```
 
+A **scale-to-zero** Hugging Face endpoint (a dedicated Inference Endpoint
+behind this kind, `tei` or `openai`) answers 503 while it wakes up. The
+gateway waits out a 503 that says how long (`Retry-After` or the loading
+`estimated_time`); for one that does not, give the provider a longer retry
+policy (`retry_max_attempts`, `retry_base_ms`, `retry_max_ms`), see
+[Resilience: scale-to-zero upstreams](operations/resilience.md#scale-to-zero-upstreams-cold-start).
+
 ### cloudflare
 
 Cloudflare **Workers AI**. Chat and embeddings go through its OpenAI-compatible

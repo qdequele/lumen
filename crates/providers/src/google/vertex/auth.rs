@@ -230,6 +230,7 @@ impl TokenSource {
                     provider: provider.to_owned(),
                     status: 502,
                     retryable: false,
+                    retry_after: None,
                 }
             })?;
             Ok(parsed)
@@ -269,6 +270,7 @@ impl TokenSource {
             provider: self.provider_name.clone(),
             status: 502,
             retryable: false,
+            retry_after: None,
         }
     }
 }
@@ -344,6 +346,7 @@ mod tests {
                 provider,
                 status,
                 retryable,
+                ..
             } => {
                 assert_eq!(provider, "vertex");
                 assert_ne!(status, 401, "must not masquerade as a client auth error");

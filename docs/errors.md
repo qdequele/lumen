@@ -75,7 +75,10 @@ advertised. The three timeouts (`LM-3011` first-token, `LM-3012` connect,
 The `3xxx` codes are what a client sees only *after* the resilience machinery
 has given up. Before surfacing, a retryable failure (`LM-3001` 429,
 `LM-3003` 5xx, `LM-3005`/`LM-3012` timeouts) is retried with exponential
-backoff, then the request fails over to the next target of the virtual model (its `fallback_on` triggers decide which failures move on, see [Virtual models](virtual-models.md#3-fallback_on-triggers)).
+backoff (floored at a 429/503 `Retry-After` or a Hugging Face loading
+`estimated_time`; a hint above `retry_after_max_ms`, or a wait that would end
+past the total timeout, is not waited for and the `LM-3001`/`LM-3003` surfaces
+at once, see [ADR 021](adr/021-upstream-cold-start-retry.md)), then the request fails over to the next target of the virtual model (its `fallback_on` triggers decide which failures move on, see [Virtual models](virtual-models.md#3-fallback_on-triggers)).
 The mapping between a failure and the code that eventually surfaces:
 
 - **`LM-3020` (503)** - the primary's circuit is open and no fallback remained.

@@ -305,6 +305,7 @@ impl VertexProvider {
             provider: self.provider_name.clone(),
             status: 401,
             retryable: false,
+            retry_after: None,
         })
     }
 

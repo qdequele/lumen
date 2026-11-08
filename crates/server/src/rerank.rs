@@ -66,6 +66,8 @@ pub async fn rerank_handler(
         chain.iter().map(|l| l.route.provider_name.as_str()),
     );
     let exec = state.resilience.exec_config(&primary);
+    // Each link is retried on its own provider's policy (ADR 021).
+    state.resilience.apply_retry_overrides(&mut links);
     // Admission BEFORE the upstream call (M5 §5.2). Rerank cost is billed in
     // search units; TPM counts the query × documents token estimate.
     let pricing = state.pricing();

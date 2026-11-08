@@ -1,9 +1,9 @@
-# ADR 021 - Speech-to-text: file and live transcription capabilities
+# ADR 022 - Speech-to-text: file and live transcription capabilities
 
 - Status: proposed
 - Date: 2026-10-07
 - Builds on: ADR 003, ADR 004, ADR 005, ADR 009, ADR 014, ADR 015
-- Depends on: ADR 022 (client tokens, for browser and mobile callers)
+- Depends on: ADR 023 (client tokens, for browser and mobile callers)
 - Amends: the v1 non-goal "image/audio support" (CLAUDE.md) and the
   "Audio (input/output)" item deferred to v2 in `docs/backlog.md`, for audio
   input transcribed to text only
@@ -197,7 +197,7 @@ and WebRTC. Each is a separate decision.
   the original text; it is never re-serialized.
 - **Session end.** A session ends on client close, upstream close,
   `max_session_seconds` (default 3600, capped by config and by a client
-  token, ADR 022), `idle_timeout_seconds` without audio (default 120), a
+  token, ADR 023), `idle_timeout_seconds` without audio (default 120), a
   refused budget lease, or the parent key being disabled or deleted. Every
   end path cancels the upstream (rule 3), settles the last lease and writes
   one `usage_log` row. Before closing, LUMEN sends an `error` event carrying
@@ -299,7 +299,7 @@ WebSocket URL LUMEN logs.
 | `LM-4006` | 429 | Live session limit reached (gateway-wide or per key). |
 | `LM-5002` | 503 | Gateway audio buffer capacity reached; retry after `Retry-After`. |
 
-`LM-4007` and `LM-4008` are defined by ADR 022. Existing codes keep their
+`LM-4007` and `LM-4008` are defined by ADR 023. Existing codes keep their
 meaning: an oversize upload is `LM-1002`, a model without the capability is
 `LM-2002`.
 
@@ -347,4 +347,4 @@ WebSockets. No `openssl`, no audio decoding library.
   path. Rejected for header probes plus labeled estimates.
 - **Proxy provider-issued browser tokens** (OpenAI `ek_`, ElevenLabs
   single-use tokens). Lets browsers bypass the gateway's budgets and keys.
-  Rejected; see ADR 022.
+  Rejected; see ADR 023.

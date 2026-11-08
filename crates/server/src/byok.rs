@@ -1136,6 +1136,7 @@ mod tests {
                             provider: "p".into(),
                             status: if n == 0 { 401 } else { 500 },
                             retryable: n != 0,
+                            retry_after: None,
                         })
                     }
                 },
@@ -1245,6 +1246,7 @@ mod tests {
                         provider: "p".into(),
                         status: 503,
                         retryable: true,
+                        retry_after: None,
                     })
                 },
             )
@@ -1316,6 +1318,7 @@ mod tests {
             model_id: "m".to_owned(),
             escapes: Vec::new(),
             breaker_scope: None,
+            retry: None,
         };
         let mut links = vec![link("p"), link("other")];
         keys_for(&pools, "g").scope_links(&reg, &mut links);

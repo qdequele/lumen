@@ -144,6 +144,7 @@ mod tests {
             provider: "p".into(),
             status,
             retryable,
+            retry_after: None,
         }
     }
 
