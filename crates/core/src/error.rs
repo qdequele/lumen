@@ -35,6 +35,10 @@ pub enum ProviderError {
         status: u16,
         /// Whether retrying (possibly on a fallback) may succeed.
         retryable: bool,
+        /// How long the upstream asked us to wait before retrying: a 503's
+        /// `Retry-After`, or Hugging Face's loading `estimated_time` (ADR
+        /// 021). `None` for every other status.
+        retry_after: Option<Duration>,
     },
 
     /// The upstream did not respond within the configured timeout (read /
@@ -224,11 +228,14 @@ impl ProviderError {
         }
     }
 
-    /// The upstream `Retry-After` hint, if this error carried one (429).
+    /// The upstream wait hint, if this error carried one: a 429's
+    /// `Retry-After`, or a 503's `Retry-After` / loading `estimated_time`
+    /// (ADR 021).
     #[must_use]
     pub const fn retry_after(&self) -> Option<Duration> {
         match self {
-            ProviderError::RateLimited { retry_after, .. } => *retry_after,
+            ProviderError::RateLimited { retry_after, .. }
+            | ProviderError::Upstream { retry_after, .. } => *retry_after,
             _ => None,
         }
     }
@@ -1127,6 +1134,7 @@ mod tests {
                 provider: "p".into(),
                 status: 503,
                 retryable: true,
+                retry_after: None,
             },
             ProviderError::Timeout {
                 provider: "p".into(),
@@ -1157,6 +1165,7 @@ mod tests {
                 provider: "p".into(),
                 status: 400,
                 retryable: false,
+                retry_after: None,
             },
             ProviderError::Translation("bad json".into()),
             ProviderError::ImageUrlNotSupported {
@@ -1313,6 +1322,7 @@ mod tests {
             provider: "cohere".into(),
             status: 503,
             retryable: true,
+            retry_after: None,
         };
         let ge = GatewayError::from_provider("cohere", pe);
         assert_eq!(ge.error_type(), ErrorType::UpstreamError);

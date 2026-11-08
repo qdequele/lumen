@@ -315,6 +315,7 @@ async fn upstream_5xx_propagates_as_retryable() {
             provider,
             status,
             retryable,
+            ..
         } => {
             assert_eq!(provider, "vertex");
             assert_eq!(status, 503);

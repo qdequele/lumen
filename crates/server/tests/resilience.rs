@@ -878,3 +878,323 @@ async fn honours_retry_after_header_as_a_floor() {
         started.elapsed()
     );
 }
+
+// ---------------------------------------------------------------------------
+// Cold start (ADR 021): a scale-to-zero upstream answers 503 until it wakes up.
+// ---------------------------------------------------------------------------
+
+/// One OpenAI-kind provider serving chat + embed and one Cohere-kind provider
+/// serving rerank, both on `url`, small backoffs. `extra` lands in
+/// `[resilience]`, `provider_extra` on the OpenAI-kind provider.
+fn cold_start_config(url: &str, extra: &str, provider_extra: &str) -> String {
+    format!(
+        r#"
+        [resilience]
+        retry_max_attempts = 3
+        retry_base_ms = 10
+        retry_max_ms = 50
+        {extra}
+
+        [[providers]]
+        name = "hf"
+        kind = "openai"
+        base_url = "{url}"
+        {provider_extra}
+        [[providers.models]]
+        id = "hf/bge-m3"
+        capabilities = ["chat", "embed"]
+
+        [[providers]]
+        name = "rr"
+        kind = "cohere"
+        base_url = "{url}"
+        [[providers.models]]
+        id = "rr/rerank"
+        upstream_id = "rerank-v3.5"
+        capabilities = ["rerank"]
+        "#
+    )
+}
+
+fn embed_ok() -> ResponseTemplate {
+    ResponseTemplate::new(200).set_body_json(json!({
+        "object": "list",
+        "data": [{ "object": "embedding", "index": 0, "embedding": [0.1, 0.2] }],
+        "model": "bge-m3",
+        "usage": { "prompt_tokens": 4, "total_tokens": 4 }
+    }))
+}
+
+/// Hugging Face's loading response: 503 with `estimated_time` in seconds.
+fn hf_loading(estimated_time: f64) -> ResponseTemplate {
+    ResponseTemplate::new(503).set_body_json(json!({
+        "error": "Model BAAI/bge-m3 is currently loading",
+        "estimated_time": estimated_time
+    }))
+}
+
+async fn post_embed(base: &str) -> reqwest::Response {
+    reqwest::Client::new()
+        .post(format!("{base}/v1/embeddings"))
+        .json(&json!({ "model": "hf/bge-m3", "input": "abcd" }))
+        .send()
+        .await
+        .expect("send embeddings")
+}
+
+/// The audit case: the first embeddings call after idle gets HF's 503
+/// loading response. The gateway waits the `estimated_time` (1 s, far past
+/// the 10 ms base backoff) and the retry succeeds: the client sees one 200.
+#[tokio::test]
+async fn embeddings_cold_start_waits_for_hf_estimated_time() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/embeddings"))
+        .respond_with(hf_loading(1.0))
+        .up_to_n_times(1)
+        .mount(&upstream)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/embeddings"))
+        .respond_with(embed_ok())
+        .mount(&upstream)
+        .await;
+
+    let base = spawn(&config_from(&cold_start_config(&upstream.uri(), "", ""))).await;
+    let started = Instant::now();
+    let resp = post_embed(&base).await;
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["usage"]["prompt_tokens"], 4,
+        "usage of the one success"
+    );
+    assert_eq!(upstream.received_requests().await.unwrap().len(), 2);
+    assert!(
+        started.elapsed() >= Duration::from_millis(950),
+        "estimated_time not honoured: {:?}",
+        started.elapsed()
+    );
+}
+
+/// A 503 `Retry-After` header is a backoff floor on rerank too.
+#[tokio::test]
+async fn rerank_503_retry_after_header_is_honoured() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v2/rerank"))
+        .respond_with(ResponseTemplate::new(503).insert_header("retry-after", "1"))
+        .up_to_n_times(1)
+        .mount(&upstream)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v2/rerank"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "results": [{ "index": 0, "relevance_score": 0.9 }],
+            "meta": { "billed_units": { "search_units": 1 } }
+        })))
+        .mount(&upstream)
+        .await;
+
+    let base = spawn(&config_from(&cold_start_config(&upstream.uri(), "", ""))).await;
+    let started = Instant::now();
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/rerank"))
+        .json(&json!({ "model": "rr/rerank", "query": "q", "documents": ["a"] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(upstream.received_requests().await.unwrap().len(), 2);
+    assert!(
+        started.elapsed() >= Duration::from_millis(950),
+        "Retry-After floor not honoured on 503: {:?}",
+        started.elapsed()
+    );
+}
+
+/// A streaming chat whose open is answered 503 is retried (nothing reached
+/// the client yet) after the hinted wait, and the stream then flows.
+#[tokio::test]
+async fn streaming_chat_503_at_open_is_retried_before_any_frame() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(503).insert_header("retry-after", "1"))
+        .up_to_n_times(1)
+        .mount(&upstream)
+        .await;
+    let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n";
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(sse),
+        )
+        .mount(&upstream)
+        .await;
+
+    let base = spawn(&config_from(&cold_start_config(&upstream.uri(), "", ""))).await;
+    let started = Instant::now();
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&json!({
+            "model": "hf/bge-m3",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("\"content\":\"hi\""), "body: {body}");
+    assert!(body.contains("[DONE]"), "body: {body}");
+    assert!(!body.contains("LM-"), "no error frame: {body}");
+    assert_eq!(upstream.received_requests().await.unwrap().len(), 2);
+    assert!(started.elapsed() >= Duration::from_millis(950));
+}
+
+/// A wait hint longer than `retry_after_max_ms` is not waited for: the 503 is
+/// returned at once (LM-3003 naming the provider), after one upstream call.
+#[tokio::test]
+async fn wait_hint_above_the_cap_is_not_waited_for() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/embeddings"))
+        .respond_with(ResponseTemplate::new(503).insert_header("retry-after", "120"))
+        .mount(&upstream)
+        .await;
+
+    let base = spawn(&config_from(&cold_start_config(
+        &upstream.uri(),
+        "retry_after_max_ms = 30000",
+        "",
+    )))
+    .await;
+    let started = Instant::now();
+    let resp = post_embed(&base).await;
+    assert_eq!(resp.status(), 502);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "LM-3003", "body: {body}");
+    assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "must not wait for a hint above the cap: {:?}",
+        started.elapsed()
+    );
+}
+
+/// When the hinted wait would end past the total deadline, the gateway does
+/// not sleep into a certain LM-3013: it returns the upstream 503 (LM-3003).
+#[tokio::test]
+async fn backoff_past_the_total_deadline_returns_the_upstream_error() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/embeddings"))
+        .respond_with(hf_loading(5.0))
+        .mount(&upstream)
+        .await;
+
+    let base = spawn(&config_from(&cold_start_config(
+        &upstream.uri(),
+        "",
+        "total_timeout_ms = 2000",
+    )))
+    .await;
+    let started = Instant::now();
+    let resp = post_embed(&base).await;
+    assert_eq!(resp.status(), 502);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "LM-3003", "body: {body}");
+    assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
+    assert!(started.elapsed() < Duration::from_millis(1500));
+}
+
+/// A provider without wait hints gets its own, longer retry policy; the
+/// global one (a single attempt here) is untouched for other providers.
+#[tokio::test]
+async fn per_provider_retry_policy_outlasts_a_hintless_cold_start() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/embeddings"))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(3)
+        .mount(&upstream)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/embeddings"))
+        .respond_with(embed_ok())
+        .mount(&upstream)
+        .await;
+    // Rerank on the other provider: a single attempt (global policy).
+    Mock::given(method("POST"))
+        .and(path("/v2/rerank"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&upstream)
+        .await;
+
+    let config = format!(
+        "{}\n",
+        cold_start_config(
+            &upstream.uri(),
+            "",
+            "retry_max_attempts = 5\nretry_base_ms = 20\nretry_max_ms = 40",
+        )
+    )
+    .replace("retry_max_attempts = 3\n", "retry_max_attempts = 1\n");
+    let base = spawn(&config_from(&config)).await;
+
+    let resp = post_embed(&base).await;
+    assert_eq!(resp.status(), 200);
+    let embed_hits = upstream
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path() == "/embeddings")
+        .count();
+    assert_eq!(embed_hits, 4, "503 x3 then 200 on the provider's policy");
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/rerank"))
+        .json(&json!({ "model": "rr/rerank", "query": "q", "documents": ["a"] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 502);
+    let rerank_hits = upstream
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path() == "/v2/rerank")
+        .count();
+    assert_eq!(rerank_hits, 1, "the global single attempt still applies");
+}
+
+/// The cap applies to a 429 too (behaviour change, ADR 021): a
+/// `Retry-After: 120` above a 30 s cap is returned at once as LM-3001.
+#[tokio::test]
+async fn rate_limit_hint_above_the_cap_is_not_waited_for() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/embeddings"))
+        .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "120"))
+        .mount(&upstream)
+        .await;
+
+    let base = spawn(&config_from(&cold_start_config(
+        &upstream.uri(),
+        "retry_after_max_ms = 30000",
+        "",
+    )))
+    .await;
+    let started = Instant::now();
+    let resp = post_embed(&base).await;
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "LM-3001", "body: {body}");
+    assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
+    assert!(started.elapsed() < Duration::from_secs(5));
+}

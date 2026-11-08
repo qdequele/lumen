@@ -274,13 +274,18 @@ mode = "heuristic"                # "heuristic" (default) or "accurate"
 [resilience]
 # Retries - applied ONLY to retryable upstream failures (5xx, connect/read
 # timeout, 429). A client 4xx is NEVER retried (a fallback would reject it too).
-# Backoff is exponential with equal jitter, and honours an upstream
-# `Retry-After` as a floor. While streaming, a retry happens only if no chunk
-# has yet reached the client.
+# Backoff is exponential with equal jitter, and honours an upstream wait hint
+# as a floor: a 429/503 `Retry-After`, or the `estimated_time` of a Hugging
+# Face loading 503. A hint above `retry_after_max_ms` is not waited for (the
+# error is returned or failed over at once), and no wait starts that would end
+# past the total timeout (ADR 021). While streaming, a retry happens only if
+# no chunk has yet reached the client. A retry never bills twice. All four
+# retry knobs can be overridden per provider (see the ollama-local block).
 retry_max_attempts = 3            # total attempts per provider incl. the first
                                   # (set to 1 to disable retries); must not be 0
 retry_base_ms = 200               # base backoff wait after the first failure
 retry_max_ms = 5000               # ceiling on the exponential backoff term
+retry_after_max_ms = 60000        # longest upstream wait hint honoured
 
 # Circuit breaker - per (provider, model). After N consecutive provider-fault
 # failures the circuit opens; while open the model is skipped straight to the
@@ -523,6 +528,14 @@ total_timeout_ms = 120000
                    # chat extras on translated providers"). `encoding_format` is
                    # always handled at the response edge and is never affected.
 connect_timeout_ms = 10000        # own client: relaxed connect for a slow local link
+# Per-provider retry overrides (optional, ADR 021); unset keys inherit
+# [resilience]. For an upstream that answers 503 while it wakes up (a
+# scale-to-zero Hugging Face endpoint, a model loading into VRAM) without
+# saying how long, give it more, longer-spaced attempts than the rest:
+# retry_max_attempts = 6          # 5 backoffs: about 15 to 30 s in total
+# retry_base_ms = 1000
+# retry_max_ms = 15000
+# retry_after_max_ms = 120000     # longest wait hint honoured from it
 
 [[providers.models]]
 id = "ollama-local/local-llama"

@@ -177,3 +177,47 @@ async fn upstream_error_echoing_the_request_never_logs_the_prompt() {
     );
     assert!(!logs.contains("a private prompt"), "prompt leaked: {logs}");
 }
+
+/// A 503 body is now read for its loading estimate (ADR 021): its message is
+/// logged like a 4xx one, credentials redacted, never returned to the client.
+#[tokio::test(flavor = "current_thread")]
+async fn upstream_503_body_is_logged_redacted_and_not_returned() {
+    let (buffer, _guard) = capture_logs();
+
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(503).set_body_json(json!({
+            "error": format!("Endpoint is waking up (token {PROVIDER_KEY})")
+        })))
+        .mount(&upstream)
+        .await;
+    let base = common::spawn_with(
+        registry(ProviderKind::Anthropic, &upstream.uri()),
+        1024 * 1024,
+    )
+    .await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&json!({
+            "model": "claude",
+            "messages": [{ "role": "user", "content": "a private prompt" }]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 502);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "LM-3003");
+    assert!(
+        !body.to_string().contains("waking up"),
+        "upstream detail leaked to the client: {body}"
+    );
+
+    let logs = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
+    assert!(logs.contains("Endpoint is waking up"), "{logs}");
+    assert!(logs.contains("status=503"), "{logs}");
+    assert!(!logs.contains(PROVIDER_KEY), "provider key leaked: {logs}");
+    assert!(!logs.contains("a private prompt"), "prompt leaked: {logs}");
+}

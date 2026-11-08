@@ -48,6 +48,9 @@ pub struct Link {
     /// breaker ([`CircuitBreakers::get_scoped`]), so team and platform
     /// failures never open each other's.
     pub breaker_scope: Option<String>,
+    /// This link's provider retry policy (ADR 021), or `None` for
+    /// [`ExecConfig::retry`].
+    pub retry: Option<RetryPolicy>,
 }
 
 /// Resilience knobs for one execution.
@@ -105,7 +108,7 @@ where
     let primary_provider = primary.provider_name.clone();
 
     let deadline = Instant::now() + config.total;
-    let chain = run_chain(links, breakers, config, cancel, &mut call);
+    let chain = run_chain(links, breakers, config, cancel, deadline, &mut call);
     match tokio::time::timeout_at(deadline, chain).await {
         Ok(result) => result,
         // The whole request outran the total timeout (spec 6.4). Attribute it
@@ -122,6 +125,7 @@ async fn run_chain<T, F, Fut>(
     breakers: &CircuitBreakers,
     config: &ExecConfig,
     cancel: &CancellationToken,
+    deadline: Instant,
     call: &mut F,
 ) -> Result<Executed<T>, GatewayError>
 where
@@ -163,7 +167,8 @@ where
         }
 
         let first_token = config.first_token;
-        let outcome = retry(&config.retry, cancel, || {
+        let policy = link.retry.unwrap_or(config.retry);
+        let outcome = retry(&policy, cancel, Some(deadline), || {
             // Invoke the call synchronously so the returned future is owned and
             // does not hold a borrow of `call` across the await (which an FnMut
             // closure cannot let escape).
@@ -253,6 +258,7 @@ mod tests {
                 model_id: (*m).to_owned(),
                 escapes: crate::triggers::linear_escapes(i, n),
                 breaker_scope: None,
+                retry: None,
             })
             .collect()
     }
@@ -288,6 +294,7 @@ mod tests {
                 max_attempts,
                 base: Duration::from_millis(200),
                 max: Duration::from_secs(5),
+                ..RetryPolicy::default()
             },
             first_token: Duration::from_secs(30),
             total: Duration::from_secs(600),
@@ -303,6 +310,7 @@ mod tests {
             provider: String::new(),
             status: 500,
             retryable: true,
+            retry_after: None,
         }
     }
 
@@ -416,6 +424,7 @@ mod tests {
                     provider: "openai".to_owned(),
                     status: 400,
                     retryable: false,
+                    retry_after: None,
                 })
             }
         })
@@ -530,6 +539,7 @@ mod tests {
                 provider_name: "pa".into(),
                 model_id: "a".into(),
                 breaker_scope: None,
+                retry: None,
                 escapes: vec![Escape {
                     on: Triggers::DEFAULT,
                     next: 2,
@@ -540,12 +550,14 @@ mod tests {
                 model_id: "b".into(),
                 escapes: vec![],
                 breaker_scope: None,
+                retry: None,
             },
             Link {
                 provider_name: "pc".into(),
                 model_id: "c".into(),
                 escapes: vec![],
                 breaker_scope: None,
+                retry: None,
             },
         ];
         let out = execute(
@@ -574,6 +586,7 @@ mod tests {
                 provider_name: "pa".into(),
                 model_id: "a".into(),
                 breaker_scope: None,
+                retry: None,
                 escapes: vec![Escape {
                     on: Triggers::from_list(&[Trigger::RateLimited]),
                     next: 1,
@@ -584,6 +597,7 @@ mod tests {
                 model_id: "b".into(),
                 escapes: vec![],
                 breaker_scope: None,
+                retry: None,
             },
         ];
         let calls = AtomicUsize::new(0);
@@ -616,6 +630,7 @@ mod tests {
             provider_name: "pa".into(),
             model_id: "a".into(),
             breaker_scope: None,
+            retry: None,
             escapes: vec![Escape {
                 on: Triggers::DEFAULT,
                 next: 0,
@@ -818,6 +833,7 @@ mod tests {
                         provider: "openai".into(),
                         status: 503,
                         retryable: true,
+                        retry_after: None,
                     })
                 } else {
                     Err(ProviderError::TeamKeysExhausted {
@@ -881,5 +897,69 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(err.code(), "LM-3021");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_link_retry_policy_overrides_the_global_one() {
+        // Global: a single attempt. The primary's provider: five (ADR 021).
+        let mut chain = links(&[("hf", "hf/bge-m3"), ("fb", "fb/embed")]);
+        chain[0].retry = Some(RetryPolicy {
+            max_attempts: 5,
+            ..RetryPolicy::default()
+        });
+        let breakers = CircuitBreakers::new(BreakerConfig::default(), None);
+        let calls = AtomicUsize::new(0);
+        let cancel = CancellationToken::new();
+        let result = execute(&chain, &breakers, &config(1), &cancel, |i| {
+            let n = calls.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if i == 0 && n < 3 {
+                    Err(ProviderError::Upstream {
+                        provider: "hf".into(),
+                        status: 503,
+                        retryable: true,
+                        retry_after: None,
+                    })
+                } else {
+                    Ok::<usize, ProviderError>(i)
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(result.model_used, "hf/bge-m3", "served by the primary");
+        assert_eq!(calls.load(Ordering::SeqCst), 4, "503 x3 then 200");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_backoff_past_the_deadline_falls_over_to_the_next_link() {
+        // Link 0 asks for a 900 s wait, past the 600 s total: no sleep, the
+        // fallback serves at once instead of the request ending in LM-3013.
+        let chain = links(&[("hf", "hf/bge-m3"), ("fb", "fb/embed")]);
+        let breakers = CircuitBreakers::new(BreakerConfig::default(), None);
+        let cancel = CancellationToken::new();
+        let start = Instant::now();
+        let mut cfg = config(3);
+        cfg.retry.max_retry_after = Duration::from_secs(3600);
+        let result = execute(&chain, &breakers, &cfg, &cancel, |i| async move {
+            if i == 0 {
+                Err(ProviderError::Upstream {
+                    provider: "hf".into(),
+                    status: 503,
+                    retryable: true,
+                    retry_after: Some(Duration::from_secs(900)),
+                })
+            } else {
+                Ok::<usize, ProviderError>(i)
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(result.model_used, "fb/embed");
+        assert_eq!(
+            start.elapsed(),
+            Duration::ZERO,
+            "no sleep into the deadline"
+        );
     }
 }

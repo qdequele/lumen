@@ -79,6 +79,7 @@
 - [017 - Decisions capability](adr/017-decisions-capability.md)
 - [018 - Team provider keys and bandwidth billing](adr/018-team-provider-keys-and-bandwidth.md)
 - [020 - Sub-groups under a team's lease](adr/020-team-sub-groups.md)
+- [021 - Upstream cold-start retry](adr/021-upstream-cold-start-retry.md)
 
 # Project
 

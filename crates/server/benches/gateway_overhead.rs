@@ -108,6 +108,7 @@ fn bench_executor(c: &mut Criterion) {
         model_id: "gpt-4o".to_owned(),
         escapes: Vec::new(),
         breaker_scope: None,
+        retry: None,
     }];
     let breakers = CircuitBreakers::new(BreakerConfig::default(), None);
     let config = ExecConfig {

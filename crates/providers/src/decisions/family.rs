@@ -527,6 +527,7 @@ pub fn decode(
                         provider: provider.to_owned(),
                         status: 200,
                         retryable: false,
+                        retry_after: None,
                     })
                 }
             }

@@ -25,6 +25,27 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ### Fixed
 
+- **The first call to a scale-to-zero upstream no longer fails
+  ([ADR 021](docs/adr/021-upstream-cold-start-retry.md)).** A Hugging Face
+  endpoint that wakes up on demand answers 503 until it is ready; the
+  gateway retried it three times within about 600 ms and then returned 502
+  `LM-3003`, so a Meilisearch embedder failed its first batch after every
+  idle period. A 503 `Retry-After` header, or the `estimated_time` of a
+  Hugging Face loading response (the 503 body is now read, bounded), is now
+  a backoff floor, as a 429 `Retry-After` already was. A provider can
+  override the retry policy with `retry_max_attempts`, `retry_base_ms`,
+  `retry_max_ms` and `retry_after_max_ms` (unset keys inherit
+  `[resilience]`; in a virtual model each target uses its own provider's
+  policy), so an endpoint that gives no hint can be waited out without
+  slowing every other provider. A retry still bills once.
+  **Behaviour change:** a wait hint above the new
+  `resilience.retry_after_max_ms` (default 60 s) is no longer waited for:
+  the error is returned, or failed over, at once. Before, a 429
+  `Retry-After: 300` held the request for five minutes. And a backoff that
+  would end past the total timeout is not started: the client gets the
+  upstream error (`LM-3003`, or `LM-3001` for a 429) instead of `LM-3013`.
+  `docs/openapi.yaml` gains the four optional provider fields.
+
 - **Text embeddings on Voyage's multimodal models.** A plain-text `input` to
   a `voyage-multimodal-*` model (any provider of kind `voyage`) went to
   Voyage's `/embeddings`, which answers 400 for those models. It now goes to

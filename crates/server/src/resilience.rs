@@ -15,7 +15,7 @@ use std::time::Duration;
 use axum::http::{HeaderMap, HeaderName, HeaderValue};
 use lumen_core::{Capability, GatewayError};
 use lumen_router::circuit::{BreakerConfig, CircuitBreakers};
-use lumen_router::executor::ExecConfig;
+use lumen_router::executor::{ExecConfig, Link};
 use lumen_router::retry::RetryPolicy;
 use lumen_router::virtual_models::{Decision, FactSource, Preset, RoutingTable};
 use lumen_telemetry::ResilienceMetrics;
@@ -67,6 +67,9 @@ pub struct Timeouts {
 #[derive(Debug, Clone)]
 struct ResiliencePolicy {
     retry: RetryPolicy,
+    /// Resolved retry policy of each provider that overrides any retry knob
+    /// (ADR 021), keyed by provider name; the rest use `retry`.
+    provider_retry: HashMap<String, RetryPolicy>,
     default_timeouts: Timeouts,
     /// Per-model timeout overrides (inherited from the owning provider).
     model_timeouts: HashMap<String, Timeouts>,
@@ -112,12 +115,38 @@ impl ResiliencePolicy {
                 RoutingTable::default()
             }
         };
+        let retry = RetryPolicy {
+            max_attempts: r.retry_max_attempts,
+            base: Duration::from_millis(r.retry_base_ms),
+            max: Duration::from_millis(r.retry_max_ms),
+            max_retry_after: Duration::from_millis(r.retry_after_max_ms),
+        };
+        let provider_retry = config
+            .providers
+            .iter()
+            .filter(|p| {
+                p.retry_max_attempts.is_some()
+                    || p.retry_base_ms.is_some()
+                    || p.retry_max_ms.is_some()
+                    || p.retry_after_max_ms.is_some()
+            })
+            .map(|p| {
+                let millis =
+                    |v: Option<u64>, default: Duration| v.map_or(default, Duration::from_millis);
+                (
+                    p.name.clone(),
+                    RetryPolicy {
+                        max_attempts: p.retry_max_attempts.unwrap_or(retry.max_attempts),
+                        base: millis(p.retry_base_ms, retry.base),
+                        max: millis(p.retry_max_ms, retry.max),
+                        max_retry_after: millis(p.retry_after_max_ms, retry.max_retry_after),
+                    },
+                )
+            })
+            .collect();
         Self {
-            retry: RetryPolicy {
-                max_attempts: r.retry_max_attempts,
-                base: Duration::from_millis(r.retry_base_ms),
-                max: Duration::from_millis(r.retry_max_ms),
-            },
+            retry,
+            provider_retry,
             default_timeouts,
             model_timeouts,
             routing: Arc::new(routing),
@@ -128,6 +157,7 @@ impl ResiliencePolicy {
     fn defaults() -> Self {
         Self {
             retry: RetryPolicy::default(),
+            provider_retry: HashMap::new(),
             default_timeouts: Timeouts {
                 first_token: Duration::from_secs(30),
                 total: Duration::from_secs(600),
@@ -282,6 +312,19 @@ impl ResilienceRuntime {
             retry: policy.retry,
             first_token: t.first_token,
             total: t.total,
+        }
+    }
+
+    /// Give each link its provider's retry policy when that provider
+    /// overrides one (ADR 021); other links keep [`ExecConfig::retry`].
+    /// Call once the chain's links are built, before executing.
+    pub fn apply_retry_overrides(&self, links: &mut [Link]) {
+        let policy = self.policy.load();
+        if policy.provider_retry.is_empty() {
+            return;
+        }
+        for link in links {
+            link.retry = policy.provider_retry.get(&link.provider_name).copied();
         }
     }
 }
@@ -461,5 +504,89 @@ mod tests {
         assert!(routing_headers("gpt-4o", None)
             .get("x-lumen-route")
             .is_none());
+    }
+
+    #[test]
+    fn provider_retry_overrides_land_on_their_links_only() {
+        let cfg = load(
+            r#"
+            [resilience]
+            retry_max_attempts = 2
+            retry_base_ms = 100
+            retry_max_ms = 1000
+            retry_after_max_ms = 30000
+            [[providers]]
+            name = "hf"
+            kind = "tei"
+            base_url = "http://127.0.0.1:9"
+            retry_max_attempts = 6
+            retry_base_ms = 1000
+            [[providers.models]]
+            id = "hf/bge-m3"
+            capabilities = ["embed"]
+            [[providers]]
+            name = "oa"
+            kind = "openai"
+            [[providers.models]]
+            id = "oa/embed"
+            capabilities = ["embed"]
+        "#,
+        );
+        let rt = ResilienceRuntime::from_config(&cfg, None);
+        let link = |provider: &str| Link {
+            provider_name: provider.to_owned(),
+            model_id: format!("{provider}/m"),
+            escapes: Vec::new(),
+            breaker_scope: None,
+            retry: None,
+        };
+        let mut links = vec![link("hf"), link("oa")];
+        rt.apply_retry_overrides(&mut links);
+        // Overridden fields from the provider, the rest inherited.
+        assert_eq!(
+            links[0].retry,
+            Some(RetryPolicy {
+                max_attempts: 6,
+                base: Duration::from_millis(1000),
+                max: Duration::from_millis(1000),
+                max_retry_after: Duration::from_secs(30),
+            })
+        );
+        assert_eq!(links[1].retry, None, "no override: the global policy");
+        let global = rt.exec_config("oa/embed").retry;
+        assert_eq!(global.max_attempts, 2);
+        assert_eq!(global.max_retry_after, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn provider_retry_overrides_follow_hot_reload() {
+        let toml = |attempts: u32| {
+            format!(
+                r#"
+                [[providers]]
+                name = "hf"
+                kind = "tei"
+                base_url = "http://127.0.0.1:9"
+                retry_max_attempts = {attempts}
+                [[providers.models]]
+                id = "hf/bge-m3"
+                capabilities = ["embed"]
+                "#
+            )
+        };
+        let rt = ResilienceRuntime::from_config(&load(&toml(4)), None);
+        let mut links = vec![Link {
+            provider_name: "hf".to_owned(),
+            model_id: "hf/bge-m3".to_owned(),
+            escapes: Vec::new(),
+            breaker_scope: None,
+            retry: None,
+        }];
+        rt.apply_retry_overrides(&mut links);
+        assert_eq!(links[0].retry.map(|r| r.max_attempts), Some(4));
+
+        rt.reload_policy(&load(&toml(7)));
+        rt.apply_retry_overrides(&mut links);
+        assert_eq!(links[0].retry.map(|r| r.max_attempts), Some(7));
     }
 }

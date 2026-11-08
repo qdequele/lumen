@@ -10,16 +10,26 @@
 //!
 //! The overall request deadline (the total timeout, M6 §6.4) is enforced by the
 //! caller wrapping the whole chain in `timeout_at`; this loop only decides
-//! *whether* and *how long* to wait between attempts.
+//! *whether* and *how long* to wait between attempts. Two rules keep a wait
+//! honest (ADR 021): an upstream hint longer than
+//! [`RetryPolicy::max_retry_after`] is not waited for, and a wait that would
+//! end past the caller's deadline is not started; in both cases the upstream
+//! error is returned so a fallback or the client can act on it.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use lumen_core::ProviderError;
 use std::future::Future;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-/// Retry parameters. Defaults (M6 spec): 3 attempts, 200 ms base, 5 s cap.
+/// Default [`RetryPolicy::max_retry_after`]: the longest upstream wait hint
+/// honoured (ADR 021).
+pub const DEFAULT_MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
+
+/// Retry parameters. Defaults (M6 spec): 3 attempts, 200 ms base, 5 s cap,
+/// upstream wait hints honoured up to 60 s (ADR 021).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetryPolicy {
     /// Total attempts, including the first (so `1` disables retrying).
@@ -28,6 +38,9 @@ pub struct RetryPolicy {
     pub base: Duration,
     /// Ceiling on the exponential term, before jitter and `Retry-After`.
     pub max: Duration,
+    /// Longest upstream wait hint (`Retry-After`, a loading `estimated_time`)
+    /// worth waiting for. A failure asking for more is not retried.
+    pub max_retry_after: Duration,
 }
 
 impl Default for RetryPolicy {
@@ -36,6 +49,7 @@ impl Default for RetryPolicy {
             max_attempts: 3,
             base: Duration::from_millis(200),
             max: Duration::from_secs(5),
+            max_retry_after: DEFAULT_MAX_RETRY_AFTER,
         }
     }
 }
@@ -48,6 +62,7 @@ impl RetryPolicy {
             max_attempts: 1,
             base: Duration::from_millis(200),
             max: Duration::from_secs(5),
+            max_retry_after: DEFAULT_MAX_RETRY_AFTER,
         }
     }
 }
@@ -114,11 +129,15 @@ fn jitter01() -> f64 {
 ///
 /// `attempt_fn` is expected to already bound each individual attempt (e.g. with
 /// a first-token `timeout`); the caller bounds the *whole* call with the total
-/// timeout. Cancellation (client disconnect) aborts immediately, mid-attempt or
-/// mid-backoff.
+/// timeout and passes that `deadline` here, so a backoff that would end past it
+/// is never started (the upstream error is returned instead of a certain total
+/// timeout). A failure whose wait hint exceeds [`RetryPolicy::max_retry_after`]
+/// is returned at once. Cancellation (client disconnect) aborts immediately,
+/// mid-attempt or mid-backoff.
 pub async fn retry<F, Fut, T>(
     policy: &RetryPolicy,
     cancel: &CancellationToken,
+    deadline: Option<Instant>,
     mut attempt_fn: F,
 ) -> Result<T, ProviderError>
 where
@@ -137,7 +156,19 @@ where
                 if !error.is_retryable() || next_attempt >= policy.max_attempts {
                     return Err(error);
                 }
-                let delay = backoff_delay(failed, policy, error.retry_after(), jitter01());
+                let hint = error.retry_after();
+                if hint.is_some_and(|h| h > policy.max_retry_after) {
+                    tracing::debug!(%error, ?hint, "upstream wait hint above the cap; not retrying");
+                    return Err(error);
+                }
+                let delay = backoff_delay(failed, policy, hint, jitter01());
+                // `saturating_duration_since` instead of `now + delay`: an
+                // absurd configured cap must never overflow `Instant`.
+                if deadline.is_some_and(|d| d.saturating_duration_since(Instant::now()) <= delay) {
+                    tracing::debug!(%error, ?delay, "next retry would end past the deadline; not retrying");
+                    return Err(error);
+                }
+                tracing::debug!(%error, ?delay, attempt = next_attempt + 1, "retrying upstream");
                 failed = next_attempt;
                 tokio::select! {
                     biased;
@@ -153,13 +184,22 @@ where
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicU32;
-    use tokio::time::Instant;
 
     fn policy() -> RetryPolicy {
         RetryPolicy {
             max_attempts: 3,
             base: Duration::from_millis(200),
             max: Duration::from_secs(5),
+            max_retry_after: DEFAULT_MAX_RETRY_AFTER,
+        }
+    }
+
+    fn unavailable_503(retry_after: Option<Duration>) -> ProviderError {
+        ProviderError::Upstream {
+            provider: "hf".to_owned(),
+            status: 503,
+            retryable: true,
+            retry_after,
         }
     }
 
@@ -208,7 +248,7 @@ mod tests {
     async fn retries_until_success_then_stops() {
         let calls = AtomicU32::new(0);
         let cancel = CancellationToken::new();
-        let result = retry(&policy(), &cancel, || {
+        let result = retry(&policy(), &cancel, None, || {
             let n = calls.fetch_add(1, Ordering::SeqCst);
             async move {
                 if n < 2 {
@@ -216,6 +256,7 @@ mod tests {
                         provider: "p".to_owned(),
                         status: 500,
                         retryable: true,
+                        retry_after: None,
                     })
                 } else {
                     Ok::<u32, ProviderError>(n)
@@ -231,7 +272,7 @@ mod tests {
     async fn backoff_delays_are_actually_waited() {
         let start = Instant::now();
         let cancel = CancellationToken::new();
-        let _ = retry(&policy(), &cancel, || async {
+        let _ = retry(&policy(), &cancel, None, || async {
             Err::<(), _>(ProviderError::Timeout {
                 provider: "p".to_owned(),
             })
@@ -251,7 +292,7 @@ mod tests {
         let start = Instant::now();
         let cancel = CancellationToken::new();
         let calls = AtomicU32::new(0);
-        let result = retry(&policy(), &cancel, || {
+        let result = retry(&policy(), &cancel, None, || {
             let n = calls.fetch_add(1, Ordering::SeqCst);
             async move {
                 if n == 0 {
@@ -277,13 +318,14 @@ mod tests {
     async fn client_4xx_is_never_retried() {
         let calls = AtomicU32::new(0);
         let cancel = CancellationToken::new();
-        let result: Result<(), _> = retry(&policy(), &cancel, || {
+        let result: Result<(), _> = retry(&policy(), &cancel, None, || {
             calls.fetch_add(1, Ordering::SeqCst);
             async {
                 Err(ProviderError::Upstream {
                     provider: "p".to_owned(),
                     status: 400,
                     retryable: false,
+                    retry_after: None,
                 })
             }
         })
@@ -301,12 +343,92 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
             child.cancel();
         });
-        let result: Result<(), _> = retry(&policy(), &cancel, || async {
+        let result: Result<(), _> = retry(&policy(), &cancel, None, || async {
             Err(ProviderError::Unavailable {
                 provider: "p".to_owned(),
             })
         })
         .await;
         assert!(matches!(result, Err(ProviderError::Cancelled)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_503_wait_hint_floors_the_backoff() {
+        // A cold-start 503 asking for 20 s is waited out, then the retry wins.
+        let start = Instant::now();
+        let cancel = CancellationToken::new();
+        let calls = AtomicU32::new(0);
+        let result = retry(&policy(), &cancel, None, || {
+            let n = calls.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if n == 0 {
+                    Err(unavailable_503(Some(Duration::from_secs(20))))
+                } else {
+                    Ok::<u32, ProviderError>(n)
+                }
+            }
+        })
+        .await;
+        assert_eq!(result.unwrap(), 1);
+        assert!(start.elapsed() >= Duration::from_secs(20));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_wait_hint_above_the_cap_is_not_retried() {
+        let start = Instant::now();
+        let cancel = CancellationToken::new();
+        let calls = AtomicU32::new(0);
+        let p = RetryPolicy {
+            max_retry_after: Duration::from_secs(30),
+            ..policy()
+        };
+        let result: Result<(), _> = retry(&p, &cancel, None, || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async { Err(unavailable_503(Some(Duration::from_secs(120)))) }
+        })
+        .await;
+        assert!(matches!(
+            result,
+            Err(ProviderError::Upstream { status: 503, .. })
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "no retry above the cap");
+        assert_eq!(start.elapsed(), Duration::ZERO, "and no wait");
+        // Exactly at the cap is still waited for.
+        let calls = AtomicU32::new(0);
+        let _: Result<(), _> = retry(&p, &cancel, None, || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async { Err(unavailable_503(Some(Duration::from_secs(30)))) }
+        })
+        .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_backoff_past_the_deadline_is_not_started() {
+        let start = Instant::now();
+        let cancel = CancellationToken::new();
+        let calls = AtomicU32::new(0);
+        let deadline = Some(start + Duration::from_secs(5));
+        let result: Result<(), _> = retry(&policy(), &cancel, deadline, || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async { Err(unavailable_503(Some(Duration::from_secs(10)))) }
+        })
+        .await;
+        // The real cause comes back at once, not a sleep into the deadline.
+        assert!(matches!(
+            result,
+            Err(ProviderError::Upstream { status: 503, .. })
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(start.elapsed(), Duration::ZERO);
+
+        // A short backoff that fits before the deadline still runs.
+        let calls = AtomicU32::new(0);
+        let _: Result<(), _> = retry(&policy(), &cancel, deadline, || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async { Err(unavailable_503(None)) }
+        })
+        .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
     }
 }
