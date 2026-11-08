@@ -1865,3 +1865,82 @@ async fn admin_routes_do_not_exist_when_auth_is_disabled() {
         .expect("send");
     assert_eq!(resp.status(), 404);
 }
+
+/// An upstream failure after admission (here a non-retryable upstream 400,
+/// surfaced as 502 `LM-3003`) leaves a status-only usage row, like an
+/// admission refusal: zero tokens, zero cost, the client-facing status. Before
+/// the fix the row was never written, so `requests_server_error` and the
+/// usage "errors" never counted upstream outages. The reservation is still
+/// refunded: nothing is charged.
+#[tokio::test]
+async fn upstream_failure_is_recorded_as_a_status_only_usage_row() {
+    let upstream = MockServer::start().await;
+    for p in [
+        "/embeddings",
+        "/chat/completions",
+        "/v2/rerank",
+        "/v1/systemone",
+    ] {
+        Mock::given(method("POST"))
+            .and(path(p))
+            .respond_with(
+                ResponseTemplate::new(400).set_body_json(json!({ "error": { "message": "bad" } })),
+            )
+            .mount(&upstream)
+            .await;
+    }
+    let h = spawn_auth(full_registry(&upstream.uri()), &[]).await;
+    let key = h.create_key(Some(100.0), None, None).await;
+
+    let calls = [
+        ("/v1/embeddings", embed_body()),
+        (
+            "/v1/chat/completions",
+            json!({ "model": "openai/gpt", "messages": [{ "role": "user", "content": "hi" }], "max_tokens": 4 }),
+        ),
+        (
+            "/v1/chat/completions",
+            json!({ "model": "openai/gpt", "messages": [{ "role": "user", "content": "hi" }], "max_tokens": 4, "stream": true }),
+        ),
+        (
+            "/v1/rerank",
+            json!({ "model": "cohere/rerank-fast", "query": "q", "documents": ["a", "b"] }),
+        ),
+        ("/v1/decisions", typesafe_decisions_body()),
+    ];
+    for (route, body) in &calls {
+        let resp = h
+            .client
+            .post(format!("{}{route}", h.base))
+            .bearer_auth(&key)
+            .json(body)
+            .send()
+            .await
+            .expect("send");
+        assert_eq!(resp.status(), 502, "{route}");
+    }
+
+    h.wait_usage_rows(5).await;
+    let dump = h.store.debug_dump().await.expect("dump");
+    let rows: Vec<&str> = dump.lines().filter(|l| l.contains("|502|")).collect();
+    assert_eq!(rows.len(), 5, "one 502 row per failed call:\n{dump}");
+    for capability in ["'embed'", "'chat'", "'rerank'", "'decisions'"] {
+        assert!(
+            rows.iter().any(|r| r.contains(capability)),
+            "{capability} failure recorded:\n{dump}"
+        );
+    }
+    // Nothing consumed: zero tokens and zero cost on every failure row
+    // (debug_dump columns: ...|tokens_in|tokens_out|search_units|cached|
+    // reasoning|cache_write|estimated|cost|latency|status|...).
+    for row in &rows {
+        assert!(row.contains("|0|0|NULL|NULL|NULL|NULL|0|0.0|"), "{row}");
+    }
+    // Every reservation was refunded: the key has spent nothing.
+    let entry = h
+        .runtime
+        .keys
+        .authenticate(&key, lumen_server::auth::now_unix())
+        .expect("key");
+    assert_eq!(entry.spent_micro(), 0, "refunded after the failures");
+}

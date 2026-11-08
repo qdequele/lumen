@@ -215,6 +215,61 @@ impl Accounting {
         })
     }
 
+    /// Close the record of an admitted request that failed before anything
+    /// was served (every upstream attempt failed or timed out, the chain was
+    /// exhausted, or a provider refused the request before any call, e.g. a
+    /// `strict` provider's unsupported field): refund the reservation, observe
+    /// the end-to-end latency under the error status, and enqueue a
+    /// status-only usage row (zero tokens, zero cost, the client-facing
+    /// `status`), the same shape as an admission refusal, so `usage_log`
+    /// counts these failures too.
+    /// Returns `error` so a handler can write
+    /// `.await.map_err(|e| accounting.fail(e))?`. Never blocks; idempotent
+    /// with respect to the budget (the reservation is taken once).
+    pub fn fail(&mut self, error: GatewayError) -> GatewayError {
+        // Dropping the reservation refunds it: nothing was consumed.
+        drop(self.reservation.take());
+        let elapsed = self.completed.unwrap_or_else(|| self.started.elapsed());
+        let status = error.http_status();
+        self.latency.observe_request(
+            self.capability,
+            &self.model_used,
+            &self.provider,
+            status,
+            elapsed.as_secs_f64(),
+        );
+        let Some(logger) = &self.usage else {
+            return error;
+        };
+        let record = UsageRecord {
+            key_id: self.key_id.clone(),
+            group_id: self.group_id.clone(),
+            model: self.model.clone(),
+            model_used: self.model_used.clone(),
+            route: self.route.clone(),
+            provider: self.provider.clone(),
+            capability: self.capability.to_owned(),
+            tokens_in: 0,
+            tokens_out: 0,
+            search_units: None,
+            cached_tokens: None,
+            reasoning_tokens: None,
+            cache_write_tokens: None,
+            media_count: 0,
+            media_bytes: 0,
+            estimated: false,
+            cost: 0.0,
+            latency_ms: i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX),
+            status,
+            metadata: self.metadata.as_ref().map(RequestMetadata::to_json),
+            ts: now_unix(),
+        };
+        if !logger.log(record) {
+            self.tokens.inc_usage_dropped();
+        }
+        error
+    }
+
     /// Enqueue a status-only usage-log row for a request refused at admission
     /// (budget/quota). Zero tokens and zero cost - nothing was consumed - the
     /// `status` column (402/429) carries the rejection. Non-blocking: a full

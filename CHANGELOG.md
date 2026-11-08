@@ -26,6 +26,15 @@ All notable changes to LUMEN are documented here. The format is based on
   the key's budget (2,500 tokens charged for an input Voyage counts at about
   2,000). The reported count is now used.
 
+- **Upstream failures are in the usage log.** A request admitted and then
+  failed upstream (every attempt failed, timed out, or the fallback chain was
+  spent: `LM-3003`, `LM-3004`, `LM-3005`, ...) left no `usage_log` row, so the
+  usage summary's `requests_server_error` and the console's error counts
+  never showed an upstream outage on chat, embeddings, rerank or decisions.
+  It now leaves a status-only row like an admission refusal: zero tokens,
+  zero cost, the status the client got. The budget reservation is still
+  refunded.
+
 ## [0.10.0] - 2026-11-08
 
 ### Added
