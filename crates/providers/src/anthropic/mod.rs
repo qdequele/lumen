@@ -39,13 +39,15 @@ pub(crate) const ANTHROPIC_VERSION: &str = "2023-06-01";
 const DEFAULT_MAX_TOKENS: u32 = 4096;
 
 /// OpenAI chat fields the Messages API has no equivalent for (issues #72,
-/// #91): no JSON mode / structured output, no sampling seed, no logprobs (nor
-/// `top_logprobs`), no logit biasing, no frequency/presence penalties.
-/// Rejected (strict) or dropped with a trace (lenient) before any upstream
-/// call. `parallel_tool_calls` is NOT here: it maps to
-/// `tool_choice.disable_parallel_tool_use` in [`translate_request`].
+/// #91): no sampling seed, no logprobs (nor `top_logprobs`), no logit
+/// biasing, no frequency/presence penalties. Rejected (strict) or dropped with
+/// a trace (lenient) before any upstream call. `parallel_tool_calls` is NOT
+/// here: it maps to `tool_choice.disable_parallel_tool_use` in
+/// [`translate_request`]. Nor is `response_format`: its `json_schema` shape
+/// maps to structured outputs (`output_config.format`), see
+/// [`translate_response_format`]; only the shapes that cannot be expressed
+/// are treated as unsupported, by [`check_response_format`].
 const UNSUPPORTED_CHAT_FIELDS: &[&str] = &[
-    "response_format",
     "seed",
     "logprobs",
     "top_logprobs",
@@ -129,6 +131,10 @@ struct AnthropicRequest {
     tools: Vec<AnthropicTool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<serde_json::Value>,
+    /// Structured outputs (`{"format": {"type": "json_schema", ...}}`),
+    /// translated from OpenAI `response_format: json_schema`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_config: Option<serde_json::Value>,
     /// Only serialized on the streaming path.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     stream: bool,
@@ -306,26 +312,7 @@ fn translate_request(req: &ChatRequest, stream: bool) -> AnthropicRequest {
         .unwrap_or_default();
 
     let tools = translate_tools(req);
-    let mut tool_choice = req.extra.get("tool_choice").and_then(translate_tool_choice);
-    // OpenAI `parallel_tool_calls: false` maps to Anthropic's
-    // `tool_choice.disable_parallel_tool_use: true` (issue #72). `true` is the
-    // upstream default on both sides, so it needs no wire field. Only
-    // meaningful alongside tools, and never on `{"type": "none"}` (no tool may
-    // be called at all there).
-    if req
-        .extra
-        .get("parallel_tool_calls")
-        .and_then(serde_json::Value::as_bool)
-        == Some(false)
-        && !tools.is_empty()
-    {
-        let choice = tool_choice.get_or_insert_with(|| json!({ "type": "auto" }));
-        if choice.get("type").and_then(|v| v.as_str()) != Some("none") {
-            if let Some(obj) = choice.as_object_mut() {
-                obj.insert("disable_parallel_tool_use".to_owned(), json!(true));
-            }
-        }
-    }
+    let tool_choice = request_tool_choice(req, !tools.is_empty());
 
     AnthropicRequest {
         model: req.model.clone(),
@@ -341,6 +328,10 @@ fn translate_request(req: &ChatRequest, stream: bool) -> AnthropicRequest {
         stop_sequences,
         tools,
         tool_choice,
+        output_config: req
+            .extra
+            .get("response_format")
+            .and_then(translate_response_format),
         stream,
     }
 }
@@ -402,6 +393,160 @@ fn parse_tool_arguments(arguments: Option<&serde_json::Value>) -> serde_json::Va
         .and_then(|v| v.as_str())
         .and_then(|s| serde_json::from_str(s).ok())
         .unwrap_or_else(|| json!({}))
+}
+
+/// The Anthropic `tool_choice` for a request: the translated OpenAI
+/// `tool_choice`, plus `parallel_tool_calls: false` mapped to
+/// `disable_parallel_tool_use: true` (issue #72). `true` is the upstream
+/// default on both sides, so it needs no wire field. Only meaningful
+/// alongside tools, and never on `{"type": "none"}` (no tool may be called
+/// at all there).
+fn request_tool_choice(req: &ChatRequest, has_tools: bool) -> Option<serde_json::Value> {
+    let mut tool_choice = req.extra.get("tool_choice").and_then(translate_tool_choice);
+    if req
+        .extra
+        .get("parallel_tool_calls")
+        .and_then(serde_json::Value::as_bool)
+        == Some(false)
+        && has_tools
+    {
+        let choice = tool_choice.get_or_insert_with(|| json!({ "type": "auto" }));
+        if choice.get("type").and_then(|v| v.as_str()) != Some("none") {
+            if let Some(obj) = choice.as_object_mut() {
+                obj.insert("disable_parallel_tool_use".to_owned(), json!(true));
+            }
+        }
+    }
+    tool_choice
+}
+
+/// OpenAI `response_format` -> Anthropic `output_config` (structured outputs).
+///
+/// Only `{"type": "json_schema", "json_schema": {"schema": ...}}` has a
+/// Messages API equivalent: `{"format": {"type": "json_schema", "schema":
+/// ...}}`, with the schema adapted by [`anthropic_schema`]. `text` is the
+/// default (nothing to send); `json_object` (schema-less JSON mode), a
+/// `json_schema` without a schema or with a schema [`anthropic_schema`]
+/// cannot express, and unknown shapes map to nothing, and
+/// [`check_response_format`] reports them as unsupported.
+fn translate_response_format(format: &serde_json::Value) -> Option<serde_json::Value> {
+    if format.get("type").and_then(serde_json::Value::as_str) != Some("json_schema") {
+        return None;
+    }
+    let schema = format.pointer("/json_schema/schema")?;
+    if !schema.is_object() {
+        return None;
+    }
+    Some(json!({
+        "format": { "type": "json_schema", "schema": anthropic_schema(schema)? }
+    }))
+}
+
+/// Pre-flight for `response_format`: a shape [`translate_response_format`]
+/// cannot express is handled like every other unsupported field (strict:
+/// 400 `LM-1001` before any upstream call; lenient: dropped with a trace).
+/// `null`, `text` and a `json_schema` carrying a schema pass.
+fn check_response_format(
+    provider: &str,
+    strict: bool,
+    extra: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), ProviderError> {
+    let Some(format) = extra.get("response_format").filter(|v| !v.is_null()) else {
+        return Ok(());
+    };
+    let is_text = format.get("type").and_then(serde_json::Value::as_str) == Some("text");
+    if is_text || translate_response_format(format).is_some() {
+        return Ok(());
+    }
+    crate::mapping::check_unsupported_chat_fields(provider, strict, extra, &["response_format"])
+}
+
+/// Schema keywords structured outputs rejects with a 400 (numeric and string
+/// length constraints, and upper bounds on arrays). OpenAI's non-strict
+/// `json_schema` mode accepts them, so the gateway drops them rather than
+/// turn a working OpenAI request into an upstream error; the output still
+/// follows every structural constraint.
+const UNSUPPORTED_SCHEMA_KEYWORDS: &[&str] = &[
+    "minimum",
+    "maximum",
+    "exclusiveMinimum",
+    "exclusiveMaximum",
+    "multipleOf",
+    "minLength",
+    "maxLength",
+    "maxItems",
+];
+
+/// Adapt an OpenAI JSON schema to what Anthropic structured outputs accept:
+/// every object schema gets `additionalProperties: false` (the only value
+/// allowed there, and what OpenAI's strict mode already requires),
+/// [`UNSUPPORTED_SCHEMA_KEYWORDS`] are dropped, `minItems` is kept only at 0
+/// or 1, and `oneOf` (not accepted) becomes `anyOf`. Applied recursively to
+/// subschemas (`properties`, `items`, `prefixItems`, `anyOf`/`allOf`/`oneOf`,
+/// `$defs`/`definitions`, `not`, `if`/`then`/`else`, ...); property *names*
+/// are never touched.
+///
+/// `None` when the schema has a shape structured outputs cannot express
+/// without changing its meaning: a free-form object or map (an object schema
+/// with no `properties` whose `additionalProperties` is not `false`, which
+/// closing would turn into "only `{}`"), or `oneOf` next to `anyOf`. The
+/// caller then treats `response_format` as unsupported.
+fn anthropic_schema(schema: &serde_json::Value) -> Option<serde_json::Value> {
+    let Some(obj) = schema.as_object() else {
+        return Some(schema.clone());
+    };
+    let is_object = obj.get("type").is_some_and(|t| match t {
+        serde_json::Value::String(s) => s == "object",
+        serde_json::Value::Array(types) => types.iter().any(|t| t == "object"),
+        _ => false,
+    }) || obj.contains_key("properties");
+    let closed = obj.get("additionalProperties") == Some(&json!(false));
+    if is_object && !obj.contains_key("properties") && !closed {
+        return None;
+    }
+    if obj.contains_key("oneOf") && obj.contains_key("anyOf") {
+        return None;
+    }
+    let mut out = serde_json::Map::with_capacity(obj.len() + 1);
+    for (key, value) in obj {
+        let key = key.as_str();
+        if UNSUPPORTED_SCHEMA_KEYWORDS.contains(&key)
+            || (key == "minItems" && value.as_u64().is_some_and(|n| n > 1))
+        {
+            continue;
+        }
+        let adapted = match key {
+            "properties" | "$defs" | "definitions" | "patternProperties" | "dependentSchemas" => {
+                adapt_schema_map(value)?
+            }
+            "items" | "not" | "additionalItems" | "if" | "then" | "else" | "prefixItems"
+            | "anyOf" | "allOf" | "oneOf" => match value {
+                serde_json::Value::Array(list) => serde_json::Value::Array(
+                    list.iter().map(anthropic_schema).collect::<Option<_>>()?,
+                ),
+                single => anthropic_schema(single)?,
+            },
+            _ => value.clone(),
+        };
+        let key = if key == "oneOf" { "anyOf" } else { key };
+        out.insert(key.to_owned(), adapted);
+    }
+    if is_object {
+        out.insert("additionalProperties".to_owned(), json!(false));
+    }
+    Some(serde_json::Value::Object(out))
+}
+
+/// [`anthropic_schema`] over every value of a name -> subschema map.
+fn adapt_schema_map(value: &serde_json::Value) -> Option<serde_json::Value> {
+    match value {
+        serde_json::Value::Object(map) => map
+            .iter()
+            .map(|(name, sub)| Some((name.clone(), anthropic_schema(sub)?)))
+            .collect::<Option<serde_json::Map<_, _>>>()
+            .map(serde_json::Value::Object),
+        other => Some(other.clone()),
+    }
 }
 
 /// OpenAI `tools` (`{type: "function", function: {name, description,
@@ -577,6 +722,7 @@ impl AnthropicProvider {
             &req.extra,
             UNSUPPORTED_CHAT_FIELDS,
         )?;
+        check_response_format(&self.provider_name, self.strict, &req.extra)?;
         let url = format!("{}/v1/messages", self.base_url);
         let body = translate_request(&req, true);
         let headers = [
@@ -613,6 +759,7 @@ impl ChatProvider for AnthropicProvider {
             &req.extra,
             UNSUPPORTED_CHAT_FIELDS,
         )?;
+        check_response_format(&self.provider_name, self.strict, &req.extra)?;
         let url = format!("{}/v1/messages", self.base_url);
         let body = translate_request(&req, false);
         let headers = [
@@ -1342,6 +1489,122 @@ mod tests {
         let body = serde_json::to_value(translate_request(&req, false)).unwrap();
         for field in ["response_format", "seed", "logprobs"] {
             assert!(body.get(field).is_none(), "{field} must not reach the wire");
+        }
+    }
+
+    /// An OpenAI schema is adapted to what structured outputs accept:
+    /// objects closed (`additionalProperties: false`) at every depth,
+    /// numeric/length constraints dropped, `oneOf` -> `anyOf`, and property
+    /// names (even ones spelled like keywords) left alone.
+    #[test]
+    fn schema_is_adapted_for_structured_outputs() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "minimum": { "type": "integer", "minimum": 0, "maximum": 9 },
+                "name": { "type": "string", "minLength": 1, "maxLength": 5 },
+                "tags": {
+                    "type": "array",
+                    "minItems": 2,
+                    "maxItems": 4,
+                    "items": {
+                        "type": "object",
+                        "properties": { "k": { "type": "string" } },
+                        "additionalProperties": true
+                    }
+                },
+                "either": { "oneOf": [{ "type": "string" }, { "type": "null" }] },
+                "opt": { "type": "array", "minItems": 1, "items": { "type": "string" } }
+            },
+            "$defs": { "Inner": { "type": ["object", "null"], "properties": {} } },
+            "required": ["name"]
+        });
+        assert_eq!(
+            anthropic_schema(&schema).unwrap(),
+            json!({
+                "type": "object",
+                "properties": {
+                    "minimum": { "type": "integer" },
+                    "name": { "type": "string" },
+                    "tags": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": { "k": { "type": "string" } },
+                            "additionalProperties": false
+                        }
+                    },
+                    "either": { "anyOf": [{ "type": "string" }, { "type": "null" }] },
+                    "opt": { "type": "array", "minItems": 1, "items": { "type": "string" } }
+                },
+                "$defs": {
+                    "Inner": {
+                        "type": ["object", "null"],
+                        "properties": {},
+                        "additionalProperties": false
+                    }
+                },
+                "required": ["name"],
+                "additionalProperties": false
+            })
+        );
+    }
+
+    /// A free-form object or a map cannot be expressed: closing it would
+    /// only allow `{}`, so the whole `response_format` is unsupported
+    /// (dropped in lenient mode, 400 in strict mode) rather than narrowed.
+    #[test]
+    fn free_form_objects_and_maps_are_not_expressible() {
+        for schema in [
+            json!({ "type": "object" }),
+            json!({ "type": "object", "additionalProperties": true }),
+            json!({ "type": "object", "additionalProperties": { "type": "string" } }),
+            json!({ "type": "object", "properties": {
+                "meta": { "type": "object", "additionalProperties": { "type": "number" } }
+            } }),
+            json!({ "type": "array", "items": { "type": "object" } }),
+            json!({ "anyOf": [{ "type": "string" }], "oneOf": [{ "type": "null" }] }),
+        ] {
+            assert_eq!(anthropic_schema(&schema), None, "{schema}");
+            let format = json!({ "type": "json_schema", "json_schema": { "schema": schema } });
+            assert_eq!(translate_response_format(&format), None);
+        }
+        // An explicitly closed empty object is fine.
+        let closed = json!({ "type": "object", "additionalProperties": false });
+        assert_eq!(anthropic_schema(&closed), Some(closed.clone()));
+        // The draft-4 tuple form of `items` is recursed into too.
+        assert_eq!(
+            anthropic_schema(
+                &json!({ "type": "array", "items": [{ "type": "string", "maxLength": 3 }] })
+            ),
+            Some(json!({ "type": "array", "items": [{ "type": "string" }] }))
+        );
+    }
+
+    #[test]
+    fn response_format_translation() {
+        let schema = json!({ "type": "object", "properties": {} });
+        assert_eq!(
+            translate_response_format(&json!({
+                "type": "json_schema",
+                "json_schema": { "name": "x", "schema": schema }
+            })),
+            Some(json!({ "format": { "type": "json_schema", "schema": {
+                "type": "object", "properties": {}, "additionalProperties": false
+            } } }))
+        );
+        for unsupported in [
+            json!({ "type": "json_object" }),
+            json!({ "type": "text" }),
+            json!({ "type": "json_schema", "json_schema": { "name": "x" } }),
+            json!({ "type": "json_schema", "json_schema": { "schema": true } }),
+            json!("json"),
+        ] {
+            assert_eq!(
+                translate_response_format(&unsupported),
+                None,
+                "{unsupported}"
+            );
         }
     }
 

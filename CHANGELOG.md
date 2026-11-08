@@ -6,6 +6,19 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **`response_format: json_schema` now works on Anthropic models.** The
+  Anthropic provider dropped `response_format` (or refused it with `strict =
+  true`), so a client asking Claude for a JSON schema got free text back
+  (`Apple` for a `{"fruit": string}` schema). It now maps to Anthropic
+  structured outputs (`output_config.format`), streaming and not, with the
+  schema adapted to what Anthropic accepts (objects closed with
+  `additionalProperties: false`, numeric and length constraints dropped,
+  `oneOf` read as `anyOf`). `json_object` has no Anthropic equivalent and is
+  still dropped (refused with `strict = true`). See the chat-extras matrix in
+  `docs/providers.md`.
+
 ## [0.10.0] - 2026-11-08
 
 ### Added
