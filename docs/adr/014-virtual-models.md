@@ -218,3 +218,12 @@ disabling one model never hands its bare form to another provider's model.
 A rerank `remap` targets any model serving `decisions`, not only Jev. The
 `noul` strategy is renamed `predicate`; `noul` stays accepted as an alias and
 `lumen config migrate` rewrites it.
+
+## Amendment (2026-11-08, ADR 022): account virtual models
+
+Virtual models can also belong to one Lab account. They live in the auth
+database, one document per account with its own `If-Match` hash, and are
+managed through the same `/admin/config/virtual_models` routes with
+`X-Lumen-Account-Ref`. They resolve only for that account's keys, may target
+platform models, and never block a platform change: a platform model they
+reference that disappears becomes a skipped leaf. See ADR 022.

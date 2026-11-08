@@ -17,9 +17,10 @@ info:
     `X-Lumen-Account-Ref: <account uuid>` (platform contract v2 section
     8.3): keys, groups and usage are then filtered to groups with that
     `account_ref`, foreign ids are 404, creation is forced into the account,
-    and the platform-only routes (provider keys and checks, webhooks,
-    config, this document, `/health/providers`, `/metrics`) answer 403
-    `LM-4005`.
+    the `/admin/config/virtual_models` routes read and write that account's
+    own virtual models (ADR 022), and the other platform-only routes
+    (provider keys and checks, webhooks, config, this document,
+    `/health/providers`, `/metrics`) answer 403 `LM-4005`.
     Source of truth: this
     file, pinned to the router by a test in `crates/server/src/app.rs`.
   license:
@@ -42,7 +43,7 @@ components:
       in: header
       required: false
       schema: { type: string, format: uuid }
-      description: Scope this call to one Lab account (platform contract v2 section 8.3). On the key, group and usage routes only that account's rows are visible and writable, and a value that is not exactly one UUID (or the header sent twice) is 400 `LM-1001`. On the platform-only routes (provider keys and checks, webhooks, config, `/openapi.json`, `/health/providers`, `/metrics`) the header, whatever its value, is refused with 403 `LM-4005`.
+      description: Scope this call to one Lab account (platform contract v2 section 8.3). On the key, group and usage routes only that account's rows are visible and writable, and a value that is not exactly one UUID (or the header sent twice) is 400 `LM-1001`. On the `/admin/config/virtual_models` routes the call reads and writes that account's own virtual models, with their own `hash` (ADR 022). On the platform-only routes (provider keys and checks, webhooks, config, `/openapi.json`, `/health/providers`, `/metrics`) the header, whatever its value, is refused with 403 `LM-4005`.
     IfMatch:
       name: If-Match
       in: header
@@ -145,7 +146,7 @@ components:
           example: openai/gpt-4o-mini
         object: { type: string, const: model }
         created: { type: integer, description: "Unix seconds at midnight UTC of `release_date`; absent when undated." }
-        owned_by: { type: string, description: "The provider name, or `lumen` for a virtual model." }
+        owned_by: { type: string, description: "The provider name, `lumen` for a platform virtual model, or `account` for a virtual model of the calling key's account (ADR 022)." }
         capabilities:
           type: array
           items: { $ref: "#/components/schemas/Capability" }
@@ -846,7 +847,11 @@ components:
               id: { type: string }
               capability: { $ref: "#/components/schemas/Capability" }
               strategy: { type: string, enum: [single, fallback, split, switch] }
-        hash: { type: string }
+              warnings:
+                type: array
+                items: { type: string }
+                description: "Account models only (ADR 022), omitted when empty: what is wrong now, such as a target the platform removed (skipped at request time), an id the platform later took (this account keeps its model), or a rule a platform change broke (the model is not served)."
+        hash: { type: string, description: "The `If-Match` version: of the platform document, or with `X-Lumen-Account-Ref` of that account's document." }
     VirtualModel:
       type: object
       description: One `[[virtual_models]]` table as JSON (ADR 014).
@@ -878,8 +883,9 @@ components:
       type: object
       required: [plan, hash]
       properties:
-        plan: { type: object, additionalProperties: true, description: "The resolved routing tree (references expanded to foundation leaves)." }
+        plan: { type: object, additionalProperties: true, description: "The resolved routing tree (references expanded to foundation leaves). For an account model a platform virtual target is a reference (`virtual: true, platform: true`, not expanded), a skipped target carries `missing: true`, and a disabled model's plan is its own config." }
         hash: { type: string }
+        warnings: { type: array, items: { type: string }, description: "Account models only, as on the list; omitted when empty." }
 paths:
   /health:
     get:
@@ -938,6 +944,7 @@ paths:
   /v1/models:
     get:
       summary: List models (foundation and listed virtual models)
+      description: "A key of a Lab account also sees that account's listed virtual models (ADR 022); an account model hides a platform model of the same id from that account's keys."
       operationId: listModels
       security: [{ virtualKey: [] }]
       responses:
@@ -1651,6 +1658,7 @@ paths:
       - $ref: "#/components/parameters/AccountRef"
     get:
       summary: Virtual models in the current document
+      description: "Without `X-Lumen-Account-Ref`, the platform document's (ADR 014); with it, that account's own (ADR 022), with that account's `hash`."
       operationId: listVirtualModels
       security: [{ masterKey: [] }]
       responses:
@@ -1674,6 +1682,7 @@ paths:
         "500": { $ref: "#/components/responses/Error" }
     put:
       summary: Create or replace one virtual model
+      description: "With `X-Lumen-Account-Ref` the model is saved in that account's document (ADR 022): `If-Match` is that account's hash, the id may not be a current platform id, targets may be the account's own, platform virtual or foundation models (never another account's), and an account holds at most 32 models in 256 KiB. The saved model must have no problem, and the save may not break another model of the account (400 `LM-1001`)."
       operationId: putVirtualModel
       security: [{ masterKey: [] }]
       parameters:
@@ -1691,6 +1700,7 @@ paths:
         "500": { $ref: "#/components/responses/Error" }
     delete:
       summary: Remove one virtual model
+      description: "With `X-Lumen-Account-Ref`, from that account's document; refused (400 `LM-1001`) while another model of the account targets it. A platform delete is never blocked by account models: they skip the missing target."
       operationId: deleteVirtualModel
       security: [{ masterKey: [] }]
       parameters:

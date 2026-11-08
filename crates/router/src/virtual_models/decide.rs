@@ -81,6 +81,8 @@ pub struct Decision {
     pub preset: Option<Arc<Preset>>,
     /// Ordered attempts; never empty.
     pub attempts: Vec<Attempt>,
+    /// The requested virtual model belongs to one account (ADR 022).
+    pub account: bool,
 }
 
 impl Decision {
@@ -91,6 +93,7 @@ impl Decision {
             virtual_model: None,
             preset: None,
             attempts: vec![Attempt::plain(model.to_owned())],
+            account: false,
         }
     }
 
@@ -106,6 +109,7 @@ impl Decision {
             virtual_model: None,
             preset: None,
             attempts,
+            account: false,
         }
     }
 
@@ -226,10 +230,19 @@ impl VirtualModel {
             .into_iter()
             .collect();
         let attempts = flatten_model(self, facts, rng, "", &base);
+        if self.account && attempts.is_empty() {
+            // Every target this request reached was skipped (ADR 022): the
+            // first missing one is the routing error, as the primary's miss
+            // is for any virtual model.
+            return Err(GatewayError::ModelNotFound(
+                first_missing(self).unwrap_or(self.id()).to_owned(),
+            ));
+        }
         Ok(Decision {
             virtual_model: Some(self.id().to_owned()),
             preset: self.preset.clone(),
             attempts,
+            account: self.account,
         })
     }
 }
@@ -307,8 +320,10 @@ fn split_order(targets: &[Target], r: u64) -> Vec<&Target> {
     order
 }
 
-/// Concatenate the attempts of `targets` in order; every attempt of a target but the
-/// last gets an escape on `on` to the first attempt of the next target.
+/// Concatenate the attempts of `targets` in order; every attempt gets an escape on `on`
+/// to the first attempt of the next target, unless no later target yields one (a
+/// skipped account target, ADR 022, yields none). An escape therefore never points
+/// past the end of its own list, so an outer level never inherits it.
 fn chain(
     targets: Vec<&Target>,
     on: Triggers,
@@ -317,17 +332,23 @@ fn chain(
     path: &str,
     overrides: &[Arc<Overrides>],
 ) -> Vec<Attempt> {
-    let n = targets.len();
-    let mut out = Vec::new();
-    for (i, target) in targets.into_iter().enumerate() {
-        let list = flatten_target(target, facts, rng, path, overrides);
+    // Flattened in order first (the same random draws as before), so the
+    // attempts still to come are known when escapes are added.
+    let lists: Vec<Vec<Attempt>> = targets
+        .into_iter()
+        .map(|t| flatten_target(t, facts, rng, path, overrides))
+        .collect();
+    let mut remaining: usize = lists.iter().map(Vec::len).sum();
+    let mut out = Vec::with_capacity(remaining);
+    for list in lists {
         let base = out.len();
         let next = base + list.len();
+        remaining -= list.len();
         for mut attempt in list {
             for escape in &mut attempt.escapes {
                 escape.next += base;
             }
-            if i + 1 < n {
+            if remaining > 0 {
                 attempt.escapes.push(Escape { on, next });
             }
             out.push(attempt);
@@ -358,7 +379,19 @@ fn flatten_target(
             escapes: Vec::new(),
         }],
         Node::Virtual(child) => flatten_model(child, facts, rng, path, &overrides),
+        // A skipped account target (ADR 022) yields no attempt.
+        Node::Missing(_) => Vec::new(),
     }
+}
+
+/// The first skipped target reachable from `vm`, depth first: the id a request
+/// whose every attempt was skipped reports as unknown (ADR 022). Cold path.
+fn first_missing(vm: &VirtualModel) -> Option<&str> {
+    vm.targets.iter().find_map(|t| match &t.node {
+        Node::Missing(id) => Some(id.as_str()),
+        Node::Virtual(child) => first_missing(child),
+        Node::Foundation(_) => None,
+    })
 }
 
 #[cfg(test)]
@@ -625,5 +658,89 @@ mod tests {
         let mut d = Decision::linear(["a", "b"].map(str::to_owned));
         d.retain_compatible(&[false, false]);
         assert_eq!(ids(&d), vec!["a", "b"], "a mask keeping nothing is ignored");
+    }
+
+    #[test]
+    fn skipped_account_leaves_yield_no_attempt_and_all_skipped_is_lm_2001() {
+        #[derive(serde::Deserialize)]
+        struct Doc {
+            virtual_models: Vec<VirtualModelConfig>,
+        }
+        let doc: Doc = toml::from_str(
+            r#"
+            [[virtual_models]]
+            id = "team/x"
+            capability = "chat"
+            strategy = "fallback"
+            targets = [ { model = "gone" }, { model = "a" }, { model = "also-gone" } ]
+
+            [[virtual_models]]
+            id = "team/none"
+            capability = "chat"
+            strategy = "single"
+            targets = [ { model = "gone" } ]
+        "#,
+        )
+        .unwrap();
+        let mut f = FoundationIndex::default();
+        f.insert("a", vec![Capability::Chat], vec!["text".into()]);
+        let t = RoutingTable::compile_account(&doc.virtual_models, &f, &RoutingTable::default());
+        let d = decide(&t, "team/x", None, 0);
+        assert_eq!(ids(&d), ["a"]);
+        assert!(d.account);
+        // The trailing skipped target leaves no escape past the end.
+        assert_eq!(d.attempts[0].escapes.len(), 0);
+        let mut rng = || 0;
+        let err = t
+            .decide(
+                Capability::Chat,
+                "team/none",
+                &NoFacts { group: None },
+                &mut rng,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, GatewayError::ModelNotFound(ref id) if id == "gone"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_nested_skipped_last_target_leaves_only_the_outer_escape() {
+        #[derive(serde::Deserialize)]
+        struct Doc {
+            virtual_models: Vec<VirtualModelConfig>,
+        }
+        let doc: Doc = toml::from_str(
+            r#"
+            [[virtual_models]]
+            id = "team/outer"
+            capability = "chat"
+            strategy = "fallback"
+            fallback_on = ["timeout"]
+            targets = [ { model = "team/inner" }, { model = "d" } ]
+
+            [[virtual_models]]
+            id = "team/inner"
+            capability = "chat"
+            strategy = "fallback"
+            targets = [ { model = "a" }, { model = "gone" } ]
+        "#,
+        )
+        .unwrap();
+        let mut f = FoundationIndex::default();
+        for id in ["a", "d"] {
+            f.insert(id, vec![Capability::Chat], vec!["text".into()]);
+        }
+        let t = RoutingTable::compile_account(&doc.virtual_models, &f, &RoutingTable::default());
+        let d = decide(&t, "team/outer", None, 0);
+        assert_eq!(ids(&d), ["a", "d"]);
+        // Only the outer `timeout` escape: a rate limit on `a` must not fall over.
+        let escapes = &d.attempts[0].escapes;
+        assert_eq!(escapes.len(), 1);
+        assert_eq!(escapes[0].next, 1);
+        assert!(escapes[0].on.contains(Trigger::Timeout));
+        assert!(!escapes[0].on.contains(Trigger::RateLimited));
+        assert_eq!(d.attempts[1].escapes.len(), 0);
     }
 }

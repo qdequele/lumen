@@ -51,13 +51,17 @@ pub async fn rerank_handler(
     }
 
     // A deprecated bare id (`gpt-4o`) resolves to its `provider/model` id.
-    let client_model = state.resilience.canonical_model(&req.model);
+    // An account key also resolves its account's own virtual models (ADR 022).
+    let account = key.as_deref().and_then(|k| k.0.account_ref());
+    let account = account.as_deref().map(String::as_str);
+    let client_model = state.resilience.canonical_model_for(account, &req.model);
     // Facts are only built for a virtual model (ADR 014).
-    let mut decision = state
-        .resilience
-        .decide(Capability::Rerank, &client_model, |_| {
-            Facts::rerank(&headers, key.as_deref(), &req)
-        })?;
+    let mut decision =
+        state
+            .resilience
+            .decide_for(Capability::Rerank, account, &client_model, |_| {
+                Facts::rerank(&headers, key.as_deref(), &req)
+            })?;
     let refusals = Some(&state.decision_metrics); // refused remap attempts (ADR 017)
     let chain = lumen_router::resolve_rerank_decision(&state.registry, &mut decision, refusals)?;
     let primary = decision.primary_model().to_owned();
@@ -152,7 +156,7 @@ pub async fn rerank_handler(
         .decision_metrics
         .add_refusals(&executed.model_used, u64::from(response.usage.refusals));
     let route = decision.route_of(executed.index);
-    accounting.set_route(route);
+    accounting.set_route(route, decision.account);
 
     let search_units = settle_search_units(&mut response, estimated_units);
     let (tokens_in, tokens_in_estimated) = settle_tokens(&mut response, estimated_tokens);

@@ -203,6 +203,45 @@ pub enum DeleteGroupOutcome {
     NotFound,
 }
 
+/// One account's stored virtual-model document (ADR 022).
+// No Debug derive: the document carries preset and remap text.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AccountModelsRow {
+    /// The account (canonical lowercase UUID).
+    pub account_ref: String,
+    /// The JSON array of virtual-model objects.
+    pub document: String,
+    /// BLAKE3 hex of `document`: the account's `If-Match` version.
+    pub hash: String,
+    /// The table-wide write counter value of this row's last write.
+    pub generation: i64,
+}
+
+impl std::fmt::Debug for AccountModelsRow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AccountModelsRow")
+            .field("account_ref", &self.account_ref)
+            .field("hash", &self.hash)
+            .field("generation", &self.generation)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The outcome of [`KeyStore::save_account_virtual_models`] (ADR 022).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AccountModelsCas {
+    /// Written; the row now carries this generation.
+    Applied {
+        /// The new generation.
+        generation: i64,
+    },
+    /// The stored hash did not match `expected_hash`; nothing changed.
+    Stale {
+        /// The hash that is actually current.
+        current_hash: String,
+    },
+}
+
 /// The outcome of a [`KeyStore::insert_config_version`] compare-and-swap
 /// (ADR 012).
 #[derive(Debug, Clone, PartialEq)]
@@ -2508,6 +2547,108 @@ impl KeyStore {
         Ok(ConfigCasOutcome::Applied)
     }
 
+    // ---- Account virtual models (ADR 022) ------------------------------------
+
+    /// One account's stored document, or `None` when it never wrote one.
+    ///
+    /// # Errors
+    /// A database error.
+    pub async fn load_account_virtual_models(
+        &self,
+        account_ref: &str,
+    ) -> Result<Option<AccountModelsRow>, AuthError> {
+        let row = sqlx::query(
+            "SELECT account_ref, document, hash, generation FROM account_virtual_models \
+             WHERE account_ref = ?",
+        )
+        .bind(account_ref)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|r| account_models_row(&r)).transpose()
+    }
+
+    /// Every row written after `generation` (all rows for 0), oldest write
+    /// first. Read by the reload task and the background refresher, never on
+    /// the request path.
+    ///
+    /// # Errors
+    /// A database error.
+    pub async fn account_virtual_models_since(
+        &self,
+        generation: i64,
+    ) -> Result<Vec<AccountModelsRow>, AuthError> {
+        let rows = sqlx::query(
+            "SELECT account_ref, document, hash, generation FROM account_virtual_models \
+             WHERE generation > ? ORDER BY generation",
+        )
+        .bind(generation)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(account_models_row).collect()
+    }
+
+    /// The highest generation written (0 when the table is empty): one
+    /// indexed read, polled by the background refresher.
+    ///
+    /// # Errors
+    /// A database error.
+    pub async fn account_virtual_models_generation(&self) -> Result<i64, AuthError> {
+        let max: Option<i64> =
+            sqlx::query_scalar("SELECT MAX(generation) FROM account_virtual_models")
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(max.unwrap_or(0))
+    }
+
+    /// Compare-and-swap write of one account's document: applies only when
+    /// the stored hash, or `empty_hash` when the account has no row yet,
+    /// equals `expected_hash`. The new row takes the table's highest
+    /// generation plus one. One `BEGIN IMMEDIATE` transaction, for the reason
+    /// [`insert_config_version`](Self::insert_config_version) gives.
+    ///
+    /// # Errors
+    /// A database error.
+    pub async fn save_account_virtual_models(
+        &self,
+        account_ref: &str,
+        document: &str,
+        hash: &str,
+        expected_hash: &str,
+        empty_hash: &str,
+    ) -> Result<AccountModelsCas, AuthError> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let current: Option<String> =
+            sqlx::query_scalar("SELECT hash FROM account_virtual_models WHERE account_ref = ?")
+                .bind(account_ref)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let current_hash = current.unwrap_or_else(|| empty_hash.to_owned());
+        if current_hash != expected_hash {
+            return Ok(AccountModelsCas::Stale { current_hash });
+        }
+        let generation: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(generation), 0) + 1 FROM account_virtual_models",
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO account_virtual_models (account_ref, document, hash, generation, updated_at) \
+             VALUES (?, ?, ?, ?, ?) \
+             ON CONFLICT (account_ref) DO UPDATE SET document = excluded.document, \
+             hash = excluded.hash, generation = excluded.generation, \
+             updated_at = excluded.updated_at",
+        )
+        .bind(account_ref)
+        .bind(document)
+        .bind(hash)
+        .bind(generation)
+        .bind(now_unix())
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(AccountModelsCas::Applied { generation })
+    }
+
     // ---- Diagnostics --------------------------------------------------------
 
     /// Render every stored row as text - a **test/diagnostic** helper backing
@@ -2702,4 +2843,14 @@ mod input_validation_tests {
         assert!(patch.validate().is_err());
         assert!(GroupPatch::default().validate().is_ok());
     }
+}
+
+/// Read one `account_virtual_models` row.
+fn account_models_row(row: &sqlx::sqlite::SqliteRow) -> Result<AccountModelsRow, AuthError> {
+    Ok(AccountModelsRow {
+        account_ref: row.try_get("account_ref")?,
+        document: row.try_get("document")?,
+        hash: row.try_get("hash")?,
+        generation: row.try_get("generation")?,
+    })
 }

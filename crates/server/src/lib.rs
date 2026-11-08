@@ -5,6 +5,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod account_models;
+pub mod account_models_admin;
 pub mod accounting;
 pub mod admin;
 pub mod admin_scope;

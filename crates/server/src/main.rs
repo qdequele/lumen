@@ -760,6 +760,18 @@ fn run(config_path: PathBuf) -> anyhow::Result<()> {
             }
         }
 
+        // Account virtual models (ADR 022): every stored document loaded and
+        // compiled once here, then kept current by the admin writes, every
+        // reload and the background refresher (other processes' writes). A
+        // load failure boots without them; the refresher retries.
+        if let Some(runtime) = &auth_runtime {
+            lumen_server::account_models::refresh(&runtime.store, &resilience).await;
+            drop(lumen_server::account_models::spawn_refresher(
+                runtime.store.clone(),
+                Arc::clone(&resilience),
+            ));
+        }
+
         // Billing usage events (ADR 015). Strictly opt-in: with no
         // [usage_events] block nothing below runs and no metric is registered.
         let usage_events_cancel = CancellationToken::new();

@@ -94,12 +94,15 @@ pub async fn chat(
     // requested id, and is applied exactly once. Facts are dropped before any
     // `.await`.
     // A deprecated bare id (`gpt-4o`) resolves to its `provider/model` id.
-    let client_model = state.resilience.canonical_model(&req.model);
+    // An account key also resolves its account's own virtual models (ADR 022).
+    let account = key.as_deref().and_then(|k| k.0.account_ref());
+    let account = account.as_deref().map(String::as_str);
+    let client_model = state.resilience.canonical_model_for(account, &req.model);
     let mut decision = {
         let (headers, key, req) = (&headers, key.as_deref(), &mut req);
         state
             .resilience
-            .decide(Capability::Chat, &client_model, move |preset| {
+            .decide_for(Capability::Chat, account, &client_model, move |preset| {
                 if let Some(preset) = preset {
                     preset.apply_prompt(req);
                 }
@@ -357,7 +360,7 @@ async fn chat_streaming(
     let (stream, served) = executed.value;
     accounting.served_by(&executed.model_used, &executed.provider_used);
     let route = ctx.decision.route_of(executed.index);
-    accounting.set_route(route);
+    accounting.set_route(route, ctx.decision.account);
 
     // A fresh first-frame deadline for the committed stream. The peek already
     // consumed (and re-attached) the first content frame, so this frame is
@@ -440,7 +443,7 @@ async fn chat_non_streaming(
     // (an early return above drops `accounting`, refunding the reservation)
     accounting.served_by(&executed.model_used, &executed.provider_used);
     let route = ctx.decision.route_of(executed.index);
-    accounting.set_route(route);
+    accounting.set_route(route, ctx.decision.account);
     let (mut response, served) = executed.value;
     let served_model = executed.model_used.clone();
     let billable = matches!(served, Served::Platform);
@@ -852,6 +855,7 @@ mod tests {
             virtual_model: Some("acme/bot".into()),
             preset: None,
             attempts,
+            account: false,
         }
     }
 
