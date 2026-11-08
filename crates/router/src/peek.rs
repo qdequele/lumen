@@ -122,6 +122,7 @@ mod tests {
                     provider: "p".to_owned(),
                     status: 500,
                     retryable: true,
+                    retry_after: None,
                 })]),
                 "p",
                 &cancel,

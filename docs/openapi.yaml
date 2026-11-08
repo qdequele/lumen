@@ -783,6 +783,10 @@ components:
         total_timeout_ms: { type: [integer, "null"] }
         strict: { type: boolean, default: false }
         connect_timeout_ms: { type: [integer, "null"] }
+        retry_max_attempts: { type: [integer, "null"], minimum: 1, description: "Retry override for this provider (ADR 021); `null` inherits `[resilience]`." }
+        retry_base_ms: { type: [integer, "null"], minimum: 1 }
+        retry_max_ms: { type: [integer, "null"], minimum: 1 }
+        retry_after_max_ms: { type: [integer, "null"], minimum: 1, description: "Longest upstream wait hint (Retry-After, loading estimated_time) honoured, in ms." }
         models:
           type: array
           description: "`[[providers.models]]` tables (`id`, `capabilities`, ...)."

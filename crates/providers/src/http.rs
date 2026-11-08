@@ -17,13 +17,15 @@ use crate::mapping::{classify_error, parse_retry_after};
 /// Most bytes of an upstream error body read for classification (ADR 014).
 const MAX_ERROR_BODY: usize = 16 * 1024;
 
-/// Longest wait for an upstream error body. An upstream that sends a 4xx
-/// header and then stalls the body must not hold the request until the
-/// first-token timeout (and turn a client error into a retryable timeout).
+/// Longest wait for an upstream error body. An upstream that sends a 4xx or
+/// 503 header and then stalls the body must not hold the request until the
+/// first-token timeout (and turn a client error into a retryable timeout, or
+/// delay a cold-start retry).
 const ERROR_BODY_DEADLINE: Duration = Duration::from_millis(500);
 
-/// Read at most [`MAX_ERROR_BODY`] bytes of an error response, only for
-/// client-error statuses ([`crate::mapping::reads_error_body`]), for at most
+/// Read at most [`MAX_ERROR_BODY`] bytes of an error response, only for the
+/// statuses [`crate::mapping::reads_error_body`] selects (client errors but
+/// 429, and 503 for its loading estimate, ADR 021), for at most
 /// [`ERROR_BODY_DEADLINE`]; on the deadline the bytes read so far are used
 /// (plain status classification applies when they carry no marker).
 /// Cancellation is the caller's: every call site runs inside [`with_cancel`].

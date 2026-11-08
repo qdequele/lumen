@@ -15,8 +15,13 @@ design.
 Applied **only** to retryable upstream failures: 5xx, connect/read timeouts,
 and 429. A client 4xx is **never** retried - a fallback provider would reject
 it too. Backoff is exponential with **equal jitter**, and honors an upstream
-`Retry-After` header as a floor (a `Retry-After: 3` guarantees at least a
-3-second wait). While streaming, commitment happens at the **first content
+wait hint as a floor: a 429 or 503 `Retry-After` header (a `Retry-After: 3`
+guarantees at least a 3-second wait), or, on a 503 without that header, the
+`estimated_time` of a Hugging Face loading response. A hint longer than
+`retry_after_max_ms` is not waited for, and a wait that would end past the
+total timeout is not started: in both cases the upstream error is returned
+(or failed over) at once ([ADR 021](../adr/021-upstream-cold-start-retry.md)).
+While streaming, commitment happens at the **first content
 frame**, not at the open: after the upstream opens (2xx + headers), the
 gateway peeks the first frame before committing. An upstream that opens
 `200` then errors or closes before delivering any content still retries and
@@ -30,12 +35,43 @@ amendment)](../adr/005-resilience-execution.md) and
 
 ```toml
 [resilience]
-retry_max_attempts = 3   # total attempts per provider incl. the first (>= 1)
-retry_base_ms = 200      # base backoff wait after the first failure
-retry_max_ms = 5000      # ceiling on the exponential backoff term
+retry_max_attempts = 3       # total attempts per provider incl. the first (>= 1)
+retry_base_ms = 200          # base backoff wait after the first failure
+retry_max_ms = 5000          # ceiling on the exponential backoff term
+retry_after_max_ms = 60000   # longest upstream wait hint honoured
 ```
 
 Set `retry_max_attempts = 1` to disable retries entirely.
+
+A retry never bills twice: a request is admitted once before the first
+attempt and settled once with the usage of the attempt that succeeded.
+
+### Scale-to-zero upstreams (cold start)
+
+A scale-to-zero endpoint (a Hugging Face Inference Endpoint, a serverless
+GPU host) answers 503 while it wakes up, often for 10 to 60 seconds. When it
+says how long (`Retry-After`, or Hugging Face's `estimated_time`), the
+gateway waits that long and retries, with no configuration. When it does not,
+the default policy (3 attempts in about 600 ms) gives up too early. Give that
+provider its own, longer policy; every other provider keeps the global one:
+
+```toml
+[[providers]]
+name = "hf-bge-m3"
+kind = "tei"
+base_url = "https://xyz.endpoints.huggingface.cloud"
+retry_max_attempts = 6       # 5 backoffs: about 15 to 30 s in total
+retry_base_ms = 1000
+retry_max_ms = 15000
+# retry_after_max_ms = 120000  # if its hints can exceed the 60 s default
+```
+
+A hint above `retry_after_max_ms` gets no retry at all: a big model whose
+loading `estimated_time` is over 60 s needs that cap raised on its provider.
+
+The four `retry_*` keys can be set on any provider; unset keys inherit
+`[resilience]`. In a virtual model each target is retried on its own
+provider's policy. The total timeout still bounds the whole request.
 
 ## Fallback chains
 

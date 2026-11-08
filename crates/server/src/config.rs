@@ -360,6 +360,11 @@ pub struct ResilienceConfig {
     /// Ceiling on the exponential backoff term in ms.
     #[serde(default = "default_retry_max_ms")]
     pub retry_max_ms: u64,
+    /// Longest upstream wait hint honoured, in ms (ADR 021): a 429/503
+    /// `Retry-After` or a loading `estimated_time` asking for more is not
+    /// waited for; the error is returned (or failed over) at once.
+    #[serde(default = "default_retry_after_max_ms")]
+    pub retry_after_max_ms: u64,
     /// Consecutive provider-fault failures that trip a circuit open.
     #[serde(default = "default_circuit_failure_threshold")]
     pub circuit_failure_threshold: u32,
@@ -386,6 +391,7 @@ impl Default for ResilienceConfig {
             retry_max_attempts: default_retry_max_attempts(),
             retry_base_ms: default_retry_base_ms(),
             retry_max_ms: default_retry_max_ms(),
+            retry_after_max_ms: default_retry_after_max_ms(),
             circuit_failure_threshold: default_circuit_failure_threshold(),
             circuit_cooldown_ms: default_circuit_cooldown_ms(),
             connect_timeout_ms: default_connect_timeout_ms(),
@@ -403,13 +409,14 @@ impl ResilienceConfig {
             path: path_label.to_owned(),
             message,
         };
-        let checks: [(&str, u64); 7] = [
+        let checks: [(&str, u64); 8] = [
             (
                 "resilience.retry_max_attempts",
                 u64::from(self.retry_max_attempts),
             ),
             ("resilience.retry_base_ms", self.retry_base_ms),
             ("resilience.retry_max_ms", self.retry_max_ms),
+            ("resilience.retry_after_max_ms", self.retry_after_max_ms),
             (
                 "resilience.circuit_failure_threshold",
                 u64::from(self.circuit_failure_threshold),
@@ -715,6 +722,22 @@ pub struct ProviderConfig {
     /// rest.
     #[serde(default)]
     pub connect_timeout_ms: Option<u64>,
+    /// Per-provider retry override (ADR 021): total attempts incl. the first
+    /// (else [`ResilienceConfig::retry_max_attempts`]). A scale-to-zero
+    /// endpoint that answers 503 while it wakes up can be given more
+    /// attempts than the rest.
+    #[serde(default)]
+    pub retry_max_attempts: Option<u32>,
+    /// Per-provider base backoff in ms (else [`ResilienceConfig::retry_base_ms`]).
+    #[serde(default)]
+    pub retry_base_ms: Option<u64>,
+    /// Per-provider backoff ceiling in ms (else [`ResilienceConfig::retry_max_ms`]).
+    #[serde(default)]
+    pub retry_max_ms: Option<u64>,
+    /// Per-provider cap on an upstream wait hint in ms (else
+    /// [`ResilienceConfig::retry_after_max_ms`]).
+    #[serde(default)]
+    pub retry_after_max_ms: Option<u64>,
     /// Models this provider exposes.
     #[serde(default)]
     pub models: Vec<ModelConfig>,
@@ -914,7 +937,7 @@ impl From<LogFormatConfig> for LogFormat {
     }
 }
 
-/// Per-provider knob validation: timeout overrides must not be 0, and
+/// Per-provider knob validation: timeout and retry overrides must not be 0, and
 /// `api_version` must be non-blank, carry no leading/trailing whitespace
 /// (a padded value would be percent-encoded verbatim into the request URL
 /// and fail upstream with an Azure 4xx only at request time), and only
@@ -929,6 +952,13 @@ fn validate_provider_knobs(
         ("first_token_timeout_ms", provider.first_token_timeout_ms),
         ("total_timeout_ms", provider.total_timeout_ms),
         ("connect_timeout_ms", provider.connect_timeout_ms),
+        (
+            "retry_max_attempts",
+            provider.retry_max_attempts.map(u64::from),
+        ),
+        ("retry_base_ms", provider.retry_base_ms),
+        ("retry_max_ms", provider.retry_max_ms),
+        ("retry_after_max_ms", provider.retry_after_max_ms),
     ] {
         if value == Some(0) {
             return Err(err(format!(
@@ -1043,6 +1073,9 @@ const fn default_retry_base_ms() -> u64 {
 }
 const fn default_retry_max_ms() -> u64 {
     5_000
+}
+const fn default_retry_after_max_ms() -> u64 {
+    60_000
 }
 const fn default_circuit_failure_threshold() -> u32 {
     5
@@ -3160,6 +3193,7 @@ mod tests {
         assert_eq!(cfg.resilience.retry_max_attempts, 3);
         assert_eq!(cfg.resilience.retry_base_ms, 200);
         assert_eq!(cfg.resilience.retry_max_ms, 5_000);
+        assert_eq!(cfg.resilience.retry_after_max_ms, 60_000);
         assert_eq!(cfg.resilience.circuit_failure_threshold, 5);
         assert_eq!(cfg.resilience.circuit_cooldown_ms, 30_000);
         assert_eq!(cfg.resilience.connect_timeout_ms, 5_000);
@@ -3173,6 +3207,41 @@ mod tests {
         assert!(err.to_string().contains("retry_max_attempts"));
         let err = load_str("[resilience]\ntotal_timeout_ms = 0\n").unwrap_err();
         assert!(err.to_string().contains("total_timeout_ms"));
+        let err = load_str("[resilience]\nretry_after_max_ms = 0\n").unwrap_err();
+        assert!(err.to_string().contains("retry_after_max_ms"));
+    }
+
+    #[test]
+    fn provider_retry_overrides_parse_and_reject_zero() {
+        let base = r#"
+            [[providers]]
+            name = "hf"
+            kind = "tei"
+            base_url = "http://127.0.0.1:9"
+            EXTRA
+            [[providers.models]]
+            id = "hf/bge-m3"
+            capabilities = ["embed"]
+        "#;
+        let cfg = load_str(&base.replace(
+            "EXTRA",
+            "retry_max_attempts = 6\nretry_base_ms = 1000\nretry_max_ms = 15000\nretry_after_max_ms = 120000",
+        ))
+        .unwrap();
+        let p = &cfg.providers[0];
+        assert_eq!(p.retry_max_attempts, Some(6));
+        assert_eq!(p.retry_base_ms, Some(1000));
+        assert_eq!(p.retry_max_ms, Some(15_000));
+        assert_eq!(p.retry_after_max_ms, Some(120_000));
+        for field in [
+            "retry_max_attempts",
+            "retry_base_ms",
+            "retry_max_ms",
+            "retry_after_max_ms",
+        ] {
+            let err = load_str(&base.replace("EXTRA", &format!("{field} = 0"))).unwrap_err();
+            assert!(err.to_string().contains(field), "{field}: {err}");
+        }
     }
 
     const LEGACY_FALLBACK: &str = r#"

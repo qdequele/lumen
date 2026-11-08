@@ -68,6 +68,9 @@ pub fn check_unsupported_chat_fields(
 }
 
 /// Classify a non-success upstream status into a [`ProviderError`].
+///
+/// `retry_after` is kept for a 429 and a 503 only (RFC 9110 defines
+/// `Retry-After` on those two); on any other status it is ignored.
 #[must_use]
 pub fn classify_status(
     provider: &str,
@@ -80,16 +83,20 @@ pub fn classify_status(
             retry_after,
         },
         // Server-side failures are worth retrying (possibly on a fallback).
+        // A 503 may say when to come back (a scale-to-zero endpoint waking
+        // up, ADR 021): the retry loop floors its backoff at that hint.
         500..=599 => ProviderError::Upstream {
             provider: provider.to_owned(),
             status,
             retryable: true,
+            retry_after: if status == 503 { retry_after } else { None },
         },
         // Other 4xx (401/403/404/422/...) are the caller's fault: not retryable.
         _ => ProviderError::Upstream {
             provider: provider.to_owned(),
             status,
             retryable: false,
+            retry_after: None,
         },
     }
 }
@@ -137,12 +144,40 @@ pub const fn needs_error_body(status: u16) -> bool {
 
 /// Statuses whose (bounded) error body is read at all: every client error but
 /// 429, so the upstream's own explanation of a 400/401/404/422 reaches the
-/// log. 429 carries `Retry-After` instead, and 5xx bodies are skipped so a
-/// stalled body never delays a retry or failover. Only
-/// [`needs_error_body`] statuses are classified from it.
+/// log, and 503, whose body may carry a loading `estimated_time` (ADR 021).
+/// 429 carries `Retry-After` instead, and other 5xx bodies are skipped so a
+/// stalled body never delays a retry or failover (a 503 body is read under
+/// the same 500 ms deadline as a 4xx one). Only [`needs_error_body`]
+/// statuses are classified from it.
 #[must_use]
 pub const fn reads_error_body(status: u16) -> bool {
-    status >= 400 && status < 500 && status != 429
+    (status >= 400 && status < 500 && status != 429) || status == 503
+}
+
+/// Longest loading estimate honoured from a body, in seconds. Anything larger
+/// is clamped here; the retry loop's `retry_after_max_ms` cap then decides
+/// whether the wait is worth it at all.
+const MAX_LOADING_ESTIMATE_SECS: f64 = 86_400.0;
+
+/// The wait a 503 body asks for: Hugging Face's loading response
+/// (`{"error": "... is currently loading", "estimated_time": 20.0}`) carries
+/// the seconds until the model is up as a top-level `estimated_time`. Rounded
+/// up to whole milliseconds. `None` when the body is not JSON, has no such
+/// number, or the number is not a finite positive value.
+#[must_use]
+pub fn loading_estimate(body: &[u8]) -> Option<Duration> {
+    if body.is_empty() {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let secs = value.get("estimated_time")?.as_f64()?;
+    if !secs.is_finite() || secs <= 0.0 {
+        return None;
+    }
+    let millis = (secs.min(MAX_LOADING_ESTIMATE_SECS) * 1000.0).ceil();
+    // Bounded to [1, 86_400_000] above: exact in f64, fits u64, non-negative.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    Some(Duration::from_millis(millis as u64))
 }
 
 /// Longest upstream error message written to the log, in characters.
@@ -374,6 +409,13 @@ pub fn classify_error(
             };
         }
     }
+    // A 503 without a useful `Retry-After` may still say when it will be up
+    // in its body (Hugging Face loading response). A non-zero header wins;
+    // `Retry-After: 0` says nothing, so a body estimate replaces it.
+    let retry_after = match retry_after {
+        None | Some(Duration::ZERO) if status == 503 => loading_estimate(body).or(retry_after),
+        hint => hint,
+    };
     classify_status(provider, status, retry_after)
 }
 
@@ -581,9 +623,72 @@ mod tests {
         for status in [400, 401, 403, 404, 413, 422, 451] {
             assert!(reads_error_body(status), "{status}");
         }
-        for status in [200, 302, 429, 500, 503, 529] {
+        for status in [200, 302, 429, 500, 502, 504, 529] {
             assert!(!reads_error_body(status), "{status}");
         }
+        // A 503 body may carry a loading estimate (ADR 021).
+        assert!(reads_error_body(503));
+    }
+
+    #[test]
+    fn a_503_keeps_its_retry_after_and_other_5xx_drop_it() {
+        let hint = Some(Duration::from_secs(7));
+        assert_eq!(classify_status("p", 503, hint).retry_after(), hint);
+        for status in [500, 502, 504] {
+            let err = classify_status("p", status, hint);
+            assert!(err.is_retryable(), "{status}");
+            assert_eq!(err.retry_after(), None, "{status}");
+        }
+        assert_eq!(classify_status("p", 401, hint).retry_after(), None);
+    }
+
+    #[test]
+    fn hf_loading_estimate_is_read_from_a_503_body() {
+        let body = br#"{"error":"Model BAAI/bge-m3 is currently loading","estimated_time":20.5}"#;
+        let err = classify_error("hf", 503, None, body);
+        assert!(err.is_retryable());
+        assert_eq!(err.retry_after(), Some(Duration::from_millis(20_500)));
+        // Rounded up to the millisecond.
+        assert_eq!(
+            loading_estimate(br#"{"estimated_time":0.0001}"#),
+            Some(Duration::from_millis(1))
+        );
+    }
+
+    #[test]
+    fn retry_after_header_wins_over_the_body_estimate() {
+        let body = br#"{"estimated_time":20.0}"#;
+        let err = classify_error("hf", 503, Some(Duration::from_secs(2)), body);
+        assert_eq!(err.retry_after(), Some(Duration::from_secs(2)));
+        // `Retry-After: 0` says nothing: the body estimate is used instead.
+        let err = classify_error("hf", 503, Some(Duration::ZERO), body);
+        assert_eq!(err.retry_after(), Some(Duration::from_secs(20)));
+        // And with no estimate, the zero header is kept as is.
+        let err = classify_error("hf", 503, Some(Duration::ZERO), b"");
+        assert_eq!(err.retry_after(), Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn loading_estimate_ignores_junk_and_other_statuses() {
+        for body in [
+            &b""[..],
+            b"not json",
+            br#"{"estimated_time":"soon"}"#,
+            br#"{"estimated_time":-3}"#,
+            br#"{"estimated_time":0}"#,
+            br#"{"error":{"estimated_time":5}}"#,
+            br"[1,2]",
+        ] {
+            assert_eq!(loading_estimate(body), None, "{body:?}");
+        }
+        // Huge estimates are clamped, never overflow.
+        assert_eq!(
+            loading_estimate(br#"{"estimated_time":1e300}"#),
+            Some(Duration::from_secs(86_400))
+        );
+        // Only a 503 reads the body estimate.
+        let body = br#"{"estimated_time":5}"#;
+        assert_eq!(classify_error("p", 500, None, body).retry_after(), None);
     }
 
     #[test]
