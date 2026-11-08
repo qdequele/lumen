@@ -355,7 +355,9 @@ async fn chat_streaming(
             }
         },
     )
-    .await?;
+    .await
+    // Every attempt failed: still leave a status-only usage row.
+    .map_err(|e| accounting.fail(e))?;
     // (an early return above drops `accounting`, refunding the reservation)
     let (stream, served) = executed.value;
     accounting.served_by(&executed.model_used, &executed.provider_used);
@@ -439,7 +441,9 @@ async fn chat_non_streaming(
             }
         },
     )
-    .await?;
+    .await
+    // Every attempt failed: still leave a status-only usage row.
+    .map_err(|e| accounting.fail(e))?;
     // (an early return above drops `accounting`, refunding the reservation)
     accounting.served_by(&executed.model_used, &executed.provider_used);
     let route = ctx.decision.route_of(executed.index);

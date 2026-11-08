@@ -197,8 +197,10 @@ capabilities = ["chat"]
 - **Translation**: OpenAI ⇄ Anthropic is bidirectional, including tools and
   streaming events, so clients keep using the OpenAI wire format.
   `parallel_tool_calls: false` maps to `tool_choice.disable_parallel_tool_use`;
-  `response_format`, `seed`, `logprobs`, `frequency_penalty` and
-  `presence_penalty` have no Messages API equivalent - see
+  `response_format: json_schema` maps to structured outputs
+  (`output_config.format`); `response_format: json_object`, `seed`,
+  `logprobs`, `frequency_penalty` and `presence_penalty` have no Messages API
+  equivalent - see
   [chat extras](#openai-chat-extras-on-translated-providers) and the
   `strict` flag.
 - **base_url**: optional override.
@@ -1052,7 +1054,7 @@ so each of these is either **mapped** onto a native equivalent or explicitly
 
 | Field | `anthropic` | `google` / `vertex_ai` | `bedrock` | `cohere` |
 |-----------------------|-------------|------------------------|-----------|----------|
-| `response_format` | unsupported | mapped¹ | unsupported | mapped² |
+| `response_format` | mapped⁵ | mapped¹ | unsupported | mapped² |
 | `seed` | unsupported | mapped (`generationConfig.seed`) | unsupported | mapped |
 | `logprobs` | unsupported | unsupported | unsupported | unsupported³ |
 | `top_logprobs` | unsupported | unsupported | unsupported | unsupported³ |
@@ -1083,6 +1085,22 @@ malformed response.
 `tool_choice.disable_parallel_tool_use: true` (defaulting the choice to
 `auto` when the request carries tools but no explicit `tool_choice`);
 `true` is the default on both sides and needs no wire field.
+
+⁵ `{"type": "json_schema", "json_schema": {"schema": ...}}` becomes
+Anthropic structured outputs, `output_config: {"format": {"type":
+"json_schema", "schema": ...}}`, on both the streaming and non-streaming
+paths. The schema is adapted to what structured outputs accept: every object
+gets `additionalProperties: false`, numeric and length constraints
+(`minimum`, `maximum`, `exclusiveMinimum`, `exclusiveMaximum`, `multipleOf`,
+`minLength`, `maxLength`, `maxItems`, and `minItems` above 1) are dropped,
+and `oneOf` becomes `anyOf`. `{"type": "text"}` is the default and sends
+nothing. `{"type": "json_object"}` (schema-less JSON mode) and a
+`json_schema` without a `schema` have no equivalent and stay unsupported,
+as does a schema with a free-form object or map (an object with no
+`properties` whose `additionalProperties` is not `false`), since closing it
+would only allow `{}`. A schema feature Anthropic rejects that the gateway
+does not adapt (a recursive `$ref`, for example) comes back as an upstream
+400, reported as `502` `LM-3003`.
 
 What happens to an **unsupported** field depends on the provider's `strict`
 flag (the same switch Ollama uses for embeddings `dimensions`, issue #25):

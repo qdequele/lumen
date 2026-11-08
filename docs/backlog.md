@@ -311,8 +311,9 @@ Follow-ups of the decisions spec (`docs/superpowers/specs/2026-10-08-decisions-d
   RESOLVED (issue #26, ADR 007): admission refusals (402/429) now enqueue a
   status-only usage row (zero tokens, `status` carries the rejection) through
   the same non-blocking channel. 401 stays unlogged (refused in the auth
-  middleware, before accounting opens - no key to attribute); upstream failures
-  are already logged by the normal finish path.
+  middleware, before accounting opens - no key to attribute). Upstream
+  failures of an admitted request (the whole chain failed) leave the same
+  status-only row with the client-facing status (502/503/504...).
 - **Rejected requests still count toward RPM/TPM.** ~~Quota bumps are not
   unwound when a later admission step (budget) refuses the request.~~ RESOLVED
   (issue #26, ADR 007): a request refused *inside* admission (TPM after RPM, or

@@ -6,6 +6,35 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **`response_format: json_schema` now works on Anthropic models.** The
+  Anthropic provider dropped `response_format` (or refused it with `strict =
+  true`), so a client asking Claude for a JSON schema got free text back
+  (`Apple` for a `{"fruit": string}` schema). It now maps to Anthropic
+  structured outputs (`output_config.format`), streaming and not, with the
+  schema adapted to what Anthropic accepts (objects closed with
+  `additionalProperties: false`, numeric and length constraints dropped,
+  `oneOf` read as `anyOf`). `json_object` has no Anthropic equivalent and is
+  still dropped (refused with `strict = true`). See the chat-extras matrix in
+  `docs/providers.md`.
+
+- **Voyage embeddings are billed on the upstream token count.** Voyage (and
+  MongoDB's Voyage endpoint) reports embedding usage as `total_tokens` only,
+  and the gateway read `prompt_tokens`, so every Voyage embedding settled on
+  the local estimate, flagged `estimated`, in the response, `usage_log` and
+  the key's budget (2,500 tokens charged for an input Voyage counts at about
+  2,000). The reported count is now used.
+
+- **Upstream failures are in the usage log.** A request admitted and then
+  failed upstream (every attempt failed, timed out, or the fallback chain was
+  spent: `LM-3003`, `LM-3004`, `LM-3005`, ...) left no `usage_log` row, so the
+  usage summary's `requests_server_error` and the console's error counts
+  never showed an upstream outage on chat, embeddings, rerank or decisions.
+  It now leaves a status-only row like an admission refusal: zero tokens,
+  zero cost, the status the client got. The budget reservation is still
+  refunded.
+
 ## [0.10.0] - 2026-11-08
 
 ### Added

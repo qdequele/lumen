@@ -208,7 +208,9 @@ pub async fn embeddings(
                 .await
             }
         })
-        .await?;
+        .await
+        // Every attempt failed: still leave a status-only usage row.
+        .map_err(|e| accounting.fail(e))?;
     // (an early return above drops `accounting`, refunding the reservation)
 
     let (mut response, served) = executed.value;

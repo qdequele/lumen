@@ -1565,3 +1565,42 @@ async fn ollama_non_strict_drops_dimensions_and_embeds() {
     assert_eq!(resp.data.len(), 2);
     assert_eq!(mock.received_requests().await.unwrap().len(), 1);
 }
+
+/// Voyage's `/embeddings` reports usage as `{"total_tokens": N}` only (no
+/// `prompt_tokens`, unlike OpenAI). The gateway settles embeddings on
+/// `prompt_tokens`, so the provider must surface Voyage's count there;
+/// before the fix every Voyage embedding was billed on a local estimate and
+/// flagged `estimated`, although the upstream reported the real count.
+#[tokio::test]
+async fn voyage_embed_reports_upstream_total_tokens_as_prompt_tokens() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/embeddings"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "object": "list",
+            "data": [{ "object": "embedding", "index": 0, "embedding": [0.5, 0.25] }],
+            "model": "voyage-4-lite",
+            "usage": { "total_tokens": 7 }
+        })))
+        .expect(1)
+        .mount(&mock)
+        .await;
+    let provider = VoyageProvider::new(
+        reqwest::Client::new(),
+        "voyage-test",
+        Some(mock.uri()),
+        Some("pa-test".to_owned()),
+    );
+    let req = EmbedRequest {
+        model: "voyage-4-lite".to_owned(),
+        input: EmbedInput::Single("what is the capital of france".into()),
+        encoding_format: None,
+        dimensions: None,
+        user: None,
+        extra: serde_json::Map::new(),
+    };
+    let resp = provider.embed(req, CancellationToken::new()).await.unwrap();
+    assert_eq!(resp.usage.prompt_tokens, 7);
+    assert_eq!(resp.usage.total_tokens, 7);
+    assert_eq!(resp.usage.estimated, None);
+}
