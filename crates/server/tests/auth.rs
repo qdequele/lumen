@@ -1944,3 +1944,65 @@ async fn upstream_failure_is_recorded_as_a_status_only_usage_row() {
         .expect("key");
     assert_eq!(entry.spent_micro(), 0, "refunded after the failures");
 }
+
+/// A request admitted and then refused before any upstream call (here the
+/// guarded image fetch refuses a loopback URL) also leaves a status-only row,
+/// and its reservation is refunded.
+#[tokio::test]
+async fn image_fetch_failure_after_admission_is_recorded() {
+    let upstream = MockServer::start().await;
+    let registry = Arc::new(
+        Registry::build(
+            vec![ProviderSpec {
+                name: "openai".to_owned(),
+                kind: ProviderKind::Openai,
+                api_key: Some("sk-test-xxx".to_owned()),
+                base_url: Some(upstream.uri()),
+                api_version: None,
+                strict: false,
+                connect_timeout_ms: None,
+                models: vec![ModelSpec {
+                    id: "openai/embed-mm".to_owned(),
+                    upstream_id: "embed-mm".to_owned(),
+                    capabilities: vec![Capability::Embed],
+                    modalities: vec!["text".to_owned(), "image".to_owned()],
+                    release_date: None,
+                }],
+                decisions_path: None,
+                forward_unknown_fields: None,
+            }],
+            http::build_client(),
+            std::time::Duration::from_secs(300),
+        )
+        .expect("registry builds"),
+    );
+    let h = spawn_auth(registry, &[]).await;
+    let key = h.create_key(Some(100.0), None, None).await;
+
+    let resp = h
+        .client
+        .post(format!("{}/v1/embeddings", h.base))
+        .bearer_auth(&key)
+        .json(&json!({
+            "model": "openai/embed-mm",
+            "input": [[
+                { "type": "image_url", "image_url": { "url": "http://127.0.0.1:1/cat.png" } }
+            ]]
+        }))
+        .send()
+        .await
+        .expect("send");
+    let status = resp.status().as_u16();
+    assert!(status >= 400, "the fetch is refused: {status}");
+
+    h.wait_usage_rows(1).await;
+    let dump = h.store.debug_dump().await.expect("dump");
+    assert!(dump.contains(&format!("|{status}|")), "{dump}");
+    assert!(upstream.received_requests().await.unwrap().is_empty());
+    let entry = h
+        .runtime
+        .keys
+        .authenticate(&key, lumen_server::auth::now_unix())
+        .expect("key");
+    assert_eq!(entry.spent_micro(), 0, "refunded");
+}

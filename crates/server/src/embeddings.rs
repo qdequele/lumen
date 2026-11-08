@@ -163,7 +163,9 @@ pub async fn embeddings(
         &state.image_fetch(),
         &cancel,
     )
-    .await?;
+    .await
+    // Admitted, then failed before any upstream call: still leave a row.
+    .map_err(|e| accounting.fail(e))?;
 
     // Execute across the chain with retries, fallback, circuit breaking and the
     // per-model timeouts. A fresh request clone (per attempt/link) carries that
