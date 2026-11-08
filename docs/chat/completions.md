@@ -73,6 +73,16 @@ header, and the path taken in `x-lumen-route`. A virtual model can also carry
 a chat preset (a stored system prompt), which is applied to the request before
 routing. See [Resilience](../operations/resilience.md).
 
+## Cost of a call
+
+A non-streaming completion carries `x-lumen-cost-micro-usd`: the provider
+cost the call settled, in integer micro-USD. It is what the key's budget is
+charged for the call (bandwidth excluded), so a caller can attribute spend to
+its own jobs. It is `0` when a team (BYOK) key paid the provider. With the
+accurate tokenizer on, the header carries the inline estimate and the
+background recount can settle a slightly different amount. Streaming
+responses do not carry it.
+
 ## Providers
 
 Which provider kinds serve `chat` and their setup is in
