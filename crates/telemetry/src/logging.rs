@@ -11,6 +11,9 @@
 //! [`init_logging`] and [`LogGuard`].
 
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, TryLockError};
+use std::time::{Duration, Instant};
 
 use tracing_appender::non_blocking::{ErrorCounter, NonBlocking, NonBlockingBuilder, WorkerGuard};
 use tracing_subscriber::EnvFilter;
@@ -33,6 +36,19 @@ pub enum LogFormat {
     Json,
 }
 
+/// Name of the log writer thread, which [`LogHandle::flush`] recognises so it
+/// never waits on itself.
+const WRITER_THREAD_NAME: &str = "lumen-log-writer";
+
+/// Longest a flush waits for one that another thread already started.
+///
+/// Slightly above the bound `tracing-appender` puts on stopping its worker
+/// (100 ms to queue the stop message, then 1 s for the worker to drain).
+const FLUSH_WAIT: Duration = Duration::from_millis(1_200);
+
+/// How often a waiting flush checks whether the other one is done.
+const FLUSH_POLL: Duration = Duration::from_millis(5);
+
 /// Keeps the log writer thread alive; dropping it flushes the queued lines.
 ///
 /// Hold it for the whole life of the process (a named binding in `main`, not
@@ -42,28 +58,34 @@ pub enum LogFormat {
 /// bounded (about one second), so a stalled log pipe cannot hang shutdown.
 ///
 /// It is not dropped when the process ends through `std::process::exit` or an
-/// aborting panic: lines still queued at that point are lost.
+/// aborting panic. For the panic case, pass [`LogGuard::handle`] to
+/// [`install_panic_flush_hook`]; lines still queued at a
+/// `std::process::exit` are lost.
 #[must_use = "dropping the guard stops the log writer thread; hold it until the process exits"]
 #[derive(Debug)]
 pub struct LogGuard {
-    dropped: ErrorCounter,
-    /// `Option` only so `Drop` can flush before reporting dropped lines.
-    worker: Option<WorkerGuard>,
+    handle: LogHandle,
 }
 
 impl LogGuard {
     /// Number of log lines discarded so far because the queue was full.
     pub fn dropped_lines(&self) -> usize {
-        self.dropped.dropped_lines()
+        self.handle.dropped_lines()
+    }
+
+    /// A handle on the same writer, for the places that outlive a borrow of
+    /// the guard: the panic hook (see [`install_panic_flush_hook`]).
+    pub fn handle(&self) -> LogHandle {
+        self.handle.clone()
     }
 }
 
 impl Drop for LogGuard {
     fn drop(&mut self) {
-        // Dropping the worker guard blocks (bounded) until the writer thread
-        // has written everything queued before this point.
-        drop(self.worker.take());
-        let dropped = self.dropped.dropped_lines();
+        // Blocks (bounded) until the writer thread has written everything
+        // queued before this point.
+        self.handle.flush();
+        let dropped = self.handle.dropped_lines();
         if dropped > 0 {
             // The log queue is closed by now, so this goes straight to stderr.
             // A failed write is ignored: there is nowhere left to report it.
@@ -73,6 +95,117 @@ impl Drop for LogGuard {
             );
         }
     }
+}
+
+/// A cloneable handle on the log writer a [`LogGuard`] owns.
+///
+/// It does not keep the writer alive: the guard does. It lets code that
+/// cannot own the guard (a panic hook) flush the queue before the process
+/// dies.
+#[derive(Debug, Clone)]
+pub struct LogHandle {
+    dropped: ErrorCounter,
+    writer: Arc<WriterSlot>,
+}
+
+/// The writer thread's guard, shared so that whichever comes first (the
+/// [`LogGuard`] dropping or a panic hook) stops the writer, exactly once.
+#[derive(Debug)]
+struct WriterSlot {
+    /// `tracing-appender` can only flush by dropping this guard, so it sits
+    /// in an `Option` that the first flush empties.
+    worker: Mutex<Option<WorkerGuard>>,
+    /// Set once the flush that emptied `worker` has returned.
+    stopped: AtomicBool,
+}
+
+impl LogHandle {
+    /// Number of log lines discarded so far because the queue was full.
+    pub fn dropped_lines(&self) -> usize {
+        self.dropped.dropped_lines()
+    }
+
+    /// Write every queued line and stop the writer thread. Lines logged
+    /// afterwards are never written, so this is for the end of the process
+    /// only.
+    ///
+    /// The wait is bounded (a little over one second) and the call can be
+    /// made from any thread, any number of times, concurrently:
+    ///
+    /// - the first caller stops the writer and waits for it to drain;
+    /// - a caller arriving while that is in progress waits for it to finish
+    ///   (bounded by the same limit) and stops nothing itself;
+    /// - a later caller returns at once;
+    /// - on the writer thread itself (a panic while writing) it does
+    ///   nothing: that thread cannot drain its own queue while it waits.
+    pub fn flush(&self) {
+        if std::thread::current().name() == Some(WRITER_THREAD_NAME) {
+            return;
+        }
+        // `try_lock`, never `lock`: this runs in a panic hook, which must not
+        // park behind another thread. The lock is only ever held for the
+        // `take` below, so a busy lock means another flush is starting.
+        let worker = match self.writer.worker.try_lock() {
+            Ok(mut slot) => slot.take(),
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner().take(),
+            Err(TryLockError::WouldBlock) => None,
+        };
+        if let Some(worker) = worker {
+            // Dropping the worker guard is the only flush `tracing-appender`
+            // offers. It blocks, bounded, until the writer has drained.
+            drop(worker);
+            self.writer.stopped.store(true, Ordering::Release);
+            return;
+        }
+        // Another thread took the worker. Give its flush time to finish, so
+        // a panic that aborts during shutdown does not cut it short. The
+        // sleep is deliberate: this branch only runs while the process is
+        // going down (the guard dropping in `main`, or a panic hook).
+        let deadline = Instant::now() + FLUSH_WAIT;
+        while !self.writer.stopped.load(Ordering::Acquire) && Instant::now() < deadline {
+            std::thread::sleep(FLUSH_POLL);
+        }
+    }
+
+    /// Whether a flush has stopped the writer.
+    #[cfg(test)]
+    fn is_stopped(&self) -> bool {
+        self.writer.stopped.load(Ordering::Acquire)
+    }
+
+    /// Whether a flush has taken the writer (it may still be draining).
+    #[cfg(test)]
+    fn is_claimed(&self) -> bool {
+        self.writer.worker.lock().unwrap().is_none()
+    }
+}
+
+/// Make a panic flush the log queue before the process aborts.
+///
+/// The release profile builds with `panic = "abort"`, so a panic ends the
+/// process without unwinding: the [`LogGuard`] in `main` is never dropped,
+/// and without this hook the lines queued just before the crash (the ones
+/// that explain it) would be lost. The hook first runs the hook that was
+/// installed before it (the default one prints the panic message to stderr),
+/// then calls [`LogHandle::flush`], whose wait is bounded.
+///
+/// Call it once, from `main`, right after [`init_logging`]. It does nothing
+/// in a build where panics unwind (dev and test profiles): there a panic
+/// inside a task is caught and the process keeps running, so stopping the
+/// log writer would silence every later line.
+pub fn install_panic_flush_hook(handle: LogHandle) {
+    if cfg!(panic = "abort") {
+        set_panic_flush_hook(handle);
+    }
+}
+
+/// Chain a hook that flushes `handle` after the current panic hook.
+fn set_panic_flush_hook(handle: LogHandle) {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        previous(info);
+        handle.flush();
+    }));
 }
 
 /// Wrap `writer` in a queue drained by a dedicated thread.
@@ -98,11 +231,16 @@ where
     let (non_blocking, worker) = NonBlockingBuilder::default()
         .lossy(true)
         .buffered_lines_limit(buffered_lines)
-        .thread_name("lumen-log-writer")
+        .thread_name(WRITER_THREAD_NAME)
         .finish(writer);
     let guard = LogGuard {
-        dropped: non_blocking.error_counter(),
-        worker: Some(worker),
+        handle: LogHandle {
+            dropped: non_blocking.error_counter(),
+            writer: Arc::new(WriterSlot {
+                worker: Mutex::new(Some(worker)),
+                stopped: AtomicBool::new(false),
+            }),
+        },
     };
     (non_blocking, guard)
 }
@@ -135,7 +273,7 @@ pub fn init_logging(format: LogFormat, default_directive: &str) -> Option<LogGua
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Condvar, Mutex};
+    use std::sync::Condvar;
 
     /// A writer that parks the writer thread until `open` is called, standing
     /// in for a stalled log pipe.
@@ -209,6 +347,97 @@ mod tests {
         }
         assert!(lines[10].contains("ERROR"), "{}", lines[10]);
         assert!(lines[10].ends_with("fatal at shutdown"), "{}", lines[10]);
+    }
+
+    #[test]
+    fn flushing_through_a_handle_writes_buffered_lines_once() {
+        let sink = GatedSink::default();
+        let (writer, guard) = non_blocking(sink.clone(), 64);
+        let handle = guard.handle();
+
+        emit(writer, 10);
+        assert_eq!(sink.lines(), Vec::<String>::new());
+
+        sink.open();
+        handle.flush();
+        let lines = sink.lines();
+        assert_eq!(lines.len(), 11, "{lines:?}");
+        assert!(lines[10].ends_with("fatal at shutdown"), "{}", lines[10]);
+
+        // The writer is gone: a second flush and the guard's own drop find
+        // nothing left to stop, and return at once.
+        handle.flush();
+        drop(guard);
+        handle.flush();
+        assert_eq!(sink.lines().len(), 11);
+    }
+
+    #[test]
+    fn a_flush_from_the_writer_thread_does_nothing() {
+        let sink = GatedSink::default();
+        let (writer, guard) = non_blocking(sink.clone(), 64);
+        let handle = guard.handle();
+        emit(writer, 1);
+
+        // Stopping the writer from its own thread would wait for an answer
+        // only that thread can give.
+        let on_writer = handle.clone();
+        std::thread::Builder::new()
+            .name(WRITER_THREAD_NAME.to_owned())
+            .spawn(move || on_writer.flush())
+            .unwrap()
+            .join()
+            .unwrap();
+        assert!(!handle.is_stopped());
+        assert_eq!(sink.lines(), Vec::<String>::new());
+
+        sink.open();
+        drop(guard);
+        assert_eq!(sink.lines().len(), 2);
+    }
+
+    #[test]
+    fn a_flush_during_shutdown_waits_for_the_flush_already_running() {
+        let sink = GatedSink::default();
+        let (writer, guard) = non_blocking(sink.clone(), 64);
+        let handle = guard.handle();
+        emit(writer, 10);
+
+        // "Shutdown": the guard is dropped while the sink is still stalled.
+        let shutdown = std::thread::spawn(move || drop(guard));
+        while !handle.is_claimed() {
+            std::thread::yield_now();
+        }
+        // A panic hook firing now has no writer left to stop, but must not
+        // return (and let the process abort) before the lines are out.
+        let hook = {
+            let (handle, sink) = (handle.clone(), sink.clone());
+            std::thread::spawn(move || {
+                handle.flush();
+                sink.lines().len()
+            })
+        };
+        sink.open();
+        assert_eq!(hook.join().unwrap(), 11);
+        shutdown.join().unwrap();
+    }
+
+    #[test]
+    fn the_panic_hook_flushes_buffered_lines() {
+        let sink = GatedSink::default();
+        let (writer, guard) = non_blocking(sink.clone(), 64);
+        emit(writer, 10);
+        sink.open();
+
+        // Installed unconditionally here: the public entry point only does
+        // so when a panic aborts, which a test build does not.
+        set_panic_flush_hook(guard.handle());
+        let panicked = std::thread::spawn(|| panic!("boom")).join();
+        assert!(panicked.is_err());
+
+        // The guard is still alive: only the hook can have stopped the writer.
+        assert!(guard.handle().is_stopped());
+        assert_eq!(sink.lines().len(), 11);
     }
 
     #[test]

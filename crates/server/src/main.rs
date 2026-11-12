@@ -30,7 +30,8 @@ use lumen_server::{
     webhooks::WebhookController,
 };
 use lumen_telemetry::{
-    logging::init_logging, LatencyMetrics, Metrics, ReloadMetrics, ResilienceMetrics, TokenMetrics,
+    logging::{init_logging, install_panic_flush_hook},
+    LatencyMetrics, Metrics, ReloadMetrics, ResilienceMetrics, TokenMetrics,
 };
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -156,7 +157,12 @@ fn main() -> ExitCode {
     // Logging is initialised only after config parses, so the format is known.
     // The guard owns the log writer thread: it lives until `main` returns, where
     // dropping it flushes every queued line (including the error logged below).
-    let _log_guard = init_logging(config.log_format.into(), "info");
+    let log_guard = init_logging(config.log_format.into(), "info");
+    // A panic aborts (release profile) without dropping the guard: the hook
+    // gives the writer the same bounded flush before the process dies.
+    if let Some(guard) = &log_guard {
+        install_panic_flush_hook(guard.handle());
+    }
 
     match run(config_path) {
         Ok(()) => ExitCode::SUCCESS,
