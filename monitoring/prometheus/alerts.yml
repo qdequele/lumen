@@ -8,11 +8,15 @@
 groups:
   - name: lumen
     rules:
-      # The usage-log channel sheds rows instead of blocking the request
-      # path. That protects latency, but every dropped row is token
-      # accounting lost - the never-zero pillar degrades silently unless
-      # this fires. Raise [auth].usage_channel_capacity or investigate DB
-      # write latency.
+      # Counts usage-log rows lost for either of two reasons: the bounded
+      # channel was full (it sheds rows instead of blocking the request
+      # path), or the database refused a batch twice (the writer retries a
+      # failed batch once, then discards its rows). Either way every dropped
+      # row is token accounting lost - the never-zero pillar degrades
+      # silently unless this fires. For channel-full drops raise
+      # [auth].usage_channel_capacity or investigate DB write latency; for
+      # refused batches check the gateway logs for the write error (disk
+      # full, locked or read-only database).
       - alert: LumenUsageLogRowsDropped
         expr: increase(lumen_usage_log_dropped_total[5m]) > 0
         labels:

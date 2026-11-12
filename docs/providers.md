@@ -804,7 +804,9 @@ capabilities = ["rerank"]
 ## tei (self-hosted)
 
 - **kind**: `tei` · **capabilities**: embed, rerank.
-- **Auth**: keyless.
+- **Auth**: optional. Keyless by default; when `api_key_env` is set, the key
+  is sent as a bearer token (for a TEI server started with `--api-key`, or
+  one behind an authenticating proxy).
 - **base_url**: **required** - points at your Text Embeddings Inference server.
   TEI serves one model per process, so `upstream_id` is ignored by the upstream
   but kept for your own clarity.
