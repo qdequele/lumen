@@ -1030,14 +1030,21 @@ pub async fn delete_webhook_signing_key(
 }
 
 /// `PUT /admin/provider-keys/{name}` body.
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 pub struct ProviderKeyBody {
     /// The provider API key to seal. Never logged; encrypted at rest.
     pub key: String,
 }
 
-// The body deliberately has no Debug-derived secret exposure: ProviderKeyBody
-// derives Debug for extractor plumbing but is never logged by the handler.
+// STRICT rule 5: the key must be unrepresentable through `Debug`, so a stray
+// `{:?}` on the extracted body cannot leak it.
+impl std::fmt::Debug for ProviderKeyBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProviderKeyBody")
+            .field("key", &"REDACTED")
+            .finish()
+    }
+}
 
 /// Store a provider key encrypted at rest and apply it without a restart: the
 /// handler pings the hot-reload trigger, and the reloader re-reads the key from
@@ -2675,6 +2682,19 @@ mod tests {
         assert!(
             !dbg.contains("fg-super-secret-plaintext"),
             "Debug output leaked the plaintext: {dbg}"
+        );
+        assert!(dbg.contains("REDACTED"), "Debug output was: {dbg}");
+    }
+
+    #[test]
+    fn provider_key_body_debug_never_shows_the_key() {
+        let body = ProviderKeyBody {
+            key: "sk-provider-plaintext-do-not-print".to_owned(),
+        };
+        let dbg = format!("{body:?}");
+        assert!(
+            !dbg.contains("sk-provider-plaintext-do-not-print"),
+            "Debug output leaked the provider key: {dbg}"
         );
         assert!(dbg.contains("REDACTED"), "Debug output was: {dbg}");
     }
