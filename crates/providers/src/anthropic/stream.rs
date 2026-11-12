@@ -30,7 +30,7 @@ use lumen_core::{ChatChunk, ChatChunkChoice, ChatDelta, ProviderError, Usage};
 use serde::Deserialize;
 use serde_json::json;
 
-use super::map_finish_reason;
+use super::{anthropic_usage, map_finish_reason};
 use crate::chat::{SseTranslator, StreamItem};
 use crate::sse::SseEvent;
 
@@ -194,17 +194,13 @@ impl SseTranslator for AnthropicTranslator {
                 BlockDelta::Other => Ok(Vec::new()),
             },
             AnthropicEvent::MessageDelta { delta, usage } => {
-                let completion = usage.output_tokens;
-                let usage = Usage {
-                    prompt_tokens: self.input_tokens,
-                    completion_tokens: completion,
-                    total_tokens: self.input_tokens.saturating_add(completion),
-                    estimated: None,
-                    // Cache breakdown captured at message_start rides the final
-                    // usage chunk (issue #99); Anthropic has no reasoning split.
-                    prompt_tokens_details: self.prompt_details(),
-                    completion_tokens_details: None,
-                };
+                // Cache breakdown captured at message_start rides the final
+                // usage chunk (issue #99) and counts toward `prompt_tokens`.
+                let usage = anthropic_usage(
+                    self.input_tokens,
+                    usage.output_tokens,
+                    self.prompt_details(),
+                );
                 Ok(vec![StreamItem::Chunk(self.chunk(
                     ChatDelta::default(),
                     map_finish_reason(delta.stop_reason.as_deref()),
@@ -407,7 +403,11 @@ mod tests {
             panic!("expected finish chunk")
         };
         let usage = finish.usage.expect("usage on final chunk");
-        assert_eq!(usage.prompt_tokens, 10);
+        // `input_tokens` (10) excludes cached tokens; OpenAI's `prompt_tokens`
+        // includes them: 10 + 90 + 40.
+        assert_eq!(usage.prompt_tokens, 140);
+        assert_eq!(usage.completion_tokens, 7);
+        assert_eq!(usage.total_tokens, 147);
         assert_eq!(usage.cached_tokens(), Some(90));
         assert_eq!(usage.cache_write_tokens(), Some(40));
     }

@@ -219,6 +219,38 @@ fn anthropic_prompt_details(usage: &AnthropicUsage) -> Option<lumen_core::Prompt
     })
 }
 
+/// OpenAI-shaped usage from Anthropic's counts (shared with the streaming
+/// translator).
+///
+/// Anthropic's `input_tokens` EXCLUDES cached tokens: "total input tokens in
+/// a request is the summation of `input_tokens`,
+/// `cache_creation_input_tokens`, and `cache_read_input_tokens`". In OpenAI
+/// semantics `prompt_tokens` is that total and `prompt_tokens_details` breaks
+/// out a subset of it, so the three are summed here. Reporting `input_tokens`
+/// alone made `cached_tokens` exceed `prompt_tokens` and dropped every cached
+/// token from the token counters (ADR 003).
+pub(super) fn anthropic_usage(
+    input_tokens: u32,
+    output_tokens: u32,
+    prompt_tokens_details: Option<lumen_core::PromptTokensDetails>,
+) -> Usage {
+    let cached = prompt_tokens_details.map_or(0, |d| {
+        d.cached_tokens
+            .unwrap_or_default()
+            .saturating_add(d.cache_creation_tokens.unwrap_or_default())
+    });
+    let prompt_tokens = input_tokens.saturating_add(cached);
+    Usage {
+        prompt_tokens,
+        completion_tokens: output_tokens,
+        total_tokens: prompt_tokens.saturating_add(output_tokens),
+        estimated: None,
+        prompt_tokens_details,
+        // Anthropic's reasoning-token split is not surfaced.
+        completion_tokens_details: None,
+    }
+}
+
 /// Translate an Anthropic `stop_reason` to an OpenAI `finish_reason`.
 fn map_finish_reason(stop_reason: Option<&str>) -> Option<String> {
     match stop_reason {
@@ -645,18 +677,11 @@ fn translate_response(resp: AnthropicResponse, requested_model: &str) -> ChatRes
         resp.model
     };
 
-    let usage = Usage {
-        prompt_tokens: resp.usage.input_tokens,
-        completion_tokens: resp.usage.output_tokens,
-        total_tokens: resp
-            .usage
-            .input_tokens
-            .saturating_add(resp.usage.output_tokens),
-        estimated: None,
-        prompt_tokens_details: anthropic_prompt_details(&resp.usage),
-        // Anthropic does not report a reasoning-token split.
-        completion_tokens_details: None,
-    };
+    let usage = anthropic_usage(
+        resp.usage.input_tokens,
+        resp.usage.output_tokens,
+        anthropic_prompt_details(&resp.usage),
+    );
 
     ChatResponse {
         id: resp.id,
@@ -965,6 +990,11 @@ mod tests {
         let usage = out.usage.unwrap();
         assert_eq!(usage.cached_tokens(), Some(80));
         assert_eq!(usage.cache_write_tokens(), Some(20));
+        // OpenAI semantics: cached tokens are a SUBSET of prompt tokens, while
+        // Anthropic's `input_tokens` (12) excludes them: 12 + 80 + 20.
+        assert_eq!(usage.prompt_tokens, 112);
+        assert_eq!(usage.completion_tokens, 3);
+        assert_eq!(usage.total_tokens, 115);
         // Serializes in the OpenAI-compatible nested shape.
         let body = serde_json::to_value(usage).unwrap();
         assert_eq!(body["prompt_tokens_details"]["cached_tokens"], 80);
@@ -991,6 +1021,8 @@ mod tests {
         let usage = out.usage.unwrap();
         assert_eq!(usage.cached_tokens(), Some(64));
         assert_eq!(usage.cache_write_tokens(), None);
+        assert_eq!(usage.prompt_tokens, 69);
+        assert_eq!(usage.total_tokens, 70);
         let body = serde_json::to_value(usage).unwrap();
         assert_eq!(body["prompt_tokens_details"]["cached_tokens"], 64);
         assert!(body["prompt_tokens_details"]
