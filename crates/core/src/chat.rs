@@ -256,12 +256,19 @@ pub struct ChatRequest {
     pub n: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop: Option<Value>,
-    /// Whether the client requested a streaming (SSE) response.
-    #[serde(default)]
+    /// Whether the client requested a streaming (SSE) response. An explicit
+    /// `null` reads as `false`, like an absent field.
+    #[serde(default, deserialize_with = "null_as_false")]
     pub stream: bool,
     /// Any additional OpenAI fields (`tools`, `response_format`, ...).
     #[serde(flatten)]
     pub extra: Map<String, Value>,
+}
+
+/// Deserialize a boolean where an explicit `null` means `false` (some SDKs
+/// serialize an unset optional field as `null`).
+fn null_as_false<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
+    Ok(Option::<bool>::deserialize(deserializer)?.unwrap_or(false))
 }
 
 impl ChatRequest {
@@ -545,6 +552,23 @@ mod tests {
             let content = m.content.as_ref().unwrap();
             assert_eq!(content.text_len(), content.text().len(), "{json}");
         }
+    }
+
+    #[test]
+    fn stream_null_reads_as_false() {
+        // Some SDKs serialize an unset `stream` as an explicit null.
+        let parse = |stream: &str| {
+            serde_json::from_str::<ChatRequest>(&format!(
+                r#"{{"model":"m","messages":[]{stream}}}"#
+            ))
+        };
+        assert!(!parse(r#","stream":null"#).unwrap().stream);
+        assert!(!parse("").unwrap().stream);
+        assert!(!parse(r#","stream":false"#).unwrap().stream);
+        assert!(parse(r#","stream":true"#).unwrap().stream);
+        // Still a boolean: anything else is a client error.
+        assert!(parse(r#","stream":"yes""#).is_err());
+        assert!(parse(r#","stream":1"#).is_err());
     }
 
     #[test]

@@ -375,6 +375,37 @@ async fn ollama_kind_serves_chat_through_its_openai_compatible_v1_path() {
 
 /// ADR 003 for the ollama chat path: an upstream reply with no `usage` still
 /// yields a non-zero token count, honestly labelled `estimated`.
+/// An explicit `"stream": null` is an unset `stream`: a normal JSON
+/// completion, not a 400.
+#[tokio::test]
+async fn stream_null_is_a_non_streaming_request() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_chat_body("llama3.2")))
+        .mount(&upstream)
+        .await;
+    let base = common::spawn_with(ollama_registry(&upstream.uri()), LIMIT).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&json!({
+            "model": "local-llama",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "stream": null
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["object"], "chat.completion");
+
+    let requests = upstream.received_requests().await.unwrap();
+    let sent: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(sent["stream"], false);
+}
+
 #[tokio::test]
 async fn ollama_chat_without_upstream_usage_reports_an_estimated_count() {
     let upstream = MockServer::start().await;
