@@ -713,25 +713,7 @@ fn translate_request(req: &ChatRequest) -> ConverseRequest {
                         "content": [{ "text": text }],
                     }
                 });
-                match messages.last_mut() {
-                    // Consecutive tool results merge into one user message
-                    // (Converse expects strict user/assistant alternation). Only
-                    // merge into a message that is ALREADY a tool-result carrier,
-                    // never into a preceding plain user text message.
-                    Some(prev)
-                        if prev.role == "user"
-                            && prev
-                                .content
-                                .last()
-                                .is_some_and(|b| b.get("toolResult").is_some()) =>
-                    {
-                        prev.content.push(block);
-                    }
-                    _ => messages.push(ConverseMessage {
-                        role: "user".to_owned(),
-                        content: vec![block],
-                    }),
-                }
+                push_message(&mut messages, "user", vec![block]);
             }
             "assistant"
                 if m.extra
@@ -753,15 +735,13 @@ fn translate_request(req: &ChatRequest) -> ConverseRequest {
                         }));
                     }
                 }
-                messages.push(ConverseMessage {
-                    role: "assistant".to_owned(),
-                    content,
-                });
+                push_message(&mut messages, "assistant", content);
             }
-            role => messages.push(ConverseMessage {
-                role: role.to_owned(),
-                content: converse_content(m.content.as_ref(), &text),
-            }),
+            role => push_message(
+                &mut messages,
+                role,
+                converse_content(m.content.as_ref(), &text),
+            ),
         }
     }
 
@@ -785,6 +765,22 @@ fn translate_request(req: &ChatRequest) -> ConverseRequest {
             Some(inference)
         },
         tool_config: translate_tool_config(req),
+    }
+}
+
+/// Append a message, merging it into the previous one when both have the
+/// same role. Converse requires strict user/assistant alternation and
+/// rejects two consecutive same-role messages, while OpenAI histories
+/// routinely hold them (several tool results, a tool result followed by a
+/// user message, two user messages in a row): their content blocks are
+/// concatenated in order into one message.
+fn push_message(messages: &mut Vec<ConverseMessage>, role: &str, content: Vec<serde_json::Value>) {
+    match messages.last_mut() {
+        Some(prev) if prev.role == role => prev.content.extend(content),
+        _ => messages.push(ConverseMessage {
+            role: role.to_owned(),
+            content,
+        }),
     }
 }
 
@@ -1375,14 +1371,55 @@ mod tests {
                 extra,
             }
         };
+        let mut assistant = msg("assistant", "");
+        assistant.extra.insert(
+            "tool_calls".to_owned(),
+            json!([
+                { "id": "call_1", "type": "function", "function": { "name": "f", "arguments": "{}" } },
+                { "id": "call_2", "type": "function", "function": { "name": "f", "arguments": "{}" } }
+            ]),
+        );
         let req = request(vec![
             msg("user", "two lookups"),
+            assistant,
             tool_msg("call_1", "a"),
             tool_msg("call_2", "b"),
+            // A user message right after the tool results joins the same
+            // Converse user message (tool results first, then the text).
+            msg("user", "and now summarise"),
         ]);
         let out = translate_request(&req);
-        assert_eq!(out.messages.len(), 2);
-        assert_eq!(out.messages[1].content.len(), 2);
+        let roles: Vec<&str> = out.messages.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(roles, ["user", "assistant", "user"]);
+        let last = &out.messages[2].content;
+        assert_eq!(last.len(), 3);
+        assert_eq!(last[0]["toolResult"]["toolUseId"], "call_1");
+        assert_eq!(last[1]["toolResult"]["toolUseId"], "call_2");
+        assert_eq!(last[2]["text"], "and now summarise");
+    }
+
+    /// Converse rejects consecutive same-role messages: adjacent plain user
+    /// (or assistant) messages are merged by concatenating content blocks.
+    #[test]
+    fn consecutive_same_role_messages_merge_to_keep_strict_alternation() {
+        let req = request(vec![
+            msg("user", "first"),
+            msg("user", "second"),
+            msg("assistant", "one"),
+            msg("assistant", "two"),
+            msg("user", "third"),
+        ]);
+        let out = translate_request(&req);
+        let roles: Vec<&str> = out.messages.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(roles, ["user", "assistant", "user"]);
+        assert_eq!(
+            out.messages[0].content,
+            vec![json!({ "text": "first" }), json!({ "text": "second" })]
+        );
+        assert_eq!(
+            out.messages[1].content,
+            vec![json!({ "text": "one" }), json!({ "text": "two" })]
+        );
     }
 
     #[test]
