@@ -1943,3 +1943,63 @@ async fn config_document_writes_cannot_point_webhooks_at_internal_hosts() {
         .await;
     assert_eq!(response.status(), 204);
 }
+
+/// A `[webhooks]` block whose `signing_key_env` this process cannot resolve
+/// (unset variable, no sealed secret) is fatal at boot. Accepting it here
+/// would turn a 204 into a failed restart later, so both document routes
+/// refuse it with `LM-1001` and leave the document untouched.
+#[tokio::test]
+async fn config_document_writes_cannot_name_an_unresolvable_signing_key() {
+    let operator_doc = format!("{CONFIG_TOML}\n[auth]\nenabled = true\n");
+    let h = spawn_admin_with_webhook_guard(&operator_doc).await;
+    const UNSET: &str = "BILLING_WEBHOOK_SECRET_UNSET_FOR_CONFIG_DOC";
+
+    let hash = h.current_hash().await;
+    let response = h
+        .put_json(
+            "/admin/config/webhooks",
+            &serde_json::json!({
+                "url": "https://93.184.215.14/lumen/events",
+                "signing_key_env": UNSET,
+            }),
+            &hash,
+        )
+        .await;
+    assert_eq!(response.status(), 400);
+    let body: Value = response.json().await.expect("json");
+    assert_eq!(body["error"]["code"], "LM-1001");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains(UNSET)),
+        "the rejection names the variable: {body}"
+    );
+
+    let hash = h.current_hash().await;
+    let doc = format!(
+        "{}\n[webhooks]\nurl = \"https://93.184.215.14/lumen/events\"\nsigning_key_env = \"{UNSET}\"\n",
+        h.valid_config()
+    );
+    let response = h.put_config(&doc, &hash).await;
+    assert_eq!(response.status(), 400);
+    let body: Value = response.json().await.expect("json");
+    assert_eq!(body["error"]["code"], "LM-1001");
+    assert!(
+        !h.valid_config().contains("[webhooks]"),
+        "a refused write must leave the document untouched"
+    );
+
+    // A variable this process can see is accepted (`init_env` exports it).
+    let hash = h.current_hash().await;
+    let response = h
+        .put_json(
+            "/admin/config/webhooks",
+            &serde_json::json!({
+                "url": "https://93.184.215.14/lumen/events",
+                "signing_key_env": PROVIDER_KEY_ENV,
+            }),
+            &hash,
+        )
+        .await;
+    assert_eq!(response.status(), 204);
+}

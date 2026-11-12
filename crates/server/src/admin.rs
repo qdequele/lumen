@@ -1767,6 +1767,7 @@ where
         .await
         .map_err(|error| describe_validation_rejection(&error))?;
     check_document_webhook_receiver(state, &current.toml, &candidate).await?;
+    check_document_webhook_signing_key(state, &current.toml, &candidate)?;
 
     let new_hash = match ctx.source.persist(&candidate, &current.hash).await {
         Ok(hash) => hash,
@@ -1840,6 +1841,46 @@ async fn check_document_webhook_receiver(
     controller
         .check_receiver_url(&new.url)
         .await
+        .map_err(|message| GatewayError::InvalidRequest(message).into())
+}
+
+/// Refuse a `[webhooks]` block whose `signing_key_env` this process cannot
+/// resolve (variable unset or empty, no sealed secret to fall back on).
+///
+/// `Config::validate` only checks the shape of the name. The hot reload
+/// merely warns about an unresolvable one and keeps the previous pipeline,
+/// but boot treats the same block as fatal: accepting it here would turn a
+/// 204 now into a failed restart later (and in `config_source = "db"` mode a
+/// binary rollback would not help, the document lives in the database).
+///
+/// Like the receiver check, only a `signing_key_env` this write introduces
+/// or changes is checked, so an unrelated edit to a document the operator
+/// wrote by hand is never refused over it.
+fn check_document_webhook_signing_key(
+    state: &AppState,
+    current: &str,
+    candidate: &str,
+) -> Result<(), ApiError> {
+    let Some(controller) = state.webhooks.as_ref() else {
+        // No auth, so no webhooks: `Config::validate` refuses the block.
+        return Ok(());
+    };
+    let Some(new) = config_from_document(candidate)?.webhooks else {
+        return Ok(());
+    };
+    if new.signing_key_env.is_none() {
+        return Ok(());
+    }
+    let old_env = toml::from_str::<Config>(current)
+        .ok()
+        .and_then(|c| c.webhooks)
+        .map(|w| w.signing_key_env);
+    if old_env.as_ref() == Some(&new.signing_key_env) {
+        return Ok(());
+    }
+    // The message names the variable, never a value.
+    controller
+        .check_signing_key(&new)
         .map_err(|message| GatewayError::InvalidRequest(message).into())
 }
 
