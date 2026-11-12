@@ -276,9 +276,11 @@ impl BedrockProvider {
         let mut data: Vec<EmbedData> = Vec::new();
         let mut total_tokens: u32 = 0;
         let mut any_usage = false;
-        for text in req.input.iter() {
+        // One call per ITEM (a multi-part item's text fragments are joined),
+        // never per fragment, so the vector count equals the item count.
+        for text in req.input.item_texts() {
             let body = serde_json::to_vec(&TitanEmbedRequest {
-                input_text: text,
+                input_text: &text,
                 dimensions,
                 normalize,
             })
@@ -327,7 +329,9 @@ impl BedrockProvider {
             .get("input_type")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("search_document");
-        let texts: Vec<&str> = req.input.iter().collect();
+        // One `texts` entry per ITEM (fragments of a multi-part item joined).
+        let item_texts = req.input.item_texts();
+        let texts: Vec<&str> = item_texts.iter().map(AsRef::as_ref).collect();
         let body = serde_json::to_vec(&CohereEmbedRequest { texts, input_type })
             .map_err(|e| ProviderError::Translation(format!("bedrock cohere request: {e}")))?;
 

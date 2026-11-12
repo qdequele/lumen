@@ -27,7 +27,9 @@ pub const MAX_ACCOUNT_DOCUMENT_BYTES: usize = 256 * 1024;
 pub const REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 
 /// The `virtual_model` label of `lumen_virtual_model_requests_total` for an
-/// account model: team-defined ids never become label values.
+/// account model, and the `model` label of `lumen_request_duration_seconds`
+/// for a request to one that failed before any target served it:
+/// team-defined ids never become label values.
 pub const METRIC_LABEL: &str = "account";
 
 /// The document text of `configs`: a JSON array, in the account's order.

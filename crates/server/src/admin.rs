@@ -4,7 +4,11 @@
 //! * `POST /admin/keys` - create a key. The response is the ONLY place the
 //!   plaintext key ever appears; it is never stored and never logged.
 //! * `GET /admin/keys` - list keys (records only, no hashes, no plaintext).
-//!   `?include_deleted=true` also shows soft-deleted tombstones.
+//!   `?include_deleted=true` also shows soft-deleted tombstones. Optional
+//!   `?limit=` and `?cursor=` page the listing (ADR 023, also on
+//!   `GET /admin/groups`): the body stays a bare array and the continuation
+//!   is the `X-Next-Cursor` response header. Without them the listing is
+//!   whole, as before.
 //! * `PATCH /admin/keys/{id}` - adjust budgets/limits, enable/disable.
 //! * `DELETE /admin/keys/{id}` - soft-delete: the row becomes a tombstone
 //!   (usage-log attribution and audit history survive) and the key stops
@@ -97,18 +101,18 @@
 //! provider, webhook and config routes answer `403 LM-4005`.
 
 use crate::admin_scope::AccountScope;
-use crate::error::ApiError;
+use crate::error::{body_rejection, ApiError};
 use crate::state::AppState;
 use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::Json;
 use lumen_auth::events::{EventKind, SettingsOrigin, SettingsSource, WebhookSettings};
 use lumen_auth::key::hash_key;
 use lumen_auth::state::{micro_to_usd, usd_to_micro};
 use lumen_auth::store::{
-    DeleteGroupOutcome, GroupPatch, GroupRecord, KeyPatch, NewGroup, NewKey, UsageAggregate,
-    UsageFilter, UsageGroupBy, VirtualKeyRecord,
+    DeleteGroupOutcome, GroupPatch, GroupRecord, KeyPatch, ListCursor, NewGroup, NewKey,
+    PageRequest, UsageAggregate, UsageFilter, UsageGroupBy, VirtualKeyRecord,
 };
 use lumen_core::GatewayError;
 use lumen_providers::KeyCheck;
@@ -214,6 +218,22 @@ fn unknown_group(id: &str) -> ApiError {
     GatewayError::NotFound(format!("unknown group id '{id}'")).into()
 }
 
+/// The JSON body of an admin write, or why it was refused: the one place
+/// every admin handler maps its body-extractor rejection. A body that ran
+/// over `body_limit` while it was read (chunked, no `Content-Length`) is
+/// `413 LM-1002` quoting the limit, as on `/v1/*`; anything else (malformed
+/// JSON, a wrong content type, an unknown field) is `400 LM-1001`. The
+/// rejection text describes the shape and never echoes a field value.
+pub(crate) fn json_body<T>(
+    state: &AppState,
+    payload: Result<Json<T>, JsonRejection>,
+) -> Result<T, ApiError> {
+    match payload {
+        Ok(Json(body)) => Ok(body),
+        Err(rejection) => Err(body_rejection(&rejection, state.body_limit).into()),
+    }
+}
+
 pub(crate) fn runtime(state: &AppState) -> Result<&crate::auth::AuthRuntime, ApiError> {
     state
         .auth
@@ -279,7 +299,7 @@ pub async fn create_key(
     scope: AccountScope,
     payload: Result<Json<NewKey>, JsonRejection>,
 ) -> Result<(StatusCode, Json<CreatedKey>), ApiError> {
-    let Json(params) = payload.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
+    let params = json_body(&state, payload)?;
     params.validate().map_err(GatewayError::InvalidRequest)?;
     validate_ref("external_ref", params.external_ref.as_deref(), false)?;
     let auth = runtime(&state)?;
@@ -294,6 +314,8 @@ pub async fn create_key(
         };
         scope.guard_group(&auth.store, group_id).await?;
     }
+    // Ordered against the hot reload's table refresh (`AuthState::sync_guard`).
+    let _sync = auth.keys.sync_guard().await;
     let (plaintext, record) = auth.store.create_key(params).await.map_err(store_error)?;
     // Make the key usable immediately, without waiting for a reboot.
     auth.keys.upsert(hash_key(plaintext.reveal()), &record);
@@ -306,6 +328,72 @@ pub async fn create_key(
     ))
 }
 
+/// Page size of a listing when `cursor` is sent without `limit` (ADR 023).
+const DEFAULT_LIST_LIMIT: u32 = 100;
+/// Largest accepted `limit` on a paginated listing. A larger value is
+/// refused, not clamped: a silent clamp reads as "that was everything".
+const MAX_LIST_LIMIT: u32 = 1_000;
+/// Response header carrying the cursor of the next page; absent on the last
+/// page and on an unpaginated listing.
+const NEXT_CURSOR: HeaderName = HeaderName::from_static("x-next-cursor");
+
+/// The page a listing call asks for (ADR 023): `None` when the caller sent
+/// neither `limit` nor `cursor`, which keeps the whole, unpaginated listing
+/// existing clients rely on.
+fn page_request(limit: Option<u32>, cursor: Option<&str>) -> Result<Option<PageRequest>, ApiError> {
+    if limit.is_none() && cursor.is_none() {
+        return Ok(None);
+    }
+    let limit = limit.unwrap_or(DEFAULT_LIST_LIMIT);
+    if limit == 0 || limit > MAX_LIST_LIMIT {
+        return Err(GatewayError::InvalidRequest(format!(
+            "`limit` must be between 1 and {MAX_LIST_LIMIT}"
+        ))
+        .into());
+    }
+    let after = match cursor {
+        None => None,
+        Some(text) => Some(decode_cursor(text).ok_or_else(|| {
+            GatewayError::InvalidRequest(
+                "invalid `cursor`: pass the X-Next-Cursor value of the previous page unchanged"
+                    .to_owned(),
+            )
+        })?),
+    };
+    Ok(Some(PageRequest { limit, after }))
+}
+
+/// A listing position as the opaque `cursor` text: lowercase hex of
+/// `<created_at>:<id>`, safe in a query string and in a header as is.
+fn encode_cursor(cursor: &ListCursor) -> String {
+    hex::encode(format!("{}:{}", cursor.created_at, cursor.id))
+}
+
+/// The inverse of [`encode_cursor`]; `None` for anything it did not produce.
+fn decode_cursor(text: &str) -> Option<ListCursor> {
+    let bytes = hex::decode(text).ok()?;
+    let plain = std::str::from_utf8(&bytes).ok()?;
+    let (created_at, id) = plain.split_once(':')?;
+    if id.is_empty() {
+        return None;
+    }
+    Some(ListCursor {
+        created_at: created_at.parse().ok()?,
+        id: id.to_owned(),
+    })
+}
+
+/// The response headers of a listing: `X-Next-Cursor` while more rows remain.
+fn next_cursor_headers(next: Option<&ListCursor>) -> Result<HeaderMap, ApiError> {
+    let mut headers = HeaderMap::new();
+    if let Some(next) = next {
+        let value = HeaderValue::try_from(encode_cursor(next))
+            .map_err(|e| GatewayError::Internal(format!("next cursor header: {e}")))?;
+        headers.insert(NEXT_CURSOR, value);
+    }
+    Ok(headers)
+}
+
 /// `GET /admin/keys` query parameters.
 #[derive(Debug, Default, Deserialize)]
 pub struct ListKeysParams {
@@ -315,29 +403,51 @@ pub struct ListKeysParams {
     /// Only keys with this `external_ref` (ADR 015).
     #[serde(default)]
     pub external_ref: Option<String>,
+    /// Page size, 1 to 1000 (ADR 023). Absent with no `cursor`: the whole
+    /// listing.
+    #[serde(default)]
+    pub limit: Option<u32>,
+    /// The `X-Next-Cursor` value of the previous page.
+    #[serde(default)]
+    pub cursor: Option<String>,
 }
 
 /// List every active key (no secrets: ids, names, budgets, limits, flags).
 /// `?include_deleted=true` adds soft-deleted tombstones for auditing. A
 /// malformed query string is a `LM-1001` JSON envelope, like every other
 /// extractor failure in this module - never axum's bare-text rejection.
+///
+/// With `limit` and/or `cursor` (ADR 023) the body is one page of the same
+/// bare array, in the same order, and `X-Next-Cursor` names the next page
+/// while one exists.
 pub async fn list_keys(
     State(state): State<AppState>,
     scope: AccountScope,
     params: Result<Query<ListKeysParams>, QueryRejection>,
-) -> Result<Json<Vec<VirtualKeyRecord>>, ApiError> {
+) -> Result<(HeaderMap, Json<Vec<VirtualKeyRecord>>), ApiError> {
     let Query(params) = params.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
+    let page = page_request(params.limit, params.cursor.as_deref())?;
     let auth = runtime(&state)?;
-    let mut keys = auth
+    // Filtered in SQL (bound parameters), not over every row in memory.
+    let filter = lumen_auth::store::KeyListFilter {
+        include_deleted: params.include_deleted,
+        external_ref: params.external_ref,
+        scope_account_ref: scope.account().map(str::to_owned),
+    };
+    let Some(page) = page else {
+        let keys = auth
+            .store
+            .list_keys_filtered(&filter)
+            .await
+            .map_err(|e| internal(&e))?;
+        return Ok((HeaderMap::new(), Json(keys)));
+    };
+    let page = auth
         .store
-        .list_keys(params.include_deleted)
+        .list_keys_page(&filter, &page)
         .await
         .map_err(|e| internal(&e))?;
-    if let Some(want) = &params.external_ref {
-        keys.retain(|k| k.external_ref.as_deref() == Some(want.as_str()));
-    }
-    let keys = scope.filter_keys(&auth.store, keys).await?;
-    Ok(Json(keys))
+    Ok((next_cursor_headers(page.next.as_ref())?, Json(page.rows)))
 }
 
 /// Patch a key: adjust budgets/limits, enable/disable. An unknown id is a
@@ -349,7 +459,7 @@ pub async fn patch_key(
     scope: AccountScope,
     payload: Result<Json<KeyPatch>, JsonRejection>,
 ) -> Result<Json<VirtualKeyRecord>, ApiError> {
-    let Json(patch) = payload.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
+    let patch = json_body(&state, payload)?;
     patch.validate().map_err(GatewayError::InvalidRequest)?;
     validate_ref(
         "external_ref",
@@ -382,6 +492,9 @@ pub async fn patch_key(
     if patch.group_id.is_some() {
         flush_before_billability_change(shared).await?;
     }
+    // Held across the DB write and the live apply, so a reload that read the
+    // old row cannot re-apply it afterwards (`AuthState::sync_guard`).
+    let _sync = auth.keys.sync_guard().await;
     let updated = auth
         .store
         .update_key(&id, patch)
@@ -413,6 +526,9 @@ pub async fn delete_key(
     // Tombstones of the account pass, so a retry still repairs a missed
     // eviction below (see `AccountScope::guard_key_delete`).
     scope.guard_key_delete(&auth.store, &id).await?;
+    // Held across the tombstone and the eviction, so a reload that read the
+    // row while it was live cannot re-insert the key (`AuthState::sync_guard`).
+    let sync = auth.keys.sync_guard().await;
     let deleted = auth.store.delete_key(&id).await.map_err(|e| internal(&e))?;
     // Evict from the live table UNCONDITIONALLY - whether this call's DB
     // write actually matched a row (`Some`) or the row was already
@@ -423,7 +539,10 @@ pub async fn delete_key(
     // restart would notice. Making the eviction unconditional means every
     // retry repairs a previously missed one, so the zombie window closes on
     // the very next delete attempt rather than lasting until a restart.
-    if let Some(entry) = auth.keys.remove(&id) {
+    let evicted = auth.keys.remove(&id);
+    // Released before the flush below, which takes the flush guard.
+    drop(sync);
+    if let Some(entry) = evicted {
         // Announce the removal only when THIS call's DB write is the one that
         // tombstoned the row: a retry that only repaired a missed eviction
         // (see above) must not fire a second `key.deleted` (ADR 011 §1).
@@ -453,6 +572,7 @@ pub async fn rotate_key(
 ) -> Result<Json<CreatedKey>, ApiError> {
     let auth = runtime(&state)?;
     scope.guard_key(&auth.store, &id).await?;
+    let _sync = auth.keys.sync_guard().await;
     let (plaintext, record) = auth
         .store
         .rotate_key(&id)
@@ -482,7 +602,7 @@ pub async fn create_group(
     scope: AccountScope,
     payload: Result<Json<NewGroup>, JsonRejection>,
 ) -> Result<(StatusCode, Json<GroupRecord>), ApiError> {
-    let Json(mut params) = payload.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
+    let mut params = json_body(&state, payload)?;
     params.validate().map_err(GatewayError::InvalidRequest)?;
     let auth = runtime(&state)?;
     // A sub-group (ADR 020) takes its parent's account: on a scoped call the
@@ -512,6 +632,7 @@ pub async fn create_group(
         params.account_ref.as_deref(),
         auth.keys.billing_enabled(),
     )?;
+    let _sync = auth.keys.sync_guard().await;
     let record = auth.store.create_group(params).await.map_err(store_error)?;
     // Make the group joinable and enforced immediately, no restart.
     auth.keys.upsert_group(&record);
@@ -530,33 +651,51 @@ pub struct ListGroupsParams {
     /// Only the sub-groups of this group (ADR 020).
     #[serde(default)]
     pub parent_id: Option<String>,
+    /// Page size, 1 to 1000 (ADR 023). Absent with no `cursor`: the whole
+    /// listing.
+    #[serde(default)]
+    pub limit: Option<u32>,
+    /// The `X-Next-Cursor` value of the previous page.
+    #[serde(default)]
+    pub cursor: Option<String>,
 }
 
 /// List every active budget group; `?include_deleted=true` adds tombstones.
+/// `limit` and `cursor` page it exactly like [`list_keys`] (ADR 023).
 pub async fn list_groups(
     State(state): State<AppState>,
     scope: AccountScope,
     params: Result<Query<ListGroupsParams>, QueryRejection>,
-) -> Result<Json<Vec<GroupRecord>>, ApiError> {
+) -> Result<(HeaderMap, Json<Vec<GroupRecord>>), ApiError> {
     let Query(params) = params.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
+    let page = page_request(params.limit, params.cursor.as_deref())?;
     let auth = runtime(&state)?;
-    let mut groups = auth
+    // Filtered in SQL (bound parameters), not over every row in memory.
+    let filter = lumen_auth::store::GroupListFilter {
+        include_deleted: params.include_deleted,
+        // Stored refs are canonical (a UUID is lowercase): compare that form.
+        account_ref: params
+            .account_ref
+            .map(lumen_auth::billing::canonical_account_ref),
+        parent_id: params.parent_id,
+        // Applied on top of the query filter, so `?account_ref=<other>` on
+        // a scoped call narrows to nothing rather than widening the scope.
+        scope_account_ref: scope.account().map(str::to_owned),
+    };
+    let Some(page) = page else {
+        let groups = auth
+            .store
+            .list_groups_filtered(&filter)
+            .await
+            .map_err(|e| internal(&e))?;
+        return Ok((HeaderMap::new(), Json(groups)));
+    };
+    let page = auth
         .store
-        .list_groups(params.include_deleted)
+        .list_groups_page(&filter, &page)
         .await
         .map_err(|e| internal(&e))?;
-    if let Some(want) = params.account_ref {
-        // Stored refs are canonical (a UUID is lowercase): compare that form.
-        let want = lumen_auth::billing::canonical_account_ref(want);
-        groups.retain(|g| g.account_ref.as_deref() == Some(want.as_str()));
-    }
-    if let Some(parent) = params.parent_id {
-        groups.retain(|g| g.parent_id.as_deref() == Some(parent.as_str()));
-    }
-    // Applied on top of the query filter, so `?account_ref=<other>` on a
-    // scoped call narrows to nothing rather than widening the scope.
-    groups.retain(|g| scope.allows_group(g));
-    Ok(Json(groups))
+    Ok((next_cursor_headers(page.next.as_ref())?, Json(page.rows)))
 }
 
 /// `GET /admin/groups/{id}` response: the record plus the live pool
@@ -608,7 +747,7 @@ pub async fn patch_group(
     scope: AccountScope,
     payload: Result<Json<GroupPatch>, JsonRejection>,
 ) -> Result<Json<GroupRecord>, ApiError> {
-    let Json(patch) = payload.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
+    let patch = json_body(&state, payload)?;
     patch.validate().map_err(GatewayError::InvalidRequest)?;
     let shared = runtime_arc(&state)?;
     let auth = shared.as_ref();
@@ -640,6 +779,7 @@ pub async fn patch_group(
         }
         flush_before_billability_change(shared).await?;
     }
+    let _sync = auth.keys.sync_guard().await;
     let updated = auth
         .store
         .update_group(&id, patch)
@@ -661,6 +801,7 @@ pub async fn delete_group(
 ) -> Result<StatusCode, ApiError> {
     let auth = runtime(&state)?;
     scope.guard_group(&auth.store, &id).await?;
+    let _sync = auth.keys.sync_guard().await;
     let outcome = auth
         .store
         .delete_group(&id)
@@ -719,9 +860,10 @@ const MAX_GRANT_USD: f64 = lumen_auth::store::MAX_BUDGET_USD;
 /// belt-and-braces in case a future serde version saturates to `inf`
 /// instead of erroring.
 fn validated_grant_amount(
+    state: &AppState,
     payload: Result<Json<GrantBody>, JsonRejection>,
 ) -> Result<f64, ApiError> {
-    let Json(body) = payload.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
+    let body = json_body(state, payload)?;
     if body.amount.is_finite() && body.amount > 0.0 && body.amount <= MAX_GRANT_USD {
         Ok(body.amount)
     } else {
@@ -747,9 +889,10 @@ pub async fn grant_key(
     scope: AccountScope,
     payload: Result<Json<GrantBody>, JsonRejection>,
 ) -> Result<Json<VirtualKeyRecord>, ApiError> {
-    let amount = validated_grant_amount(payload)?;
+    let amount = validated_grant_amount(&state, payload)?;
     let auth = runtime(&state)?;
     scope.guard_key(&auth.store, &id).await?;
+    let _sync = auth.keys.sync_guard().await;
     let record = auth
         .store
         .grant_key_budget(&id, amount)
@@ -778,9 +921,10 @@ pub async fn grant_group(
     scope: AccountScope,
     payload: Result<Json<GrantBody>, JsonRejection>,
 ) -> Result<Json<GroupRecord>, ApiError> {
-    let amount = validated_grant_amount(payload)?;
+    let amount = validated_grant_amount(&state, payload)?;
     let auth = runtime(&state)?;
     scope.guard_group(&auth.store, &id).await?;
+    let _sync = auth.keys.sync_guard().await;
     let record = auth
         .store
         .grant_group_budget(&id, amount)
@@ -846,6 +990,19 @@ fn webhooks(state: &AppState) -> Result<&Arc<crate::webhooks::WebhookController>
         .ok_or_else(|| GatewayError::Unauthorized.into())
 }
 
+/// Map a refused webhook apply (or preflight): settings the gateway cannot
+/// accept are the caller's error (400 `LM-1001`, the message names the field
+/// or the variable), a failure of the gateway itself (metrics registration,
+/// a poisoned lock) is an opaque 500 `LM-5001`.
+fn webhook_apply_error(error: crate::webhooks::WebhookApplyError) -> ApiError {
+    use crate::webhooks::WebhookApplyError;
+    match error {
+        WebhookApplyError::Invalid(message) => GatewayError::InvalidRequest(message),
+        WebhookApplyError::Internal(message) => GatewayError::Internal(message),
+    }
+    .into()
+}
+
 /// Build the current status snapshot.
 fn webhook_status(controller: &crate::webhooks::WebhookController) -> WebhookStatus {
     let live = controller.live_settings();
@@ -876,14 +1033,15 @@ pub async fn get_webhooks(State(state): State<AppState>) -> Result<Json<WebhookS
 /// successful one survives a restart.
 ///
 /// Invalid settings are a 400 `LM-1001` naming the field, like every other
-/// admin write. An unresolvable signing secret (a `signing_key_env` naming a
+/// admin write; a failure of the gateway itself while checking or applying
+/// them is a 500 `LM-5001`. An unresolvable signing secret (a `signing_key_env` naming a
 /// variable this process cannot see, with nothing stored) is the same: it
 /// would silently downgrade a billing integration to unsigned deliveries.
 pub async fn put_webhooks(
     State(state): State<AppState>,
     payload: Result<Json<WebhookSettings>, JsonRejection>,
 ) -> Result<Json<WebhookStatus>, ApiError> {
-    let Json(settings) = payload.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
+    let settings = json_body(&state, payload)?;
     let auth = runtime(&state)?;
     let controller = webhooks(&state)?;
     settings
@@ -896,10 +1054,17 @@ pub async fn put_webhooks(
         .check_receiver_url(&settings.url)
         .await
         .map_err(GatewayError::InvalidRequest)?;
+    // Everything `apply` can refuse (an unresolvable signing secret above
+    // all) is checked before the write: a rejected document must not replace
+    // a stored row that works with one no reload or restart can apply.
+    controller
+        .preflight(&settings)
+        .map_err(webhook_apply_error)?;
 
     // Persist, refresh the cache, then apply. Applying first would leave the
     // database disagreeing with a running pipeline if the write then failed;
-    // this order means a failed apply leaves the stored row ahead of the live
+    // this order means a failed apply (only possible now if the environment
+    // changed since the preflight) leaves the stored row ahead of the live
     // one, which `GET /admin/webhooks` makes visible and the next reload
     // reconciles.
     auth.store
@@ -911,7 +1076,7 @@ pub async fn put_webhooks(
         .await;
     controller
         .apply(&settings, &auth.keys)
-        .map_err(GatewayError::InvalidRequest)?;
+        .map_err(webhook_apply_error)?;
     Ok(Json(webhook_status(controller)))
 }
 
@@ -944,9 +1109,10 @@ pub async fn delete_webhooks(
             .map(|_disabled| ()),
     }
     .map_err(|e| internal(&e))?;
-    controller.disable(&auth.keys);
+    // Refresh the cache, then disable (the order `put_webhooks` uses): a
+    // reload that cached the row before the write above cannot re-apply it.
     controller
-        .refresh_from_store(&auth.store, auth.master.as_ref())
+        .disable_from_store(&auth.store, auth.master.as_ref(), &auth.keys)
         .await;
     Ok(Json(webhook_status(controller)))
 }
@@ -960,7 +1126,7 @@ pub async fn put_webhook_signing_key(
     State(state): State<AppState>,
     payload: Result<Json<WebhookSecretBody>, JsonRejection>,
 ) -> Result<StatusCode, ApiError> {
-    let Json(body) = payload.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
+    let body = json_body(&state, payload)?;
     if body.secret.is_empty() {
         return Err(GatewayError::InvalidRequest("`secret` must not be empty".to_owned()).into());
     }
@@ -983,7 +1149,7 @@ pub async fn put_webhook_signing_key(
     if let Some(settings) = controller.live_settings() {
         controller
             .apply(&settings, &auth.keys)
-            .map_err(GatewayError::InvalidRequest)?;
+            .map_err(webhook_apply_error)?;
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1000,6 +1166,11 @@ pub async fn delete_webhook_signing_key(
 ) -> Result<StatusCode, ApiError> {
     let auth = runtime(&state)?;
     let controller = webhooks(&state)?;
+    // Refuse before deleting: a 400 that had already removed the secret would
+    // leave the live pipeline signing with a key no restart can find again.
+    controller
+        .check_signing_key_without_stored_secret()
+        .map_err(GatewayError::InvalidRequest)?;
     auth.store
         .delete_webhook_secret()
         .await
@@ -1008,25 +1179,31 @@ pub async fn delete_webhook_signing_key(
         .refresh_from_store(&auth.store, auth.master.as_ref())
         .await;
     if let Some(settings) = controller.live_settings() {
-        // The live pipeline keeps its old key on failure (`apply` swaps
-        // nothing when it errors), so delivery stays signed until the operator
-        // supplies a working source - the refusal is advisory, not a rollback.
+        // Only reachable with an error if the environment changed since the
+        // check above; `apply` swaps nothing when it errors.
         controller
             .apply(&settings, &auth.keys)
-            .map_err(GatewayError::InvalidRequest)?;
+            .map_err(webhook_apply_error)?;
     }
     Ok(StatusCode::NO_CONTENT)
 }
 
 /// `PUT /admin/provider-keys/{name}` body.
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 pub struct ProviderKeyBody {
     /// The provider API key to seal. Never logged; encrypted at rest.
     pub key: String,
 }
 
-// The body deliberately has no Debug-derived secret exposure: ProviderKeyBody
-// derives Debug for extractor plumbing but is never logged by the handler.
+// STRICT rule 5: the key must be unrepresentable through `Debug`, so a stray
+// `{:?}` on the extracted body cannot leak it.
+impl std::fmt::Debug for ProviderKeyBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProviderKeyBody")
+            .field("key", &"REDACTED")
+            .finish()
+    }
+}
 
 /// Store a provider key encrypted at rest and apply it without a restart: the
 /// handler pings the hot-reload trigger, and the reloader re-reads the key from
@@ -1042,7 +1219,7 @@ pub async fn put_provider_key(
     Path(name): Path<String>,
     payload: Result<Json<ProviderKeyBody>, JsonRejection>,
 ) -> Result<StatusCode, ApiError> {
-    let Json(body) = payload.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
+    let body = json_body(&state, payload)?;
     if body.key.trim().is_empty() {
         return Err(GatewayError::InvalidRequest("`key` must not be empty".to_owned()).into());
     }
@@ -1667,7 +1844,7 @@ fn require_if_match(headers: &axum::http::HeaderMap) -> Result<String, ApiError>
 /// 4. Validate the candidate
 ///    ([`ConfigContext::validate_document`](crate::config_source::ConfigContext::validate_document):
 ///    parse, semantic validation, a throwaway registry build) - `LM-1001`
-///    (400) on failure, logged in full at `warn` and scrubbed of any
+///    (400) on failure, logged at `warn` without document content and scrubbed of any
 ///    filesystem path before it reaches the client
 ///    ([`describe_validation_rejection`]).
 /// 5. Persist through `ctx.source`. Its own compare-and-swap is a second,
@@ -1715,7 +1892,14 @@ where
         // for the same reason every other rejection below is (see
         // `describe_validation_rejection`'s doc comment): `ApiError`'s
         // `IntoResponse` only logs at `debug` for a non-5xx response.
-        tracing::warn!(%error, "config apply rejected: candidate document failed to parse");
+        //
+        // Logged as its content-free summary: the full message quotes the
+        // document (which holds operator prompt text) and goes to the client
+        // that sent it, never to a log.
+        tracing::warn!(
+            error = %error.log_summary(),
+            "config apply rejected: candidate document failed to parse"
+        );
         GatewayError::InvalidRequest(error.to_string())
     })?;
     if !diff.is_empty() {
@@ -1744,7 +1928,7 @@ where
         // ever validated or persisted.
         ensure_dynamic_only(&candidate, "candidate").map_err(|error| {
             tracing::warn!(
-                %error,
+                error = %error.log_summary(),
                 "config apply rejected: candidate document carried a boot-layer key in \
                  config_source = \"db\" mode"
             );
@@ -1756,6 +1940,7 @@ where
         .await
         .map_err(|error| describe_validation_rejection(&error))?;
     check_document_webhook_receiver(state, &current.toml, &candidate).await?;
+    check_document_webhook_signing_key(state, &current.toml, &candidate)?;
 
     let new_hash = match ctx.source.persist(&candidate, &current.hash).await {
         Ok(hash) => hash,
@@ -1832,6 +2017,46 @@ async fn check_document_webhook_receiver(
         .map_err(|message| GatewayError::InvalidRequest(message).into())
 }
 
+/// Refuse a `[webhooks]` block whose `signing_key_env` this process cannot
+/// resolve (variable unset or empty, no sealed secret to fall back on).
+///
+/// `Config::validate` only checks the shape of the name. The hot reload
+/// merely warns about an unresolvable one and keeps the previous pipeline,
+/// but boot treats the same block as fatal: accepting it here would turn a
+/// 204 now into a failed restart later (and in `config_source = "db"` mode a
+/// binary rollback would not help, the document lives in the database).
+///
+/// Like the receiver check, only a `signing_key_env` this write introduces
+/// or changes is checked, so an unrelated edit to a document the operator
+/// wrote by hand is never refused over it.
+fn check_document_webhook_signing_key(
+    state: &AppState,
+    current: &str,
+    candidate: &str,
+) -> Result<(), ApiError> {
+    let Some(controller) = state.webhooks.as_ref() else {
+        // No auth, so no webhooks: `Config::validate` refuses the block.
+        return Ok(());
+    };
+    let Some(new) = config_from_document(candidate)?.webhooks else {
+        return Ok(());
+    };
+    if new.signing_key_env.is_none() {
+        return Ok(());
+    }
+    let old_env = toml::from_str::<Config>(current)
+        .ok()
+        .and_then(|c| c.webhooks)
+        .map(|w| w.signing_key_env);
+    if old_env.as_ref() == Some(&new.signing_key_env) {
+        return Ok(());
+    }
+    // The message names the variable, never a value.
+    controller
+        .check_signing_key(&new)
+        .map_err(|message| GatewayError::InvalidRequest(message).into())
+}
+
 /// `LM-1004` (412), the same message on every path that produces it (the
 /// fast `If-Match` check in [`apply_document`] and `ConfigSource::persist`'s
 /// own compare-and-swap alike).
@@ -1866,7 +2091,8 @@ pub(crate) fn source_internal_error(error: &ConfigSourceError) -> ApiError {
 /// `RegistryError`'s variants never embed a path, so those pass through
 /// unchanged.
 ///
-/// The full detail - path included - still needs to reach a human somewhere,
+/// The detail (path, error kind, key path, position; never document content)
+/// still needs to reach a human somewhere,
 /// since a rejected apply is exactly the kind of thing an operator wants a
 /// record of. It does NOT reach it via `ApiError`'s `IntoResponse`
 /// (`crate::error`): that only logs `code` and `status` for a non-5xx
@@ -1874,7 +2100,14 @@ pub(crate) fn source_internal_error(error: &ConfigSourceError) -> ApiError {
 /// this function logs it directly, at `warn`, before scrubbing the message
 /// down to what the client is allowed to see.
 fn describe_validation_rejection(error: &ConfigLoadError) -> ApiError {
-    tracing::warn!(error = %error, "config apply rejected: candidate document failed validation");
+    // `log_summary`, not `Display`: a parse failure's full message quotes
+    // the document (the offending line or value), and a document holds
+    // operator prompt text that is never logged. The path, error kind, key
+    // path and line/column all survive.
+    tracing::warn!(
+        error = %error.log_summary(),
+        "config apply rejected: candidate document failed validation"
+    );
     match error {
         ConfigLoadError::Config(config_error) => match config_error {
             ConfigError::Parse { message, .. } | ConfigError::Validation { message, .. } => {
@@ -1955,8 +2188,9 @@ fn describe_validation_rejection(error: &ConfigLoadError) -> ApiError {
 /// any `LM-1001`.
 pub(crate) fn config_from_document(text: &str) -> Result<Config, ApiError> {
     toml::from_str::<Config>(text).map_err(|error| {
+        // Position only: toml's `Display` quotes the offending source line.
         tracing::error!(
-            %error,
+            position = %crate::config::toml_position(text, error.span()),
             "stored config document failed to parse while serving a granular admin read; \
              this should be unreachable, since every persisted document is validated first"
         );
@@ -1974,8 +2208,14 @@ pub(crate) fn config_from_document(text: &str) -> Result<Config, ApiError> {
 /// itself failed against a document that was already validated when it was
 /// persisted - an internal inconsistency, not a client mistake.
 fn edit_internal_error(error: &config_edit::EditError) -> ApiError {
-    tracing::error!(%error, "config document edit failed against an already-validated document");
-    GatewayError::Internal(error.to_string()).into()
+    // The summary, for the log line and for the internal error alike (a 5xx
+    // is logged with its message): `toml_edit` quotes the source line.
+    let summary = error.log_summary();
+    tracing::error!(
+        error = %summary,
+        "config document edit failed against an already-validated document"
+    );
+    GatewayError::Internal(summary).into()
 }
 
 /// One entry in [`ProvidersList`]: just enough to pick a provider without
@@ -2081,7 +2321,7 @@ pub async fn put_provider(
     payload: Result<Json<ProviderConfig>, JsonRejection>,
 ) -> Result<StatusCode, ApiError> {
     let if_match = require_if_match(&headers)?;
-    let Json(provider) = payload.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
+    let provider = json_body(&state, payload)?;
     if provider.name != name {
         return Err(GatewayError::InvalidRequest(format!(
             "path provider name '{name}' does not match the request body's 'name' field '{}'",
@@ -2264,7 +2504,7 @@ pub async fn put_virtual_model(
     payload: Result<Json<lumen_router::virtual_models::VirtualModelConfig>, JsonRejection>,
 ) -> Result<StatusCode, ApiError> {
     let if_match = require_if_match(&headers)?;
-    let Json(vm) = payload.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
+    let vm = json_body(&state, payload)?;
     if vm.id != id {
         return Err(GatewayError::InvalidRequest(format!(
             "path virtual model id '{id}' does not match the request body's 'id' field '{}'",
@@ -2625,6 +2865,55 @@ mod tests {
             "Debug output leaked the plaintext: {dbg}"
         );
         assert!(dbg.contains("REDACTED"), "Debug output was: {dbg}");
+    }
+
+    #[test]
+    fn provider_key_body_debug_never_shows_the_key() {
+        let body = ProviderKeyBody {
+            key: "sk-provider-plaintext-do-not-print".to_owned(),
+        };
+        let dbg = format!("{body:?}");
+        assert!(
+            !dbg.contains("sk-provider-plaintext-do-not-print"),
+            "Debug output leaked the provider key: {dbg}"
+        );
+        assert!(dbg.contains("REDACTED"), "Debug output was: {dbg}");
+    }
+
+    #[test]
+    fn a_cursor_round_trips_and_garbage_is_refused() {
+        let cursor = ListCursor {
+            created_at: 1_760_000_000,
+            // An id holding the separator still round-trips: only the first
+            // `:` splits.
+            id: "key_ab:cd".to_owned(),
+        };
+        let text = encode_cursor(&cursor);
+        assert!(text.bytes().all(|b| b.is_ascii_hexdigit()), "{text}");
+        assert_eq!(decode_cursor(&text), Some(cursor));
+
+        for bad in [
+            "",
+            "zz",
+            "6e6f7065",
+            &hex::encode("x:id"),
+            &hex::encode("12:"),
+        ] {
+            assert_eq!(decode_cursor(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn no_paging_parameter_means_no_page() {
+        assert!(matches!(page_request(None, None), Ok(None)));
+        let page = page_request(None, Some(&hex::encode("5:k")))
+            .ok()
+            .flatten()
+            .unwrap();
+        assert_eq!(page.limit, DEFAULT_LIST_LIMIT);
+        assert!(page_request(Some(0), None).is_err());
+        assert!(page_request(Some(MAX_LIST_LIMIT + 1), None).is_err());
+        assert!(page_request(Some(MAX_LIST_LIMIT), None).is_ok());
     }
 
     #[test]

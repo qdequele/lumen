@@ -14,11 +14,11 @@ use lumen_auth::crypto::MasterKey;
 use lumen_auth::key::hash_key;
 use lumen_auth::state::AuthState;
 use lumen_auth::store::{GroupRecord, KeyStore};
-use lumen_auth::usage::{spawn_usage_writer, UsageWriterConfig};
+use lumen_auth::usage::{spawn_usage_writer_with_drop_hook, UsageWriterConfig};
 use lumen_server::{
     auth::{now_unix, AuthRuntime},
     build_app,
-    config::{ensure_boot_only, Config, ConfigSourceKind},
+    config::{Config, ConfigSourceKind},
     config_source::{ConfigContext, ConfigSource, DbSource},
     health::{spawn_health_checks, ProviderHealth},
     lifecycle, log_startup,
@@ -30,7 +30,8 @@ use lumen_server::{
     webhooks::WebhookController,
 };
 use lumen_telemetry::{
-    logging::init_logging, LatencyMetrics, Metrics, ReloadMetrics, ResilienceMetrics, TokenMetrics,
+    logging::{init_logging, install_panic_flush_hook},
+    LatencyMetrics, LogGuard, LogHandle, Metrics, ReloadMetrics, ResilienceMetrics, TokenMetrics,
 };
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -154,9 +155,16 @@ fn main() -> ExitCode {
     };
 
     // Logging is initialised only after config parses, so the format is known.
-    init_logging(config.log_format.into(), "info");
+    // The guard owns the log writer thread: it lives until `main` returns, where
+    // dropping it flushes every queued line (including the error logged below).
+    let log_guard = init_logging(config.log_format.into(), "info");
+    // A panic aborts (release profile) without dropping the guard: the hook
+    // gives the writer the same bounded flush before the process dies.
+    if let Some(guard) = &log_guard {
+        install_panic_flush_hook(guard.handle());
+    }
 
-    match run(config_path) {
+    match run(config_path, log_guard.as_ref().map(LogGuard::handle)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             tracing::error!(error = %format!("{err:#}"), "server exited with error");
@@ -630,7 +638,7 @@ fn build_token_counter(config: &Config) -> Arc<TokenCounter> {
 /// (boot + dynamic) config, and the context just wraps the same path the
 /// process has always read and rewritten. DB mode reads ONLY the boot layer
 /// from `config_path` (a dynamic key there is a boot error -
-/// [`ensure_boot_only`]), requires `auth.enabled = true`, opens the auth
+/// `ensure_boot_only`), requires `auth.enabled = true`, opens the auth
 /// database early, and loads the stored dynamic document through
 /// [`ConfigContext::load_config`], which refuses one carrying a boot-layer
 /// key and merges it over the boot layer. An empty stored document (a
@@ -643,24 +651,16 @@ async fn boot_config_context(
     // Reading and parsing the boot file is synchronous file I/O, and this
     // runs inside the runtime: do it on the blocking pool.
     let path = config_path.to_path_buf();
-    let boot = tokio::task::spawn_blocking(move || -> anyhow::Result<Config> {
-        let boot = Config::load(&path)?;
-        if boot.config_source == ConfigSourceKind::Db {
-            let text = std::fs::read_to_string(&path)?;
-            ensure_boot_only(&text, &path.display().to_string())?;
-        }
-        Ok(boot)
-    })
-    .await
-    .context("boot config load task failed")??;
+    // `Config::load_boot` is the preflight `--check-config` runs too: every
+    // boot-file check that needs no database (db mode: boot-layer keys only,
+    // auth enabled) lives there, so the deploy gate and the boot agree.
+    let boot = tokio::task::spawn_blocking(move || Config::load_boot(&path))
+        .await
+        .context("boot config load task failed")??;
 
     match boot.config_source {
         ConfigSourceKind::File => Ok((boot, ConfigContext::file(config_path.to_path_buf()), None)),
         ConfigSourceKind::Db => {
-            anyhow::ensure!(
-                boot.auth.enabled,
-                "config_source = \"db\" requires [auth] enabled = true with a database"
-            );
             let store = KeyStore::connect(&boot.auth.db_url()).await?; // runs migrations
             let source = DbSource::new(store.clone());
             if source.load().await?.toml.is_empty() {
@@ -675,10 +675,14 @@ async fn boot_config_context(
             // the boot file, so the bind address, log format, auth switch
             // and DB path always come from the boot file alone - a stored
             // document can neither disable auth nor silently rebind.
-            let config = ctx
-                .load_config()
-                .await
-                .context("config_source = \"db\": the stored config document cannot be loaded")?;
+            // `log_summary`: this error ends up in the fatal log line, and a
+            // parse failure's full message quotes the stored document.
+            let config = ctx.load_config().await.map_err(|error| {
+                anyhow::anyhow!(
+                    "config_source = \"db\": the stored config document cannot be loaded: {}",
+                    error.log_summary()
+                )
+            })?;
             Ok((config, ctx, Some(store)))
         }
     }
@@ -686,7 +690,7 @@ async fn boot_config_context(
 
 // Linear boot sequence: each step depends on the previous one's output.
 #[allow(clippy::too_many_lines)]
-fn run(config_path: PathBuf) -> anyhow::Result<()> {
+fn run(config_path: PathBuf, log: Option<LogHandle>) -> anyhow::Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -716,7 +720,7 @@ fn run(config_path: PathBuf) -> anyhow::Result<()> {
             latency,
             resilience: resilience_metrics,
             reload: reload_metrics,
-        } = register_metrics(&config)?;
+        } = register_metrics(&config, log.as_ref())?;
         let resilience = Arc::new(ResilienceRuntime::from_config(
             &config,
             Some(resilience_metrics.clone()),
@@ -728,7 +732,8 @@ fn run(config_path: PathBuf) -> anyhow::Result<()> {
         let mut provider_specs = config.provider_specs();
         let (auth_runtime, usage_logger, usage_writer, boot_backfill, key_source, auth_knobs) =
             if config.auth.enabled {
-                let boot = boot_auth_stack(&config, &mut provider_specs, prebuilt_store).await?;
+                let boot =
+                    boot_auth_stack(&config, &mut provider_specs, prebuilt_store, &tokens).await?;
                 (
                     Some(boot.runtime),
                     Some(boot.usage_logger),
@@ -1119,7 +1124,10 @@ struct RegisteredMetrics {
 }
 
 /// Create the registry and register every always-on collector.
-fn register_metrics(config: &Config) -> anyhow::Result<RegisteredMetrics> {
+///
+/// `log` is the log writer's handle, absent only when logging was already
+/// initialised by someone else: it exposes the lines the log queue dropped.
+fn register_metrics(config: &Config, log: Option<&LogHandle>) -> anyhow::Result<RegisteredMetrics> {
     let metrics = Metrics::new();
     let tokens = TokenMetrics::register(&metrics, &config.telemetry.metadata_labels)
         .context("failed to register token metrics")?;
@@ -1128,6 +1136,10 @@ fn register_metrics(config: &Config) -> anyhow::Result<RegisteredMetrics> {
     let resilience =
         ResilienceMetrics::register(&metrics).context("failed to register resilience metrics")?;
     let reload = ReloadMetrics::register(&metrics).context("failed to register reload metrics")?;
+    if let Some(log) = log {
+        log.register_dropped_lines(&metrics)
+            .context("failed to register log metrics")?;
+    }
     Ok(RegisteredMetrics {
         metrics,
         tokens,
@@ -1303,6 +1315,7 @@ async fn boot_auth_stack(
     config: &Config,
     provider_specs: &mut [lumen_providers::ProviderSpec],
     prebuilt_store: Option<KeyStore>,
+    tokens: &TokenMetrics,
 ) -> anyhow::Result<AuthBoot> {
     use zeroize::Zeroize;
     let mut master_value = std::env::var(MASTER_KEY_ENV).with_context(|| {
@@ -1359,13 +1372,17 @@ async fn boot_auth_stack(
     }
     tracing::info!(key_count = keys.len(), group_count, "virtual keys loaded");
 
-    let (logger, writer) = spawn_usage_writer(
+    // Rows the writer finally discards (a batch the DB refused twice) land in
+    // the same `lumen_usage_log_dropped_total` as the channel-full drops.
+    let dropped = tokens.clone();
+    let (logger, writer) = spawn_usage_writer_with_drop_hook(
         store.clone(),
         UsageWriterConfig {
             capacity: config.auth.usage_channel_capacity,
             batch_max: config.auth.usage_batch_max,
             flush_interval: Duration::from_millis(config.auth.usage_flush_ms),
         },
+        Arc::new(move |rows| (0..rows).for_each(|_| dropped.inc_usage_dropped())),
     );
 
     // The reloader re-reads DB provider keys on each reload (rotation without a
@@ -1395,8 +1412,12 @@ async fn boot_auth_stack(
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
-            let retention = i64::from(purge_knobs.retention_days()) * 86_400;
-            match store.purge_usage_older_than(now_unix() - retention).await {
+            // `None` = a zero window (a reload that disabled auth stores 0):
+            // skip, never purge with a cutoff of "now".
+            let Some(cutoff) = purge_knobs.retention_cutoff(now_unix()) else {
+                continue;
+            };
+            match store.purge_usage_older_than(cutoff).await {
                 Ok(0) => {}
                 Ok(purged) => tracing::info!(purged, "usage-log retention purge"),
                 Err(error) => tracing::warn!(%error, "usage-log purge failed"),

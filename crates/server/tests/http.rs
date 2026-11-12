@@ -104,3 +104,86 @@ async fn oversized_body_is_rejected_with_413() {
         "expected the message to cite the configured 32-byte limit, got {body:?}"
     );
 }
+
+/// A valid JSON body of about `filler` bytes for each `/v1` POST route. The
+/// model is unknown to the (empty) registry, so a body that was accepted and
+/// parsed answers `404 LM-2001`, never a body-size or parse error.
+fn sized_bodies(filler: usize) -> [(&'static str, String); 4] {
+    let big = "x".repeat(filler);
+    [
+        (
+            "/v1/chat/completions",
+            format!(r#"{{"model":"nope","messages":[{{"role":"user","content":"{big}"}}]}}"#),
+        ),
+        (
+            "/v1/embeddings",
+            format!(r#"{{"model":"nope","input":"{big}"}}"#),
+        ),
+        (
+            "/v1/rerank",
+            format!(r#"{{"model":"nope","query":"q","documents":["{big}"]}}"#),
+        ),
+        (
+            "/v1/decisions",
+            format!(
+                r#"{{"model":"nope","input":"{big}","questions":[{{"type":"predicate","instructions":"?"}}]}}"#
+            ),
+        ),
+    ]
+}
+
+/// `server.body_limit` is the only body limit: a body larger than axum's
+/// built-in 2 MiB extractor default but under the configured limit is read
+/// and parsed on every `/v1` POST route.
+#[tokio::test]
+async fn a_body_between_2_mib_and_the_limit_is_accepted() {
+    let base = common::spawn_with_limit(8 * 1024 * 1024).await;
+    let client = reqwest::Client::new();
+    for (route, body) in sized_bodies(3 * 1024 * 1024) {
+        let resp = client
+            .post(format!("{base}{route}"))
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status();
+        let json: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(status, 404, "{route}: {json}");
+        assert_eq!(json["error"]["code"], "LM-2001", "{route}: {json}");
+    }
+}
+
+/// A chunked body (no `Content-Length`) is only found over the limit while
+/// the handler reads it: that is still `413 LM-1002` quoting the configured
+/// limit, never a `400 LM-1001`.
+#[tokio::test]
+async fn an_over_limit_chunked_body_is_a_413_lm_1002() {
+    let base = common::spawn_with_limit(1024).await;
+    let client = reqwest::Client::new();
+    for (route, body) in sized_bodies(64 * 1024) {
+        let chunks: Vec<Result<Vec<u8>, std::io::Error>> = body
+            .as_bytes()
+            .chunks(512)
+            .map(|c| Ok(c.to_vec()))
+            .collect();
+        let resp = client
+            .post(format!("{base}{route}"))
+            .header("content-type", "application/json")
+            .body(reqwest::Body::wrap_stream(futures::stream::iter(chunks)))
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status();
+        let json: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(status, 413, "{route}: {json}");
+        assert_eq!(json["error"]["code"], "LM-1002", "{route}: {json}");
+        assert!(
+            json["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("1024"),
+            "{route}: {json}"
+        );
+    }
+}

@@ -6,12 +6,16 @@
 //! cancelled if the client disconnects (via the drop guard), aborting the
 //! upstream call.
 
+use axum::body::Body;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::State;
-use axum::http::HeaderMap;
+use axum::http::{header, HeaderMap};
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
-use lumen_core::{tokens, Capability, GatewayError, ProviderError};
+use lumen_core::{
+    tokens, Capability, EmbedCompletion, EmbedRequest, EmbeddingProvider, GatewayError,
+    ProviderError,
+};
 use lumen_providers::batch;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -20,7 +24,7 @@ use crate::accounting::{Accounting, Outcome, Target, TokenBreakdown};
 use crate::auth::AuthedKey;
 use crate::bandwidth::UpstreamMark;
 use crate::byok::{RequestKeys, Served};
-use crate::error::ApiError;
+use crate::error::{body_rejection, ApiError};
 use crate::facts::Facts;
 use crate::resilience::routing_headers;
 use crate::state::AppState;
@@ -81,8 +85,8 @@ pub async fn embeddings(
     payload: Result<Json<lumen_core::EmbedRequest>, JsonRejection>,
 ) -> Result<Response, ApiError> {
     // Malformed request body → LM-1001 in our standard envelope (not axum's
-    // default plain-text rejection).
-    let Json(req) = payload.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
+    // default plain-text rejection); a body over the limit → LM-1002.
+    let Json(req) = payload.map_err(|e| body_rejection(&e, state.body_limit))?;
 
     if req.input.is_empty() {
         return Err(GatewayError::InvalidRequest("`input` must not be empty".to_owned()).into());
@@ -140,6 +144,7 @@ pub async fn embeddings(
             capability: "embed",
             model: &client_model,
             provider: &chain[0].route.provider_name,
+            account_model: decision.account,
         },
         estimated_input,
         estimated_cost,
@@ -166,42 +171,38 @@ pub async fn embeddings(
     .await?;
 
     // Execute across the chain with retries, fallback, circuit breaking and the
-    // per-model timeouts. A fresh request clone (per attempt/link) carries that
-    // link's upstream id.
+    // per-model timeouts. The client's request is shared by reference across
+    // attempts, retries and key rotations: the one copy an upstream call needs
+    // (providers take their request by value) is made when a provider is about
+    // to be called, carrying that attempt's overrides and upstream id.
     let executed =
         lumen_router::executor::execute(&links, &state.resilience.breakers, &exec, &cancel, |i| {
-            let platform = chain[i].route.provider.clone();
-            let provider_name = chain[i].route.provider_name.clone();
-            let cancel = cancel.clone();
-            let mut attempt_req = req.clone();
-            decision.attempts[i].apply(&mut attempt_req);
-            chain[i]
-                .route
-                .upstream_id
-                .clone_into(&mut attempt_req.model);
-            let (keys, registry, mark) = (&keys, &*state.registry, &mark);
+            let link = &chain[i].route;
+            let platform = link.provider.clone();
+            let provider_name = link.provider_name.as_str();
+            let attempt = &decision.attempts[i];
+            let (keys, registry, mark, req, cancel) =
+                (&keys, &*state.registry, &mark, &req, &cancel);
+            // A split request retries a failed sub-batch within this link's
+            // retry policy: off when the policy allows no retry (ADR 005).
+            let sub_batch_retry =
+                batch::SubBatchRetry::capped_at(links[i].retry.unwrap_or(exec.retry).max_attempts);
             async move {
                 // Marked only when an upstream call is actually sent.
-                let call = |provider: Option<Arc<dyn lumen_core::EmbeddingProvider>>| {
-                    let (req, cancel, name) =
-                        (attempt_req.clone(), cancel.clone(), provider_name.clone());
-                    async move {
-                        let provider =
-                            provider.ok_or(ProviderError::Unavailable { provider: name })?;
-                        mark.mark();
-                        batch::embed_batched(
-                            provider.as_ref(),
-                            req,
-                            &cancel,
-                            batch::DEFAULT_CONCURRENCY,
-                        )
-                        .await
-                    }
+                let call = |provider: Option<Arc<dyn EmbeddingProvider>>| async move {
+                    let provider = provider.ok_or_else(|| ProviderError::Unavailable {
+                        provider: provider_name.to_owned(),
+                    })?;
+                    mark.mark();
+                    let mut attempt_req = req.clone();
+                    attempt.apply(&mut attempt_req);
+                    link.upstream_id.clone_into(&mut attempt_req.model);
+                    embed_upstream(provider.as_ref(), attempt_req, cancel, sub_batch_retry).await
                 };
                 keys.attempt(
                     registry,
                     i,
-                    &provider_name,
+                    provider_name,
                     || call(Some(platform)),
                     |set| call(set.embed.clone()),
                 )
@@ -213,10 +214,36 @@ pub async fn embeddings(
         .map_err(|e| accounting.fail(e))?;
     // (an early return above drops `accounting`, refunding the reservation)
 
-    let (mut response, served) = executed.value;
+    let (completion, served) = executed.value;
     accounting.served_by(&executed.model_used, &executed.provider_used);
     let route = decision.route_of(executed.index);
     accounting.set_route(route, decision.account);
+    let billable = matches!(served, Served::Platform);
+
+    let mut response = match completion {
+        // The upstream body already is the client's answer: usage reported,
+        // every vector in the requested encoding. It is forwarded as the
+        // bytes received (ADR 004, 2026-11-12 amendment).
+        EmbedCompletion::Passthrough(upstream) => {
+            let tokens_in = u64::from(upstream.usage().prompt_tokens);
+            finish_embed(
+                &state,
+                accounting,
+                &pricing,
+                &executed.model_used,
+                &req,
+                (tokens_in, false),
+                billable,
+            );
+            return Ok((
+                routing_headers(&executed.model_used, route),
+                [(header::CONTENT_TYPE, "application/json")],
+                Body::from(upstream.into_body()),
+            )
+                .into_response());
+        }
+        EmbedCompletion::Typed(response) => response,
+    };
 
     // ADR 003: upstream usage when reported, else the local estimate - never
     // a silent zero (e.g. TEI reports nothing). The response envelope always
@@ -239,7 +266,7 @@ pub async fn embeddings(
         &executed.model_used,
         &req,
         (tokens_in, estimated),
-        matches!(served, Served::Platform),
+        billable,
     );
 
     // Honor the requested output encoding (OpenAI `encoding_format`), as the
@@ -258,6 +285,44 @@ pub async fn embeddings(
     }
 
     Ok((routing_headers(&executed.model_used, route), Json(response)).into_response())
+}
+
+/// Send one attempt's request upstream.
+///
+/// A request that fits one upstream call goes through
+/// [`EmbeddingProvider::embed_completion`], so a same-schema body can come
+/// back as bytes (ADR 004, 2026-11-12 amendment); one that has to be split
+/// goes through [`batch::embed_batched_with`], whose reassembled answer is
+/// always typed and which retries a failed sub-batch within `sub_batch_retry`
+/// (derived from the link's retry policy, ADR 005). Either way the number of vectors returned must equal the number of
+/// inputs sent: a short upstream response is a `LM-3002`, never a silent
+/// short result (issue #89, the same check as `batch.rs`).
+async fn embed_upstream(
+    provider: &dyn EmbeddingProvider,
+    req: EmbedRequest,
+    cancel: &CancellationToken,
+    sub_batch_retry: batch::SubBatchRetry,
+) -> Result<EmbedCompletion, ProviderError> {
+    let expected = req.input.len();
+    if expected > provider.max_batch_size().max(1) {
+        return batch::embed_batched_with(
+            provider,
+            req,
+            cancel,
+            batch::DEFAULT_CONCURRENCY,
+            sub_batch_retry,
+        )
+        .await
+        .map(EmbedCompletion::Typed);
+    }
+    let completion = provider.embed_completion(req, cancel.clone()).await?;
+    let returned = completion.vector_count();
+    if returned != expected {
+        return Err(ProviderError::Translation(format!(
+            "embedding count {returned} != input count {expected}"
+        )));
+    }
+    Ok(completion)
 }
 
 /// Close the embed accounting record: inline for upstream-reported or
@@ -284,12 +349,15 @@ fn finish_embed(
         let counter = state.token_counter();
         let model = model_used.to_owned();
         let texts: Vec<String> = req.input.iter().map(str::to_owned).collect();
+        // The recount covers the text only: images and pre-tokenized ids keep
+        // their estimate, so an image-only item is not refined down to zero.
+        let non_text = tokens::estimate_embed_non_text(req);
         let pricing_task = pricing.clone();
         tokio::spawn(async move {
             let refined = counter
                 .refine_embed(&model, texts)
                 .await
-                .unwrap_or(tokens_in);
+                .map_or(tokens_in, |text| text.saturating_add(non_text));
             let cost = pricing_task.token_cost(&model, refined, 0);
             accounting.finish(&Outcome {
                 tokens_in: refined,

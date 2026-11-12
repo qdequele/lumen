@@ -158,7 +158,17 @@ impl FileSource {
         toml: &str,
         expected_hash: &str,
     ) -> Result<String, ConfigSourceError> {
-        let path = self.path.as_path();
+        // Resolve the path once and do everything at the resolved location.
+        // A config path is often a symlink (`/etc/lumen/config.toml` pointing
+        // into a managed directory): renaming a staged file over `self.path`
+        // itself would replace the LINK with a regular file and silently
+        // sever it from its target. `replace_file_in_place` in `main.rs`
+        // canonicalises for the same reason. Staging next to the resolved
+        // target also keeps the rename on one filesystem, which a link into
+        // another mount would not.
+        let resolved = std::fs::canonicalize(&self.path)
+            .map_err(|e| ConfigSourceError::Io(format!("resolving config path: {e}")))?;
+        let path = resolved.as_path();
 
         let current = std::fs::read(path)
             .map_err(|e| ConfigSourceError::Io(format!("reading config: {e}")))?;
@@ -222,7 +232,10 @@ impl FileSource {
             );
         }
 
-        let backup = path.with_extension("toml.bak");
+        // The backup stays a sibling of the path the operator configured
+        // (the link, when there is one), where it has always been and where
+        // the docs say to look for it.
+        let backup = self.path.with_extension("toml.bak");
         std::fs::copy(path, &backup)
             .map_err(|e| ConfigSourceError::Io(format!("backing up config: {e}")))?;
         std::fs::rename(&staged, path)
@@ -349,6 +362,20 @@ pub enum ConfigLoadError {
     /// on every reload.
     #[error(transparent)]
     Registry(#[from] RegistryError),
+}
+
+impl ConfigLoadError {
+    /// This error for a LOG line: a config parse failure prints its
+    /// content-free summary ([`ConfigError::log_summary`]) so no document
+    /// content (operator prompt text included) reaches a log; the other
+    /// variants carry none and print as usual.
+    #[must_use]
+    pub fn log_summary(&self) -> String {
+        match self {
+            Self::Config(error) => error.log_summary(),
+            Self::Source(_) | Self::Registry(_) => self.to_string(),
+        }
+    }
 }
 
 /// Where the dynamic config document lives, bundled with the boot file path
@@ -482,7 +509,12 @@ impl ConfigContext {
             ConfigSourceKind::Db => {
                 let text = text.to_owned();
                 let boot_path = self.boot_path.clone();
-                load_blocking(move || Config::load_with_dynamic(&boot_path, &text)).await?
+                load_blocking(move || {
+                    let config = Config::load_with_dynamic(&boot_path, &text)?;
+                    ensure_db_mode_signing_env(&config, &boot_path)?;
+                    Ok(config)
+                })
+                .await?
             }
         };
         // A throwaway client: this runs on an admin route, never the hot
@@ -495,6 +527,44 @@ impl ConfigContext {
         )?;
         Ok(())
     }
+}
+
+/// Refuse a `config_source = "db"` candidate whose `[webhooks]` block names a
+/// `LUMEN_`-prefixed `signing_key_env`.
+///
+/// `LUMEN_`-prefixed variables live in the config loader's overlay namespace
+/// and are only kept out of it by being named in the document the loader is
+/// reading. At boot (and in `--check-config`) the boot file is parsed alone,
+/// before the database is open, so a name stored in the dynamic document is
+/// unknown to that load: once the variable is exported it is read as an
+/// unknown config key and the process exits before it ever reaches the
+/// database. `lumen_auth::events` refuses the prefix on the stored
+/// `/admin/webhooks` row for the same reason.
+///
+/// Write path only: a document stored before this check existed still loads
+/// (it boots whenever the variable is unset and a sealed secret signs), and
+/// refusing it on the read path would turn that working boot into a failure.
+fn ensure_db_mode_signing_env(config: &Config, boot_path: &Path) -> Result<(), ConfigError> {
+    let Some(var) = config
+        .webhooks
+        .as_ref()
+        .and_then(|w| w.signing_key_env.as_deref())
+    else {
+        return Ok(());
+    };
+    if !var.starts_with("LUMEN_") {
+        return Ok(());
+    }
+    Err(ConfigError::Validation {
+        path: boot_path.display().to_string(),
+        message: format!(
+            "webhooks.signing_key_env '{var}' must not start with 'LUMEN_' in config_source = \
+             \"db\" mode: that prefix is the config loader's namespace and the boot file is \
+             parsed before the database is read, so the variable cannot be excluded from it. \
+             Name the variable without the prefix, or store the secret with PUT \
+             /admin/webhooks/signing-key"
+        ),
+    })
 }
 
 /// Run a synchronous `Config`-parsing closure on the blocking pool and fold
@@ -644,6 +714,58 @@ mod tests {
             std::fs::read_to_string(path.with_extension("toml.bak")).unwrap(),
             "a = 2\n"
         );
+    }
+
+    /// A config path that is a symlink (a common `/etc/lumen/config.toml`
+    /// layout) must stay one: the write goes to the file it points at, not
+    /// over the link itself.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn file_source_persist_writes_through_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let real_dir = dir.path().join("real");
+        std::fs::create_dir(&real_dir).unwrap();
+        let target = real_dir.join("lumen.toml");
+        std::fs::write(&target, "a = 1\n").unwrap();
+        let link_dir = dir.path().join("etc");
+        std::fs::create_dir(&link_dir).unwrap();
+        let link = link_dir.join("config.toml");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let src = FileSource::new(link.clone());
+        let doc = src.load().await.unwrap();
+        src.persist("a = 2\n", &doc.hash).await.unwrap();
+
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the config path must still be a symlink after a persist"
+        );
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "a = 2\n");
+        assert_eq!(std::fs::read_to_string(&link).unwrap(), "a = 2\n");
+        // The backup stays next to the path the operator configured, and no
+        // staging file is left in either directory.
+        assert_eq!(
+            std::fs::read_to_string(link.with_extension("toml.bak")).unwrap(),
+            "a = 1\n"
+        );
+        let names = |dir: &Path| {
+            let mut names: Vec<String> = std::fs::read_dir(dir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            names
+        };
+        assert_eq!(names(&real_dir), ["lumen.toml"]);
+        assert_eq!(names(&link_dir), ["config.toml", "config.toml.bak"]);
+        // A second persist still works through the link.
+        let doc = src.load().await.unwrap();
+        src.persist("a = 3\n", &doc.hash).await.unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "a = 3\n");
     }
 
     #[tokio::test]

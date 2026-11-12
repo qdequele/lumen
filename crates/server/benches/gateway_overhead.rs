@@ -109,6 +109,7 @@ fn bench_executor(c: &mut Criterion) {
         escapes: Vec::new(),
         breaker_scope: None,
         retry: None,
+        first_token: None,
     }];
     let breakers = CircuitBreakers::new(BreakerConfig::default(), None);
     let config = ExecConfig {
@@ -226,10 +227,142 @@ fn bench_decisions(c: &mut Criterion) {
     }
 }
 
+/// The cost of one deep copy of a chat request. The handlers make one per
+/// upstream call (the copy the provider consumes); they used to make two.
+fn bench_request_clone(c: &mut Criterion) {
+    let small = sample_request();
+    let mut large = sample_request();
+    // A 12-turn conversation of ~8 KB with a tool definition.
+    let turn = large.messages[1].clone();
+    for i in 0..12 {
+        let mut message = turn.clone();
+        message.content = Some(MessageContent::Text(format!(
+            "turn {i}: {}",
+            "x".repeat(660)
+        )));
+        large.messages.push(message);
+    }
+    large.extra.insert(
+        "tools".to_owned(),
+        serde_json::json!([{ "type": "function", "function": {
+            "name": "search", "description": "Search the index.",
+            "parameters": { "type": "object", "properties": {
+                "q": { "type": "string" }, "limit": { "type": "integer" } } } } }]),
+    );
+    for (name, req) in [("small", small), ("8k", large)] {
+        c.bench_function(&format!("chat_request_clone_{name}"), |b| {
+            b.iter(|| black_box(black_box(&req).clone()));
+        });
+    }
+}
+
+/// An OpenAI-format completion body whose answer is `content_bytes` long.
+fn completion_body(content_bytes: usize) -> bytes::Bytes {
+    let content = "The quick brown fox. ".repeat(content_bytes / 21 + 1);
+    bytes::Bytes::from(format!(
+        r#"{{"id":"chatcmpl-1","object":"chat.completion","created":1,"model":"gpt-4o","choices":[{{"index":0,"message":{{"role":"assistant","content":"{content}","refusal":null}},"logprobs":null,"finish_reason":"stop"}}],"usage":{{"prompt_tokens":20,"completion_tokens":30,"total_tokens":50,"prompt_tokens_details":{{"cached_tokens":0}}}},"system_fingerprint":"fp_1"}}"#
+    ))
+}
+
+/// What the gateway does with a non-streaming upstream body (ADR 004,
+/// 2026-11-12): `typed` parses it into a `ChatResponse` and serializes it
+/// again (the path a body without usage still takes), `passthrough` probes
+/// `usage` and keeps the bytes.
+fn bench_response_passthrough(c: &mut Criterion) {
+    use lumen_core::ChatCompletion;
+    for (name, body) in [
+        ("small", completion_body(128)),
+        ("4k", completion_body(4 * 1024)),
+    ] {
+        c.bench_function(&format!("chat_response_typed_{name}"), |b| {
+            b.iter(|| {
+                let response: ChatResponse =
+                    serde_json::from_slice(black_box(&body)).expect("parse");
+                let out = serde_json::to_vec(&response).expect("serialize");
+                black_box(out.len());
+            });
+        });
+        c.bench_function(&format!("chat_response_passthrough_{name}"), |b| {
+            b.iter(|| {
+                let completion =
+                    ChatCompletion::from_openai_body(black_box(&body).clone()).expect("probe");
+                assert!(matches!(completion, ChatCompletion::Passthrough(_)));
+                black_box(completion);
+            });
+        });
+    }
+}
+
+/// An OpenAI-format embeddings body: `vectors` vectors of 1536 dimensions,
+/// as float arrays or base64 strings.
+fn embeddings_body(vectors: usize, base64: bool) -> bytes::Bytes {
+    let items: Vec<String> = (0..vectors)
+        .map(|index| {
+            // Values spread over [-1, 1) with full f32 digits, like a real
+            // normalized embedding.
+            #[allow(clippy::cast_precision_loss)]
+            let vector: Vec<f32> = (0..1536)
+                .map(|d| ((index * 1536 + d) as f32 * 0.618_034).sin() * 0.05)
+                .collect();
+            let embedding = if base64 {
+                format!("\"{}\"", lumen_core::encode_embedding_base64(&vector))
+            } else {
+                serde_json::to_string(&vector).expect("floats")
+            };
+            format!(r#"{{"object":"embedding","index":{index},"embedding":{embedding}}}"#)
+        })
+        .collect();
+    bytes::Bytes::from(format!(
+        r#"{{"object":"list","data":[{}],"model":"text-embedding-3-small","usage":{{"prompt_tokens":64,"total_tokens":64}}}}"#,
+        items.join(",")
+    ))
+}
+
+/// What the gateway does with an embeddings body (ADR 004, 2026-11-12):
+/// `typed` decodes every vector to `Vec<f32>` and encodes it again,
+/// `passthrough` probes the usage and the vector count and keeps the bytes.
+fn bench_embeddings_passthrough(c: &mut Criterion) {
+    use lumen_core::{EmbedCompletion, EmbedResponse, EmbeddingEncoding};
+    for (name, base64, encoding) in [
+        ("float", false, EmbeddingEncoding::Float),
+        ("base64", true, EmbeddingEncoding::Base64),
+    ] {
+        for vectors in [1, 32] {
+            let body = embeddings_body(vectors, base64);
+            c.bench_function(&format!("embed_response_typed_{name}_{vectors}"), |b| {
+                b.iter(|| {
+                    let mut response: EmbedResponse =
+                        serde_json::from_slice(black_box(&body)).expect("parse");
+                    for item in &mut response.data {
+                        item.encoding = encoding;
+                    }
+                    let out = serde_json::to_vec(&response).expect("serialize");
+                    black_box(out.len());
+                });
+            });
+            c.bench_function(
+                &format!("embed_response_passthrough_{name}_{vectors}"),
+                |b| {
+                    b.iter(|| {
+                        let completion =
+                            EmbedCompletion::from_openai_body(black_box(&body).clone(), encoding)
+                                .expect("probe");
+                        assert!(matches!(completion, EmbedCompletion::Passthrough(_)));
+                        black_box(completion);
+                    });
+                },
+            );
+        }
+    }
+}
+
 criterion_group!(
     benches,
     bench_executor,
     bench_json_roundtrip,
-    bench_decisions
+    bench_decisions,
+    bench_request_clone,
+    bench_response_passthrough,
+    bench_embeddings_passthrough
 );
 criterion_main!(benches);

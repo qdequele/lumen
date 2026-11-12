@@ -6,6 +6,8 @@
 
 use std::borrow::Cow;
 
+use bytes::Bytes;
+use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
@@ -141,8 +143,9 @@ pub struct DataUri {
 
 impl MessageContent {
     /// The concatenated text of the content (borrowed for `Text`; the joined
-    /// `text` parts for `Parts`). Empty for an image-only message. Used by the
-    /// token estimator and any text-only inspection path.
+    /// `text` parts for `Parts`). Empty for an image-only message. Used by
+    /// text-only inspection paths; the token estimator only needs
+    /// [`text_len`](Self::text_len).
     #[must_use]
     pub fn text(&self) -> Cow<'_, str> {
         match self {
@@ -158,6 +161,21 @@ impl MessageContent {
                 }
                 Cow::Owned(out)
             }
+        }
+    }
+
+    /// The byte length of [`text`](Self::text), computed without building it
+    /// (no allocation, whatever the number of parts).
+    #[must_use]
+    pub fn text_len(&self) -> usize {
+        match self {
+            MessageContent::Text(s) => s.len(),
+            MessageContent::Parts(parts) => parts
+                .iter()
+                .filter(|p| p.kind == "text")
+                .filter_map(|p| p.text.as_ref())
+                .map(String::len)
+                .sum(),
         }
     }
 
@@ -240,12 +258,19 @@ pub struct ChatRequest {
     pub n: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop: Option<Value>,
-    /// Whether the client requested a streaming (SSE) response.
-    #[serde(default)]
+    /// Whether the client requested a streaming (SSE) response. An explicit
+    /// `null` reads as `false`, like an absent field.
+    #[serde(default, deserialize_with = "null_as_false")]
     pub stream: bool,
     /// Any additional OpenAI fields (`tools`, `response_format`, ...).
     #[serde(flatten)]
     pub extra: Map<String, Value>,
+}
+
+/// Deserialize a boolean where an explicit `null` means `false` (some SDKs
+/// serialize an unset optional field as `null`).
+fn null_as_false<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
+    Ok(Option::<bool>::deserialize(deserializer)?.unwrap_or(false))
 }
 
 impl ChatRequest {
@@ -362,6 +387,140 @@ pub struct ChatResponse {
     pub usage: Option<Usage>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
+}
+
+/// A non-streaming completion as a provider hands it to the gateway: the typed
+/// response, or the upstream body itself when it can be forwarded unchanged
+/// (ADR 004, 2026-11-12 amendment).
+#[derive(Debug, Clone, PartialEq)]
+pub enum ChatCompletion {
+    /// A response the gateway may read and modify (translating providers, and
+    /// any body whose usage has to be estimated locally).
+    Typed(ChatResponse),
+    /// An OpenAI-format upstream body to forward byte for byte.
+    Passthrough(ChatPassthrough),
+}
+
+/// An OpenAI-format completion body forwarded verbatim, with the usage the
+/// gateway accounts for. Only [`ChatCompletion::from_openai_body`] builds one,
+/// so the usage is always upstream-reported and non-zero (ADR 003).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChatPassthrough {
+    body: Bytes,
+    usage: Usage,
+}
+
+impl ChatPassthrough {
+    /// The upstream-reported usage (never all-zero).
+    #[must_use]
+    pub fn usage(&self) -> &Usage {
+        &self.usage
+    }
+
+    /// The upstream body, to send to the client unchanged.
+    #[must_use]
+    pub fn into_body(self) -> Bytes {
+        self.body
+    }
+}
+
+/// The only parts of an OpenAI completion body the gateway reads when it
+/// forwards the body unchanged. Every other field is skipped without being
+/// built (no allocation), though the whole body is still checked to be JSON.
+///
+/// Read through [`ObjectOnly`], like its `usage`: a derived struct also
+/// deserializes from a JSON array, which no completion is.
+#[derive(Deserialize)]
+struct CompletionProbe {
+    #[serde(default)]
+    usage: Option<ObjectOnly<Usage>>,
+    #[serde(default)]
+    choices: Option<SkippedArray>,
+}
+
+/// `T` read from a JSON object and from nothing else.
+///
+/// serde's derived `Deserialize` also accepts a JSON array, taking the
+/// struct's fields by position, so `[{"prompt_tokens":8},[]]` would read as a
+/// struct with a `usage` and a `choices` field. The probes decide whether an
+/// upstream body is forwarded and billed as it stands, so they read every
+/// struct through this wrapper: an array in place of an object fails the
+/// probe and the body goes to the typed parser instead.
+pub(crate) struct ObjectOnly<T>(pub(crate) T);
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for ObjectOnly<T> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor<T>(std::marker::PhantomData<T>);
+
+        impl<'de, T: Deserialize<'de>> serde::de::Visitor<'de> for Visitor<T> {
+            type Value = ObjectOnly<T>;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("an object")
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> Result<Self::Value, A::Error> {
+                T::deserialize(serde::de::value::MapAccessDeserializer::new(map)).map(ObjectOnly)
+            }
+        }
+
+        deserializer.deserialize_map(Visitor(std::marker::PhantomData))
+    }
+}
+
+/// A JSON array whose elements are skipped, not built.
+struct SkippedArray;
+
+impl<'de> Deserialize<'de> for SkippedArray {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = SkippedArray;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("an array")
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(SkippedArray)
+            }
+        }
+
+        deserializer.deserialize_seq(Visitor)
+    }
+}
+
+impl ChatCompletion {
+    /// Read a non-streaming OpenAI-format completion body.
+    ///
+    /// When the body reports usable usage (a prompt or completion count above
+    /// zero) and has a `choices` array, nothing in it has to change: it is
+    /// kept as bytes and only `usage` is read. Otherwise (no usage to trust,
+    /// or a body the probe cannot read) it is parsed into a [`ChatResponse`]
+    /// so the gateway can add its flagged estimate (ADR 003).
+    ///
+    /// # Errors
+    /// The body is not a valid OpenAI chat completion.
+    pub fn from_openai_body(body: Bytes) -> Result<Self, serde_json::Error> {
+        if let Ok(ObjectOnly(CompletionProbe {
+            usage: Some(ObjectOnly(usage)),
+            choices: Some(SkippedArray),
+        })) = serde_json::from_slice::<ObjectOnly<CompletionProbe>>(&body)
+        {
+            if usage.prompt_tokens > 0 || usage.completion_tokens > 0 {
+                return Ok(Self::Passthrough(ChatPassthrough { body, usage }));
+            }
+        }
+        serde_json::from_slice::<ChatResponse>(&body).map(Self::Typed)
+    }
 }
 
 /// The incremental delta carried by a streaming chunk.
@@ -510,6 +669,42 @@ mod tests {
         ]}"#;
         let m: ChatMessage = serde_json::from_str(json).unwrap();
         assert_eq!(m.content.as_ref().unwrap().text(), "");
+    }
+
+    #[test]
+    fn text_len_is_the_length_of_text_for_every_shape() {
+        for json in [
+            r#"{"role":"user","content":"héllo"}"#,
+            r#"{"role":"user","content":[
+                {"type":"text","text":"what is "},
+                {"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}},
+                {"type":"input_audio","text":"not a text part"},
+                {"type":"text","text":"this?"},
+                {"type":"text"}
+            ]}"#,
+            r#"{"role":"user","content":[]}"#,
+        ] {
+            let m: ChatMessage = serde_json::from_str(json).unwrap();
+            let content = m.content.as_ref().unwrap();
+            assert_eq!(content.text_len(), content.text().len(), "{json}");
+        }
+    }
+
+    #[test]
+    fn stream_null_reads_as_false() {
+        // Some SDKs serialize an unset `stream` as an explicit null.
+        let parse = |stream: &str| {
+            serde_json::from_str::<ChatRequest>(&format!(
+                r#"{{"model":"m","messages":[]{stream}}}"#
+            ))
+        };
+        assert!(!parse(r#","stream":null"#).unwrap().stream);
+        assert!(!parse("").unwrap().stream);
+        assert!(!parse(r#","stream":false"#).unwrap().stream);
+        assert!(parse(r#","stream":true"#).unwrap().stream);
+        // Still a boolean: anything else is a client error.
+        assert!(parse(r#","stream":"yes""#).is_err());
+        assert!(parse(r#","stream":1"#).is_err());
     }
 
     #[test]
@@ -669,6 +864,84 @@ mod tests {
         ] {
             req.extra.insert("max_completion_tokens".into(), bad);
             assert_eq!(req.effective_max_tokens(), None);
+        }
+    }
+
+    /// An upstream body with odd spacing, an unknown top-level field and an
+    /// unknown usage field: none of it survives a typed round trip unchanged.
+    const UPSTREAM_BODY: &str = r#"{ "id":"c-1","object":"chat.completion","created":7,
+  "model":"gpt-4o", "system_fingerprint":"fp_1",
+  "choices":[{"index":0,"message":{"role":"assistant","content":"hi [\"x\"] }"},"logprobs":null,"finish_reason":"stop"}],
+  "usage":{"prompt_tokens":8,"completion_tokens":2,"total_tokens":10,"cost":0.25,
+           "prompt_tokens_details":{"cached_tokens":4}} }"#;
+
+    #[test]
+    fn a_body_with_reported_usage_is_kept_as_the_bytes_received() {
+        let body = Bytes::from_static(UPSTREAM_BODY.as_bytes());
+        let ChatCompletion::Passthrough(upstream) =
+            ChatCompletion::from_openai_body(body.clone()).unwrap()
+        else {
+            panic!("expected a passthrough");
+        };
+        assert_eq!(upstream.usage().prompt_tokens, 8);
+        assert_eq!(upstream.usage().completion_tokens, 2);
+        assert_eq!(upstream.usage().cached_tokens(), Some(4));
+        assert_eq!(upstream.into_body(), body);
+    }
+
+    #[test]
+    fn a_body_without_usable_usage_is_parsed_for_the_local_estimate() {
+        for usage in [
+            "",
+            r#","usage":null"#,
+            r#","usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}"#,
+        ] {
+            let body = format!(
+                r#"{{"id":"c","object":"chat.completion","created":1,"model":"m",
+                "choices":[{{"index":0,"message":{{"role":"assistant","content":"hi"}}}}]{usage}}}"#
+            );
+            let completion = ChatCompletion::from_openai_body(Bytes::from(body)).unwrap();
+            assert!(
+                matches!(completion, ChatCompletion::Typed(_)),
+                "usage fragment {usage:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_usage_that_is_not_an_object_is_never_forwarded_verbatim() {
+        // serde reads a derived struct from an array too (fields by
+        // position). Such a body must not be forwarded as it stands.
+        let body = r#"{"id":"c","object":"chat.completion","created":1,"model":"m",
+            "choices":[{"index":0,"message":{"role":"assistant","content":"hi"}}],
+            "usage":[8,2,10]}"#;
+        let completion = ChatCompletion::from_openai_body(Bytes::from_static(body.as_bytes()));
+        assert!(
+            !matches!(completion, Ok(ChatCompletion::Passthrough(_))),
+            "{completion:?}"
+        );
+    }
+
+    #[test]
+    fn a_body_that_is_not_a_completion_is_an_error_even_with_usage() {
+        for body in [
+            // No `choices`: usage alone does not make a completion.
+            r#"{"usage":{"prompt_tokens":8,"completion_tokens":2,"total_tokens":10}}"#,
+            // `choices` of the wrong type.
+            r#"{"choices":"x","usage":{"prompt_tokens":8,"completion_tokens":2}}"#,
+            // Truncated after a complete usage object.
+            r#"{"usage":{"prompt_tokens":8,"completion_tokens":2},"choices":[{"index":0"#,
+            // A top-level array is never a completion, even when its items
+            // line up with the fields the probe reads.
+            r#"[{"prompt_tokens":8},[]]"#,
+            r#"[{"prompt_tokens":8,"completion_tokens":2,"total_tokens":10},[{"index":0}]]"#,
+            "[]",
+            "not json",
+        ] {
+            assert!(
+                ChatCompletion::from_openai_body(Bytes::from_static(body.as_bytes())).is_err(),
+                "{body}"
+            );
         }
     }
 }

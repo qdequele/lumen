@@ -32,9 +32,9 @@ pub mod tokens;
 
 pub use capability::Capability;
 pub use chat::{
-    developer_role_as_system, ChatChoice, ChatChunk, ChatChunkChoice, ChatDelta, ChatMessage,
-    ChatRequest, ChatResponse, CompletionTokensDetails, ContentPart, DataUri, ImageUrl,
-    MessageContent, PromptTokensDetails, Usage, DEVELOPER_ROLE,
+    developer_role_as_system, ChatChoice, ChatChunk, ChatChunkChoice, ChatCompletion, ChatDelta,
+    ChatMessage, ChatPassthrough, ChatRequest, ChatResponse, CompletionTokensDetails, ContentPart,
+    DataUri, ImageUrl, MessageContent, PromptTokensDetails, Usage, DEVELOPER_ROLE,
 };
 pub use decisions::{
     Answer, ChoiceOption, ChoiceValue, DecisionLimits, DecisionRequest, DecisionResponse,
@@ -42,8 +42,8 @@ pub use decisions::{
     QuestionKind, Text,
 };
 pub use embed::{
-    encode_embedding_base64, EmbedData, EmbedInput, EmbedItem, EmbedRequest, EmbedResponse,
-    EmbedUsage, EmbeddingEncoding,
+    encode_embedding_base64, EmbedCompletion, EmbedData, EmbedInput, EmbedItem, EmbedPassthrough,
+    EmbedRequest, EmbedResponse, EmbedUsage, EmbeddingEncoding,
 };
 pub use error::{
     BudgetScope, ErrorBody, ErrorEnvelope, ErrorType, GatewayError, ProviderError, QuotaKind,

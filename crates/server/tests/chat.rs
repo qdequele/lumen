@@ -375,6 +375,37 @@ async fn ollama_kind_serves_chat_through_its_openai_compatible_v1_path() {
 
 /// ADR 003 for the ollama chat path: an upstream reply with no `usage` still
 /// yields a non-zero token count, honestly labelled `estimated`.
+/// An explicit `"stream": null` is an unset `stream`: a normal JSON
+/// completion, not a 400.
+#[tokio::test]
+async fn stream_null_is_a_non_streaming_request() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_chat_body("llama3.2")))
+        .mount(&upstream)
+        .await;
+    let base = common::spawn_with(ollama_registry(&upstream.uri()), LIMIT).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&json!({
+            "model": "local-llama",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "stream": null
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["object"], "chat.completion");
+
+    let requests = upstream.received_requests().await.unwrap();
+    let sent: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(sent["stream"], false);
+}
+
 #[tokio::test]
 async fn ollama_chat_without_upstream_usage_reports_an_estimated_count() {
     let upstream = MockServer::start().await;
@@ -449,6 +480,43 @@ async fn ollama_streaming_passthrough_is_byte_identical() {
     let sent: Value = serde_json::from_slice(&requests[0].body).unwrap();
     assert_eq!(sent["stream"], true);
     assert_eq!(sent["stream_options"]["include_usage"], true);
+}
+
+/// ADR 003: the upstream is always asked for stream usage, even when the
+/// client sent `stream_options.include_usage: false`. The client's other
+/// stream options are forwarded.
+#[tokio::test]
+async fn a_client_cannot_opt_out_of_upstream_stream_usage() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(upstream_sse_body(2)),
+        )
+        .mount(&upstream)
+        .await;
+    let base = common::spawn_with(openai_registry(&upstream.uri()), LIMIT).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&json!({
+            "model": "gpt",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "stream": true,
+            "stream_options": { "include_usage": false, "include_obfuscation": false }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let _ = resp.text().await.unwrap();
+
+    let requests = upstream.received_requests().await.unwrap();
+    let sent: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(sent["stream_options"]["include_usage"], true);
+    assert_eq!(sent["stream_options"]["include_obfuscation"], false);
 }
 
 /// Issue #63: cancellation on the ollama chat path - a client disconnect
@@ -576,6 +644,124 @@ async fn openai_without_breakdown_omits_detail_objects() {
     let out: Value = resp.json().await.unwrap();
     assert!(out["usage"].get("prompt_tokens_details").is_none());
     assert!(out["usage"].get("completion_tokens_details").is_none());
+}
+
+/// Read one `lumen_tokens_total` series for chat from `/metrics`.
+async fn chat_tokens_metric(base: &str, direction: &str) -> Option<f64> {
+    let text = reqwest::get(format!("{base}/metrics"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    text.lines()
+        .find(|line| {
+            line.starts_with("lumen_tokens_total{")
+                && line.contains("capability=\"chat\"")
+                && line.contains(&format!("direction=\"{direction}\""))
+        })
+        .and_then(|line| line.rsplit(' ').next())
+        .and_then(|v| v.parse().ok())
+}
+
+/// ADR 004 (2026-11-12): an OpenAI-format body that reports usage reaches the
+/// client as the exact bytes the upstream sent (spacing, key order, unknown
+/// fields and all), and the gateway still accounts its tokens.
+#[tokio::test]
+async fn non_streaming_body_with_usage_is_forwarded_byte_identical() {
+    let upstream_body = "{ \"id\":\"c-1\",\"object\":\"chat.completion\",\"created\":7,\n  \
+        \"model\":\"gpt-4o-2024-08-06\", \"system_fingerprint\":\"fp_1\",\n  \
+        \"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"hi\",\
+        \"refusal\":null},\"logprobs\":null,\"finish_reason\":\"stop\"}],\n  \
+        \"usage\":{\"total_tokens\":10,\"completion_tokens\":2,\"prompt_tokens\":8,\
+        \"cost\":0.25,\"prompt_tokens_details\":{\"cached_tokens\":4,\"audio_tokens\":0}} }\n";
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(upstream_body, "application/json"))
+        .mount(&upstream)
+        .await;
+
+    let base = common::spawn_with(openai_registry(&upstream.uri()), LIMIT).await;
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&json!({ "model": "gpt", "messages": [{ "role": "user", "content": "hi" }] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers()["content-type"],
+        "application/json",
+        "a forwarded body is still declared as JSON"
+    );
+    assert!(resp.headers().contains_key("x-lumen-cost-micro-usd"));
+    assert_eq!(resp.bytes().await.unwrap(), upstream_body.as_bytes());
+
+    // Pillar 5: the forwarded body's usage is what the gateway counted.
+    assert_eq!(chat_tokens_metric(&base, "input").await, Some(8.0));
+    assert_eq!(chat_tokens_metric(&base, "output").await, Some(2.0));
+}
+
+/// The other side of ADR 004 (2026-11-12): a body without usable usage has to
+/// change (the flagged estimate is added), so it takes the typed path, which
+/// still keeps the upstream's unknown fields.
+#[tokio::test]
+async fn non_streaming_body_without_usage_gets_the_flagged_estimate() {
+    for usage in [
+        Value::Null,
+        json!({ "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0 }),
+    ] {
+        let mut body = openai_chat_body("gpt-4o-2024-08-06");
+        body["usage"] = usage.clone();
+        body["system_fingerprint"] = json!("fp_1");
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&upstream)
+            .await;
+
+        let base = common::spawn_with(openai_registry(&upstream.uri()), LIMIT).await;
+        let resp = reqwest::Client::new()
+            .post(format!("{base}/v1/chat/completions"))
+            .json(&json!({ "model": "gpt", "messages": [{ "role": "user", "content": "hi" }] }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "usage {usage}");
+        let out: Value = resp.json().await.unwrap();
+        assert_eq!(out["usage"]["estimated"], true, "usage {usage}");
+        assert!(out["usage"]["prompt_tokens"].as_u64().unwrap() > 0);
+        assert!(out["usage"]["completion_tokens"].as_u64().unwrap() > 0);
+        assert_eq!(out["system_fingerprint"], "fp_1");
+        assert_eq!(out["choices"][0]["message"]["content"], "hi there");
+    }
+}
+
+/// A 200 that carries usage but is not a completion is still an upstream
+/// fault (`LM-3002`), never forwarded as if it were an answer.
+#[tokio::test]
+async fn non_streaming_body_with_usage_but_no_choices_is_502() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "usage": { "prompt_tokens": 8, "completion_tokens": 2, "total_tokens": 10 }
+        })))
+        .mount(&upstream)
+        .await;
+
+    let base = common::spawn_with(openai_registry(&upstream.uri()), LIMIT).await;
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&json!({ "model": "gpt", "messages": [{ "role": "user", "content": "hi" }] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 502);
+    let out: Value = resp.json().await.unwrap();
+    assert_eq!(out["error"]["code"], "LM-3002");
 }
 
 #[tokio::test]

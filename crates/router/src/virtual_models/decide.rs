@@ -9,7 +9,9 @@ use lumen_core::{Capability, GatewayError};
 use lumen_providers::decisions::rerank::RerankTemplate;
 
 use super::condition::FactSource;
-use super::overrides::{apply_chain, effective_field, Overridable, Overrides, Preset};
+use super::overrides::{
+    apply_chain, effective_field, effective_output_caps, Overridable, Overrides, Preset,
+};
 use super::table::{Node, RoutingTable, Strategy, Target, VirtualModel};
 use crate::triggers::{linear_escapes, Escape, Triggers};
 
@@ -70,6 +72,19 @@ impl Attempt {
     ) -> Option<serde_json::Value> {
         effective_field(&self.overrides, name, current)
     }
+
+    /// The two spellings of the output cap, (`max_tokens`,
+    /// `max_completion_tokens`), as this attempt's request carries them,
+    /// given their values in the client request. They are resolved together
+    /// because a `default` on either applies only when both are absent.
+    #[must_use]
+    pub fn output_caps(
+        &self,
+        max_tokens: Option<serde_json::Value>,
+        max_completion_tokens: Option<serde_json::Value>,
+    ) -> (Option<serde_json::Value>, Option<serde_json::Value>) {
+        effective_output_caps(&self.overrides, max_tokens, max_completion_tokens)
+    }
 }
 
 /// The outcome of the decide phase.
@@ -128,7 +143,10 @@ impl Decision {
     }
 
     /// Drop the attempts whose `keep` entry is false (the primary is always
-    /// kept) and rewire escapes to the next surviving attempt.
+    /// kept) and rewire each escape to the next surviving attempt of the
+    /// level that owns it. An escape whose level has no surviving attempt
+    /// left is removed, never pointed at an outer level's attempt (which
+    /// that outer level's own triggers guard).
     pub fn retain_mask(&mut self, keep: &[bool]) {
         self.retain(keep, true);
     }
@@ -162,18 +180,29 @@ impl Decision {
                 count += 1;
             }
         }
-        let resolve = |k: usize| (k..n).find(|&j| kept[j]).map(|j| new_index[j]);
+        // The first surviving attempt in `from..end`, renumbered.
+        let resolve =
+            |from: usize, end: usize| (from..end.min(n)).find(|&j| kept[j]).map(|j| new_index[j]);
         let old = std::mem::take(&mut self.attempts);
         for (i, mut attempt) in old.into_iter().enumerate() {
             if !kept[i] {
                 continue;
             }
             let me = new_index[i];
+            // Escapes are innermost first and levels nest, so the level
+            // owning an escape ends where the next outer escape points (the
+            // first attempt after it), or at the end of the list for the
+            // outermost one. `chain` builds them that way and this rewiring
+            // keeps it true, so a second pass sees the same bounds.
+            let ends: Vec<usize> = (1..=attempt.escapes.len())
+                .map(|k| attempt.escapes.get(k).map_or(n, |outer| outer.next))
+                .collect();
             attempt.escapes = attempt
                 .escapes
                 .into_iter()
-                .filter_map(|e| {
-                    resolve(e.next)
+                .zip(ends)
+                .filter_map(|(e, end)| {
+                    resolve(e.next, end)
                         .filter(|&next| next > me)
                         .map(|next| Escape { on: e.on, next })
                 })
@@ -641,6 +670,63 @@ mod tests {
         let mut d = Decision::linear(["a", "b"].map(str::to_owned));
         d.retain_mask(&[false, true]);
         assert_eq!(ids(&d), vec!["a", "b"], "the primary is never removed");
+    }
+
+    #[test]
+    fn retain_never_rewires_an_escape_out_of_its_own_level() {
+        let t = table(
+            r#"
+            [[virtual_models]]
+            id = "outer"
+            capability = "chat"
+            strategy = "fallback"
+            fallback_on = ["provider_error"]
+            targets = [{ model = "inner" }, { model = "d" }]
+
+            [[virtual_models]]
+            id = "inner"
+            capability = "chat"
+            strategy = "fallback"
+            fallback_on = ["rate_limited"]
+            targets = [{ model = "a" }, { model = "b" }, { model = "c" }]
+            "#,
+        );
+        let rate_limited = Triggers::from_list(&[Trigger::RateLimited]);
+        let provider_error = Triggers::from_list(&[Trigger::ProviderError]);
+        let escape = |on, next| Escape { on, next };
+
+        // b dropped: a's inner escape moves to c, still inside `inner`.
+        let mut d = decide(&t, "outer", None, 0);
+        assert_eq!(ids(&d), vec!["a", "b", "c", "d"]);
+        d.retain_mask(&[true, false, true, true]);
+        assert_eq!(ids(&d), vec!["a", "c", "d"]);
+        assert_eq!(
+            d.attempts[0].escapes,
+            vec![escape(rate_limited, 1), escape(provider_error, 2)]
+        );
+
+        // b and c dropped: nothing of `inner` is left after a, so its
+        // rate_limited escape goes away instead of pointing at d, which only
+        // the outer level (provider_error) may reach.
+        let mut d = decide(&t, "outer", None, 0);
+        d.retain_mask(&[true, false, false, true]);
+        assert_eq!(ids(&d), vec!["a", "d"]);
+        assert_eq!(d.attempts[0].escapes, vec![escape(provider_error, 1)]);
+
+        // Dropping in two passes (a registry miss, then an incompatible
+        // decisions target) gives the same result.
+        let mut d = decide(&t, "outer", None, 0);
+        d.retain_mask(&[true, false, true, true]);
+        d.retain_compatible(&[true, false, true]);
+        assert_eq!(ids(&d), vec!["a", "d"]);
+        assert_eq!(d.attempts[0].escapes, vec![escape(provider_error, 1)]);
+
+        // d dropped: the outer escapes go, the inner ones stay.
+        let mut d = decide(&t, "outer", None, 0);
+        d.retain_mask(&[true, true, true, false]);
+        assert_eq!(d.attempts[0].escapes, vec![escape(rate_limited, 1)]);
+        assert_eq!(d.attempts[1].escapes, vec![escape(rate_limited, 2)]);
+        assert_eq!(d.attempts[2].escapes, Vec::new());
     }
 
     #[test]

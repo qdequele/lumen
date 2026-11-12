@@ -920,6 +920,36 @@ async fn put_config_rejects_restart_only_boot_layer_keys_in_db_mode() {
     assert_eq!(after["config"].as_str().expect("config string"), "");
 }
 
+/// In db mode the boot file is parsed before the database is open, so the
+/// loader cannot know a stored `signing_key_env` name and keep it out of its
+/// `LUMEN_` overlay: once the variable is exported, `deny_unknown_fields`
+/// rejects it as config key `webhook_secret` and the process never reaches
+/// the database. A db-mode document therefore may not name a
+/// `LUMEN_`-prefixed variable, exactly like the stored `/admin/webhooks` row.
+#[tokio::test]
+async fn put_config_rejects_a_lumen_prefixed_signing_key_env_in_db_mode() {
+    let h = spawn_admin_db_mode(registry()).await;
+    let empty_hash = h.current_hash().await;
+
+    let doc =
+        "[webhooks]\nurl = \"https://b.example/e\"\nsigning_key_env = \"LUMEN_WEBHOOK_SECRET\"\n";
+    let response = h.put_config(doc, &empty_hash).await;
+    assert_eq!(response.status(), 400);
+    let body: Value = response.json().await.expect("json");
+    assert_eq!(body["error"]["code"].as_str().expect("code"), "LM-1001");
+    let message = body["error"]["message"].as_str().expect("message");
+    assert!(
+        message.contains("signing_key_env") && message.contains("LUMEN_"),
+        "the rejection must name the field and the prefix: {message}"
+    );
+    let after: Value = h.get("/admin/config").await.json().await.expect("json");
+    assert_eq!(after["config"].as_str().expect("config string"), "");
+
+    // The same block under a name outside the loader's namespace is fine.
+    let doc = doc.replace("LUMEN_WEBHOOK_SECRET", "BILLING_WEBHOOK_SECRET");
+    assert_eq!(h.put_config(&doc, &empty_hash).await.status(), 204);
+}
+
 /// Final-review fix wave, Finding 1: a candidate that sets a boot-layer key
 /// EXPLICITLY to its own built-in default produces NO diff against
 /// `boot_layer_diff` alone - in db mode the current (empty) document already
@@ -1942,4 +1972,141 @@ async fn config_document_writes_cannot_point_webhooks_at_internal_hosts() {
         )
         .await;
     assert_eq!(response.status(), 204);
+}
+
+/// A `[webhooks]` block whose `signing_key_env` this process cannot resolve
+/// (unset variable, no sealed secret) is fatal at boot. Accepting it here
+/// would turn a 204 into a failed restart later, so both document routes
+/// refuse it with `LM-1001` and leave the document untouched.
+#[tokio::test]
+async fn config_document_writes_cannot_name_an_unresolvable_signing_key() {
+    const UNSET: &str = "BILLING_WEBHOOK_SECRET_UNSET_FOR_CONFIG_DOC";
+    let operator_doc = format!("{CONFIG_TOML}\n[auth]\nenabled = true\n");
+    let h = spawn_admin_with_webhook_guard(&operator_doc).await;
+
+    let hash = h.current_hash().await;
+    let response = h
+        .put_json(
+            "/admin/config/webhooks",
+            &serde_json::json!({
+                "url": "https://93.184.215.14/lumen/events",
+                "signing_key_env": UNSET,
+            }),
+            &hash,
+        )
+        .await;
+    assert_eq!(response.status(), 400);
+    let body: Value = response.json().await.expect("json");
+    assert_eq!(body["error"]["code"], "LM-1001");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains(UNSET)),
+        "the rejection names the variable: {body}"
+    );
+
+    let hash = h.current_hash().await;
+    let doc = format!(
+        "{}\n[webhooks]\nurl = \"https://93.184.215.14/lumen/events\"\nsigning_key_env = \"{UNSET}\"\n",
+        h.valid_config()
+    );
+    let response = h.put_config(&doc, &hash).await;
+    assert_eq!(response.status(), 400);
+    let body: Value = response.json().await.expect("json");
+    assert_eq!(body["error"]["code"], "LM-1001");
+    assert!(
+        !h.valid_config().contains("[webhooks]"),
+        "a refused write must leave the document untouched"
+    );
+
+    // A variable this process can see is accepted (`init_env` exports it).
+    let hash = h.current_hash().await;
+    let response = h
+        .put_json(
+            "/admin/config/webhooks",
+            &serde_json::json!({
+                "url": "https://93.184.215.14/lumen/events",
+                "signing_key_env": PROVIDER_KEY_ENV,
+            }),
+            &hash,
+        )
+        .await;
+    assert_eq!(response.status(), 204);
+}
+
+// ---- A rejected config write never logs document content -------------------
+
+#[derive(Clone)]
+struct BufMakeWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+struct BufGuard(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for BufMakeWriter {
+    type Writer = BufGuard;
+    fn make_writer(&'a self) -> Self::Writer {
+        BufGuard(self.0.clone())
+    }
+}
+
+impl std::io::Write for BufGuard {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().expect("log buffer").extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A config document holds operator prompt text (`remap.instructions`,
+/// presets), which is never logged. toml and figment both embed document
+/// content in their error messages (the offending source line for a syntax
+/// error, the offending value for a type error), so a rejected write logs
+/// only the error kind, key path and position. The client that sent the
+/// document still gets the full message.
+#[tokio::test(flavor = "current_thread")]
+async fn a_rejected_config_write_never_logs_document_content() {
+    const PROMPT: &str = "SENTINEL-OPERATOR-PROMPT-TEXT";
+    let buffer = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(BufMakeWriter(buffer.clone()))
+        .with_ansi(false)
+        .with_max_level(tracing::Level::TRACE)
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+    // Another test may have cached "never" for these callsites first.
+    tracing::callsite::rebuild_interest_cache();
+
+    let h = spawn_admin(registry()).await;
+    let hash = h.current_hash().await;
+    let head = "[[virtual_models]]\nid = \"acme/rerank\"\ncapability = \"rerank\"\nstrategy = \"single\"\n";
+    // A syntax error on the line holding the prompt, then a type error whose
+    // offending value IS the prompt.
+    let syntax = format!(
+        "{}\n{head}targets = [{{ model = \"x/y\", remap = {{ instructions = \"{PROMPT}\" oops }} }}]\n",
+        h.valid_config()
+    );
+    let wrong_type = format!(
+        "{}\n{head}targets = [{{ model = \"x/y\", remap = \"{PROMPT}\" }}]\n",
+        h.valid_config()
+    );
+    for doc in [syntax, wrong_type] {
+        let response = h.put_config(&doc, &hash).await;
+        assert_eq!(response.status(), 400);
+        let body: Value = response.json().await.expect("json");
+        assert_eq!(body["error"]["code"], "LM-1001");
+    }
+
+    let logs = String::from_utf8_lossy(&buffer.lock().expect("log buffer")).into_owned();
+    assert!(
+        logs.contains("config apply rejected"),
+        "the rejection is still logged: {logs}"
+    );
+    assert!(
+        !logs.contains(PROMPT),
+        "document content reached the logs: {logs}"
+    );
+    assert!(
+        logs.contains("line") && logs.contains("column"),
+        "the position is still logged: {logs}"
+    );
 }

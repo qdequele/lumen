@@ -255,6 +255,29 @@ struct Pipeline {
     signing: Arc<ArcSwapOption<SigningKey>>,
 }
 
+/// Why webhook settings could not be applied (or would not be, for a
+/// [`preflight`](WebhookController::preflight)). The two cases are different
+/// faults: the admin API answers the first with a 400 and the second with a
+/// 500.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum WebhookApplyError {
+    /// The settings themselves are at fault: they do not validate, or name a
+    /// signing secret this process cannot resolve. The message names the
+    /// field or the variable, never a value.
+    #[error("{0}")]
+    Invalid(String),
+    /// The gateway is at fault whatever the settings say: the Prometheus
+    /// collectors could not be registered, or the apply lock is poisoned.
+    #[error("{0}")]
+    Internal(String),
+}
+
+impl WebhookApplyError {
+    fn lock_poisoned() -> Self {
+        Self::Internal("the webhook apply lock is poisoned".to_owned())
+    }
+}
+
 /// The webhook control surface: builds, retunes and tears down the delivery
 /// pipeline, and answers `GET /admin/webhooks`.
 ///
@@ -285,6 +308,12 @@ pub struct WebhookController {
     /// interleave a queue rebuild with a metrics registration and leave the
     /// live cell pointing at a pipeline whose task was never spawned.
     apply_lock: std::sync::Mutex<()>,
+    /// Serialises [`refresh_from_store`](Self::refresh_from_store): held
+    /// across the database read and the cache store, so the cache only ever
+    /// moves forward. Without it a reload's refresh could read the row, lose
+    /// the race to an admin write's own refresh, and then overwrite the
+    /// fresher cached row with its older read.
+    refresh_lock: tokio::sync::Mutex<()>,
     /// Hosts an admin-supplied receiver URL may name even though they are
     /// internal ([`ALLOWED_HOSTS_ENV`]); empty means public receivers only.
     receiver_allowlist: Vec<String>,
@@ -314,6 +343,7 @@ impl WebhookController {
             stored: ArcSwapOption::empty(),
             stored_secret: ArcSwapOption::empty(),
             apply_lock: std::sync::Mutex::new(()),
+            refresh_lock: tokio::sync::Mutex::new(()),
             receiver_allowlist: Vec::new(),
         }
     }
@@ -357,7 +387,12 @@ impl WebhookController {
     /// Runs at boot, in the reload task, and after an admin write - never on a
     /// request path. A failure leaves the previous cache in place and is
     /// logged, so a sick database cannot strip a working configuration.
+    ///
+    /// Refreshes are serialised (read and store under one guard): an admin
+    /// write refreshes after its own database write, so once that refresh
+    /// returns no refresh that read earlier can still replace the cache.
     pub async fn refresh_from_store(&self, store: &KeyStore, master: Option<&MasterKey>) {
+        let _refresh = self.refresh_lock.lock().await;
         match store.load_webhook_config().await {
             Ok(stored) => self.stored.store(stored.map(Arc::new)),
             Err(error) => {
@@ -414,31 +449,46 @@ impl WebhookController {
     /// Returns the source that won, so the caller can log or report it.
     ///
     /// # Errors
-    /// The winning settings do not validate, the signing secret cannot be
-    /// resolved, or the Prometheus collectors cannot be registered. The
-    /// previous pipeline is left running in every case.
+    /// [`WebhookApplyError::Invalid`] when the winning settings do not
+    /// validate or the signing secret cannot be resolved,
+    /// [`WebhookApplyError::Internal`] when the Prometheus collectors cannot
+    /// be registered or the apply lock is poisoned. The previous pipeline is
+    /// left running in every case.
     pub fn resolve_and_apply(
         &self,
         file_block: Option<&WebhookSettings>,
         keys: &AuthState,
-    ) -> Result<SettingsSource, String> {
+    ) -> Result<SettingsSource, WebhookApplyError> {
+        // The cached row is read UNDER the apply lock: reading it first would
+        // let an admin write refresh the cache and apply its settings between
+        // this read and this apply, which would then put the older row back.
+        // A poisoned lock still excludes other appliers (the error carries
+        // the guard); only the apply branches refuse it, like `apply`.
+        let guard = self.apply_lock.lock();
+        let poisoned = WebhookApplyError::lock_poisoned;
         match self.stored() {
             Some(stored) if stored.enabled => {
-                self.apply(&stored.settings, keys)?;
+                if guard.is_err() {
+                    return Err(poisoned());
+                }
+                self.apply_locked(&stored.settings, keys)?;
                 Ok(SettingsSource::Database)
             }
             // A stored row marked disabled shadows the file block on purpose:
             // a DELETE must not be undone by the next reload.
             Some(_) => {
-                self.disable(keys);
+                self.disable_locked(keys);
                 Ok(SettingsSource::None)
             }
             None => {
                 if let Some(settings) = file_block {
-                    self.apply(settings, keys)?;
+                    if guard.is_err() {
+                        return Err(poisoned());
+                    }
+                    self.apply_locked(settings, keys)?;
                     Ok(SettingsSource::Config)
                 } else {
-                    self.disable(keys);
+                    self.disable_locked(keys);
                     Ok(SettingsSource::None)
                 }
             }
@@ -466,21 +516,40 @@ impl WebhookController {
     /// already accepted is thrown away to resize a channel.
     ///
     /// # Errors
-    /// Invalid settings, an unresolvable signing secret, or a metrics
-    /// registration failure. Nothing is swapped on error.
-    pub fn apply(&self, settings: &WebhookSettings, keys: &AuthState) -> Result<(), String> {
+    /// [`WebhookApplyError::Invalid`] for invalid settings or an unresolvable
+    /// signing secret, [`WebhookApplyError::Internal`] for a metrics
+    /// registration failure or a poisoned apply lock. Nothing is swapped on
+    /// error.
+    pub fn apply(
+        &self,
+        settings: &WebhookSettings,
+        keys: &AuthState,
+    ) -> Result<(), WebhookApplyError> {
+        // Held across the whole sequence: validate, register, build, swap.
+        let _guard = self
+            .apply_lock
+            .lock()
+            .map_err(|_| WebhookApplyError::lock_poisoned())?;
+        self.apply_locked(settings, keys)
+    }
+
+    /// [`apply`](Self::apply) for a caller that already holds `apply_lock`.
+    fn apply_locked(
+        &self,
+        settings: &WebhookSettings,
+        keys: &AuthState,
+    ) -> Result<(), WebhookApplyError> {
         // Defence in depth. Each surface validates with its own origin before
         // reaching here - the config loader on parse, the admin route before
         // it writes - so this pass uses the permissive origin: it re-checks the
         // rules both surfaces share, and must not re-apply the API-only
         // `LUMEN_` prefix rule to a perfectly legal file-declared variable.
-        settings.validate(SettingsOrigin::ConfigFile)?;
-        // Held across the whole sequence: validate, register, build, swap.
-        let _guard = self
-            .apply_lock
-            .lock()
-            .map_err(|_| "the webhook apply lock is poisoned".to_owned())?;
-        let signing = self.resolve_signing_key(settings)?;
+        settings
+            .validate(SettingsOrigin::ConfigFile)
+            .map_err(WebhookApplyError::Invalid)?;
+        let signing = self
+            .resolve_signing_key(settings)
+            .map_err(WebhookApplyError::Invalid)?;
         let metrics = self.metrics_handle()?;
 
         let current = self.live.load_full();
@@ -544,6 +613,30 @@ impl WebhookController {
     pub fn disable(&self, keys: &AuthState) {
         // Best effort: a poisoned lock must not leave webhooks stuck on.
         let _guard = self.apply_lock.lock();
+        self.disable_locked(keys);
+    }
+
+    /// Turn the pipeline off after an admin write persisted a disabled row:
+    /// refresh the cache from the store, then disable under the apply lock.
+    ///
+    /// The order matters, and is the one `PUT /admin/webhooks` uses. A reload
+    /// that cached the row before the write resolves from the cache under the
+    /// apply lock ([`resolve_and_apply`](Self::resolve_and_apply)): once this
+    /// refresh has returned it can only see the disabled row, whichever side
+    /// of the disable it runs on. Disabling first would leave a window in
+    /// which that reload re-applies the stale enabled row for good.
+    pub async fn disable_from_store(
+        &self,
+        store: &KeyStore,
+        master: Option<&MasterKey>,
+        keys: &AuthState,
+    ) {
+        self.refresh_from_store(store, master).await;
+        self.disable(keys);
+    }
+
+    /// [`disable`](Self::disable) for a caller that already holds `apply_lock`.
+    fn disable_locked(&self, keys: &AuthState) {
         keys.set_signals(None);
         self.live.store(None);
     }
@@ -552,14 +645,65 @@ impl WebhookController {
     /// afterwards. Must be called with `apply_lock` held: Prometheus refuses a
     /// duplicate registration, so two racing first-enables would make one of
     /// them fail for no operator-visible reason.
-    fn metrics_handle(&self) -> Result<WebhookMetrics, String> {
+    fn metrics_handle(&self) -> Result<WebhookMetrics, WebhookApplyError> {
         if let Some(metrics) = self.metrics.get() {
             return Ok(metrics.clone());
         }
-        let metrics = WebhookMetrics::register(&self.registry)
-            .map_err(|error| format!("could not register the webhook metrics: {error}"))?;
+        let metrics = WebhookMetrics::register(&self.registry).map_err(|error| {
+            WebhookApplyError::Internal(format!("could not register the webhook metrics: {error}"))
+        })?;
         let _ = self.metrics.set(metrics.clone());
         Ok(metrics)
+    }
+
+    /// Run every fallible step of [`apply`](Self::apply) without building,
+    /// swapping or logging anything: validation, signing-secret resolution
+    /// and the metrics registration.
+    ///
+    /// The admin writes call this BEFORE they persist, so a document the
+    /// gateway could not apply never replaces a stored one that works.
+    ///
+    /// # Errors
+    /// The same errors [`apply`](Self::apply) would return: the document's
+    /// own faults as [`WebhookApplyError::Invalid`], the gateway's as
+    /// [`WebhookApplyError::Internal`].
+    pub fn preflight(&self, settings: &WebhookSettings) -> Result<(), WebhookApplyError> {
+        settings
+            .validate(SettingsOrigin::ConfigFile)
+            .map_err(WebhookApplyError::Invalid)?;
+        self.check_signing_key(settings)
+            .map_err(WebhookApplyError::Invalid)?;
+        let _guard = self
+            .apply_lock
+            .lock()
+            .map_err(|_| WebhookApplyError::lock_poisoned())?;
+        self.metrics_handle().map(|_metrics| ())
+    }
+
+    /// Whether the signing secret `settings` asks for can be resolved right
+    /// now (environment first, then the sealed secret). A dry run of the
+    /// resolution [`apply`](Self::apply) performs: nothing is logged, nothing
+    /// is swapped.
+    ///
+    /// # Errors
+    /// `signing_key_env` names a variable that is unset or empty and no secret
+    /// is stored. The message names the variable, never a value.
+    pub fn check_signing_key(&self, settings: &WebhookSettings) -> Result<(), String> {
+        resolve_signing_key(settings, self.stored_secret.load_full(), false).map(|_key| ())
+    }
+
+    /// Whether the live settings could still resolve a signing secret (or
+    /// are deliberately unsigned) once the stored secret is gone. Checked
+    /// before `DELETE /admin/webhooks/signing-key` deletes anything.
+    ///
+    /// # Errors
+    /// The live settings name an environment variable this process cannot
+    /// see, so the stored secret is the only thing signing deliveries.
+    pub fn check_signing_key_without_stored_secret(&self) -> Result<(), String> {
+        match self.live_settings() {
+            Some(settings) => resolve_signing_key(&settings, None, false).map(|_key| ()),
+            None => Ok(()),
+        }
     }
 
     /// Resolve the signing secret: the named environment variable first, then
@@ -573,36 +717,51 @@ impl WebhookController {
         &self,
         settings: &WebhookSettings,
     ) -> Result<Option<Arc<SigningKey>>, String> {
-        // Only variable NAMES appear in any message or log line below.
-        if let Some(var) = &settings.signing_key_env {
-            match std::env::var(var) {
-                Ok(value) if !value.is_empty() => {
-                    return Ok(Some(Arc::new(SigningKey::new(value.into_bytes()))));
-                }
-                _ => {
-                    if let Some(stored) = self.stored_secret.load_full() {
+        resolve_signing_key(settings, self.stored_secret.load_full(), true)
+    }
+}
+
+/// The resolution behind [`WebhookController::apply`] and its dry runs, over
+/// an explicit stored secret. `log` is off for a dry run, so a check that
+/// precedes an apply does not print every warning twice.
+fn resolve_signing_key(
+    settings: &WebhookSettings,
+    stored: Option<Arc<SigningKey>>,
+    log: bool,
+) -> Result<Option<Arc<SigningKey>>, String> {
+    // Only variable NAMES appear in any message or log line below.
+    if let Some(var) = &settings.signing_key_env {
+        return match std::env::var(var) {
+            Ok(value) if !value.is_empty() => {
+                Ok(Some(Arc::new(SigningKey::new(value.into_bytes()))))
+            }
+            _ => match stored {
+                Some(stored) => {
+                    if log {
                         tracing::warn!(
                             "webhooks.signing_key_env names '{var}', which is unset or empty; \
                              using the secret stored through PUT /admin/webhooks/signing-key"
                         );
-                        return Ok(Some(stored));
                     }
-                    return Err(format!(
-                        "webhooks.signing_key_env names '{var}', which is unset or empty in the \
-                         environment, and no signing secret is stored"
-                    ));
+                    Ok(Some(stored))
                 }
-            }
-        }
-        if let Some(stored) = self.stored_secret.load_full() {
-            return Ok(Some(stored));
-        }
+                None => Err(format!(
+                    "webhooks.signing_key_env names '{var}', which is unset or empty in the \
+                     environment, and no signing secret is stored"
+                )),
+            },
+        };
+    }
+    if stored.is_some() {
+        return Ok(stored);
+    }
+    if log {
         tracing::warn!(
             "webhooks are enabled with no signing secret: deliveries carry no x-lumen-signature \
              header and the receiver cannot verify authenticity"
         );
-        Ok(None)
     }
+    Ok(None)
 }
 
 /// Bridges the queue's drop accounting to Prometheus, so `lumen_auth` never
@@ -1003,6 +1162,216 @@ mod tests {
             signing_key_env: var.map(str::to_owned),
             ..WebhookSettings::default()
         }
+    }
+
+    fn stored_row(url: &str) -> Arc<StoredWebhookConfig> {
+        Arc::new(StoredWebhookConfig {
+            enabled: true,
+            settings: WebhookSettings {
+                url: url.to_owned(),
+                ..WebhookSettings::default()
+            },
+            updated_at: 0,
+        })
+    }
+
+    #[tokio::test]
+    async fn a_refresh_cannot_overwrite_the_cache_with_a_row_read_before_an_admin_write() {
+        // The reload's refresh and an admin write's refresh race. Holding the
+        // refresh guard stands in for the admin refresh in progress: the
+        // reload's refresh must wait, and so read the row the admin wrote
+        // rather than store one it read earlier.
+        let store = KeyStore::in_memory().await.expect("store");
+        let row = |url: &str| WebhookSettings {
+            url: url.to_owned(),
+            ..WebhookSettings::default()
+        };
+        store
+            .save_webhook_config(&row("https://old.example/events"))
+            .await
+            .expect("store the old row");
+        let controller = Arc::new(controller());
+
+        let guard = controller.refresh_lock.lock().await;
+        let reload_controller = Arc::clone(&controller);
+        let reload_store = store.clone();
+        let mut reload = tokio::spawn(async move {
+            reload_controller
+                .refresh_from_store(&reload_store, None)
+                .await;
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), &mut reload)
+                .await
+                .is_err(),
+            "a refresh must wait for the one in progress"
+        );
+        // The admin write lands and its own refresh caches it.
+        store
+            .save_webhook_config(&row("https://new.example/events"))
+            .await
+            .expect("store the new row");
+        controller.stored.store(
+            store
+                .load_webhook_config()
+                .await
+                .expect("load")
+                .map(Arc::new),
+        );
+        drop(guard);
+
+        reload.await.expect("reload refresh");
+        assert_eq!(
+            controller.stored().expect("cached").settings.url,
+            "https://new.example/events"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reload_racing_a_delete_cannot_reapply_the_row_it_cached_before() {
+        // A reload refreshed the cache before the DELETE wrote its disabled
+        // row, and resolves while the DELETE is still under way. Holding the
+        // refresh guard pins the DELETE at its own refresh, so the reload's
+        // resolve runs in the middle of it, against the stale enabled row.
+        let store = KeyStore::in_memory().await.expect("store");
+        let settings = WebhookSettings {
+            url: "https://old.example/events".to_owned(),
+            ..WebhookSettings::default()
+        };
+        store
+            .save_webhook_config(&settings)
+            .await
+            .expect("store the enabled row");
+        let controller = Arc::new(controller());
+        let keys = Arc::new(AuthState::default());
+        controller.refresh_from_store(&store, None).await;
+        controller
+            .resolve_and_apply(None, &keys)
+            .expect("the enabled row applies");
+
+        // The DELETE persists its decision, then turns the pipeline off.
+        store
+            .save_webhook_config_disabled(&settings)
+            .await
+            .expect("store the disabled row");
+        let guard = controller.refresh_lock.lock().await;
+        let delete_controller = Arc::clone(&controller);
+        let delete_store = store.clone();
+        let delete_keys = Arc::clone(&keys);
+        let mut delete = tokio::spawn(async move {
+            delete_controller
+                .disable_from_store(&delete_store, None, &delete_keys)
+                .await;
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), &mut delete)
+                .await
+                .is_err(),
+            "the DELETE waits for the refresh in progress"
+        );
+        // The reload resolves from the cache it refreshed before the write.
+        controller
+            .resolve_and_apply(None, &keys)
+            .expect("the reload resolves");
+        drop(guard);
+        delete.await.expect("delete");
+
+        assert!(
+            !controller.stored().expect("cached").enabled,
+            "the cache holds the disabled row"
+        );
+        assert!(
+            controller.live_settings().is_none(),
+            "the reload re-applied the enabled row the DELETE replaced"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resolve_and_apply_reads_the_cached_row_under_the_apply_lock() {
+        // An admin PUT refreshes the cache and applies while a reload is about
+        // to resolve. Holding the apply lock stands in for the admin apply in
+        // progress; the reload must resolve from the cache as it is once the
+        // lock is free, not from a row it read before waiting.
+        let controller = Arc::new(controller());
+        let keys = Arc::new(AuthState::default());
+        controller
+            .stored
+            .store(Some(stored_row("https://old.example/events")));
+
+        let guard = controller.apply_lock.lock().expect("apply lock");
+        let reload_controller = Arc::clone(&controller);
+        let reload_keys = Arc::clone(&keys);
+        let reload = tokio::task::spawn_blocking(move || {
+            reload_controller.resolve_and_apply(None, &reload_keys)
+        });
+        // Let the blocking thread reach the lock. A thread sleep on purpose:
+        // the std guard must not be held across an await.
+        std::thread::sleep(Duration::from_millis(200));
+        controller
+            .stored
+            .store(Some(stored_row("https://new.example/events")));
+        drop(guard);
+
+        let source = reload.await.expect("join").expect("apply");
+        assert_eq!(source, SettingsSource::Database);
+        assert_eq!(
+            controller.live_settings().expect("enabled").url,
+            "https://new.example/events",
+            "the reload re-applied a stored row older than the cached one"
+        );
+    }
+
+    #[tokio::test]
+    async fn preflight_and_apply_tell_invalid_settings_from_internal_failures() {
+        let keys = AuthState::default();
+        let good = settings_with_env(None);
+
+        // The document's own faults.
+        let controller = controller();
+        let unresolvable = settings_with_env(Some("LUMEN_TEST_WEBHOOK_SECRET_ABSENT"));
+        for settings in [&unresolvable, &WebhookSettings::default()] {
+            assert!(matches!(
+                controller.preflight(settings),
+                Err(WebhookApplyError::Invalid(_))
+            ));
+            assert!(matches!(
+                controller.apply(settings, &keys),
+                Err(WebhookApplyError::Invalid(_))
+            ));
+        }
+
+        // A failed Prometheus registration is the gateway's fault.
+        let _taken = WebhookMetrics::register(&controller.registry).expect("register");
+        assert!(matches!(
+            controller.preflight(&good),
+            Err(WebhookApplyError::Internal(_))
+        ));
+        assert!(matches!(
+            controller.apply(&good, &keys),
+            Err(WebhookApplyError::Internal(_))
+        ));
+
+        // So is a poisoned apply lock.
+        let controller = Arc::new(self::controller());
+        let poisoner = Arc::clone(&controller);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.apply_lock.lock();
+            panic!("poison the apply lock");
+        })
+        .join();
+        assert!(matches!(
+            controller.preflight(&good),
+            Err(WebhookApplyError::Internal(_))
+        ));
+        assert!(matches!(
+            controller.apply(&good, &keys),
+            Err(WebhookApplyError::Internal(_))
+        ));
+        controller.stored.store(Some(stored_row(&good.url)));
+        assert!(matches!(
+            controller.resolve_and_apply(None, &keys),
+            Err(WebhookApplyError::Internal(_))
+        ));
     }
 
     #[test]

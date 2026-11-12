@@ -712,6 +712,9 @@ pub struct OutboxInsert {
     pub created_ms: i64,
 }
 
+/// Rows deleted per statement by [`KeyStore::purge_usage_older_than`].
+pub const USAGE_PURGE_CHUNK: i64 = 5000;
+
 /// Rows deleted per statement by [`KeyStore::outbox_purge_delivered`].
 pub const OUTBOX_PURGE_CHUNK: i64 = 5000;
 
@@ -753,6 +756,177 @@ macro_rules! group_columns {
         "id, name, budget_max, budget_spent, created_at, deleted_at, account_ref, \
          bandwidth_micro_usd_per_gb, parent_id"
     };
+}
+
+/// What [`KeyStore::list_keys_filtered`] returns: every condition is part of
+/// the SQL (bound parameters), so a filtered listing never loads the whole
+/// table to drop most of it in memory.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct KeyListFilter {
+    /// Also list soft-deleted tombstones.
+    pub include_deleted: bool,
+    /// Only keys with exactly this `external_ref`.
+    pub external_ref: Option<String>,
+    /// Only keys whose group belongs to this account (the admin account
+    /// scope, canonical form). A key with no group is in no account; a
+    /// tombstoned group still counts, so the tombstones of its keys stay
+    /// visible to their account.
+    pub scope_account_ref: Option<String>,
+}
+
+impl KeyListFilter {
+    /// The query for this filter. Values are never part of the text: each
+    /// `Some` field contributes one `?`, bound by
+    /// [`KeyStore::list_keys_filtered`] in field order (`external_ref`, then
+    /// `scope_account_ref`). Public so a test can check the plan of the SQL
+    /// that actually runs.
+    #[must_use]
+    pub fn sql(&self) -> String {
+        list_sql(key_columns!(), "virtual_keys", &self.conditions())
+    }
+
+    /// The query for one page of this filter ([`KeyStore::list_keys_page`]):
+    /// the same conditions and order as [`sql`](Self::sql), plus the keyset
+    /// bound when `after` is set and a `LIMIT`. Bind order: the filter's
+    /// values, then the cursor's `created_at` and `id`, then the limit.
+    #[must_use]
+    pub fn page_sql(&self, after: bool) -> String {
+        page_sql(key_columns!(), "virtual_keys", &self.conditions(), after)
+    }
+
+    fn conditions(&self) -> Vec<&'static str> {
+        let mut conditions = Vec::new();
+        if !self.include_deleted {
+            conditions.push("deleted_at IS NULL");
+        }
+        if self.external_ref.is_some() {
+            conditions.push("external_ref = ?");
+        }
+        if self.scope_account_ref.is_some() {
+            conditions.push("group_id IN (SELECT id FROM budget_groups WHERE account_ref = ?)");
+        }
+        conditions
+    }
+}
+
+/// What [`KeyStore::list_groups_filtered`] returns; the group half of
+/// [`KeyListFilter`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GroupListFilter {
+    /// Also list soft-deleted tombstones.
+    pub include_deleted: bool,
+    /// Only groups with exactly this `account_ref` (canonical form).
+    pub account_ref: Option<String>,
+    /// Only the sub-groups of this group (ADR 020).
+    pub parent_id: Option<String>,
+    /// Only groups of this account (the admin account scope). Applied on top
+    /// of `account_ref`: asking for another account narrows to nothing.
+    pub scope_account_ref: Option<String>,
+}
+
+impl GroupListFilter {
+    /// The query for this filter; see [`KeyListFilter::sql`]. Bind order:
+    /// `account_ref`, `parent_id`, `scope_account_ref`.
+    #[must_use]
+    pub fn sql(&self) -> String {
+        list_sql(group_columns!(), "budget_groups", &self.conditions())
+    }
+
+    /// The query for one page of this filter; see [`KeyListFilter::page_sql`].
+    #[must_use]
+    pub fn page_sql(&self, after: bool) -> String {
+        page_sql(group_columns!(), "budget_groups", &self.conditions(), after)
+    }
+
+    fn conditions(&self) -> Vec<&'static str> {
+        let mut conditions = Vec::new();
+        if !self.include_deleted {
+            conditions.push("deleted_at IS NULL");
+        }
+        if self.account_ref.is_some() {
+            conditions.push("account_ref = ?");
+        }
+        if self.parent_id.is_some() {
+            conditions.push("parent_id = ?");
+        }
+        if self.scope_account_ref.is_some() {
+            conditions.push("account_ref = ?");
+        }
+        conditions
+    }
+}
+
+/// A position in a listing ordered by `(created_at, id)`: the last row of
+/// the page before (ADR 023). Both columns are written once at creation and
+/// never updated, so a position stays valid whatever is created, patched or
+/// soft-deleted between two pages.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListCursor {
+    /// `created_at` of that row, unix seconds.
+    pub created_at: i64,
+    /// Its `id` (the tie-break within one second).
+    pub id: String,
+}
+
+/// One page to read from a keyset-paginated listing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PageRequest {
+    /// Most rows to return.
+    pub limit: u32,
+    /// Return rows strictly after this position; `None` starts at the
+    /// beginning.
+    pub after: Option<ListCursor>,
+}
+
+/// One page of a keyset-paginated listing.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ListPage<T> {
+    /// At most [`PageRequest::limit`] rows, oldest first.
+    pub rows: Vec<T>,
+    /// Where the next page starts; `None` when this page ends the listing.
+    pub next: Option<ListCursor>,
+}
+
+impl<T> ListPage<T> {
+    /// Build a page from `rows`, which were read with `LIMIT limit + 1`: the
+    /// extra row only proves that more exist, so a page that happens to end
+    /// the listing carries no cursor (no empty trailing page).
+    fn cut(mut rows: Vec<T>, limit: u32, position: impl Fn(&T) -> ListCursor) -> Self {
+        let limit = limit as usize;
+        let more = rows.len() > limit;
+        rows.truncate(limit);
+        let next = if more {
+            rows.last().map(position)
+        } else {
+            None
+        };
+        Self { rows, next }
+    }
+}
+
+/// `SELECT columns FROM table [WHERE a AND b] ORDER BY created_at, id`, from
+/// fixed fragments only (no caller-supplied text).
+fn list_sql(columns: &str, table: &str, conditions: &[&str]) -> String {
+    let mut sql = format!("SELECT {columns} FROM {table}");
+    if !conditions.is_empty() {
+        sql.push_str(" WHERE ");
+        sql.push_str(&conditions.join(" AND "));
+    }
+    sql.push_str(" ORDER BY created_at, id");
+    sql
+}
+
+/// [`list_sql`] for one page: the keyset bound `(created_at, id) > (?, ?)`
+/// when `after` is set (a row-value comparison the `(created_at, id)` index
+/// of migration 0021 answers by a seek, never an `OFFSET`), and `LIMIT ?`.
+fn page_sql(columns: &str, table: &str, conditions: &[&str], after: bool) -> String {
+    let mut conditions = conditions.to_vec();
+    if after {
+        conditions.push("(created_at, id) > (?, ?)");
+    }
+    let mut sql = list_sql(columns, table, &conditions);
+    sql.push_str(" LIMIT ?");
+    sql
 }
 
 /// Handle to the SQLite database (pooled; cheap to clone).
@@ -923,23 +1097,68 @@ impl KeyStore {
         &self,
         include_deleted: bool,
     ) -> Result<Vec<VirtualKeyRecord>, AuthError> {
-        let sql = if include_deleted {
-            concat!(
-                "SELECT ",
-                key_columns!(),
-                " FROM virtual_keys ORDER BY created_at, id"
-            )
-        } else {
-            concat!(
-                "SELECT ",
-                key_columns!(),
-                " FROM virtual_keys WHERE deleted_at IS NULL ORDER BY created_at, id"
-            )
-        };
-        let records = sqlx::query_as::<_, VirtualKeyRecord>(sql)
+        self.list_keys_filtered(&KeyListFilter {
+            include_deleted,
+            ..KeyListFilter::default()
+        })
+        .await
+    }
+
+    /// The keys matching `filter`, oldest first. The filter runs in SQL with
+    /// bound parameters (`external_ref` through its index), not over every
+    /// row in memory.
+    ///
+    /// # Errors
+    ///
+    /// [`AuthError::Db`] if the query fails.
+    pub async fn list_keys_filtered(
+        &self,
+        filter: &KeyListFilter,
+    ) -> Result<Vec<VirtualKeyRecord>, AuthError> {
+        // Built from fixed fragments only; every value is bound below.
+        let mut query = sqlx::query_as::<_, VirtualKeyRecord>(sqlx::AssertSqlSafe(filter.sql()));
+        for value in [&filter.external_ref, &filter.scope_account_ref]
+            .into_iter()
+            .flatten()
+        {
+            query = query.bind(value.as_str());
+        }
+        Ok(query.fetch_all(&self.pool).await?)
+    }
+
+    /// One page of the keys matching `filter`, in the order of
+    /// [`list_keys_filtered`](Self::list_keys_filtered): the pages of a walk
+    /// concatenate to that listing (ADR 023).
+    ///
+    /// # Errors
+    ///
+    /// [`AuthError::Db`] if the query fails.
+    pub async fn list_keys_page(
+        &self,
+        filter: &KeyListFilter,
+        page: &PageRequest,
+    ) -> Result<ListPage<VirtualKeyRecord>, AuthError> {
+        // Built from fixed fragments only; every value is bound below.
+        let sql = filter.page_sql(page.after.is_some());
+        let mut query = sqlx::query_as::<_, VirtualKeyRecord>(sqlx::AssertSqlSafe(sql));
+        for value in [&filter.external_ref, &filter.scope_account_ref]
+            .into_iter()
+            .flatten()
+        {
+            query = query.bind(value.as_str());
+        }
+        if let Some(after) = &page.after {
+            query = query.bind(after.created_at).bind(after.id.as_str());
+        }
+        // One row past the page: it tells whether a next page exists.
+        let rows = query
+            .bind(i64::from(page.limit) + 1)
             .fetch_all(&self.pool)
             .await?;
-        Ok(records)
+        Ok(ListPage::cut(rows, page.limit, |key| ListCursor {
+            created_at: key.created_at,
+            id: key.id.clone(),
+        }))
     }
 
     /// One live key by id: `None` for an unknown id or a tombstone.
@@ -1416,23 +1635,73 @@ impl KeyStore {
     /// Every active group - for the admin API. Pass `include_deleted = true`
     /// to also see tombstones (audit view).
     pub async fn list_groups(&self, include_deleted: bool) -> Result<Vec<GroupRecord>, AuthError> {
-        let sql = if include_deleted {
-            concat!(
-                "SELECT ",
-                group_columns!(),
-                " FROM budget_groups ORDER BY created_at, id"
-            )
-        } else {
-            concat!(
-                "SELECT ",
-                group_columns!(),
-                " FROM budget_groups WHERE deleted_at IS NULL ORDER BY created_at, id"
-            )
-        };
-        let records = sqlx::query_as::<_, GroupRecord>(sql)
+        self.list_groups_filtered(&GroupListFilter {
+            include_deleted,
+            ..GroupListFilter::default()
+        })
+        .await
+    }
+
+    /// The groups matching `filter`, oldest first; the group half of
+    /// [`list_keys_filtered`](Self::list_keys_filtered).
+    ///
+    /// # Errors
+    ///
+    /// [`AuthError::Db`] if the query fails.
+    pub async fn list_groups_filtered(
+        &self,
+        filter: &GroupListFilter,
+    ) -> Result<Vec<GroupRecord>, AuthError> {
+        // Built from fixed fragments only; every value is bound below.
+        let mut query = sqlx::query_as::<_, GroupRecord>(sqlx::AssertSqlSafe(filter.sql()));
+        for value in [
+            &filter.account_ref,
+            &filter.parent_id,
+            &filter.scope_account_ref,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            query = query.bind(value.as_str());
+        }
+        Ok(query.fetch_all(&self.pool).await?)
+    }
+
+    /// One page of the groups matching `filter`; the group half of
+    /// [`list_keys_page`](Self::list_keys_page).
+    ///
+    /// # Errors
+    ///
+    /// [`AuthError::Db`] if the query fails.
+    pub async fn list_groups_page(
+        &self,
+        filter: &GroupListFilter,
+        page: &PageRequest,
+    ) -> Result<ListPage<GroupRecord>, AuthError> {
+        // Built from fixed fragments only; every value is bound below.
+        let sql = filter.page_sql(page.after.is_some());
+        let mut query = sqlx::query_as::<_, GroupRecord>(sqlx::AssertSqlSafe(sql));
+        for value in [
+            &filter.account_ref,
+            &filter.parent_id,
+            &filter.scope_account_ref,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            query = query.bind(value.as_str());
+        }
+        if let Some(after) = &page.after {
+            query = query.bind(after.created_at).bind(after.id.as_str());
+        }
+        let rows = query
+            .bind(i64::from(page.limit) + 1)
             .fetch_all(&self.pool)
             .await?;
-        Ok(records)
+        Ok(ListPage::cut(rows, page.limit, |group| ListCursor {
+            created_at: group.created_at,
+            id: group.id.clone(),
+        }))
     }
 
     /// One live group by id: `None` for an unknown id or a tombstone.
@@ -1702,13 +1971,32 @@ impl KeyStore {
 
     /// Delete usage entries with `ts` strictly older than `cutoff` (retention
     /// purge). Returns the number of rows removed.
+    ///
+    /// Deletes oldest-first in chunks of [`USAGE_PURGE_CHUNK`] rows, yielding
+    /// between chunks, like
+    /// [`outbox_purge_delivered`](Self::outbox_purge_delivered): one
+    /// unbounded `DELETE` over a large table would hold the SQLite write lock
+    /// (shared with the budget flush and the usage writer) past their busy
+    /// timeout. Each chunk commits on its own, so an error part-way keeps
+    /// what was already purged and the next run resumes.
     pub async fn purge_usage_older_than(&self, cutoff: i64) -> Result<u64, AuthError> {
-        let deleted = sqlx::query("DELETE FROM usage_log WHERE ts < ?")
+        let mut total = 0;
+        loop {
+            let purged = sqlx::query(
+                "DELETE FROM usage_log WHERE id IN (\
+                   SELECT id FROM usage_log WHERE ts < ? ORDER BY ts LIMIT ?)",
+            )
             .bind(cutoff)
+            .bind(USAGE_PURGE_CHUNK)
             .execute(&self.pool)
             .await?
             .rows_affected();
-        Ok(deleted)
+            total += purged;
+            if purged < USAGE_PURGE_CHUNK.unsigned_abs() {
+                return Ok(total);
+            }
+            tokio::task::yield_now().await;
+        }
     }
 
     /// Aggregate the usage log per `group_by`, under `filter` (issue #64).

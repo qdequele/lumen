@@ -4,6 +4,11 @@
 //! `cost_per_1m_output`, `cost_per_1k_searches` on each model). A model with
 //! no configured price costs 0 - budgets then only bite on priced models,
 //! which is the operator's deliberate choice.
+//!
+//! Prompt caching (ADR 003 amendment): the cache-read and cache-creation
+//! parts of a call's input tokens have their own optional rates
+//! (`cost_per_1m_cached_input`, `cost_per_1m_cache_write`). Each defaults to
+//! the input rate, so a config that sets neither prices exactly as before.
 
 use crate::config::Config;
 use std::collections::HashMap;
@@ -17,6 +22,10 @@ pub const DEFAULT_RESERVED_OUTPUT_TOKENS: u64 = 2_048;
 #[derive(Debug, Clone, Copy, Default)]
 struct ModelPrice {
     input_token: f64,
+    /// Input tokens read from the provider's prompt cache.
+    cached_input_token: f64,
+    /// Input tokens written to the provider's prompt cache.
+    cache_write_token: f64,
     output_token: f64,
     search_unit: f64,
 }
@@ -35,15 +44,24 @@ impl CostTable {
         for provider in &config.providers {
             for model in &provider.models {
                 if model.cost_per_1m_input.is_none()
+                    && model.cost_per_1m_cached_input.is_none()
+                    && model.cost_per_1m_cache_write.is_none()
                     && model.cost_per_1m_output.is_none()
                     && model.cost_per_1k_searches.is_none()
                 {
                     continue;
                 }
+                // An unset cache rate is the input rate: no discount and no
+                // surcharge the operator did not ask for.
+                let input = model.cost_per_1m_input.unwrap_or(0.0);
                 prices.insert(
                     model.id.clone(),
                     ModelPrice {
-                        input_token: model.cost_per_1m_input.unwrap_or(0.0) / 1_000_000.0,
+                        input_token: input / 1_000_000.0,
+                        cached_input_token: model.cost_per_1m_cached_input.unwrap_or(input)
+                            / 1_000_000.0,
+                        cache_write_token: model.cost_per_1m_cache_write.unwrap_or(input)
+                            / 1_000_000.0,
                         output_token: model.cost_per_1m_output.unwrap_or(0.0) / 1_000_000.0,
                         search_unit: model.cost_per_1k_searches.unwrap_or(0.0) / 1_000.0,
                     },
@@ -54,11 +72,61 @@ impl CostTable {
     }
 
     /// Cost of a chat call (also correct for embeddings with
-    /// `tokens_out = 0`).
+    /// `tokens_out = 0`), every input token at the input rate. Use
+    /// [`token_cost_with_cache`](Self::token_cost_with_cache) when the
+    /// upstream reported a cache breakdown.
     #[must_use]
     pub fn token_cost(&self, model: &str, tokens_in: u64, tokens_out: u64) -> f64 {
+        self.token_cost_with_cache(model, tokens_in, tokens_out, None, None)
+    }
+
+    /// Cost of a chat call whose upstream reported how many of its input
+    /// tokens were read from (`cached`) or written to (`cache_write`) the
+    /// prompt cache.
+    ///
+    /// Both counts are subsets of `tokens_in` (OpenAI's
+    /// `prompt_tokens_details.cached_tokens`; Anthropic's cache read and
+    /// cache creation, which the provider layer already folds into the
+    /// prompt count). They are charged at the model's cached-input and
+    /// cache-write rates and the rest of `tokens_in` at the input rate. A
+    /// breakdown larger than `tokens_in` is clamped, so the three parts
+    /// always sum to `tokens_in` and a malformed upstream count can never
+    /// produce a negative or inflated input.
+    ///
+    /// The result is bit-identical to [`token_cost`](Self::token_cost)
+    /// whenever the breakdown cannot change the price: no cached or written
+    /// token, or cache rates equal to the input rate (the default when none
+    /// is configured).
+    #[must_use]
+    pub fn token_cost_with_cache(
+        &self,
+        model: &str,
+        tokens_in: u64,
+        tokens_out: u64,
+        cached: Option<u64>,
+        cache_write: Option<u64>,
+    ) -> f64 {
         self.prices.get(model).map_or(0.0, |p| {
-            to_f64(tokens_in) * p.input_token + to_f64(tokens_out) * p.output_token
+            let cached = cached.unwrap_or(0).min(tokens_in);
+            let cache_write = cache_write.unwrap_or(0).min(tokens_in - cached);
+            // A part priced at the input rate (no cache rate configured, or
+            // one equal to it) or holding no token adds nothing a single
+            // product does not already cover. Splitting the input anyway
+            // would round three products instead of one and could land one
+            // ULP away from `token_cost`, so the split is only made when it
+            // changes the price.
+            let same_rate = |rate: f64| rate.to_bits() == p.input_token.to_bits();
+            let input = if (cached == 0 || same_rate(p.cached_input_token))
+                && (cache_write == 0 || same_rate(p.cache_write_token))
+            {
+                to_f64(tokens_in) * p.input_token
+            } else {
+                let plain = tokens_in - cached - cache_write;
+                to_f64(plain) * p.input_token
+                    + to_f64(cached) * p.cached_input_token
+                    + to_f64(cache_write) * p.cache_write_token
+            };
+            input + to_f64(tokens_out) * p.output_token
         })
     }
 
@@ -112,6 +180,130 @@ mod tests {
         // 1M in at $2 + 100k out at $10 = 2 + 1 = 3.
         let cost = t.token_cost("openai/gpt", 1_000_000, 100_000);
         assert!((cost - 3.0).abs() < 1e-9, "{cost}");
+    }
+
+    const CACHE_PRICED: &str = r#"
+        [[providers]]
+        name = "anthropic"
+        kind = "anthropic"
+        [[providers.models]]
+        id = "anthropic/claude"
+        capabilities = ["chat"]
+        cost_per_1m_input = 3.0
+        cost_per_1m_output = 15.0
+        cost_per_1m_cached_input = 0.3
+        cost_per_1m_cache_write = 3.75
+        [[providers.models]]
+        id = "anthropic/read-only"
+        capabilities = ["chat"]
+        cost_per_1m_input = 3.0
+        cost_per_1m_cached_input = 0.3
+        [[providers.models]]
+        id = "anthropic/cache-only"
+        capabilities = ["chat"]
+        cost_per_1m_cached_input = 0.3
+    "#;
+
+    #[test]
+    fn cached_and_cache_write_tokens_have_their_own_rates() {
+        let t = table(CACHE_PRICED);
+        // 1M input: 200k plain at $3, 700k read at $0.30, 100k written at
+        // $3.75, plus 100k out at $15.
+        let cost = t.token_cost_with_cache(
+            "anthropic/claude",
+            1_000_000,
+            100_000,
+            Some(700_000),
+            Some(100_000),
+        );
+        let expected = 0.6 + 0.21 + 0.375 + 1.5;
+        assert!((cost - expected).abs() < 1e-9, "{cost}");
+    }
+
+    #[test]
+    fn unset_cache_rates_default_to_the_input_rate() {
+        // No cache rate at all: the breakdown changes nothing.
+        let t = table(PRICED);
+        let flat = t.token_cost("openai/gpt", 1_000_000, 100_000);
+        let with_breakdown = t.token_cost_with_cache(
+            "openai/gpt",
+            1_000_000,
+            100_000,
+            Some(600_000),
+            Some(200_000),
+        );
+        assert_eq!(flat.to_bits(), with_breakdown.to_bits());
+
+        // Bit for bit, not merely close: summing three partial products
+        // rounds differently from one product (one ULP apart here).
+        // 123457 plain + 654321 cached + 222223 written, at 2.5 per 1M.
+        let t = table(
+            r#"
+            [[providers]]
+            name = "openai"
+            kind = "openai"
+            [[providers.models]]
+            id = "openai/gpt"
+            capabilities = ["chat"]
+            cost_per_1m_input = 2.5
+            cost_per_1m_output = 10.0
+        "#,
+        );
+        for tokens_out in [0, 100_000] {
+            let flat = t.token_cost("openai/gpt", 1_000_001, tokens_out);
+            let with_breakdown = t.token_cost_with_cache(
+                "openai/gpt",
+                1_000_001,
+                tokens_out,
+                Some(654_321),
+                Some(222_223),
+            );
+            assert_eq!(flat.to_bits(), with_breakdown.to_bits());
+        }
+        // A breakdown that clamps to nothing is the flat cost too, whatever
+        // the cache rates are.
+        let t = table(CACHE_PRICED);
+        let flat = t.token_cost("anthropic/claude", 1_000_001, 7);
+        let zeroes = t.token_cost_with_cache("anthropic/claude", 1_000_001, 7, Some(0), Some(0));
+        assert_eq!(flat.to_bits(), zeroes.to_bits());
+
+        // Only the read rate set: written tokens stay at the input rate.
+        let t = table(CACHE_PRICED);
+        let cost = t.token_cost_with_cache(
+            "anthropic/read-only",
+            1_000_000,
+            0,
+            Some(500_000),
+            Some(500_000),
+        );
+        assert!((cost - (0.15 + 1.5)).abs() < 1e-9, "{cost}");
+
+        // A cache rate with no input rate is still a priced model.
+        let cost =
+            t.token_cost_with_cache("anthropic/cache-only", 1_000_000, 0, Some(1_000_000), None);
+        assert!((cost - 0.3).abs() < 1e-9, "{cost}");
+    }
+
+    #[test]
+    fn no_breakdown_is_the_plain_token_cost() {
+        let t = table(CACHE_PRICED);
+        let plain = t.token_cost("anthropic/claude", 1_000_000, 100_000);
+        assert!((plain - 4.5).abs() < 1e-9, "{plain}");
+        let none = t.token_cost_with_cache("anthropic/claude", 1_000_000, 100_000, None, None);
+        assert!((plain - none).abs() < 1e-12);
+    }
+
+    #[test]
+    fn a_breakdown_larger_than_the_input_is_clamped() {
+        let t = table(CACHE_PRICED);
+        // 100 input tokens, but the upstream claims 80 read and 50 written:
+        // 80 read, 20 written, nothing left at the plain rate.
+        let cost = t.token_cost_with_cache("anthropic/claude", 100, 0, Some(80), Some(50));
+        let expected = (80.0 * 0.3 + 20.0 * 3.75) / 1_000_000.0;
+        assert!((cost - expected).abs() < 1e-12, "{cost}");
+        // More cached than input: everything at the cached rate, never more.
+        let cost = t.token_cost_with_cache("anthropic/claude", 100, 0, Some(500), Some(500));
+        assert!((cost - 100.0 * 0.3 / 1_000_000.0).abs() < 1e-12, "{cost}");
     }
 
     #[test]

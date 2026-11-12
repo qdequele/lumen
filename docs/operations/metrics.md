@@ -20,7 +20,8 @@ to gate it. See [`SECURITY.md`](https://github.com/qdequele/lumen/blob/main/SECU
 | `lumen_request_duration_seconds` | `capability, model, provider, status` | End-to-end latency of one accounted API call. For streaming chat this covers the full stream, recorded when accounting closes. |
 | `lumen_circuit_state` | `provider, model` | Circuit-breaker state: `0` closed, `1` open, `2` half-open. |
 | `lumen_provider_up` | `provider` | Background health-probe result: `1` up, `0` down (absent = unknown / not probed). |
-| `lumen_usage_log_dropped_total` | none | Usage-log entries dropped because the logging channel was full. |
+| `lumen_usage_log_dropped_total` | none | Usage-log entries dropped: the logging channel was full, or the database refused their batch twice (the writer retries a failed batch once after 250 ms, then discards it and counts every row). |
+| `lumen_log_lines_dropped_total` | none | Log lines dropped because the log output could not keep up. Logs are written by a dedicated thread through a bounded queue (16 384 lines), so a stalled log pipe never stalls a request; a line that finds the queue full is discarded and counted here. The total is also printed on stderr at exit. |
 | `lumen_metadata_rejected_total` | none | `x-lumen-metadata` headers dropped as malformed or out of bounds. |
 | `lumen_config_reloads_total` | none | Successful configuration hot reloads. |
 | `lumen_config_reload_failures_total` | none | Configuration reloads rejected as invalid; the previous config kept serving. |
@@ -55,7 +56,8 @@ something watches these:
 
 | Alert condition | Meaning |
 |---|---|
-| `increase(lumen_usage_log_dropped_total[5m]) > 0` | Usage-log rows are being shed under pressure: token accounting is incomplete for those requests. Raise `usage_channel_capacity` or investigate DB write latency. |
+| `increase(lumen_usage_log_dropped_total[5m]) > 0` | Usage-log rows are being lost: token accounting is incomplete for those requests. Either the channel is full (raise `usage_channel_capacity` or investigate DB write latency) or the database refused a batch twice (look for `usage-log batch write failed twice` in the logs, then check the disk and the database file). |
+| `increase(lumen_log_lines_dropped_total[5m]) > 0` | The log pipe (stdout, journald, the container log driver) is stalled or too slow and log lines are being lost. Requests are unaffected, but the logs for that window are incomplete: check the log collector and the disk it writes to. |
 | `increase(lumen_config_reload_failures_total[15m]) > 0` | A config reload was rejected; the **old** config keeps serving. The deploy that "went out" did not. |
 | `increase(lumen_webhook_dropped_total[5m]) > 0` | The webhook queue is full and signals are being shed: a billing backend relying on `budget.threshold` for auto-recharge is running blind, and key-lifecycle events are being lost too. Raise `channel_capacity` or fix a slow receiver. |
 | `increase(lumen_webhook_dead_total[15m]) > 0` | Events are being abandoned - the receiver is down past the retry budget, or rejecting deliveries outright (check for a signature mismatch). Reconcile through `GET /admin/usage/export` until it recovers. |

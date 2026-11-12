@@ -26,9 +26,9 @@
 //!   is this stream's sole terminal event: it yields the final chunk followed
 //!   immediately by [`StreamItem::Done`];
 //! * `citation-start`/`citation-end` and any future event type are ignored;
-//!   an `error` event surfaces as a [`ProviderError`] (only the fact of an
-//!   error propagates - never any upstream-provided message text, which could
-//!   echo prompt content).
+//!   an `error` event surfaces as a retryable upstream [`ProviderError`]
+//!   (only the fact of an error propagates - never any upstream-provided
+//!   message text, which could echo prompt content) and ends the stream.
 
 use std::collections::HashMap;
 
@@ -46,19 +46,23 @@ pub(super) struct CohereTranslator {
     id: String,
     /// The requested model (Cohere does not echo a model id in stream events).
     model: String,
+    /// The provider instance name, for in-stream upstream errors.
+    provider_name: String,
     /// Cohere tool-call index -> OpenAI tool-call index.
     tool_indices: HashMap<u64, u64>,
     /// Next OpenAI tool-call index to allocate.
     next_tool_index: u64,
-    /// Set once `message-end` was seen; later events are ignored.
+    /// Set once `message-end` or an `error` event was seen; later events are
+    /// ignored.
     finished: bool,
 }
 
 impl CohereTranslator {
-    pub(super) fn new(requested_model: &str) -> Self {
+    pub(super) fn new(requested_model: &str, provider_name: &str) -> Self {
         Self {
             id: String::new(),
             model: requested_model.to_owned(),
+            provider_name: provider_name.to_owned(),
             tool_indices: HashMap::new(),
             next_tool_index: 0,
             finished: false,
@@ -171,9 +175,21 @@ impl SseTranslator for CohereTranslator {
                     StreamItem::Done,
                 ])
             }
-            CohereEvent::Error => Err(ProviderError::Translation(
-                "cohere stream error event".to_owned(),
-            )),
+            CohereEvent::Error => {
+                // The stream is over: latch so trailing events are ignored.
+                self.finished = true;
+                tracing::warn!("cohere stream carried an error event");
+                // An upstream failure, not a response the gateway failed to
+                // parse (LM-3002). The event carries no machine-readable class
+                // this translator knows, so it is a generic retryable upstream
+                // error naming the provider instance.
+                Err(ProviderError::Upstream {
+                    provider: self.provider_name.clone(),
+                    status: 500,
+                    retryable: true,
+                    retry_after: None,
+                })
+            }
             CohereEvent::Ignored => Ok(Vec::new()),
         }
     }
@@ -310,7 +326,7 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     #[test]
     fn full_stream_with_tool_call_translates_to_openai_chunks() {
-        let mut t = CohereTranslator::new("command-r-plus");
+        let mut t = CohereTranslator::new("command-r-plus", "cohere-test");
         let items = feed(
             &mut t,
             &[
@@ -432,7 +448,7 @@ mod tests {
     #[test]
     fn tool_call_indices_are_allocated_in_order_of_appearance() {
         // Cohere block indices 3 and 7 -> OpenAI tool indices 0 and 1.
-        let mut t = CohereTranslator::new("m");
+        let mut t = CohereTranslator::new("m", "cohere-test");
         let items = feed(
             &mut t,
             &[
@@ -474,7 +490,7 @@ mod tests {
 
     #[test]
     fn tool_plan_and_citation_events_are_ignored() {
-        let mut t = CohereTranslator::new("m");
+        let mut t = CohereTranslator::new("m", "cohere-test");
         let items = feed(
             &mut t,
             &[
@@ -500,21 +516,49 @@ mod tests {
     }
 
     #[test]
-    fn error_event_surfaces_but_never_a_message_body() {
-        let mut t = CohereTranslator::new("m");
+    fn error_event_is_a_retryable_upstream_error_without_the_message_body() {
+        let mut t = CohereTranslator::new("m", "cohere-test");
         let err = t
             .translate(&event(
                 "error",
                 json!({ "type": "error", "message": "SECRET DETAIL" }),
             ))
             .expect_err("error event fails the stream");
-        let text = err.to_string();
-        assert!(!text.contains("SECRET DETAIL"));
+        // The error names the provider instance it came from (like the
+        // Anthropic, Google and Bedrock translators), not an empty name the
+        // server has to fill in from the route.
+        assert!(
+            matches!(
+                &err,
+                ProviderError::Upstream {
+                    provider,
+                    retryable: true,
+                    ..
+                } if provider == "cohere-test"
+            ),
+            "{err:?}"
+        );
+        assert!(!err.to_string().contains("SECRET DETAIL"));
+    }
+
+    #[test]
+    fn events_after_an_error_event_are_ignored() {
+        let mut t = CohereTranslator::new("m", "cohere-test");
+        let _ = t
+            .translate(&event("error", json!({ "type": "error" })))
+            .expect_err("error event fails the stream");
+        let late = t
+            .translate(&event(
+                "message-start",
+                json!({ "type": "message-start", "id": "late" }),
+            ))
+            .expect("ignored after the error");
+        assert!(late.is_empty(), "{late:?}");
     }
 
     #[test]
     fn malformed_event_json_is_a_translation_error() {
-        let mut t = CohereTranslator::new("m");
+        let mut t = CohereTranslator::new("m", "cohere-test");
         let err = t
             .translate(&SseEvent {
                 event: Some("message-start".to_owned()),
@@ -526,7 +570,7 @@ mod tests {
 
     #[test]
     fn tool_call_delta_for_unknown_index_is_a_translation_error() {
-        let mut t = CohereTranslator::new("m");
+        let mut t = CohereTranslator::new("m", "cohere-test");
         let err = t
             .translate(&event(
                 "tool-call-delta",
@@ -541,7 +585,7 @@ mod tests {
 
     #[test]
     fn events_after_message_end_are_ignored() {
-        let mut t = CohereTranslator::new("m");
+        let mut t = CohereTranslator::new("m", "cohere-test");
         let _ = t
             .translate(&event("message-end", json!({ "type": "message-end" })))
             .expect("message-end ok");
@@ -559,7 +603,7 @@ mod tests {
 
     #[test]
     fn message_end_without_usage_or_finish_reason_still_terminates() {
-        let mut t = CohereTranslator::new("m");
+        let mut t = CohereTranslator::new("m", "cohere-test");
         let items = feed(
             &mut t,
             &[event("message-end", json!({ "type": "message-end" }))],

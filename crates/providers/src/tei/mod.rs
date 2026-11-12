@@ -2,7 +2,7 @@
 //!
 //! TEI serves one model per process and has no OpenAI-compatible envelope:
 //!
-//! * embed: `POST /embed` takes `{ inputs: [..] }` and returns a bare array of
+//! * embed: `POST /embed` takes `{ inputs: [..], dimensions? }` and returns a bare array of
 //!   float arrays (`[[..], ..]`) with no usage;
 //! * rerank: `POST /rerank` takes `{ query, texts }` and returns a bare array of
 //!   `{ index, score }` with no usage.
@@ -67,6 +67,10 @@ impl fmt::Debug for TeiProvider {
 #[derive(Serialize)]
 struct TeiEmbedRequest<'a> {
     inputs: Vec<std::borrow::Cow<'a, str>>,
+    /// TEI's `/embed` takes the output width under the OpenAI name; omitted
+    /// when the client sets none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dimensions: Option<u32>,
 }
 
 #[async_trait]
@@ -85,6 +89,7 @@ impl EmbeddingProvider for TeiProvider {
         // `max_batch_size` after the gateway's split (issue #90).
         let body = TeiEmbedRequest {
             inputs: req.input.item_texts(),
+            dimensions: req.dimensions,
         };
 
         let bytes = post_json(

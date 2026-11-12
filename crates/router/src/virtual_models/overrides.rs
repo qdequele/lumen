@@ -138,7 +138,8 @@ fn check(ty: Ty, key: &str, value: &Value) -> Result<(), String> {
 
 /// A request whose allow-listed fields can be read and rewritten by name.
 pub trait Overridable {
-    /// Whether the field is present.
+    /// Whether the field is present, under any spelling: it decides whether
+    /// a `default` applies.
     fn has_field(&self, name: &str) -> bool;
     /// Set the field (the value was type-checked at load).
     fn set_field(&mut self, name: &str, value: &Value);
@@ -151,7 +152,12 @@ impl Overridable for ChatRequest {
         match name {
             "temperature" => self.temperature.is_some(),
             "top_p" => self.top_p.is_some(),
-            "max_tokens" => self.max_tokens.is_some(),
+            // The two spellings of the output cap are one field: a client
+            // value under either keeps a `default` on the other from being
+            // added (`effective_max_tokens` would prefer `max_tokens`).
+            "max_tokens" | "max_completion_tokens" => {
+                self.max_tokens.is_some() || self.extra.contains_key("max_completion_tokens")
+            }
             "stop" => self.stop.is_some(),
             other => self.extra.contains_key(other),
         }
@@ -287,6 +293,61 @@ pub fn effective_field(
     };
     apply_chain(chain, &mut probe);
     probe.value
+}
+
+/// The two spellings of a chat request's output cap standing in for the whole
+/// request. They are probed together because [`ChatRequest`] treats them as
+/// one field when a `default` applies.
+struct OutputCapProbe {
+    max_tokens: Option<Value>,
+    max_completion_tokens: Option<Value>,
+}
+
+impl OutputCapProbe {
+    fn slot(&mut self, name: &str) -> Option<&mut Option<Value>> {
+        match name {
+            "max_tokens" => Some(&mut self.max_tokens),
+            "max_completion_tokens" => Some(&mut self.max_completion_tokens),
+            _ => None,
+        }
+    }
+}
+
+impl Overridable for OutputCapProbe {
+    fn has_field(&self, name: &str) -> bool {
+        matches!(name, "max_tokens" | "max_completion_tokens")
+            && (self.max_tokens.is_some() || self.max_completion_tokens.is_some())
+    }
+
+    fn set_field(&mut self, name: &str, value: &Value) {
+        if let Some(slot) = self.slot(name) {
+            *slot = Some(value.clone());
+        }
+    }
+
+    fn remove_field(&mut self, name: &str) {
+        if let Some(slot) = self.slot(name) {
+            *slot = None;
+        }
+    }
+}
+
+/// The values `max_tokens` and `max_completion_tokens` end up with once
+/// `chain` is applied to a chat request carrying the given ones: the same
+/// rules as [`apply_chain`] on a [`ChatRequest`], where a client value under
+/// either spelling keeps a `default` on the other from being added.
+#[must_use]
+pub fn effective_output_caps(
+    chain: &[Arc<Overrides>],
+    max_tokens: Option<Value>,
+    max_completion_tokens: Option<Value>,
+) -> (Option<Value>, Option<Value>) {
+    let mut probe = OutputCapProbe {
+        max_tokens,
+        max_completion_tokens,
+    };
+    apply_chain(chain, &mut probe);
+    (probe.max_tokens, probe.max_completion_tokens)
 }
 
 /// A compiled chat preset.
@@ -452,6 +513,49 @@ mod tests {
         apply_chain(&[outer, inner], &mut req);
         assert_eq!(req.max_tokens, Some(200));
         assert_eq!(req.temperature, Some(0.7));
+    }
+
+    #[test]
+    fn a_default_output_cap_never_beats_the_client_cap_under_either_spelling() {
+        let default_max_tokens = || {
+            ov(
+                json!({ "default": { "max_tokens": 4096 } }),
+                Capability::Chat,
+            )
+        };
+        // The client capped the output with the newer spelling: a default on
+        // `max_tokens` must not add a field `effective_max_tokens` prefers.
+        let mut req = chat(json!({ "model": "m", "messages": [], "max_completion_tokens": 100 }));
+        apply_chain(&[default_max_tokens()], &mut req);
+        assert_eq!(req.max_tokens, None);
+        assert_eq!(req.effective_max_tokens(), Some(100));
+
+        // And the other way round.
+        let mut req = chat(json!({ "model": "m", "messages": [], "max_tokens": 100 }));
+        apply_chain(
+            &[ov(
+                json!({ "default": { "max_completion_tokens": 4096 } }),
+                Capability::Chat,
+            )],
+            &mut req,
+        );
+        assert!(!req.extra.contains_key("max_completion_tokens"));
+        assert_eq!(req.effective_max_tokens(), Some(100));
+
+        // Across levels the two spellings are one field too: the level
+        // closest to the leaf wins.
+        let inner = ov(
+            json!({ "default": { "max_completion_tokens": 200 } }),
+            Capability::Chat,
+        );
+        let mut req = chat(json!({ "model": "m", "messages": [] }));
+        apply_chain(&[default_max_tokens(), inner], &mut req);
+        assert_eq!(req.effective_max_tokens(), Some(200));
+
+        // Without any client cap the default still applies.
+        let mut req = chat(json!({ "model": "m", "messages": [] }));
+        apply_chain(&[default_max_tokens()], &mut req);
+        assert_eq!(req.max_tokens, Some(4096));
     }
 
     #[test]

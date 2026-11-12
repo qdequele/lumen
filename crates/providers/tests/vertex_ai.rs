@@ -169,12 +169,14 @@ async fn token_is_cached_across_two_requests() {
     assert_eq!(hits(&mock, &generate_path("generateContent")).await, 2);
 }
 
+/// A token endpoint that states a zero lifetime (`expires_in: 0`) must not
+/// put the token exchange on every request: the token is cached for a short
+/// floor, so two back-to-back requests mint exactly one. (Refresh after the
+/// deadline is covered by the `auth` unit tests.)
 #[tokio::test]
-async fn token_refreshes_when_expired() {
+async fn zero_expires_in_does_not_remint_on_every_request() {
     let mock = MockServer::start().await;
-    // A token that is already within the refresh skew (expires_in 0): each
-    // request must mint a fresh one, so the token endpoint is hit twice.
-    mount_token(&mock, "ya29.short", 0, 2).await;
+    mount_token(&mock, "ya29.short", 0, 1).await;
     Mock::given(method("POST"))
         .and(path(generate_path("generateContent")))
         .and(header("authorization", "Bearer ya29.short"))
@@ -192,8 +194,8 @@ async fn token_refreshes_when_expired() {
 
     assert_eq!(
         hits(&mock, TOKEN_PATH).await,
-        2,
-        "expired token must refresh"
+        1,
+        "a zero-lifetime token must still be cached briefly"
     );
 }
 

@@ -298,57 +298,199 @@ async fn falls_back_to_second_provider_and_advertises_it() {
     assert_eq!(fallback.received_requests().await.unwrap().len(), 1);
 }
 
-// GH #13 / LM-2004: the primary (OpenAI) accepts a remote image URL, so the
-// LM-2004 pre-flight (which only inspects `chain[0]`) lets the request
-// through. The primary then fails and the chain falls back to Gemini, which
-// cannot take a remote URL. That must surface as the honest LM-2004 client
-// error (400), not an upstream LM-3002 (502) - a fail-over is not the
-// client's fault when it happens, but *this specific* failure (an
-// image-incapable fallback) is a client-input problem, not the fallback
-// provider's fault.
-#[tokio::test]
-async fn fallback_incapable_of_remote_image_url_is_lm_2004_not_502() {
-    let primary = MockServer::start().await;
-    let fallback = MockServer::start().await;
-    // Primary always fails, forcing a fail-over to the Gemini fallback. The
-    // fallback mock is never given a mapping - it must never be hit.
-    Mock::given(method("POST"))
-        .and(path("/chat/completions"))
-        .respond_with(ResponseTemplate::new(503))
-        .mount(&primary)
-        .await;
-
-    let base = spawn(&config_from(
-        &image_capable_primary_with_gemini_fallback_config(&primary.uri(), &fallback.uri()),
-    ))
-    .await;
-
-    let resp = reqwest::Client::new()
+/// POST a one-image chat request for `model` whose image is `url`.
+async fn post_image_chat(base: &str, model: &str, url: &str) -> reqwest::Response {
+    reqwest::Client::new()
         .post(format!("{base}/v1/chat/completions"))
         .json(&json!({
-            "model": "gpt",
+            "model": model,
             "messages": [{"role":"user","content":[
                 {"type":"text","text":"what is this?"},
-                {"type":"image_url","image_url":{"url":"https://example.com/x.png"}}
+                {"type":"image_url","image_url":{"url": url}}
             ]}]
         }))
         .send()
         .await
-        .expect("request sent");
+        .expect("request sent")
+}
 
-    assert_eq!(
-        resp.status(),
-        400,
-        "an image-incapable fallback must surface as a client error, not a 502"
+/// A server that answers every POST with `status`.
+async fn always(status: u16) -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(status))
+        .mount(&server)
+        .await;
+    server
+}
+
+// GH #13 / LM-2004: the primary (OpenAI) accepts a remote image URL, so the
+// request clears the LM-2004 pre-flight, which judges the primary. A Gemini
+// fallback cannot fetch a remote URL: it is not an attempt for this request,
+// exactly as a text-only fallback is not one for an image. The fail-over goes
+// on to the next target that can take the URL.
+#[tokio::test]
+async fn fallback_incapable_of_remote_image_url_is_skipped() {
+    let primary = always(503).await;
+    let gemini = always(503).await;
+    let third = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(chat_body("gpt")))
+        .mount(&third)
+        .await;
+    let config = format!(
+        r#"{}
+        [[providers]]
+        name = "third"
+        kind = "openai"
+        base_url = "{}"
+        [[providers.models]]
+        id = "third/third-gpt"
+        upstream_id = "gpt"
+        capabilities = ["chat"]
+        modalities = ["text", "image"]
+
+        [[virtual_models]]
+        id = "lumen/three"
+        capability = "chat"
+        strategy = "fallback"
+        targets = [
+            {{ model = "primary/primary-gpt" }},
+            {{ model = "fallback/gemini-fb" }},
+            {{ model = "third/third-gpt" }},
+        ]
+        "#,
+        image_capable_primary_with_gemini_fallback_config(&primary.uri(), &gemini.uri()),
+        third.uri()
     );
-    let body: Value = resp.json().await.expect("json body");
-    assert_eq!(body["error"]["code"], "LM-2004");
+    let base = spawn(&config_from(&config)).await;
 
-    // The primary was tried (and exhausted its retry budget); the fallback
-    // was never actually contacted over HTTP - the remote URL is rejected in
-    // translation, before any request leaves the gateway.
+    let resp = post_image_chat(&base, "lumen/three", "https://example.com/x.png").await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers()
+            .get("x-lumen-model-used")
+            .and_then(|v| v.to_str().ok()),
+        Some("third/third-gpt")
+    );
     assert!(!primary.received_requests().await.unwrap().is_empty());
-    assert!(fallback.received_requests().await.unwrap().is_empty());
+    assert!(
+        gemini.received_requests().await.unwrap().is_empty(),
+        "a target that cannot fetch the URL must never be sent it"
+    );
+
+    // An inline `data:` image is something Gemini can take: the same chain
+    // does fail over to it.
+    let _ = post_image_chat(&base, "lumen/three", "data:image/png;base64,AAAA").await;
+    assert!(
+        !gemini.received_requests().await.unwrap().is_empty(),
+        "an inline image still fails over to the Gemini target"
+    );
+}
+
+// When the only fallback cannot take the remote URL, nothing is left after
+// the primary: its own upstream failure is what the client sees (not an
+// `LM-2004` blaming the client for a fail-over it did not choose).
+#[tokio::test]
+async fn primary_failure_surfaces_when_no_fallback_can_take_the_remote_image_url() {
+    let primary = always(503).await;
+    let gemini = always(200).await;
+    let base = spawn(&config_from(
+        &image_capable_primary_with_gemini_fallback_config(&primary.uri(), &gemini.uri()),
+    ))
+    .await;
+
+    let resp = post_image_chat(&base, "gpt", "https://example.com/x.png").await;
+    assert_eq!(resp.status(), 502);
+    let body: Value = resp.json().await.expect("json body");
+    assert_eq!(body["error"]["code"], "LM-3003");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("'primary'")),
+        "{body}"
+    );
+    assert!(!primary.received_requests().await.unwrap().is_empty());
+    assert!(gemini.received_requests().await.unwrap().is_empty());
+}
+
+// LM-2008 follows the same rule: a provider-native image source is judged on
+// the primary, and a fallback that cannot resolve it is skipped. An OpenAI
+// fallback would otherwise be sent `anthropic-file:...` or a Gemini file URI
+// verbatim as an image URL.
+#[tokio::test]
+async fn fallback_incapable_of_a_provider_native_image_source_is_skipped() {
+    for (kind, url) in [
+        ("anthropic", "anthropic-file:file_abc123"),
+        (
+            "google",
+            "https://generativelanguage.googleapis.com/v1beta/files/abc123",
+        ),
+        ("google", "gs://bucket/cat.png"),
+    ] {
+        let primary = always(503).await;
+        let fallback = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(chat_body("gpt")))
+            .mount(&fallback)
+            .await;
+        let config = format!(
+            r#"
+            [resilience]
+            retry_max_attempts = 1
+            retry_base_ms = 5
+            retry_max_ms = 20
+
+            [[providers]]
+            name = "primary"
+            kind = "{kind}"
+            base_url = "{}"
+            [[providers.models]]
+            id = "primary/native"
+            capabilities = ["chat"]
+            modalities = ["text", "image"]
+
+            [[providers]]
+            name = "fallback"
+            kind = "openai"
+            base_url = "{}"
+            [[providers.models]]
+            id = "fallback/gpt-fb"
+            upstream_id = "gpt"
+            capabilities = ["chat"]
+            modalities = ["text", "image"]
+
+            [[virtual_models]]
+            id = "lumen/native"
+            capability = "chat"
+            strategy = "fallback"
+            targets = [{{ model = "primary/native" }}, {{ model = "fallback/gpt-fb" }}]
+            "#,
+            primary.uri(),
+            fallback.uri()
+        );
+        let base = spawn(&config_from(&config)).await;
+
+        let resp = post_image_chat(&base, "lumen/native", url).await;
+        assert_ne!(resp.status(), 200, "{kind} {url}");
+        let body: Value = resp.json().await.expect("json body");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("'primary'")),
+            "{kind} {url}: {body}"
+        );
+        assert!(
+            fallback.received_requests().await.unwrap().is_empty(),
+            "{kind} {url}: the fallback cannot resolve this source"
+        );
+
+        // A plain inline image still fails over to the OpenAI target.
+        let resp = post_image_chat(&base, "lumen/native", "data:image/png;base64,AAAA").await;
+        assert_eq!(resp.status(), 200, "{kind}");
+    }
 }
 
 // Criterion 3: 5 failures open the circuit; the next request skips the primary
@@ -1197,4 +1339,144 @@ async fn rate_limit_hint_above_the_cap_is_not_waited_for() {
     assert_eq!(body["error"]["code"], "LM-3001", "body: {body}");
     assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
     assert!(started.elapsed() < Duration::from_secs(5));
+}
+
+// ---------------------------------------------------------------------------
+// Sub-batch retry of a split embeddings request follows the retry policy
+// (ADR 005, 2026-11-12 amendment)
+// ---------------------------------------------------------------------------
+
+/// One TEI-kind provider (32 inputs per upstream call) on `url`, with a
+/// millisecond request-level backoff. `resilience` lands in `[resilience]`,
+/// `provider` on the provider.
+fn split_embed_config(url: &str, resilience: &str, provider: &str) -> Config {
+    config_from(&format!(
+        r#"
+        [resilience]
+        retry_base_ms = 1
+        retry_max_ms = 5
+        {resilience}
+
+        [[providers]]
+        name = "tei"
+        kind = "tei"
+        base_url = "{url}"
+        {provider}
+        [[providers.models]]
+        id = "tei/bge"
+        capabilities = ["embed"]
+        "#
+    ))
+}
+
+/// Number of inputs in a TEI `/embed` request body.
+fn tei_inputs(request: &wiremock::Request) -> usize {
+    serde_json::from_slice::<Value>(&request.body)
+        .ok()
+        .and_then(|body| body["inputs"].as_array().map(Vec::len))
+        .unwrap_or(0)
+}
+
+/// A TEI upstream for a 33-input request, which the gateway splits into a
+/// 32-input sub-batch (always answered) and a 1-input sub-batch that gets a
+/// 503 for its first `failures` calls.
+async fn split_embed_upstream(failures: u64) -> MockServer {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/embed"))
+        .and(|r: &wiremock::Request| tei_inputs(r) == 1)
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(failures)
+        .mount(&upstream)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/embed"))
+        .respond_with(|r: &wiremock::Request| {
+            ResponseTemplate::new(200).set_body_json(vec![vec![0.5f32, 0.25]; tei_inputs(r)])
+        })
+        .mount(&upstream)
+        .await;
+    upstream
+}
+
+/// POST 33 inputs, then report the status and how many upstream calls each
+/// of the two sub-batches received: `(status, 32-input calls, 1-input calls)`.
+async fn post_split_embed(base: &str, upstream: &MockServer) -> (u16, usize, usize) {
+    let inputs: Vec<String> = (0..33).map(|i| format!("text {i}")).collect();
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/embeddings"))
+        .json(&json!({ "model": "tei/bge", "input": inputs }))
+        .send()
+        .await
+        .expect("send embeddings");
+    let status = resp.status().as_u16();
+    if status == 200 {
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(body["data"].as_array().map(Vec::len), Some(33));
+    }
+    let requests = upstream.received_requests().await.unwrap();
+    let calls = |n: usize| requests.iter().filter(|r| tei_inputs(r) == n).count();
+    (status, calls(32), calls(1))
+}
+
+/// Retries enabled (the default policy): the failed sub-batch is sent again
+/// on its own and the completed one is not.
+#[tokio::test]
+async fn split_embeddings_retry_a_failed_sub_batch_when_retries_are_enabled() {
+    let upstream = split_embed_upstream(1).await;
+    let base = spawn(&split_embed_config(&upstream.uri(), "", "")).await;
+
+    let (status, full, single) = post_split_embed(&base, &upstream).await;
+    assert_eq!(status, 200);
+    assert_eq!(single, 2, "the failed sub-batch is retried");
+    assert_eq!(full, 1, "the completed sub-batch is not sent again");
+}
+
+/// `retry_max_attempts = 1` in `[resilience]` turns the sub-batch retry off
+/// too: one call per sub-batch, and the upstream error is returned.
+#[tokio::test]
+async fn split_embeddings_do_not_retry_a_sub_batch_when_retries_are_disabled() {
+    let upstream = split_embed_upstream(1).await;
+    let config = split_embed_config(&upstream.uri(), "retry_max_attempts = 1", "");
+    let base = spawn(&config).await;
+
+    let (status, full, single) = post_split_embed(&base, &upstream).await;
+    assert_eq!(status, 502);
+    assert_eq!(single, 1, "no sub-batch retry when retries are disabled");
+    assert_eq!(full, 1);
+}
+
+/// A provider that disables retries for itself (ADR 021) gets no sub-batch
+/// retry either, whatever the global policy allows.
+#[tokio::test]
+async fn split_embeddings_follow_the_provider_retry_override() {
+    let upstream = split_embed_upstream(1).await;
+    let config = split_embed_config(
+        &upstream.uri(),
+        "retry_max_attempts = 3",
+        "retry_max_attempts = 1",
+    );
+    let base = spawn(&config).await;
+
+    let (status, full, single) = post_split_embed(&base, &upstream).await;
+    assert_eq!(status, 502);
+    assert_eq!(single, 1, "the provider's own policy allows no retry");
+    assert_eq!(full, 1);
+}
+
+/// The sub-batch attempt count never exceeds the policy's: with two attempts
+/// allowed, a sub-batch that always fails is called twice per request-level
+/// attempt (2 x 2), not three times (2 x 3).
+#[tokio::test]
+async fn split_embeddings_sub_batch_attempts_are_capped_by_the_policy() {
+    let upstream = split_embed_upstream(u64::MAX).await;
+    let config = split_embed_config(&upstream.uri(), "retry_max_attempts = 2", "");
+    let base = spawn(&config).await;
+
+    let (status, _full, single) = post_split_embed(&base, &upstream).await;
+    assert_eq!(status, 502);
+    assert_eq!(
+        single, 4,
+        "two sub-batch attempts per request-level attempt"
+    );
 }

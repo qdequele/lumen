@@ -343,6 +343,55 @@ async fn voyage_embed_does_not_forward_extra_fields() {
     assert_extra_not_forwarded(&VoyageEmbedFixture).await;
 }
 
+/// Jina's `/embeddings` schema has no `user` and no `encoding_format` (its
+/// output encoding field is `embedding_type`): the text path sends an explicit
+/// body with only `model`, `input` and, when the client sets it, `dimensions`.
+/// The gateway re-encodes base64 at the request edge, so the upstream is
+/// always asked for its default float output.
+#[tokio::test]
+async fn jina_text_embed_sends_only_fields_jina_accepts() {
+    let mock = MockServer::start().await;
+    JinaEmbedFixture.mount_echo(&mock).await;
+    let provider = JinaEmbedFixture.build(mock.uri());
+
+    let mut req = batch_request(vec!["0".into(), "1".into()]);
+    req.user = Some("end-user-42".to_owned());
+    req.encoding_format = Some("base64".to_owned());
+    req.dimensions = Some(256);
+    provider.embed(req, CancellationToken::new()).await.unwrap();
+
+    let requests = mock.received_requests().await.unwrap();
+    let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(
+        body,
+        json!({ "model": body["model"], "input": ["0", "1"], "dimensions": 256 }),
+        "unexpected Jina body: {body}"
+    );
+}
+
+/// `dimensions` is omitted, not sent as null, when the client sets none.
+#[tokio::test]
+async fn jina_text_embed_omits_dimensions_by_default() {
+    let mock = MockServer::start().await;
+    JinaEmbedFixture.mount_echo(&mock).await;
+    let provider = JinaEmbedFixture.build(mock.uri());
+
+    provider
+        .embed(batch_request(vec!["0".into()]), CancellationToken::new())
+        .await
+        .unwrap();
+
+    let requests = mock.received_requests().await.unwrap();
+    let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    let keys: Vec<&str> = body
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(keys, vec!["input", "model"], "got body: {body}");
+}
+
 // --------------------------------------------------------------------------
 // TEI fixture - request `inputs`, response is a bare `[[f32]]` array
 // --------------------------------------------------------------------------
@@ -1603,4 +1652,323 @@ async fn voyage_embed_reports_upstream_total_tokens_as_prompt_tokens() {
     assert_eq!(resp.usage.prompt_tokens, 7);
     assert_eq!(resp.usage.total_tokens, 7);
     assert_eq!(resp.usage.estimated, None);
+}
+
+/// An OpenAI-compatible upstream may list `data` in any order: `index` is what
+/// ties a vector to its input. Across sub-batches the gateway must place each
+/// vector by that upstream index, not by its position in the array.
+#[tokio::test]
+async fn batched_reassembly_follows_the_upstream_index() {
+    // Like `OpenAiEcho`, but `data` is reversed (each entry keeps its index).
+    struct ReversedEcho;
+    impl Respond for ReversedEcho {
+        fn respond(&self, request: &Request) -> ResponseTemplate {
+            let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
+            let inputs = extract_inputs(&body["input"]);
+            let mut data: Vec<Value> = inputs
+                .iter()
+                .enumerate()
+                .map(|(i, s)| {
+                    let val: f32 = s.parse().unwrap_or(f32::NAN);
+                    json!({ "object": "embedding", "index": i, "embedding": [val] })
+                })
+                .collect();
+            data.reverse();
+            let n = inputs.len();
+            ResponseTemplate::new(200).set_body_json(json!({
+                "object": "list",
+                "data": data,
+                "model": "test-model",
+                "usage": { "prompt_tokens": n, "total_tokens": n }
+            }))
+        }
+    }
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ReversedEcho)
+        .mount(&mock)
+        .await;
+    let provider = OpenAiFixture.build(mock.uri());
+    let n = provider.max_batch_size() + 3;
+    let texts: Vec<String> = (0..n).map(|i| i.to_string()).collect();
+
+    let resp = batch::embed_batched(
+        &*provider,
+        batch_request(texts),
+        &CancellationToken::new(),
+        4,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(resp.data.len(), n);
+    for (i, item) in resp.data.iter().enumerate() {
+        assert_eq!(item.index as usize, i);
+        #[allow(clippy::cast_precision_loss)] // small test indices
+        let expected = i as f32;
+        assert!(
+            (item.embedding[0] - expected).abs() < f32::EPSILON,
+            "position {i} holds the vector of input {}",
+            item.embedding[0]
+        );
+    }
+}
+
+/// Ollama is keyless by default (no `Authorization` header), but a configured
+/// key is sent as bearer auth and never appears in `Debug`.
+#[tokio::test]
+async fn ollama_embed_sends_bearer_only_when_a_key_is_configured() {
+    let mock = MockServer::start().await;
+    OllamaFixture.mount_echo(&mock).await;
+
+    let keyless = OllamaFixture.build(mock.uri());
+    keyless
+        .embed(batch_request(vec!["0".into()]), CancellationToken::new())
+        .await
+        .unwrap();
+
+    let keyed = OllamaProvider::new(reqwest::Client::new(), "ollama-keyed", mock.uri(), false)
+        .with_api_key(Some("sk-ollama-secret".to_owned()));
+    let dbg = format!("{keyed:?}");
+    assert!(!dbg.contains("sk-ollama-secret"), "key leaked: {dbg}");
+    assert!(dbg.contains("<redacted>"), "got: {dbg}");
+    keyed
+        .embed(batch_request(vec!["0".into()]), CancellationToken::new())
+        .await
+        .unwrap();
+
+    let requests = mock.received_requests().await.unwrap();
+    assert!(requests[0].headers.get("authorization").is_none());
+    assert_eq!(
+        requests[1]
+            .headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok()),
+        Some("Bearer sk-ollama-secret")
+    );
+}
+
+/// Embed one text with `dimensions: 256` through `fx` and return the body the
+/// upstream received.
+async fn body_sent_with_dimensions(fx: &dyn EmbedFixture) -> Value {
+    let mock = MockServer::start().await;
+    fx.mount_echo(&mock).await;
+    let provider = fx.build(mock.uri());
+
+    let mut req = req_for(fx, vec!["0".into()]);
+    req.dimensions = Some(256);
+    provider.embed(req, CancellationToken::new()).await.unwrap();
+
+    let requests = mock.received_requests().await.unwrap();
+    serde_json::from_slice(&requests[0].body).unwrap()
+}
+
+/// Cohere v2 embed names the output width `output_dimension`; a requested
+/// `dimensions` must reach the upstream instead of being silently dropped.
+#[tokio::test]
+async fn cohere_embed_maps_dimensions_to_output_dimension() {
+    let body = body_sent_with_dimensions(&CohereEmbedFixture).await;
+    assert_eq!(body["output_dimension"], 256);
+    assert!(body.get("dimensions").is_none(), "got body: {body}");
+}
+
+/// Cohere omits `output_dimension` when the client sets no `dimensions`.
+#[tokio::test]
+async fn cohere_embed_omits_output_dimension_by_default() {
+    let mock = MockServer::start().await;
+    CohereEmbedFixture.mount_echo(&mock).await;
+    let provider = CohereEmbedFixture.build(mock.uri());
+    let req = batch_request(vec!["0".into()]);
+    provider.embed(req, CancellationToken::new()).await.unwrap();
+    let requests = mock.received_requests().await.unwrap();
+    let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert!(body.get("output_dimension").is_none(), "got body: {body}");
+}
+
+/// TEI's `/embed` accepts `dimensions` natively; it must be forwarded.
+#[tokio::test]
+async fn tei_embed_forwards_dimensions() {
+    let body = body_sent_with_dimensions(&TeiEmbedFixture).await;
+    assert_eq!(body["dimensions"], 256);
+
+    // Absent by default.
+    let mock = MockServer::start().await;
+    TeiEmbedFixture.mount_echo(&mock).await;
+    let provider = TeiEmbedFixture.build(mock.uri());
+    let req = batch_request(vec!["0".into()]);
+    provider.embed(req, CancellationToken::new()).await.unwrap();
+    let requests = mock.received_requests().await.unwrap();
+    let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(body, json!({ "inputs": ["0"] }));
+}
+
+/// A two-item multimodal batch whose second item carries two text fragments.
+fn two_items_one_multipart() -> EmbedInput {
+    let part = |t: &str| ContentPart {
+        kind: "text".to_owned(),
+        text: Some(t.to_owned()),
+        image_url: None,
+        extra: serde_json::Map::new(),
+    };
+    EmbedInput::Multi(vec![
+        EmbedItem::Text("solo".to_owned()),
+        EmbedItem::Parts(vec![part("foo"), part("bar")]),
+    ])
+}
+
+/// Bedrock Titan embeds per ITEM, never per text fragment: an item made of two
+/// text parts is one `InvokeModel` call carrying the newline-joined text, so
+/// the vector count equals the item count (same contract as issue #90).
+#[tokio::test]
+async fn bedrock_titan_embeds_one_vector_per_multipart_item() {
+    let mock = MockServer::start().await;
+    // A fixed valid vector per call (the echo responder needs numeric text).
+    BedrockTitanFixture
+        .mount_delayed(&mock, Duration::ZERO)
+        .await;
+    let provider = BedrockTitanFixture.build(mock.uri());
+
+    let mut req = req_for(&BedrockTitanFixture, Vec::new());
+    req.input = two_items_one_multipart();
+    let resp = provider.embed(req, CancellationToken::new()).await.unwrap();
+    assert_eq!(resp.data.len(), 2);
+
+    let requests = mock.received_requests().await.unwrap();
+    assert_eq!(
+        requests.len(),
+        2,
+        "one InvokeModel per item, not per fragment"
+    );
+    let second: Value = serde_json::from_slice(&requests[1].body).unwrap();
+    assert_eq!(second["inputText"], "foo\nbar");
+}
+
+/// Bedrock Cohere sends one `texts` entry per ITEM (fragments joined), so the
+/// returned vector count matches the item count.
+#[tokio::test]
+async fn bedrock_cohere_embeds_one_vector_per_multipart_item() {
+    // One vector per `texts` entry, whatever the (non-numeric) text is.
+    struct CohereCount;
+    impl Respond for CohereCount {
+        fn respond(&self, request: &Request) -> ResponseTemplate {
+            let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
+            let n = body["texts"].as_array().map_or(0, Vec::len);
+            let embeddings: Vec<Value> = (0..n).map(|_| json!([0.0])).collect();
+            ResponseTemplate::new(200).set_body_json(json!({ "embeddings": embeddings }))
+        }
+    }
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(CohereCount)
+        .mount(&mock)
+        .await;
+    let provider = BedrockCohereFixture.build(mock.uri());
+
+    let mut req = req_for(&BedrockCohereFixture, Vec::new());
+    req.input = two_items_one_multipart();
+    let resp = provider.embed(req, CancellationToken::new()).await.unwrap();
+    assert_eq!(resp.data.len(), 2);
+
+    let requests = mock.received_requests().await.unwrap();
+    let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(body["texts"], json!(["solo", "foo\nbar"]));
+}
+
+// --------------------------------------------------------------------------
+// Sub-batch retry (ADR 005, 2026-11-12 amendment)
+// --------------------------------------------------------------------------
+
+/// Mount a response that answers only the first request it sees, ahead of
+/// the fixture's echo.
+async fn mount_once(mock: &MockServer, template: ResponseTemplate) {
+    Mock::given(method("POST"))
+        .respond_with(template)
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(mock)
+        .await;
+}
+
+/// 65 inputs on TEI (32 per call) are 3 upstream calls. One of them is rate
+/// limited once: it alone is sent again, and the request succeeds with every
+/// vector in input order, instead of failing and re-running all three.
+#[tokio::test]
+async fn rate_limited_sub_batch_is_retried_without_resending_the_others() {
+    let mock = MockServer::start().await;
+    mount_once(&mock, ResponseTemplate::new(429)).await;
+    TeiEmbedFixture.mount_echo(&mock).await;
+    let provider = TeiEmbedFixture.build(mock.uri());
+
+    let texts: Vec<String> = (0..65).map(|i| i.to_string()).collect();
+    let resp = batch::embed_batched(
+        &*provider,
+        batch_request(texts),
+        &CancellationToken::new(),
+        4,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(resp.data.len(), 65);
+    for (i, d) in resp.data.iter().enumerate() {
+        assert_eq!(d.index as usize, i);
+        assert_eq!(d.embedding[0], i as f32, "embedding out of order at {i}");
+    }
+    // 3 sub-batches + the one retry.
+    let calls = mock.received_requests().await.unwrap().len();
+    assert_eq!(calls, 4, "expected 4 upstream calls, got {calls}");
+}
+
+/// A client error on a sub-batch is returned as is: never sent again.
+#[tokio::test]
+async fn client_error_on_a_sub_batch_is_not_retried() {
+    let mock = MockServer::start().await;
+    mount_once(&mock, ResponseTemplate::new(400)).await;
+    TeiEmbedFixture.mount_echo(&mock).await;
+    let provider = TeiEmbedFixture.build(mock.uri());
+
+    let texts: Vec<String> = (0..65).map(|i| i.to_string()).collect();
+    let err = batch::embed_batched(
+        &*provider,
+        batch_request(texts),
+        &CancellationToken::new(),
+        4,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(!err.is_retryable(), "{err:?}");
+    let calls = mock.received_requests().await.unwrap().len();
+    assert!(calls <= 3, "a client error was retried: {calls} calls");
+}
+
+/// A client disconnect while a sub-batch waits out a `Retry-After` ends the
+/// request at once, and nothing more is sent upstream.
+#[tokio::test]
+async fn cancellation_during_a_sub_batch_backoff_stops_the_request() {
+    let mock = MockServer::start().await;
+    mount_status(&mock, 429, Some("5")).await;
+    let provider = TeiEmbedFixture.build(mock.uri());
+
+    let cancel = CancellationToken::new();
+    let canceller = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        canceller.cancel();
+    });
+
+    let texts: Vec<String> = (0..65).map(|i| i.to_string()).collect();
+    let started = Instant::now();
+    let err = batch::embed_batched(&*provider, batch_request(texts), &cancel, 4)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, ProviderError::Cancelled), "{err:?}");
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "cancellation did not interrupt the backoff: {:?}",
+        started.elapsed()
+    );
+    let calls = mock.received_requests().await.unwrap().len();
+    assert!(calls <= 3, "calls were sent during the pause: {calls}");
 }

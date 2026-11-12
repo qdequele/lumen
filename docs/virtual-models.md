@@ -38,9 +38,10 @@ its id without the `<provider>/` prefix.
 **Deprecated bare aliases.** So existing clients keep working, each prefixed
 id's bare form (`gpt-4o` for `openai/gpt-4o`) still resolves to it. These
 aliases are hidden: `GET /v1/models` never lists them, usage and metrics
-record the prefixed id, and every use logs a warning and increments
-`lumen_deprecated_model_alias_total{alias,model}`, so you know when nobody
-sends them any more. A bare form that is itself a configured id is no alias;
+record the prefixed id, and every use increments
+`lumen_deprecated_model_alias_total{alias,model}` (a warning is also logged,
+at most once per alias every ten minutes), so you know when nobody sends
+them any more. A bare form that is itself a configured id is no alias;
 when a virtual model and a foundation model share a bare form, the virtual
 model gets it (a migrated fallback chain keeps its old client-facing id);
 two of the same kind get none. The aliases will be removed in a future
@@ -119,7 +120,13 @@ failure with the virtual model id and the reason:
    attempts of every target, a `switch` only its largest branch, and a
    foundation target counts 1 (a DAG that lists the same child several times
    per level multiplies quickly; the error names the model and its count);
-7. the contents of `overrides`, `preset` and `remap`.
+7. at most **64** targets per virtual model (the attempt limit does not
+   bound a `switch`, which counts only its largest branch);
+8. `when` conditions: at most **16** attribute tests per `when` table
+   (counted through `any`), at most **16** `regex` conditions per virtual
+   model, and each `regex` at most **256** bytes long and **64 KiB** once
+   compiled (see section 3);
+9. the contents of `overrides`, `preset` and `remap`.
 
 A `preset` on a virtual model that is only reached through another one is
 ignored at request time (section 6), and loading logs a warning.
@@ -191,7 +198,10 @@ nested table `metadata = { plan = "pro" }` and is rejected; write
 
 **Operators.** A bare value means equality. Otherwise use a one-key table:
 `in` (a list), `ne`, `gt`, `gte`, `lt`, `lte`, or `regex` (compiled at load;
-an invalid regex is a validation error). Several keys in one `when` table are
+an invalid regex is a validation error, and so is one longer than 256 bytes
+or compiling to more than 64 KiB. Unicode classes are what makes a pattern
+large: `\w+` fits once, `\w{20}` does not; ASCII classes such as `[a-z0-9_]`
+or `(?-u:\w)` cost almost nothing). Several keys in one `when` table are
 ANDed. `any = [ {...}, {...} ]` is an OR of tables and can nest. A missing
 attribute makes its comparison false (including `ne`), so the branch does not
 match and evaluation moves on to the next rule.
@@ -223,7 +233,9 @@ targets = [{ model = "openai/gpt-4o", overrides = { set = { max_tokens = 4096 },
 ```
 
 - `set` always applies; `default` applies only when the client did not send the
-  field; `drop` removes it.
+  field; `drop` removes it. For `default`, `max_tokens` and
+  `max_completion_tokens` are one field: a client value under either spelling
+  keeps a default on the other from being added.
 - On translated providers (Anthropic, Bedrock, Google, Cohere) a client-sent
   `max_tokens` wins over `max_completion_tokens`. To cap output tokens there
   with an override, `set` `max_tokens`.

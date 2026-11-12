@@ -115,6 +115,45 @@ capabilities = ["rerank"]
 cost_per_1k_searches = 2.0
 ```
 
+### Prompt caching
+
+Providers bill input tokens they read from their prompt cache at a discount,
+and Anthropic bills the tokens it writes to the cache at a premium. Two
+optional per-model prices cover that:
+
+```toml
+[[providers.models]]
+id = "anthropic/claude-sonnet-4-5"
+capabilities = ["chat"]
+cost_per_1m_input = 3.0
+cost_per_1m_output = 15.0
+cost_per_1m_cached_input = 0.3   # input tokens read from the cache
+cost_per_1m_cache_write = 3.75   # input tokens written to the cache
+```
+
+- The counts come from the upstream's own usage: `cached_tokens` is OpenAI's
+  `prompt_tokens_details.cached_tokens` or Anthropic's
+  `cache_read_input_tokens`; `cache_write_tokens` is Anthropic's
+  `cache_creation_input_tokens`. Both are part of `prompt_tokens`, so a call
+  costs `(prompt - cached - cache_write) x input + cached x cached_input +
+  cache_write x cache_write + completion x output`.
+- **Unset means the input price.** A config with neither key charges every
+  input token at `cost_per_1m_input`, exactly as before these keys existed.
+  Set them to stop over-charging keys and budgets for cached input.
+- Only the cost changes. `tokens_in`, `cached_tokens` and
+  `cache_write_tokens` in the usage log, the response `usage` and the
+  Prometheus counters are the upstream's counts either way.
+- Applies to chat, streaming and non-streaming. The pre-call budget
+  reservation still assumes the full input price (nothing is known about the
+  cache before the call) and is corrected at settlement. A locally estimated
+  count carries no cache breakdown and is priced at the input rate.
+- One write rate per model: Anthropic prices a 1-hour cache write above a
+  5-minute one, so set the rate of the TTL your clients use.
+
+The gateway ships no price table: every price is the operator's config.
+See [ADR 003](../adr/003-token-accounting.md) (addendum on cached-input
+pricing).
+
 A model without prices set costs `0`, so hard budgets never bite on it. See
 [Keys, quotas & budgets](keys-budgets.md) for how cost feeds budget
 enforcement.

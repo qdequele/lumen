@@ -20,7 +20,6 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use lumen_auth::store::{GroupRecord, KeyStore, VirtualKeyRecord};
 use lumen_core::GatewayError;
-use std::collections::HashSet;
 
 /// The scoping header.
 pub const ACCOUNT_HEADER: &str = "X-Lumen-Account-Ref";
@@ -175,34 +174,6 @@ impl AccountScope {
         } else {
             Err(unknown_key(id))
         }
-    }
-
-    /// Keep only the keys whose group is in scope (every key, unscoped).
-    /// Tombstoned groups count, so `?include_deleted=true` stays inside the
-    /// account too.
-    ///
-    /// # Errors
-    /// `LM-5001` on a store failure.
-    pub async fn filter_keys(
-        &self,
-        store: &KeyStore,
-        keys: Vec<VirtualKeyRecord>,
-    ) -> Result<Vec<VirtualKeyRecord>, ApiError> {
-        let Some(account) = self.0.as_deref() else {
-            return Ok(keys);
-        };
-        let groups: HashSet<String> = store
-            .list_groups(true)
-            .await
-            .map_err(|e| internal(&e))?
-            .into_iter()
-            .filter(|group| group.account_ref.as_deref() == Some(account))
-            .map(|group| group.id)
-            .collect();
-        Ok(keys
-            .into_iter()
-            .filter(|key| key.group_id.as_ref().is_some_and(|g| groups.contains(g)))
-            .collect())
     }
 }
 

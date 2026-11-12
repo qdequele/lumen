@@ -135,6 +135,23 @@ impl AuthKnobs {
         self.retention_days.load(Ordering::Relaxed)
     }
 
+    /// The retention purge's cutoff at `now` (unix seconds): usage rows with
+    /// `ts` strictly older are purged. `None` means "do not purge".
+    ///
+    /// A window of 0 days is `None`, never `now`: `Config::validate` refuses
+    /// 0 only while auth is enabled, but a reload stores the knob
+    /// unconditionally, so a document that disables auth (and leaves
+    /// `retention_days = 0`) reaches a purge task that is still running. A
+    /// cutoff of `now - 0` would then delete the whole usage log on its next
+    /// tick. Mirrors the `.max(1)` guard on the flush cadence.
+    #[must_use]
+    pub fn retention_cutoff(&self, now: i64) -> Option<i64> {
+        match self.retention_days() {
+            0 => None,
+            days => Some(now.saturating_sub(i64::from(days) * 86_400)),
+        }
+    }
+
     /// Overwrite both knobs from a freshly loaded config (called on reload).
     fn store_from_config(&self, config: &Config) {
         self.flush_interval_ms
@@ -511,6 +528,44 @@ pub fn spawn_config_reloader(
     Ok(handle)
 }
 
+/// Re-read the virtual-key and budget-group tables and upsert them into the
+/// in-memory state, so entries created offline (e.g. `lumen keys create`
+/// straight against the DB) become live. Groups refresh FIRST so the key pass
+/// can resolve its group pointers (ADR 009). New entries are inserted;
+/// existing ones only have their limits re-applied and keep their in-memory
+/// spend. A DB error keeps the current tables (a sick DB never locks anyone
+/// out).
+///
+/// The whole read-then-upsert runs under [`AuthState::sync_guard`], the guard
+/// every admin key/group mutation holds across its own DB write and in-memory
+/// apply. A mutation therefore lands entirely before the read (the snapshot
+/// already contains it) or entirely after the upsert (it overwrites the
+/// snapshot): a stale snapshot can never undo a completed delete, disable or
+/// budget change. Runs in the reload task, never on the request path.
+///
+/// [`AuthState::sync_guard`]: lumen_auth::state::AuthState::sync_guard
+pub async fn refresh_auth_tables(runtime: &crate::auth::AuthRuntime) {
+    let _sync = runtime.keys.sync_guard().await;
+    match runtime.store.load_groups().await {
+        Ok(groups) => runtime.keys.upsert_groups(&groups),
+        Err(error) => tracing::warn!(
+            %error,
+            "budget-group refresh failed; keeping the current in-memory group table"
+        ),
+    }
+    match runtime.store.load_auth_entries().await {
+        Ok(entries) => {
+            for (hash, record) in entries {
+                runtime.keys.upsert(hash, &record);
+            }
+        }
+        Err(error) => tracing::warn!(
+            %error,
+            "virtual-key refresh failed; keeping the current in-memory key table"
+        ),
+    }
+}
+
 /// Run one reload: load and validate the current document via
 /// `ctx.load_config()`, refresh the DB provider-key snapshot for its providers
 /// (async, in this task, off the request path), then apply it on a blocking
@@ -522,32 +577,8 @@ pub fn spawn_config_reloader(
 /// extended to the whole document). Public so the boot path and the tests
 /// share exactly one reload entry point.
 pub async fn reload_once(ctx: &Arc<ConfigContext>, targets: &Arc<ReloadTargets>) {
-    // Virtual keys and budget groups created offline (e.g. `lumen keys
-    // create` straight against the DB) become live here: re-read the tables
-    // and upsert into the in-memory state. Groups refresh FIRST so the key
-    // pass can resolve its group pointers (ADR 009). New entries are
-    // inserted; existing ones only have their limits re-applied and keep
-    // their in-memory spend. A DB error keeps the current tables (a sick DB
-    // never locks anyone out).
     if let Some(runtime) = &targets.auth_runtime {
-        match runtime.store.load_groups().await {
-            Ok(groups) => runtime.keys.upsert_groups(&groups),
-            Err(error) => tracing::warn!(
-                %error,
-                "budget-group refresh failed; keeping the current in-memory group table"
-            ),
-        }
-        match runtime.store.load_auth_entries().await {
-            Ok(entries) => {
-                for (hash, record) in entries {
-                    runtime.keys.upsert(hash, &record);
-                }
-            }
-            Err(error) => tracing::warn!(
-                %error,
-                "virtual-key refresh failed; keeping the current in-memory key table"
-            ),
-        }
+        refresh_auth_tables(runtime).await;
     }
     // The webhook config and its sealed signing secret live in the same DB;
     // refresh the cache the synchronous resolve below reads (ADR 011
@@ -566,7 +597,10 @@ pub async fn reload_once(ctx: &Arc<ConfigContext>, targets: &Arc<ReloadTargets>)
         Ok(config) => config,
         Err(error) => {
             targets.metrics.inc_failure();
-            tracing::warn!(%error, "config reload rejected; keeping the running config");
+            tracing::warn!(
+                error = %error.log_summary(),
+                "config reload rejected; keeping the running config"
+            );
             return;
         }
     };
@@ -867,6 +901,23 @@ mod tests {
             t.resilience.breakers.get("openai", "openai/gpt").state(),
             CircuitState::Open,
             "reload must not reset circuit-breaker state"
+        );
+    }
+
+    #[test]
+    fn a_zero_retention_window_never_yields_a_purge_cutoff() {
+        // 0 reaches the live knob through a reload that disables auth (the
+        // non-zero check only runs while auth is enabled). `now - 0` as a
+        // cutoff would delete every usage row.
+        assert_eq!(AuthKnobs::new(10_000, 0).retention_cutoff(1_000_000), None);
+        assert_eq!(
+            AuthKnobs::new(10_000, 2).retention_cutoff(1_000_000),
+            Some(1_000_000 - 2 * 86_400)
+        );
+        // No overflow on a degenerate clock.
+        assert_eq!(
+            AuthKnobs::new(10_000, u32::MAX).retention_cutoff(i64::MIN),
+            Some(i64::MIN)
         );
     }
 

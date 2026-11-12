@@ -203,6 +203,18 @@ capabilities = ["chat"]
   equivalent - see
   [chat extras](#openai-chat-extras-on-translated-providers) and the
   `strict` flag.
+- **Sampling**: current Claude models accept `temperature` or `top_p`, not
+  both, and answer 400 to a request carrying the pair. When both are set the
+  gateway sends `temperature` and drops `top_p` (logged at `debug`), with or
+  without `strict`.
+- **`n`**: the Messages API returns one completion. `n > 1` is dropped (one
+  completion comes back, logged at `debug`), or rejected with 400 `LM-1001`
+  when `strict = true`.
+- **Usage**: `prompt_tokens` is the whole input: Anthropic's `input_tokens`
+  plus `cache_read_input_tokens` and `cache_creation_input_tokens`. The two
+  cache counts are also broken out in `prompt_tokens_details`
+  (`cached_tokens`, `cache_creation_tokens`). All of it is priced at the
+  model's input rate.
 - **base_url**: optional override.
 
 ```toml
@@ -228,6 +240,23 @@ capabilities = ["chat"]
   / `presence_penalty` to `generationConfig.frequencyPenalty` /
   `presencePenalty`; `logprobs` and `parallel_tool_calls` have no mapping - see
   [chat extras](#openai-chat-extras-on-translated-providers).
+- **Tool calls**: tool `parameters` schemas go through the same clean-up as
+  `responseSchema` (`additionalProperties` and `$schema` are stripped, so
+  they are dropped, not enforced). Gemini returns no tool-call id, so the
+  gateway makes one up per call, unique across responses. A `thoughtSignature`
+  on a `functionCall` part is returned as
+  `tool_calls[].extra_content.google.thought_signature` (the place Google's
+  own OpenAI-compatible endpoint uses), streaming and not. Send the assistant
+  message back unchanged on the next turn and the gateway replays the
+  signature with the call: Gemini 3 models answer 400 to a `functionCall`
+  sent back without it.
+- **Thinking tokens**: `usageMetadata.thoughtsTokenCount` is counted in
+  `completion_tokens` and reported in
+  `completion_tokens_details.reasoning_tokens`. It is absent, not `0`, when
+  the model did not think.
+- **Blocked prompts**: a 200 with `promptFeedback.blockReason` and no
+  candidates is returned as a content-filter refusal, 400 `LM-2013`,
+  streaming and not.
 - **Embeddings**: served through `models/{model}:batchEmbedContents`
   (`gemini-embedding-001`, `text-embedding-004`, ...). One inner request per
   input; the OpenAI `dimensions` field maps to `outputDimensionality`. The API
@@ -422,6 +451,10 @@ capabilities = ["embed"]
   Provider-native references (`anthropic-file:`, `gs://`, Gemini Files API
   URIs) are rejected pre-flight with `LM-2008`.
 - **Embed batch limit**: 96.
+- **`dimensions`**: sent as Cohere's `output_dimension`, for text and
+  multimodal input. Only `embed-v4` and newer accept it; it is forwarded for
+  every model, so an unsupported model or size fails upstream instead of
+  returning full-width vectors.
 - **Cost**: rerank is billed in search units (`cost_per_1k_searches`).
 - **`input_type` override**: Cohere's embed v2 API requires an `input_type`
   and the gateway cannot know query-vs-document intent, so it defaults to
@@ -463,6 +496,15 @@ capabilities = ["embed", "rerank"]
 - **kind**: `jina` · **capabilities**: embed, rerank (hosted).
 - **Auth**: `api_key_env` (e.g. `JINA_API_KEY`), bearer token.
 - **Embed batch limit**: 2048.
+- **`dimensions`**: forwarded as Jina's `dimensions`, for text and
+  multimodal (content-parts) input. It is sent whenever the client sets it;
+  a model without it (`jina-embeddings-v2-*`, `jina-clip-v1`) gets Jina's own
+  answer rather than silently full-width vectors.
+- **Request fields**: the gateway sends only `model`, `input` and
+  `dimensions`. `user` is not forwarded (Jina has no such field), and neither
+  is `encoding_format` (Jina's field is `embedding_type`): Jina is always
+  asked for float vectors and the gateway encodes base64 itself when the
+  client asks for it.
 
 ```toml
 [[providers]]
@@ -762,11 +804,14 @@ capabilities = ["rerank"]
 ## tei (self-hosted)
 
 - **kind**: `tei` · **capabilities**: embed, rerank.
-- **Auth**: keyless.
+- **Auth**: optional. Keyless by default; when `api_key_env` is set, the key
+  is sent as a bearer token (for a TEI server started with `--api-key`, or
+  one behind an authenticating proxy).
 - **base_url**: **required** - points at your Text Embeddings Inference server.
   TEI serves one model per process, so `upstream_id` is ignored by the upstream
   but kept for your own clarity.
 - **Embed batch limit**: 32.
+- **`dimensions`**: forwarded as `dimensions` on `POST /embed`.
 
 ```toml
 [[providers]]
@@ -796,11 +841,9 @@ capabilities = ["rerank"]
   passthrough), cancellation, and token accounting (upstream `usage` when
   Ollama reports it, otherwise a local count marked `estimated`, ADR 003) all
   work exactly as for the `openai` kind.
-- **`api_key` asymmetry**: if you set an `api_key_env` on this kind (e.g. an
-  Ollama server behind an authenticated reverse proxy), the chat path sends it
-  as a bearer token but the native embed path currently sends no
-  Authorization header at all - keep the embed route unauthenticated at the
-  proxy, or front only `/v1` with auth.
+- **`api_key_env`** (optional): for an Ollama server behind an authenticated
+  reverse proxy. The key is sent as a bearer token on chat (`/v1`) and on
+  embeddings (`/api/embed`) alike.
 - **Embed batch limit**: 512.
 - **Tip**: a local model may take a while to load into VRAM on its first call -
   relax `first_token_timeout_ms` / `total_timeout_ms` on the provider block (see
@@ -1123,6 +1166,21 @@ An unrecognised `response_format` **shape** (an unknown `type` value) is
 dropped with a debug log on the mapping providers, matching how unknown
 `tool_choice` shapes are handled: dropped, not guessed.
 
+Three more translations sit outside the table:
+
+- **`n` on `anthropic`**: `n > 1` is unsupported and follows the `strict`
+  rule above (dropped by default, 400 `LM-1001` with `strict = true`). `n`
+  unset or `1` is always fine.
+- **`top_p` on `anthropic`**: dropped whenever `temperature` is also set,
+  whatever `strict` says. Claude accepts only one of the two, and
+  `temperature` wins.
+- **Gemini thought signatures** (`google` / `vertex_ai`): a tool call's
+  `thoughtSignature` is carried as
+  `tool_calls[].extra_content.google.thought_signature` and replayed when
+  the client sends the assistant message back. Thinking tokens are counted
+  in `completion_tokens` and reported in
+  `completion_tokens_details.reasoning_tokens`.
+
 ## Vision (image input)
 
 `POST /v1/chat/completions` accepts OpenAI's content-parts message shape, so a
@@ -1158,6 +1216,13 @@ modalities = ["text", "image"]   # opts this model into vision
 model. Sending an image part to a model whose `modalities` lack `"image"` is
 rejected with `LM-2003` (400, see `docs/errors.md`) before any upstream call.
 
+That check is on the model the request resolves to first. Fallback targets
+of a virtual model that do not declare `image` are skipped for a request
+carrying an image: a fail-over never sends image content to a text-only
+model, and the request goes on to the next target that can take it. Declare
+`modalities = ["text", "image"]` on every fallback meant to serve vision
+traffic.
+
 **Which kinds support it:**
 
 | Provider family | `data:` (inline base64) | `http(s)` URL |
@@ -1178,12 +1243,15 @@ itself (OpenAI, Anthropic); Gemini's `inline_data` field takes only inline
 bytes, so a remote URL routed to Gemini is rejected with `LM-2004` (400)
 instead of the gateway silently fetching it on the caller's behalf.
 
-The `LM-2004` pre-flight check inspects the **primary** provider of the model's
-fallback chain. In the uncommon case where the primary accepts remote URLs
-(e.g. OpenAI) but a Gemini model is configured as a *fallback*, a request with a
-remote image URL passes pre-flight and, only if the primary then fails over to
-Gemini, surfaces as an upstream `LM-3002` (502) - the gateway still never
-fetches the URL. Configure inline `data:` URIs when a Gemini fallback is in play.
+The `LM-2004` pre-flight check judges the **primary**: the provider of the
+model the request resolves to first. Fallback targets follow the same rule as
+for the `image` modality above: a target whose provider cannot fetch a remote
+URL (`google`, `vertex_ai`, `bedrock`) is skipped for a request carrying one.
+With an OpenAI primary and a Gemini fallback, a request with a remote image
+URL is served by OpenAI or, if OpenAI fails, goes on to the next target that
+takes URLs; when none is left it ends with the primary's own error, never
+with an `LM-2004` raised by a fail-over. Send inline `data:` URIs when a
+Gemini, Vertex or Bedrock fallback is meant to cover vision traffic.
 
 **Provider-native image sources (issue #12).** Two provider-native reference
 forms are recognised in the `image_url.url` field, for callers whose images
@@ -1200,7 +1268,11 @@ not the reference's own provider is rejected pre-flight with `LM-2008` (400) -
 an honest client error instead of a confusing upstream failure. A Gemini
 Files API URI is also an `https://` URL, but it is exempt from the `LM-2004`
 remote-URL check: it is not a URL the provider would have to fetch, and its
-routing verdict belongs to the `LM-2008` check.
+routing verdict belongs to the `LM-2008` check. Fallback targets on another
+provider are skipped for a request carrying such a reference (an
+`anthropic-file:` id only fails over to `anthropic` targets, a Gemini file URI
+only to `google` ones), so the reference is never forwarded to a provider
+that would read it as a plain image URL.
 
 > **`gs://` caveat.** The gateway forwards a `gs://` URI to Gemini verbatim,
 > but the Gemini **Developer API** (`generativelanguage.googleapis.com`, the

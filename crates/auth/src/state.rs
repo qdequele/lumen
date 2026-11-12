@@ -168,16 +168,18 @@ impl GroupEntry {
     /// source of truth for spend after boot, exactly like keys.
     fn apply_limits(&self, record: &GroupRecord) {
         self.name.store(Arc::new(record.name.clone()));
-        self.budget_max_micro.store(
-            record.budget_max.map_or(UNLIMITED, usd_to_micro),
-            Ordering::SeqCst,
-        );
+        let cap = record.budget_max.map_or(UNLIMITED, usd_to_micro);
+        let previous_cap = self.budget_max_micro.swap(cap, Ordering::SeqCst);
         self.account_ref
             .store(record.account_ref.clone().map(Arc::new));
         self.bandwidth_micro_per_gb
             .store(record.bandwidth_micro_usd_per_gb.max(0), Ordering::SeqCst);
-        // A changed cap starts a new budget epoch (ADR 011 §1).
-        self.rearm_signals();
+        // A changed cap starts a new budget epoch (ADR 011 §1). An unchanged
+        // one does not: a hot reload re-applies every record, and re-arming
+        // there would let in-flight reservations move the signal state.
+        if previous_cap != cap {
+            self.rearm_signals();
+        }
     }
 
     /// Atomically raise the pool's cap by `amount_micro` (admin grant). A
@@ -209,11 +211,19 @@ impl GroupEntry {
         f(signals, &self.signal_state, &subject);
     }
 
-    /// Re-arm the pool's budget signals against the current cap (a cap change,
-    /// or a newly installed policy).
+    /// Re-arm the pool's budget signals against a changed cap. Only lowers
+    /// the fired-threshold count; see [`SignalState::rearm`].
     fn rearm_signals(&self) {
         self.with_signals(|signals, state, subject| {
             state.rearm(signals.thresholds(), subject);
+        });
+    }
+
+    /// Arm the pool's budget signals against current spend for a newly
+    /// installed policy; see [`SignalState::arm_to_current`].
+    fn arm_signals(&self) {
+        self.with_signals(|signals, state, subject| {
+            state.arm_to_current(signals.thresholds(), subject);
         });
     }
 
@@ -413,10 +423,8 @@ impl KeyEntry {
     /// of truth for spend after boot.
     fn apply_limits(&self, record: &VirtualKeyRecord) {
         self.name.store(Arc::new(record.name.clone()));
-        self.budget_max_micro.store(
-            record.budget_max.map_or(UNLIMITED, usd_to_micro),
-            Ordering::SeqCst,
-        );
+        let cap = record.budget_max.map_or(UNLIMITED, usd_to_micro);
+        let previous_cap = self.budget_max_micro.swap(cap, Ordering::SeqCst);
         self.rpm_limit
             .store(record.rpm_limit.unwrap_or(UNLIMITED), Ordering::SeqCst);
         self.tpm_limit
@@ -427,8 +435,12 @@ impl KeyEntry {
         // The billing watermark is NOT overwritten, like spend.
         self.external_ref
             .store(record.external_ref.clone().map(Arc::new));
-        // A changed cap starts a new budget epoch (ADR 011 §1).
-        self.rearm_signals();
+        // A changed cap starts a new budget epoch (ADR 011 §1). An unchanged
+        // one does not: a hot reload re-applies every record, and re-arming
+        // there would let in-flight reservations move the signal state.
+        if previous_cap != cap {
+            self.rearm_signals();
+        }
     }
 
     /// The key's opaque id (the `virtual_keys.id` column).
@@ -483,11 +495,19 @@ impl KeyEntry {
         f(signals, &self.signal_state, &subject);
     }
 
-    /// Re-arm the key's budget signals against the current cap (a cap change,
-    /// or a newly installed policy).
+    /// Re-arm the key's budget signals against a changed cap. Only lowers
+    /// the fired-threshold count; see [`SignalState::rearm`].
     fn rearm_signals(&self) {
         self.with_signals(|signals, state, subject| {
             state.rearm(signals.thresholds(), subject);
+        });
+    }
+
+    /// Arm the key's budget signals against current spend for a newly
+    /// installed policy; see [`SignalState::arm_to_current`].
+    fn arm_signals(&self) {
+        self.with_signals(|signals, state, subject| {
+            state.arm_to_current(signals.thresholds(), subject);
         });
     }
 
@@ -833,6 +853,9 @@ pub struct AuthState {
     retired: std::sync::Mutex<Vec<Arc<KeyEntry>>>,
     /// Serializes flushers; see [`flush_guard`](Self::flush_guard).
     flush_lock: tokio::sync::Mutex<()>,
+    /// Orders admin key/group mutations against the hot reload's table
+    /// refresh; see [`sync_guard`](Self::sync_guard).
+    sync_lock: tokio::sync::Mutex<()>,
 }
 
 impl AuthState {
@@ -853,24 +876,40 @@ impl AuthState {
         state
     }
 
-    /// Install (or clear, with `None`) the live webhook signalling policy and
-    /// re-arm every live entry against it.
+    /// Install (or clear, with `None`) the live webhook signalling policy
+    /// and, when its arming differs from the previous policy's, arm every
+    /// live entry against current spend.
     ///
-    /// Re-arming matters twice. At boot it stops a key already past a
+    /// Arming matters twice. At boot it stops a key already past a
     /// threshold from re-firing that threshold on its first settle - the
     /// budget it was flushed with is the epoch it is already in. On a hot
     /// reload that changes `thresholds`, it arms the new list against current
     /// spend instead of replaying every threshold below it.
     ///
+    /// A policy that arms like the one it replaces (same thresholds, same
+    /// budget events: what every config reload re-installs) leaves the
+    /// entries alone. Arming marks thresholds fired without emitting, and
+    /// spend includes in-flight reservations, so doing it on every reload
+    /// would swallow the event of a crossing whose settle is still to come.
+    ///
     /// The queue behind the policy is created once and reused, so the sender
     /// task keeps the receiver it was spawned with.
     pub fn set_signals(&self, signals: Option<Arc<BudgetSignals>>) {
+        let unchanged = match (self.signals.load().as_ref(), &signals) {
+            (Some(old), Some(new)) => old.arms_like(new),
+            // Nothing to arm against when the policy is cleared.
+            (_, None) => true,
+            (None, Some(_)) => false,
+        };
         self.signals.store(signals);
+        if unchanged {
+            return;
+        }
         for group in &self.groups {
-            group.rearm_signals();
+            group.arm_signals();
         }
         for entry in &self.by_id {
-            entry.rearm_signals();
+            entry.arm_signals();
         }
     }
 
@@ -972,6 +1011,11 @@ impl AuthState {
             dashmap::Entry::Vacant(slot) => {
                 let entry = Arc::new(KeyEntry::from_record(record, Arc::clone(&self.signals)));
                 entry.set_group(group);
+                // A key that arrives under a live policy (a hot reload, the
+                // rotate fallback) carries its spend with it: the thresholds
+                // already behind it are armed as fired, without an event.
+                // Nothing is in flight on an entry no request can reach yet.
+                entry.arm_signals();
                 self.by_hash.insert(hash, Arc::clone(&entry));
                 slot.insert(entry);
             }
@@ -1038,6 +1082,9 @@ impl AuthState {
             }
             dashmap::Entry::Vacant(slot) => {
                 let entry = Arc::new(GroupEntry::from_record(record, Arc::clone(&self.signals)));
+                // Armed against the spend it arrives with, like a new key in
+                // `upsert`: no member can reach the pool before the insert.
+                entry.arm_signals();
                 slot.insert(Arc::clone(&entry));
                 entry
             }
@@ -1173,6 +1220,24 @@ impl AuthState {
         }
     }
 
+    /// Order the writers of the key and group tables against each other.
+    ///
+    /// Two kinds of caller change both the database and this in-memory state:
+    /// an admin mutation (database write, then in-memory apply) and the hot
+    /// reload's refresh (database read, then in-memory upsert). Each must hold
+    /// this guard across its whole pair. Without it a refresh can read a
+    /// snapshot, lose the race to an admin delete or patch, and then upsert
+    /// the stale snapshot over the completed mutation: a deleted key
+    /// authenticates again until the next restart, a disabled key is
+    /// re-enabled, a lowered budget is raised back.
+    ///
+    /// Never taken on the request path: authentication and admission stay
+    /// lock-free. Do not await a flush while holding it (a flush takes
+    /// [`flush_guard`](Self::flush_guard) and writes to the database).
+    pub async fn sync_guard(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.sync_lock.lock().await
+    }
+
     /// Serialize flushers. Every flush (periodic, shutdown, admin) must hold
     /// this guard from [`drain_flush`](Self::drain_flush) through the persist
     /// to [`commit_flush`](Self::commit_flush) or
@@ -1305,6 +1370,19 @@ impl AuthState {
             }
         }
         out
+    }
+
+    /// Mark groups dirty again after a failed persist of what
+    /// [`drain_dirty_groups`](Self::drain_dirty_groups) returned: the drain
+    /// cleared their flags, so without this an idle group would never be
+    /// flushed again and its pool spend would be lost at the next boot. An id
+    /// no longer live (deleted meanwhile; the delete flushed it) is skipped.
+    pub fn mark_groups_dirty<'a>(&self, ids: impl IntoIterator<Item = &'a str>) {
+        for id in ids {
+            if let Some(entry) = self.groups.get(id) {
+                entry.dirty.store(true, Ordering::SeqCst);
+            }
+        }
     }
 }
 

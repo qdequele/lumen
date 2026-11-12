@@ -144,6 +144,91 @@ async fn fallback_virtual_model_serves_from_second_target_and_reports_route() {
     );
 }
 
+/// A fallback target that does not declare the `image` modality is not an
+/// attempt for a request carrying an image: the fail-over skips it and goes
+/// on to the next target that can take the image.
+#[tokio::test]
+async fn image_request_skips_text_only_fallback_targets() {
+    let (a, b, c) = (
+        upstream(503, "model-a").await,
+        upstream(200, "model-b").await,
+        upstream(200, "model-c").await,
+    );
+    let cfg = load(&format!(
+        r#"
+        [resilience]
+        retry_max_attempts = 1
+        retry_base_ms = 10
+        retry_max_ms = 20
+
+        [[providers]]
+        name = "a"
+        kind = "openai"
+        base_url = "{}"
+        [[providers.models]]
+        id = "a/model-a"
+        capabilities = ["chat"]
+        modalities = ["text", "image"]
+
+        [[providers]]
+        name = "b"
+        kind = "openai"
+        base_url = "{}"
+        [[providers.models]]
+        id = "b/model-b"
+        capabilities = ["chat"]
+
+        [[providers]]
+        name = "c"
+        kind = "openai"
+        base_url = "{}"
+        [[providers.models]]
+        id = "c/model-c"
+        capabilities = ["chat"]
+        modalities = ["text", "image"]
+
+        [[virtual_models]]
+        id = "acme/vision"
+        capability = "chat"
+        strategy = "fallback"
+        targets = [{{ model = "a/model-a" }}, {{ model = "b/model-b" }}, {{ model = "c/model-c" }}]
+        "#,
+        a.uri(),
+        b.uri(),
+        c.uri()
+    ));
+    let base = spawn(&cfg, &cfg).await;
+    let image = json!({
+        "model": "acme/vision",
+        "messages": [{ "role": "user", "content": [
+            { "type": "text", "text": "what is this?" },
+            { "type": "image_url", "image_url": { "url": "data:image/png;base64,AAAA" } }
+        ]}]
+    });
+
+    let resp = post(&base, image, &[]).await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(header(&resp, "x-lumen-model-used"), Some("c/model-c"));
+    assert_eq!(
+        header(&resp, "x-lumen-route"),
+        Some("acme/vision>c/model-c")
+    );
+    assert!(
+        b.received_requests().await.expect("requests").is_empty(),
+        "the text-only target must never receive the image"
+    );
+
+    // Without an image, the text-only target is a normal fallback.
+    let resp = post(
+        &base,
+        json!({ "model": "acme/vision", "messages": [{ "role": "user", "content": "hi" }] }),
+        &[],
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(header(&resp, "x-lumen-model-used"), Some("b/model-b"));
+}
+
 #[tokio::test]
 async fn a_direct_foundation_call_has_no_route_header() {
     let (a, b) = (
@@ -280,6 +365,64 @@ async fn preset_and_overrides_reach_the_upstream_body() {
         json!("model-b"),
         "the upstream id, never the virtual id"
     );
+}
+
+/// Each upstream call is built from the client's request, never from the
+/// request a previous attempt sent: one target's overrides and upstream id do
+/// not leak into the retry of the same target or into the next target.
+#[tokio::test]
+async fn each_attempt_sends_its_own_overrides_and_upstream_id() {
+    let (a, b) = (
+        upstream(503, "model-a").await,
+        upstream(200, "model-b").await,
+    );
+    let cfg = load(
+        &two_providers(
+            &a.uri(),
+            &b.uri(),
+            r#"
+        [[virtual_models]]
+        id = "acme/bot"
+        capability = "chat"
+        strategy = "fallback"
+        targets = [
+            { model = "a/model-a", overrides = { set = { max_tokens = 11 }, drop = ["seed"] } },
+            { model = "b/model-b" },
+        ]
+    "#,
+        )
+        .replace("retry_max_attempts = 1", "retry_max_attempts = 2"),
+    );
+    let base = spawn(&cfg, &cfg).await;
+    let resp = post(
+        &base,
+        json!({ "model": "acme/bot", "seed": 1,
+        "messages": [{ "role": "user", "content": "hi" }] }),
+        &[],
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(header(&resp, "x-lumen-model-used"), Some("b/model-b"));
+
+    let to_a = a.received_requests().await.unwrap();
+    assert!(
+        to_a.len() >= 2,
+        "the first target is retried: {}",
+        to_a.len()
+    );
+    for request in &to_a {
+        let sent: Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(sent["model"], json!("model-a"));
+        assert_eq!(sent["max_tokens"], json!(11));
+        assert!(sent.get("seed").is_none());
+    }
+    let to_b = b.received_requests().await.unwrap();
+    assert_eq!(to_b.len(), 1);
+    let sent: Value = serde_json::from_slice(&to_b[0].body).unwrap();
+    assert_eq!(sent["model"], json!("model-b"));
+    assert_eq!(sent["seed"], json!(1));
+    assert!(sent.get("max_tokens").is_none());
+    assert_eq!(sent["messages"][0]["content"], json!("hi"));
 }
 
 #[tokio::test]

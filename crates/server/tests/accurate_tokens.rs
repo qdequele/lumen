@@ -143,6 +143,81 @@ async fn chat_envelope_stays_heuristic_while_metrics_get_the_accurate_count() {
     wait_for_tokens(&base, "chat", "output", 2.0).await;
 }
 
+/// The accurate recount covers the text only: the per-image estimate of a
+/// vision request must survive it, not be refined away (as embeddings do).
+#[tokio::test]
+async fn chat_refinement_keeps_the_per_image_estimate() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "chatcmpl-1",
+            "object": "chat.completion",
+            "created": 1,
+            "model": "gpt-4-0613",
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": "hello world" },
+                "finish_reason": "stop"
+            }]
+        })))
+        .mount(&upstream)
+        .await;
+
+    let specs = vec![ProviderSpec {
+        name: "openai".to_owned(),
+        kind: ProviderKind::Openai,
+        api_key: Some("sk-test".to_owned()),
+        base_url: Some(upstream.uri()),
+        api_version: None,
+        strict: false,
+        connect_timeout_ms: None,
+        models: vec![ModelSpec {
+            id: "gpt-4".to_owned(),
+            upstream_id: "gpt-4-0613".to_owned(),
+            capabilities: vec![Capability::Chat],
+            modalities: vec!["text".to_owned(), "image".to_owned()],
+            release_date: None,
+        }],
+        decisions_path: None,
+        forward_unknown_fields: None,
+    }];
+    let registry = Arc::new(
+        Registry::build(
+            specs,
+            http::build_client(),
+            std::time::Duration::from_secs(300),
+        )
+        .expect("registry builds"),
+    );
+    let base = spawn_accurate(registry).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&json!({
+            "model": "gpt-4",
+            "messages": [{ "role": "user", "content": [
+                { "type": "text", "text": "hello world" },
+                { "type": "image_url", "image_url": { "url": "data:image/png;base64,AAAA" } },
+                { "type": "image_url",
+                  "image_url": { "url": "data:image/png;base64,AAAA", "detail": "low" } }
+            ]}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+
+    // Heuristic envelope: text ceil(11/4)=3 + 4 overhead + images 765 + 85.
+    assert_eq!(body["usage"]["estimated"], true);
+    assert_eq!(body["usage"]["prompt_tokens"], 857);
+
+    // Refined: exact text 2 + 4 overhead, plus the same 850 image tokens.
+    wait_for_tokens(&base, "chat", "input", 856.0).await;
+    wait_for_tokens(&base, "chat", "output", 2.0).await;
+}
+
 #[tokio::test]
 async fn embed_envelope_stays_heuristic_while_metrics_get_the_accurate_count() {
     let upstream = MockServer::start().await;
@@ -271,4 +346,98 @@ async fn rerank_metrics_get_the_accurate_count_via_the_deferred_close() {
     // Metrics: accurate query(2) x 1 document + document(2) = 4 tokens.
     // (Heuristic would be 3 + 3 = 6.)
     wait_for_tokens(&base, "rerank", "input", 4.0).await;
+}
+
+/// The deferred rerank close prices the tokens it settles: the refined count,
+/// not the heuristic one it replaced (as chat and embeddings do).
+#[tokio::test]
+async fn rerank_refinement_recomputes_the_cost_from_the_refined_count() {
+    use figment::providers::Format as _;
+    use lumen_auth::store::KeyStore;
+    use lumen_auth::usage::{spawn_usage_writer, UsageWriterConfig};
+    use lumen_server::config::Config;
+    use lumen_server::pricing::CostTable;
+
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v2/rerank"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "results": [{ "index": 0, "relevance_score": 0.5 }]
+        })))
+        .mount(&upstream)
+        .await;
+
+    // $1 per input token, no search-unit price: the cost is the token count.
+    let toml = format!(
+        r#"
+        [[providers]]
+        name = "cohere"
+        kind = "cohere"
+        base_url = "{}"
+        [[providers.models]]
+        id = "gpt-4o-rerank"
+        upstream_id = "rerank-v3.5"
+        capabilities = ["rerank"]
+        cost_per_1m_input = 1000000.0
+        "#,
+        upstream.uri()
+    );
+    let config: Config = figment::Figment::new()
+        .merge(figment::providers::Toml::string(&toml))
+        .extract()
+        .expect("valid config");
+    let registry = Arc::new(
+        Registry::build(
+            config.provider_specs(),
+            http::build_client(),
+            Duration::from_secs(300),
+        )
+        .expect("registry builds"),
+    );
+    let store = KeyStore::in_memory().await.expect("open store");
+    let (logger, _writer) = spawn_usage_writer(
+        store.clone(),
+        UsageWriterConfig {
+            capacity: 64,
+            batch_max: 500,
+            flush_interval: Duration::from_millis(25),
+        },
+    );
+    let counter = Arc::new(TokenCounter::from_config(&TokenizerConfig {
+        mode: TokenizerMode::Accurate,
+    }));
+    let state = common::base_state(registry)
+        .with_token_counter(counter)
+        .with_pricing(CostTable::from_config(&config))
+        .with_usage(logger);
+    let base = common::spawn_state(state, LIMIT).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/rerank"))
+        .json(&json!({
+            "model": "gpt-4o-rerank",
+            "query": "hello world",
+            "documents": ["hello world"]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let mut rows = Vec::new();
+    for _ in 0..250 {
+        rows = store
+            .usage_export(0, i64::MAX, None, 10, None)
+            .await
+            .expect("usage rows");
+        if !rows.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(rows.len(), 1, "one usage row");
+    // Accurate: query(2) x 1 document + document(2) = 4 tokens, so $4.
+    // (The heuristic count is 6, which would cost $6.)
+    assert_eq!(rows[0].tokens_in, 4);
+    assert!((rows[0].cost - 4.0).abs() < 1e-9, "cost: {}", rows[0].cost);
 }

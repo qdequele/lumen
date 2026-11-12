@@ -45,6 +45,29 @@ pub enum EditError {
     AuthNotTable,
 }
 
+impl EditError {
+    /// This error for a LOG line (and for the opaque internal error, which
+    /// is logged too): `toml_edit`'s own `Display` quotes the offending
+    /// source line, and a config document holds operator prompt text, so a
+    /// parse failure is reduced to its byte offset. The other variants carry
+    /// no document content.
+    #[must_use]
+    pub fn log_summary(&self) -> String {
+        match self {
+            Self::Parse(error) => match error.span() {
+                Some(span) => format!(
+                    "config document is not valid TOML (at byte offset {})",
+                    span.start
+                ),
+                None => "config document is not valid TOML".to_owned(),
+            },
+            // A serializer message can quote the value it refused.
+            Self::Serialize(_) => "failed to serialize value into the config document".to_owned(),
+            other => other.to_string(),
+        }
+    }
+}
+
 /// Insert or replace the `[[providers]]` entry named `provider.name`.
 ///
 /// Matches by the `name` field: if a provider with that name already exists

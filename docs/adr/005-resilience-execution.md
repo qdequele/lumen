@@ -243,3 +243,161 @@ clean terminal error each time).
 The peek lives in `crates/router/src/peek.rs` (generic over the frame type,
 unit-tested for commit / error / empty / cancel / timeout); wiremock acceptance
 tests are in `crates/server/tests/resilience.rs`.
+
+---
+
+## Amendment - 2026-11-12: per-link first-token timeout
+
+The first-token timeout was resolved once per request, from the first attempt's
+model, so a provider's `first_token_timeout_ms` applied only when its model was
+the primary: a slow local fallback configured for 60 s was cut at the default
+30 s, and a fallback behind a slow primary inherited the primary's longer
+deadline. The executor `Link` now carries an optional `first_token`, filled by
+the server from the link's own provider next to `Link::retry` (ADR 021), and
+the executor uses `link.first_token.unwrap_or(config.first_token)` for each
+attempt. The **total** timeout stays per request, resolved from the primary: it
+is one deadline over the whole chain.
+
+---
+
+## Amendment - 2026-11-12: the total timeout is attributed to the link in flight
+
+`LM-3013` named the first link of the chain whatever link was running when the
+total deadline fired, and that link's breaker got no outcome (a half-open probe
+was left to the auto-rearm described under *Half-open cannot wedge*). The
+executor now tracks the link being called outside the timeout envelope. When
+the deadline fires, `LM-3013` names that link's provider: the retry loop never
+sleeps past the deadline (ADR 021), so the deadline can only fire while that
+link's call is pending.
+
+Its breaker records one failure, like a first-token or read timeout, only when
+the link has been in flight (since its first attempt) for at least its own
+first-token timeout: the per-link value, else the configured default. A link
+cut earlier was not given the time the gateway itself allows a provider to
+answer: typically a fallback reached milliseconds before the deadline, after
+the links before it used up the budget. Charging it would open the breaker of
+a healthy provider on the strength of another one's slowness, so it gets a
+neutral outcome instead: no failure is counted, and a half-open probe the
+request held is handed back for the next caller. A half-open probe that did
+outlive its first-token timeout reopens the circuit at once; the auto-rearm
+remains for probes lost to a client disconnect.
+
+Consequence: a link whose first-token timeout is not shorter than the total
+timeout can only be charged for a total timeout after a retry, since a single
+attempt hits the total deadline first. Its hangs still surface as `LM-3013`,
+and its breaker opens on the failures that are its own (first-token timeouts,
+upstream errors).
+
+---
+
+## Amendment - 2026-11-12: only the probe holder releases the probe
+
+A call that ends with no verdict on the provider (a cancellation, a client
+fault, a link refused before the upstream call) hands a half-open probe back so
+the next caller can probe at once. That release was unconditional: a request
+admitted while the breaker was still closed, finishing with a neutral outcome
+after the circuit had opened and gone half-open, cleared the flag of a probe it
+did not hold, and a second probe was admitted while the first was in flight.
+`admit` now returns `Admission::Probe(marker)` for the probe, and
+`on_neutral(marker)` releases only the outstanding probe with that marker.
+`on_success` and `on_failure` are unchanged: any completed call is a verdict on
+the provider. A probe still runs its link's full retry policy; this ADR never
+made it a single attempt.
+
+---
+
+## Amendment - 2026-11-12: breaker eviction
+
+The original decision called the breaker map "bounded by the (provider x
+model) count". Team-scoped breakers (ADR 018) broke that bound: one entry per
+(provider, budget group, model) that ever served a request, kept for the life
+of the process. The registry now evicts breakers that hold no state (closed,
+no failure streak, not held by an in-flight request): on every reload, and
+when a new breaker would take the map past 1024 entries. Such a breaker is
+identical to the one its next request would create, so eviction never loses an
+open or half-open circuit or a failure streak. The request-path lookup now
+borrows the link's provider, group and model instead of allocating a key.
+
+---
+
+## Amendment - 2026-11-12: sub-batch retry for split embedding requests
+
+An embedding request with more inputs than the provider's `max_batch_size` is
+split into sub-batches (`embed_batched`, `crates/providers/src/batch.rs`). The
+first sub-batch error failed the whole request and dropped the sub-responses
+already received; the executor's retry then started again from the first
+input. For the single-input providers (`max_batch_size() = 1`: Bedrock,
+Vertex) a 1,000-input request is 1,000 upstream calls, so a 429 on call 900
+re-sent, and re-billed, the 899 that had succeeded, and sent them into an
+upstream that had just asked for less traffic.
+
+### Decision
+
+`embed_batched` retries a failed sub-batch on its own, inside the request, and
+keeps the completed sub-responses. The retry sits below the executor: it is
+one more reason a provider call takes longer, not a second resilience layer.
+
+- **Classification**: `ProviderError::is_retryable()`, the same single source
+  of truth as the executor's retry (429, 5xx, timeouts, unreachable). A client
+  error (4xx, translation, context length, content filter) and a cancellation
+  are returned at once.
+- **Backoff**: the executor's formula, `base * 2^n` capped at `max` with equal
+  jitter, floored at the upstream `Retry-After`. The `providers` crate does not
+  depend on `router`, so the pure function and the splitmix64 jitter are
+  repeated in `batch.rs` (a few lines, unit-tested against the same bounds).
+- **Bounds** (`SubBatchRetry`, defaults in brackets): at most `max_attempts`
+  [3, lowered to the provider's `retry_max_attempts`, see Consequences]
+  upstream calls per sub-batch, and at most `max_total_backoff` [10 s] of
+  waiting per request, all sub-batches together. A wait that does not fit in
+  what is left of that budget (a long `Retry-After` included) is not started:
+  the error is returned, hint intact, and the executor's retry, fallback and
+  `resilience.retry_after_max_ms` decide what to do with it, as before.
+- **The wait pauses the whole request.** A sub-batch that has to wait extends
+  a pause shared by every sub-batch of the request, and no sub-batch sends
+  anything before the pause ends. The budget is charged for the time added to
+  the pause, so it is wall-clock time: concurrent sub-batches that are rate
+  limited together wait once, not once each. Without the shared pause the
+  other concurrency slots would keep calling a rate-limited upstream while
+  one slot backed off.
+- **Concurrency is not multiplied.** A sub-batch retries inside its own
+  future, so it keeps its slot of the `buffered(concurrency)` stream while it
+  waits and when it calls again. The number of upstream calls in flight never
+  exceeds `concurrency` (4 from the server), whatever fails.
+- **Cancellation**: the pause races the request `CancellationToken`; a client
+  disconnect returns `ProviderError::Cancelled` and nothing more is sent.
+- **Scope**: only a request that was split. A request that fits in one
+  upstream call is not retried here: nothing would be saved.
+
+### Consequences
+
+- One logical request still records **one** breaker outcome per link:
+  sub-batch retries are invisible to the breaker, like the executor's own
+  retries. A sub-batch that fails for good fails the request with its error,
+  and the executor then retries or falls over as before; that retry does
+  start from the first input (completed sub-responses cannot be reused on
+  another model, and are not kept across executor attempts). The worst case
+  for one stubborn sub-batch is therefore `max_attempts` calls per executor
+  attempt.
+- The sub-batch waits run inside the executor's per-attempt first-token
+  timeout, which bounds a non-streaming call as a whole. The 10 s budget is
+  sized against its 30 s default; an operator who lowers
+  `first_token_timeout_ms` below it gets `LM-3011` first.
+- Each sub-batch request is cloned once (the copy a retry needs to send
+  again); the last attempt allowed moves the original. A request that is not
+  split is not cloned.
+- The sub-batch retry follows the retry configuration of the provider
+  called. The embeddings handler builds the `SubBatchRetry` of each upstream
+  call from the effective retry policy of its link (the provider's own
+  `retry_max_attempts` when it sets one, ADR 021, `[resilience]` otherwise)
+  with `SubBatchRetry::capped_at`: `retry_max_attempts = 1` turns the
+  sub-batch retry off, and a sub-batch never gets more attempts than the
+  policy allows nor more than the default 3 (a provider with
+  `retry_max_attempts = 6` still retries a sub-batch at most twice). The
+  delays (200 ms base, 5 s cap) and the 10 s budget are not configurable:
+  `retry_base_ms`, `retry_max_ms` and `retry_after_max_ms` apply to the
+  executor's retry only. The policy is read per request, so a hot reload
+  applies to the next request, like the executor's. `providers` still does
+  not depend on `router`: the server passes the attempt count.
+- Still open: the upstream usage of a failed executor attempt is lost to
+  accounting (the sub-responses of an attempt that fails for good are
+  dropped). Partial results stay rejected for v1.

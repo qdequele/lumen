@@ -68,7 +68,7 @@ struct H {
     client: reqwest::Client,
     resilience: Arc<ResilienceRuntime>,
     store: KeyStore,
-    _upstream: MockServer,
+    upstream: MockServer,
     _dir: TempDir,
 }
 
@@ -145,7 +145,7 @@ async fn spawn() -> H {
         client: reqwest::Client::new(),
         resilience,
         store,
-        _upstream: upstream,
+        upstream,
         _dir: dir,
     }
 }
@@ -416,6 +416,47 @@ async fn two_accounts_are_isolated() {
         "{counter:?}"
     );
     assert!(!metrics.contains("team/fast"), "{counter:?}");
+}
+
+/// A request to an account model that fails before anything served it still
+/// records its latency: under the fixed `account` label, never the team's id.
+#[tokio::test]
+async fn a_failed_account_model_request_never_labels_the_team_id() {
+    let h = spawn().await;
+    let key = h.key_of(A).await;
+    // `chat-b` now fails upstream (ahead of the default 200 mock).
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_partial_json(json!({ "model": "chat-b" })))
+        .respond_with(ResponseTemplate::new(500))
+        .with_priority(1)
+        .mount(&h.upstream)
+        .await;
+    let (status, body) = h.put(Some(A), &single("team/broken", "p/chat-b")).await;
+    assert_eq!(status, 204, "{body}");
+
+    let (status, _, _, body) = h.chat(&key, "team/broken").await;
+    assert_eq!(status, 502, "{body}");
+
+    let metrics = h
+        .client
+        .get(format!("{}/metrics", h.base))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let failed: Vec<&str> = metrics
+        .lines()
+        .filter(|l| l.starts_with("lumen_request_duration_seconds_count{"))
+        .filter(|l| l.contains(r#"status="502""#))
+        .collect();
+    assert!(
+        failed.iter().any(|l| l.contains(r#"model="account""#)),
+        "{failed:?}"
+    );
+    assert!(!metrics.contains("team/broken"), "{failed:?}");
 }
 
 #[tokio::test]

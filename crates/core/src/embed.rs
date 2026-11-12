@@ -10,10 +10,11 @@
 
 use std::borrow::Cow;
 
+use bytes::Bytes;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
 
-use crate::chat::ContentPart;
+use crate::chat::{ContentPart, ObjectOnly};
 
 /// Input to an embedding request: a single string, a text batch, a pre-tokenized
 /// input (token ids), or a multimodal batch of content-parts items.
@@ -242,6 +243,20 @@ pub struct EmbedRequest {
     pub extra: Map<String, Value>,
 }
 
+impl EmbedRequest {
+    /// The encoding the vectors of this request's answer are returned in:
+    /// base64 for `encoding_format: "base64"`, a float array for any other
+    /// value or none.
+    #[must_use]
+    pub fn output_encoding(&self) -> EmbeddingEncoding {
+        if self.encoding_format.as_deref() == Some("base64") {
+            EmbeddingEncoding::Base64
+        } else {
+            EmbeddingEncoding::Float
+        }
+    }
+}
+
 /// Token accounting for embeddings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct EmbedUsage {
@@ -326,26 +341,48 @@ pub fn encode_embedding_base64(embedding: &[f32]) -> String {
 /// as base64-encoded little-endian `f32` bytes. We decode it to a float vector
 /// so a base64 request never breaks parsing (LUMEN always returns float
 /// arrays to the client in v1).
+///
+/// A hand-written visitor rather than a `#[serde(untagged)]` enum: an untagged
+/// enum first buffers the whole value into serde's generic `Content` tree
+/// (one boxed-enum node per float) and only then converts it, which doubles
+/// the work and the allocations for every vector of every embedding response.
+/// The visitor reads the array straight into the `Vec<f32>`.
 fn deserialize_embedding<'de, D>(deserializer: D) -> Result<Vec<f32>, D::Error>
 where
     D: Deserializer<'de>,
 {
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum Repr {
-        Floats(Vec<f32>),
-        Base64(String),
-    }
+    struct EmbeddingVisitor;
 
-    match Repr::deserialize(deserializer)? {
-        Repr::Floats(v) => Ok(v),
-        Repr::Base64(s) => {
+    impl<'de> serde::de::Visitor<'de> for EmbeddingVisitor {
+        type Value = Vec<f32>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("an array of numbers or a base64 string")
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::SeqAccess<'de>,
+        {
+            // The hint is upstream-controlled: cap it so a lying one cannot
+            // force a large allocation up front.
+            let mut out = Vec::with_capacity(seq.size_hint().unwrap_or(0).min(4096));
+            while let Some(value) = seq.next_element::<f32>()? {
+                out.push(value);
+            }
+            Ok(out)
+        }
+
+        fn visit_str<E>(self, s: &str) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
             use base64::Engine;
             let bytes = base64::engine::general_purpose::STANDARD
                 .decode(s.as_bytes())
-                .map_err(serde::de::Error::custom)?;
+                .map_err(E::custom)?;
             if bytes.len() % 4 != 0 {
-                return Err(serde::de::Error::custom(
+                return Err(E::custom(
                     "base64 embedding byte length is not a multiple of 4",
                 ));
             }
@@ -357,6 +394,8 @@ where
                 .collect())
         }
     }
+
+    deserializer.deserialize_any(EmbeddingVisitor)
 }
 
 /// An embedding response in OpenAI format.
@@ -368,6 +407,186 @@ pub struct EmbedResponse {
     pub model: String,
     #[serde(default)]
     pub usage: EmbedUsage,
+}
+
+/// An embeddings answer as a provider hands it to the gateway: the typed
+/// response, or the upstream body itself when it can be forwarded unchanged
+/// (ADR 004, 2026-11-12 amendment).
+#[derive(Debug, Clone, PartialEq)]
+pub enum EmbedCompletion {
+    /// Vectors decoded to `Vec<f32>`, for the gateway to re-encode, reorder
+    /// or annotate.
+    Typed(EmbedResponse),
+    /// An OpenAI-format upstream body to forward byte for byte.
+    Passthrough(EmbedPassthrough),
+}
+
+/// An OpenAI-format embeddings body forwarded verbatim. Only
+/// [`EmbedCompletion::from_openai_body`] builds one, so its usage is always
+/// upstream-reported and non-zero (ADR 003) and its vectors are all in the
+/// encoding the client asked for.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EmbedPassthrough {
+    body: Bytes,
+    usage: EmbedUsage,
+    vectors: usize,
+}
+
+impl EmbedPassthrough {
+    /// The upstream-reported usage (`prompt_tokens` is never zero).
+    #[must_use]
+    pub fn usage(&self) -> &EmbedUsage {
+        &self.usage
+    }
+
+    /// The upstream body, to send to the client unchanged.
+    #[must_use]
+    pub fn into_body(self) -> Bytes {
+        self.body
+    }
+}
+
+/// The only parts of an OpenAI embeddings body the gateway reads when it
+/// forwards the body unchanged: the usage, and how many vectors `data` holds
+/// in which encoding. No vector is decoded or allocated.
+///
+/// Read through [`ObjectOnly`], like its `usage` and each `data` item: a
+/// derived struct also deserializes from a JSON array, which none of them is.
+#[derive(Deserialize)]
+struct EmbedProbe {
+    data: DataProbe,
+    #[serde(default)]
+    usage: Option<ObjectOnly<EmbedUsage>>,
+}
+
+/// The `data` array of an embeddings body, counted without decoding it.
+struct DataProbe {
+    /// How many items the array holds.
+    vectors: usize,
+    /// How many of them are float arrays (the rest are base64 strings).
+    floats: usize,
+}
+
+impl<'de> Deserialize<'de> for DataProbe {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        /// One `data` item: only the JSON type of its vector matters.
+        #[derive(Deserialize)]
+        struct Item {
+            embedding: VectorKind,
+            /// Required, as in [`EmbedData`]; the value is not used.
+            #[serde(rename = "index")]
+            _index: u32,
+        }
+
+        struct Visitor;
+
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = DataProbe;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("an array of embedding objects")
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut probe = DataProbe {
+                    vectors: 0,
+                    floats: 0,
+                };
+                while let Some(ObjectOnly(item)) = seq.next_element::<ObjectOnly<Item>>()? {
+                    probe.vectors += 1;
+                    if item.embedding == VectorKind(EmbeddingEncoding::Float) {
+                        probe.floats += 1;
+                    }
+                }
+                Ok(probe)
+            }
+        }
+
+        deserializer.deserialize_seq(Visitor)
+    }
+}
+
+/// The wire encoding of one vector, read off its JSON type: an array is a
+/// float vector, a string is base64. The contents are skipped, not decoded.
+#[derive(PartialEq, Eq)]
+struct VectorKind(EmbeddingEncoding);
+
+impl<'de> Deserialize<'de> for VectorKind {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = VectorKind;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("an array of numbers or a base64 string")
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+                Ok(VectorKind(EmbeddingEncoding::Float))
+            }
+
+            fn visit_str<E: serde::de::Error>(self, _: &str) -> Result<Self::Value, E> {
+                Ok(VectorKind(EmbeddingEncoding::Base64))
+            }
+        }
+
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
+impl EmbedCompletion {
+    /// Read an OpenAI-format embeddings body for a client that asked for
+    /// vectors in the `wanted` encoding.
+    ///
+    /// When the body reports usage (`prompt_tokens` above zero) and every
+    /// vector is already in the `wanted` encoding, nothing in it has to
+    /// change: it is kept as bytes, and only the usage and the vector count
+    /// are read. Otherwise (no usage to trust, vectors to re-encode, or a body
+    /// the probe cannot read) it is parsed into an [`EmbedResponse`].
+    ///
+    /// # Errors
+    /// The body is not a valid OpenAI embeddings response.
+    pub fn from_openai_body(
+        body: Bytes,
+        wanted: EmbeddingEncoding,
+    ) -> Result<Self, serde_json::Error> {
+        if let Ok(ObjectOnly(EmbedProbe {
+            data,
+            usage: Some(ObjectOnly(usage)),
+        })) = serde_json::from_slice::<ObjectOnly<EmbedProbe>>(&body)
+        {
+            let wanted_floats = match wanted {
+                EmbeddingEncoding::Float => data.vectors,
+                EmbeddingEncoding::Base64 => 0,
+            };
+            if usage.prompt_tokens > 0 && data.floats == wanted_floats {
+                return Ok(Self::Passthrough(EmbedPassthrough {
+                    body,
+                    usage,
+                    vectors: data.vectors,
+                }));
+            }
+        }
+        serde_json::from_slice::<EmbedResponse>(&body).map(Self::Typed)
+    }
+
+    /// How many vectors the answer holds, to check against the number of
+    /// inputs sent (a short upstream response is never accepted, issue #89).
+    #[must_use]
+    pub fn vector_count(&self) -> usize {
+        match self {
+            Self::Typed(response) => response.data.len(),
+            Self::Passthrough(upstream) => upstream.vectors,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -522,6 +741,191 @@ mod tests {
         let json = format!(r#"{{"object":"embedding","index":0,"embedding":"{b64}"}}"#);
         let back: EmbedData = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back.embedding, vec![1.0, 2.0]);
+    }
+
+    fn embed_data_from(embedding_json: &str) -> Result<EmbedData, serde_json::Error> {
+        serde_json::from_str(&format!(
+            r#"{{"object":"embedding","index":0,"embedding":{embedding_json}}}"#
+        ))
+    }
+
+    #[test]
+    fn embedding_deserializes_from_a_number_array() {
+        // Floats, integers, negatives and exponents are all JSON numbers.
+        let data = embed_data_from("[0.5, -1, 2, 1e-3]").expect("float array");
+        assert_eq!(data.embedding, vec![0.5, -1.0, 2.0, 1e-3]);
+        assert_eq!(data.encoding, EmbeddingEncoding::Float);
+        // An empty array is an empty vector.
+        assert_eq!(embed_data_from("[]").expect("empty").embedding.len(), 0);
+        // Through a `Value` (owned, non-streaming deserializer) too.
+        let via_value: EmbedData = serde_json::from_value(
+            serde_json::json!({"object":"embedding","index":3,"embedding":[1.5, 2]}),
+        )
+        .expect("from value");
+        assert_eq!(via_value.embedding, vec![1.5, 2.0]);
+        assert_eq!(via_value.index, 3);
+    }
+
+    #[test]
+    fn embedding_deserializes_from_a_base64_string() {
+        // 1.0f32 and -2.0f32, little-endian.
+        let data = embed_data_from(r#""AACAPwAAAMA=""#).expect("base64");
+        assert_eq!(data.embedding, vec![1.0, -2.0]);
+        // The empty string is an empty vector.
+        assert_eq!(embed_data_from(r#""""#).expect("empty").embedding.len(), 0);
+        // Owned-string path (through a `Value`).
+        let via_value: EmbedData = serde_json::from_value(
+            serde_json::json!({"object":"embedding","index":0,"embedding":"AACAPwAAAMA="}),
+        )
+        .expect("from value");
+        assert_eq!(via_value.embedding, vec![1.0, -2.0]);
+    }
+
+    #[test]
+    fn embedding_rejects_malformed_base64_and_other_shapes() {
+        // Three bytes: valid base64, not a whole number of f32s.
+        let err = embed_data_from(r#""AAAA""#).expect_err("3 bytes");
+        assert!(
+            err.to_string()
+                .contains("base64 embedding byte length is not a multiple of 4"),
+            "{err}"
+        );
+        // Not base64 at all.
+        assert!(embed_data_from(r#""not base64!""#).is_err());
+        // Neither an array of numbers nor a string.
+        for bad in [
+            "null",
+            "1.5",
+            "true",
+            r#"{"a":1}"#,
+            r#"["a"]"#,
+            "[[1.0]]",
+            "[null]",
+        ] {
+            assert!(embed_data_from(bad).is_err(), "{bad} must be rejected");
+        }
+    }
+
+    /// A two-vector body in the given per-item `embedding` JSON, with odd
+    /// spacing and an unknown usage field a typed round trip would not keep.
+    fn body_with(embeddings: [&str; 2], usage: &str) -> Bytes {
+        Bytes::from(format!(
+            "{{ \"object\":\"list\",\n \"data\":[{{\"object\":\"embedding\",\"index\":0,\
+             \"embedding\":{}}}, {{\"embedding\":{},\"index\":1,\"object\":\"embedding\"}}],\
+             \"model\":\"m\"{usage} }}",
+            embeddings[0], embeddings[1]
+        ))
+    }
+
+    const USAGE: &str = r#","usage":{"total_tokens":5,"prompt_tokens":5,"cost":0.1}"#;
+    const FLOATS: &str = "[0.006929283495992422, -1e-3, 2]";
+    const BASE64: &str = r#""AACAPwAAAMA=""#;
+
+    #[test]
+    fn a_body_in_the_wanted_encoding_is_kept_as_the_bytes_received() {
+        for (vector, wanted) in [
+            (FLOATS, EmbeddingEncoding::Float),
+            (BASE64, EmbeddingEncoding::Base64),
+        ] {
+            let body = body_with([vector, vector], USAGE);
+            let completion = EmbedCompletion::from_openai_body(body.clone(), wanted).unwrap();
+            assert_eq!(completion.vector_count(), 2);
+            let EmbedCompletion::Passthrough(upstream) = completion else {
+                panic!("expected a passthrough for {wanted:?}");
+            };
+            assert_eq!(upstream.usage().prompt_tokens, 5);
+            assert_eq!(upstream.into_body(), body);
+        }
+    }
+
+    #[test]
+    fn a_body_that_has_to_change_is_parsed() {
+        let cases = [
+            // Vectors in the other encoding have to be re-encoded.
+            (
+                body_with([FLOATS, FLOATS], USAGE),
+                EmbeddingEncoding::Base64,
+            ),
+            (body_with([BASE64, BASE64], USAGE), EmbeddingEncoding::Float),
+            // One vector in the other encoding is enough.
+            (body_with([FLOATS, BASE64], USAGE), EmbeddingEncoding::Float),
+            (
+                body_with([FLOATS, BASE64], USAGE),
+                EmbeddingEncoding::Base64,
+            ),
+            // No usage to trust: the flagged estimate has to be added.
+            (body_with([FLOATS, FLOATS], ""), EmbeddingEncoding::Float),
+            (
+                body_with(
+                    [FLOATS, FLOATS],
+                    r#","usage":{"prompt_tokens":0,"total_tokens":0}"#,
+                ),
+                EmbeddingEncoding::Float,
+            ),
+        ];
+        for (body, wanted) in cases {
+            let completion = EmbedCompletion::from_openai_body(body.clone(), wanted).unwrap();
+            assert!(
+                matches!(completion, EmbedCompletion::Typed(_)),
+                "{wanted:?}: {body:?}"
+            );
+            assert_eq!(completion.vector_count(), 2);
+        }
+    }
+
+    #[test]
+    fn a_usage_that_is_not_an_object_is_never_forwarded_verbatim() {
+        let body = r#"{"object":"list","model":"m",
+            "data":[{"object":"embedding","index":0,"embedding":[1.0]}],
+            "usage":[5,5]}"#;
+        let completion = EmbedCompletion::from_openai_body(
+            Bytes::from_static(body.as_bytes()),
+            EmbeddingEncoding::Float,
+        );
+        assert!(
+            !matches!(completion, Ok(EmbedCompletion::Passthrough(_))),
+            "{completion:?}"
+        );
+    }
+
+    #[test]
+    fn a_body_that_is_not_an_embeddings_response_is_an_error() {
+        for body in [
+            r#"{"usage":{"prompt_tokens":5}}"#,
+            r#"{"data":"x","usage":{"prompt_tokens":5}}"#,
+            // An item without `index`, or with a vector of the wrong type.
+            r#"{"object":"list","model":"m","data":[{"object":"embedding","embedding":[1.0]}],"usage":{"prompt_tokens":5}}"#,
+            r#"{"object":"list","model":"m","data":[{"object":"embedding","index":0,"embedding":7}],"usage":{"prompt_tokens":5}}"#,
+            // Truncated after a complete item.
+            r#"{"usage":{"prompt_tokens":5},"data":[{"index":0,"embedding":[1.0]},"#,
+            // A top-level array is never an embeddings response, even when
+            // its items line up with the fields the probe reads.
+            r#"[[{"index":0,"embedding":[1.0]}],{"prompt_tokens":5}]"#,
+            r#"[[],{"prompt_tokens":5}]"#,
+            "[]",
+            // Nor is a `data` item written as an array.
+            r#"{"object":"list","model":"m","data":[[[1.0],0]],"usage":{"prompt_tokens":5}}"#,
+            "not json",
+        ] {
+            assert!(
+                EmbedCompletion::from_openai_body(
+                    Bytes::from_static(body.as_bytes()),
+                    EmbeddingEncoding::Float
+                )
+                .is_err(),
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn output_encoding_is_base64_only_when_asked() {
+        let mut req: EmbedRequest = serde_json::from_str(r#"{"model":"m","input":"x"}"#).unwrap();
+        assert_eq!(req.output_encoding(), EmbeddingEncoding::Float);
+        req.encoding_format = Some("float".to_owned());
+        assert_eq!(req.output_encoding(), EmbeddingEncoding::Float);
+        req.encoding_format = Some("base64".to_owned());
+        assert_eq!(req.output_encoding(), EmbeddingEncoding::Base64);
     }
 
     #[test]

@@ -23,13 +23,14 @@
 //! caller's frame guards own the rest and never retry.
 
 use std::future::Future;
+use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 use lumen_core::{GatewayError, ProviderError};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-use crate::circuit::{Admission, CircuitBreakers};
+use crate::circuit::{Admission, CircuitBreakers, Probe};
 use crate::retry::{retry, RetryPolicy};
 
 /// One link of a fallback chain: the metadata the executor keys on. The actual
@@ -51,6 +52,11 @@ pub struct Link {
     /// This link's provider retry policy (ADR 021), or `None` for
     /// [`ExecConfig::retry`].
     pub retry: Option<RetryPolicy>,
+    /// This link's own first-token deadline (its provider's
+    /// `first_token_timeout_ms`), or `None` for [`ExecConfig::first_token`].
+    /// Per link, like `retry`: a fallback keeps its own provider's deadline
+    /// instead of inheriting the primary's.
+    pub first_token: Option<Duration>,
 }
 
 /// Resilience knobs for one execution.
@@ -59,7 +65,8 @@ pub struct ExecConfig {
     /// Retry policy applied per link.
     pub retry: RetryPolicy,
     /// Per-attempt first-token deadline (whole call for non-streaming; time to
-    /// the opened stream for streaming).
+    /// the opened stream for streaming). A link's own
+    /// [`Link::first_token`] takes precedence.
     pub first_token: Duration,
     /// Absolute cap on the whole call (all retries and fallbacks together).
     pub total: Duration,
@@ -88,7 +95,9 @@ pub struct Executed<T> {
 /// # Errors
 ///
 /// The last upstream error encountered (already mapped to a [`GatewayError`]
-/// naming the provider), `LM-3013` if the total timeout elapsed, `LM-3020` if
+/// naming the provider), `LM-3013` if the total timeout elapsed (naming the
+/// link that was in flight, whose breaker records a failure once the link has
+/// been running for its own first-token timeout), `LM-3020` if
 /// every remaining link's breaker was open, or the immediate error for a hard
 /// client fault (which no fallback can fix).
 pub async fn execute<T, F, Fut>(
@@ -102,20 +111,86 @@ where
     F: FnMut(usize) -> Fut,
     Fut: Future<Output = Result<T, ProviderError>>,
 {
-    let Some(primary) = links.first() else {
+    if links.is_empty() {
         return Err(GatewayError::Internal("empty provider chain".to_owned()));
-    };
-    let primary_provider = primary.provider_name.clone();
+    }
 
     let deadline = Instant::now() + config.total;
-    let chain = run_chain(links, breakers, config, cancel, deadline, &mut call);
-    match tokio::time::timeout_at(deadline, chain).await {
-        Ok(result) => result,
-        // The whole request outran the total timeout (spec 6.4). Attribute it
-        // to the request's intended target.
-        Err(_) => Err(GatewayError::UpstreamTotalTimeout {
-            provider: primary_provider,
-        }),
+    // The link being called, kept outside the timeout: when it fires the
+    // chain future is dropped, and with it any local record of how far it got.
+    let in_flight = InFlightSlot::default();
+    let chain = run_chain(
+        links, breakers, config, cancel, deadline, &in_flight, &mut call,
+    );
+    if let Ok(result) = tokio::time::timeout_at(deadline, chain).await {
+        return result;
+    }
+    // The whole request outran the total timeout (spec 6.4). The chain only
+    // ever waits inside a link's retry loop, so the slot holds the link that
+    // was being called (never one skipped on an open circuit), and the error
+    // names it. It did not answer in time, which counts against its breaker
+    // like any other timeout, but only once it has had its own first-token
+    // timeout to answer: a fallback reached moments before the deadline was
+    // cut by the links before it, not by its own slowness, so it gets a
+    // neutral outcome (which hands back a half-open probe it held).
+    let Some(InFlight {
+        index,
+        since,
+        probe,
+    }) = in_flight.get()
+    else {
+        // The deadline fired before any link was called.
+        let provider = links
+            .first()
+            .map_or_else(String::new, |link| link.provider_name.clone());
+        return Err(GatewayError::UpstreamTotalTimeout { provider });
+    };
+    let Some(link) = links.get(index) else {
+        return Err(GatewayError::Internal(
+            "in-flight link outside the provider chain".to_owned(),
+        ));
+    };
+    let breaker = breakers.get_scoped(
+        &link.provider_name,
+        link.breaker_scope.as_deref(),
+        &link.model_id,
+    );
+    let now = Instant::now();
+    let first_token = link.first_token.unwrap_or(config.first_token);
+    if now.saturating_duration_since(since) >= first_token {
+        breaker.on_failure(now);
+    } else {
+        breaker.on_neutral(probe);
+    }
+    Err(GatewayError::UpstreamTotalTimeout {
+        provider: link.provider_name.clone(),
+    })
+}
+
+/// The link whose call is pending.
+#[derive(Debug, Clone, Copy)]
+struct InFlight {
+    /// Its index in the chain.
+    index: usize,
+    /// When its first attempt started.
+    since: Instant,
+    /// The half-open probe this request holds on its breaker, if any.
+    probe: Option<Probe>,
+}
+
+/// Where the chain records the link in flight for [`execute`] to read after
+/// the total timeout dropped the chain future. A mutex (never held across an
+/// await) rather than a `Cell`, so the execution future stays `Send`.
+#[derive(Debug, Default)]
+struct InFlightSlot(Mutex<Option<InFlight>>);
+
+impl InFlightSlot {
+    fn set(&self, in_flight: InFlight) {
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = Some(in_flight);
+    }
+
+    fn get(&self) -> Option<InFlight> {
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -126,6 +201,7 @@ async fn run_chain<T, F, Fut>(
     config: &ExecConfig,
     cancel: &CancellationToken,
     deadline: Instant,
+    in_flight: &InFlightSlot,
     call: &mut F,
 ) -> Result<Executed<T>, GatewayError>
 where
@@ -144,7 +220,10 @@ where
             link.breaker_scope.as_deref(),
             &link.model_id,
         );
-        if let Admission::Rejected { retry_after } = breaker.admit(Instant::now()) {
+        let admission = breaker.admit(Instant::now());
+        // The half-open probe, when this call is the one that holds it.
+        let probe = admission.probe();
+        if let Admission::Rejected { retry_after } = admission {
             // Circuit open: never touches the upstream. Moves on only through
             // an escape that lists `circuit_open`.
             let error = GatewayError::CircuitOpen {
@@ -166,7 +245,12 @@ where
             }
         }
 
-        let first_token = config.first_token;
+        in_flight.set(InFlight {
+            index,
+            since: Instant::now(),
+            probe,
+        });
+        let first_token = link.first_token.unwrap_or(config.first_token);
         let policy = link.retry.unwrap_or(config.retry);
         let outcome = retry(&policy, cancel, Some(deadline), || {
             // Invoke the call synchronously so the returned future is owned and
@@ -201,8 +285,8 @@ where
                     mapped
                 } else {
                     // No verdict on the provider, but a half-open probe this
-                    // call took is handed back.
-                    breaker.on_neutral();
+                    // call took is handed back (and only by this call).
+                    breaker.on_neutral(probe);
                     match (&error, &upstream_failure) {
                         // Refused by the chain lock of another provider's
                         // pool (an exhausted pool is reported under its own
@@ -259,6 +343,7 @@ mod tests {
                 escapes: crate::triggers::linear_escapes(i, n),
                 breaker_scope: None,
                 retry: None,
+                first_token: None,
             })
             .collect()
     }
@@ -488,6 +573,185 @@ mod tests {
         assert_eq!(err.code(), "LM-3013");
     }
 
+    /// A breaker registry that opens on the first failure.
+    fn fragile_breakers() -> CircuitBreakers {
+        CircuitBreakers::new(
+            BreakerConfig {
+                failure_threshold: 1,
+                ..BreakerConfig::default()
+            },
+            None,
+        )
+    }
+
+    /// Link 0 fails at once, link 1 never answers.
+    async fn primary_fails_fallback_hangs(i: usize) -> Result<(), ProviderError> {
+        if i == 0 {
+            Err(upstream_500())
+        } else {
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            Ok(())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_total_timeout_names_and_charges_the_link_in_flight() {
+        // The primary fails at once; the fallback outlives its first-token
+        // timeout (40 ms, retried) until the total timeout. LM-3013 names the
+        // fallback, and its breaker (threshold 1 here) records the failure.
+        let chain = links(&[("openai", "gpt-4o"), ("anthropic", "claude")]);
+        let cb = fragile_breakers();
+        let cfg = ExecConfig {
+            retry: RetryPolicy {
+                max_attempts: 10,
+                base: Duration::from_millis(1),
+                max: Duration::from_millis(1),
+                ..RetryPolicy::default()
+            },
+            first_token: Duration::from_millis(40),
+            total: Duration::from_millis(100),
+        };
+        let err = execute(
+            &chain,
+            &cb,
+            &cfg,
+            &CancellationToken::new(),
+            primary_fails_fallback_hangs,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&err, GatewayError::UpstreamTotalTimeout { provider } if provider == "anthropic"),
+            "{err:?}"
+        );
+        assert_eq!(
+            cb.get("anthropic", "claude").state(),
+            crate::circuit::CircuitState::Open,
+            "the hanging link is charged"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_total_timeout_spares_a_link_that_barely_started() {
+        // The primary eats almost the whole budget, so the fallback is cut
+        // 10 ms into its call, far short of its 30 s first-token timeout:
+        // LM-3013 still names it, but its breaker records no failure.
+        let chain = links(&[("openai", "gpt-4o"), ("anthropic", "claude")]);
+        let cb = fragile_breakers();
+        let cfg = ExecConfig {
+            retry: RetryPolicy::never(),
+            first_token: Duration::from_secs(30),
+            total: Duration::from_millis(100),
+        };
+        let err = execute(
+            &chain,
+            &cb,
+            &cfg,
+            &CancellationToken::new(),
+            |i| async move {
+                if i == 0 {
+                    tokio::time::sleep(Duration::from_millis(90)).await;
+                }
+                primary_fails_fallback_hangs(i).await
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&err, GatewayError::UpstreamTotalTimeout { provider } if provider == "anthropic"),
+            "{err:?}"
+        );
+        assert_eq!(
+            cb.get("anthropic", "claude").state(),
+            crate::circuit::CircuitState::Closed,
+            "a link cut before its own first-token timeout is not charged"
+        );
+        assert_eq!(
+            cb.get("openai", "gpt-4o").state(),
+            crate::circuit::CircuitState::Open,
+            "the primary's own failure still counts"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_total_timeout_judges_a_link_by_its_own_first_token_timeout() {
+        // Same race, but the fallback's own first-token timeout is 7 ms and
+        // it has been retried past it by the time the deadline fires.
+        let mut chain = links(&[("openai", "gpt-4o"), ("anthropic", "claude")]);
+        chain[1].first_token = Some(Duration::from_millis(7));
+        chain[1].retry = Some(RetryPolicy {
+            max_attempts: 10,
+            base: Duration::from_millis(1),
+            max: Duration::from_millis(1),
+            ..RetryPolicy::default()
+        });
+        let cb = fragile_breakers();
+        let cfg = ExecConfig {
+            retry: RetryPolicy::never(),
+            first_token: Duration::from_secs(30),
+            total: Duration::from_millis(100),
+        };
+        let err = execute(
+            &chain,
+            &cb,
+            &cfg,
+            &CancellationToken::new(),
+            |i| async move {
+                if i == 0 {
+                    tokio::time::sleep(Duration::from_millis(80)).await;
+                }
+                primary_fails_fallback_hangs(i).await
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), "LM-3013");
+        assert_eq!(
+            cb.get("anthropic", "claude").state(),
+            crate::circuit::CircuitState::Open
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_total_timeout_on_a_barely_started_probe_releases_it() {
+        // The fallback's breaker is half-open and this request holds its
+        // probe when the total timeout cuts it short: the probe is handed
+        // back (no failure), so the next request probes at once.
+        let chain = links(&[("openai", "gpt-4o"), ("anthropic", "claude")]);
+        let fallback = links(&[("anthropic", "claude")]);
+        let cb = breakers();
+        open_with(&fallback, &cb, upstream_500).await;
+        tokio::time::advance(BreakerConfig::default().cooldown + Duration::from_secs(1)).await;
+        let cfg = ExecConfig {
+            retry: RetryPolicy::never(),
+            first_token: Duration::from_secs(30),
+            total: Duration::from_millis(100),
+        };
+        let cancel = CancellationToken::new();
+        let err = execute(&chain, &cb, &cfg, &cancel, |i| async move {
+            if i == 0 {
+                tokio::time::sleep(Duration::from_millis(90)).await;
+            }
+            primary_fails_fallback_hangs(i).await
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), "LM-3013");
+        assert_eq!(
+            cb.get("anthropic", "claude").state(),
+            crate::circuit::CircuitState::HalfOpen
+        );
+        execute(&fallback, &cb, &config(1), &cancel, |_| async {
+            Ok::<_, ProviderError>(())
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            cb.get("anthropic", "claude").state(),
+            crate::circuit::CircuitState::Closed
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn first_token_timeout_per_attempt_surfaces_fg_3011() {
         let chain = links(&[("openai", "gpt-4o")]);
@@ -540,6 +804,7 @@ mod tests {
                 model_id: "a".into(),
                 breaker_scope: None,
                 retry: None,
+                first_token: None,
                 escapes: vec![Escape {
                     on: Triggers::DEFAULT,
                     next: 2,
@@ -551,6 +816,7 @@ mod tests {
                 escapes: vec![],
                 breaker_scope: None,
                 retry: None,
+                first_token: None,
             },
             Link {
                 provider_name: "pc".into(),
@@ -558,6 +824,7 @@ mod tests {
                 escapes: vec![],
                 breaker_scope: None,
                 retry: None,
+                first_token: None,
             },
         ];
         let out = execute(
@@ -587,6 +854,7 @@ mod tests {
                 model_id: "a".into(),
                 breaker_scope: None,
                 retry: None,
+                first_token: None,
                 escapes: vec![Escape {
                     on: Triggers::from_list(&[Trigger::RateLimited]),
                     next: 1,
@@ -598,6 +866,7 @@ mod tests {
                 escapes: vec![],
                 breaker_scope: None,
                 retry: None,
+                first_token: None,
             },
         ];
         let calls = AtomicUsize::new(0);
@@ -631,6 +900,7 @@ mod tests {
             model_id: "a".into(),
             breaker_scope: None,
             retry: None,
+            first_token: None,
             escapes: vec![Escape {
                 on: Triggers::DEFAULT,
                 next: 0,
@@ -929,6 +1199,48 @@ mod tests {
         .unwrap();
         assert_eq!(result.model_used, "hf/bge-m3", "served by the primary");
         assert_eq!(calls.load(Ordering::SeqCst), 4, "503 x3 then 200");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_link_first_token_timeout_overrides_the_global_one() {
+        // Global: 30 s. The fallback's provider (a slow local model): 60 s.
+        // The fallback answers after 45 s and must not be cut at 30 s.
+        let mut chain = links(&[("openai", "gpt-4o"), ("ollama", "llama")]);
+        chain[1].first_token = Some(Duration::from_secs(60));
+        let out = execute(
+            &chain,
+            &breakers(),
+            &config(1),
+            &CancellationToken::new(),
+            |i| async move {
+                if i == 0 {
+                    Err(upstream_500())
+                } else {
+                    tokio::time::sleep(Duration::from_secs(45)).await;
+                    Ok::<usize, ProviderError>(i)
+                }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.model_used, "llama");
+
+        // And a shorter link deadline cuts earlier than the global one.
+        let mut chain = links(&[("openai", "gpt-4o")]);
+        chain[0].first_token = Some(Duration::from_secs(5));
+        let err = execute(
+            &chain,
+            &breakers(),
+            &config(1),
+            &CancellationToken::new(),
+            |_| async {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                Ok::<(), ProviderError>(())
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), "LM-3011");
     }
 
     #[tokio::test(start_paused = true)]

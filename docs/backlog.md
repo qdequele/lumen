@@ -5,6 +5,15 @@ Ideas surfaced during development that are intentionally out of scope for v1
 Recorded here so they are not lost, and so we don't gold-plate the current
 milestone.
 
+## Noted while adding cached-input pricing (ADR 003 addendum)
+
+- One `cost_per_1m_cache_write` rate per model. Anthropic prices a 1-hour
+  cache write above a 5-minute one and reports the split
+  (`cache_creation.ephemeral_5m_input_tokens` / `ephemeral_1h_input_tokens`);
+  carry both counts and a second rate if a deployment mixes TTLs.
+- `/v1/decisions` records no cache breakdown, so cached input on a decision
+  model is charged at the input rate.
+
 ## Noted while building ADR 022 (account virtual models)
 
 - Purge the `account_virtual_models` row of an account whose groups are all
@@ -240,6 +249,13 @@ Follow-ups of the decisions spec (`docs/superpowers/specs/2026-10-08-decisions-d
   models, keyed by model) would soften this bottleneck. Deferred: it needs
   per-model config plumbing that the current `EmbeddingProvider::max_batch_size`
   (provider-wide, model-agnostic) does not carry.
+- ~~**A failed sub-batch re-runs the whole embedding request (code review,
+  needs a design decision).**~~ **Resolved**: `embed_batched` retries a failed
+  sub-batch on its own and keeps the completed sub-responses, within the
+  retry configuration of the provider called (`retry_max_attempts = 1` turns
+  it off). Design, bounds and what stays open (the usage of a failed attempt):
+  ADR 005, amendment of 2026-11-12 "sub-batch retry for split embedding
+  requests" (`docs/adr/005-resilience-execution.md`).
 
 ## Noted while building M4 (slice 1 - non-streaming chat)
 
@@ -502,14 +518,17 @@ Follow-ups of the decisions spec (`docs/superpowers/specs/2026-10-08-decisions-d
 
 ## Noted while building M8 (vision / image input)
 
-- **`LM-2004` pre-flight is primary-only.** A remote `http(s)` image URL is
+- ~~**`LM-2004` pre-flight is primary-only.** A remote `http(s)` image URL is
   rejected up front (`LM-2004`, 400) only when the model's *primary* provider
-  can't fetch it (Gemini). If the primary accepts URLs (OpenAI) but a Gemini
-  model is a *fallback*, a fail-over to Gemini surfaces as `LM-3002` (502,
-  translation error) rather than a client 4xx - safe (never fetched, no retry
-  loop) but a soft break of the 4xx/5xx separation (rule 8). Options if it ever
-  bites: scan the whole chain in the pre-flight (rejects some primary-servable
-  requests), or add a dedicated client-input `ProviderError` mapped to a 4xx.
+  can't fetch it (Gemini); a fail-over to a Gemini *fallback* surfaced the
+  error from the fallback instead.~~ **Resolved** with the approach taken for
+  the `image` modality: the `LM-2004` and `LM-2008` checks still judge the
+  primary and answer with its error, and fallback targets whose provider
+  cannot fetch the request's remote image URLs or resolve its provider-native
+  sources are skipped (`drop_incompatible_fallbacks` in
+  `crates/server/src/chat.rs`). Neither alternative listed here before
+  (rejecting on any link of the chain, or a client 4xx raised mid fail-over)
+  was kept: both fail requests the primary can serve.
 - **Per-image token heuristic for the estimation fallback - done** (issue #9,
   see the note above under "M8 (vision - image input to chat)"). The remaining
   gap is a true dimension-based tile count, which needs image decoding this

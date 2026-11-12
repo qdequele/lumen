@@ -24,8 +24,24 @@ channel is ever full, an entry is dropped rather than backpressuring the
 request path, and `lumen_usage_log_dropped_total` increments so the drop is
 visible on [`/metrics`](metrics.md).
 
-Rows age out on their own: `retention_days` purges `usage_log` rows older
-than that many days.
+A batch the database refuses (a transient `SQLITE_BUSY`, say) is retried
+once, 250 ms later. The insert is one transaction, so the retry cannot
+duplicate rows. A batch that fails twice is discarded, not retried forever
+against a sick database, and every row of it is added to the same
+`lumen_usage_log_dropped_total`. That counter therefore covers both ways a
+row can be lost: the channel was full, or the database refused its batch
+twice. The server log tells them apart: the second case logs
+`usage-log batch write failed twice; the batch is discarded` with the row
+count.
+
+Rows age out on their own: an hourly task purges `usage_log` rows older than
+`retention_days` days. It deletes oldest first, 5000 rows per statement, so
+a large backlog never holds the SQLite write lock long enough to stall the
+usage writer or the budget flush; if a statement fails, the rows already
+purged stay purged and the next run carries on. `retention_days = 0` is
+refused at config validation while `[auth]` is enabled. The purge task also
+treats 0 as "do not purge": a reload that turns auth off and leaves the
+window at 0 skips the purge instead of deleting every row.
 
 ## Querying it over HTTP
 

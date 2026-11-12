@@ -9,7 +9,7 @@
 //! All state is in-memory; nothing here touches a database.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -55,6 +55,26 @@ pub fn routing_headers(model_used: &str, route: Option<&str>) -> HeaderMap {
     headers
 }
 
+/// How often a deprecated bare model id is logged, per alias. Every use is
+/// still counted on `lumen_deprecated_model_alias_total`; the log line is a
+/// synchronous write, so it must not be paid per request.
+const ALIAS_WARN_INTERVAL_SECS: u64 = 600;
+
+/// Whether a use of an alias at `now_secs` (seconds since the runtime
+/// started) should be logged, given `last`, the slot holding when it last
+/// was (`0`: never; stored one second ahead so a use at second zero is not
+/// "never"). Lock-free: of concurrent callers in a new interval, exactly one
+/// wins the swap and logs.
+fn alias_warning_due(last: &AtomicU64, now_secs: u64) -> bool {
+    let stamp = now_secs.saturating_add(1);
+    let previous = last.load(Ordering::Relaxed);
+    if previous != 0 && stamp.saturating_sub(previous) < ALIAS_WARN_INTERVAL_SECS {
+        return false;
+    }
+    last.compare_exchange(previous, stamp, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
+}
+
 /// The two request-scoped timeouts the executor enforces (connect is a
 /// client-wide setting, applied when the HTTP client is built).
 #[derive(Debug, Clone, Copy)]
@@ -86,6 +106,10 @@ struct ResiliencePolicy {
     /// Deprecated bare id -> its `provider/model` (or `namespace/model`) id,
     /// from the same config snapshot as `routing`. Hidden: never listed.
     aliases: Arc<HashMap<String, String>>,
+    /// When each alias was last logged (see [`alias_warning_due`]), keyed
+    /// like `aliases`. Rebuilt with the policy, so a reload logs each alias
+    /// still in use once more.
+    alias_warned: Arc<HashMap<String, AtomicU64>>,
 }
 
 impl ResiliencePolicy {
@@ -151,6 +175,11 @@ impl ResiliencePolicy {
                 )
             })
             .collect();
+        let aliases = config.model_aliases();
+        let alias_warned = aliases
+            .keys()
+            .map(|alias| (alias.clone(), AtomicU64::new(0)))
+            .collect();
         Self {
             retry,
             provider_retry,
@@ -158,7 +187,8 @@ impl ResiliencePolicy {
             model_timeouts,
             routing: Arc::new(routing),
             foundation: Arc::new(config.foundation_index()),
-            aliases: Arc::new(config.model_aliases()),
+            aliases: Arc::new(aliases),
+            alias_warned: Arc::new(alias_warned),
         }
     }
 
@@ -174,14 +204,24 @@ impl ResiliencePolicy {
             routing: Arc::new(RoutingTable::default()),
             foundation: Arc::new(FoundationIndex::default()),
             aliases: Arc::new(HashMap::new()),
+            alias_warned: Arc::new(HashMap::new()),
         }
+    }
+}
+
+/// The circuit-breaker tuning of `config`.
+fn breaker_config(config: &Config) -> BreakerConfig {
+    BreakerConfig {
+        failure_threshold: config.resilience.circuit_failure_threshold,
+        cooldown: Duration::from_millis(config.resilience.circuit_cooldown_ms),
     }
 }
 
 /// Process-wide resilience state. The circuit breakers are stable for the life
 /// of the process (so their state survives a hot reload); the derived policy is
 /// behind an [`ArcSwap`] so a config reload can replace it atomically without
-/// touching breaker state (DEBT-1 / M7 §7.3).
+/// touching breaker state (DEBT-1 / M7 §7.3). The breaker tuning follows the
+/// reload through [`CircuitBreakers::set_config`].
 #[derive(Debug)]
 pub struct ResilienceRuntime {
     /// Per-(provider, model) circuit breakers - never rebuilt on reload.
@@ -198,6 +238,8 @@ pub struct ResilienceRuntime {
     accounts_write: Mutex<()>,
     /// The highest store generation installed into `accounts`.
     account_generation: AtomicI64,
+    /// When the runtime was built: the clock of the alias-warning limiter.
+    started: std::time::Instant,
 }
 
 impl ResilienceRuntime {
@@ -205,18 +247,14 @@ impl ResilienceRuntime {
     /// provided.
     #[must_use]
     pub fn from_config(config: &Config, metrics: Option<ResilienceMetrics>) -> Self {
-        let r = &config.resilience;
-        let breaker_config = BreakerConfig {
-            failure_threshold: r.circuit_failure_threshold,
-            cooldown: Duration::from_millis(r.circuit_cooldown_ms),
-        };
         Self {
-            breakers: CircuitBreakers::new(breaker_config, metrics.clone()),
+            breakers: CircuitBreakers::new(breaker_config(config), metrics.clone()),
             policy: arc_swap::ArcSwap::from_pointee(ResiliencePolicy::from_config(config)),
             metrics,
             accounts: arc_swap::ArcSwap::from_pointee(HashMap::new()),
             accounts_write: Mutex::new(()),
             account_generation: AtomicI64::new(0),
+            started: std::time::Instant::now(),
         }
     }
 
@@ -231,15 +269,23 @@ impl ResilienceRuntime {
             accounts: arc_swap::ArcSwap::from_pointee(HashMap::new()),
             accounts_write: Mutex::new(()),
             account_generation: AtomicI64::new(0),
+            started: std::time::Instant::now(),
         }
     }
 
     /// Atomically replace the derived policy (retry, timeouts, virtual models) from a
     /// new config - the hot-reload entry point. Circuit-breaker state is left
-    /// untouched, so an open circuit stays open across a reload.
+    /// untouched, so an open circuit stays open across a reload (only
+    /// breakers that are closed with no failure streak are evicted); the breaker
+    /// tuning (`circuit_failure_threshold`, `circuit_cooldown_ms`) is live,
+    /// for existing breakers too.
     pub fn reload_policy(&self, config: &Config) {
         self.policy
             .store(Arc::new(ResiliencePolicy::from_config(config)));
+        self.breakers.set_config(breaker_config(config));
+        // Drop the breakers that hold no state (removed models, team pools
+        // of groups that went quiet): a reload is the cheap moment for it.
+        self.breakers.prune();
         // Account tables hold compiled platform nodes: rebuild them over the
         // new platform snapshot (ADR 022).
         self.recompile_accounts();
@@ -269,9 +315,10 @@ impl ResilienceRuntime {
 
     /// The id a request's `model` names: itself, or, for a deprecated bare id
     /// (`gpt-4o` for `openai/gpt-4o`), the prefixed id it aliases. An alias
-    /// resolves but is never listed; each use is logged and counted on
-    /// `lumen_deprecated_model_alias_total` so the aliases can be dropped once
-    /// nobody sends them.
+    /// resolves but is never listed; each use is counted on
+    /// `lumen_deprecated_model_alias_total`, and logged at most once per
+    /// alias every ten minutes, so the aliases can be dropped once nobody
+    /// sends them.
     #[must_use]
     pub fn canonical_model(&self, requested: &str) -> String {
         self.canonical_model_for(None, requested)
@@ -291,11 +338,19 @@ impl ResilienceRuntime {
         let Some(canonical) = policy.aliases.get(requested) else {
             return requested.to_owned();
         };
-        tracing::warn!(
-            alias = %requested,
-            model = %canonical,
-            "deprecated bare model id: send the `provider/model` id instead"
-        );
+        let due = policy
+            .alias_warned
+            .get(requested)
+            .is_some_and(|last| alias_warning_due(last, self.started.elapsed().as_secs()));
+        if due {
+            tracing::warn!(
+                alias = %requested,
+                model = %canonical,
+                "deprecated bare model id: send the `provider/model` id instead \
+                 (logged at most once per alias every ten minutes; every use is counted \
+                 on lumen_deprecated_model_alias_total)"
+            );
+        }
         if let Some(metrics) = &self.metrics {
             metrics.inc_deprecated_alias(requested, canonical);
         }
@@ -489,16 +544,30 @@ impl ResilienceRuntime {
         }
     }
 
-    /// Give each link its provider's retry policy when that provider
-    /// overrides one (ADR 021); other links keep [`ExecConfig::retry`].
+    /// Give each link its provider's own knobs: the retry policy when that
+    /// provider overrides one (ADR 021; other links keep
+    /// [`ExecConfig::retry`]) and the first-token timeout (ADR 005, per-link
+    /// amendment), so a fallback is bounded by its own provider's
+    /// `first_token_timeout_ms` and not by the primary's.
     /// Call once the chain's links are built, before executing.
     pub fn apply_retry_overrides(&self, links: &mut [Link]) {
         let policy = self.policy.load();
-        if policy.provider_retry.is_empty() {
-            return;
+        if !policy.provider_retry.is_empty() {
+            for link in links.iter_mut() {
+                link.retry = policy.provider_retry.get(&link.provider_name).copied();
+            }
         }
-        for link in links {
-            link.retry = policy.provider_retry.get(&link.provider_name).copied();
+        // Without any override every link shares `ExecConfig::first_token`
+        // (the default): nothing to carry.
+        if !policy.model_timeouts.is_empty() {
+            for link in links {
+                link.first_token = Some(
+                    policy
+                        .model_timeouts
+                        .get(&link.model_id)
+                        .map_or(policy.default_timeouts.first_token, |t| t.first_token),
+                );
+            }
         }
     }
 }
@@ -668,6 +737,29 @@ mod tests {
         assert!(metrics.encode_text().contains(
             "lumen_deprecated_model_alias_total{alias=\"gpt-4o\",model=\"openai/gpt-4o\"} 1"
         ));
+        // Every use is counted, whatever the log limiter decides.
+        assert_eq!(rt.canonical_model("gpt-4o"), "openai/gpt-4o");
+        assert!(metrics.encode_text().contains(
+            "lumen_deprecated_model_alias_total{alias=\"gpt-4o\",model=\"openai/gpt-4o\"} 2"
+        ));
+        // The first use took the alias's log slot; the second did not log.
+        let policy = rt.policy.load();
+        let last = &policy.alias_warned["gpt-4o"];
+        assert_ne!(last.load(Ordering::Relaxed), 0);
+        assert!(!alias_warning_due(last, rt.started.elapsed().as_secs()));
+    }
+
+    #[test]
+    fn a_deprecated_alias_is_logged_once_per_interval() {
+        let last = AtomicU64::new(0);
+        assert!(alias_warning_due(&last, 0), "the first use logs");
+        assert!(!alias_warning_due(&last, 0));
+        assert!(!alias_warning_due(&last, ALIAS_WARN_INTERVAL_SECS - 1));
+        assert!(alias_warning_due(&last, ALIAS_WARN_INTERVAL_SECS));
+        assert!(!alias_warning_due(&last, ALIAS_WARN_INTERVAL_SECS + 1));
+        assert!(alias_warning_due(&last, 2 * ALIAS_WARN_INTERVAL_SECS));
+        // Each alias has its own slot.
+        assert!(alias_warning_due(&AtomicU64::new(0), 1));
     }
 
     #[test]
@@ -713,6 +805,7 @@ mod tests {
             escapes: Vec::new(),
             breaker_scope: None,
             retry: None,
+            first_token: None,
         };
         let mut links = vec![link("hf"), link("oa")];
         rt.apply_retry_overrides(&mut links);
@@ -730,6 +823,100 @@ mod tests {
         let global = rt.exec_config("oa/embed").retry;
         assert_eq!(global.max_attempts, 2);
         assert_eq!(global.max_retry_after, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn breaker_tuning_follows_hot_reload_and_keeps_state() {
+        let toml = |threshold: u32, cooldown_ms: u64| {
+            format!(
+                r#"
+                [resilience]
+                circuit_failure_threshold = {threshold}
+                circuit_cooldown_ms = {cooldown_ms}
+                [[providers]]
+                name = "oa"
+                kind = "openai"
+                [[providers.models]]
+                id = "oa/gpt"
+                capabilities = ["chat"]
+                "#
+            )
+        };
+        let rt = ResilienceRuntime::from_config(&load(&toml(5, 30_000)), None);
+        let breaker = rt.breakers.get("oa", "oa/gpt");
+        let now = tokio::time::Instant::now();
+        breaker.on_failure(now);
+        breaker.on_failure(now);
+
+        rt.reload_policy(&load(&toml(3, 1_000)));
+        assert_eq!(
+            rt.breakers.config(),
+            BreakerConfig {
+                failure_threshold: 3,
+                cooldown: Duration::from_secs(1),
+            }
+        );
+        // The breaker that existed before the reload: its streak of two is
+        // kept and the new threshold of three applies to it.
+        breaker.on_failure(now);
+        assert_eq!(
+            breaker.state(),
+            lumen_router::circuit::CircuitState::Open,
+            "an existing breaker reads the reloaded threshold"
+        );
+        assert!(matches!(
+            breaker.admit(now + Duration::from_secs(2)),
+            lumen_router::circuit::Admission::Probe(_)
+        ));
+    }
+
+    #[test]
+    fn each_link_gets_its_own_provider_first_token_timeout() {
+        let cfg = load(
+            r#"
+            [server]
+            first_token_timeout_ms = 30000
+            [[providers]]
+            name = "oa"
+            kind = "openai"
+            [[providers.models]]
+            id = "oa/gpt"
+            capabilities = ["chat"]
+            [[providers]]
+            name = "ollama"
+            kind = "ollama"
+            base_url = "http://127.0.0.1:9"
+            first_token_timeout_ms = 60000
+            [[providers.models]]
+            id = "ollama/llama"
+            capabilities = ["chat"]
+        "#,
+        );
+        let rt = ResilienceRuntime::from_config(&cfg, None);
+        let link = |provider: &str, model: &str| Link {
+            provider_name: provider.to_owned(),
+            model_id: model.to_owned(),
+            escapes: Vec::new(),
+            breaker_scope: None,
+            retry: None,
+            first_token: None,
+        };
+        // The override applies to the fallback although the chain's
+        // ExecConfig is resolved from the primary.
+        let mut links = vec![link("oa", "oa/gpt"), link("ollama", "ollama/llama")];
+        rt.apply_retry_overrides(&mut links);
+        assert_eq!(
+            rt.exec_config("oa/gpt").first_token,
+            Duration::from_secs(30)
+        );
+        assert_eq!(links[0].first_token, Some(Duration::from_secs(30)));
+        assert_eq!(links[1].first_token, Some(Duration::from_secs(60)));
+        // And the other way round: a fallback without an override does not
+        // inherit the primary's longer deadline.
+        let mut links = vec![link("ollama", "ollama/llama"), link("oa", "oa/gpt")];
+        rt.apply_retry_overrides(&mut links);
+        assert_eq!(links[0].first_token, Some(Duration::from_secs(60)));
+        assert_eq!(links[1].first_token, Some(Duration::from_secs(30)));
     }
 
     #[test]
@@ -755,6 +942,7 @@ mod tests {
             escapes: Vec::new(),
             breaker_scope: None,
             retry: None,
+            first_token: None,
         }];
         rt.apply_retry_overrides(&mut links);
         assert_eq!(links[0].retry.map(|r| r.max_attempts), Some(4));

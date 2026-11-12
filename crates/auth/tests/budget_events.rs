@@ -337,3 +337,210 @@ async fn concurrent_settles_across_a_threshold_fire_it_once() {
     assert_eq!(fired.len(), 1, "one crossing, one event: {fired:?}");
     assert_eq!(fired[0].threshold, Some(50));
 }
+
+// ---- Re-arming never swallows a crossing ------------------------------------
+
+fn thresholds_of(events: Vec<BudgetEvent>) -> Vec<Option<u8>> {
+    events.into_iter().map(|e| e.threshold).collect()
+}
+
+#[tokio::test]
+async fn a_reload_upsert_between_admit_and_settle_does_not_swallow_the_threshold() {
+    // A hot reload upserts every key with its unchanged record. Spend
+    // includes in-flight reservations, so re-arming "against current spend"
+    // there used to mark the threshold fired without emitting it, and the
+    // settle that really crossed it then stayed silent.
+    let record = key_record("k1", Some(100.0));
+    let state = AuthState::load(Vec::new(), vec![(hash_key("fg-u"), record.clone())]);
+    let mut rx = arm(&state, &[50]);
+    let entry = state.authenticate("fg-u", NOW).expect("key valid");
+
+    let reservation = entry.admit(NOW, 0, usd_to_micro(60.0)).expect("admitted");
+    state.upsert(hash_key("fg-u"), &record); // the reload pass
+    state.apply(&record); // an admin PATCH that leaves the cap alone
+    reservation.settle(usd_to_micro(60.0), 0);
+
+    assert_eq!(thresholds_of(drain(&mut rx)), [Some(50)]);
+}
+
+#[tokio::test]
+async fn a_reload_while_a_reservation_is_in_flight_keeps_the_later_real_crossing() {
+    // The reservation crosses 50 % on paper, a reload happens, and the call
+    // settles far lower. The real crossing comes later and must still fire.
+    let record = key_record("k1", Some(100.0));
+    let state = AuthState::load(Vec::new(), vec![(hash_key("fg-l"), record.clone())]);
+    let mut rx = arm(&state, &[50]);
+    let entry = state.authenticate("fg-l", NOW).expect("key valid");
+
+    let reservation = entry.admit(NOW, 0, usd_to_micro(60.0)).expect("admitted");
+    state.upsert(hash_key("fg-l"), &record);
+    reservation.settle(usd_to_micro(10.0), 0); // 10 %
+    assert_eq!(drain(&mut rx), [] as [BudgetEvent; 0]);
+
+    spend(&entry, 45.0); // 55 %
+    assert_eq!(thresholds_of(drain(&mut rx)), [Some(50)]);
+}
+
+#[tokio::test]
+async fn a_group_reload_upsert_between_admit_and_settle_does_not_swallow_the_threshold() {
+    let group = group_record("g1", Some(100.0));
+    let state = AuthState::load(
+        vec![group.clone()],
+        vec![(
+            hash_key("fg-gu"),
+            VirtualKeyRecord {
+                group_id: Some("g1".to_owned()),
+                ..key_record("k1", None)
+            },
+        )],
+    );
+    let mut rx = arm(&state, &[50]);
+    let entry = state.authenticate("fg-gu", NOW).expect("key valid");
+
+    let reservation = entry.admit(NOW, 0, usd_to_micro(60.0)).expect("admitted");
+    state.upsert_groups(std::slice::from_ref(&group));
+    state.apply_group(&group);
+    reservation.settle(usd_to_micro(60.0), 0);
+
+    let fired = drain(&mut rx);
+    assert_eq!(fired.len(), 1, "{fired:?}");
+    assert_eq!(fired[0].scope, EventScope::Group);
+    assert_eq!(fired[0].threshold, Some(50));
+}
+
+#[tokio::test]
+async fn reinstalling_an_unchanged_policy_does_not_swallow_the_threshold() {
+    // Every config reload re-applies the webhook settings, which installs a
+    // fresh but equivalent policy. That must not re-arm against a spend that
+    // includes in-flight reservations either.
+    let state = AuthState::load(
+        Vec::new(),
+        vec![(hash_key("fg-p"), key_record("k1", Some(100.0)))],
+    );
+    let (queue, mut rx) = SignalQueue::new(64, Arc::new(NoopCounters));
+    let install = || {
+        state.set_signals(Some(Arc::new(BudgetSignals::new(
+            Arc::clone(&queue),
+            &EventKind::ALL,
+            &[50],
+        ))));
+    };
+    install();
+    let entry = state.authenticate("fg-p", NOW).expect("key valid");
+
+    let reservation = entry.admit(NOW, 0, usd_to_micro(60.0)).expect("admitted");
+    install(); // the reload
+    reservation.settle(usd_to_micro(60.0), 0);
+
+    assert_eq!(thresholds_of(drain(&mut rx)), [Some(50)]);
+}
+
+#[tokio::test]
+async fn a_changed_threshold_list_is_still_armed_against_current_spend() {
+    // The legitimate "arm against current spend" case: a NEW threshold list
+    // must not replay every threshold below the spend already reached.
+    let state = AuthState::load(
+        Vec::new(),
+        vec![(hash_key("fg-c"), key_record("k1", Some(100.0)))],
+    );
+    let mut rx = arm(&state, &[50]);
+    let entry = state.authenticate("fg-c", NOW).expect("key valid");
+    spend(&entry, 70.0);
+    assert_eq!(thresholds_of(drain(&mut rx)), [Some(50)]);
+
+    let mut rx = arm(&state, &[25, 60, 90]);
+    spend(&entry, 1.0); // 71 %: 25 and 60 are behind us, not news
+    assert_eq!(drain(&mut rx), [] as [BudgetEvent; 0]);
+    spend(&entry, 20.0); // 91 %
+    assert_eq!(thresholds_of(drain(&mut rx)), [Some(90)]);
+}
+
+#[tokio::test]
+async fn a_patch_that_raises_the_cap_reopens_the_thresholds_it_drops_below() {
+    let state = AuthState::load(
+        Vec::new(),
+        vec![(hash_key("fg-pr"), key_record("k1", Some(100.0)))],
+    );
+    let mut rx = arm(&state, &[50, 80]);
+    let entry = state.authenticate("fg-pr", NOW).expect("key valid");
+    spend(&entry, 85.0);
+    assert_eq!(thresholds_of(drain(&mut rx)), [Some(50), Some(80)]);
+
+    // PATCH budget_max = 300: 85/300 = 28 %, a new epoch.
+    state.apply(&key_record("k1", Some(300.0)));
+    spend(&entry, 70.0); // 51 %
+    assert_eq!(thresholds_of(drain(&mut rx)), [Some(50)]);
+}
+
+#[tokio::test]
+async fn a_patch_that_lowers_the_cap_past_a_threshold_reports_it_on_the_next_settle() {
+    // Lowering the cap moves the key past 50 % without any settle. Nothing
+    // was emitted for it, so it must not be recorded as fired: the next
+    // settle reports it.
+    let state = AuthState::load(
+        Vec::new(),
+        vec![(hash_key("fg-pl"), key_record("k1", Some(100.0)))],
+    );
+    let mut rx = arm(&state, &[50]);
+    let entry = state.authenticate("fg-pl", NOW).expect("key valid");
+    spend(&entry, 30.0);
+    assert_eq!(drain(&mut rx), [] as [BudgetEvent; 0]);
+
+    state.apply(&key_record("k1", Some(50.0))); // 60 % of the new cap
+    spend(&entry, 1.0);
+    assert_eq!(thresholds_of(drain(&mut rx)), [Some(50)]);
+}
+
+#[tokio::test]
+async fn a_key_inserted_under_a_live_policy_is_armed_against_its_spend() {
+    // A key that reaches the live table after the policy was installed (a
+    // hot reload picking up a key another instance created) arrives with
+    // its spend: the thresholds already behind it are not news.
+    let state = AuthState::load(Vec::new(), Vec::new());
+    let mut rx = arm(&state, &[50, 80, 95]);
+    let mut record = key_record("k1", Some(100.0));
+    record.budget_spent = 90.0;
+    state.upsert(hash_key("fg-n"), &record);
+    assert!(drain(&mut rx).is_empty(), "arming emits nothing");
+    let entry = state.authenticate("fg-n", NOW).expect("key valid");
+
+    spend(&entry, 1.0); // 91 %: 50 and 80 were crossed before the insert
+    assert_eq!(drain(&mut rx), [] as [BudgetEvent; 0]);
+    spend(&entry, 5.0); // 96 %
+    assert_eq!(thresholds_of(drain(&mut rx)), [Some(95)]);
+}
+
+#[tokio::test]
+async fn a_key_inserted_by_the_rotate_fallback_is_armed_against_its_spend() {
+    let state = AuthState::load(Vec::new(), Vec::new());
+    let mut rx = arm(&state, &[50, 80, 95]);
+    let mut record = key_record("k1", Some(100.0));
+    record.budget_spent = 90.0;
+    state.rotate(hash_key("fg-r"), &record);
+    let entry = state.authenticate("fg-r", NOW).expect("key valid");
+
+    spend(&entry, 1.0);
+    assert_eq!(drain(&mut rx), [] as [BudgetEvent; 0]);
+}
+
+#[tokio::test]
+async fn a_group_inserted_under_a_live_policy_is_armed_against_its_spend() {
+    let state = AuthState::load(Vec::new(), Vec::new());
+    let mut rx = arm(&state, &[50, 80, 95]);
+    let mut group = group_record("g1", Some(100.0));
+    group.budget_spent = 90.0;
+    state.upsert_groups(std::slice::from_ref(&group));
+    let mut record = key_record("k1", None);
+    record.group_id = Some("g1".to_owned());
+    state.upsert(hash_key("fg-gn"), &record);
+    assert!(drain(&mut rx).is_empty(), "arming emits nothing");
+    let entry = state.authenticate("fg-gn", NOW).expect("key valid");
+
+    spend(&entry, 1.0); // pool at 91 %
+    assert_eq!(drain(&mut rx), [] as [BudgetEvent; 0]);
+    spend(&entry, 5.0); // pool at 96 %
+    let fired = drain(&mut rx);
+    assert_eq!(fired.len(), 1, "{fired:?}");
+    assert_eq!(fired[0].scope, EventScope::Group);
+    assert_eq!(fired[0].threshold, Some(95));
+}

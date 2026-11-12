@@ -11,7 +11,10 @@
 //! user-supplied URL" rule (which still holds for chat vision): it is opt-in,
 //! off the streaming hot path, and time-bounded. See the M9 design.
 
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
 use base64::Engine;
@@ -71,6 +74,172 @@ const MAX_IMAGES_PER_REQUEST: usize = 32;
 /// How many image fetches run concurrently. Bounds wall-clock to
 /// roughly `ceil(N / CONCURRENCY) * timeout`.
 const FETCH_CONCURRENCY: usize = 4;
+
+/// The DNS resolver of the shared fetch client: it answers ONLY with
+/// addresses the guards vetted for a fetch that is in flight, and fails for
+/// every other name. The client therefore has no way to reach an address
+/// that did not pass [`resolve_vetted_addr`] for that exact host, and never
+/// falls back to the system resolver (which a DNS-rebinding host could
+/// answer differently the second time).
+#[derive(Default)]
+struct PinnedResolver {
+    /// Host -> the pins of the hops currently fetching from it. Almost always
+    /// zero or one entry per host; several only when concurrent fetches name
+    /// the same host. Never held across an `.await`.
+    pins: Mutex<HashMap<String, Vec<(u64, SocketAddr)>>>,
+    /// Source of pin ids, so a hop removes its own pin and no other.
+    next_id: AtomicU64,
+}
+
+impl PinnedResolver {
+    /// Pin `host` to `addr` until the returned guard is dropped.
+    fn pin(self: &Arc<Self>, host: &str, addr: SocketAddr) -> PinGuard {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        self.pins
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(host.to_owned())
+            .or_default()
+            .push((id, addr));
+        PinGuard {
+            resolver: Arc::clone(self),
+            host: host.to_owned(),
+            id,
+        }
+    }
+
+    /// The vetted IP to connect to for `host`, if a hop pinned one. With
+    /// several concurrent hops on one host, the most recent pin: every pin was
+    /// vetted for this host under the same policy, so any of them upholds the
+    /// guard.
+    ///
+    /// Only the IP is answered, never the pinned port: pins are keyed by host,
+    /// and concurrent hops may target different ports of one host
+    /// (`http://h/` and `https://h/`, or an explicit port). The port always
+    /// comes from the URL of the request being sent (see `resolve`).
+    fn pinned(&self, host: &str) -> Option<IpAddr> {
+        self.pins
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(host)
+            .and_then(|pins| pins.last())
+            .map(|(_, addr)| addr.ip())
+    }
+}
+
+impl reqwest::dns::Resolve for PinnedResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let pinned = self.pinned(name.as_str());
+        Box::pin(async move {
+            match pinned {
+                Some(ip) => {
+                    // Port 0: the connector then applies the port of the
+                    // request URL (explicit, or the scheme default), which is
+                    // the port the guards vetted for this hop.
+                    let addrs: reqwest::dns::Addrs =
+                        Box::new(std::iter::once(SocketAddr::new(ip, 0)));
+                    Ok(addrs)
+                }
+                // Fail closed: no vetted address, no connection.
+                None => Err("image fetch: no vetted address for this host".into()),
+            }
+        })
+    }
+}
+
+/// Removes one hop's pin when dropped, on every exit path (success, error,
+/// cancellation).
+struct PinGuard {
+    resolver: Arc<PinnedResolver>,
+    host: String,
+    id: u64,
+}
+
+impl Drop for PinGuard {
+    fn drop(&mut self) {
+        let mut pins = self
+            .resolver
+            .pins
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(entries) = pins.get_mut(&self.host) {
+            entries.retain(|(id, _)| *id != self.id);
+            if entries.is_empty() {
+                pins.remove(&self.host);
+            }
+        }
+    }
+}
+
+/// The HTTP client every image fetch goes through, with the resolver that
+/// pins it. Built once per process: building a `reqwest::Client` sets up the
+/// rustls config and its root store, which used to be paid per image and per
+/// redirect hop.
+struct Fetcher {
+    client: reqwest::Client,
+    resolver: Arc<PinnedResolver>,
+}
+
+impl Fetcher {
+    /// Build the client. Its properties are the ones each per-hop client had:
+    ///
+    /// - `no_proxy`: an environment proxy (`HTTPS_PROXY`...) would resolve the
+    ///   target host itself, defeating both the vetted-address pin and the
+    ///   private-IP block. Image fetches always go direct.
+    /// - no redirect is followed by the client: each hop comes back to
+    ///   [`fetch_to_data_uri`] and is re-validated by every guard.
+    /// - DNS goes through [`PinnedResolver`] only.
+    /// - no idle connection is kept: every hop dials again, so every hop
+    ///   connects to an address vetted for it (a kept-alive connection would
+    ///   reuse the address of an earlier fetch instead).
+    ///
+    /// The per-fetch timeout is set on each request, since it comes from the
+    /// (hot-reloadable) policy.
+    fn new() -> Result<Self, GatewayError> {
+        let resolver = Arc::new(PinnedResolver::default());
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .dns_resolver(Arc::clone(&resolver))
+            .pool_max_idle_per_host(0)
+            .build()
+            .map_err(|_| GatewayError::ImageFetchFailed)?;
+        Ok(Self { client, resolver })
+    }
+
+    /// The process-wide fetcher. A build failure is not cached: the next
+    /// fetch tries again, as the per-hop builds did.
+    fn shared() -> Result<&'static Self, GatewayError> {
+        static SHARED: OnceLock<Fetcher> = OnceLock::new();
+        if let Some(fetcher) = SHARED.get() {
+            return Ok(fetcher);
+        }
+        let built = Self::new()?;
+        Ok(SHARED.get_or_init(|| built))
+    }
+
+    /// Send one GET to `url`, connecting only to `addr` (the address the
+    /// guards vetted for the URL's host). The pin is held until the response
+    /// head is in: the connection is established by then, and the body is
+    /// read from that same connection.
+    async fn get_pinned(
+        &self,
+        url: reqwest::Url,
+        addr: SocketAddr,
+        timeout: Duration,
+        cancel: &CancellationToken,
+    ) -> Result<reqwest::Response, GatewayError> {
+        let host = url.host_str().ok_or(GatewayError::ImageUrlRejected)?;
+        let _pin = self.resolver.pin(host, addr);
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => Err(GatewayError::ImageFetchFailed),
+            r = self.client.get(url).timeout(timeout).send() => {
+                r.map_err(|_| GatewayError::ImageFetchFailed)
+            }
+        }
+    }
+}
 
 /// Whether a URL is an inline `data:` URI (never fetched).
 fn is_data_uri(url: &str) -> bool {
@@ -173,10 +342,37 @@ async fn fetch_all(
     .await
 }
 
-/// Whether the URL string starts with one of the allowed prefixes (empty =
+/// Whether the URL falls under one of the allowed prefixes (empty =
 /// unrestricted).
-fn prefix_allowed(url: &str, allowed: &[String]) -> bool {
-    allowed.is_empty() || allowed.iter().any(|p| url.starts_with(p))
+///
+/// The comparison is made on the PARSED, normalised URL (the one the request
+/// is actually sent to), never on the client's raw string: dot segments
+/// (`/tenant-a/../tenant-b/`, also percent-encoded) are already resolved, the
+/// host is lower-cased and default ports dropped. Each prefix is normalised
+/// the same way; one that does not parse as a URL matches nothing (fail
+/// closed). A prefix without a query or fragment must end on a path boundary:
+/// `https://h/tenant-a` covers `https://h/tenant-a/x.png` but neither
+/// `https://h/tenant-ab/x.png` nor `https://h.evil.example/`.
+fn prefix_allowed(url: &reqwest::Url, allowed: &[String]) -> bool {
+    if allowed.is_empty() {
+        return true;
+    }
+    let target = url.as_str();
+    allowed.iter().any(|raw| {
+        let Ok(prefix) = reqwest::Url::parse(raw) else {
+            tracing::debug!("image fetch: an allowed_url_prefixes entry is not a valid URL");
+            return false;
+        };
+        let p = prefix.as_str();
+        let Some(rest) = target.strip_prefix(p) else {
+            return false;
+        };
+        if prefix.query().is_some() || prefix.fragment().is_some() {
+            // The operator pinned part of the query: a plain prefix match.
+            return true;
+        }
+        p.ends_with('/') || rest.is_empty() || rest.starts_with(['/', '?', '#'])
+    })
 }
 
 /// Fetch a remote URL under all guards, returning a `data:<mime>;base64,<...>`
@@ -186,6 +382,7 @@ async fn fetch_to_data_uri(
     policy: &ImageFetchPolicy,
     cancel: &CancellationToken,
 ) -> Result<String, GatewayError> {
+    let fetcher = Fetcher::shared()?;
     let mut current = url.to_owned();
 
     for _hop in 0..=MAX_REDIRECTS {
@@ -203,7 +400,7 @@ async fn fetch_to_data_uri(
         // Guard 2 + 3: host and prefix allowlists.
         let host = parsed.host_str().ok_or(GatewayError::ImageUrlRejected)?;
         if !host_allowed(host, &policy.allowed_hosts)
-            || !prefix_allowed(&current, &policy.allowed_url_prefixes)
+            || !prefix_allowed(&parsed, &policy.allowed_url_prefixes)
         {
             // Server-side diagnostic only; the host is not returned to the client.
             tracing::debug!(host, "image fetch rejected: host/prefix not allowed");
@@ -216,18 +413,12 @@ async fn fetch_to_data_uri(
             .ok_or(GatewayError::ImageUrlRejected)?;
         let addr = resolve_vetted_addr(host, port, policy, cancel).await?;
 
-        let client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(policy.timeout)
-            .resolve(host, addr)
-            .build()
-            .map_err(|_| GatewayError::ImageFetchFailed)?;
-
-        let resp = tokio::select! {
-            biased;
-            () = cancel.cancelled() => return Err(GatewayError::ImageFetchFailed),
-            r = client.get(&current).send() => r.map_err(|_| GatewayError::ImageFetchFailed)?,
-        };
+        // Send the parsed URL that the guards vetted, not the raw string,
+        // through the shared client pinned to the vetted address for this
+        // hop (no proxy, no client-side redirect, see [`Fetcher`]).
+        let resp = fetcher
+            .get_pinned(parsed.clone(), addr, policy.timeout, cancel)
+            .await?;
 
         let status = resp.status();
         if status.is_redirection() {
@@ -236,7 +427,8 @@ async fn fetch_to_data_uri(
                 .get(reqwest::header::LOCATION)
                 .and_then(|v| v.to_str().ok())
                 .ok_or(GatewayError::ImageFetchFailed)?;
-            // Resolve relative redirects against the current URL.
+            // Resolve relative redirects against the current URL. The next
+            // hop is re-parsed and re-validated by every guard above.
             current = parsed
                 .join(location)
                 .map_err(|_| GatewayError::ImageUrlRejected)?
@@ -478,5 +670,215 @@ mod tests {
         assert!(!host_allowed("notmycompany.com", &allow));
         // Case-insensitive.
         assert!(host_allowed("CDN.Example.COM", &allow));
+    }
+    fn url(s: &str) -> reqwest::Url {
+        reqwest::Url::parse(s).unwrap()
+    }
+
+    #[test]
+    fn empty_prefix_allowlist_permits_any() {
+        assert!(prefix_allowed(&url("https://h.example/x.png"), &[]));
+    }
+
+    #[test]
+    fn prefix_is_matched_on_the_normalised_url() {
+        let allow = vec!["https://h.example/tenant-a/".to_owned()];
+        assert!(prefix_allowed(
+            &url("https://h.example/tenant-a/x.png"),
+            &allow
+        ));
+        // Dot segments (plain or percent-encoded) are resolved before matching.
+        assert!(!prefix_allowed(
+            &url("https://h.example/tenant-a/../tenant-b/x.png"),
+            &allow
+        ));
+        assert!(!prefix_allowed(
+            &url("https://h.example/tenant-a/%2e%2e/tenant-b/x.png"),
+            &allow
+        ));
+        // Host case and a default port do not defeat a legitimate match.
+        assert!(prefix_allowed(
+            &url("https://H.Example:443/tenant-a/x.png"),
+            &allow
+        ));
+    }
+
+    #[test]
+    fn prefix_match_ends_on_a_path_boundary() {
+        let allow = vec!["https://h.example/tenant-a".to_owned()];
+        assert!(prefix_allowed(&url("https://h.example/tenant-a"), &allow));
+        assert!(prefix_allowed(
+            &url("https://h.example/tenant-a/x.png"),
+            &allow
+        ));
+        assert!(prefix_allowed(
+            &url("https://h.example/tenant-a?x=1"),
+            &allow
+        ));
+        assert!(!prefix_allowed(
+            &url("https://h.example/tenant-ab/x.png"),
+            &allow
+        ));
+        // A host-only prefix cannot be extended into another host.
+        let host_only = vec!["https://h.example".to_owned()];
+        assert!(prefix_allowed(&url("https://h.example/x.png"), &host_only));
+        assert!(!prefix_allowed(
+            &url("https://h.example.evil.test/x.png"),
+            &host_only
+        ));
+        assert!(!prefix_allowed(
+            &url("https://h.example@evil.test/x.png"),
+            &host_only
+        ));
+    }
+
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    async fn image_server() -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/img.png"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"PNG".to_vec()))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// The shared client reaches a NAMED host only through the address pinned
+    /// for the hop: the name below does not exist in DNS, so a 200 proves the
+    /// connection went to the pinned address.
+    #[tokio::test]
+    async fn pinned_host_is_fetched_from_the_vetted_address() {
+        let server = image_server().await;
+        let fetcher = Fetcher::new().unwrap();
+        let url = url(&format!(
+            "http://pinned.invalid:{}/img.png",
+            server.address().port()
+        ));
+        let resp = fetcher
+            .get_pinned(
+                url,
+                *server.address(),
+                Duration::from_secs(5),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    /// Fail closed: without a pin the client resolves nothing, not even a
+    /// name the system resolver knows (`localhost`), and a pin is gone as
+    /// soon as its hop ends, with no idle connection left to reuse.
+    #[tokio::test]
+    async fn unpinned_host_is_never_resolved_and_pins_do_not_outlive_their_hop() {
+        let server = image_server().await;
+        let fetcher = Fetcher::new().unwrap();
+        let target = url(&format!(
+            "http://localhost:{}/img.png",
+            server.address().port()
+        ));
+
+        // No pin at all: the system resolver would answer for `localhost`.
+        let unpinned = fetcher.client.get(target.clone()).send().await;
+        assert!(unpinned.is_err(), "{unpinned:?}");
+
+        // A pinned hop works, and reads its body.
+        let resp = fetcher
+            .get_pinned(
+                target.clone(),
+                *server.address(),
+                Duration::from_secs(5),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.bytes().await.unwrap().as_ref(), b"PNG");
+        assert!(fetcher.resolver.pinned("localhost").is_none());
+
+        // After the hop: no pin, and no kept-alive connection to fall back on.
+        let after = fetcher.client.get(target).send().await;
+        assert!(after.is_err(), "{after:?}");
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    /// A pin is scoped to its host and to its guard: other hosts stay
+    /// unresolvable, and concurrent hops on one host each remove only their
+    /// own pin.
+    #[test]
+    fn pins_are_per_host_and_removed_by_their_own_guard() {
+        let resolver = Arc::new(PinnedResolver::default());
+        let a: SocketAddr = "1.1.1.1:443".parse().unwrap();
+        let b: SocketAddr = "8.8.8.8:443".parse().unwrap();
+
+        let first = resolver.pin("h.example", a);
+        assert_eq!(resolver.pinned("h.example"), Some(a.ip()));
+        assert_eq!(resolver.pinned("other.example"), None);
+
+        let second = resolver.pin("h.example", b);
+        assert_eq!(resolver.pinned("h.example"), Some(b.ip()));
+        drop(first);
+        assert_eq!(resolver.pinned("h.example"), Some(b.ip()));
+        drop(second);
+        assert_eq!(resolver.pinned("h.example"), None);
+        assert!(resolver.pins.lock().unwrap().is_empty());
+    }
+
+    /// The port of a connection comes from the request URL, never from a
+    /// pin: a concurrent hop on another port of the same host (here a pin
+    /// for port 1, still held) must not redirect this hop there.
+    #[tokio::test]
+    async fn a_pin_for_another_port_of_the_host_does_not_change_the_port_dialled() {
+        let server = image_server().await;
+        let fetcher = Fetcher::new().unwrap();
+        let ip = server.address().ip();
+        let target = url(&format!(
+            "http://pinned.invalid:{}/img.png",
+            server.address().port()
+        ));
+
+        let hop = fetcher.resolver.pin("pinned.invalid", *server.address());
+        // Pinned later, so it is the pin the resolver answers with.
+        let other_port = fetcher
+            .resolver
+            .pin("pinned.invalid", SocketAddr::new(ip, 1));
+
+        let resp = fetcher
+            .client
+            .get(target)
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        drop((hop, other_port));
+    }
+
+    /// A cancelled hop drops its pin.
+    #[tokio::test]
+    async fn cancelled_hop_releases_its_pin() {
+        let fetcher = Fetcher::new().unwrap();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        // TEST-NET-1: never connected to, the cancelled branch wins first.
+        let err = fetcher
+            .get_pinned(
+                url("http://h.example/img.png"),
+                "192.0.2.1:80".parse().unwrap(),
+                Duration::from_secs(5),
+                &cancel,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, GatewayError::ImageFetchFailed), "{err:?}");
+        assert!(fetcher.resolver.pinned("h.example").is_none());
+    }
+
+    #[test]
+    fn unparseable_prefix_matches_nothing() {
+        let allow = vec!["not a url".to_owned()];
+        assert!(!prefix_allowed(&url("https://h.example/x.png"), &allow));
     }
 }

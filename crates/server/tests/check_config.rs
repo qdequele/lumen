@@ -181,6 +181,81 @@ fn check_config_succeeds_with_lumen_master_key_set_and_auth_enabled() {
     assert!(stdout.contains("config OK"), "stdout was: {stdout}");
 }
 
+/// `--check-config` is the deploy gate: it must refuse every boot file the
+/// real boot refuses without needing the database. In `config_source = "db"`
+/// mode the boot file may carry boot-layer keys only.
+#[test]
+fn check_config_refuses_a_db_mode_boot_file_carrying_dynamic_keys() {
+    let file = write_config(
+        r#"
+        config_source = "db"
+
+        [auth]
+        enabled = true
+
+        [[providers]]
+        name = "openai-main"
+        kind = "openai"
+
+        [[providers.models]]
+        id = "openai-main/gpt-4o"
+        capabilities = ["chat"]
+        "#,
+    );
+
+    let output = lumen()
+        .args(["--check-config", "--config"])
+        .arg(file.path())
+        .output()
+        .expect("run lumen --check-config");
+
+    assert!(
+        !output.status.success(),
+        "a boot file the real boot refuses must not print config OK: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("providers"), "stderr was: {stderr}");
+}
+
+/// `config_source = "db"` needs the auth database, so the real boot refuses
+/// it with auth off; the gate must too.
+#[test]
+fn check_config_refuses_db_mode_without_auth() {
+    let file = write_config("config_source = \"db\"\n");
+
+    let output = lumen()
+        .args(["--check-config", "--config"])
+        .arg(file.path())
+        .output()
+        .expect("run lumen --check-config");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("requires [auth] enabled = true"),
+        "stderr was: {stderr}"
+    );
+}
+
+/// A well-formed db-mode boot file still passes, without opening a database.
+#[test]
+fn check_config_accepts_a_boot_only_db_mode_file() {
+    let file = write_config("config_source = \"db\"\n\n[auth]\nenabled = true\n");
+
+    let output = lumen()
+        .args(["--check-config", "--config"])
+        .arg(file.path())
+        .output()
+        .expect("run lumen --check-config");
+
+    assert!(
+        output.status.success(),
+        "stderr was: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[test]
 fn help_text_documents_check_config() {
     let output = lumen().arg("--help").output().expect("run lumen --help");

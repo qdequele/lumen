@@ -13,6 +13,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use std::borrow::Cow;
 
 /// A document to rerank: a bare string, `{ "text": "..." }`, or (Cohere) an
 /// arbitrary JSON object whose fields are selected by the request's
@@ -35,7 +36,7 @@ pub enum RerankDocument {
 impl RerankDocument {
     /// Borrow the document text, regardless of which form it took. An object
     /// without a string `text` field borrows the empty string (the ranking text
-    /// is computed separately by [`into_rank_text`](Self::into_rank_text)).
+    /// is computed separately by [`rank_text`](Self::rank_text)).
     #[must_use]
     pub fn text(&self) -> &str {
         match self {
@@ -59,7 +60,7 @@ impl RerankDocument {
         }
     }
 
-    /// Consume the document, reducing it to the single text used for ranking.
+    /// The single text this document is ranked on.
     ///
     /// Bare strings are returned unchanged (`rank_fields` never applies to
     /// them). For object documents: when `rank_fields` is `Some` and non-empty,
@@ -67,22 +68,33 @@ impl RerankDocument {
     /// values via their compact JSON form) and joined with newlines in selector
     /// order, skipping absent fields (Cohere semantics); otherwise the object's
     /// `text` field is used.
+    ///
+    /// Borrowed unless `rank_fields` selects fields of an object document.
+    /// This is the one definition of the reduction: the gateway edge
+    /// ([`into_rank_text`](Self::into_rank_text)) and the token estimate
+    /// (`tokens::estimate_rerank`) both go through it, so what is counted is
+    /// what the provider ranks.
     #[must_use]
-    pub fn into_rank_text(self, rank_fields: Option<&[String]>) -> String {
-        match self {
-            RerankDocument::Text(s) => s,
-            RerankDocument::Object(map) => match rank_fields {
-                Some(fields) if !fields.is_empty() => fields
+    pub fn rank_text(&self, rank_fields: Option<&[String]>) -> Cow<'_, str> {
+        match (self, rank_fields) {
+            (RerankDocument::Object(map), Some(fields)) if !fields.is_empty() => Cow::Owned(
+                fields
                     .iter()
                     .filter_map(|f| map.get(f).map(value_to_text))
                     .collect::<Vec<_>>()
                     .join("\n"),
-                _ => map
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-                    .unwrap_or_default(),
-            },
+            ),
+            _ => Cow::Borrowed(self.text()),
+        }
+    }
+
+    /// Consume the document, reducing it to the single text used for ranking
+    /// (see [`rank_text`](Self::rank_text)).
+    #[must_use]
+    pub fn into_rank_text(self, rank_fields: Option<&[String]>) -> String {
+        match self {
+            RerankDocument::Text(s) => s,
+            object @ RerankDocument::Object(_) => object.rank_text(rank_fields).into_owned(),
         }
     }
 }
@@ -254,6 +266,7 @@ mod tests {
     fn rank_fields_do_not_apply_to_bare_strings() {
         let doc = RerankDocument::Text("bare".to_owned());
         let fields = vec!["title".to_owned()];
+        assert_eq!(doc.rank_text(Some(&fields)), "bare");
         assert_eq!(doc.into_rank_text(Some(&fields)), "bare");
     }
 

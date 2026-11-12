@@ -38,12 +38,14 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::BoxStream;
 use lumen_core::{
-    ChatChoice, ChatChunk, ChatMessage, ChatProvider, ChatRequest, ChatResponse, MessageContent,
-    ProviderError, Usage,
+    ChatChoice, ChatChunk, ChatMessage, ChatProvider, ChatRequest, ChatResponse,
+    CompletionTokensDetails, MessageContent, ProviderError, Usage,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio_util::sync::CancellationToken;
 
 use self::stream::GoogleTranslator;
@@ -189,6 +191,11 @@ struct GeminiPart {
     /// A tool result fed back to the model: `{ "name": ..., "response": {...} }`.
     #[serde(rename = "functionResponse", skip_serializing_if = "Option::is_none")]
     function_response: Option<serde_json::Value>,
+    /// The opaque thought signature Gemini attached to this part when it
+    /// produced it (a sibling of `functionCall`), replayed verbatim. Gemini 3
+    /// models answer 400 when a `functionCall` part comes back without it.
+    #[serde(rename = "thoughtSignature", skip_serializing_if = "Option::is_none")]
+    thought_signature: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -222,6 +229,7 @@ impl GeminiPart {
             file_data: None,
             function_call: None,
             function_response: None,
+            thought_signature: None,
         }
     }
 
@@ -233,17 +241,25 @@ impl GeminiPart {
             file_data: None,
             function_call: None,
             function_response: None,
+            thought_signature: None,
         }
     }
 
-    /// An assistant tool-call part (`functionCall`).
-    fn function_call(name: &str, args: &serde_json::Value) -> Self {
+    /// An assistant tool-call part (`functionCall`), with the thought
+    /// signature the call was originally returned with, if the history
+    /// carries one.
+    fn function_call(
+        name: &str,
+        args: &serde_json::Value,
+        thought_signature: Option<&str>,
+    ) -> Self {
         Self {
             text: None,
             inline_data: None,
             file_data: None,
             function_call: Some(json!({ "name": name, "args": args })),
             function_response: None,
+            thought_signature: thought_signature.map(str::to_owned),
         }
     }
 
@@ -255,6 +271,7 @@ impl GeminiPart {
             file_data: None,
             function_call: None,
             function_response: Some(json!({ "name": name, "response": response })),
+            thought_signature: None,
         }
     }
 
@@ -269,6 +286,7 @@ impl GeminiPart {
             }),
             function_call: None,
             function_response: None,
+            thought_signature: None,
         }
     }
 }
@@ -327,6 +345,44 @@ struct GeminiResponse {
     candidates: Vec<GeminiCandidate>,
     #[serde(rename = "usageMetadata", default)]
     usage_metadata: GeminiUsage,
+    #[serde(rename = "promptFeedback", default)]
+    prompt_feedback: Option<GeminiPromptFeedback>,
+}
+
+/// Gemini `promptFeedback`: when `blockReason` is set "the prompt was blocked
+/// and no candidates are returned" (HTTP 200 all the same).
+#[derive(Default, Deserialize)]
+pub(super) struct GeminiPromptFeedback {
+    #[serde(rename = "blockReason", default)]
+    block_reason: Option<String>,
+}
+
+/// A prompt-level block (`promptFeedback.blockReason` set, no candidates) as
+/// the content-filter refusal it is (LM-2013), rather than an empty success
+/// or, when streaming, a stream without a terminator (LM-3010). Gemini
+/// answers 200, so the carried status is a synthetic 400: the client's input
+/// was refused. Only the block reason enum is logged, never the prompt.
+pub(super) fn prompt_block_error(
+    feedback: Option<&GeminiPromptFeedback>,
+    has_candidates: bool,
+    provider_name: &str,
+) -> Option<ProviderError> {
+    if has_candidates {
+        return None;
+    }
+    let reason = feedback?.block_reason.as_deref()?;
+    if reason.is_empty() || reason == "BLOCK_REASON_UNSPECIFIED" {
+        return None;
+    }
+    tracing::debug!(
+        provider = provider_name,
+        block_reason = reason,
+        "gemini blocked the prompt (promptFeedback.blockReason)"
+    );
+    Some(ProviderError::ContentFiltered {
+        provider: provider_name.to_owned(),
+        status: 400,
+    })
 }
 
 #[derive(Deserialize)]
@@ -349,6 +405,8 @@ struct GeminiResponsePart {
     text: String,
     #[serde(rename = "functionCall", default)]
     function_call: Option<GeminiFunctionCall>,
+    #[serde(rename = "thoughtSignature", default)]
+    thought_signature: Option<String>,
 }
 
 /// A model-emitted tool call: Gemini returns the arguments as a JSON object
@@ -361,14 +419,99 @@ struct GeminiFunctionCall {
     args: serde_json::Value,
 }
 
+/// Gemini `usageMetadata` (shared by the streaming and non-streaming paths).
 #[derive(Default, Deserialize)]
-struct GeminiUsage {
+pub(super) struct GeminiUsage {
     #[serde(rename = "promptTokenCount", default)]
     prompt: u32,
+    /// Tokens of the tool-use prompt(s): what a built-in tool (code
+    /// execution, search) fed back to the model. Reported SEPARATELY from
+    /// `promptTokenCount` and billed as input.
+    #[serde(rename = "toolUsePromptTokenCount", default)]
+    tool_use_prompt: u32,
     #[serde(rename = "candidatesTokenCount", default)]
     candidates: u32,
+    /// Thinking tokens (thinking models only). Reported SEPARATELY from
+    /// `candidatesTokenCount`: `totalTokenCount` is documented as
+    /// `prompt + tool-use prompt + thoughts + response candidates`.
+    #[serde(rename = "thoughtsTokenCount", default)]
+    thoughts: Option<u32>,
+    /// `None` when the upstream sent no total (never read as a real 0).
     #[serde(rename = "totalTokenCount", default)]
-    total: u32,
+    total: Option<u32>,
+}
+
+impl GeminiUsage {
+    /// OpenAI-shaped usage, self-consistent: `total_tokens` is never below
+    /// `prompt_tokens + completion_tokens`.
+    ///
+    /// Thinking tokens are billed as output, so they are folded into
+    /// `completion_tokens` (OpenAI semantics: reasoning tokens are a subset
+    /// of completion tokens) and exposed as
+    /// `completion_tokens_details.reasoning_tokens`. Absent thoughts stay
+    /// absent, never a fabricated zero (ADR 003). Tool-use prompt tokens are
+    /// billed as input, so they are folded into `prompt_tokens`. The total is
+    /// the upstream `totalTokenCount`, raised to the sum of the parts when it
+    /// is absent or lower; a higher upstream total is kept, so a token
+    /// category this struct does not model is not under-reported.
+    pub(super) fn into_usage(self) -> Usage {
+        let prompt_tokens = self.prompt.saturating_add(self.tool_use_prompt);
+        let completion_tokens = self
+            .candidates
+            .saturating_add(self.thoughts.unwrap_or_default());
+        let parts = prompt_tokens.saturating_add(completion_tokens);
+        Usage {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens: self.total.unwrap_or_default().max(parts),
+            estimated: None,
+            // Gemini cached-content tokens are not surfaced yet (issue #99 scope).
+            prompt_tokens_details: None,
+            completion_tokens_details: self.thoughts.map(|t| CompletionTokensDetails {
+                reasoning_tokens: Some(t),
+            }),
+        }
+    }
+}
+
+/// JSON pointer to a tool call's Gemini thought signature in the OpenAI
+/// shape. This is where Google's own OpenAI-compatible endpoint carries it
+/// (`tool_calls[i].extra_content.google.thought_signature`), so a client that
+/// already round-trips it for that endpoint works unchanged.
+const THOUGHT_SIGNATURE_POINTER: &str = "/extra_content/google/thought_signature";
+
+/// Attach a part's `thoughtSignature` to the OpenAI tool call built from it
+/// (see [`THOUGHT_SIGNATURE_POINTER`]). The signature is opaque and must be
+/// replayed verbatim with the call: Gemini 3 models reject (400) a
+/// `functionCall` part sent back without the signature it was issued with.
+/// Absent signatures add nothing.
+pub(super) fn with_thought_signature(
+    mut tool_call: serde_json::Value,
+    signature: Option<String>,
+) -> serde_json::Value {
+    if let (Some(signature), Some(map)) = (signature, tool_call.as_object_mut()) {
+        map.insert(
+            "extra_content".to_owned(),
+            json!({ "google": { "thought_signature": signature } }),
+        );
+    }
+    tool_call
+}
+
+/// A fresh prefix for the tool-call ids synthesized for ONE response (Gemini
+/// returns none). The ids are `{prefix}_{index}`: unique within the response
+/// by index, and across responses by the prefix (wall-clock nanoseconds plus
+/// a process-wide counter), so a multi-turn history never holds two calls
+/// with the same id (which breaks clients and providers that pair a tool
+/// result with its call by id). Replay does not depend on the format:
+/// [`translate_request`] maps whatever id the history carries to its name.
+pub(super) fn new_tool_call_id_prefix() -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("call_{nanos:x}{n:x}")
 }
 
 /// Translate a Gemini `finishReason` to an OpenAI `finish_reason`.
@@ -547,6 +690,8 @@ fn push_assistant_tool_calls(
             parts.push(GeminiPart::function_call(
                 name,
                 &parse_tool_arguments(call.pointer("/function/arguments")),
+                call.pointer(THOUGHT_SIGNATURE_POINTER)
+                    .and_then(|v| v.as_str()),
             ));
         }
     }
@@ -577,7 +722,11 @@ fn tool_response_value(text: &str) -> serde_json::Value {
 
 /// OpenAI `tools` (`{type: "function", function: {name, description,
 /// parameters}}`) → one Gemini `tools[]` entry whose `functionDeclarations`
-/// hold every function. Non-function entries are skipped.
+/// hold every function. Non-function entries are skipped. `parameters` is the
+/// same OpenAPI-subset `Schema` type as `responseSchema`, so it goes through
+/// the same [`sanitize_gemini_schema`] pass: OpenAI clients (and strict-mode
+/// tool schemas in particular) routinely send `additionalProperties: false`
+/// and `$schema`, which Gemini rejects as unknown fields.
 fn translate_tools(req: &ChatRequest) -> Vec<GeminiTool> {
     let Some(tools) = req.extra.get("tools").and_then(|v| v.as_array()) else {
         return Vec::new();
@@ -592,7 +741,10 @@ fn translate_tools(req: &ChatRequest) -> Vec<GeminiTool> {
                     .get("description")
                     .and_then(|v| v.as_str())
                     .map(str::to_owned),
-                parameters: function.get("parameters").cloned(),
+                parameters: function.get("parameters").cloned().map(|mut schema| {
+                    sanitize_gemini_schema(&mut schema);
+                    schema
+                }),
             })
         })
         .collect();
@@ -710,7 +862,8 @@ fn translate_response_format(
     }
 }
 
-/// Strip JSON Schema keywords Gemini's OpenAPI-subset `responseSchema` rejects
+/// Strip JSON Schema keywords Gemini's OpenAPI-subset `Schema` type (used by
+/// `responseSchema` and by function-declaration `parameters`) rejects
 /// (`additionalProperties`, `$schema`), recursing only through positions that
 /// hold sub-SCHEMAS (`properties` values, `items`, `anyOf`/`allOf`/`oneOf`
 /// entries) so a property literally named `additionalProperties` is untouched.
@@ -723,7 +876,7 @@ fn sanitize_gemini_schema(schema: &mut serde_json::Value) {
             tracing::debug!(
                 keyword,
                 "gemini chat: stripped a JSON Schema keyword Gemini's \
-                 responseSchema does not accept (it is dropped, not enforced)"
+                 Schema type does not accept (it is dropped, not enforced)"
             );
         }
     }
@@ -757,30 +910,50 @@ fn collect_stop_sequences(stop: &serde_json::Value) -> Vec<String> {
 }
 
 /// Build an OpenAI-shaped [`ChatResponse`] from a Gemini response.
-fn translate_response(resp: GeminiResponse, requested_model: &str) -> ChatResponse {
+///
+/// # Errors
+/// Returns [`ProviderError::ContentFiltered`] when Gemini blocked the prompt
+/// (`promptFeedback.blockReason` with no candidates).
+fn translate_response(
+    resp: GeminiResponse,
+    requested_model: &str,
+    provider_name: &str,
+) -> Result<ChatResponse, ProviderError> {
+    if let Some(err) = prompt_block_error(
+        resp.prompt_feedback.as_ref(),
+        !resp.candidates.is_empty(),
+        provider_name,
+    ) {
+        return Err(err);
+    }
     let mut text = String::new();
     let mut tool_calls: Vec<serde_json::Value> = Vec::new();
     let mut finish_reason = None;
+    let id_prefix = new_tool_call_id_prefix();
     if let Some(candidate) = resp.candidates.into_iter().next() {
         finish_reason = map_finish_reason(candidate.finish_reason.as_deref());
         for part in candidate.content.parts {
             if let Some(call) = part.function_call {
-                // Gemini omits a call id; synthesize a stable, per-response one.
+                // Gemini omits a call id; synthesize one unique to this
+                // response (see `new_tool_call_id_prefix`).
                 let index = tool_calls.len();
                 let args = if call.args.is_null() {
                     json!({})
                 } else {
                     call.args
                 };
-                tool_calls.push(json!({
-                    "id": format!("call_{index}"),
-                    "type": "function",
-                    "function": {
-                        "name": call.name,
-                        // OpenAI carries arguments as a JSON string.
-                        "arguments": args.to_string(),
-                    },
-                }));
+                tool_calls.push(with_thought_signature(
+                    json!({
+                        "id": format!("{id_prefix}_{index}"),
+                        "type": "function",
+                        "function": {
+                            "name": call.name,
+                            // OpenAI carries arguments as a JSON string.
+                            "arguments": args.to_string(),
+                        },
+                    }),
+                    part.thought_signature,
+                ));
             } else {
                 text.push_str(&part.text);
             }
@@ -803,17 +976,9 @@ fn translate_response(resp: GeminiResponse, requested_model: &str) -> ChatRespon
         Some(MessageContent::Text(text))
     };
 
-    let usage = Usage {
-        prompt_tokens: resp.usage_metadata.prompt,
-        completion_tokens: resp.usage_metadata.candidates,
-        total_tokens: resp.usage_metadata.total,
-        estimated: None,
-        // Gemini cached-content tokens are not surfaced yet (issue #99 scope).
-        prompt_tokens_details: None,
-        completion_tokens_details: None,
-    };
+    let usage = resp.usage_metadata.into_usage();
 
-    ChatResponse {
+    Ok(ChatResponse {
         id: String::new(),
         object: "chat.completion".to_owned(),
         created: 0, // Gemini does not return a creation timestamp.
@@ -830,7 +995,7 @@ fn translate_response(resp: GeminiResponse, requested_model: &str) -> ChatRespon
         }],
         usage: Some(usage),
         extra: serde_json::Map::new(),
-    }
+    })
 }
 
 #[async_trait]
@@ -866,7 +1031,7 @@ impl ChatProvider for GoogleProvider {
 
         let parsed: GeminiResponse = serde_json::from_slice(&bytes)
             .map_err(|e| ProviderError::Translation(format!("google gemini response: {e}")))?;
-        Ok(translate_response(parsed, &req.model))
+        translate_response(parsed, &req.model, &self.provider_name)
     }
 
     async fn chat_stream(
@@ -931,7 +1096,7 @@ pub mod fuzzing {
     /// whatever parses; must never panic on malformed or adversarial input.
     pub fn fuzz_translate_response(data: &[u8], requested_model: &str) {
         if let Ok(resp) = serde_json::from_slice::<GeminiResponse>(data) {
-            let _ = translate_response(resp, requested_model);
+            let _ = translate_response(resp, requested_model, "fuzz");
         }
     }
 }
@@ -969,7 +1134,7 @@ impl GoogleProvider {
         .await?;
         Ok(translate_sse_stream(
             bytes,
-            GoogleTranslator::new(&req.model),
+            GoogleTranslator::new(&req.model, &self.provider_name),
         ))
     }
 }
@@ -1054,6 +1219,316 @@ mod tests {
         assert_eq!(cfg.stop_sequences, vec!["END".to_owned()]);
     }
 
+    /// Thinking tokens are reported apart from `candidatesTokenCount` but are
+    /// part of `totalTokenCount`: they must land in `completion_tokens` and
+    /// `completion_tokens_details.reasoning_tokens`.
+    #[test]
+    fn thoughts_tokens_count_as_completion_and_reasoning_tokens() {
+        let resp: GeminiResponse = serde_json::from_value(json!({
+            "candidates": [{
+                "content": { "parts": [{ "text": "ok" }] },
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 10,
+                "candidatesTokenCount": 4,
+                "thoughtsTokenCount": 30,
+                "totalTokenCount": 44
+            }
+        }))
+        .unwrap();
+        let usage = translate_response(resp, "gemini-2.5-pro", "google")
+            .unwrap()
+            .usage
+            .unwrap();
+        assert_eq!(usage.prompt_tokens, 10);
+        assert_eq!(usage.completion_tokens, 34);
+        assert_eq!(usage.total_tokens, 44);
+        assert_eq!(usage.reasoning_tokens(), Some(30));
+    }
+
+    /// `toolUsePromptTokenCount` is billed input that `promptTokenCount` does
+    /// not include (the documented total is `prompt + tool-use prompt +
+    /// thoughts + candidates`): it belongs in `prompt_tokens`, so the parts
+    /// add up to the total.
+    #[test]
+    fn tool_use_prompt_tokens_count_as_prompt_tokens() {
+        let resp: GeminiResponse = serde_json::from_value(json!({
+            "candidates": [{ "content": { "parts": [{ "text": "ok" }] }, "finishReason": "STOP" }],
+            "usageMetadata": {
+                "promptTokenCount": 10,
+                "toolUsePromptTokenCount": 25,
+                "candidatesTokenCount": 4,
+                "thoughtsTokenCount": 6,
+                "totalTokenCount": 45
+            }
+        }))
+        .unwrap();
+        let usage = translate_response(resp, "gemini-2.5-pro", "google")
+            .unwrap()
+            .usage
+            .unwrap();
+        assert_eq!(usage.prompt_tokens, 35);
+        assert_eq!(usage.completion_tokens, 10);
+        assert_eq!(usage.total_tokens, 45);
+        assert_eq!(
+            usage.total_tokens,
+            usage.prompt_tokens + usage.completion_tokens
+        );
+    }
+
+    /// An absent `totalTokenCount` is computed from the parts, never
+    /// reported as 0 next to non-zero parts.
+    #[test]
+    fn absent_total_token_count_is_computed_from_the_parts() {
+        let resp: GeminiResponse = serde_json::from_value(json!({
+            "candidates": [{ "content": { "parts": [{ "text": "ok" }] }, "finishReason": "STOP" }],
+            "usageMetadata": { "promptTokenCount": 10, "candidatesTokenCount": 4 }
+        }))
+        .unwrap();
+        let usage = translate_response(resp, "gemini-2.0", "google")
+            .unwrap()
+            .usage
+            .unwrap();
+        assert_eq!(usage.prompt_tokens, 10);
+        assert_eq!(usage.completion_tokens, 4);
+        assert_eq!(usage.total_tokens, 14);
+    }
+
+    /// An upstream total above the sum of the reported parts is kept (a
+    /// category this gateway does not model must not be under-reported); one
+    /// below it is raised to the sum.
+    #[test]
+    fn upstream_total_is_never_below_the_sum_of_the_parts() {
+        let usage = |total: u32| {
+            let resp: GeminiResponse = serde_json::from_value(json!({
+                "candidates": [{ "content": { "parts": [{ "text": "ok" }] }, "finishReason": "STOP" }],
+                "usageMetadata": {
+                    "promptTokenCount": 10, "candidatesTokenCount": 4, "totalTokenCount": total
+                }
+            }))
+            .unwrap();
+            translate_response(resp, "gemini-2.0", "google")
+                .unwrap()
+                .usage
+                .unwrap()
+        };
+        assert_eq!(usage(20).total_tokens, 20);
+        assert_eq!(usage(3).total_tokens, 14);
+    }
+
+    /// Without `thoughtsTokenCount` no reasoning breakdown is fabricated.
+    #[test]
+    fn absent_thoughts_tokens_leave_no_reasoning_breakdown() {
+        let resp: GeminiResponse = serde_json::from_value(json!({
+            "candidates": [{ "content": { "parts": [{ "text": "ok" }] }, "finishReason": "STOP" }],
+            "usageMetadata": {
+                "promptTokenCount": 10, "candidatesTokenCount": 4, "totalTokenCount": 14
+            }
+        }))
+        .unwrap();
+        let usage = translate_response(resp, "gemini-2.0", "google")
+            .unwrap()
+            .usage
+            .unwrap();
+        assert_eq!(usage.completion_tokens, 4);
+        assert_eq!(usage.completion_tokens_details, None);
+    }
+
+    /// A 200 with `promptFeedback.blockReason` and no candidates is a
+    /// content-policy refusal naming the provider, not an empty success.
+    #[test]
+    fn prompt_level_block_is_content_filtered() {
+        let resp: GeminiResponse = serde_json::from_value(json!({
+            "promptFeedback": { "blockReason": "SAFETY" },
+            "usageMetadata": { "promptTokenCount": 9, "totalTokenCount": 9 }
+        }))
+        .unwrap();
+        let err = translate_response(resp, "gemini-2.0", "google-main").unwrap_err();
+        assert!(
+            matches!(&err, ProviderError::ContentFiltered { provider, status: 400 } if provider == "google-main"),
+            "{err:?}"
+        );
+    }
+
+    /// Prompt feedback without a block reason, or alongside candidates, is
+    /// not a refusal.
+    #[test]
+    fn prompt_feedback_without_block_reason_is_not_an_error() {
+        let resp: GeminiResponse = serde_json::from_value(json!({
+            "candidates": [{ "content": { "parts": [{ "text": "ok" }] }, "finishReason": "STOP" }],
+            "promptFeedback": { "safetyRatings": [] }
+        }))
+        .unwrap();
+        assert!(translate_response(resp, "gemini-2.0", "google").is_ok());
+    }
+
+    /// Tool `parameters` are the same `Schema` type as `responseSchema`: the
+    /// keywords Gemini rejects are stripped at every schema level, while a
+    /// property that merely happens to be NAMED `additionalProperties` stays.
+    #[test]
+    fn tool_parameters_are_sanitized_like_response_schema() {
+        let mut req = request(vec![msg("user", "hi")]);
+        req.extra.insert(
+            "tools".to_owned(),
+            json!([{
+                "type": "function",
+                "function": {
+                    "name": "lookup",
+                    "description": "d",
+                    "parameters": {
+                        "$schema": "http://json-schema.org/draft-07/schema#",
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "filter": {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "properties": { "additionalProperties": { "type": "string" } }
+                            },
+                            "tags": {
+                                "type": "array",
+                                "items": { "type": "object", "additionalProperties": false }
+                            }
+                        },
+                        "required": ["filter"]
+                    }
+                }
+            }]),
+        );
+        let out = serde_json::to_value(translate_request(&req, "google").unwrap()).unwrap();
+        let params = &out["tools"][0]["functionDeclarations"][0]["parameters"];
+        assert!(params.get("$schema").is_none(), "{params}");
+        assert!(params.get("additionalProperties").is_none(), "{params}");
+        let filter = &params["properties"]["filter"];
+        assert!(filter.get("additionalProperties").is_none(), "{filter}");
+        assert_eq!(
+            filter["properties"]["additionalProperties"]["type"],
+            "string"
+        );
+        assert!(params["properties"]["tags"]["items"]
+            .get("additionalProperties")
+            .is_none());
+        assert_eq!(params["required"], json!(["filter"]));
+    }
+
+    fn two_call_response() -> GeminiResponse {
+        serde_json::from_value(json!({
+            "candidates": [{
+                "content": { "parts": [
+                    { "functionCall": { "name": "a", "args": {} } },
+                    { "functionCall": { "name": "b", "args": {} } }
+                ] },
+                "finishReason": "STOP"
+            }]
+        }))
+        .unwrap()
+    }
+
+    fn call_ids(resp: &ChatResponse) -> Vec<String> {
+        resp.choices[0].message.extra["tool_calls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["id"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    /// Synthesized tool-call ids are unique within a response AND across
+    /// responses, so a multi-turn history never repeats one.
+    #[test]
+    fn synthesized_tool_call_ids_are_unique_across_responses() {
+        let first = translate_response(two_call_response(), "g", "google").unwrap();
+        let second = translate_response(two_call_response(), "g", "google").unwrap();
+        let mut ids = call_ids(&first);
+        ids.extend(call_ids(&second));
+        assert_eq!(ids.len(), 4);
+        let unique: std::collections::HashSet<&String> = ids.iter().collect();
+        assert_eq!(unique.len(), 4, "{ids:?}");
+        assert!(ids.iter().all(|id| id.starts_with("call_")), "{ids:?}");
+    }
+
+    /// The ids produced by two turns replay to the right function names.
+    #[test]
+    fn synthesized_ids_from_two_turns_replay_to_their_own_names() {
+        let mut history = vec![msg("user", "go")];
+        let mut expected = Vec::new();
+        for names in [["a", "b"], ["c", "d"]] {
+            let resp: GeminiResponse = serde_json::from_value(json!({
+                "candidates": [{
+                    "content": { "parts": [
+                        { "functionCall": { "name": names[0], "args": {} } },
+                        { "functionCall": { "name": names[1], "args": {} } }
+                    ] },
+                    "finishReason": "STOP"
+                }]
+            }))
+            .unwrap();
+            let out = translate_response(resp, "g", "google").unwrap();
+            let ids = call_ids(&out);
+            history.push(out.choices[0].message.clone());
+            // Answer in reverse order to prove the lookup is by id.
+            for (id, name) in ids.iter().zip(names).rev() {
+                let mut extra = serde_json::Map::new();
+                extra.insert("tool_call_id".to_owned(), json!(id));
+                history.push(ChatMessage {
+                    role: "tool".to_owned(),
+                    content: Some(MessageContent::Text("{}".to_owned())),
+                    name: None,
+                    extra,
+                });
+                expected.push(name);
+            }
+        }
+        let body =
+            serde_json::to_value(translate_request(&request(history), "google").unwrap()).unwrap();
+        let replayed: Vec<String> = body["contents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|c| c["parts"].as_array().unwrap().iter())
+            .filter_map(|p| p.get("functionResponse"))
+            .map(|r| r["name"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(replayed, expected);
+    }
+
+    /// A `thoughtSignature` on a `functionCall` part survives the round trip:
+    /// out on the tool call (where Google's OpenAI-compatible endpoint puts
+    /// it), back in as a sibling of the replayed `functionCall`. A call
+    /// without one (parallel calls carry it on the first only) gets none.
+    #[test]
+    fn thought_signature_round_trips_through_the_openai_tool_call() {
+        let resp: GeminiResponse = serde_json::from_value(json!({
+            "candidates": [{
+                "content": { "parts": [
+                    { "functionCall": { "name": "a", "args": { "x": 1 } }, "thoughtSignature": "SIG_A" },
+                    { "functionCall": { "name": "b", "args": {} } }
+                ] },
+                "finishReason": "STOP"
+            }]
+        }))
+        .unwrap();
+        let out = translate_response(resp, "gemini-3", "google").unwrap();
+        let assistant = out.choices[0].message.clone();
+        let calls = assistant.extra["tool_calls"].as_array().unwrap();
+        assert_eq!(
+            calls[0]["extra_content"]["google"]["thought_signature"],
+            "SIG_A"
+        );
+        assert!(calls[1].get("extra_content").is_none(), "{}", calls[1]);
+
+        let body = serde_json::to_value(
+            translate_request(&request(vec![msg("user", "go"), assistant]), "google").unwrap(),
+        )
+        .unwrap();
+        let parts = body["contents"][1]["parts"].as_array().unwrap();
+        assert_eq!(parts[0]["functionCall"]["name"], "a");
+        assert_eq!(parts[0]["thoughtSignature"], "SIG_A");
+        assert_eq!(parts[1]["functionCall"]["name"], "b");
+        assert!(parts[1].get("thoughtSignature").is_none(), "{}", parts[1]);
+    }
+
     #[test]
     fn response_concatenates_parts_and_maps_usage() {
         let resp = GeminiResponse {
@@ -1063,22 +1538,27 @@ mod tests {
                         GeminiResponsePart {
                             text: "Hello ".to_owned(),
                             function_call: None,
+                            thought_signature: None,
                         },
                         GeminiResponsePart {
                             text: "there".to_owned(),
                             function_call: None,
+                            thought_signature: None,
                         },
                     ],
                 },
                 finish_reason: Some("MAX_TOKENS".to_owned()),
             }],
+            prompt_feedback: None,
             usage_metadata: GeminiUsage {
                 prompt: 7,
                 candidates: 4,
-                total: 11,
+                tool_use_prompt: 0,
+                thoughts: None,
+                total: Some(11),
             },
         };
-        let out = translate_response(resp, "gemini-2.0");
+        let out = translate_response(resp, "gemini-2.0", "google").unwrap();
         assert_eq!(
             out.choices[0]
                 .message
@@ -1277,17 +1757,21 @@ mod tests {
                             name: "get_weather".to_owned(),
                             args: json!({ "city": "Paris" }),
                         }),
+                        thought_signature: None,
                     }],
                 },
                 finish_reason: Some("STOP".to_owned()),
             }],
+            prompt_feedback: None,
             usage_metadata: GeminiUsage {
                 prompt: 4,
                 candidates: 2,
-                total: 6,
+                tool_use_prompt: 0,
+                thoughts: None,
+                total: Some(6),
             },
         };
-        let out = translate_response(resp, "gemini-2.0");
+        let out = translate_response(resp, "gemini-2.0", "google").unwrap();
         let message = &out.choices[0].message;
         // Pure tool-call message: content is null, tool_calls carry the call.
         assert_eq!(message.content, None);
