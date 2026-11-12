@@ -13,7 +13,7 @@ use lumen_core::{ChatChunk, ChatChunkChoice, ChatDelta, ProviderError, Usage};
 use serde::Deserialize;
 use serde_json::json;
 
-use super::map_finish_reason;
+use super::{map_finish_reason, GeminiUsage};
 use crate::chat::{SseTranslator, StreamItem};
 use crate::sse::SseEvent;
 
@@ -160,14 +160,7 @@ impl SseTranslator for GoogleTranslator {
 
         if finish.is_some() {
             // The final fragment: emit the finish/usage chunk, then terminate.
-            let usage = parsed.usage_metadata.map(|u| Usage {
-                prompt_tokens: u.prompt,
-                completion_tokens: u.candidates,
-                total_tokens: u.total,
-                estimated: None,
-                prompt_tokens_details: None,
-                completion_tokens_details: None,
-            });
+            let usage = parsed.usage_metadata.map(GeminiUsage::into_usage);
             items.push(StreamItem::Chunk(self.chunk(
                 ChatDelta::default(),
                 finish,
@@ -187,7 +180,7 @@ struct GeminiStreamChunk {
     #[serde(default)]
     candidates: Vec<GeminiStreamCandidate>,
     #[serde(rename = "usageMetadata", default)]
-    usage_metadata: Option<GeminiStreamUsage>,
+    usage_metadata: Option<GeminiUsage>,
 }
 
 #[derive(Deserialize)]
@@ -220,16 +213,6 @@ struct GeminiStreamFunctionCall {
     name: String,
     #[serde(default)]
     args: serde_json::Value,
-}
-
-#[derive(Deserialize)]
-struct GeminiStreamUsage {
-    #[serde(rename = "promptTokenCount", default)]
-    prompt: u32,
-    #[serde(rename = "candidatesTokenCount", default)]
-    candidates: u32,
-    #[serde(rename = "totalTokenCount", default)]
-    total: u32,
 }
 
 #[cfg(test)]
@@ -362,6 +345,32 @@ mod tests {
             panic!("expected chunk")
         };
         assert_eq!(finish.choices[0].finish_reason.as_deref(), Some("length"));
+    }
+
+    #[test]
+    fn stream_usage_folds_thoughts_into_completion_tokens() {
+        let mut t = GoogleTranslator::new("g");
+        let items = t
+            .translate(&event(serde_json::json!({
+                "candidates": [{ "content": { "parts": [{ "text": "x" }] }, "finishReason": "STOP" }],
+                "usageMetadata": {
+                    "promptTokenCount": 10,
+                    "candidatesTokenCount": 4,
+                    "thoughtsTokenCount": 30,
+                    "totalTokenCount": 44
+                }
+            })))
+            .expect("ok");
+        let usage = items
+            .iter()
+            .find_map(|i| match i {
+                StreamItem::Chunk(c) => c.usage,
+                StreamItem::Done => None,
+            })
+            .expect("usage");
+        assert_eq!(usage.completion_tokens, 34);
+        assert_eq!(usage.total_tokens, 44);
+        assert_eq!(usage.reasoning_tokens(), Some(30));
     }
 
     #[test]

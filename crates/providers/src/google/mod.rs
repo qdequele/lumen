@@ -38,8 +38,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::BoxStream;
 use lumen_core::{
-    ChatChoice, ChatChunk, ChatMessage, ChatProvider, ChatRequest, ChatResponse, MessageContent,
-    ProviderError, Usage,
+    ChatChoice, ChatChunk, ChatMessage, ChatProvider, ChatRequest, ChatResponse,
+    CompletionTokensDetails, MessageContent, ProviderError, Usage,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -361,14 +361,43 @@ struct GeminiFunctionCall {
     args: serde_json::Value,
 }
 
+/// Gemini `usageMetadata` (shared by the streaming and non-streaming paths).
 #[derive(Default, Deserialize)]
-struct GeminiUsage {
+pub(super) struct GeminiUsage {
     #[serde(rename = "promptTokenCount", default)]
     prompt: u32,
     #[serde(rename = "candidatesTokenCount", default)]
     candidates: u32,
+    /// Thinking tokens (thinking models only). Reported SEPARATELY from
+    /// `candidatesTokenCount`: `totalTokenCount` is documented as
+    /// `prompt + tool-use prompt + thoughts + response candidates`.
+    #[serde(rename = "thoughtsTokenCount", default)]
+    thoughts: Option<u32>,
     #[serde(rename = "totalTokenCount", default)]
     total: u32,
+}
+
+impl GeminiUsage {
+    /// OpenAI-shaped usage. Thinking tokens are billed as output, so they are
+    /// folded into `completion_tokens` (OpenAI semantics: reasoning tokens are
+    /// a subset of completion tokens) and exposed as
+    /// `completion_tokens_details.reasoning_tokens`. Absent thoughts stay
+    /// absent, never a fabricated zero (ADR 003).
+    pub(super) fn into_usage(self) -> Usage {
+        Usage {
+            prompt_tokens: self.prompt,
+            completion_tokens: self
+                .candidates
+                .saturating_add(self.thoughts.unwrap_or_default()),
+            total_tokens: self.total,
+            estimated: None,
+            // Gemini cached-content tokens are not surfaced yet (issue #99 scope).
+            prompt_tokens_details: None,
+            completion_tokens_details: self.thoughts.map(|t| CompletionTokensDetails {
+                reasoning_tokens: Some(t),
+            }),
+        }
+    }
 }
 
 /// Translate a Gemini `finishReason` to an OpenAI `finish_reason`.
@@ -803,15 +832,7 @@ fn translate_response(resp: GeminiResponse, requested_model: &str) -> ChatRespon
         Some(MessageContent::Text(text))
     };
 
-    let usage = Usage {
-        prompt_tokens: resp.usage_metadata.prompt,
-        completion_tokens: resp.usage_metadata.candidates,
-        total_tokens: resp.usage_metadata.total,
-        estimated: None,
-        // Gemini cached-content tokens are not surfaced yet (issue #99 scope).
-        prompt_tokens_details: None,
-        completion_tokens_details: None,
-    };
+    let usage = resp.usage_metadata.into_usage();
 
     ChatResponse {
         id: String::new(),
@@ -1054,6 +1075,46 @@ mod tests {
         assert_eq!(cfg.stop_sequences, vec!["END".to_owned()]);
     }
 
+    /// Thinking tokens are reported apart from `candidatesTokenCount` but are
+    /// part of `totalTokenCount`: they must land in `completion_tokens` and
+    /// `completion_tokens_details.reasoning_tokens`.
+    #[test]
+    fn thoughts_tokens_count_as_completion_and_reasoning_tokens() {
+        let resp: GeminiResponse = serde_json::from_value(json!({
+            "candidates": [{
+                "content": { "parts": [{ "text": "ok" }] },
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 10,
+                "candidatesTokenCount": 4,
+                "thoughtsTokenCount": 30,
+                "totalTokenCount": 44
+            }
+        }))
+        .unwrap();
+        let usage = translate_response(resp, "gemini-2.5-pro").usage.unwrap();
+        assert_eq!(usage.prompt_tokens, 10);
+        assert_eq!(usage.completion_tokens, 34);
+        assert_eq!(usage.total_tokens, 44);
+        assert_eq!(usage.reasoning_tokens(), Some(30));
+    }
+
+    /// Without `thoughtsTokenCount` no reasoning breakdown is fabricated.
+    #[test]
+    fn absent_thoughts_tokens_leave_no_reasoning_breakdown() {
+        let resp: GeminiResponse = serde_json::from_value(json!({
+            "candidates": [{ "content": { "parts": [{ "text": "ok" }] }, "finishReason": "STOP" }],
+            "usageMetadata": {
+                "promptTokenCount": 10, "candidatesTokenCount": 4, "totalTokenCount": 14
+            }
+        }))
+        .unwrap();
+        let usage = translate_response(resp, "gemini-2.0").usage.unwrap();
+        assert_eq!(usage.completion_tokens, 4);
+        assert_eq!(usage.completion_tokens_details, None);
+    }
+
     #[test]
     fn response_concatenates_parts_and_maps_usage() {
         let resp = GeminiResponse {
@@ -1075,6 +1136,7 @@ mod tests {
             usage_metadata: GeminiUsage {
                 prompt: 7,
                 candidates: 4,
+                thoughts: None,
                 total: 11,
             },
         };
@@ -1284,6 +1346,7 @@ mod tests {
             usage_metadata: GeminiUsage {
                 prompt: 4,
                 candidates: 2,
+                thoughts: None,
                 total: 6,
             },
         };
