@@ -294,6 +294,8 @@ pub async fn create_key(
         };
         scope.guard_group(&auth.store, group_id).await?;
     }
+    // Ordered against the hot reload's table refresh (`AuthState::sync_guard`).
+    let _sync = auth.keys.sync_guard().await;
     let (plaintext, record) = auth.store.create_key(params).await.map_err(store_error)?;
     // Make the key usable immediately, without waiting for a reboot.
     auth.keys.upsert(hash_key(plaintext.reveal()), &record);
@@ -328,15 +330,16 @@ pub async fn list_keys(
 ) -> Result<Json<Vec<VirtualKeyRecord>>, ApiError> {
     let Query(params) = params.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
     let auth = runtime(&state)?;
-    let mut keys = auth
+    // Filtered in SQL (bound parameters), not over every row in memory.
+    let keys = auth
         .store
-        .list_keys(params.include_deleted)
+        .list_keys_filtered(&lumen_auth::store::KeyListFilter {
+            include_deleted: params.include_deleted,
+            external_ref: params.external_ref,
+            scope_account_ref: scope.account().map(str::to_owned),
+        })
         .await
         .map_err(|e| internal(&e))?;
-    if let Some(want) = &params.external_ref {
-        keys.retain(|k| k.external_ref.as_deref() == Some(want.as_str()));
-    }
-    let keys = scope.filter_keys(&auth.store, keys).await?;
     Ok(Json(keys))
 }
 
@@ -382,6 +385,9 @@ pub async fn patch_key(
     if patch.group_id.is_some() {
         flush_before_billability_change(shared).await?;
     }
+    // Held across the DB write and the live apply, so a reload that read the
+    // old row cannot re-apply it afterwards (`AuthState::sync_guard`).
+    let _sync = auth.keys.sync_guard().await;
     let updated = auth
         .store
         .update_key(&id, patch)
@@ -413,6 +419,9 @@ pub async fn delete_key(
     // Tombstones of the account pass, so a retry still repairs a missed
     // eviction below (see `AccountScope::guard_key_delete`).
     scope.guard_key_delete(&auth.store, &id).await?;
+    // Held across the tombstone and the eviction, so a reload that read the
+    // row while it was live cannot re-insert the key (`AuthState::sync_guard`).
+    let sync = auth.keys.sync_guard().await;
     let deleted = auth.store.delete_key(&id).await.map_err(|e| internal(&e))?;
     // Evict from the live table UNCONDITIONALLY - whether this call's DB
     // write actually matched a row (`Some`) or the row was already
@@ -423,7 +432,10 @@ pub async fn delete_key(
     // restart would notice. Making the eviction unconditional means every
     // retry repairs a previously missed one, so the zombie window closes on
     // the very next delete attempt rather than lasting until a restart.
-    if let Some(entry) = auth.keys.remove(&id) {
+    let evicted = auth.keys.remove(&id);
+    // Released before the flush below, which takes the flush guard.
+    drop(sync);
+    if let Some(entry) = evicted {
         // Announce the removal only when THIS call's DB write is the one that
         // tombstoned the row: a retry that only repaired a missed eviction
         // (see above) must not fire a second `key.deleted` (ADR 011 §1).
@@ -453,6 +465,7 @@ pub async fn rotate_key(
 ) -> Result<Json<CreatedKey>, ApiError> {
     let auth = runtime(&state)?;
     scope.guard_key(&auth.store, &id).await?;
+    let _sync = auth.keys.sync_guard().await;
     let (plaintext, record) = auth
         .store
         .rotate_key(&id)
@@ -512,6 +525,7 @@ pub async fn create_group(
         params.account_ref.as_deref(),
         auth.keys.billing_enabled(),
     )?;
+    let _sync = auth.keys.sync_guard().await;
     let record = auth.store.create_group(params).await.map_err(store_error)?;
     // Make the group joinable and enforced immediately, no restart.
     auth.keys.upsert_group(&record);
@@ -540,22 +554,22 @@ pub async fn list_groups(
 ) -> Result<Json<Vec<GroupRecord>>, ApiError> {
     let Query(params) = params.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
     let auth = runtime(&state)?;
-    let mut groups = auth
+    // Filtered in SQL (bound parameters), not over every row in memory.
+    let groups = auth
         .store
-        .list_groups(params.include_deleted)
+        .list_groups_filtered(&lumen_auth::store::GroupListFilter {
+            include_deleted: params.include_deleted,
+            // Stored refs are canonical (a UUID is lowercase): compare that form.
+            account_ref: params
+                .account_ref
+                .map(lumen_auth::billing::canonical_account_ref),
+            parent_id: params.parent_id,
+            // Applied on top of the query filter, so `?account_ref=<other>` on
+            // a scoped call narrows to nothing rather than widening the scope.
+            scope_account_ref: scope.account().map(str::to_owned),
+        })
         .await
         .map_err(|e| internal(&e))?;
-    if let Some(want) = params.account_ref {
-        // Stored refs are canonical (a UUID is lowercase): compare that form.
-        let want = lumen_auth::billing::canonical_account_ref(want);
-        groups.retain(|g| g.account_ref.as_deref() == Some(want.as_str()));
-    }
-    if let Some(parent) = params.parent_id {
-        groups.retain(|g| g.parent_id.as_deref() == Some(parent.as_str()));
-    }
-    // Applied on top of the query filter, so `?account_ref=<other>` on a
-    // scoped call narrows to nothing rather than widening the scope.
-    groups.retain(|g| scope.allows_group(g));
     Ok(Json(groups))
 }
 
@@ -640,6 +654,7 @@ pub async fn patch_group(
         }
         flush_before_billability_change(shared).await?;
     }
+    let _sync = auth.keys.sync_guard().await;
     let updated = auth
         .store
         .update_group(&id, patch)
@@ -661,6 +676,7 @@ pub async fn delete_group(
 ) -> Result<StatusCode, ApiError> {
     let auth = runtime(&state)?;
     scope.guard_group(&auth.store, &id).await?;
+    let _sync = auth.keys.sync_guard().await;
     let outcome = auth
         .store
         .delete_group(&id)
@@ -750,6 +766,7 @@ pub async fn grant_key(
     let amount = validated_grant_amount(payload)?;
     let auth = runtime(&state)?;
     scope.guard_key(&auth.store, &id).await?;
+    let _sync = auth.keys.sync_guard().await;
     let record = auth
         .store
         .grant_key_budget(&id, amount)
@@ -781,6 +798,7 @@ pub async fn grant_group(
     let amount = validated_grant_amount(payload)?;
     let auth = runtime(&state)?;
     scope.guard_group(&auth.store, &id).await?;
+    let _sync = auth.keys.sync_guard().await;
     let record = auth
         .store
         .grant_group_budget(&id, amount)

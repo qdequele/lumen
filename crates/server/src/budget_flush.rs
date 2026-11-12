@@ -20,7 +20,8 @@ use std::sync::Arc;
 /// was nothing to flush), `false` when serialization or the store failed (the
 /// batch is rolled back first, so the next flush retries it). The group flush
 /// does not affect billing, so its failure is logged but never changes the
-/// return value. Callers that must not proceed with unbilled spend (admin
+/// return value; the drained groups are marked dirty again, so the next flush
+/// retries them even if they see no further traffic. Callers that must not proceed with unbilled spend (admin
 /// changes of billability) fail closed on `false`.
 #[must_use]
 pub async fn flush_budgets(runtime: &AuthRuntime) -> bool {
@@ -31,6 +32,12 @@ pub async fn flush_budgets(runtime: &AuthRuntime) -> bool {
     let groups = runtime.keys.drain_dirty_groups();
     if !groups.is_empty() {
         if let Err(error) = runtime.store.persist_group_budgets(&groups).await {
+            // Draining cleared the dirty flags: put them back, or a group
+            // with no further traffic is never flushed again (the shutdown
+            // flush included) and boot reloads a stale, lower pool spend.
+            runtime
+                .keys
+                .mark_groups_dirty(groups.iter().map(|(id, _)| id.as_str()));
             tracing::warn!(%error, "group budget flush failed; will retry next interval");
         }
     }

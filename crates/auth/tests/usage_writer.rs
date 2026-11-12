@@ -1,7 +1,11 @@
 //! Tests for the bounded-channel usage writer (M5 §5.3).
 
 use lumen_auth::store::{KeyStore, UsageRecord};
-use lumen_auth::usage::{spawn_usage_writer, UsageWriterConfig};
+use lumen_auth::usage::{
+    spawn_usage_writer, spawn_usage_writer_with_drop_hook, UsageDropHook, UsageWriterConfig,
+};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 fn record(model: &str) -> UsageRecord {
@@ -118,4 +122,81 @@ async fn shutdown_drains_pending_records() {
     drop(logger); // last sender gone → writer drains and exits
     writer.await.expect("writer task completes");
     assert_eq!(store.count_usage().await.expect("count"), 1);
+}
+
+/// Make every `usage_log` insert fail until the trigger is dropped.
+async fn refuse_usage_inserts(store: &KeyStore) {
+    sqlx::query(
+        "CREATE TRIGGER refuse_usage BEFORE INSERT ON usage_log \
+         BEGIN SELECT RAISE(ABORT, 'usage insert refused'); END",
+    )
+    .execute(store.pool())
+    .await
+    .expect("create trigger");
+}
+
+/// A drop hook and the counter it feeds.
+fn counting_hook() -> (UsageDropHook, Arc<AtomicUsize>) {
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let sink = Arc::clone(&dropped);
+    let hook: UsageDropHook = Arc::new(move |rows| {
+        sink.fetch_add(rows, Ordering::SeqCst);
+    });
+    (hook, dropped)
+}
+
+#[tokio::test]
+async fn a_batch_that_fails_twice_is_counted_as_dropped() {
+    let store = KeyStore::in_memory().await.expect("store");
+    refuse_usage_inserts(&store).await;
+    let (hook, dropped) = counting_hook();
+    let (logger, writer) = spawn_usage_writer_with_drop_hook(
+        store.clone(),
+        UsageWriterConfig {
+            capacity: 100,
+            batch_max: 500,
+            flush_interval: Duration::from_secs(3600),
+        },
+        hook,
+    );
+
+    assert!(logger.log(record("lost-1")));
+    assert!(logger.log(record("lost-2")));
+    drop(logger); // the shutdown drain is the flush under test
+    writer.await.expect("writer task completes");
+
+    assert_eq!(
+        dropped.load(Ordering::SeqCst),
+        2,
+        "rows the writer discards must reach the dropped counter, not only a log line"
+    );
+    assert_eq!(store.count_usage().await.expect("count"), 0);
+}
+
+#[tokio::test]
+async fn a_failed_batch_is_retried_once_before_being_dropped() {
+    let store = KeyStore::in_memory().await.expect("store");
+    refuse_usage_inserts(&store).await;
+    let (hook, dropped) = counting_hook();
+    let (logger, _writer) = spawn_usage_writer_with_drop_hook(
+        store.clone(),
+        UsageWriterConfig {
+            capacity: 100,
+            batch_max: 1, // flush on the first record, no interval involved
+            flush_interval: Duration::from_secs(3600),
+        },
+        hook,
+    );
+
+    assert!(logger.log(record("retried")));
+    // The first attempt fails right away; the store recovers inside the
+    // writer's retry pause (250 ms), so the retry lands the row.
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    sqlx::query("DROP TRIGGER refuse_usage")
+        .execute(store.pool())
+        .await
+        .expect("drop trigger");
+
+    wait_for_count(&store, 1).await;
+    assert_eq!(dropped.load(Ordering::SeqCst), 0, "nothing was lost");
 }
