@@ -13,7 +13,10 @@ use lumen_core::{ChatChunk, ChatChunkChoice, ChatDelta, ProviderError, Usage};
 use serde::Deserialize;
 use serde_json::json;
 
-use super::{map_finish_reason, prompt_block_error, GeminiPromptFeedback, GeminiUsage};
+use super::{
+    map_finish_reason, new_tool_call_id_prefix, prompt_block_error, GeminiPromptFeedback,
+    GeminiUsage,
+};
 use crate::chat::{SseTranslator, StreamItem};
 use crate::sse::SseEvent;
 
@@ -29,6 +32,9 @@ pub(super) struct GoogleTranslator {
     finished: bool,
     /// Next OpenAI tool-call index to allocate (Gemini has no block indices).
     next_tool_index: u64,
+    /// Prefix of the tool-call ids synthesized for this response, unique
+    /// across responses (see [`new_tool_call_id_prefix`]).
+    tool_call_id_prefix: String,
     /// Set once any `functionCall` part was forwarded; a trailing Gemini
     /// `STOP` then maps to OpenAI's `tool_calls` rather than `stop`.
     saw_tool_call: bool,
@@ -42,6 +48,7 @@ impl GoogleTranslator {
             started: false,
             finished: false,
             next_tool_index: 0,
+            tool_call_id_prefix: new_tool_call_id_prefix(),
             saw_tool_call: false,
         }
     }
@@ -139,7 +146,7 @@ impl SseTranslator for GoogleTranslator {
                 };
                 tool_deltas.push(json!({
                     "index": index,
-                    "id": format!("call_{index}"),
+                    "id": format!("{}_{index}", self.tool_call_id_prefix),
                     "type": "function",
                     "function": { "name": call.name, "arguments": args.to_string() },
                 }));
@@ -412,6 +419,35 @@ mod tests {
             })))
             .expect("ok");
         assert!(late.is_empty(), "{late:?}");
+    }
+
+    /// Two streams never synthesize the same tool-call id, and two calls in
+    /// one stream differ by index.
+    #[test]
+    fn stream_tool_call_ids_are_unique_across_streams() {
+        let fragment = serde_json::json!({
+            "candidates": [{
+                "content": { "parts": [
+                    { "functionCall": { "name": "a", "args": {} } },
+                    { "functionCall": { "name": "b", "args": {} } }
+                ] },
+                "finishReason": "STOP"
+            }]
+        });
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            let mut t = GoogleTranslator::new("g", "google-test");
+            for item in t.translate(&event(fragment.clone())).expect("ok") {
+                if let StreamItem::Chunk(c) = item {
+                    if let Some(calls) = c.choices[0].delta.extra.get("tool_calls") {
+                        ids.push(calls[0]["id"].as_str().expect("id").to_owned());
+                    }
+                }
+            }
+        }
+        assert_eq!(ids.len(), 4);
+        let unique: std::collections::HashSet<&String> = ids.iter().collect();
+        assert_eq!(unique.len(), 4, "{ids:?}");
     }
 
     #[test]

@@ -44,6 +44,8 @@ use lumen_core::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio_util::sync::CancellationToken;
 
 use self::stream::GoogleTranslator;
@@ -436,6 +438,22 @@ impl GeminiUsage {
             }),
         }
     }
+}
+
+/// A fresh prefix for the tool-call ids synthesized for ONE response (Gemini
+/// returns none). The ids are `{prefix}_{index}`: unique within the response
+/// by index, and across responses by the prefix (wall-clock nanoseconds plus
+/// a process-wide counter), so a multi-turn history never holds two calls
+/// with the same id (which breaks clients and providers that pair a tool
+/// result with its call by id). Replay does not depend on the format:
+/// [`translate_request`] maps whatever id the history carries to its name.
+pub(super) fn new_tool_call_id_prefix() -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("call_{nanos:x}{n:x}")
 }
 
 /// Translate a Gemini `finishReason` to an OpenAI `finish_reason`.
@@ -851,11 +869,13 @@ fn translate_response(
     let mut text = String::new();
     let mut tool_calls: Vec<serde_json::Value> = Vec::new();
     let mut finish_reason = None;
+    let id_prefix = new_tool_call_id_prefix();
     if let Some(candidate) = resp.candidates.into_iter().next() {
         finish_reason = map_finish_reason(candidate.finish_reason.as_deref());
         for part in candidate.content.parts {
             if let Some(call) = part.function_call {
-                // Gemini omits a call id; synthesize a stable, per-response one.
+                // Gemini omits a call id; synthesize one unique to this
+                // response (see `new_tool_call_id_prefix`).
                 let index = tool_calls.len();
                 let args = if call.args.is_null() {
                     json!({})
@@ -863,7 +883,7 @@ fn translate_response(
                     call.args
                 };
                 tool_calls.push(json!({
-                    "id": format!("call_{index}"),
+                    "id": format!("{id_prefix}_{index}"),
                     "type": "function",
                     "function": {
                         "name": call.name,
@@ -1257,6 +1277,87 @@ mod tests {
             .get("additionalProperties")
             .is_none());
         assert_eq!(params["required"], json!(["filter"]));
+    }
+
+    fn two_call_response() -> GeminiResponse {
+        serde_json::from_value(json!({
+            "candidates": [{
+                "content": { "parts": [
+                    { "functionCall": { "name": "a", "args": {} } },
+                    { "functionCall": { "name": "b", "args": {} } }
+                ] },
+                "finishReason": "STOP"
+            }]
+        }))
+        .unwrap()
+    }
+
+    fn call_ids(resp: &ChatResponse) -> Vec<String> {
+        resp.choices[0].message.extra["tool_calls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["id"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    /// Synthesized tool-call ids are unique within a response AND across
+    /// responses, so a multi-turn history never repeats one.
+    #[test]
+    fn synthesized_tool_call_ids_are_unique_across_responses() {
+        let first = translate_response(two_call_response(), "g", "google").unwrap();
+        let second = translate_response(two_call_response(), "g", "google").unwrap();
+        let mut ids = call_ids(&first);
+        ids.extend(call_ids(&second));
+        assert_eq!(ids.len(), 4);
+        let unique: std::collections::HashSet<&String> = ids.iter().collect();
+        assert_eq!(unique.len(), 4, "{ids:?}");
+        assert!(ids.iter().all(|id| id.starts_with("call_")), "{ids:?}");
+    }
+
+    /// The ids produced by two turns replay to the right function names.
+    #[test]
+    fn synthesized_ids_from_two_turns_replay_to_their_own_names() {
+        let mut history = vec![msg("user", "go")];
+        let mut expected = Vec::new();
+        for names in [["a", "b"], ["c", "d"]] {
+            let resp: GeminiResponse = serde_json::from_value(json!({
+                "candidates": [{
+                    "content": { "parts": [
+                        { "functionCall": { "name": names[0], "args": {} } },
+                        { "functionCall": { "name": names[1], "args": {} } }
+                    ] },
+                    "finishReason": "STOP"
+                }]
+            }))
+            .unwrap();
+            let out = translate_response(resp, "g", "google").unwrap();
+            let ids = call_ids(&out);
+            history.push(out.choices[0].message.clone());
+            // Answer in reverse order to prove the lookup is by id.
+            for (id, name) in ids.iter().zip(names).rev() {
+                let mut extra = serde_json::Map::new();
+                extra.insert("tool_call_id".to_owned(), json!(id));
+                history.push(ChatMessage {
+                    role: "tool".to_owned(),
+                    content: Some(MessageContent::Text("{}".to_owned())),
+                    name: None,
+                    extra,
+                });
+                expected.push(name);
+            }
+        }
+        let body =
+            serde_json::to_value(translate_request(&request(history), "google").unwrap()).unwrap();
+        let replayed: Vec<String> = body["contents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|c| c["parts"].as_array().unwrap().iter())
+            .filter_map(|p| p.get("functionResponse"))
+            .map(|r| r["name"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(replayed, expected);
     }
 
     #[test]
