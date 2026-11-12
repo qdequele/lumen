@@ -317,12 +317,22 @@ impl BedrockProvider {
     /// values are picked up per request.
     fn request_credentials(&self) -> Result<Credentials, ProviderError> {
         let missing = || {
-            // No secret leaks: this only reports that config is incomplete.
-            ProviderError::Translation(format!(
-                "bedrock provider '{}' has no AWS credentials configured \
-                 (set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY)",
-                self.provider_name
-            ))
+            // No request was sent, so this is not an unparseable upstream
+            // response (LM-3002): it is an upstream auth failure attributed to
+            // this provider, like Vertex without a service account (a 502
+            // naming the provider, never a misleading gateway 401). No secret
+            // leaks: the log only reports that config is incomplete.
+            tracing::warn!(
+                provider = %self.provider_name,
+                "bedrock provider has no AWS credentials configured \
+                 (set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY)"
+            );
+            ProviderError::Upstream {
+                provider: self.provider_name.clone(),
+                status: 401,
+                retryable: false,
+                retry_after: None,
+            }
         };
         match &self.credentials {
             CredentialSource::Static(creds) => Ok(creds.clone()),
@@ -1512,7 +1522,16 @@ mod tests {
             .chat(request(vec![msg("user", "hi")]), CancellationToken::new())
             .await
             .expect_err("no creds should fail before sending");
-        assert!(matches!(err, ProviderError::Translation(_)));
+        // Consistent with Vertex: a non-retryable upstream auth failure
+        // naming the provider, not LM-3002 "invalid upstream response".
+        assert!(
+            matches!(
+                &err,
+                ProviderError::Upstream { provider, status: 401, retryable: false, .. }
+                    if provider == "bedrock"
+            ),
+            "{err:?}"
+        );
     }
 
     /// The env credential source must never leak its secret override through
