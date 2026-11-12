@@ -356,7 +356,7 @@ fn translate_request(req: &ChatRequest, stream: bool) -> AnthropicRequest {
             Some(system_parts.join("\n\n"))
         },
         temperature: req.temperature,
-        top_p: req.top_p,
+        top_p: effective_top_p(req),
         stop_sequences,
         tools,
         tool_choice,
@@ -366,6 +366,48 @@ fn translate_request(req: &ChatRequest, stream: bool) -> AnthropicRequest {
             .and_then(translate_response_format),
         stream,
     }
+}
+
+/// The `top_p` to send. Current Claude models accept `temperature` or `top_p`
+/// but not both, and answer 400 to a request carrying the pair, which OpenAI
+/// clients send routinely. When both are set `temperature` wins and `top_p`
+/// is dropped (traced), rather than turning a working OpenAI request into an
+/// upstream error.
+fn effective_top_p(req: &ChatRequest) -> Option<f32> {
+    if req.temperature.is_some() && req.top_p.is_some() {
+        tracing::debug!(
+            "anthropic chat: `temperature` and `top_p` are both set; dropping `top_p` \
+             (the Messages API accepts only one of them)"
+        );
+        return None;
+    }
+    req.top_p
+}
+
+/// OpenAI `n > 1` (several completions) has no Messages API equivalent: one
+/// message is always returned. Handled like [`UNSUPPORTED_CHAT_FIELDS`]
+/// (`n` is a typed request field, not part of `extra`): rejected in strict
+/// mode (`LM-1001`), dropped with a `debug` trace otherwise. `n` of 1 (or
+/// unset) is the default and always fine.
+///
+/// # Errors
+/// Returns [`ProviderError::UnsupportedField`] in strict mode when `n > 1`.
+fn check_n(provider: &str, strict: bool, n: Option<u32>) -> Result<(), ProviderError> {
+    if n.is_some_and(|n| n > 1) {
+        if strict {
+            return Err(ProviderError::UnsupportedField {
+                provider: provider.to_owned(),
+                field: "n".to_owned(),
+            });
+        }
+        tracing::debug!(
+            provider,
+            n,
+            "anthropic chat: `n` (multiple completions) has no Messages API equivalent; \
+             only one completion will be returned"
+        );
+    }
+    Ok(())
 }
 
 /// Build an Anthropic message `content`: a plain string when there are no
@@ -748,6 +790,7 @@ impl AnthropicProvider {
             UNSUPPORTED_CHAT_FIELDS,
         )?;
         check_response_format(&self.provider_name, self.strict, &req.extra)?;
+        check_n(&self.provider_name, self.strict, req.n)?;
         let url = format!("{}/v1/messages", self.base_url);
         let body = translate_request(&req, true);
         let headers = [
@@ -785,6 +828,7 @@ impl ChatProvider for AnthropicProvider {
             UNSUPPORTED_CHAT_FIELDS,
         )?;
         check_response_format(&self.provider_name, self.strict, &req.extra)?;
+        check_n(&self.provider_name, self.strict, req.n)?;
         let url = format!("{}/v1/messages", self.base_url);
         let body = translate_request(&req, false);
         let headers = [
