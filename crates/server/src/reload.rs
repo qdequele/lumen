@@ -566,7 +566,10 @@ pub async fn reload_once(ctx: &Arc<ConfigContext>, targets: &Arc<ReloadTargets>)
         Ok(config) => config,
         Err(error) => {
             targets.metrics.inc_failure();
-            tracing::warn!(%error, "config reload rejected; keeping the running config");
+            tracing::warn!(
+                error = %error.log_summary(),
+                "config reload rejected; keeping the running config"
+            );
             return;
         }
     };

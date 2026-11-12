@@ -667,10 +667,14 @@ async fn boot_config_context(
             // the boot file, so the bind address, log format, auth switch
             // and DB path always come from the boot file alone - a stored
             // document can neither disable auth nor silently rebind.
-            let config = ctx
-                .load_config()
-                .await
-                .context("config_source = \"db\": the stored config document cannot be loaded")?;
+            // `log_summary`: this error ends up in the fatal log line, and a
+            // parse failure's full message quotes the stored document.
+            let config = ctx.load_config().await.map_err(|error| {
+                anyhow::anyhow!(
+                    "config_source = \"db\": the stored config document cannot be loaded: {}",
+                    error.log_summary()
+                )
+            })?;
             Ok((config, ctx, Some(store)))
         }
     }

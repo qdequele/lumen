@@ -2033,3 +2033,80 @@ async fn config_document_writes_cannot_name_an_unresolvable_signing_key() {
         .await;
     assert_eq!(response.status(), 204);
 }
+
+// ---- A rejected config write never logs document content -------------------
+
+#[derive(Clone)]
+struct BufMakeWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+struct BufGuard(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for BufMakeWriter {
+    type Writer = BufGuard;
+    fn make_writer(&'a self) -> Self::Writer {
+        BufGuard(self.0.clone())
+    }
+}
+
+impl std::io::Write for BufGuard {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().expect("log buffer").extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A config document holds operator prompt text (`remap.instructions`,
+/// presets), which is never logged. toml and figment both embed document
+/// content in their error messages (the offending source line for a syntax
+/// error, the offending value for a type error), so a rejected write logs
+/// only the error kind, key path and position. The client that sent the
+/// document still gets the full message.
+#[tokio::test(flavor = "current_thread")]
+async fn a_rejected_config_write_never_logs_document_content() {
+    const PROMPT: &str = "SENTINEL-OPERATOR-PROMPT-TEXT";
+    let buffer = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(BufMakeWriter(buffer.clone()))
+        .with_ansi(false)
+        .with_max_level(tracing::Level::TRACE)
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+    // Another test may have cached "never" for these callsites first.
+    tracing::callsite::rebuild_interest_cache();
+
+    let h = spawn_admin(registry()).await;
+    let hash = h.current_hash().await;
+    let head = "[[virtual_models]]\nid = \"acme/rerank\"\ncapability = \"rerank\"\nstrategy = \"single\"\n";
+    // A syntax error on the line holding the prompt, then a type error whose
+    // offending value IS the prompt.
+    let syntax = format!(
+        "{}\n{head}targets = [{{ model = \"x/y\", remap = {{ instructions = \"{PROMPT}\" oops }} }}]\n",
+        h.valid_config()
+    );
+    let wrong_type = format!(
+        "{}\n{head}targets = [{{ model = \"x/y\", remap = \"{PROMPT}\" }}]\n",
+        h.valid_config()
+    );
+    for doc in [syntax, wrong_type] {
+        let response = h.put_config(&doc, &hash).await;
+        assert_eq!(response.status(), 400);
+        let body: Value = response.json().await.expect("json");
+        assert_eq!(body["error"]["code"], "LM-1001");
+    }
+
+    let logs = String::from_utf8_lossy(&buffer.lock().expect("log buffer")).into_owned();
+    assert!(
+        logs.contains("config apply rejected"),
+        "the rejection is still logged: {logs}"
+    );
+    assert!(
+        !logs.contains(PROMPT),
+        "document content reached the logs: {logs}"
+    );
+    assert!(
+        logs.contains("line") && logs.contains("column"),
+        "the position is still logged: {logs}"
+    );
+}

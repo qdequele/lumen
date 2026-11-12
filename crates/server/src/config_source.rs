@@ -351,6 +351,20 @@ pub enum ConfigLoadError {
     Registry(#[from] RegistryError),
 }
 
+impl ConfigLoadError {
+    /// This error for a LOG line: a config parse failure prints its
+    /// content-free summary ([`ConfigError::log_summary`]) so no document
+    /// content (operator prompt text included) reaches a log; the other
+    /// variants carry none and print as usual.
+    #[must_use]
+    pub fn log_summary(&self) -> String {
+        match self {
+            Self::Config(error) => error.log_summary(),
+            Self::Source(_) | Self::Registry(_) => self.to_string(),
+        }
+    }
+}
+
 /// Where the dynamic config document lives, bundled with the boot file path
 /// and the mode (ADR 012): the one thing every caller that needs "the current
 /// config" or "is this candidate document valid" goes through, instead of

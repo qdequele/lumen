@@ -1685,7 +1685,7 @@ fn require_if_match(headers: &axum::http::HeaderMap) -> Result<String, ApiError>
 /// 4. Validate the candidate
 ///    ([`ConfigContext::validate_document`](crate::config_source::ConfigContext::validate_document):
 ///    parse, semantic validation, a throwaway registry build) - `LM-1001`
-///    (400) on failure, logged in full at `warn` and scrubbed of any
+///    (400) on failure, logged at `warn` without document content and scrubbed of any
 ///    filesystem path before it reaches the client
 ///    ([`describe_validation_rejection`]).
 /// 5. Persist through `ctx.source`. Its own compare-and-swap is a second,
@@ -1733,7 +1733,14 @@ where
         // for the same reason every other rejection below is (see
         // `describe_validation_rejection`'s doc comment): `ApiError`'s
         // `IntoResponse` only logs at `debug` for a non-5xx response.
-        tracing::warn!(%error, "config apply rejected: candidate document failed to parse");
+        //
+        // Logged as its content-free summary: the full message quotes the
+        // document (which holds operator prompt text) and goes to the client
+        // that sent it, never to a log.
+        tracing::warn!(
+            error = %error.log_summary(),
+            "config apply rejected: candidate document failed to parse"
+        );
         GatewayError::InvalidRequest(error.to_string())
     })?;
     if !diff.is_empty() {
@@ -1762,7 +1769,7 @@ where
         // ever validated or persisted.
         ensure_dynamic_only(&candidate, "candidate").map_err(|error| {
             tracing::warn!(
-                %error,
+                error = %error.log_summary(),
                 "config apply rejected: candidate document carried a boot-layer key in \
                  config_source = \"db\" mode"
             );
@@ -1925,7 +1932,8 @@ pub(crate) fn source_internal_error(error: &ConfigSourceError) -> ApiError {
 /// `RegistryError`'s variants never embed a path, so those pass through
 /// unchanged.
 ///
-/// The full detail - path included - still needs to reach a human somewhere,
+/// The detail (path, error kind, key path, position; never document content)
+/// still needs to reach a human somewhere,
 /// since a rejected apply is exactly the kind of thing an operator wants a
 /// record of. It does NOT reach it via `ApiError`'s `IntoResponse`
 /// (`crate::error`): that only logs `code` and `status` for a non-5xx
@@ -1933,7 +1941,14 @@ pub(crate) fn source_internal_error(error: &ConfigSourceError) -> ApiError {
 /// this function logs it directly, at `warn`, before scrubbing the message
 /// down to what the client is allowed to see.
 fn describe_validation_rejection(error: &ConfigLoadError) -> ApiError {
-    tracing::warn!(error = %error, "config apply rejected: candidate document failed validation");
+    // `log_summary`, not `Display`: a parse failure's full message quotes
+    // the document (the offending line or value), and a document holds
+    // operator prompt text that is never logged. The path, error kind, key
+    // path and line/column all survive.
+    tracing::warn!(
+        error = %error.log_summary(),
+        "config apply rejected: candidate document failed validation"
+    );
     match error {
         ConfigLoadError::Config(config_error) => match config_error {
             ConfigError::Parse { message, .. } | ConfigError::Validation { message, .. } => {
@@ -2014,8 +2029,9 @@ fn describe_validation_rejection(error: &ConfigLoadError) -> ApiError {
 /// any `LM-1001`.
 pub(crate) fn config_from_document(text: &str) -> Result<Config, ApiError> {
     toml::from_str::<Config>(text).map_err(|error| {
+        // Position only: toml's `Display` quotes the offending source line.
         tracing::error!(
-            %error,
+            position = %crate::config::toml_position(text, error.span()),
             "stored config document failed to parse while serving a granular admin read; \
              this should be unreachable, since every persisted document is validated first"
         );
@@ -2033,8 +2049,14 @@ pub(crate) fn config_from_document(text: &str) -> Result<Config, ApiError> {
 /// itself failed against a document that was already validated when it was
 /// persisted - an internal inconsistency, not a client mistake.
 fn edit_internal_error(error: &config_edit::EditError) -> ApiError {
-    tracing::error!(%error, "config document edit failed against an already-validated document");
-    GatewayError::Internal(error.to_string()).into()
+    // The summary, for the log line and for the internal error alike (a 5xx
+    // is logged with its message): `toml_edit` quotes the source line.
+    let summary = error.log_summary();
+    tracing::error!(
+        error = %summary,
+        "config document edit failed against an already-validated document"
+    );
+    GatewayError::Internal(summary).into()
 }
 
 /// One entry in [`ProvidersList`]: just enough to pick a provider without

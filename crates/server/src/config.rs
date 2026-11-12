@@ -1131,7 +1131,13 @@ pub enum ConfigError {
         /// The config file path (for the operator's benefit).
         path: String,
         /// Human-readable reason, naming the offending field where possible.
+        /// May embed document content (toml renders the offending source
+        /// line, figment the offending value): fit for the client that sent
+        /// the document or the operator's terminal, never for a log line.
         message: String,
+        /// The same failure with no document content: error kind, key path
+        /// and line/column only. What [`ConfigError::log_summary`] prints.
+        summary: String,
     },
     /// The config parsed but failed a semantic validation rule.
     #[error("invalid config '{path}': {message}")]
@@ -1196,13 +1202,127 @@ pub enum ConfigError {
 /// stays correct if figment ever reorders or restyles its own `Display`,
 /// where a suffix-trim would silently stop matching.
 fn describe_figment_error(error: &figment::Error) -> String {
+    render_figment_error(error, ToString::to_string)
+}
+
+/// [`describe_figment_error`] with every piece of document content withheld,
+/// for log lines: a config document holds operator prompt text
+/// (`remap.instructions`, presets), and figment's own rendering embeds the
+/// offending value (`invalid type: found string "..."`) or, for a syntax
+/// error, toml's rendering of the whole offending source line. Kept: the
+/// error kind, what was expected, key and field NAMES, and the line/column.
+fn summarize_figment_error(error: &figment::Error) -> String {
+    render_figment_error(error, summarize_figment_kind)
+}
+
+/// A figment error kind with the offending value reduced to its type.
+fn summarize_figment_kind(kind: &figment::error::Kind) -> String {
+    use figment::error::Kind;
+
+    match kind {
+        // A free-form message. The one this loader produces in practice is
+        // toml's syntax error, whose FIRST line is the position alone
+        // ("TOML parse error at line 5, column 90"); the lines after it
+        // quote the source. Any other custom message is withheld whole.
+        Kind::Message(message) => match message.lines().next() {
+            Some(first) if first.starts_with("TOML parse error at line ") => first.to_owned(),
+            _ => "invalid value (detail withheld)".to_owned(),
+        },
+        Kind::InvalidType(actual, expected) => {
+            format!(
+                "invalid type: found {}, expected {expected}",
+                actual_kind(actual)
+            )
+        }
+        Kind::InvalidValue(actual, expected) => {
+            format!(
+                "invalid value: found {}, expected {expected}",
+                actual_kind(actual)
+            )
+        }
+        Kind::InvalidLength(length, expected) => {
+            format!("invalid length {length}, expected {expected}")
+        }
+        // The variant found is a document VALUE: withheld. The accepted
+        // names are compiled in.
+        Kind::UnknownVariant(_, expected) => {
+            format!("unknown variant, expected one of: {}", expected.join(", "))
+        }
+        // Field names are keys, not values.
+        Kind::UnknownField(field, _) => format!("unknown field `{field}`"),
+        Kind::MissingField(field) => format!("missing field `{field}`"),
+        Kind::DuplicateField(field) => format!("duplicate field `{field}`"),
+        Kind::ISizeOutOfRange(_) | Kind::USizeOutOfRange(_) => "integer out of range".to_owned(),
+        Kind::Unsupported(actual) => format!("unsupported type {}", actual_kind(actual)),
+        Kind::UnsupportedKey(actual, _) => {
+            format!("unsupported key type {}", actual_kind(actual))
+        }
+    }
+}
+
+/// The TYPE of a value figment found, never the value itself.
+fn actual_kind(actual: &figment::error::Actual) -> &'static str {
+    use figment::error::Actual;
+
+    match actual {
+        Actual::Bool(_) => "bool",
+        Actual::Unsigned(_) => "unsigned int",
+        Actual::Signed(_) => "signed int",
+        Actual::Float(_) => "float",
+        Actual::Char(_) => "char",
+        Actual::Str(_) => "string",
+        Actual::Bytes(_) => "bytes",
+        Actual::Unit => "unit",
+        Actual::Option => "option",
+        Actual::Seq => "sequence",
+        Actual::Map => "map",
+        Actual::NewtypeStruct
+        | Actual::Enum
+        | Actual::UnitVariant
+        | Actual::NewtypeVariant
+        | Actual::TupleVariant
+        | Actual::StructVariant
+        | Actual::Other(_) => "another type",
+    }
+}
+
+/// "line L, column C" (both from 1) for the start of `span` in `text`, the
+/// content-free way to point at a TOML error. `toml` and `toml_edit` errors
+/// both expose their position only as a byte span (or inside a `Display`
+/// that quotes the source line).
+pub(crate) fn toml_position(text: &str, span: Option<std::ops::Range<usize>>) -> String {
+    let Some(span) = span else {
+        return "an unknown position".to_owned();
+    };
+    // Clamp to the text and back off to a char boundary: a span is produced
+    // by the parser, but nothing here may panic on a surprising one.
+    let mut start = span.start.min(text.len());
+    while !text.is_char_boundary(start) {
+        start -= 1;
+    }
+    let before = &text[..start];
+    let line = before.matches('\n').count() + 1;
+    let column = before
+        .rsplit('\n')
+        .next()
+        .map_or(0, |tail| tail.chars().count())
+        + 1;
+    format!("line {line}, column {column}")
+}
+
+/// One line per error level: `render` turns the kind into text, and the key
+/// path (when figment knows it) is appended.
+fn render_figment_error(
+    error: &figment::Error,
+    render: impl Fn(&figment::error::Kind) -> String,
+) -> String {
     use std::fmt::Write as _;
 
     error
         .clone()
         .into_iter()
         .map(|level| {
-            let mut message = level.kind.to_string();
+            let mut message = render(&level.kind);
             if let (Some(profile), Some(metadata)) = (&level.profile, &level.metadata) {
                 if !level.path.is_empty() {
                     let key = metadata.interpolate(profile, &level.path);
@@ -1214,6 +1334,26 @@ fn describe_figment_error(error: &figment::Error) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+impl ConfigError {
+    /// This error for a LOG line: identical to its `Display`, except that a
+    /// [`ConfigError::Parse`] prints its content-free `summary` (error kind,
+    /// key path, line/column) instead of the full message.
+    ///
+    /// A config document holds operator prompt text (`remap.instructions`,
+    /// presets), which is never logged, and the parsers' own messages quote
+    /// the document. Every other variant names only paths, keys and
+    /// hand-written validation text.
+    #[must_use]
+    pub fn log_summary(&self) -> String {
+        match self {
+            Self::Parse { path, summary, .. } => {
+                format!("invalid config file '{path}': {summary}")
+            }
+            other => other.to_string(),
+        }
+    }
 }
 
 /// The `LUMEN_`-prefixed environment variables that are process **secrets**
@@ -1383,6 +1523,7 @@ pub fn boot_view(toml_text: &str, label: &str) -> Result<BootView, ConfigError> 
     let config: Config = figment.extract().map_err(|e| ConfigError::Parse {
         path: label.to_owned(),
         message: describe_figment_error(&e),
+        summary: summarize_figment_error(&e),
     })?;
     Ok(BootView {
         server: config.server,
@@ -1500,6 +1641,7 @@ fn classify_keys(toml_text: &str, label: &str) -> Result<Vec<(String, Layer)>, C
             .map_err(|e: toml::de::Error| ConfigError::Parse {
                 path: label.to_owned(),
                 message: e.to_string(),
+                summary: format!("TOML parse error at {}", toml_position(toml_text, e.span())),
             })?;
     let mut keys = Vec::new();
     // A syntactically valid TOML document is always a table at the top
@@ -1625,10 +1767,14 @@ impl Config {
         let boot = Self::load(path)?;
         if boot.config_source == ConfigSourceKind::Db {
             let label = path.display().to_string();
-            let text = std::fs::read_to_string(path).map_err(|e| ConfigError::Parse {
-                path: label.clone(),
+            let text = std::fs::read_to_string(path).map_err(|e| {
                 // An I/O error kind only: no file content can be in it.
-                message: format!("could not read the file: {e}"),
+                let message = format!("could not read the file: {e}");
+                ConfigError::Parse {
+                    path: label.clone(),
+                    summary: message.clone(),
+                    message,
+                }
             })?;
             ensure_boot_only(&text, &label)?;
             if !boot.auth.enabled {
@@ -1709,6 +1855,7 @@ impl Config {
         let mut config: Config = figment.extract().map_err(|e| ConfigError::Parse {
             path: path_label.to_owned(),
             message: describe_figment_error(&e),
+            summary: summarize_figment_error(&e),
         })?;
         apply_lab_env(&mut config, lookup);
         config.validate(path_label)?;
@@ -2837,6 +2984,114 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A document whose only defect sits next to operator prompt text
+    /// (`remap.instructions`, never logged anywhere else).
+    const PROMPT_SENTINEL: &str = "SENTINEL-OPERATOR-PROMPT";
+
+    /// A syntax error on the line that holds the prompt text.
+    fn doc_with_a_syntax_error_on_a_prompt_line() -> String {
+        format!(
+            "[[virtual_models]]\nid = \"acme/rerank\"\ncapability = \"rerank\"\n\
+             strategy = \"single\"\ntargets = [{{ model = \"typesafe/jev\", remap = {{ \
+             instructions = \"{PROMPT_SENTINEL}\" oops }} }}]\n"
+        )
+    }
+
+    /// A type error whose offending value IS the prompt text: `remap` given
+    /// as a bare string instead of a table.
+    fn doc_with_a_type_error_on_a_prompt_value() -> String {
+        format!(
+            "[[virtual_models]]\nid = \"acme/rerank\"\ncapability = \"rerank\"\n\
+             strategy = \"single\"\ntargets = [{{ model = \"typesafe/jev\", remap = \
+             \"{PROMPT_SENTINEL}\" }}]\n"
+        )
+    }
+
+    /// What the pinned toml 0.8 / figment 0.10 print, confirmed here so the
+    /// reason for [`ConfigError::log_summary`] cannot silently go stale: a
+    /// syntax error renders the offending source LINE, a type error the
+    /// offending VALUE. Both are document content, and a document holds
+    /// operator prompt text, so the full message is for the client that sent
+    /// the document and never for a log line.
+    #[test]
+    fn parse_error_messages_embed_document_content() {
+        for doc in [
+            doc_with_a_syntax_error_on_a_prompt_line(),
+            doc_with_a_type_error_on_a_prompt_value(),
+        ] {
+            let err = load_str(&doc).unwrap_err();
+            assert!(err.to_string().contains(PROMPT_SENTINEL), "{err}");
+            let err = boot_view(&doc, "candidate").unwrap_err();
+            assert!(err.to_string().contains(PROMPT_SENTINEL), "{err}");
+        }
+        let err = ensure_dynamic_only(&doc_with_a_syntax_error_on_a_prompt_line(), "candidate")
+            .unwrap_err();
+        assert!(err.to_string().contains(PROMPT_SENTINEL), "{err}");
+    }
+
+    #[test]
+    fn the_log_summary_of_a_syntax_error_has_the_position_and_no_content() {
+        let doc = doc_with_a_syntax_error_on_a_prompt_line();
+        for summary in [
+            load_str(&doc).unwrap_err().log_summary(),
+            boot_view(&doc, "candidate").unwrap_err().log_summary(),
+            ensure_dynamic_only(&doc, "candidate")
+                .unwrap_err()
+                .log_summary(),
+        ] {
+            assert!(!summary.contains(PROMPT_SENTINEL), "{summary}");
+            assert!(!summary.contains("typesafe/jev"), "{summary}");
+            assert!(summary.contains("line 5, column 90"), "{summary}");
+        }
+    }
+
+    #[test]
+    fn the_log_summary_of_a_type_error_has_the_kind_and_key_and_no_content() {
+        let doc = doc_with_a_type_error_on_a_prompt_value();
+        for summary in [
+            load_str(&doc).unwrap_err().log_summary(),
+            boot_view(&doc, "candidate").unwrap_err().log_summary(),
+        ] {
+            assert!(!summary.contains(PROMPT_SENTINEL), "{summary}");
+            assert!(summary.contains("invalid type"), "{summary}");
+            assert!(summary.contains("found string"), "{summary}");
+            assert!(
+                summary.contains("virtual_models.0.targets.0.remap"),
+                "{summary}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_log_summary_withholds_offending_values_but_keeps_key_names() {
+        // An unknown enum variant: the value is withheld, the key is named.
+        let summary = load_str("[[providers]]\nname = \"x\"\nkind = \"SENTINEL-KIND\"\n")
+            .unwrap_err()
+            .log_summary();
+        assert!(!summary.contains("SENTINEL-KIND"), "{summary}");
+        assert!(summary.contains("unknown variant"), "{summary}");
+        assert!(summary.contains("providers.0.kind"), "{summary}");
+        // An unknown field is a key NAME, which is what the operator needs.
+        let summary = load_str("[server]\nprot = 1\n").unwrap_err().log_summary();
+        assert!(summary.contains("unknown field"), "{summary}");
+        assert!(summary.contains("prot"), "{summary}");
+        // Validation messages are hand-written and name fields only.
+        let err = load_str("[server]\nport = 0\n").unwrap_err();
+        assert_eq!(err.log_summary(), err.to_string());
+    }
+
+    #[test]
+    fn toml_position_counts_lines_and_columns_from_one() {
+        assert_eq!(
+            toml_position("a = 1\nb = 2\n", Some(8..9)),
+            "line 2, column 3"
+        );
+        assert_eq!(toml_position("a = 1", Some(0..1)), "line 1, column 1");
+        // Past the end (or no span at all) never panics.
+        assert_eq!(toml_position("a", Some(40..41)), "line 1, column 2");
+        assert_eq!(toml_position("a", None), "an unknown position");
     }
 
     #[test]
