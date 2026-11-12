@@ -55,6 +55,16 @@ components:
       in: query
       schema: { type: boolean, default: false }
       description: Also list soft-deleted tombstones.
+    PageLimit:
+      name: limit
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 1000 }
+      description: Page size (ADR 023). Sent with or without `cursor`, it turns the listing into one page of at most this many rows, in the same order as the whole listing. 0 or a value above 1000 is 400 `LM-1001`. With neither `limit` nor `cursor` the whole listing is returned, as before pagination existed.
+    PageCursor:
+      name: cursor
+      in: query
+      schema: { type: string }
+      description: The `X-Next-Cursor` value of the previous page, unchanged (opaque). Keep the other query parameters and the account scope identical across the pages of one walk. Sent without `limit`, the page size is 100. A value this gateway did not issue is 400 `LM-1001`.
     Since:
       name: since
       in: query
@@ -87,6 +97,9 @@ components:
       schema: { type: string }
       description: Percent-encode `/` (`acme%2Fchat`).
   headers:
+    NextCursor:
+      description: "Paginated listing only (a call with `limit` or `cursor`): the opaque `cursor` of the next page. Absent on the last page and on an unpaginated call."
+      schema: { type: string }
     ModelUsed:
       description: The model id that actually served the request (primary or fallback).
       schema: { type: string }
@@ -296,7 +309,7 @@ components:
               - type: object
                 additionalProperties: true
         rank_fields: { type: array, items: { type: string } }
-        top_n: { type: integer, minimum: 0, description: "Clamped to the document count." }
+        top_n: { type: integer, minimum: 1, description: "At least 1, clamped to the document count. `0` is 400 `LM-1001`; omit it to get every document." }
         return_documents: { type: boolean, default: false }
     RerankResponse:
       type: object
@@ -813,6 +826,8 @@ components:
           items: { $ref: "#/components/schemas/Capability" }
         modalities: { type: array, items: { type: string } }
         cost_per_1m_input: { type: number, minimum: 0 }
+        cost_per_1m_cached_input: { type: number, minimum: 0, description: "USD per million input tokens read from the provider's prompt cache. Unset: `cost_per_1m_input`." }
+        cost_per_1m_cache_write: { type: number, minimum: 0, description: "USD per million input tokens written to the provider's prompt cache. Unset: `cost_per_1m_input`." }
         cost_per_1m_output: { type: number, minimum: 0 }
         cost_per_1k_searches: { type: number, minimum: 0 }
         release_date: { type: string, format: date }
@@ -1101,8 +1116,14 @@ paths:
           in: query
           schema: { type: string }
           description: Only keys with this `external_ref`.
+        - $ref: "#/components/parameters/PageLimit"
+        - $ref: "#/components/parameters/PageCursor"
       responses:
-        "200": { description: Keys (no secrets)., content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/Key" } } } } }
+        "200":
+          description: Keys (no secrets), oldest first. The whole listing, or one page of it when `limit` or `cursor` is sent.
+          headers:
+            X-Next-Cursor: { $ref: "#/components/headers/NextCursor" }
+          content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/Key" } } } }
         "400": { $ref: "#/components/responses/Error" }
         "401": { $ref: "#/components/responses/Error" }
         "500": { $ref: "#/components/responses/Error" }
@@ -1197,8 +1218,14 @@ paths:
           in: query
           schema: { type: string }
           description: Only the sub-groups of this group (ADR 020).
+        - $ref: "#/components/parameters/PageLimit"
+        - $ref: "#/components/parameters/PageCursor"
       responses:
-        "200": { description: Groups., content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/Group" } } } } }
+        "200":
+          description: Groups, oldest first. The whole listing, or one page of it when `limit` or `cursor` is sent.
+          headers:
+            X-Next-Cursor: { $ref: "#/components/headers/NextCursor" }
+          content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/Group" } } } }
         "400": { $ref: "#/components/responses/Error" }
         "401": { $ref: "#/components/responses/Error" }
         "500": { $ref: "#/components/responses/Error" }

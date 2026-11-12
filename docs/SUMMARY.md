@@ -81,6 +81,7 @@
 - [020 - Sub-groups under a team's lease](adr/020-team-sub-groups.md)
 - [021 - Upstream cold-start retry](adr/021-upstream-cold-start-retry.md)
 - [022 - Account virtual models](adr/022-account-virtual-models.md)
+- [023 - Admin listing pagination](adr/023-admin-listing-pagination.md)
 
 # Project
 

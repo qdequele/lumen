@@ -4,7 +4,11 @@
 //! * `POST /admin/keys` - create a key. The response is the ONLY place the
 //!   plaintext key ever appears; it is never stored and never logged.
 //! * `GET /admin/keys` - list keys (records only, no hashes, no plaintext).
-//!   `?include_deleted=true` also shows soft-deleted tombstones.
+//!   `?include_deleted=true` also shows soft-deleted tombstones. Optional
+//!   `?limit=` and `?cursor=` page the listing (ADR 023, also on
+//!   `GET /admin/groups`): the body stays a bare array and the continuation
+//!   is the `X-Next-Cursor` response header. Without them the listing is
+//!   whole, as before.
 //! * `PATCH /admin/keys/{id}` - adjust budgets/limits, enable/disable.
 //! * `DELETE /admin/keys/{id}` - soft-delete: the row becomes a tombstone
 //!   (usage-log attribution and audit history survive) and the key stops
@@ -97,18 +101,18 @@
 //! provider, webhook and config routes answer `403 LM-4005`.
 
 use crate::admin_scope::AccountScope;
-use crate::error::ApiError;
+use crate::error::{body_rejection, ApiError};
 use crate::state::AppState;
 use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::Json;
 use lumen_auth::events::{EventKind, SettingsOrigin, SettingsSource, WebhookSettings};
 use lumen_auth::key::hash_key;
 use lumen_auth::state::{micro_to_usd, usd_to_micro};
 use lumen_auth::store::{
-    DeleteGroupOutcome, GroupPatch, GroupRecord, KeyPatch, NewGroup, NewKey, UsageAggregate,
-    UsageFilter, UsageGroupBy, VirtualKeyRecord,
+    DeleteGroupOutcome, GroupPatch, GroupRecord, KeyPatch, ListCursor, NewGroup, NewKey,
+    PageRequest, UsageAggregate, UsageFilter, UsageGroupBy, VirtualKeyRecord,
 };
 use lumen_core::GatewayError;
 use lumen_providers::KeyCheck;
@@ -214,6 +218,22 @@ fn unknown_group(id: &str) -> ApiError {
     GatewayError::NotFound(format!("unknown group id '{id}'")).into()
 }
 
+/// The JSON body of an admin write, or why it was refused: the one place
+/// every admin handler maps its body-extractor rejection. A body that ran
+/// over `body_limit` while it was read (chunked, no `Content-Length`) is
+/// `413 LM-1002` quoting the limit, as on `/v1/*`; anything else (malformed
+/// JSON, a wrong content type, an unknown field) is `400 LM-1001`. The
+/// rejection text describes the shape and never echoes a field value.
+pub(crate) fn json_body<T>(
+    state: &AppState,
+    payload: Result<Json<T>, JsonRejection>,
+) -> Result<T, ApiError> {
+    match payload {
+        Ok(Json(body)) => Ok(body),
+        Err(rejection) => Err(body_rejection(&rejection, state.body_limit).into()),
+    }
+}
+
 pub(crate) fn runtime(state: &AppState) -> Result<&crate::auth::AuthRuntime, ApiError> {
     state
         .auth
@@ -279,7 +299,7 @@ pub async fn create_key(
     scope: AccountScope,
     payload: Result<Json<NewKey>, JsonRejection>,
 ) -> Result<(StatusCode, Json<CreatedKey>), ApiError> {
-    let Json(params) = payload.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
+    let params = json_body(&state, payload)?;
     params.validate().map_err(GatewayError::InvalidRequest)?;
     validate_ref("external_ref", params.external_ref.as_deref(), false)?;
     let auth = runtime(&state)?;
@@ -308,6 +328,72 @@ pub async fn create_key(
     ))
 }
 
+/// Page size of a listing when `cursor` is sent without `limit` (ADR 023).
+const DEFAULT_LIST_LIMIT: u32 = 100;
+/// Largest accepted `limit` on a paginated listing. A larger value is
+/// refused, not clamped: a silent clamp reads as "that was everything".
+const MAX_LIST_LIMIT: u32 = 1_000;
+/// Response header carrying the cursor of the next page; absent on the last
+/// page and on an unpaginated listing.
+const NEXT_CURSOR: HeaderName = HeaderName::from_static("x-next-cursor");
+
+/// The page a listing call asks for (ADR 023): `None` when the caller sent
+/// neither `limit` nor `cursor`, which keeps the whole, unpaginated listing
+/// existing clients rely on.
+fn page_request(limit: Option<u32>, cursor: Option<&str>) -> Result<Option<PageRequest>, ApiError> {
+    if limit.is_none() && cursor.is_none() {
+        return Ok(None);
+    }
+    let limit = limit.unwrap_or(DEFAULT_LIST_LIMIT);
+    if limit == 0 || limit > MAX_LIST_LIMIT {
+        return Err(GatewayError::InvalidRequest(format!(
+            "`limit` must be between 1 and {MAX_LIST_LIMIT}"
+        ))
+        .into());
+    }
+    let after = match cursor {
+        None => None,
+        Some(text) => Some(decode_cursor(text).ok_or_else(|| {
+            GatewayError::InvalidRequest(
+                "invalid `cursor`: pass the X-Next-Cursor value of the previous page unchanged"
+                    .to_owned(),
+            )
+        })?),
+    };
+    Ok(Some(PageRequest { limit, after }))
+}
+
+/// A listing position as the opaque `cursor` text: lowercase hex of
+/// `<created_at>:<id>`, safe in a query string and in a header as is.
+fn encode_cursor(cursor: &ListCursor) -> String {
+    hex::encode(format!("{}:{}", cursor.created_at, cursor.id))
+}
+
+/// The inverse of [`encode_cursor`]; `None` for anything it did not produce.
+fn decode_cursor(text: &str) -> Option<ListCursor> {
+    let bytes = hex::decode(text).ok()?;
+    let plain = std::str::from_utf8(&bytes).ok()?;
+    let (created_at, id) = plain.split_once(':')?;
+    if id.is_empty() {
+        return None;
+    }
+    Some(ListCursor {
+        created_at: created_at.parse().ok()?,
+        id: id.to_owned(),
+    })
+}
+
+/// The response headers of a listing: `X-Next-Cursor` while more rows remain.
+fn next_cursor_headers(next: Option<&ListCursor>) -> Result<HeaderMap, ApiError> {
+    let mut headers = HeaderMap::new();
+    if let Some(next) = next {
+        let value = HeaderValue::try_from(encode_cursor(next))
+            .map_err(|e| GatewayError::Internal(format!("next cursor header: {e}")))?;
+        headers.insert(NEXT_CURSOR, value);
+    }
+    Ok(headers)
+}
+
 /// `GET /admin/keys` query parameters.
 #[derive(Debug, Default, Deserialize)]
 pub struct ListKeysParams {
@@ -317,30 +403,51 @@ pub struct ListKeysParams {
     /// Only keys with this `external_ref` (ADR 015).
     #[serde(default)]
     pub external_ref: Option<String>,
+    /// Page size, 1 to 1000 (ADR 023). Absent with no `cursor`: the whole
+    /// listing.
+    #[serde(default)]
+    pub limit: Option<u32>,
+    /// The `X-Next-Cursor` value of the previous page.
+    #[serde(default)]
+    pub cursor: Option<String>,
 }
 
 /// List every active key (no secrets: ids, names, budgets, limits, flags).
 /// `?include_deleted=true` adds soft-deleted tombstones for auditing. A
 /// malformed query string is a `LM-1001` JSON envelope, like every other
 /// extractor failure in this module - never axum's bare-text rejection.
+///
+/// With `limit` and/or `cursor` (ADR 023) the body is one page of the same
+/// bare array, in the same order, and `X-Next-Cursor` names the next page
+/// while one exists.
 pub async fn list_keys(
     State(state): State<AppState>,
     scope: AccountScope,
     params: Result<Query<ListKeysParams>, QueryRejection>,
-) -> Result<Json<Vec<VirtualKeyRecord>>, ApiError> {
+) -> Result<(HeaderMap, Json<Vec<VirtualKeyRecord>>), ApiError> {
     let Query(params) = params.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
+    let page = page_request(params.limit, params.cursor.as_deref())?;
     let auth = runtime(&state)?;
     // Filtered in SQL (bound parameters), not over every row in memory.
-    let keys = auth
+    let filter = lumen_auth::store::KeyListFilter {
+        include_deleted: params.include_deleted,
+        external_ref: params.external_ref,
+        scope_account_ref: scope.account().map(str::to_owned),
+    };
+    let Some(page) = page else {
+        let keys = auth
+            .store
+            .list_keys_filtered(&filter)
+            .await
+            .map_err(|e| internal(&e))?;
+        return Ok((HeaderMap::new(), Json(keys)));
+    };
+    let page = auth
         .store
-        .list_keys_filtered(&lumen_auth::store::KeyListFilter {
-            include_deleted: params.include_deleted,
-            external_ref: params.external_ref,
-            scope_account_ref: scope.account().map(str::to_owned),
-        })
+        .list_keys_page(&filter, &page)
         .await
         .map_err(|e| internal(&e))?;
-    Ok(Json(keys))
+    Ok((next_cursor_headers(page.next.as_ref())?, Json(page.rows)))
 }
 
 /// Patch a key: adjust budgets/limits, enable/disable. An unknown id is a
@@ -352,7 +459,7 @@ pub async fn patch_key(
     scope: AccountScope,
     payload: Result<Json<KeyPatch>, JsonRejection>,
 ) -> Result<Json<VirtualKeyRecord>, ApiError> {
-    let Json(patch) = payload.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
+    let patch = json_body(&state, payload)?;
     patch.validate().map_err(GatewayError::InvalidRequest)?;
     validate_ref(
         "external_ref",
@@ -495,7 +602,7 @@ pub async fn create_group(
     scope: AccountScope,
     payload: Result<Json<NewGroup>, JsonRejection>,
 ) -> Result<(StatusCode, Json<GroupRecord>), ApiError> {
-    let Json(mut params) = payload.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
+    let mut params = json_body(&state, payload)?;
     params.validate().map_err(GatewayError::InvalidRequest)?;
     let auth = runtime(&state)?;
     // A sub-group (ADR 020) takes its parent's account: on a scoped call the
@@ -544,33 +651,51 @@ pub struct ListGroupsParams {
     /// Only the sub-groups of this group (ADR 020).
     #[serde(default)]
     pub parent_id: Option<String>,
+    /// Page size, 1 to 1000 (ADR 023). Absent with no `cursor`: the whole
+    /// listing.
+    #[serde(default)]
+    pub limit: Option<u32>,
+    /// The `X-Next-Cursor` value of the previous page.
+    #[serde(default)]
+    pub cursor: Option<String>,
 }
 
 /// List every active budget group; `?include_deleted=true` adds tombstones.
+/// `limit` and `cursor` page it exactly like [`list_keys`] (ADR 023).
 pub async fn list_groups(
     State(state): State<AppState>,
     scope: AccountScope,
     params: Result<Query<ListGroupsParams>, QueryRejection>,
-) -> Result<Json<Vec<GroupRecord>>, ApiError> {
+) -> Result<(HeaderMap, Json<Vec<GroupRecord>>), ApiError> {
     let Query(params) = params.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
+    let page = page_request(params.limit, params.cursor.as_deref())?;
     let auth = runtime(&state)?;
     // Filtered in SQL (bound parameters), not over every row in memory.
-    let groups = auth
+    let filter = lumen_auth::store::GroupListFilter {
+        include_deleted: params.include_deleted,
+        // Stored refs are canonical (a UUID is lowercase): compare that form.
+        account_ref: params
+            .account_ref
+            .map(lumen_auth::billing::canonical_account_ref),
+        parent_id: params.parent_id,
+        // Applied on top of the query filter, so `?account_ref=<other>` on
+        // a scoped call narrows to nothing rather than widening the scope.
+        scope_account_ref: scope.account().map(str::to_owned),
+    };
+    let Some(page) = page else {
+        let groups = auth
+            .store
+            .list_groups_filtered(&filter)
+            .await
+            .map_err(|e| internal(&e))?;
+        return Ok((HeaderMap::new(), Json(groups)));
+    };
+    let page = auth
         .store
-        .list_groups_filtered(&lumen_auth::store::GroupListFilter {
-            include_deleted: params.include_deleted,
-            // Stored refs are canonical (a UUID is lowercase): compare that form.
-            account_ref: params
-                .account_ref
-                .map(lumen_auth::billing::canonical_account_ref),
-            parent_id: params.parent_id,
-            // Applied on top of the query filter, so `?account_ref=<other>` on
-            // a scoped call narrows to nothing rather than widening the scope.
-            scope_account_ref: scope.account().map(str::to_owned),
-        })
+        .list_groups_page(&filter, &page)
         .await
         .map_err(|e| internal(&e))?;
-    Ok(Json(groups))
+    Ok((next_cursor_headers(page.next.as_ref())?, Json(page.rows)))
 }
 
 /// `GET /admin/groups/{id}` response: the record plus the live pool
@@ -622,7 +747,7 @@ pub async fn patch_group(
     scope: AccountScope,
     payload: Result<Json<GroupPatch>, JsonRejection>,
 ) -> Result<Json<GroupRecord>, ApiError> {
-    let Json(patch) = payload.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
+    let patch = json_body(&state, payload)?;
     patch.validate().map_err(GatewayError::InvalidRequest)?;
     let shared = runtime_arc(&state)?;
     let auth = shared.as_ref();
@@ -735,9 +860,10 @@ const MAX_GRANT_USD: f64 = lumen_auth::store::MAX_BUDGET_USD;
 /// belt-and-braces in case a future serde version saturates to `inf`
 /// instead of erroring.
 fn validated_grant_amount(
+    state: &AppState,
     payload: Result<Json<GrantBody>, JsonRejection>,
 ) -> Result<f64, ApiError> {
-    let Json(body) = payload.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
+    let body = json_body(state, payload)?;
     if body.amount.is_finite() && body.amount > 0.0 && body.amount <= MAX_GRANT_USD {
         Ok(body.amount)
     } else {
@@ -763,7 +889,7 @@ pub async fn grant_key(
     scope: AccountScope,
     payload: Result<Json<GrantBody>, JsonRejection>,
 ) -> Result<Json<VirtualKeyRecord>, ApiError> {
-    let amount = validated_grant_amount(payload)?;
+    let amount = validated_grant_amount(&state, payload)?;
     let auth = runtime(&state)?;
     scope.guard_key(&auth.store, &id).await?;
     let _sync = auth.keys.sync_guard().await;
@@ -795,7 +921,7 @@ pub async fn grant_group(
     scope: AccountScope,
     payload: Result<Json<GrantBody>, JsonRejection>,
 ) -> Result<Json<GroupRecord>, ApiError> {
-    let amount = validated_grant_amount(payload)?;
+    let amount = validated_grant_amount(&state, payload)?;
     let auth = runtime(&state)?;
     scope.guard_group(&auth.store, &id).await?;
     let _sync = auth.keys.sync_guard().await;
@@ -915,7 +1041,7 @@ pub async fn put_webhooks(
     State(state): State<AppState>,
     payload: Result<Json<WebhookSettings>, JsonRejection>,
 ) -> Result<Json<WebhookStatus>, ApiError> {
-    let Json(settings) = payload.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
+    let settings = json_body(&state, payload)?;
     let auth = runtime(&state)?;
     let controller = webhooks(&state)?;
     settings
@@ -1000,7 +1126,7 @@ pub async fn put_webhook_signing_key(
     State(state): State<AppState>,
     payload: Result<Json<WebhookSecretBody>, JsonRejection>,
 ) -> Result<StatusCode, ApiError> {
-    let Json(body) = payload.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
+    let body = json_body(&state, payload)?;
     if body.secret.is_empty() {
         return Err(GatewayError::InvalidRequest("`secret` must not be empty".to_owned()).into());
     }
@@ -1093,7 +1219,7 @@ pub async fn put_provider_key(
     Path(name): Path<String>,
     payload: Result<Json<ProviderKeyBody>, JsonRejection>,
 ) -> Result<StatusCode, ApiError> {
-    let Json(body) = payload.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
+    let body = json_body(&state, payload)?;
     if body.key.trim().is_empty() {
         return Err(GatewayError::InvalidRequest("`key` must not be empty".to_owned()).into());
     }
@@ -2195,7 +2321,7 @@ pub async fn put_provider(
     payload: Result<Json<ProviderConfig>, JsonRejection>,
 ) -> Result<StatusCode, ApiError> {
     let if_match = require_if_match(&headers)?;
-    let Json(provider) = payload.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
+    let provider = json_body(&state, payload)?;
     if provider.name != name {
         return Err(GatewayError::InvalidRequest(format!(
             "path provider name '{name}' does not match the request body's 'name' field '{}'",
@@ -2378,7 +2504,7 @@ pub async fn put_virtual_model(
     payload: Result<Json<lumen_router::virtual_models::VirtualModelConfig>, JsonRejection>,
 ) -> Result<StatusCode, ApiError> {
     let if_match = require_if_match(&headers)?;
-    let Json(vm) = payload.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
+    let vm = json_body(&state, payload)?;
     if vm.id != id {
         return Err(GatewayError::InvalidRequest(format!(
             "path virtual model id '{id}' does not match the request body's 'id' field '{}'",
@@ -2752,6 +2878,42 @@ mod tests {
             "Debug output leaked the provider key: {dbg}"
         );
         assert!(dbg.contains("REDACTED"), "Debug output was: {dbg}");
+    }
+
+    #[test]
+    fn a_cursor_round_trips_and_garbage_is_refused() {
+        let cursor = ListCursor {
+            created_at: 1_760_000_000,
+            // An id holding the separator still round-trips: only the first
+            // `:` splits.
+            id: "key_ab:cd".to_owned(),
+        };
+        let text = encode_cursor(&cursor);
+        assert!(text.bytes().all(|b| b.is_ascii_hexdigit()), "{text}");
+        assert_eq!(decode_cursor(&text), Some(cursor));
+
+        for bad in [
+            "",
+            "zz",
+            "6e6f7065",
+            &hex::encode("x:id"),
+            &hex::encode("12:"),
+        ] {
+            assert_eq!(decode_cursor(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn no_paging_parameter_means_no_page() {
+        assert!(matches!(page_request(None, None), Ok(None)));
+        let page = page_request(None, Some(&hex::encode("5:k")))
+            .ok()
+            .flatten()
+            .unwrap();
+        assert_eq!(page.limit, DEFAULT_LIST_LIMIT);
+        assert!(page_request(Some(0), None).is_err());
+        assert!(page_request(Some(MAX_LIST_LIMIT + 1), None).is_err());
+        assert!(page_request(Some(MAX_LIST_LIMIT), None).is_ok());
     }
 
     #[test]

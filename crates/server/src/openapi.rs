@@ -51,4 +51,15 @@ mod tests {
         assert_eq!(doc["openapi"], "3.1.0");
         assert_eq!(doc["info"]["version"], env!("CARGO_PKG_VERSION"));
     }
+
+    /// The gateway refuses `top_n: 0` on `/v1/rerank` with `LM-1001`; the
+    /// contract must not advertise 0 as valid.
+    #[test]
+    fn rerank_top_n_is_at_least_one() {
+        let json = OPENAPI_JSON.as_ref().unwrap();
+        let doc: serde_json::Value = serde_json::from_str(json).unwrap();
+        let top_n = &doc["components"]["schemas"]["RerankRequest"]["properties"]["top_n"];
+        assert_eq!(top_n["type"], "integer");
+        assert_eq!(top_n["minimum"], 1);
+    }
 }

@@ -58,6 +58,13 @@ no separate migrate command and nothing to run by hand.
 - **Integrity-checked.** Each applied migration's checksum is verified at
   boot; a mismatch is a hard, named error rather than a silent
   divergence.
+- **Index-only migrations change no rows.** Migration 0020 adds an index on
+  `virtual_keys.group_id` (account-scoped key listings no longer scan the
+  table), and migration 0021 adds `(created_at, id)` indexes on
+  `virtual_keys` and `budget_groups` for the paginated listings
+  ([ADR 023](../adr/023-admin-listing-pagination.md)). Each is built once,
+  at the first boot of the new binary, in time proportional to the number
+  of rows; nothing to run by hand.
 - With `[auth].enabled = false` there is no database and this whole
   section is moot.
 

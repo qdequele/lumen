@@ -12,7 +12,9 @@
 //! and `last4`) and never logged. Every write pings the reload trigger: the
 //! request path reads the pools from memory, rebuilt by the reloader.
 
-use crate::admin::{config_ctx, config_from_document, internal, runtime, source_internal_error};
+use crate::admin::{
+    config_ctx, config_from_document, internal, json_body, runtime, source_internal_error,
+};
 use crate::admin_scope::AccountScope;
 use crate::config::ProviderConfig;
 use crate::error::ApiError;
@@ -219,7 +221,7 @@ pub async fn add_team_key(
     let auth = runtime(&state)?;
     scope.require_top_level_group(&auth.store, &id).await?;
     // JsonRejection text describes the shape, never echoes field values.
-    let Json(body) = payload.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
+    let body = json_body(&state, payload)?;
     let key = body.key.trim();
     if key.chars().count() < MIN_KEY_CHARS {
         return Err(GatewayError::InvalidRequest(format!(
@@ -310,7 +312,7 @@ pub async fn put_team_provider(
 ) -> Result<StatusCode, ApiError> {
     let auth = runtime(&state)?;
     scope.require_top_level_group(&auth.store, &id).await?;
-    let Json(body) = payload.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
+    let body = json_body(&state, payload)?;
     let _guard = state.config_apply_lock.lock().await;
     let configured = document_providers(&state).await?;
     let found = configured

@@ -762,6 +762,15 @@ pub struct ModelConfig {
     /// Price per **million input tokens**, USD (M5 cost counting).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_per_1m_input: Option<f64>,
+    /// Price per **million input tokens read from the provider's prompt
+    /// cache**, USD (ADR 003 amendment). Unset: the input price, so cached
+    /// input is charged like any other input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_per_1m_cached_input: Option<f64>,
+    /// Price per **million input tokens written to the provider's prompt
+    /// cache** (Anthropic cache creation), USD. Unset: the input price.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_per_1m_cache_write: Option<f64>,
     /// Price per **million output tokens**, USD.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_per_1m_output: Option<f64>,
@@ -804,6 +813,8 @@ impl ModelConfig {
             capabilities: Vec::new(),
             modalities: default_modalities(),
             cost_per_1m_input: None,
+            cost_per_1m_cached_input: None,
+            cost_per_1m_cache_write: None,
             cost_per_1m_output: None,
             cost_per_1k_searches: None,
             fallbacks: Vec::new(),
@@ -1965,6 +1976,8 @@ impl Config {
                 }
                 for (field, value) in [
                     ("cost_per_1m_input", model.cost_per_1m_input),
+                    ("cost_per_1m_cached_input", model.cost_per_1m_cached_input),
+                    ("cost_per_1m_cache_write", model.cost_per_1m_cache_write),
                     ("cost_per_1m_output", model.cost_per_1m_output),
                     ("cost_per_1k_searches", model.cost_per_1k_searches),
                 ] {
@@ -3318,6 +3331,42 @@ mod tests {
         let bad = toml.replace("2.5", "-1.0");
         let err = load_str(&bad).unwrap_err();
         assert!(err.to_string().contains("cost_per_1m_input"));
+    }
+
+    #[test]
+    fn cache_prices_are_optional_and_validated() {
+        let toml = r#"
+            [[providers]]
+            name = "anthropic"
+            kind = "anthropic"
+            [[providers.models]]
+            id = "anthropic/claude"
+            capabilities = ["chat"]
+            cost_per_1m_input = 3.0
+            cost_per_1m_output = 15.0
+            cost_per_1m_cached_input = 0.3
+            cost_per_1m_cache_write = 3.75
+        "#;
+        let cfg = load_str(toml).unwrap();
+        let model = &cfg.providers[0].models[0];
+        assert_eq!(model.cost_per_1m_cached_input, Some(0.3));
+        assert_eq!(model.cost_per_1m_cache_write, Some(3.75));
+
+        // Unset by default, and absent from a serialised model.
+        let plain = ModelConfig::minimal("anthropic/claude");
+        assert_eq!(plain.cost_per_1m_cached_input, None);
+        assert_eq!(plain.cost_per_1m_cache_write, None);
+        let json = serde_json::to_string(&plain).unwrap();
+        assert!(!json.contains("cache"), "{json}");
+
+        for (value, field) in [
+            ("0.3", "cost_per_1m_cached_input"),
+            ("3.75", "cost_per_1m_cache_write"),
+        ] {
+            let bad = toml.replace(&format!("{field} = {value}"), &format!("{field} = -1.0"));
+            let err = load_str(&bad).unwrap_err();
+            assert!(err.to_string().contains(field), "{err}");
+        }
     }
 
     #[test]

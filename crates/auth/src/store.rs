@@ -782,6 +782,19 @@ impl KeyListFilter {
     /// that actually runs.
     #[must_use]
     pub fn sql(&self) -> String {
+        list_sql(key_columns!(), "virtual_keys", &self.conditions())
+    }
+
+    /// The query for one page of this filter ([`KeyStore::list_keys_page`]):
+    /// the same conditions and order as [`sql`](Self::sql), plus the keyset
+    /// bound when `after` is set and a `LIMIT`. Bind order: the filter's
+    /// values, then the cursor's `created_at` and `id`, then the limit.
+    #[must_use]
+    pub fn page_sql(&self, after: bool) -> String {
+        page_sql(key_columns!(), "virtual_keys", &self.conditions(), after)
+    }
+
+    fn conditions(&self) -> Vec<&'static str> {
         let mut conditions = Vec::new();
         if !self.include_deleted {
             conditions.push("deleted_at IS NULL");
@@ -792,7 +805,7 @@ impl KeyListFilter {
         if self.scope_account_ref.is_some() {
             conditions.push("group_id IN (SELECT id FROM budget_groups WHERE account_ref = ?)");
         }
-        list_sql(key_columns!(), "virtual_keys", &conditions)
+        conditions
     }
 }
 
@@ -816,6 +829,16 @@ impl GroupListFilter {
     /// `account_ref`, `parent_id`, `scope_account_ref`.
     #[must_use]
     pub fn sql(&self) -> String {
+        list_sql(group_columns!(), "budget_groups", &self.conditions())
+    }
+
+    /// The query for one page of this filter; see [`KeyListFilter::page_sql`].
+    #[must_use]
+    pub fn page_sql(&self, after: bool) -> String {
+        page_sql(group_columns!(), "budget_groups", &self.conditions(), after)
+    }
+
+    fn conditions(&self) -> Vec<&'static str> {
         let mut conditions = Vec::new();
         if !self.include_deleted {
             conditions.push("deleted_at IS NULL");
@@ -829,7 +852,55 @@ impl GroupListFilter {
         if self.scope_account_ref.is_some() {
             conditions.push("account_ref = ?");
         }
-        list_sql(group_columns!(), "budget_groups", &conditions)
+        conditions
+    }
+}
+
+/// A position in a listing ordered by `(created_at, id)`: the last row of
+/// the page before (ADR 023). Both columns are written once at creation and
+/// never updated, so a position stays valid whatever is created, patched or
+/// soft-deleted between two pages.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListCursor {
+    /// `created_at` of that row, unix seconds.
+    pub created_at: i64,
+    /// Its `id` (the tie-break within one second).
+    pub id: String,
+}
+
+/// One page to read from a keyset-paginated listing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PageRequest {
+    /// Most rows to return.
+    pub limit: u32,
+    /// Return rows strictly after this position; `None` starts at the
+    /// beginning.
+    pub after: Option<ListCursor>,
+}
+
+/// One page of a keyset-paginated listing.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ListPage<T> {
+    /// At most [`PageRequest::limit`] rows, oldest first.
+    pub rows: Vec<T>,
+    /// Where the next page starts; `None` when this page ends the listing.
+    pub next: Option<ListCursor>,
+}
+
+impl<T> ListPage<T> {
+    /// Build a page from `rows`, which were read with `LIMIT limit + 1`: the
+    /// extra row only proves that more exist, so a page that happens to end
+    /// the listing carries no cursor (no empty trailing page).
+    fn cut(mut rows: Vec<T>, limit: u32, position: impl Fn(&T) -> ListCursor) -> Self {
+        let limit = limit as usize;
+        let more = rows.len() > limit;
+        rows.truncate(limit);
+        let next = if more {
+            rows.last().map(position)
+        } else {
+            None
+        };
+        Self { rows, next }
     }
 }
 
@@ -842,6 +913,19 @@ fn list_sql(columns: &str, table: &str, conditions: &[&str]) -> String {
         sql.push_str(&conditions.join(" AND "));
     }
     sql.push_str(" ORDER BY created_at, id");
+    sql
+}
+
+/// [`list_sql`] for one page: the keyset bound `(created_at, id) > (?, ?)`
+/// when `after` is set (a row-value comparison the `(created_at, id)` index
+/// of migration 0021 answers by a seek, never an `OFFSET`), and `LIMIT ?`.
+fn page_sql(columns: &str, table: &str, conditions: &[&str], after: bool) -> String {
+    let mut conditions = conditions.to_vec();
+    if after {
+        conditions.push("(created_at, id) > (?, ?)");
+    }
+    let mut sql = list_sql(columns, table, &conditions);
+    sql.push_str(" LIMIT ?");
     sql
 }
 
@@ -1040,6 +1124,41 @@ impl KeyStore {
             query = query.bind(value.as_str());
         }
         Ok(query.fetch_all(&self.pool).await?)
+    }
+
+    /// One page of the keys matching `filter`, in the order of
+    /// [`list_keys_filtered`](Self::list_keys_filtered): the pages of a walk
+    /// concatenate to that listing (ADR 023).
+    ///
+    /// # Errors
+    ///
+    /// [`AuthError::Db`] if the query fails.
+    pub async fn list_keys_page(
+        &self,
+        filter: &KeyListFilter,
+        page: &PageRequest,
+    ) -> Result<ListPage<VirtualKeyRecord>, AuthError> {
+        // Built from fixed fragments only; every value is bound below.
+        let sql = filter.page_sql(page.after.is_some());
+        let mut query = sqlx::query_as::<_, VirtualKeyRecord>(sqlx::AssertSqlSafe(sql));
+        for value in [&filter.external_ref, &filter.scope_account_ref]
+            .into_iter()
+            .flatten()
+        {
+            query = query.bind(value.as_str());
+        }
+        if let Some(after) = &page.after {
+            query = query.bind(after.created_at).bind(after.id.as_str());
+        }
+        // One row past the page: it tells whether a next page exists.
+        let rows = query
+            .bind(i64::from(page.limit) + 1)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(ListPage::cut(rows, page.limit, |key| ListCursor {
+            created_at: key.created_at,
+            id: key.id.clone(),
+        }))
     }
 
     /// One live key by id: `None` for an unknown id or a tombstone.
@@ -1546,6 +1665,43 @@ impl KeyStore {
             query = query.bind(value.as_str());
         }
         Ok(query.fetch_all(&self.pool).await?)
+    }
+
+    /// One page of the groups matching `filter`; the group half of
+    /// [`list_keys_page`](Self::list_keys_page).
+    ///
+    /// # Errors
+    ///
+    /// [`AuthError::Db`] if the query fails.
+    pub async fn list_groups_page(
+        &self,
+        filter: &GroupListFilter,
+        page: &PageRequest,
+    ) -> Result<ListPage<GroupRecord>, AuthError> {
+        // Built from fixed fragments only; every value is bound below.
+        let sql = filter.page_sql(page.after.is_some());
+        let mut query = sqlx::query_as::<_, GroupRecord>(sqlx::AssertSqlSafe(sql));
+        for value in [
+            &filter.account_ref,
+            &filter.parent_id,
+            &filter.scope_account_ref,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            query = query.bind(value.as_str());
+        }
+        if let Some(after) = &page.after {
+            query = query.bind(after.created_at).bind(after.id.as_str());
+        }
+        let rows = query
+            .bind(i64::from(page.limit) + 1)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(ListPage::cut(rows, page.limit, |group| ListCursor {
+            created_at: group.created_at,
+            id: group.id.clone(),
+        }))
     }
 
     /// One live group by id: `None` for an unknown id or a tombstone.
