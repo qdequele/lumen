@@ -1605,6 +1605,40 @@ async fn voyage_embed_reports_upstream_total_tokens_as_prompt_tokens() {
     assert_eq!(resp.usage.estimated, None);
 }
 
+/// Ollama is keyless by default (no `Authorization` header), but a configured
+/// key is sent as bearer auth and never appears in `Debug`.
+#[tokio::test]
+async fn ollama_embed_sends_bearer_only_when_a_key_is_configured() {
+    let mock = MockServer::start().await;
+    OllamaFixture.mount_echo(&mock).await;
+
+    let keyless = OllamaFixture.build(mock.uri());
+    keyless
+        .embed(batch_request(vec!["0".into()]), CancellationToken::new())
+        .await
+        .unwrap();
+
+    let keyed = OllamaProvider::new(reqwest::Client::new(), "ollama-keyed", mock.uri(), false)
+        .with_api_key(Some("sk-ollama-secret".to_owned()));
+    let dbg = format!("{keyed:?}");
+    assert!(!dbg.contains("sk-ollama-secret"), "key leaked: {dbg}");
+    assert!(dbg.contains("<redacted>"), "got: {dbg}");
+    keyed
+        .embed(batch_request(vec!["0".into()]), CancellationToken::new())
+        .await
+        .unwrap();
+
+    let requests = mock.received_requests().await.unwrap();
+    assert!(requests[0].headers.get("authorization").is_none());
+    assert_eq!(
+        requests[1]
+            .headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok()),
+        Some("Bearer sk-ollama-secret")
+    );
+}
+
 /// Embed one text with `dimensions: 256` through `fx` and return the body the
 /// upstream received.
 async fn body_sent_with_dimensions(fx: &dyn EmbedFixture) -> Value {

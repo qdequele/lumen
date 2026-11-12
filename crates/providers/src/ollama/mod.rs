@@ -1,4 +1,5 @@
-//! Ollama provider - local, keyless embeddings via `/api/embed`.
+//! Ollama provider - local embeddings via `/api/embed`. Keyless by default; an
+//! optional bearer token supports deployments behind an authenticating proxy.
 //!
 //! Ollama's embed schema differs from OpenAI's: the request is
 //! `{ "model", "input" }` and the response returns `embeddings` as an array of
@@ -11,6 +12,7 @@ use lumen_core::{
     ProviderError,
 };
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use tokio_util::sync::CancellationToken;
 
 use crate::http::post_json;
@@ -20,8 +22,7 @@ use crate::http::post_json;
 const MAX_BATCH_SIZE: usize = 512;
 
 /// An Ollama embeddings provider. Requires a `base_url` (e.g.
-/// `http://localhost:11434`); no API key.
-#[derive(Debug)]
+/// `http://localhost:11434`); the API key is optional.
 pub struct OllamaProvider {
     client: reqwest::Client,
     provider_name: String,
@@ -29,6 +30,8 @@ pub struct OllamaProvider {
     /// When `true`, reject a request that sets `dimensions` (which Ollama cannot
     /// honor) with a 400 (`LM-1001`) instead of silently dropping it.
     strict: bool,
+    /// Optional bearer token (redacted from `Debug`; usually absent).
+    api_key: Option<String>,
 }
 
 impl OllamaProvider {
@@ -47,7 +50,30 @@ impl OllamaProvider {
             provider_name: provider_name.into(),
             base_url: base_url.into().trim_end_matches('/').to_owned(),
             strict,
+            api_key: None,
         }
+    }
+
+    /// Set the bearer token sent with every embed call. Ollama itself is
+    /// keyless, so this defaults to `None`; a key configured on the provider
+    /// (an authenticating proxy in front of Ollama) is forwarded exactly as
+    /// the chat and decisions paths of the same provider forward it.
+    #[must_use]
+    pub fn with_api_key(mut self, api_key: Option<String>) -> Self {
+        self.api_key = api_key;
+        self
+    }
+}
+
+/// Redacted so any bearer token can never reach a log line via `{:?}`.
+impl fmt::Debug for OllamaProvider {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OllamaProvider")
+            .field("provider_name", &self.provider_name)
+            .field("base_url", &self.base_url)
+            .field("strict", &self.strict)
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .finish_non_exhaustive()
     }
 }
 
@@ -105,12 +131,13 @@ impl EmbeddingProvider for OllamaProvider {
             input: &req.input,
         };
 
-        // Ollama is keyless; a client disconnect aborts the call (see `post_json`).
+        // Keyless unless a key was configured; a client disconnect aborts the
+        // call (see `post_json`).
         let bytes = post_json(
             &self.client,
             &url,
             &body,
-            None,
+            self.api_key.as_deref(),
             &self.provider_name,
             &cancel,
         )
