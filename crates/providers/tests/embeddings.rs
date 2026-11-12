@@ -343,6 +343,55 @@ async fn voyage_embed_does_not_forward_extra_fields() {
     assert_extra_not_forwarded(&VoyageEmbedFixture).await;
 }
 
+/// Jina's `/embeddings` schema has no `user` and no `encoding_format` (its
+/// output encoding field is `embedding_type`): the text path sends an explicit
+/// body with only `model`, `input` and, when the client sets it, `dimensions`.
+/// The gateway re-encodes base64 at the request edge, so the upstream is
+/// always asked for its default float output.
+#[tokio::test]
+async fn jina_text_embed_sends_only_fields_jina_accepts() {
+    let mock = MockServer::start().await;
+    JinaEmbedFixture.mount_echo(&mock).await;
+    let provider = JinaEmbedFixture.build(mock.uri());
+
+    let mut req = batch_request(vec!["0".into(), "1".into()]);
+    req.user = Some("end-user-42".to_owned());
+    req.encoding_format = Some("base64".to_owned());
+    req.dimensions = Some(256);
+    provider.embed(req, CancellationToken::new()).await.unwrap();
+
+    let requests = mock.received_requests().await.unwrap();
+    let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(
+        body,
+        json!({ "model": body["model"], "input": ["0", "1"], "dimensions": 256 }),
+        "unexpected Jina body: {body}"
+    );
+}
+
+/// `dimensions` is omitted, not sent as null, when the client sets none.
+#[tokio::test]
+async fn jina_text_embed_omits_dimensions_by_default() {
+    let mock = MockServer::start().await;
+    JinaEmbedFixture.mount_echo(&mock).await;
+    let provider = JinaEmbedFixture.build(mock.uri());
+
+    provider
+        .embed(batch_request(vec!["0".into()]), CancellationToken::new())
+        .await
+        .unwrap();
+
+    let requests = mock.received_requests().await.unwrap();
+    let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    let keys: Vec<&str> = body
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(keys, vec!["input", "model"], "got body: {body}");
+}
+
 // --------------------------------------------------------------------------
 // TEI fixture - request `inputs`, response is a bare `[[f32]]` array
 // --------------------------------------------------------------------------
@@ -1823,4 +1872,103 @@ async fn bedrock_cohere_embeds_one_vector_per_multipart_item() {
     let requests = mock.received_requests().await.unwrap();
     let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
     assert_eq!(body["texts"], json!(["solo", "foo\nbar"]));
+}
+
+// --------------------------------------------------------------------------
+// Sub-batch retry (ADR 005, 2026-11-12 amendment)
+// --------------------------------------------------------------------------
+
+/// Mount a response that answers only the first request it sees, ahead of
+/// the fixture's echo.
+async fn mount_once(mock: &MockServer, template: ResponseTemplate) {
+    Mock::given(method("POST"))
+        .respond_with(template)
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(mock)
+        .await;
+}
+
+/// 65 inputs on TEI (32 per call) are 3 upstream calls. One of them is rate
+/// limited once: it alone is sent again, and the request succeeds with every
+/// vector in input order, instead of failing and re-running all three.
+#[tokio::test]
+async fn rate_limited_sub_batch_is_retried_without_resending_the_others() {
+    let mock = MockServer::start().await;
+    mount_once(&mock, ResponseTemplate::new(429)).await;
+    TeiEmbedFixture.mount_echo(&mock).await;
+    let provider = TeiEmbedFixture.build(mock.uri());
+
+    let texts: Vec<String> = (0..65).map(|i| i.to_string()).collect();
+    let resp = batch::embed_batched(
+        &*provider,
+        batch_request(texts),
+        &CancellationToken::new(),
+        4,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(resp.data.len(), 65);
+    for (i, d) in resp.data.iter().enumerate() {
+        assert_eq!(d.index as usize, i);
+        assert_eq!(d.embedding[0], i as f32, "embedding out of order at {i}");
+    }
+    // 3 sub-batches + the one retry.
+    let calls = mock.received_requests().await.unwrap().len();
+    assert_eq!(calls, 4, "expected 4 upstream calls, got {calls}");
+}
+
+/// A client error on a sub-batch is returned as is: never sent again.
+#[tokio::test]
+async fn client_error_on_a_sub_batch_is_not_retried() {
+    let mock = MockServer::start().await;
+    mount_once(&mock, ResponseTemplate::new(400)).await;
+    TeiEmbedFixture.mount_echo(&mock).await;
+    let provider = TeiEmbedFixture.build(mock.uri());
+
+    let texts: Vec<String> = (0..65).map(|i| i.to_string()).collect();
+    let err = batch::embed_batched(
+        &*provider,
+        batch_request(texts),
+        &CancellationToken::new(),
+        4,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(!err.is_retryable(), "{err:?}");
+    let calls = mock.received_requests().await.unwrap().len();
+    assert!(calls <= 3, "a client error was retried: {calls} calls");
+}
+
+/// A client disconnect while a sub-batch waits out a `Retry-After` ends the
+/// request at once, and nothing more is sent upstream.
+#[tokio::test]
+async fn cancellation_during_a_sub_batch_backoff_stops_the_request() {
+    let mock = MockServer::start().await;
+    mount_status(&mock, 429, Some("5")).await;
+    let provider = TeiEmbedFixture.build(mock.uri());
+
+    let cancel = CancellationToken::new();
+    let canceller = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        canceller.cancel();
+    });
+
+    let texts: Vec<String> = (0..65).map(|i| i.to_string()).collect();
+    let started = Instant::now();
+    let err = batch::embed_batched(&*provider, batch_request(texts), &cancel, 4)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, ProviderError::Cancelled), "{err:?}");
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "cancellation did not interrupt the backoff: {:?}",
+        started.elapsed()
+    );
+    let calls = mock.received_requests().await.unwrap().len();
+    assert!(calls <= 3, "calls were sent during the pause: {calls}");
 }

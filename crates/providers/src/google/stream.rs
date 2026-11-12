@@ -405,6 +405,31 @@ mod tests {
         assert_eq!(usage.reasoning_tokens(), Some(30));
     }
 
+    #[test]
+    fn stream_usage_counts_tool_use_prompt_and_computes_an_absent_total() {
+        let mut t = GoogleTranslator::new("g", "google-test");
+        let items = t
+            .translate(&event(serde_json::json!({
+                "candidates": [{ "content": { "parts": [{ "text": "x" }] }, "finishReason": "STOP" }],
+                "usageMetadata": {
+                    "promptTokenCount": 10,
+                    "toolUsePromptTokenCount": 25,
+                    "candidatesTokenCount": 4
+                }
+            })))
+            .expect("ok");
+        let usage = items
+            .iter()
+            .find_map(|i| match i {
+                StreamItem::Chunk(c) => c.usage,
+                StreamItem::Done => None,
+            })
+            .expect("usage");
+        assert_eq!(usage.prompt_tokens, 35);
+        assert_eq!(usage.completion_tokens, 4);
+        assert_eq!(usage.total_tokens, 39);
+    }
+
     /// A prompt-level block is a content-filter refusal (and latches), not a
     /// silently unterminated stream.
     #[test]

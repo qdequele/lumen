@@ -249,19 +249,12 @@ Follow-ups of the decisions spec (`docs/superpowers/specs/2026-10-08-decisions-d
   models, keyed by model) would soften this bottleneck. Deferred: it needs
   per-model config plumbing that the current `EmbeddingProvider::max_batch_size`
   (provider-wide, model-agnostic) does not carry.
-- **A failed sub-batch re-runs the whole embedding request (code review,
-  needs a design decision).** `embed_batched` (`crates/providers/src/batch.rs`)
-  fails the request on the first sub-batch error and drops the sub-responses
-  it already has; the retry or fallback above it then starts again from the
-  first input. For the single-instance providers (`max_batch_size() = 1`:
-  Bedrock, Vertex) an N-input request is N upstream calls, so one transient
-  failure on the last call re-sends, and re-bills, the N-1 that succeeded.
-  Options to weigh: retry only the failed sub-batch inside `embed_batched`
-  (needs the retry policy and breaker accounting, which live in the router,
-  to reach the providers crate), keep the completed sub-responses across
-  attempts on the same provider (they cannot be reused on a fallback to a
-  different model), or return partial results (rejected for v1). Until then
-  the upstream usage of a failed attempt is also lost to accounting.
+- ~~**A failed sub-batch re-runs the whole embedding request (code review,
+  needs a design decision).**~~ **Resolved**: `embed_batched` retries a failed
+  sub-batch on its own and keeps the completed sub-responses. Design, bounds
+  and what stays open (the usage of a failed attempt, a configurable policy):
+  ADR 005, amendment of 2026-11-12 "sub-batch retry for split embedding
+  requests" (`docs/adr/005-resilience-execution.md`).
 
 ## Noted while building M4 (slice 1 - non-streaming chat)
 
