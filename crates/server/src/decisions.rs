@@ -10,6 +10,7 @@
 //! content: never logged and never in `usage_log`.
 
 use axum::body::Bytes;
+use axum::extract::rejection::BytesRejection;
 use axum::extract::State;
 use axum::http::{header, HeaderMap, HeaderValue};
 use axum::response::{IntoResponse, Response};
@@ -23,7 +24,7 @@ use crate::accounting::{Accounting, Outcome, Target, TokenBreakdown};
 use crate::auth::AuthedKey;
 use crate::bandwidth::UpstreamMark;
 use crate::byok::{RequestKeys, Served};
-use crate::error::ApiError;
+use crate::error::{body_rejection, ApiError};
 use crate::facts::Facts;
 use crate::resilience::routing_headers;
 use crate::state::AppState;
@@ -34,8 +35,10 @@ pub async fn decisions_handler(
     headers: HeaderMap,
     key: Option<Extension<AuthedKey>>,
     Extension(mark): Extension<UpstreamMark>,
-    body: Bytes,
+    body: Result<Bytes, BytesRejection>,
 ) -> Result<Response, ApiError> {
+    // A body that could not be read → LM-1001; one over the limit → LM-1002.
+    let body = body.map_err(|e| body_rejection(&e, state.body_limit))?;
     handle(state, &headers, key.as_deref(), &mark, &body).await
 }
 

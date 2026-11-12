@@ -4,6 +4,7 @@
 //! this newtype adds the axum [`IntoResponse`] impl (status, JSON envelope and
 //! `Retry-After` header) here in the server layer.
 
+use axum::extract::rejection::{BytesRejection, JsonRejection};
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -15,6 +16,48 @@ pub struct ApiError(pub GatewayError);
 impl From<GatewayError> for ApiError {
     fn from(err: GatewayError) -> Self {
         ApiError(err)
+    }
+}
+
+/// A body-extractor rejection ([`JsonRejection`] or [`BytesRejection`]): its
+/// HTTP status and its plain-text description.
+pub trait BodyRejection {
+    /// The status axum would answer with.
+    fn status(&self) -> StatusCode;
+    /// The description of what was wrong with the body.
+    fn body_text(&self) -> String;
+}
+
+impl BodyRejection for JsonRejection {
+    fn status(&self) -> StatusCode {
+        JsonRejection::status(self)
+    }
+    fn body_text(&self) -> String {
+        JsonRejection::body_text(self)
+    }
+}
+
+impl BodyRejection for BytesRejection {
+    fn status(&self) -> StatusCode {
+        BytesRejection::status(self)
+    }
+    fn body_text(&self) -> String {
+        BytesRejection::body_text(self)
+    }
+}
+
+/// Map a body-extractor rejection to the gateway's error envelope.
+///
+/// A `413` means the body ran over `body_limit` while it was being read (a
+/// chunked body with no `Content-Length`, which the body-limit layer cannot
+/// refuse up front): `LM-1002`, quoting the configured limit. Anything else
+/// (malformed JSON, wrong content type, a broken body) is `LM-1001`.
+#[must_use]
+pub fn body_rejection(rejection: &impl BodyRejection, body_limit: usize) -> GatewayError {
+    if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        GatewayError::PayloadTooLarge { limit: body_limit }
+    } else {
+        GatewayError::InvalidRequest(rejection.body_text())
     }
 }
 

@@ -87,6 +87,10 @@ struct Harness {
 }
 
 async fn harness(registry: Arc<Registry>) -> Harness {
+    harness_with_limit(registry, LIMIT).await
+}
+
+async fn harness_with_limit(registry: Arc<Registry>, body_limit: usize) -> Harness {
     let store = KeyStore::in_memory().await.expect("store");
     let group = store
         .create_group(NewGroup {
@@ -130,7 +134,7 @@ async fn harness(registry: Arc<Registry>) -> Harness {
     let state = AppState::new(metrics, registry, tokens, latency)
         .with_pricing(dollar_pricing())
         .with_auth(Arc::clone(&runtime));
-    let base = common::spawn_state(state, LIMIT).await;
+    let base = common::spawn_state(state, body_limit).await;
     Harness {
         base,
         runtime,
@@ -387,6 +391,37 @@ async fn bandwidth_ignores_gateway_refusals() {
     assert_eq!(resp.status(), 402);
     let v: Value = resp.json().await.expect("json");
     assert_eq!(v["error"]["code"], "LM-4001");
+
+    assert!(upstream.received_requests().await.expect("reqs").is_empty());
+    h.assert_quiet().await;
+}
+
+/// The metering layer wraps the request body; a chunked body that runs over
+/// the limit behind it is still `413 LM-1002`, and is not billed.
+#[tokio::test]
+async fn over_limit_chunked_body_behind_the_meter_is_lm_1002() {
+    let upstream = MockServer::start().await;
+    mount_embeddings(&upstream, 200).await;
+    let h = harness_with_limit(registry(&upstream.uri()), 1024).await;
+
+    let body = serde_json::to_vec(&json!({
+        "model": "openai/embed-small",
+        "input": "x".repeat(64 * 1024)
+    }))
+    .expect("json");
+    let chunks: Vec<Result<Vec<u8>, std::io::Error>> =
+        body.chunks(512).map(|c| Ok(c.to_vec())).collect();
+    let resp = reqwest::Client::new()
+        .post(format!("{}/v1/embeddings", h.base))
+        .bearer_auth(&h.key)
+        .header("content-type", "application/json")
+        .body(reqwest::Body::wrap_stream(futures::stream::iter(chunks)))
+        .send()
+        .await
+        .expect("send");
+    assert_eq!(resp.status(), 413);
+    let v: Value = resp.json().await.expect("json");
+    assert_eq!(v["error"]["code"], "LM-1002");
 
     assert!(upstream.received_requests().await.expect("reqs").is_empty());
     h.assert_quiet().await;

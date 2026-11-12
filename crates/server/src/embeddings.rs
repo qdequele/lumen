@@ -20,7 +20,7 @@ use crate::accounting::{Accounting, Outcome, Target, TokenBreakdown};
 use crate::auth::AuthedKey;
 use crate::bandwidth::UpstreamMark;
 use crate::byok::{RequestKeys, Served};
-use crate::error::ApiError;
+use crate::error::{body_rejection, ApiError};
 use crate::facts::Facts;
 use crate::resilience::routing_headers;
 use crate::state::AppState;
@@ -81,8 +81,8 @@ pub async fn embeddings(
     payload: Result<Json<lumen_core::EmbedRequest>, JsonRejection>,
 ) -> Result<Response, ApiError> {
     // Malformed request body → LM-1001 in our standard envelope (not axum's
-    // default plain-text rejection).
-    let Json(req) = payload.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
+    // default plain-text rejection); a body over the limit → LM-1002.
+    let Json(req) = payload.map_err(|e| body_rejection(&e, state.body_limit))?;
 
     if req.input.is_empty() {
         return Err(GatewayError::InvalidRequest("`input` must not be empty".to_owned()).into());

@@ -50,7 +50,7 @@ use crate::accounting::{Accounting, Outcome, StreamAccounting, Target, TokenBrea
 use crate::auth::AuthedKey;
 use crate::bandwidth::UpstreamMark;
 use crate::byok::{RequestKeys, Served};
-use crate::error::ApiError;
+use crate::error::{body_rejection, ApiError};
 use crate::facts::Facts;
 use crate::pricing::DEFAULT_RESERVED_OUTPUT_TOKENS;
 use crate::resilience::routing_headers;
@@ -74,13 +74,12 @@ pub async fn chat(
 ) -> Result<Response, ApiError> {
     // Malformed body → LM-1001 in our envelope (not axum's plain-text default).
     //
-    // An over-limit body never reaches here: `RequestBodyLimitLayer` (see
-    // `app.rs`) short-circuits at the tower layer with a bare 413 before axum's
-    // routing/extraction runs, so `JsonRejection` never surfaces
-    // `PAYLOAD_TOO_LARGE` - verified empirically (a debug probe in this
-    // `map_err` never fired for an over-limit request). `app::map_body_limit_response`
-    // rewrites that bare 413 into the `LM-1002` envelope instead.
-    let Json(mut req) = payload.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
+    // A body whose `Content-Length` is over the limit never reaches here:
+    // `RequestBodyLimitLayer` (see `app.rs`) answers a bare 413 first, which
+    // `app::map_body_limit_response` rewrites into `LM-1002`. A chunked body
+    // is only found over the limit while it is read, so it surfaces here as a
+    // 413 rejection, mapped to the same `LM-1002`.
+    let Json(mut req) = payload.map_err(|e| body_rejection(&e, state.body_limit))?;
 
     if req.messages.is_empty() {
         return Err(GatewayError::InvalidRequest("`messages` must not be empty".to_owned()).into());

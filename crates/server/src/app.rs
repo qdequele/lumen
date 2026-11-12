@@ -4,7 +4,7 @@ use crate::{
     admin, admin_scope, auth, byok_admin, chat, decisions, embeddings, health, models, openapi,
     platform_keys_admin, rerank, routes, state::AppState,
 };
-use axum::extract::{MatchedPath, Request, State};
+use axum::extract::{DefaultBodyLimit, MatchedPath, Request, State};
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::{
@@ -37,6 +37,9 @@ use crate::error::ApiError;
 ///    envelope;
 /// 6. reject bodies larger than `body_limit` bytes.
 ///
+/// axum's own 2 MiB [`DefaultBodyLimit`] on the `Json`/`Bytes` extractors is
+/// disabled, so `body_limit` is the only limit (larger or smaller than 2 MiB).
+///
 /// Route groups:
 /// * `/health`, `/health/providers`, `/metrics` - operational, never
 ///   authenticated, no I/O (`/health` never depends on provider state);
@@ -59,12 +62,14 @@ pub fn build_app(state: AppState) -> Router {
         .layer(middleware::from_fn_with_state(state.clone(), track_latency))
         // Conservative default security headers on every response (M7 §7.4).
         .layer(middleware::from_fn(security_headers))
-        // `RequestBodyLimitLayer` short-circuits an over-limit body with a bare
-        // `413 Payload Too Large` plain-text response *before* axum routing or
-        // any handler runs (verified empirically: it fires on `Content-Length`
-        // alone, so the chat handler's `JsonRejection` branch never sees it).
-        // This middleware sits just outside that layer to rewrite the bare 413
-        // into our `LM-1002` JSON envelope.
+        // `RequestBodyLimitLayer` short-circuits a body whose `Content-Length`
+        // is over the limit with a bare `413 Payload Too Large` plain-text
+        // response *before* axum routing or any handler runs. This middleware
+        // sits just outside that layer to rewrite the bare 413 into our
+        // `LM-1002` JSON envelope. A body with no `Content-Length` (chunked)
+        // is only found over the limit while a handler reads it: the `/v1`
+        // handlers map that extractor rejection to `LM-1002` themselves
+        // (`error::body_rejection`).
         .layer(middleware::from_fn_with_state(
             state.clone(),
             map_body_limit_response,
@@ -126,6 +131,10 @@ pub fn build_app(state: AppState) -> Router {
     // is not the secret - only its auth state is.
     app.fallback(route_not_found)
         .with_state(state)
+        // `RequestBodyLimitLayer` (in the stack below) is the single body
+        // limit: without this, axum's extractors would still cap a body at
+        // their built-in 2 MiB whatever `server.body_limit` says.
+        .layer(DefaultBodyLimit::disable())
         .layer(middleware_stack)
 }
 
@@ -145,11 +154,12 @@ async fn route_not_found() -> Response {
 /// produces for [`GatewayError::PayloadTooLarge`], keeping the `body_limit`
 /// this gateway was configured with in the message.
 ///
-/// This rewrites *every* `413`, trusting that only `RequestBodyLimitLayer`
-/// (immediately inside this middleware in the stack below) ever produces one.
-/// No handler in this crate returns 413 for any other reason today; if one
-/// ever needs to, route it around this layer or it will be relabelled as a
-/// body-size rejection.
+/// This rewrites *every* `413`, trusting that only a body over `body_limit`
+/// ever produces one: `RequestBodyLimitLayer` (immediately inside this
+/// middleware in the stack below), or a handler whose extractor hit that
+/// layer's limit while reading a chunked body. No handler in this crate
+/// returns 413 for any other reason today; if one ever needs to, route it
+/// around this layer or it will be relabelled as a body-size rejection.
 async fn map_body_limit_response(
     State(state): State<AppState>,
     request: Request,

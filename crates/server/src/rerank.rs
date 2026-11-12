@@ -22,7 +22,7 @@ use crate::accounting::{Accounting, Outcome, Target, TokenBreakdown};
 use crate::auth::AuthedKey;
 use crate::bandwidth::UpstreamMark;
 use crate::byok::{RequestKeys, Served};
-use crate::error::ApiError;
+use crate::error::{body_rejection, ApiError};
 use crate::facts::Facts;
 use crate::resilience::routing_headers;
 use crate::state::AppState;
@@ -42,8 +42,9 @@ pub async fn rerank_handler(
     Extension(mark): Extension<UpstreamMark>,
     payload: Result<Json<lumen_core::RerankRequest>, JsonRejection>,
 ) -> Result<Response, ApiError> {
-    // Malformed body → LM-1001 in our envelope (not axum's plain-text default).
-    let Json(req) = payload.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
+    // Malformed body → LM-1001 in our envelope (not axum's plain-text
+    // default); a body over the limit → LM-1002.
+    let Json(req) = payload.map_err(|e| body_rejection(&e, state.body_limit))?;
 
     // Empty documents is a distinct, pinned client error (LM-2010).
     if req.documents.is_empty() {
