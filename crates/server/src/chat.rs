@@ -542,9 +542,13 @@ fn settle_non_streaming(
         // Prometheus and usage_log. The response envelope already holds it
         // (deserialized straight into `response.usage`).
         let breakdown = TokenBreakdown::from_usage(&usage);
-        let cost = accounting
-            .pricing()
-            .token_cost(client_model, tokens_in, tokens_out);
+        let cost = accounting.pricing().token_cost_with_cache(
+            client_model,
+            tokens_in,
+            tokens_out,
+            breakdown.cached_tokens,
+            breakdown.cache_write_tokens,
+        );
         accounting.finish(&Outcome {
             tokens_in,
             tokens_out,

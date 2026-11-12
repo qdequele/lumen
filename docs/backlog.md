@@ -5,6 +5,15 @@ Ideas surfaced during development that are intentionally out of scope for v1
 Recorded here so they are not lost, and so we don't gold-plate the current
 milestone.
 
+## Noted while adding cached-input pricing (ADR 003 addendum)
+
+- One `cost_per_1m_cache_write` rate per model. Anthropic prices a 1-hour
+  cache write above a 5-minute one and reports the split
+  (`cache_creation.ephemeral_5m_input_tokens` / `ephemeral_1h_input_tokens`);
+  carry both counts and a second rate if a deployment mixes TTLs.
+- `/v1/decisions` records no cache breakdown, so cached input on a decision
+  model is charged at the input rate.
+
 ## Noted while building ADR 022 (account virtual models)
 
 - Purge the `account_virtual_models` row of an account whose groups are all

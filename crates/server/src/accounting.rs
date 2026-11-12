@@ -606,9 +606,13 @@ impl StreamAccounting {
         // Bill at the model that actually served the stream (a fallback may
         // differ from the requested model) - consistent with the non-streaming,
         // embed and rerank paths.
-        let cost = accounting
-            .pricing()
-            .token_cost(accounting.model_used(), tokens_in, tokens_out);
+        let cost = accounting.pricing().token_cost_with_cache(
+            accounting.model_used(),
+            tokens_in,
+            tokens_out,
+            breakdown.cached_tokens,
+            breakdown.cache_write_tokens,
+        );
         accounting.finish(&Outcome {
             tokens_in,
             tokens_out,

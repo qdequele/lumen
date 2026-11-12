@@ -360,6 +360,11 @@ health_check_interval_ms = 30000  # probe cadence (must not be 0 when enabled)
 #   cost_per_1m_input / cost_per_1m_output / cost_per_1k_searches
 #                 optional prices (USD), the source of cost counting and hard
 #                 budgets
+#   cost_per_1m_cached_input / cost_per_1m_cache_write
+#                 optional prices (USD) for the part of a chat call's input
+#                 that the provider read from, or wrote to, its prompt cache.
+#                 Each defaults to cost_per_1m_input when unset, so cached
+#                 input is then charged like any other input.
 #   release_date  optional ISO date the model was released, quoted
 #                 ("2024-08-06") or as a bare TOML date (2024-08-06).
 #                 GET /v1/models returns it as `release_date` and as the
@@ -402,6 +407,10 @@ release_date = "2024-08-06"
 # A model without prices costs 0: budgets then never bite on it.
 cost_per_1m_input = 2.5
 cost_per_1m_output = 10.0
+# Input tokens OpenAI served from its prompt cache
+# (usage.prompt_tokens_details.cached_tokens) are billed at a discount.
+# Unset, they are charged at cost_per_1m_input.
+cost_per_1m_cached_input = 1.25
 
 [[providers.models]]
 id = "openai/text-embedding-3-small"
@@ -431,6 +440,12 @@ upstream_id = "claude-sonnet-4-5-20250929"
 capabilities = ["chat"]
 cost_per_1m_input = 3.0
 cost_per_1m_output = 15.0
+# Anthropic prompt caching: cache reads are cheaper than plain input, cache
+# writes dearer (this is the 5-minute cache rate; a 1-hour cache write costs
+# more, so set the rate of the TTL your clients use). Unset, both are charged
+# at cost_per_1m_input.
+cost_per_1m_cached_input = 0.3
+cost_per_1m_cache_write = 3.75
 
 # Google Gemini (public Gemini Developer API): chat + embeddings. The key
 # rides the `x-goog-api-key` header, never the URL. Embeddings go through

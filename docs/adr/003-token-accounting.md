@@ -182,3 +182,57 @@ a config knob, without disturbing the default heuristic path.
   (heuristic) and the accounting surfaces (accurate) intentionally differ -
   the envelope is the hot-path-safe estimate, the accounting surfaces are the
   billing-grade one.
+
+## Addendum (2026-11-12 - cached-input pricing)
+
+Cost is a consumer of the token counts (above), and until now it had one
+input rate per model: `tokens_in x cost_per_1m_input`. That stopped being
+right once the counts became honest about prompt caching:
+
+- OpenAI-compatible upstreams report `prompt_tokens_details.cached_tokens`
+  as a subset of `prompt_tokens`, billed by the provider at a discount.
+- Anthropic's `prompt_tokens` now includes `cache_read_input_tokens` and
+  `cache_creation_input_tokens` (the provider layer folds them in so the
+  OpenAI invariant "cached is a subset of prompt" holds). Anthropic bills a
+  cache read well below the input price and a cache write above it.
+
+So a cache-heavy workload was charged to its key and budgets at the full
+input rate for tokens the provider sold at a fraction of it.
+
+**Decision.**
+
+- Two optional per-model prices: `cost_per_1m_cached_input` (cache read)
+  and `cost_per_1m_cache_write` (cache creation). **Each defaults to
+  `cost_per_1m_input` when unset**, so an existing config prices exactly as
+  before; nothing is discounted or surcharged that the operator did not ask
+  for.
+- `CostTable::token_cost_with_cache(model, tokens_in, tokens_out, cached,
+  cache_write)` splits `tokens_in` into three parts that always sum to it:
+  cached at the cached rate, cache-write at the write rate, the rest at the
+  input rate. A breakdown larger than `tokens_in` is clamped (cached first,
+  then cache-write), so a malformed upstream count cannot produce a negative
+  or inflated input. `token_cost` is the same call with no breakdown.
+- The breakdown is the one the accounting already carries for Prometheus and
+  `usage_log` (`TokenBreakdown`, issue #99), so nothing new is parsed. It is
+  passed at the two chat settlement points: the non-streaming settlement and
+  the streaming one (`StreamAccounting::finalize_with_status`, including a
+  stream cut short, which settles what the last usage chunk reported).
+- **Only the cost moves.** `tokens_in`, `cached_tokens`,
+  `cache_write_tokens`, the response `usage`, the Prometheus counters and
+  the TPM settlement are unchanged.
+
+**Not covered, on purpose.**
+
+- The pre-call reservation keeps the full input rate: the cache outcome is
+  unknown before the call, and over-reserving is the safe side (it is
+  released at settlement).
+- A locally estimated count has no breakdown (a breakdown is an upstream
+  fact, never derived) and is priced at the input rate.
+- One cache-write rate per model. Anthropic prices a 1-hour cache write
+  above a 5-minute one and reports the split, but the gateway's usage has a
+  single `cache_creation_tokens`; the operator sets the rate of the TTL in
+  use. Splitting it is a backlog item if a deployment mixes both.
+- `/v1/decisions` does not record a cache breakdown today (its settlement
+  passes an empty one), so cached input there stays at the input rate.
+- There is no built-in price table to seed these from: prices are operator
+  config only, and `scripts/model-watch` tracks model ids, not prices.
