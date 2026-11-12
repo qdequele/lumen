@@ -191,6 +191,11 @@ struct GeminiPart {
     /// A tool result fed back to the model: `{ "name": ..., "response": {...} }`.
     #[serde(rename = "functionResponse", skip_serializing_if = "Option::is_none")]
     function_response: Option<serde_json::Value>,
+    /// The opaque thought signature Gemini attached to this part when it
+    /// produced it (a sibling of `functionCall`), replayed verbatim. Gemini 3
+    /// models answer 400 when a `functionCall` part comes back without it.
+    #[serde(rename = "thoughtSignature", skip_serializing_if = "Option::is_none")]
+    thought_signature: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -224,6 +229,7 @@ impl GeminiPart {
             file_data: None,
             function_call: None,
             function_response: None,
+            thought_signature: None,
         }
     }
 
@@ -235,17 +241,25 @@ impl GeminiPart {
             file_data: None,
             function_call: None,
             function_response: None,
+            thought_signature: None,
         }
     }
 
-    /// An assistant tool-call part (`functionCall`).
-    fn function_call(name: &str, args: &serde_json::Value) -> Self {
+    /// An assistant tool-call part (`functionCall`), with the thought
+    /// signature the call was originally returned with, if the history
+    /// carries one.
+    fn function_call(
+        name: &str,
+        args: &serde_json::Value,
+        thought_signature: Option<&str>,
+    ) -> Self {
         Self {
             text: None,
             inline_data: None,
             file_data: None,
             function_call: Some(json!({ "name": name, "args": args })),
             function_response: None,
+            thought_signature: thought_signature.map(str::to_owned),
         }
     }
 
@@ -257,6 +271,7 @@ impl GeminiPart {
             file_data: None,
             function_call: None,
             function_response: Some(json!({ "name": name, "response": response })),
+            thought_signature: None,
         }
     }
 
@@ -271,6 +286,7 @@ impl GeminiPart {
             }),
             function_call: None,
             function_response: None,
+            thought_signature: None,
         }
     }
 }
@@ -389,6 +405,8 @@ struct GeminiResponsePart {
     text: String,
     #[serde(rename = "functionCall", default)]
     function_call: Option<GeminiFunctionCall>,
+    #[serde(rename = "thoughtSignature", default)]
+    thought_signature: Option<String>,
 }
 
 /// A model-emitted tool call: Gemini returns the arguments as a JSON object
@@ -438,6 +456,30 @@ impl GeminiUsage {
             }),
         }
     }
+}
+
+/// JSON pointer to a tool call's Gemini thought signature in the OpenAI
+/// shape. This is where Google's own OpenAI-compatible endpoint carries it
+/// (`tool_calls[i].extra_content.google.thought_signature`), so a client that
+/// already round-trips it for that endpoint works unchanged.
+const THOUGHT_SIGNATURE_POINTER: &str = "/extra_content/google/thought_signature";
+
+/// Attach a part's `thoughtSignature` to the OpenAI tool call built from it
+/// (see [`THOUGHT_SIGNATURE_POINTER`]). The signature is opaque and must be
+/// replayed verbatim with the call: Gemini 3 models reject (400) a
+/// `functionCall` part sent back without the signature it was issued with.
+/// Absent signatures add nothing.
+pub(super) fn with_thought_signature(
+    mut tool_call: serde_json::Value,
+    signature: Option<String>,
+) -> serde_json::Value {
+    if let (Some(signature), Some(map)) = (signature, tool_call.as_object_mut()) {
+        map.insert(
+            "extra_content".to_owned(),
+            json!({ "google": { "thought_signature": signature } }),
+        );
+    }
+    tool_call
 }
 
 /// A fresh prefix for the tool-call ids synthesized for ONE response (Gemini
@@ -632,6 +674,8 @@ fn push_assistant_tool_calls(
             parts.push(GeminiPart::function_call(
                 name,
                 &parse_tool_arguments(call.pointer("/function/arguments")),
+                call.pointer(THOUGHT_SIGNATURE_POINTER)
+                    .and_then(|v| v.as_str()),
             ));
         }
     }
@@ -882,15 +926,18 @@ fn translate_response(
                 } else {
                     call.args
                 };
-                tool_calls.push(json!({
-                    "id": format!("{id_prefix}_{index}"),
-                    "type": "function",
-                    "function": {
-                        "name": call.name,
-                        // OpenAI carries arguments as a JSON string.
-                        "arguments": args.to_string(),
-                    },
-                }));
+                tool_calls.push(with_thought_signature(
+                    json!({
+                        "id": format!("{id_prefix}_{index}"),
+                        "type": "function",
+                        "function": {
+                            "name": call.name,
+                            // OpenAI carries arguments as a JSON string.
+                            "arguments": args.to_string(),
+                        },
+                    }),
+                    part.thought_signature,
+                ));
             } else {
                 text.push_str(&part.text);
             }
@@ -1360,6 +1407,42 @@ mod tests {
         assert_eq!(replayed, expected);
     }
 
+    /// A `thoughtSignature` on a `functionCall` part survives the round trip:
+    /// out on the tool call (where Google's OpenAI-compatible endpoint puts
+    /// it), back in as a sibling of the replayed `functionCall`. A call
+    /// without one (parallel calls carry it on the first only) gets none.
+    #[test]
+    fn thought_signature_round_trips_through_the_openai_tool_call() {
+        let resp: GeminiResponse = serde_json::from_value(json!({
+            "candidates": [{
+                "content": { "parts": [
+                    { "functionCall": { "name": "a", "args": { "x": 1 } }, "thoughtSignature": "SIG_A" },
+                    { "functionCall": { "name": "b", "args": {} } }
+                ] },
+                "finishReason": "STOP"
+            }]
+        }))
+        .unwrap();
+        let out = translate_response(resp, "gemini-3", "google").unwrap();
+        let assistant = out.choices[0].message.clone();
+        let calls = assistant.extra["tool_calls"].as_array().unwrap();
+        assert_eq!(
+            calls[0]["extra_content"]["google"]["thought_signature"],
+            "SIG_A"
+        );
+        assert!(calls[1].get("extra_content").is_none(), "{}", calls[1]);
+
+        let body = serde_json::to_value(
+            translate_request(&request(vec![msg("user", "go"), assistant]), "google").unwrap(),
+        )
+        .unwrap();
+        let parts = body["contents"][1]["parts"].as_array().unwrap();
+        assert_eq!(parts[0]["functionCall"]["name"], "a");
+        assert_eq!(parts[0]["thoughtSignature"], "SIG_A");
+        assert_eq!(parts[1]["functionCall"]["name"], "b");
+        assert!(parts[1].get("thoughtSignature").is_none(), "{}", parts[1]);
+    }
+
     #[test]
     fn response_concatenates_parts_and_maps_usage() {
         let resp = GeminiResponse {
@@ -1369,10 +1452,12 @@ mod tests {
                         GeminiResponsePart {
                             text: "Hello ".to_owned(),
                             function_call: None,
+                            thought_signature: None,
                         },
                         GeminiResponsePart {
                             text: "there".to_owned(),
                             function_call: None,
+                            thought_signature: None,
                         },
                     ],
                 },
@@ -1585,6 +1670,7 @@ mod tests {
                             name: "get_weather".to_owned(),
                             args: json!({ "city": "Paris" }),
                         }),
+                        thought_signature: None,
                     }],
                 },
                 finish_reason: Some("STOP".to_owned()),

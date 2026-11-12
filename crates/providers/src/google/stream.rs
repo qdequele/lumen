@@ -14,8 +14,8 @@ use serde::Deserialize;
 use serde_json::json;
 
 use super::{
-    map_finish_reason, new_tool_call_id_prefix, prompt_block_error, GeminiPromptFeedback,
-    GeminiUsage,
+    map_finish_reason, new_tool_call_id_prefix, prompt_block_error, with_thought_signature,
+    GeminiPromptFeedback, GeminiUsage,
 };
 use crate::chat::{SseTranslator, StreamItem};
 use crate::sse::SseEvent;
@@ -144,12 +144,15 @@ impl SseTranslator for GoogleTranslator {
                 } else {
                     call.args
                 };
-                tool_deltas.push(json!({
-                    "index": index,
-                    "id": format!("{}_{index}", self.tool_call_id_prefix),
-                    "type": "function",
-                    "function": { "name": call.name, "arguments": args.to_string() },
-                }));
+                tool_deltas.push(with_thought_signature(
+                    json!({
+                        "index": index,
+                        "id": format!("{}_{index}", self.tool_call_id_prefix),
+                        "type": "function",
+                        "function": { "name": call.name, "arguments": args.to_string() },
+                    }),
+                    part.thought_signature,
+                ));
             } else {
                 text.push_str(&part.text);
             }
@@ -228,6 +231,10 @@ struct GeminiStreamPart {
     text: String,
     #[serde(rename = "functionCall", default)]
     function_call: Option<GeminiStreamFunctionCall>,
+    /// Opaque signature to replay with the call (see
+    /// [`with_thought_signature`]).
+    #[serde(rename = "thoughtSignature", default)]
+    thought_signature: Option<String>,
 }
 
 /// A streamed tool call. Gemini sends the whole call (name and complete args)
@@ -448,6 +455,32 @@ mod tests {
         assert_eq!(ids.len(), 4);
         let unique: std::collections::HashSet<&String> = ids.iter().collect();
         assert_eq!(unique.len(), 4, "{ids:?}");
+    }
+
+    /// A streamed `functionCall` part's `thoughtSignature` rides the tool-call
+    /// delta, so the client can send it back with the call.
+    #[test]
+    fn stream_function_call_carries_its_thought_signature() {
+        let mut t = GoogleTranslator::new("g", "google-test");
+        let items = t
+            .translate(&event(serde_json::json!({
+                "candidates": [{
+                    "content": { "parts": [{
+                        "functionCall": { "name": "a", "args": {} },
+                        "thoughtSignature": "SIG_A"
+                    }] },
+                    "finishReason": "STOP"
+                }]
+            })))
+            .expect("ok");
+        let StreamItem::Chunk(tool) = &items[1] else {
+            panic!("expected chunk")
+        };
+        assert_eq!(
+            tool.choices[0].delta.extra["tool_calls"][0]["extra_content"]["google"]
+                ["thought_signature"],
+            "SIG_A"
+        );
     }
 
     #[test]
