@@ -14,7 +14,7 @@ use lumen_auth::crypto::MasterKey;
 use lumen_auth::key::hash_key;
 use lumen_auth::state::AuthState;
 use lumen_auth::store::{GroupRecord, KeyStore};
-use lumen_auth::usage::{spawn_usage_writer, UsageWriterConfig};
+use lumen_auth::usage::{spawn_usage_writer_with_drop_hook, UsageWriterConfig};
 use lumen_server::{
     auth::{now_unix, AuthRuntime},
     build_app,
@@ -728,7 +728,8 @@ fn run(config_path: PathBuf) -> anyhow::Result<()> {
         let mut provider_specs = config.provider_specs();
         let (auth_runtime, usage_logger, usage_writer, boot_backfill, key_source, auth_knobs) =
             if config.auth.enabled {
-                let boot = boot_auth_stack(&config, &mut provider_specs, prebuilt_store).await?;
+                let boot =
+                    boot_auth_stack(&config, &mut provider_specs, prebuilt_store, &tokens).await?;
                 (
                     Some(boot.runtime),
                     Some(boot.usage_logger),
@@ -1303,6 +1304,7 @@ async fn boot_auth_stack(
     config: &Config,
     provider_specs: &mut [lumen_providers::ProviderSpec],
     prebuilt_store: Option<KeyStore>,
+    tokens: &TokenMetrics,
 ) -> anyhow::Result<AuthBoot> {
     use zeroize::Zeroize;
     let mut master_value = std::env::var(MASTER_KEY_ENV).with_context(|| {
@@ -1359,13 +1361,17 @@ async fn boot_auth_stack(
     }
     tracing::info!(key_count = keys.len(), group_count, "virtual keys loaded");
 
-    let (logger, writer) = spawn_usage_writer(
+    // Rows the writer finally discards (a batch the DB refused twice) land in
+    // the same `lumen_usage_log_dropped_total` as the channel-full drops.
+    let dropped = tokens.clone();
+    let (logger, writer) = spawn_usage_writer_with_drop_hook(
         store.clone(),
         UsageWriterConfig {
             capacity: config.auth.usage_channel_capacity,
             batch_max: config.auth.usage_batch_max,
             flush_interval: Duration::from_millis(config.auth.usage_flush_ms),
         },
+        Arc::new(move |rows| (0..rows).for_each(|_| dropped.inc_usage_dropped())),
     );
 
     // The reloader re-reads DB provider keys on each reload (rotation without a
