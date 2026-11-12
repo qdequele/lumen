@@ -227,10 +227,48 @@ fn bench_decisions(c: &mut Criterion) {
     }
 }
 
+/// An OpenAI-format completion body whose answer is `content_bytes` long.
+fn completion_body(content_bytes: usize) -> bytes::Bytes {
+    let content = "The quick brown fox. ".repeat(content_bytes / 21 + 1);
+    bytes::Bytes::from(format!(
+        r#"{{"id":"chatcmpl-1","object":"chat.completion","created":1,"model":"gpt-4o","choices":[{{"index":0,"message":{{"role":"assistant","content":"{content}","refusal":null}},"logprobs":null,"finish_reason":"stop"}}],"usage":{{"prompt_tokens":20,"completion_tokens":30,"total_tokens":50,"prompt_tokens_details":{{"cached_tokens":0}}}},"system_fingerprint":"fp_1"}}"#
+    ))
+}
+
+/// What the gateway does with a non-streaming upstream body (ADR 004,
+/// 2026-11-12): `typed` parses it into a `ChatResponse` and serializes it
+/// again (the path a body without usage still takes), `passthrough` probes
+/// `usage` and keeps the bytes.
+fn bench_response_passthrough(c: &mut Criterion) {
+    use lumen_core::ChatCompletion;
+    for (name, body) in [
+        ("small", completion_body(128)),
+        ("4k", completion_body(4 * 1024)),
+    ] {
+        c.bench_function(&format!("chat_response_typed_{name}"), |b| {
+            b.iter(|| {
+                let response: ChatResponse =
+                    serde_json::from_slice(black_box(&body)).expect("parse");
+                let out = serde_json::to_vec(&response).expect("serialize");
+                black_box(out.len());
+            });
+        });
+        c.bench_function(&format!("chat_response_passthrough_{name}"), |b| {
+            b.iter(|| {
+                let completion =
+                    ChatCompletion::from_openai_body(black_box(&body).clone()).expect("probe");
+                assert!(matches!(completion, ChatCompletion::Passthrough(_)));
+                black_box(completion);
+            });
+        });
+    }
+}
+
 criterion_group!(
     benches,
     bench_executor,
     bench_json_roundtrip,
-    bench_decisions
+    bench_decisions,
+    bench_response_passthrough
 );
 criterion_main!(benches);

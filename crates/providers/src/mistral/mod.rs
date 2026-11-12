@@ -7,8 +7,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::BoxStream;
 use lumen_core::{
-    developer_role_as_system, ChatChunk, ChatProvider, ChatRequest, ChatResponse, EmbedRequest,
-    EmbedResponse, EmbeddingProvider, ProviderError,
+    developer_role_as_system, ChatChunk, ChatCompletion, ChatProvider, ChatRequest, ChatResponse,
+    EmbedRequest, EmbedResponse, EmbeddingProvider, ProviderError,
 };
 use std::fmt;
 use tokio_util::sync::CancellationToken;
@@ -51,6 +51,27 @@ impl MistralProvider {
             api_key,
         }
     }
+
+    /// Send a non-streaming completion and return the upstream body.
+    async fn post_chat(
+        &self,
+        mut req: ChatRequest,
+        cancel: &CancellationToken,
+    ) -> Result<Bytes, ProviderError> {
+        req.stream = false;
+        // Mistral has no `developer` role (OpenAI's alias for `system`).
+        developer_role_as_system(&mut req.messages);
+        let url = format!("{}/chat/completions", self.base_url);
+        post_json(
+            &self.client,
+            &url,
+            &req,
+            self.api_key.as_deref(),
+            &self.provider_name,
+            cancel,
+        )
+        .await
+    }
 }
 
 /// Redacted so the API key can never reach a log line via `{:?}`.
@@ -68,23 +89,23 @@ impl fmt::Debug for MistralProvider {
 impl ChatProvider for MistralProvider {
     async fn chat(
         &self,
-        mut req: ChatRequest,
+        req: ChatRequest,
         cancel: CancellationToken,
     ) -> Result<ChatResponse, ProviderError> {
-        req.stream = false;
-        // Mistral has no `developer` role (OpenAI's alias for `system`).
-        developer_role_as_system(&mut req.messages);
-        let url = format!("{}/chat/completions", self.base_url);
-        let bytes = post_json(
-            &self.client,
-            &url,
-            &req,
-            self.api_key.as_deref(),
-            &self.provider_name,
-            &cancel,
-        )
-        .await?;
+        let bytes = self.post_chat(req, &cancel).await?;
         serde_json::from_slice::<ChatResponse>(&bytes)
+            .map_err(|e| ProviderError::Translation(format!("mistral chat response: {e}")))
+    }
+
+    async fn chat_completion(
+        &self,
+        req: ChatRequest,
+        cancel: CancellationToken,
+    ) -> Result<ChatCompletion, ProviderError> {
+        // Mistral answers in the OpenAI format: keep its body as bytes when
+        // nothing in it has to change (ADR 004, 2026-11-12).
+        let bytes = self.post_chat(req, &cancel).await?;
+        ChatCompletion::from_openai_body(bytes)
             .map_err(|e| ProviderError::Translation(format!("mistral chat response: {e}")))
     }
 

@@ -6,7 +6,7 @@
 //! generating - dropping the response body is not enough (lesson: LiteLLM
 //! issue #22805).
 
-use crate::chat::{ChatChunk, ChatRequest, ChatResponse};
+use crate::chat::{ChatChunk, ChatCompletion, ChatRequest, ChatResponse};
 use crate::decisions::{DecisionLimits, DecisionRequest, DecisionResponse};
 use crate::embed::{EmbedRequest, EmbedResponse};
 use crate::error::{GatewayError, ProviderError};
@@ -25,6 +25,23 @@ pub trait ChatProvider: Send + Sync {
         req: ChatRequest,
         cancel: CancellationToken,
     ) -> Result<ChatResponse, ProviderError>;
+
+    /// Perform a non-streaming chat completion for the request path, which
+    /// forwards an upstream body unchanged when it can (ADR 004, 2026-11-12
+    /// amendment).
+    ///
+    /// The default wraps [`chat`](ChatProvider::chat): correct for every
+    /// provider that translates a foreign schema. Providers whose upstream
+    /// already answers in the OpenAI format override it with
+    /// [`ChatCompletion::from_openai_body`], so the body is not parsed into a
+    /// [`ChatResponse`] and serialized again.
+    async fn chat_completion(
+        &self,
+        req: ChatRequest,
+        cancel: CancellationToken,
+    ) -> Result<ChatCompletion, ProviderError> {
+        self.chat(req, cancel).await.map(ChatCompletion::Typed)
+    }
 
     /// Perform a streaming chat completion, yielding typed chunks as they arrive.
     ///

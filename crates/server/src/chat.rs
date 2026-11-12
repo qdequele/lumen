@@ -43,7 +43,8 @@ use lumen_auth::state::usd_to_micro;
 use std::sync::Arc;
 
 use lumen_core::{
-    tokens, Capability, ChatProvider, ChatRequest, GatewayError, ProviderError, Usage,
+    tokens, Capability, ChatCompletion, ChatProvider, ChatRequest, GatewayError, ProviderError,
+    Usage,
 };
 use tokio_util::sync::{CancellationToken, DropGuard};
 
@@ -482,7 +483,7 @@ async fn chat_non_streaming(
                         let provider =
                             provider.ok_or(ProviderError::Unavailable { provider: name })?;
                         mark.mark();
-                        provider.chat(req, cancel).await
+                        provider.chat_completion(req, cancel).await
                     }
                 };
                 keys.attempt(
@@ -503,13 +504,62 @@ async fn chat_non_streaming(
     accounting.served_by(&executed.model_used, &executed.provider_used);
     let route = ctx.decision.route_of(executed.index);
     accounting.set_route(route, ctx.decision.account);
-    let (mut response, served) = executed.value;
+    let (completion, served) = executed.value;
     let served_model = executed.model_used.clone();
     let billable = matches!(served, Served::Platform);
-    let cost = settle_non_streaming(ctx, accounting, &served_model, &mut response, billable);
     let mut headers = routing_headers(&served_model, route);
-    insert_cost_header(&mut headers, cost, billable);
-    Ok((headers, Json(response)).into_response())
+    Ok(match completion {
+        // The upstream body already is the client's answer: its usage is
+        // reported and nothing in it has to change, so it is forwarded as the
+        // bytes received (ADR 004, 2026-11-12 amendment).
+        ChatCompletion::Passthrough(upstream) => {
+            let cost = settle_reported(accounting, &served_model, upstream.usage(), billable);
+            insert_cost_header(&mut headers, cost, billable);
+            (
+                headers,
+                [(header::CONTENT_TYPE, "application/json")],
+                Body::from(upstream.into_body()),
+            )
+                .into_response()
+        }
+        ChatCompletion::Typed(mut response) => {
+            let cost =
+                settle_non_streaming(ctx, accounting, &served_model, &mut response, billable);
+            insert_cost_header(&mut headers, cost, billable);
+            (headers, Json(response)).into_response()
+        }
+    })
+}
+
+/// Close the books on a completion whose usage the upstream reported.
+fn settle_reported(
+    accounting: Accounting,
+    client_model: &str,
+    usage: &Usage,
+    billable: bool,
+) -> f64 {
+    let (tokens_in, tokens_out) = (
+        u64::from(usage.prompt_tokens),
+        u64::from(usage.completion_tokens),
+    );
+    // Issue #99: carry the upstream-reported breakdown through to Prometheus
+    // and usage_log. The response body already holds it.
+    let breakdown = TokenBreakdown::from_usage(usage);
+    let cost = accounting
+        .pricing()
+        .token_cost(client_model, tokens_in, tokens_out);
+    accounting.finish(&Outcome {
+        tokens_in,
+        tokens_out,
+        estimated: false,
+        search_units: None,
+        breakdown,
+        media: lumen_core::MediaUsage::default(),
+        cost,
+        status: 200,
+        billable,
+    });
+    cost
 }
 
 /// Close the books on a non-streaming completion (ADR 003): upstream usage
@@ -534,29 +584,7 @@ fn settle_non_streaming(
         .usage
         .filter(|u| u.prompt_tokens > 0 || u.completion_tokens > 0);
     if let Some(usage) = reported {
-        let (tokens_in, tokens_out) = (
-            u64::from(usage.prompt_tokens),
-            u64::from(usage.completion_tokens),
-        );
-        // Issue #99: carry the upstream-reported breakdown through to
-        // Prometheus and usage_log. The response envelope already holds it
-        // (deserialized straight into `response.usage`).
-        let breakdown = TokenBreakdown::from_usage(&usage);
-        let cost = accounting
-            .pricing()
-            .token_cost(client_model, tokens_in, tokens_out);
-        accounting.finish(&Outcome {
-            tokens_in,
-            tokens_out,
-            estimated: false,
-            search_units: None,
-            breakdown,
-            media: lumen_core::MediaUsage::default(),
-            cost,
-            status: 200,
-            billable,
-        });
-        return cost;
+        return settle_reported(accounting, client_model, &usage, billable);
     }
 
     // Upstream reported nothing: the envelope gets the inline heuristic.

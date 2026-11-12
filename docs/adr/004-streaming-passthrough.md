@@ -68,3 +68,57 @@ it must never block or re-serialize the passthrough path.
   to an explicit injected frame rather than axum's `KeepAlive`.
 - `core` gains a `bytes` dependency (already ubiquitous via reqwest) for the
   trait's return type.
+
+## Amendment 2026-11-12 - non-streaming responses are forwarded as bytes too
+
+The decision above covered `stream: true` only. A non-streaming completion
+from a same-schema upstream was still parsed into `ChatResponse` and
+serialized again, although the gateway reads nothing from it but `usage`.
+
+### Chat completions
+
+`ChatProvider` gains `chat_completion`, which returns a `ChatCompletion`:
+`Typed(ChatResponse)` or `Passthrough` (the upstream body as `Bytes` plus the
+`Usage` read from it). The default wraps `chat`, so translating providers
+(Anthropic, Google, Vertex, Bedrock, Cohere) are unchanged. The
+OpenAI-compatible providers (`openai` and the kinds built on it, `mistral`,
+`azure`) override it with `ChatCompletion::from_openai_body`. `chat` itself
+stays typed: the registry probes and the typed streaming fallback use it.
+
+**When a body is forwarded as bytes.** Only when nothing in it has to change,
+which today means all of:
+
+- the upstream speaks the OpenAI schema (the provider overrides
+  `chat_completion`);
+- the body reports usable usage: `usage.prompt_tokens > 0` or
+  `usage.completion_tokens > 0`, the same test the handler already used to
+  tell reported usage from none (ADR 003);
+- the body has a `choices` array.
+
+In every other case the body is parsed into `ChatResponse` as before, and the
+handler adds the flagged estimate (`usage.estimated: true`). The handler never
+rewrites any other field of a non-streaming completion (the response `model`
+is the upstream's, also for a virtual model), so no other condition applies.
+A future feature that edits the response body must take the typed path, or
+extend the conditions here.
+
+**What is probed.** One `serde_json` pass over the body that builds only the
+`Usage` (with its `prompt_tokens_details` / `completion_tokens_details`
+breakdown, issue #99) and checks that `choices` is an array. Every other value
+is skipped without being built. The pass still rejects a body that is not
+well-formed JSON, including a truncated one. A probe that fails, or finds no
+usable usage, falls back to the full typed parse, whose error is the
+`LM-3002` reported before: a `200` that carries usage but no `choices` is
+still an upstream fault.
+
+**What changes for clients.** A forwarded body is byte-identical to the
+upstream's. The typed path dropped fields it has no slot for (unknown keys
+inside `usage` or a choice, such as a provider's `cost` or `logprobs`) and
+normalised spacing and key order; a forwarded body keeps them. The response
+headers are unchanged (`content-type: application/json`, the routing headers,
+`x-lumen-cost-micro-usd`).
+
+**What is no longer checked.** A forwarded body is not validated against the
+`ChatResponse` shape beyond the two probed fields (`id`, `object`, `created`,
+`model` and the choice contents are not inspected), as a streamed body never
+was. Token accounting is unaffected: it reads the same `Usage` either way.
