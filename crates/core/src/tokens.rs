@@ -109,13 +109,16 @@ pub fn estimate_embed_input(req: &EmbedRequest) -> u64 {
 }
 
 /// Estimate the tokens processed by a rerank request: the query is compared
-/// against every document, so it counts once per document.
+/// against every document, so it counts once per document. A document counts
+/// as the text the provider will rank (its `rank_fields` reduction for an
+/// object document, see [`RerankDocument::rank_text`](crate::rerank::RerankDocument::rank_text)).
 #[must_use]
 pub fn estimate_rerank(req: &RerankRequest) -> u64 {
     let query = estimate_text(&req.query);
+    let rank_fields = req.rank_fields.as_deref();
     req.documents
         .iter()
-        .map(|d| query + estimate_text(d.text()))
+        .map(|d| query + estimate_text(&d.rank_text(rank_fields)))
         .sum()
 }
 
@@ -293,6 +296,29 @@ mod tests {
                 .expect("valid request");
         // (1 query + 1 doc) + (1 query + 2 doc) = 5
         assert_eq!(estimate_rerank(&req), 5);
+    }
+
+    #[test]
+    fn rerank_counts_the_fields_the_provider_will_rank() {
+        // Object documents with no `text` field: the ranked text is the
+        // `rank_fields` reduction ("abcd\nabcdefgh" = 13 bytes, 4 tokens), not
+        // the empty string.
+        let req: RerankRequest = serde_json::from_str(
+            r#"{"model":"m","query":"abcd","rank_fields":["title","body"],
+                "documents":[{"title":"abcd","body":"abcdefgh"},{"title":"abcd"}]}"#,
+        )
+        .expect("valid request");
+        // (1 query + 4 doc) + (1 query + 1 doc) = 7
+        assert_eq!(estimate_rerank(&req), 7);
+    }
+
+    #[test]
+    fn rerank_object_documents_without_rank_fields_count_their_text() {
+        let req: RerankRequest = serde_json::from_str(
+            r#"{"model":"m","query":"abcd","documents":[{"text":"abcdefgh","id":"zzzzzzzzzzzz"}]}"#,
+        )
+        .expect("valid request");
+        assert_eq!(estimate_rerank(&req), 3);
     }
 
     #[test]

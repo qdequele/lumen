@@ -183,7 +183,13 @@ pub async fn rerank_handler(
         let counter = state.token_counter();
         let model = executed.model_used.clone();
         let query = req.query.clone();
-        let docs: Vec<String> = req.documents.iter().map(|d| d.text().to_owned()).collect();
+        // The text the provider ranked (the `rank_fields` reduction).
+        let rank_fields = req.rank_fields.as_deref();
+        let docs: Vec<String> = req
+            .documents
+            .iter()
+            .map(|d| d.rank_text(rank_fields).into_owned())
+            .collect();
         tokio::spawn(async move {
             let tokens_in = counter
                 .refine_rerank(&model, query, docs)
