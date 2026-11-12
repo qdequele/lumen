@@ -168,16 +168,18 @@ impl GroupEntry {
     /// source of truth for spend after boot, exactly like keys.
     fn apply_limits(&self, record: &GroupRecord) {
         self.name.store(Arc::new(record.name.clone()));
-        self.budget_max_micro.store(
-            record.budget_max.map_or(UNLIMITED, usd_to_micro),
-            Ordering::SeqCst,
-        );
+        let cap = record.budget_max.map_or(UNLIMITED, usd_to_micro);
+        let previous_cap = self.budget_max_micro.swap(cap, Ordering::SeqCst);
         self.account_ref
             .store(record.account_ref.clone().map(Arc::new));
         self.bandwidth_micro_per_gb
             .store(record.bandwidth_micro_usd_per_gb.max(0), Ordering::SeqCst);
-        // A changed cap starts a new budget epoch (ADR 011 §1).
-        self.rearm_signals();
+        // A changed cap starts a new budget epoch (ADR 011 §1). An unchanged
+        // one does not: a hot reload re-applies every record, and re-arming
+        // there would let in-flight reservations move the signal state.
+        if previous_cap != cap {
+            self.rearm_signals();
+        }
     }
 
     /// Atomically raise the pool's cap by `amount_micro` (admin grant). A
@@ -209,11 +211,19 @@ impl GroupEntry {
         f(signals, &self.signal_state, &subject);
     }
 
-    /// Re-arm the pool's budget signals against the current cap (a cap change,
-    /// or a newly installed policy).
+    /// Re-arm the pool's budget signals against a changed cap. Only lowers
+    /// the fired-threshold count; see [`SignalState::rearm`].
     fn rearm_signals(&self) {
         self.with_signals(|signals, state, subject| {
             state.rearm(signals.thresholds(), subject);
+        });
+    }
+
+    /// Arm the pool's budget signals against current spend for a newly
+    /// installed policy; see [`SignalState::arm_to_current`].
+    fn arm_signals(&self) {
+        self.with_signals(|signals, state, subject| {
+            state.arm_to_current(signals.thresholds(), subject);
         });
     }
 
@@ -413,10 +423,8 @@ impl KeyEntry {
     /// of truth for spend after boot.
     fn apply_limits(&self, record: &VirtualKeyRecord) {
         self.name.store(Arc::new(record.name.clone()));
-        self.budget_max_micro.store(
-            record.budget_max.map_or(UNLIMITED, usd_to_micro),
-            Ordering::SeqCst,
-        );
+        let cap = record.budget_max.map_or(UNLIMITED, usd_to_micro);
+        let previous_cap = self.budget_max_micro.swap(cap, Ordering::SeqCst);
         self.rpm_limit
             .store(record.rpm_limit.unwrap_or(UNLIMITED), Ordering::SeqCst);
         self.tpm_limit
@@ -427,8 +435,12 @@ impl KeyEntry {
         // The billing watermark is NOT overwritten, like spend.
         self.external_ref
             .store(record.external_ref.clone().map(Arc::new));
-        // A changed cap starts a new budget epoch (ADR 011 §1).
-        self.rearm_signals();
+        // A changed cap starts a new budget epoch (ADR 011 §1). An unchanged
+        // one does not: a hot reload re-applies every record, and re-arming
+        // there would let in-flight reservations move the signal state.
+        if previous_cap != cap {
+            self.rearm_signals();
+        }
     }
 
     /// The key's opaque id (the `virtual_keys.id` column).
@@ -483,11 +495,19 @@ impl KeyEntry {
         f(signals, &self.signal_state, &subject);
     }
 
-    /// Re-arm the key's budget signals against the current cap (a cap change,
-    /// or a newly installed policy).
+    /// Re-arm the key's budget signals against a changed cap. Only lowers
+    /// the fired-threshold count; see [`SignalState::rearm`].
     fn rearm_signals(&self) {
         self.with_signals(|signals, state, subject| {
             state.rearm(signals.thresholds(), subject);
+        });
+    }
+
+    /// Arm the key's budget signals against current spend for a newly
+    /// installed policy; see [`SignalState::arm_to_current`].
+    fn arm_signals(&self) {
+        self.with_signals(|signals, state, subject| {
+            state.arm_to_current(signals.thresholds(), subject);
         });
     }
 
@@ -856,24 +876,40 @@ impl AuthState {
         state
     }
 
-    /// Install (or clear, with `None`) the live webhook signalling policy and
-    /// re-arm every live entry against it.
+    /// Install (or clear, with `None`) the live webhook signalling policy
+    /// and, when its arming differs from the previous policy's, arm every
+    /// live entry against current spend.
     ///
-    /// Re-arming matters twice. At boot it stops a key already past a
+    /// Arming matters twice. At boot it stops a key already past a
     /// threshold from re-firing that threshold on its first settle - the
     /// budget it was flushed with is the epoch it is already in. On a hot
     /// reload that changes `thresholds`, it arms the new list against current
     /// spend instead of replaying every threshold below it.
     ///
+    /// A policy that arms like the one it replaces (same thresholds, same
+    /// budget events: what every config reload re-installs) leaves the
+    /// entries alone. Arming marks thresholds fired without emitting, and
+    /// spend includes in-flight reservations, so doing it on every reload
+    /// would swallow the event of a crossing whose settle is still to come.
+    ///
     /// The queue behind the policy is created once and reused, so the sender
     /// task keeps the receiver it was spawned with.
     pub fn set_signals(&self, signals: Option<Arc<BudgetSignals>>) {
+        let unchanged = match (self.signals.load().as_ref(), &signals) {
+            (Some(old), Some(new)) => old.arms_like(new),
+            // Nothing to arm against when the policy is cleared.
+            (_, None) => true,
+            (None, Some(_)) => false,
+        };
         self.signals.store(signals);
+        if unchanged {
+            return;
+        }
         for group in &self.groups {
-            group.rearm_signals();
+            group.arm_signals();
         }
         for entry in &self.by_id {
-            entry.rearm_signals();
+            entry.arm_signals();
         }
     }
 

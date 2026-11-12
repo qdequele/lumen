@@ -448,6 +448,18 @@ impl BudgetSignals {
         &self.thresholds
     }
 
+    /// Whether `other` arms the per-subject edge-trigger state exactly like
+    /// this policy: the same threshold list and the same budget events
+    /// enabled. Swapping between two such policies (every config reload
+    /// re-applies the webhook settings) leaves the armed state valid, so it
+    /// must not be recomputed; see [`SignalState::arm_to_current`].
+    #[must_use]
+    pub fn arms_like(&self, other: &Self) -> bool {
+        self.thresholds == other.thresholds
+            && self.wants(EventKind::BudgetThreshold) == other.wants(EventKind::BudgetThreshold)
+            && self.wants(EventKind::BudgetExhausted) == other.wants(EventKind::BudgetExhausted)
+    }
+
     /// Emit `kind` for `subject`, if that kind is enabled. Used for the
     /// administrative lifecycle events, which have no threshold and no
     /// edge-trigger state of their own (each admin action IS the edge).
@@ -569,14 +581,46 @@ impl SignalState {
     /// disarms every threshold it drops below and re-arms `budget.exhausted`;
     /// a cap *reduction* leaves the already-fired thresholds fired.
     ///
-    /// Called from the admin grant/patch paths only, never from the request
-    /// path: an unsettled reservation's refund deliberately does NOT re-arm,
-    /// so a failed call cannot make a threshold flap.
+    /// This only ever LOWERS the fired count. It never records a threshold as
+    /// fired, because nothing is emitted here: `spent_micro` includes
+    /// in-flight reservations, so "reached" at this instant may be a crossing
+    /// whose settle has not run yet (the settle would then find it already
+    /// claimed and emit nothing), or one that never happens at all (the call
+    /// settles lower). A threshold a cap reduction moves the subject past is
+    /// therefore reported by the next settle.
+    ///
+    /// Called from the admin grant/patch paths only, and only when the cap
+    /// actually changed; never from the request path: an unsettled
+    /// reservation's refund deliberately does NOT re-arm, so a failed call
+    /// cannot make a threshold flap.
     pub fn rearm(&self, thresholds: &[u8], subject: &Subject<'_>) {
         let reached = subject
             .consumed_percent()
             .map_or(0, |percent| crossed_count(thresholds, percent));
+        self.crossed.fetch_min(reached, Ordering::SeqCst);
+        self.rearm_exhausted(subject);
+    }
+
+    /// Arm both signals against the current spend for a policy whose arming
+    /// differs from the previous one (or that had no predecessor): thresholds
+    /// already reached count as fired, so a subject loaded at 90 % does not
+    /// replay 50 % and 80 % on its first settle, and a new threshold list is
+    /// not replayed below the spend already reached.
+    ///
+    /// Unlike [`rearm`](Self::rearm) this can mark a threshold fired without
+    /// an event, which is the point at boot (no reservation is in flight) and
+    /// the accepted cost of changing the list on a live process. It must NOT
+    /// run when the policy is merely re-installed unchanged.
+    pub fn arm_to_current(&self, thresholds: &[u8], subject: &Subject<'_>) {
+        let reached = subject
+            .consumed_percent()
+            .map_or(0, |percent| crossed_count(thresholds, percent));
         self.crossed.store(reached, Ordering::SeqCst);
+        self.rearm_exhausted(subject);
+    }
+
+    /// Re-arm `budget.exhausted` when the subject has headroom again.
+    fn rearm_exhausted(&self, subject: &Subject<'_>) {
         let has_headroom = subject
             .max_micro
             .is_none_or(|max| subject.spent_micro < max);
@@ -692,6 +736,50 @@ mod tests {
         state.on_settle(&s, &subject(101_000_000, Some(200_000_000)));
         let fired: Vec<Option<u8>> = drain(&mut rx).into_iter().map(|e| e.threshold).collect();
         assert_eq!(fired, [Some(50)]);
+    }
+
+    #[test]
+    fn a_rearm_never_marks_a_threshold_fired() {
+        let (q, mut rx) = queue();
+        let s = signals(&q);
+        let state = SignalState::default();
+
+        // 96 % reached, but nothing was emitted: the settle must still fire.
+        state.rearm(s.thresholds(), &subject(96_000_000, Some(100_000_000)));
+        state.on_settle(&s, &subject(96_000_000, Some(100_000_000)));
+        let fired: Vec<Option<u8>> = drain(&mut rx).into_iter().map(|e| e.threshold).collect();
+        assert_eq!(fired, [Some(50), Some(80), Some(95)]);
+    }
+
+    #[test]
+    fn arming_to_current_spend_silences_the_thresholds_already_reached() {
+        let (q, mut rx) = queue();
+        let s = signals(&q);
+        let state = SignalState::default();
+
+        state.arm_to_current(s.thresholds(), &subject(85_000_000, Some(100_000_000)));
+        state.on_settle(&s, &subject(96_000_000, Some(100_000_000)));
+        let fired: Vec<Option<u8>> = drain(&mut rx).into_iter().map(|e| e.threshold).collect();
+        assert_eq!(fired, [Some(95)]);
+    }
+
+    #[test]
+    fn policies_arm_alike_only_with_the_same_thresholds_and_budget_events() {
+        let (q, _rx) = queue();
+        let base = signals(&q);
+        assert!(base.arms_like(&signals(&q)));
+        // Lifecycle kinds do not touch the edge-trigger state.
+        let no_lifecycle = BudgetSignals::new(
+            Arc::clone(&q),
+            &[EventKind::BudgetThreshold, EventKind::BudgetExhausted],
+            &[95, 80, 50],
+        );
+        assert!(base.arms_like(&no_lifecycle));
+        let other_list = BudgetSignals::new(Arc::clone(&q), &EventKind::ALL, &[50, 80]);
+        assert!(!base.arms_like(&other_list));
+        let no_threshold =
+            BudgetSignals::new(Arc::clone(&q), &[EventKind::BudgetExhausted], &[50, 80, 95]);
+        assert!(!base.arms_like(&no_threshold));
     }
 
     #[test]
