@@ -266,12 +266,27 @@ is one deadline over the whole chain.
 total deadline fired, and that link's breaker got no outcome (a half-open probe
 was left to the auto-rearm described under *Half-open cannot wedge*). The
 executor now tracks the link being called outside the timeout envelope. When
-the deadline fires, `LM-3013` names that link's provider and its breaker
-records one failure, like a first-token or read timeout: the retry loop never
+the deadline fires, `LM-3013` names that link's provider: the retry loop never
 sleeps past the deadline (ADR 021), so the deadline can only fire while that
-link's call is pending. A half-open probe cut by the total timeout therefore
-reopens the circuit at once; the auto-rearm remains for probes lost to a client
-disconnect.
+link's call is pending.
+
+Its breaker records one failure, like a first-token or read timeout, only when
+the link has been in flight (since its first attempt) for at least its own
+first-token timeout: the per-link value, else the configured default. A link
+cut earlier was not given the time the gateway itself allows a provider to
+answer: typically a fallback reached milliseconds before the deadline, after
+the links before it used up the budget. Charging it would open the breaker of
+a healthy provider on the strength of another one's slowness, so it gets a
+neutral outcome instead: no failure is counted, and a half-open probe the
+request held is handed back for the next caller. A half-open probe that did
+outlive its first-token timeout reopens the circuit at once; the auto-rearm
+remains for probes lost to a client disconnect.
+
+Consequence: a link whose first-token timeout is not shorter than the total
+timeout can only be charged for a total timeout after a retry, since a single
+attempt hits the total deadline first. Its hangs still surface as `LM-3013`,
+and its breaker opens on the failures that are its own (first-token timeouts,
+upstream errors).
 
 ---
 
