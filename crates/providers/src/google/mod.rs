@@ -644,7 +644,11 @@ fn tool_response_value(text: &str) -> serde_json::Value {
 
 /// OpenAI `tools` (`{type: "function", function: {name, description,
 /// parameters}}`) → one Gemini `tools[]` entry whose `functionDeclarations`
-/// hold every function. Non-function entries are skipped.
+/// hold every function. Non-function entries are skipped. `parameters` is the
+/// same OpenAPI-subset `Schema` type as `responseSchema`, so it goes through
+/// the same [`sanitize_gemini_schema`] pass: OpenAI clients (and strict-mode
+/// tool schemas in particular) routinely send `additionalProperties: false`
+/// and `$schema`, which Gemini rejects as unknown fields.
 fn translate_tools(req: &ChatRequest) -> Vec<GeminiTool> {
     let Some(tools) = req.extra.get("tools").and_then(|v| v.as_array()) else {
         return Vec::new();
@@ -659,7 +663,10 @@ fn translate_tools(req: &ChatRequest) -> Vec<GeminiTool> {
                     .get("description")
                     .and_then(|v| v.as_str())
                     .map(str::to_owned),
-                parameters: function.get("parameters").cloned(),
+                parameters: function.get("parameters").cloned().map(|mut schema| {
+                    sanitize_gemini_schema(&mut schema);
+                    schema
+                }),
             })
         })
         .collect();
@@ -777,7 +784,8 @@ fn translate_response_format(
     }
 }
 
-/// Strip JSON Schema keywords Gemini's OpenAPI-subset `responseSchema` rejects
+/// Strip JSON Schema keywords Gemini's OpenAPI-subset `Schema` type (used by
+/// `responseSchema` and by function-declaration `parameters`) rejects
 /// (`additionalProperties`, `$schema`), recursing only through positions that
 /// hold sub-SCHEMAS (`properties` values, `items`, `anyOf`/`allOf`/`oneOf`
 /// entries) so a property literally named `additionalProperties` is untouched.
@@ -790,7 +798,7 @@ fn sanitize_gemini_schema(schema: &mut serde_json::Value) {
             tracing::debug!(
                 keyword,
                 "gemini chat: stripped a JSON Schema keyword Gemini's \
-                 responseSchema does not accept (it is dropped, not enforced)"
+                 Schema type does not accept (it is dropped, not enforced)"
             );
         }
     }
@@ -1200,6 +1208,55 @@ mod tests {
         }))
         .unwrap();
         assert!(translate_response(resp, "gemini-2.0", "google").is_ok());
+    }
+
+    /// Tool `parameters` are the same `Schema` type as `responseSchema`: the
+    /// keywords Gemini rejects are stripped at every schema level, while a
+    /// property that merely happens to be NAMED `additionalProperties` stays.
+    #[test]
+    fn tool_parameters_are_sanitized_like_response_schema() {
+        let mut req = request(vec![msg("user", "hi")]);
+        req.extra.insert(
+            "tools".to_owned(),
+            json!([{
+                "type": "function",
+                "function": {
+                    "name": "lookup",
+                    "description": "d",
+                    "parameters": {
+                        "$schema": "http://json-schema.org/draft-07/schema#",
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "filter": {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "properties": { "additionalProperties": { "type": "string" } }
+                            },
+                            "tags": {
+                                "type": "array",
+                                "items": { "type": "object", "additionalProperties": false }
+                            }
+                        },
+                        "required": ["filter"]
+                    }
+                }
+            }]),
+        );
+        let out = serde_json::to_value(translate_request(&req, "google").unwrap()).unwrap();
+        let params = &out["tools"][0]["functionDeclarations"][0]["parameters"];
+        assert!(params.get("$schema").is_none(), "{params}");
+        assert!(params.get("additionalProperties").is_none(), "{params}");
+        let filter = &params["properties"]["filter"];
+        assert!(filter.get("additionalProperties").is_none(), "{filter}");
+        assert_eq!(
+            filter["properties"]["additionalProperties"]["type"],
+            "string"
+        );
+        assert!(params["properties"]["tags"]["items"]
+            .get("additionalProperties")
+            .is_none());
+        assert_eq!(params["required"], json!(["filter"]));
     }
 
     #[test]
