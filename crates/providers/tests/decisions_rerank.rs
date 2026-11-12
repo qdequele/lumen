@@ -606,6 +606,50 @@ async fn refusals_score_zero_and_a_refused_choice_is_content_filtered() {
     }
 }
 
+/// A choice answer that names a winner but carries no usable distribution
+/// (absent, or every probability zero) cannot rank the documents: scoring them
+/// all 0.0 would return the input order as a successful rerank. It is a
+/// translation error instead; a real distribution still ranks.
+#[tokio::test]
+async fn a_choice_answer_without_probabilities_is_a_translation_error() {
+    let docs = ["a".to_owned(), "b".to_owned(), "c".to_owned()];
+    for answer in [
+        json!({"type": "choice", "name": "rank", "choice": "d2"}),
+        json!({"type": "choice", "name": "rank", "choice": "d2", "probabilities": [
+            {"value": "d0", "probability": 0.0},
+            {"value": "d1", "probability": 0.0},
+            {"value": "d2", "probability": 0.0}
+        ]}),
+    ] {
+        let mock = mock_at("/v1/decisions", OpenAiAnswers(vec![answer])).await;
+        let err = wrap(openai(&mock.uri()), choice_template())
+            .rerank(request(&docs), CancellationToken::new())
+            .await
+            .expect_err("no distribution, no ranking");
+        assert!(
+            matches!(err, ProviderError::Translation(ref m) if m.contains("probabilities")),
+            "got {err:?}"
+        );
+    }
+
+    let mock = mock_at(
+        "/v1/decisions",
+        OpenAiAnswers(vec![
+            json!({"type": "choice", "name": "rank", "choice": "d2", "probabilities": [
+                {"value": "d0", "probability": 0.1},
+                {"value": "d1", "probability": 0.2},
+                {"value": "d2", "probability": 0.7}
+            ]}),
+        ]),
+    )
+    .await;
+    let resp = wrap(openai(&mock.uri()), choice_template())
+        .rerank(request(&docs), CancellationToken::new())
+        .await
+        .expect("a real distribution ranks");
+    assert_eq!(by_score(&resp)[0].0, 2);
+}
+
 /// Question count of each recorded call, largest first (calls run
 /// concurrently, so arrival order is not call order).
 async fn questions_per_call(mock: &MockServer) -> Vec<usize> {
