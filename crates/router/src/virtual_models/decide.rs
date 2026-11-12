@@ -711,7 +711,7 @@ mod tests {
         d.retain_mask(&[true, true, true, false]);
         assert_eq!(d.attempts[0].escapes, vec![escape(rate_limited, 1)]);
         assert_eq!(d.attempts[1].escapes, vec![escape(rate_limited, 2)]);
-        assert!(d.attempts[2].escapes.is_empty());
+        assert_eq!(d.attempts[2].escapes, Vec::new());
     }
 
     #[test]

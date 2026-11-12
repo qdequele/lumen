@@ -121,28 +121,26 @@ where
     let chain = run_chain(
         links, breakers, config, cancel, deadline, &current, &mut call,
     );
-    match tokio::time::timeout_at(deadline, chain).await {
-        Ok(result) => result,
-        // The whole request outran the total timeout (spec 6.4). The chain
-        // only ever waits inside a link's retry loop, so `current` is the
-        // link that was being called (never one skipped on an open circuit):
-        // it did not answer in time, which counts against its breaker like
-        // any other timeout, and the error names it.
-        Err(_) => {
-            let link = links.get(current.load(Ordering::Relaxed)).or(links.first());
-            let provider = link.map_or_else(String::new, |link| {
-                breakers
-                    .get_scoped(
-                        &link.provider_name,
-                        link.breaker_scope.as_deref(),
-                        &link.model_id,
-                    )
-                    .on_failure(Instant::now());
-                link.provider_name.clone()
-            });
-            Err(GatewayError::UpstreamTotalTimeout { provider })
-        }
+    if let Ok(result) = tokio::time::timeout_at(deadline, chain).await {
+        return result;
     }
+    // The whole request outran the total timeout (spec 6.4). The chain only
+    // ever waits inside a link's retry loop, so `current` is the link that
+    // was being called (never one skipped on an open circuit): it did not
+    // answer in time, which counts against its breaker like any other
+    // timeout, and the error names it.
+    let link = links.get(current.load(Ordering::Relaxed)).or(links.first());
+    let provider = link.map_or_else(String::new, |link| {
+        breakers
+            .get_scoped(
+                &link.provider_name,
+                link.breaker_scope.as_deref(),
+                &link.model_id,
+            )
+            .on_failure(Instant::now());
+        link.provider_name.clone()
+    });
+    Err(GatewayError::UpstreamTotalTimeout { provider })
 }
 
 /// The fallback loop, run inside the total-timeout envelope.
