@@ -109,6 +109,19 @@ pub fn estimate_chat_prompt(req: &ChatRequest) -> u64 {
         .sum()
 }
 
+/// The part of a chat prompt estimate that is not text: the flat per-image
+/// estimate (see [`estimate_image_tokens`]) for every image part of every
+/// message. A tokenizer pass over the text refines only the text, so this is
+/// added to its result unchanged.
+#[must_use]
+pub fn estimate_chat_non_text(req: &ChatRequest) -> u64 {
+    req.messages
+        .iter()
+        .filter_map(|m| m.content.as_ref())
+        .map(estimate_content_images)
+        .sum()
+}
+
 /// Estimate the input tokens of an embeddings request (sum over the batch).
 /// Pre-tokenized inputs (token-id arrays) contribute one token per id, with no
 /// byte heuristic; text inputs use the byte-per-token heuristic; image parts
@@ -427,6 +440,22 @@ mod tests {
         assert_eq!(
             estimate_chat_prompt(&with_low) - estimate_chat_prompt(&text_only),
             LOW_DETAIL_IMAGE_TOKENS
+        );
+    }
+
+    #[test]
+    fn chat_non_text_is_the_image_share_of_the_prompt_estimate() {
+        let text_only = request(vec![msg("hello"), parts_msg(vec![text_part("hi")])]);
+        assert_eq!(estimate_chat_non_text(&text_only), 0);
+
+        let with_images = request(vec![
+            msg("hello"),
+            parts_msg(vec![text_part("hi"), image_part(None)]),
+            parts_msg(vec![image_part(Some("low"))]),
+        ]);
+        assert_eq!(
+            estimate_chat_non_text(&with_images),
+            DEFAULT_IMAGE_TOKENS + LOW_DETAIL_IMAGE_TOKENS
         );
     }
 

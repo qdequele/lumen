@@ -697,11 +697,16 @@ fn defer_chat_refinement(
         .iter()
         .filter_map(|c| c.message.content.as_ref().map(|c| c.text()))
         .collect();
+    // The recount covers the text only: images keep their flat estimate, so
+    // a vision prompt is not refined down to its text (as for embeddings).
+    let non_text = tokens::estimate_chat_non_text(ctx.req);
     tokio::spawn(async move {
         let (refined_in, refined_out) = counter
             .refine_chat(&model, message_texts, output_text)
             .await
-            .unwrap_or(heuristic);
+            .map_or(heuristic, |(text_in, out)| {
+                (text_in.saturating_add(non_text), out)
+            });
         let cost = accounting
             .pricing()
             .token_cost(&model, refined_in, refined_out);
