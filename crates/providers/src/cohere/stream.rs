@@ -26,9 +26,9 @@
 //!   is this stream's sole terminal event: it yields the final chunk followed
 //!   immediately by [`StreamItem::Done`];
 //! * `citation-start`/`citation-end` and any future event type are ignored;
-//!   an `error` event surfaces as a [`ProviderError`] (only the fact of an
-//!   error propagates - never any upstream-provided message text, which could
-//!   echo prompt content).
+//!   an `error` event surfaces as a retryable upstream [`ProviderError`]
+//!   (only the fact of an error propagates - never any upstream-provided
+//!   message text, which could echo prompt content) and ends the stream.
 
 use std::collections::HashMap;
 
@@ -50,7 +50,8 @@ pub(super) struct CohereTranslator {
     tool_indices: HashMap<u64, u64>,
     /// Next OpenAI tool-call index to allocate.
     next_tool_index: u64,
-    /// Set once `message-end` was seen; later events are ignored.
+    /// Set once `message-end` or an `error` event was seen; later events are
+    /// ignored.
     finished: bool,
 }
 
@@ -171,9 +172,23 @@ impl SseTranslator for CohereTranslator {
                     StreamItem::Done,
                 ])
             }
-            CohereEvent::Error => Err(ProviderError::Translation(
-                "cohere stream error event".to_owned(),
-            )),
+            CohereEvent::Error => {
+                // The stream is over: latch so trailing events are ignored.
+                self.finished = true;
+                tracing::warn!("cohere stream carried an error event");
+                // An upstream failure, not a response the gateway failed to
+                // parse (LM-3002). The event carries no machine-readable class
+                // this translator knows, so it is a generic retryable upstream
+                // error. The provider name is left empty: the translator is not
+                // given it, and `GatewayError::from_provider` falls back to the
+                // routed provider's name for an empty one.
+                Err(ProviderError::Upstream {
+                    provider: String::new(),
+                    status: 500,
+                    retryable: true,
+                    retry_after: None,
+                })
+            }
             CohereEvent::Ignored => Ok(Vec::new()),
         }
     }
@@ -500,7 +515,7 @@ mod tests {
     }
 
     #[test]
-    fn error_event_surfaces_but_never_a_message_body() {
+    fn error_event_is_a_retryable_upstream_error_without_the_message_body() {
         let mut t = CohereTranslator::new("m");
         let err = t
             .translate(&event(
@@ -508,8 +523,32 @@ mod tests {
                 json!({ "type": "error", "message": "SECRET DETAIL" }),
             ))
             .expect_err("error event fails the stream");
-        let text = err.to_string();
-        assert!(!text.contains("SECRET DETAIL"));
+        assert!(
+            matches!(
+                err,
+                ProviderError::Upstream {
+                    retryable: true,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        assert!(!err.to_string().contains("SECRET DETAIL"));
+    }
+
+    #[test]
+    fn events_after_an_error_event_are_ignored() {
+        let mut t = CohereTranslator::new("m");
+        let _ = t
+            .translate(&event("error", json!({ "type": "error" })))
+            .expect_err("error event fails the stream");
+        let late = t
+            .translate(&event(
+                "message-start",
+                json!({ "type": "message-start", "id": "late" }),
+            ))
+            .expect("ignored after the error");
+        assert!(late.is_empty(), "{late:?}");
     }
 
     #[test]

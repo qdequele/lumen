@@ -741,7 +741,7 @@ impl AnthropicProvider {
         .await?;
         Ok(translate_sse_stream(
             bytes,
-            AnthropicTranslator::new(&req.model),
+            AnthropicTranslator::new(&req.model, &self.provider_name),
         ))
     }
 }

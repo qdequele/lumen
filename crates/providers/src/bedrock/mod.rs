@@ -540,7 +540,12 @@ impl BedrockProvider {
         let body = serialize_body(&req)?;
         let path = Self::path(&req.model, "converse-stream");
         let bytes = self.open(&path, body, &cancel).await?;
-        let translator = BedrockStreamTranslator::new(generated_id(), &req.model, now_secs());
+        let translator = BedrockStreamTranslator::new(
+            generated_id(),
+            &req.model,
+            &self.provider_name,
+            now_secs(),
+        );
         Ok(translate_eventstream(bytes, translator))
     }
 }

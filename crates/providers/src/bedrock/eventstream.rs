@@ -63,14 +63,21 @@ impl EventMessage {
         self.header(":event-type")
     }
 
-    /// The `:message-type` header (`event` or `exception`).
+    /// The `:message-type` header (`event`, `exception` or `error`).
     pub fn message_type(&self) -> Option<&str> {
         self.header(":message-type")
     }
 
-    /// The `:exception-type` header, present on error frames.
+    /// The `:exception-type` header, present on `exception` frames (modeled
+    /// service exceptions).
     pub fn exception_type(&self) -> Option<&str> {
         self.header(":exception-type")
+    }
+
+    /// The `:error-code` header, present on `error` frames (unmodeled
+    /// errors, which carry `:error-code` / `:error-message` and no payload).
+    pub fn error_code(&self) -> Option<&str> {
+        self.header(":error-code")
     }
 }
 

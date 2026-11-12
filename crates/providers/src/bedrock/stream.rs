@@ -17,8 +17,11 @@
 //!   `finish_reason`;
 //! * `metadata` (`{"usage":{...}}`) -> a usage chunk (ADR 003) followed by the
 //!   terminal marker (`data: [DONE]` on the byte path);
-//! * `exception` frames surface as a [`ProviderError`] carrying only the
-//!   exception TYPE, never the upstream message (which could echo prompt text).
+//! * `exception` frames (`:exception-type`) and `error` frames
+//!   (`:error-code`) surface as the [`ProviderError`] class of that failure
+//!   (throttling -> rate limited, service errors -> retryable upstream),
+//!   naming the provider. Only the TYPE is used, never the upstream message
+//!   (which could echo prompt text).
 
 use std::collections::HashMap;
 
@@ -38,6 +41,8 @@ pub(super) struct BedrockStreamTranslator {
     id: String,
     /// Requested model id, echoed on every chunk.
     model: String,
+    /// The provider instance name, for error attribution.
+    provider_name: String,
     /// Creation timestamp echoed on every chunk.
     created: u64,
     /// Converse `contentBlockIndex` -> OpenAI tool-call index.
@@ -49,10 +54,11 @@ pub(super) struct BedrockStreamTranslator {
 }
 
 impl BedrockStreamTranslator {
-    pub(super) fn new(id: String, model: &str, created: u64) -> Self {
+    pub(super) fn new(id: String, model: &str, provider_name: &str, created: u64) -> Self {
         Self {
             id,
             model: model.to_owned(),
+            provider_name: provider_name.to_owned(),
             created,
             tool_indices: HashMap::new(),
             next_tool_index: 0,
@@ -106,15 +112,28 @@ impl BedrockStreamTranslator {
             return Ok(Vec::new());
         }
 
-        // Exception frames are surfaced by TYPE only - never the payload body,
-        // which may echo prompt content. The stream is latched finished so any
-        // trailing frames after the exception are ignored.
-        if message.message_type() == Some("exception") {
-            self.finished = true;
-            let kind = message.exception_type().unwrap_or("unknown");
-            return Err(ProviderError::Translation(format!(
-                "bedrock stream exception: {kind}"
-            )));
+        // Exception frames (modeled, `:exception-type`) and error frames
+        // (unmodeled, `:error-code`) are surfaced by TYPE only - never the
+        // payload body or `:error-message`, which may echo prompt content. The
+        // stream is latched finished so any trailing frames are ignored.
+        match message.message_type() {
+            Some("exception") => {
+                self.finished = true;
+                return Err(stream_failure(
+                    &self.provider_name,
+                    "exception",
+                    message.exception_type(),
+                ));
+            }
+            Some("error") => {
+                self.finished = true;
+                return Err(stream_failure(
+                    &self.provider_name,
+                    "error",
+                    message.error_code(),
+                ));
+            }
+            _ => {}
         }
 
         let Some(event_type) = message.event_type() else {
@@ -327,13 +346,58 @@ struct StreamUsage {
     total_tokens: Option<u32>,
 }
 
+/// Classify a `ConverseStream` failure frame by its exception type or error
+/// code, as the HTTP status the same failure carries on the non-streaming
+/// API (the documented `ConverseStream` stream exceptions). Matching is
+/// case-insensitive (`throttlingException` in the stream, `ThrottlingException`
+/// as an error code). An unknown or absent type is a generic retryable
+/// upstream failure. Only the type is logged, never the message.
+fn stream_failure(provider: &str, frame_kind: &str, kind: Option<&str>) -> ProviderError {
+    let kind = kind.unwrap_or("unknown");
+    let status = match kind.to_ascii_lowercase().as_str() {
+        "throttlingexception" => 429,
+        "validationexception" => 400,
+        "accessdeniedexception" => 403,
+        "resourcenotfoundexception" => 404,
+        "modeltimeoutexception" => 408,
+        "serviceunavailableexception" => 503,
+        // `modelStreamErrorException` (424): AWS documents it as retryable.
+        "modelstreamerrorexception" => 424,
+        // `internalServerException` and anything unrecognised.
+        _ => 500,
+    };
+    tracing::warn!(
+        provider,
+        frame_kind,
+        kind,
+        status,
+        "bedrock stream carried a failure frame"
+    );
+    match status {
+        // The model failed mid-stream or timed out: the upstream's fault and
+        // worth a retry, unlike the other 4xx.
+        408 | 424 => ProviderError::Upstream {
+            provider: provider.to_owned(),
+            status,
+            retryable: true,
+            retry_after: None,
+        },
+        _ => crate::mapping::classify_status(provider, status, None),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::eventstream::test_support::event_frame;
     use super::*;
 
     fn translator() -> BedrockStreamTranslator {
-        BedrockStreamTranslator::new("chatcmpl-x".to_owned(), "anthropic.claude", 42)
+        BedrockStreamTranslator::new(
+            "chatcmpl-x".to_owned(),
+            "anthropic.claude",
+            "bedrock-test",
+            42,
+        )
     }
 
     fn decode_one(bytes: &[u8]) -> EventMessage {
@@ -442,22 +506,107 @@ mod tests {
         );
     }
 
+    fn failure_frame(headers: &[(&str, &str)]) -> EventMessage {
+        decode_one(&super::super::eventstream::test_support::frame(
+            headers,
+            br#"{"message":"SECRET UPSTREAM DETAIL"}"#,
+        ))
+    }
+
     #[test]
-    fn exception_frame_surfaces_type_but_not_body() {
+    fn model_stream_error_exception_is_a_retryable_upstream_error() {
         let mut t = translator();
-        let frame = super::super::eventstream::test_support::frame(
-            &[
+        let err = t
+            .translate(&failure_frame(&[
                 (":exception-type", "modelStreamErrorException"),
                 (":message-type", "exception"),
-            ],
-            br#"{"message":"SECRET UPSTREAM DETAIL"}"#,
-        );
-        let err = t
-            .translate(&decode_one(&frame))
+            ]))
             .expect_err("exception fails");
-        let text = err.to_string();
-        assert!(text.contains("modelStreamErrorException"));
-        assert!(!text.contains("SECRET UPSTREAM DETAIL"));
+        assert!(
+            matches!(
+                &err,
+                ProviderError::Upstream { provider, status: 424, retryable: true, .. }
+                    if provider == "bedrock-test"
+            ),
+            "{err:?}"
+        );
+        assert!(!err.to_string().contains("SECRET UPSTREAM DETAIL"));
+    }
+
+    #[test]
+    fn throttling_exception_is_rate_limited() {
+        let mut t = translator();
+        let err = t
+            .translate(&failure_frame(&[
+                (":exception-type", "throttlingException"),
+                (":message-type", "exception"),
+            ]))
+            .expect_err("exception fails");
+        assert!(
+            matches!(&err, ProviderError::RateLimited { provider, .. } if provider == "bedrock-test"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn validation_exception_is_a_non_retryable_upstream_error() {
+        let mut t = translator();
+        let err = t
+            .translate(&failure_frame(&[
+                (":exception-type", "validationException"),
+                (":message-type", "exception"),
+            ]))
+            .expect_err("exception fails");
+        assert!(
+            matches!(
+                err,
+                ProviderError::Upstream {
+                    status: 400,
+                    retryable: false,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// `:message-type: error` frames carry no `:event-type`; they used to be
+    /// ignored, leaving a stream that just stopped.
+    #[test]
+    fn error_frame_is_an_upstream_error_and_latches() {
+        let mut t = translator();
+        let err = t
+            .translate(&failure_frame(&[
+                (":error-code", "InternalServerException"),
+                (":error-message", "SECRET UPSTREAM DETAIL"),
+                (":message-type", "error"),
+            ]))
+            .expect_err("error frame fails the stream");
+        assert!(
+            matches!(
+                &err,
+                ProviderError::Upstream { provider, status: 500, retryable: true, .. }
+                    if provider == "bedrock-test"
+            ),
+            "{err:?}"
+        );
+        assert!(!err.to_string().contains("SECRET UPSTREAM DETAIL"));
+        let late = t
+            .translate(&decode_one(&event_frame(
+                "contentBlockDelta",
+                r#"{"delta":{"text":"late"},"contentBlockIndex":0}"#,
+            )))
+            .expect("ignored after the error frame");
+        assert!(late.is_empty(), "{late:?}");
+
+        let mut t = translator();
+        let err = t
+            .translate(&failure_frame(&[
+                (":error-code", "ThrottlingException"),
+                (":message-type", "error"),
+            ]))
+            .expect_err("error frame fails the stream");
+        assert!(matches!(err, ProviderError::RateLimited { .. }), "{err:?}");
     }
 
     #[test]
