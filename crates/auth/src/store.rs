@@ -758,6 +758,93 @@ macro_rules! group_columns {
     };
 }
 
+/// What [`KeyStore::list_keys_filtered`] returns: every condition is part of
+/// the SQL (bound parameters), so a filtered listing never loads the whole
+/// table to drop most of it in memory.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct KeyListFilter {
+    /// Also list soft-deleted tombstones.
+    pub include_deleted: bool,
+    /// Only keys with exactly this `external_ref`.
+    pub external_ref: Option<String>,
+    /// Only keys whose group belongs to this account (the admin account
+    /// scope, canonical form). A key with no group is in no account; a
+    /// tombstoned group still counts, so the tombstones of its keys stay
+    /// visible to their account.
+    pub scope_account_ref: Option<String>,
+}
+
+impl KeyListFilter {
+    /// The query for this filter. Values are never part of the text: each
+    /// `Some` field contributes one `?`, bound by
+    /// [`KeyStore::list_keys_filtered`] in field order (`external_ref`, then
+    /// `scope_account_ref`). Public so a test can check the plan of the SQL
+    /// that actually runs.
+    #[must_use]
+    pub fn sql(&self) -> String {
+        let mut conditions = Vec::new();
+        if !self.include_deleted {
+            conditions.push("deleted_at IS NULL");
+        }
+        if self.external_ref.is_some() {
+            conditions.push("external_ref = ?");
+        }
+        if self.scope_account_ref.is_some() {
+            conditions.push("group_id IN (SELECT id FROM budget_groups WHERE account_ref = ?)");
+        }
+        list_sql(key_columns!(), "virtual_keys", &conditions)
+    }
+}
+
+/// What [`KeyStore::list_groups_filtered`] returns; the group half of
+/// [`KeyListFilter`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GroupListFilter {
+    /// Also list soft-deleted tombstones.
+    pub include_deleted: bool,
+    /// Only groups with exactly this `account_ref` (canonical form).
+    pub account_ref: Option<String>,
+    /// Only the sub-groups of this group (ADR 020).
+    pub parent_id: Option<String>,
+    /// Only groups of this account (the admin account scope). Applied on top
+    /// of `account_ref`: asking for another account narrows to nothing.
+    pub scope_account_ref: Option<String>,
+}
+
+impl GroupListFilter {
+    /// The query for this filter; see [`KeyListFilter::sql`]. Bind order:
+    /// `account_ref`, `parent_id`, `scope_account_ref`.
+    #[must_use]
+    pub fn sql(&self) -> String {
+        let mut conditions = Vec::new();
+        if !self.include_deleted {
+            conditions.push("deleted_at IS NULL");
+        }
+        if self.account_ref.is_some() {
+            conditions.push("account_ref = ?");
+        }
+        if self.parent_id.is_some() {
+            conditions.push("parent_id = ?");
+        }
+        if self.scope_account_ref.is_some() {
+            conditions.push("account_ref = ?");
+        }
+        list_sql(group_columns!(), "budget_groups", &conditions)
+    }
+}
+
+/// `SELECT columns FROM table [WHERE a AND b] ORDER BY created_at, id`, from
+/// fixed fragments only (no caller-supplied text).
+fn list_sql(columns: &str, table: &str, conditions: &[&str]) -> String {
+    let mut sql = format!("SELECT {columns} FROM {table}");
+    if !conditions.is_empty() {
+        sql.push_str(" WHERE ");
+        sql.push_str(&conditions.join(" AND "));
+    }
+    sql.push_str(" ORDER BY created_at, id");
+    sql
+}
+
 /// Handle to the SQLite database (pooled; cheap to clone).
 #[derive(Debug, Clone)]
 pub struct KeyStore {
@@ -926,23 +1013,33 @@ impl KeyStore {
         &self,
         include_deleted: bool,
     ) -> Result<Vec<VirtualKeyRecord>, AuthError> {
-        let sql = if include_deleted {
-            concat!(
-                "SELECT ",
-                key_columns!(),
-                " FROM virtual_keys ORDER BY created_at, id"
-            )
-        } else {
-            concat!(
-                "SELECT ",
-                key_columns!(),
-                " FROM virtual_keys WHERE deleted_at IS NULL ORDER BY created_at, id"
-            )
-        };
-        let records = sqlx::query_as::<_, VirtualKeyRecord>(sql)
-            .fetch_all(&self.pool)
-            .await?;
-        Ok(records)
+        self.list_keys_filtered(&KeyListFilter {
+            include_deleted,
+            ..KeyListFilter::default()
+        })
+        .await
+    }
+
+    /// The keys matching `filter`, oldest first. The filter runs in SQL with
+    /// bound parameters (`external_ref` through its index), not over every
+    /// row in memory.
+    ///
+    /// # Errors
+    ///
+    /// [`AuthError::Db`] if the query fails.
+    pub async fn list_keys_filtered(
+        &self,
+        filter: &KeyListFilter,
+    ) -> Result<Vec<VirtualKeyRecord>, AuthError> {
+        // Built from fixed fragments only; every value is bound below.
+        let mut query = sqlx::query_as::<_, VirtualKeyRecord>(sqlx::AssertSqlSafe(filter.sql()));
+        for value in [&filter.external_ref, &filter.scope_account_ref]
+            .into_iter()
+            .flatten()
+        {
+            query = query.bind(value.as_str());
+        }
+        Ok(query.fetch_all(&self.pool).await?)
     }
 
     /// One live key by id: `None` for an unknown id or a tombstone.
@@ -1419,23 +1516,36 @@ impl KeyStore {
     /// Every active group - for the admin API. Pass `include_deleted = true`
     /// to also see tombstones (audit view).
     pub async fn list_groups(&self, include_deleted: bool) -> Result<Vec<GroupRecord>, AuthError> {
-        let sql = if include_deleted {
-            concat!(
-                "SELECT ",
-                group_columns!(),
-                " FROM budget_groups ORDER BY created_at, id"
-            )
-        } else {
-            concat!(
-                "SELECT ",
-                group_columns!(),
-                " FROM budget_groups WHERE deleted_at IS NULL ORDER BY created_at, id"
-            )
-        };
-        let records = sqlx::query_as::<_, GroupRecord>(sql)
-            .fetch_all(&self.pool)
-            .await?;
-        Ok(records)
+        self.list_groups_filtered(&GroupListFilter {
+            include_deleted,
+            ..GroupListFilter::default()
+        })
+        .await
+    }
+
+    /// The groups matching `filter`, oldest first; the group half of
+    /// [`list_keys_filtered`](Self::list_keys_filtered).
+    ///
+    /// # Errors
+    ///
+    /// [`AuthError::Db`] if the query fails.
+    pub async fn list_groups_filtered(
+        &self,
+        filter: &GroupListFilter,
+    ) -> Result<Vec<GroupRecord>, AuthError> {
+        // Built from fixed fragments only; every value is bound below.
+        let mut query = sqlx::query_as::<_, GroupRecord>(sqlx::AssertSqlSafe(filter.sql()));
+        for value in [
+            &filter.account_ref,
+            &filter.parent_id,
+            &filter.scope_account_ref,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            query = query.bind(value.as_str());
+        }
+        Ok(query.fetch_all(&self.pool).await?)
     }
 
     /// One live group by id: `None` for an unknown id or a tombstone.

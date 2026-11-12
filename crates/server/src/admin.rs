@@ -330,15 +330,16 @@ pub async fn list_keys(
 ) -> Result<Json<Vec<VirtualKeyRecord>>, ApiError> {
     let Query(params) = params.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
     let auth = runtime(&state)?;
-    let mut keys = auth
+    // Filtered in SQL (bound parameters), not over every row in memory.
+    let keys = auth
         .store
-        .list_keys(params.include_deleted)
+        .list_keys_filtered(&lumen_auth::store::KeyListFilter {
+            include_deleted: params.include_deleted,
+            external_ref: params.external_ref,
+            scope_account_ref: scope.account().map(str::to_owned),
+        })
         .await
         .map_err(|e| internal(&e))?;
-    if let Some(want) = &params.external_ref {
-        keys.retain(|k| k.external_ref.as_deref() == Some(want.as_str()));
-    }
-    let keys = scope.filter_keys(&auth.store, keys).await?;
     Ok(Json(keys))
 }
 
@@ -553,22 +554,22 @@ pub async fn list_groups(
 ) -> Result<Json<Vec<GroupRecord>>, ApiError> {
     let Query(params) = params.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
     let auth = runtime(&state)?;
-    let mut groups = auth
+    // Filtered in SQL (bound parameters), not over every row in memory.
+    let groups = auth
         .store
-        .list_groups(params.include_deleted)
+        .list_groups_filtered(&lumen_auth::store::GroupListFilter {
+            include_deleted: params.include_deleted,
+            // Stored refs are canonical (a UUID is lowercase): compare that form.
+            account_ref: params
+                .account_ref
+                .map(lumen_auth::billing::canonical_account_ref),
+            parent_id: params.parent_id,
+            // Applied on top of the query filter, so `?account_ref=<other>` on
+            // a scoped call narrows to nothing rather than widening the scope.
+            scope_account_ref: scope.account().map(str::to_owned),
+        })
         .await
         .map_err(|e| internal(&e))?;
-    if let Some(want) = params.account_ref {
-        // Stored refs are canonical (a UUID is lowercase): compare that form.
-        let want = lumen_auth::billing::canonical_account_ref(want);
-        groups.retain(|g| g.account_ref.as_deref() == Some(want.as_str()));
-    }
-    if let Some(parent) = params.parent_id {
-        groups.retain(|g| g.parent_id.as_deref() == Some(parent.as_str()));
-    }
-    // Applied on top of the query filter, so `?account_ref=<other>` on a
-    // scoped call narrows to nothing rather than widening the scope.
-    groups.retain(|g| scope.allows_group(g));
     Ok(Json(groups))
 }
 
