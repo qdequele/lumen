@@ -79,7 +79,13 @@ fn estimate_content_images(content: &MessageContent) -> u64 {
 /// zero tokens.
 #[must_use]
 pub fn estimate_text(text: &str) -> u64 {
-    (text.len() as u64).div_ceil(BYTES_PER_TOKEN)
+    estimate_bytes(text.len())
+}
+
+/// [`estimate_text`] for a text of `len` bytes, for callers that know the
+/// length without holding the text as one string.
+fn estimate_bytes(len: usize) -> u64 {
+    (len as u64).div_ceil(BYTES_PER_TOKEN)
 }
 
 /// Estimate the prompt tokens of a chat request: content of every message
@@ -94,7 +100,11 @@ pub fn estimate_chat_prompt(req: &ChatRequest) -> u64 {
             PER_MESSAGE_OVERHEAD
                 + m.content
                     .as_ref()
-                    .map_or(0, |c| estimate_text(&c.text()) + estimate_content_images(c))
+                    // The length of the text, never the text itself: joining
+                    // the parts would copy the whole prompt just to measure it.
+                    .map_or(0, |c| {
+                        estimate_bytes(c.text_len()) + estimate_content_images(c)
+                    })
         })
         .sum()
 }
@@ -291,6 +301,20 @@ mod tests {
         };
         // 8 bytes → 2 tokens + 4 overhead, empty → 0 + 4 overhead.
         assert_eq!(estimate_chat_prompt(&req), 10);
+    }
+
+    #[test]
+    fn chat_parts_are_measured_as_one_text_without_joining_them() {
+        // Three one-byte parts are 3 bytes of text: 1 token, exactly what the
+        // joined text would give (not 1 token per part).
+        let split = request(vec![parts_msg(vec![
+            text_part("a"),
+            text_part("b"),
+            text_part("c"),
+        ])]);
+        let joined = request(vec![msg("abc")]);
+        assert_eq!(estimate_chat_prompt(&split), estimate_chat_prompt(&joined));
+        assert_eq!(estimate_chat_prompt(&split), PER_MESSAGE_OVERHEAD + 1);
     }
 
     #[test]

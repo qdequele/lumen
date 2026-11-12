@@ -141,8 +141,9 @@ pub struct DataUri {
 
 impl MessageContent {
     /// The concatenated text of the content (borrowed for `Text`; the joined
-    /// `text` parts for `Parts`). Empty for an image-only message. Used by the
-    /// token estimator and any text-only inspection path.
+    /// `text` parts for `Parts`). Empty for an image-only message. Used by
+    /// text-only inspection paths; the token estimator only needs
+    /// [`text_len`](Self::text_len).
     #[must_use]
     pub fn text(&self) -> Cow<'_, str> {
         match self {
@@ -158,6 +159,21 @@ impl MessageContent {
                 }
                 Cow::Owned(out)
             }
+        }
+    }
+
+    /// The byte length of [`text`](Self::text), computed without building it
+    /// (no allocation, whatever the number of parts).
+    #[must_use]
+    pub fn text_len(&self) -> usize {
+        match self {
+            MessageContent::Text(s) => s.len(),
+            MessageContent::Parts(parts) => parts
+                .iter()
+                .filter(|p| p.kind == "text")
+                .filter_map(|p| p.text.as_ref())
+                .map(String::len)
+                .sum(),
         }
     }
 
@@ -510,6 +526,25 @@ mod tests {
         ]}"#;
         let m: ChatMessage = serde_json::from_str(json).unwrap();
         assert_eq!(m.content.as_ref().unwrap().text(), "");
+    }
+
+    #[test]
+    fn text_len_is_the_length_of_text_for_every_shape() {
+        for json in [
+            r#"{"role":"user","content":"héllo"}"#,
+            r#"{"role":"user","content":[
+                {"type":"text","text":"what is "},
+                {"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}},
+                {"type":"input_audio","text":"not a text part"},
+                {"type":"text","text":"this?"},
+                {"type":"text"}
+            ]}"#,
+            r#"{"role":"user","content":[]}"#,
+        ] {
+            let m: ChatMessage = serde_json::from_str(json).unwrap();
+            let content = m.content.as_ref().unwrap();
+            assert_eq!(content.text_len(), content.text().len(), "{json}");
+        }
     }
 
     #[test]
