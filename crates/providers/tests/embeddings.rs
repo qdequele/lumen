@@ -343,6 +343,55 @@ async fn voyage_embed_does_not_forward_extra_fields() {
     assert_extra_not_forwarded(&VoyageEmbedFixture).await;
 }
 
+/// Jina's `/embeddings` schema has no `user` and no `encoding_format` (its
+/// output encoding field is `embedding_type`): the text path sends an explicit
+/// body with only `model`, `input` and, when the client sets it, `dimensions`.
+/// The gateway re-encodes base64 at the request edge, so the upstream is
+/// always asked for its default float output.
+#[tokio::test]
+async fn jina_text_embed_sends_only_fields_jina_accepts() {
+    let mock = MockServer::start().await;
+    JinaEmbedFixture.mount_echo(&mock).await;
+    let provider = JinaEmbedFixture.build(mock.uri());
+
+    let mut req = batch_request(vec!["0".into(), "1".into()]);
+    req.user = Some("end-user-42".to_owned());
+    req.encoding_format = Some("base64".to_owned());
+    req.dimensions = Some(256);
+    provider.embed(req, CancellationToken::new()).await.unwrap();
+
+    let requests = mock.received_requests().await.unwrap();
+    let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(
+        body,
+        json!({ "model": body["model"], "input": ["0", "1"], "dimensions": 256 }),
+        "unexpected Jina body: {body}"
+    );
+}
+
+/// `dimensions` is omitted, not sent as null, when the client sets none.
+#[tokio::test]
+async fn jina_text_embed_omits_dimensions_by_default() {
+    let mock = MockServer::start().await;
+    JinaEmbedFixture.mount_echo(&mock).await;
+    let provider = JinaEmbedFixture.build(mock.uri());
+
+    provider
+        .embed(batch_request(vec!["0".into()]), CancellationToken::new())
+        .await
+        .unwrap();
+
+    let requests = mock.received_requests().await.unwrap();
+    let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    let keys: Vec<&str> = body
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(keys, vec!["input", "model"], "got body: {body}");
+}
+
 // --------------------------------------------------------------------------
 // TEI fixture - request `inputs`, response is a bare `[[f32]]` array
 // --------------------------------------------------------------------------

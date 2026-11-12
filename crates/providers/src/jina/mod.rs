@@ -1,7 +1,9 @@
 //! Jina AI provider - embeddings and reranking.
 //!
-//! Jina's embeddings endpoint is OpenAI-compatible, so the embed path is a
-//! near-passthrough (like [`crate::openai`]). Reranking (`POST /rerank`) is
+//! Jina's embeddings endpoint returns an OpenAI-shaped response, but its
+//! request has its own field set (no `user`, and the output encoding is
+//! `embedding_type`, not `encoding_format`), so the embed path builds an
+//! explicit body instead of forwarding the OpenAI request. Reranking (`POST /rerank`) is
 //! Cohere-shaped but bills in tokens rather than search units, so
 //! `usage.search_units` is reported as `0` (the value does not apply);
 //! `usage.total_tokens` carries Jina's reported token count instead (ADR
@@ -79,38 +81,31 @@ impl EmbeddingProvider for JinaProvider {
         // fail opaquely upstream. Honest 400 before any call (issue #25).
         crate::mapping::reject_pretokenized_input(&self.provider_name, &req.input)?;
 
-        // OpenAI-compatible schema: near-passthrough for text. A multimodal
+        // The response is OpenAI-shaped; the request is not. A multimodal
         // (content-parts) request translates to Jina's object-`input` array
-        // (`{"text":...}` / `{"image":...}`), one element per item; the response
-        // is OpenAI-shaped either way.
+        // (`{"text":...}` / `{"image":...}`), one element per item. A text
+        // request sends the strings as they are, in an explicit body: Jina's
+        // schema has no `user` and no `encoding_format`, so the OpenAI request
+        // is never forwarded verbatim.
         let url = format!("{}/embeddings", self.base_url);
-        let bytes = if let EmbedInput::Multi(items) = &req.input {
-            let mut body = json!({ "model": req.model, "input": jina_multimodal_input(items) });
-            // Jina names the output width `dimensions`, like OpenAI; without
-            // it the request would silently return full-width vectors.
-            if let Some(dimensions) = req.dimensions {
-                body["dimensions"] = json!(dimensions);
-            }
-            post_json(
-                &self.client,
-                &url,
-                &body,
-                self.api_key.as_deref(),
-                &self.provider_name,
-                &cancel,
-            )
-            .await?
-        } else {
-            post_json(
-                &self.client,
-                &url,
-                &req,
-                self.api_key.as_deref(),
-                &self.provider_name,
-                &cancel,
-            )
-            .await?
+        let input = match &req.input {
+            EmbedInput::Multi(items) => JinaInput::Multimodal(jina_multimodal_input(items)),
+            text => JinaInput::Text(text),
         };
+        let body = JinaEmbedRequest {
+            model: &req.model,
+            input,
+            dimensions: req.dimensions,
+        };
+        let bytes = post_json(
+            &self.client,
+            &url,
+            &body,
+            self.api_key.as_deref(),
+            &self.provider_name,
+            &cancel,
+        )
+        .await?;
         serde_json::from_slice::<EmbedResponse>(&bytes)
             .map_err(|e| ProviderError::Translation(format!("jina embeddings response: {e}")))
     }
@@ -118,6 +113,33 @@ impl EmbeddingProvider for JinaProvider {
     fn max_batch_size(&self) -> usize {
         MAX_BATCH_SIZE
     }
+}
+
+/// Jina `/embeddings` request body: only fields Jina's schema defines.
+/// `user` has no Jina equivalent. The output encoding (`embedding_type` in
+/// Jina's schema, `encoding_format` in OpenAI's) is not sent: the default is
+/// float, which is what the gateway needs, since it re-encodes the output at
+/// the request edge.
+#[derive(Serialize)]
+struct JinaEmbedRequest<'a> {
+    model: &'a str,
+    input: JinaInput<'a>,
+    /// Jina names the output width `dimensions`, like OpenAI. Sent whenever
+    /// the client sets it and omitted otherwise: dropping it would silently
+    /// return full-width vectors, so a model without it (`jina-embeddings-v2`,
+    /// `jina-clip-v1`) gets Jina's own answer instead.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dimensions: Option<u32>,
+}
+
+/// The `input` of a Jina embeddings request.
+#[derive(Serialize)]
+#[serde(untagged)]
+enum JinaInput<'a> {
+    /// A string or an array of strings (token inputs are rejected up front).
+    Text(&'a EmbedInput),
+    /// One `{"text":...}` or `{"image":...}` object per item.
+    Multimodal(Vec<Value>),
 }
 
 /// Build Jina's object-`input` array, one element per batch item. Jina's CLIP

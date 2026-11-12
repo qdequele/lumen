@@ -497,7 +497,14 @@ capabilities = ["embed", "rerank"]
 - **Auth**: `api_key_env` (e.g. `JINA_API_KEY`), bearer token.
 - **Embed batch limit**: 2048.
 - **`dimensions`**: forwarded as Jina's `dimensions`, for text and
-  multimodal (content-parts) input.
+  multimodal (content-parts) input. It is sent whenever the client sets it;
+  a model without it (`jina-embeddings-v2-*`, `jina-clip-v1`) gets Jina's own
+  answer rather than silently full-width vectors.
+- **Request fields**: the gateway sends only `model`, `input` and
+  `dimensions`. `user` is not forwarded (Jina has no such field), and neither
+  is `encoding_format` (Jina's field is `embedding_type`): Jina is always
+  asked for float vectors and the gateway encodes base64 itself when the
+  client asks for it.
 
 ```toml
 [[providers]]
