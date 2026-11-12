@@ -55,13 +55,13 @@ retried on a fallback before surfacing.
 | `LM-3001` | 429  | An upstream provider rate limited the request.                 |
 | `LM-3002` | 502  | An upstream provider returned an unparseable/malformed response.|
 | `LM-3003` | 502  | An upstream provider returned an error status. Also a Cloudflare Workers AI decisions call answered HTTP 200 with `success: false` (the upstream `errors[].message` is kept out of the client response), and a Perplexity 413 (body over 32 MiB) or 504 (no answer within about 60 s; the 504 is retryable). For an upstream 4xx, the provider's own message is usually in the preceding `upstream returned an error` log line (field `upstream_error`, same `request_id`; bounded, credentials redacted, never sent to the client). That line is absent when the upstream body carries no JSON message string. |
-| `LM-3004` | 503  | No healthy upstream available (circuit open / fallbacks spent).|
+| `LM-3004` | 503  | The upstream provider could not be reached at all (DNS failure, connection refused, TLS error), as opposed to answering with an error status. An exhausted fallback chain does not turn into this code: it returns the last link's own error. |
 | `LM-3005` | 504  | An upstream provider timed out.                                |
 | `LM-3010` | 502  | An upstream stream ended prematurely (no terminator).          |
 | `LM-3011` | 504  | An upstream produced no first token within the first-token deadline. |
 | `LM-3012` | 504  | The connection to an upstream could not be established within the connect timeout. |
-| `LM-3013` | 504  | The whole request (all retries + fallbacks) exceeded the total timeout. |
-| `LM-3020` | 503  | The provider's circuit breaker is open and no fallback remained. |
+| `LM-3013` | 504  | The whole request (all retries + fallbacks) exceeded the total timeout. Names the provider that was being called when the deadline fired. |
+| `LM-3020` | 503  | The named provider's circuit breaker is open and the chain does not move past it: it is the last link, or its level's `fallback_on` does not list `circuit_open`. Any link of the chain, not only the first. |
 | `LM-3021` | 429  | Every team (BYOK) key of the caller's group for the provider is rate-limited or failing, and the group's fallback to the platform's keys is off. |
 | `LM-3022` | 503  | The provider has a platform key pool (ADR 019) and every key of it is disabled. The pool replaces the configured key, so nothing can serve the request until an operator enables or adds a key. |
 
@@ -81,8 +81,11 @@ past the total timeout, is not waited for and the `LM-3001`/`LM-3003` surfaces
 at once, see [ADR 021](adr/021-upstream-cold-start-retry.md)), then the request fails over to the next target of the virtual model (its `fallback_on` triggers decide which failures move on, see [Virtual models](virtual-models.md#3-fallback_on-triggers)).
 The mapping between a failure and the code that eventually surfaces:
 
-- **`LM-3020` (503)** - the primary's circuit is open and no fallback remained.
-  Skipping an open circuit is instant (no upstream call), and the response
+- **`LM-3020` (503)** - the chain reached a link whose circuit is open and
+  could not move past it: that link is the last one, or the `fallback_on` of
+  its level does not list `circuit_open` (the default list does). This can be
+  any link, a fallback as well as the primary, and the error names that
+  link's provider. Skipping an open circuit is instant (no upstream call), and the response
   carries a `Retry-After` equal to the cooldown remainder. A link served from
   a group's team keys (BYOK) has its own breaker, apart from the platform
   key's, so one never opens the other.
@@ -104,11 +107,18 @@ The mapping between a failure and the code that eventually surfaces:
   circuit breaker; a fallback chain may move on under its `provider_error`
   trigger. Enabling or adding a key fixes it; deleting every platform key of
   the provider brings back the configured key.
-- **`LM-3004` (503)** - every link in the fallback chain was tried and failed
-  (retries exhausted or circuits open all the way down).
+- **`LM-3004` (503)** - the provider could not be reached at all (DNS
+  failure, connection refused, TLS error). Retried and failed over like any
+  provider fault. It is not a summary code for an exhausted chain: when every
+  link was tried and failed, the client gets the **last link's own error**
+  (`LM-3001`, `LM-3003`, `LM-3011`, `LM-3020`, ...), naming that link's
+  provider ([ADR 014](adr/014-virtual-models.md)). So `LM-3004` after a
+  fallback means the last link tried was unreachable.
 - **`LM-3013` (504)** - the total per-request deadline elapsed while retrying or
   failing over; it bounds *all* attempts together, so a slow chain fails here
-  rather than hanging.
+  rather than hanging. The error names the provider of the link that was
+  being called when the deadline fired, and that link's circuit breaker
+  records a failure.
 - **`LM-3011` / `LM-3012` (504)** - first-token and connect timeouts; each is a
   retryable failure on its own before it surfaces.
 

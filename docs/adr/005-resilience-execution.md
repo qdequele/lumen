@@ -243,3 +243,62 @@ clean terminal error each time).
 The peek lives in `crates/router/src/peek.rs` (generic over the frame type,
 unit-tested for commit / error / empty / cancel / timeout); wiremock acceptance
 tests are in `crates/server/tests/resilience.rs`.
+
+---
+
+## Amendment - 2026-11-12: per-link first-token timeout
+
+The first-token timeout was resolved once per request, from the first attempt's
+model, so a provider's `first_token_timeout_ms` applied only when its model was
+the primary: a slow local fallback configured for 60 s was cut at the default
+30 s, and a fallback behind a slow primary inherited the primary's longer
+deadline. The executor `Link` now carries an optional `first_token`, filled by
+the server from the link's own provider next to `Link::retry` (ADR 021), and
+the executor uses `link.first_token.unwrap_or(config.first_token)` for each
+attempt. The **total** timeout stays per request, resolved from the primary: it
+is one deadline over the whole chain.
+
+---
+
+## Amendment - 2026-11-12: the total timeout is attributed to the link in flight
+
+`LM-3013` named the first link of the chain whatever link was running when the
+total deadline fired, and that link's breaker got no outcome (a half-open probe
+was left to the auto-rearm described under *Half-open cannot wedge*). The
+executor now tracks the link being called outside the timeout envelope. When
+the deadline fires, `LM-3013` names that link's provider and its breaker
+records one failure, like a first-token or read timeout: the retry loop never
+sleeps past the deadline (ADR 021), so the deadline can only fire while that
+link's call is pending. A half-open probe cut by the total timeout therefore
+reopens the circuit at once; the auto-rearm remains for probes lost to a client
+disconnect.
+
+---
+
+## Amendment - 2026-11-12: only the probe holder releases the probe
+
+A call that ends with no verdict on the provider (a cancellation, a client
+fault, a link refused before the upstream call) hands a half-open probe back so
+the next caller can probe at once. That release was unconditional: a request
+admitted while the breaker was still closed, finishing with a neutral outcome
+after the circuit had opened and gone half-open, cleared the flag of a probe it
+did not hold, and a second probe was admitted while the first was in flight.
+`admit` now returns `Admission::Probe(marker)` for the probe, and
+`on_neutral(marker)` releases only the outstanding probe with that marker.
+`on_success` and `on_failure` are unchanged: any completed call is a verdict on
+the provider. A probe still runs its link's full retry policy; this ADR never
+made it a single attempt.
+
+---
+
+## Amendment - 2026-11-12: breaker eviction
+
+The original decision called the breaker map "bounded by the (provider x
+model) count". Team-scoped breakers (ADR 018) broke that bound: one entry per
+(provider, budget group, model) that ever served a request, kept for the life
+of the process. The registry now evicts breakers that hold no state (closed,
+no failure streak, not held by an in-flight request): on every reload, and
+when a new breaker would take the map past 1024 entries. Such a breaker is
+identical to the one its next request would create, so eviction never loses an
+open or half-open circuit or a failure streak. The request-path lookup now
+borrows the link's provider, group and model instead of allocating a key.

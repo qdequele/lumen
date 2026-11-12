@@ -1319,6 +1319,7 @@ mod tests {
             escapes: Vec::new(),
             breaker_scope: None,
             retry: None,
+            first_token: None,
         };
         let mut links = vec![link("p"), link("other")];
         keys_for(&pools, "g").scope_links(&reg, &mut links);

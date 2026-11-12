@@ -145,6 +145,21 @@ platform.
   attempts are counted through platform virtual targets: a platform model
   reached from an account model contributes its own height and attempts to
   the ADR 014 bounds (`MAX_DEPTH` 8, `MAX_ATTEMPTS` 64).
+- **Limits per virtual model (amended 2026-11-12).** An account document is
+  compiled on every platform reload and its `switch` conditions are scanned
+  per request, so what one model can hold is bounded too. `MAX_ATTEMPTS`
+  counts only the largest branch of a `switch`, so it never bounded the
+  number of branches, and each `regex` was compiled with the `regex` crate's
+  default 10 MiB size limit. The compile step now rejects, with the usual
+  validation error (`LM-1001` on a save, a disabled model on a recompile):
+  more than 64 targets on one virtual model (`MAX_TARGETS`); more than 16
+  attribute tests in one `when`, counted through `any` (`MAX_CONDITIONS`);
+  more than 16 `regex` conditions on one virtual model (`MAX_REGEXES`); a
+  `regex` longer than 256 bytes (`MAX_REGEX_LEN`) or compiling to more than
+  64 KiB (`REGEX_SIZE_LIMIT`, also the cap of its lazy DFA cache). The worst
+  case for one account is therefore 32 x 16 regexes of 64 KiB, about 32 MiB,
+  instead of thousands of 10 MiB programs. The limits live in the shared
+  compile step, so they apply to platform virtual models as well.
 - **No database on the request path.** Each process keeps a compiled table
   per account in memory, behind an `ArcSwap` next to the platform routing
   policy. It is refreshed: on a write, before the `204` (read your writes on

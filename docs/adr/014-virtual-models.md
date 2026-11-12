@@ -66,6 +66,9 @@ The goals are:
    (`MAX_ATTEMPTS`: a `fallback` or `split` sums its targets, a `switch`
    takes its largest branch, a foundation target is 1), so a DAG listing the
    same child several times per level cannot blow up the decide step;
+   at most 64 targets per virtual model, 16 attribute tests per `when`, 16
+   `regex` conditions per virtual model, each at most 256 bytes and 64 KiB
+   compiled (added 2026-11-12, see ADR 022 section 5);
    contents of `overrides`, `preset` and `remap`.
    Validation runs at boot, reload and on every admin write. `listed = false`
    hides a virtual model from `GET /v1/models` while it stays callable.
