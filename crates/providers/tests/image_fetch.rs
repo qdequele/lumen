@@ -232,3 +232,73 @@ async fn too_many_remote_images_is_rejected_before_fetching() {
     // Rejected before any fetch.
     assert!(host.received_requests().await.unwrap().is_empty());
 }
+
+/// A dot-segment path must not slip past a URL prefix allowlist: the check
+/// runs on the normalised URL the request is actually sent to, so no request
+/// reaches the host for the other tenant's path.
+#[tokio::test]
+async fn dot_segments_cannot_escape_the_url_prefix_allowlist() {
+    let host = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "image/png")
+                .set_body_bytes(vec![1u8, 2, 3]),
+        )
+        .mount(&host)
+        .await;
+
+    let mut policy = enabled_policy();
+    policy.allowed_url_prefixes = vec![format!("{}/tenant-a/", host.uri())];
+
+    for path in [
+        "/tenant-a/../tenant-b/x.png",
+        "/tenant-a/%2e%2e/tenant-b/x.png",
+    ] {
+        let mut input = input_with_image(&format!("{}{path}", host.uri()));
+        let err = resolve_image_parts(&mut input, &policy, &CancellationToken::new())
+            .await
+            .expect_err("escaping the prefix is rejected");
+        assert!(matches!(err, GatewayError::ImageUrlRejected), "{err:?}");
+    }
+    assert!(host.received_requests().await.unwrap().is_empty());
+
+    // The legitimate path under the prefix still fetches.
+    let mut input = input_with_image(&format!("{}/tenant-a/x.png", host.uri()));
+    resolve_image_parts(&mut input, &policy, &CancellationToken::new())
+        .await
+        .expect("allowed prefix fetches");
+    assert!(image_url_of(&input).starts_with("data:image/png;base64,"));
+}
+
+/// A redirect hop is held to the same normalised prefix check as the
+/// original URL.
+#[tokio::test]
+async fn redirect_out_of_the_url_prefix_is_rejected() {
+    let host = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(wiremock::matchers::path("/tenant-a/go.png"))
+        .respond_with(
+            ResponseTemplate::new(302).insert_header("location", "../tenant-b/secret.png"),
+        )
+        .mount(&host)
+        .await;
+    Mock::given(method("GET"))
+        .and(wiremock::matchers::path("/tenant-b/secret.png"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "image/png")
+                .set_body_bytes(vec![1u8]),
+        )
+        .expect(0)
+        .mount(&host)
+        .await;
+
+    let mut policy = enabled_policy();
+    policy.allowed_url_prefixes = vec![format!("{}/tenant-a/", host.uri())];
+    let mut input = input_with_image(&format!("{}/tenant-a/go.png", host.uri()));
+    let err = resolve_image_parts(&mut input, &policy, &CancellationToken::new())
+        .await
+        .expect_err("redirect leaves the prefix");
+    assert!(matches!(err, GatewayError::ImageUrlRejected), "{err:?}");
+}
