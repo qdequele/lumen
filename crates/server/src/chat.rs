@@ -38,6 +38,7 @@ use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
 use bytes::Bytes;
 use futures::stream::{BoxStream, StreamExt};
+use futures::FutureExt;
 use lumen_auth::state::usd_to_micro;
 use std::sync::Arc;
 
@@ -690,6 +691,71 @@ fn defer_chat_refinement(
 /// says "data: [DONE]" inside a delta can never spoof the terminator.
 const DONE_MARKER: &[u8] = b"\ndata: [DONE]";
 
+/// How many trailing bytes of the forwarded stream are remembered: enough to
+/// complete a [`DONE_MARKER`] that started in an earlier frame.
+const TAIL_LEN: usize = DONE_MARKER.len() - 1;
+
+/// Whether `bytes` holds a whole [`DONE_MARKER`]. The marker opens with a
+/// newline, so only the (few) newlines of a frame are compared against it.
+fn contains_done(bytes: &[u8]) -> bool {
+    let mut rest = bytes;
+    while let Some(at) = rest.iter().position(|&b| b == b'\n') {
+        if rest[at..].starts_with(DONE_MARKER) {
+            return true;
+        }
+        rest = &rest[at + 1..];
+    }
+    false
+}
+
+/// The last bytes (at most [`TAIL_LEN`]) of the forwarded stream, in fixed
+/// storage: recording a frame allocates nothing and copies only those bytes.
+struct Tail {
+    bytes: [u8; TAIL_LEN],
+    len: usize,
+}
+
+impl Tail {
+    /// A stream that forwarded nothing yet, seeded with a virtual blank line:
+    /// a `[DONE]` opening the very first frame still matches the
+    /// line-anchored marker, and the stream stands on an event boundary.
+    fn line_start() -> Self {
+        let mut bytes = [0; TAIL_LEN];
+        bytes[..2].copy_from_slice(b"\n\n");
+        Self { bytes, len: 2 }
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+
+    /// Record a forwarded frame. Returns whether a [`DONE_MARKER`] ends in
+    /// it, including one that started in the bytes remembered so far.
+    fn push(&mut self, frame: &[u8]) -> bool {
+        // A marker that straddles the boundary starts in the tail and ends
+        // within the first `TAIL_LEN` bytes of the frame: the two are joined
+        // on the stack. The frame itself is searched in place.
+        let head = &frame[..frame.len().min(TAIL_LEN)];
+        let mut joint = [0; 2 * TAIL_LEN];
+        let joint_len = self.len + head.len();
+        joint[..self.len].copy_from_slice(self.as_slice());
+        joint[self.len..joint_len].copy_from_slice(head);
+        let joint = &joint[..joint_len];
+        let found = contains_done(joint) || contains_done(frame);
+
+        // A frame shorter than the tail is wholly in `joint`, after the
+        // bytes that were already there.
+        let last = if frame.len() >= TAIL_LEN {
+            &frame[frame.len() - TAIL_LEN..]
+        } else {
+            &joint[joint_len.saturating_sub(TAIL_LEN)..]
+        };
+        self.bytes[..last.len()].copy_from_slice(last);
+        self.len = last.len();
+        found
+    }
+}
+
 /// One SSE frame carrying the standard JSON error envelope, after `prefix`
 /// (the newlines that close a half-forwarded event, see [`event_closer`]).
 fn error_frame(error: &GatewayError, prefix: &str) -> Bytes {
@@ -739,6 +805,7 @@ enum Step {
 
 /// Streaming wrapper state. Bounded: no frame content is retained beyond the
 /// few bytes needed to detect a `[DONE]` split across frame boundaries.
+/// Forwarding a frame allocates nothing here.
 struct EventStreamState {
     inner: BoxStream<'static, Result<Bytes, ProviderError>>,
     provider: String,
@@ -755,8 +822,12 @@ struct EventStreamState {
     /// Trailing bytes of the forwarded stream, so a `[DONE]` marker split
     /// across two frames is still detected, and so the gateway knows whether
     /// the stream stands on an event boundary before inserting a frame of its
-    /// own. At most `DONE_MARKER.len() - 1` bytes.
-    tail: Vec<u8>,
+    /// own.
+    tail: Tail,
+    /// The heartbeat timer: one for the whole stream, re-armed before each
+    /// wait (a new timer per wait is registered with the time driver, then
+    /// cancelled, for every chunk that has to be waited for).
+    heartbeat: std::pin::Pin<Box<tokio::time::Sleep>>,
     /// Token/cost accounting riding along the stream (M5). `None` in unit
     /// tests that only exercise the guards. Its `Drop` settles the books, so
     /// a client disconnect can never leak a budget reservation.
@@ -770,25 +841,21 @@ impl EventStreamState {
         if let Some(accounting) = &mut self.accounting {
             accounting.scan(frame);
         }
-        let mut window = std::mem::take(&mut self.tail);
-        window.extend_from_slice(frame);
-        if window.windows(DONE_MARKER.len()).any(|w| w == DONE_MARKER) {
+        if self.tail.push(frame) {
             self.saw_done = true;
         }
-        let keep = window.len().min(DONE_MARKER.len() - 1);
-        self.tail = window.split_off(window.len() - keep);
     }
 
     /// The terminal SSE frame for `error`, closing any half-forwarded event
     /// first so the frame is always an event of its own.
     fn terminal_error_frame(&self, error: &GatewayError) -> Bytes {
-        error_frame(error, event_closer(&self.tail))
+        error_frame(error, event_closer(self.tail.as_slice()))
     }
 
     /// Whether the forwarded bytes end on an event boundary, where a frame
     /// of the gateway's own can be inserted without altering an event.
     fn on_event_boundary(&self) -> bool {
-        event_closer(&self.tail).is_empty()
+        event_closer(self.tail.as_slice()).is_empty()
     }
 
     /// Close the accounting record with the stream's terminal outcome, so
@@ -837,10 +904,8 @@ fn to_event_stream(
         got_first_frame: false,
         saw_done: false,
         ended: false,
-        // Seeded with a virtual blank line: a `[DONE]` opening the very
-        // first frame still matches the line-anchored marker, and a stream
-        // that forwarded nothing yet stands on an event boundary.
-        tail: vec![b'\n', b'\n'],
+        tail: Tail::line_start(),
+        heartbeat: Box::pin(tokio::time::sleep(guards.heartbeat_interval)),
         accounting,
     };
 
@@ -850,13 +915,21 @@ fn to_event_stream(
         }
 
         let step = loop {
-            let heartbeat = tokio::time::sleep(s.guards.heartbeat_interval);
-            tokio::pin!(heartbeat);
+            // A frame that is already there is forwarded without touching a
+            // timer (the upstream always wins a tie, as in the waits below).
+            if let Some(item) = s.inner.next().now_or_never() {
+                break Step::Item(item);
+            }
+            // Each wait gets a full heartbeat interval, as a fresh timer
+            // would give it. Re-arming to a later deadline leaves the timer
+            // registered: no per-chunk registration with the time driver.
+            let rearmed = tokio::time::Instant::now() + s.guards.heartbeat_interval;
+            s.heartbeat.as_mut().reset(rearmed);
             let step = if s.got_first_frame {
                 tokio::select! {
                     biased;
                     item = s.inner.next() => Step::Item(item),
-                    () = &mut heartbeat => Step::Ping,
+                    () = s.heartbeat.as_mut() => Step::Ping,
                 }
             } else {
                 tokio::select! {
@@ -866,7 +939,7 @@ fn to_event_stream(
                     () = tokio::time::sleep_until(s.first_frame_deadline) => {
                         Step::FirstTokenTimeout
                     }
-                    () = &mut heartbeat => Step::Ping,
+                    () = s.heartbeat.as_mut() => Step::Ping,
                 }
             };
             // The upstream paused in the middle of an event: a ping inserted
@@ -1094,6 +1167,48 @@ mod tests {
         // No LM-3010: the split terminator was recognised.
         assert_eq!(out.len(), 2);
         assert!(!out.iter().any(|f| f.contains("LM-3010")));
+    }
+
+    #[tokio::test]
+    async fn done_marker_is_detected_wherever_the_frames_are_cut() {
+        // The same stream cut in two at every byte, then fed byte by byte.
+        let body: &[u8] = b"data: {\"x\":1}\n\ndata: [DONE]\n\n";
+        for cut in 0..=body.len() {
+            let out = collect(wrap(
+                frames(vec![
+                    Ok(Bytes::copy_from_slice(&body[..cut])),
+                    Ok(Bytes::copy_from_slice(&body[cut..])),
+                ]),
+                guards(30_000, 15_000),
+            ))
+            .await;
+            assert_eq!(out.concat().as_bytes(), body, "cut at {cut}");
+        }
+        let bytes = body.iter().map(|b| Ok(Bytes::copy_from_slice(&[*b])));
+        let out = collect(wrap(frames(bytes.collect()), guards(30_000, 15_000))).await;
+        assert_eq!(out.concat().as_bytes(), body);
+    }
+
+    #[test]
+    fn tail_keeps_the_last_bytes_and_finds_the_marker_across_pushes() {
+        let mut tail = Tail::line_start();
+        assert_eq!(tail.as_slice(), b"\n\n");
+        // Shorter than the tail: appended to what was there.
+        assert!(!tail.push(b"abc"));
+        assert_eq!(tail.as_slice(), b"\n\nabc");
+        assert!(!tail.push(b""));
+        assert_eq!(tail.as_slice(), b"\n\nabc");
+        // Overflowing: only the last TAIL_LEN bytes stay.
+        assert!(!tail.push(b"0123456789"));
+        assert_eq!(tail.as_slice(), b"bc0123456789");
+        // Longer than the tail: the frame's own last bytes.
+        assert!(!tail.push(b"a long frame that ends with\ndata: [DO"));
+        assert_eq!(tail.as_slice(), b"th\ndata: [DO");
+        // The marker completes across the boundary.
+        assert!(tail.push(b"NE]\n\n"));
+        // A marker wholly inside one frame, and none at all.
+        assert!(Tail::line_start().push(b"data: {}\n\ndata: [DONE]\n\n"));
+        assert!(!Tail::line_start().push(b"data: {\"c\":\"data: [DONE]\"}\n\n"));
     }
 
     #[tokio::test]
