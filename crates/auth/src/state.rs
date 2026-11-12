@@ -1011,6 +1011,11 @@ impl AuthState {
             dashmap::Entry::Vacant(slot) => {
                 let entry = Arc::new(KeyEntry::from_record(record, Arc::clone(&self.signals)));
                 entry.set_group(group);
+                // A key that arrives under a live policy (a hot reload, the
+                // rotate fallback) carries its spend with it: the thresholds
+                // already behind it are armed as fired, without an event.
+                // Nothing is in flight on an entry no request can reach yet.
+                entry.arm_signals();
                 self.by_hash.insert(hash, Arc::clone(&entry));
                 slot.insert(entry);
             }
@@ -1077,6 +1082,9 @@ impl AuthState {
             }
             dashmap::Entry::Vacant(slot) => {
                 let entry = Arc::new(GroupEntry::from_record(record, Arc::clone(&self.signals)));
+                // Armed against the spend it arrives with, like a new key in
+                // `upsert`: no member can reach the pool before the insert.
+                entry.arm_signals();
                 slot.insert(Arc::clone(&entry));
                 entry
             }
