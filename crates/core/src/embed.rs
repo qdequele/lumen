@@ -14,7 +14,7 @@ use bytes::Bytes;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
 
-use crate::chat::ContentPart;
+use crate::chat::{ContentPart, ObjectOnly};
 
 /// Input to an embedding request: a single string, a text batch, a pre-tokenized
 /// input (token ids), or a multimodal batch of content-parts items.
@@ -449,11 +449,14 @@ impl EmbedPassthrough {
 /// The only parts of an OpenAI embeddings body the gateway reads when it
 /// forwards the body unchanged: the usage, and how many vectors `data` holds
 /// in which encoding. No vector is decoded or allocated.
+///
+/// Read through [`ObjectOnly`], like its `usage` and each `data` item: a
+/// derived struct also deserializes from a JSON array, which none of them is.
 #[derive(Deserialize)]
 struct EmbedProbe {
     data: DataProbe,
     #[serde(default)]
-    usage: EmbedUsage,
+    usage: Option<ObjectOnly<EmbedUsage>>,
 }
 
 /// The `data` array of an embeddings body, counted without decoding it.
@@ -492,7 +495,7 @@ impl<'de> Deserialize<'de> for DataProbe {
                     vectors: 0,
                     floats: 0,
                 };
-                while let Some(item) = seq.next_element::<Item>()? {
+                while let Some(ObjectOnly(item)) = seq.next_element::<ObjectOnly<Item>>()? {
                     probe.vectors += 1;
                     if item.embedding == VectorKind(EmbeddingEncoding::Float) {
                         probe.floats += 1;
@@ -555,7 +558,11 @@ impl EmbedCompletion {
         body: Bytes,
         wanted: EmbeddingEncoding,
     ) -> Result<Self, serde_json::Error> {
-        if let Ok(EmbedProbe { data, usage }) = serde_json::from_slice::<EmbedProbe>(&body) {
+        if let Ok(ObjectOnly(EmbedProbe {
+            data,
+            usage: Some(ObjectOnly(usage)),
+        })) = serde_json::from_slice::<ObjectOnly<EmbedProbe>>(&body)
+        {
             let wanted_floats = match wanted {
                 EmbeddingEncoding::Float => data.vectors,
                 EmbeddingEncoding::Base64 => 0,
@@ -867,6 +874,21 @@ mod tests {
     }
 
     #[test]
+    fn a_usage_that_is_not_an_object_is_never_forwarded_verbatim() {
+        let body = r#"{"object":"list","model":"m",
+            "data":[{"object":"embedding","index":0,"embedding":[1.0]}],
+            "usage":[5,5]}"#;
+        let completion = EmbedCompletion::from_openai_body(
+            Bytes::from_static(body.as_bytes()),
+            EmbeddingEncoding::Float,
+        );
+        assert!(
+            !matches!(completion, Ok(EmbedCompletion::Passthrough(_))),
+            "{completion:?}"
+        );
+    }
+
+    #[test]
     fn a_body_that_is_not_an_embeddings_response_is_an_error() {
         for body in [
             r#"{"usage":{"prompt_tokens":5}}"#,
@@ -876,6 +898,13 @@ mod tests {
             r#"{"object":"list","model":"m","data":[{"object":"embedding","index":0,"embedding":7}],"usage":{"prompt_tokens":5}}"#,
             // Truncated after a complete item.
             r#"{"usage":{"prompt_tokens":5},"data":[{"index":0,"embedding":[1.0]},"#,
+            // A top-level array is never an embeddings response, even when
+            // its items line up with the fields the probe reads.
+            r#"[[{"index":0,"embedding":[1.0]}],{"prompt_tokens":5}]"#,
+            r#"[[],{"prompt_tokens":5}]"#,
+            "[]",
+            // Nor is a `data` item written as an array.
+            r#"{"object":"list","model":"m","data":[[[1.0],0]],"usage":{"prompt_tokens":5}}"#,
             "not json",
         ] {
             assert!(

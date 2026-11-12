@@ -427,12 +427,48 @@ impl ChatPassthrough {
 /// The only parts of an OpenAI completion body the gateway reads when it
 /// forwards the body unchanged. Every other field is skipped without being
 /// built (no allocation), though the whole body is still checked to be JSON.
+///
+/// Read through [`ObjectOnly`], like its `usage`: a derived struct also
+/// deserializes from a JSON array, which no completion is.
 #[derive(Deserialize)]
 struct CompletionProbe {
     #[serde(default)]
-    usage: Option<Usage>,
+    usage: Option<ObjectOnly<Usage>>,
     #[serde(default)]
     choices: Option<SkippedArray>,
+}
+
+/// `T` read from a JSON object and from nothing else.
+///
+/// serde's derived `Deserialize` also accepts a JSON array, taking the
+/// struct's fields by position, so `[{"prompt_tokens":8},[]]` would read as a
+/// struct with a `usage` and a `choices` field. The probes decide whether an
+/// upstream body is forwarded and billed as it stands, so they read every
+/// struct through this wrapper: an array in place of an object fails the
+/// probe and the body goes to the typed parser instead.
+pub(crate) struct ObjectOnly<T>(pub(crate) T);
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for ObjectOnly<T> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor<T>(std::marker::PhantomData<T>);
+
+        impl<'de, T: Deserialize<'de>> serde::de::Visitor<'de> for Visitor<T> {
+            type Value = ObjectOnly<T>;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("an object")
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> Result<Self::Value, A::Error> {
+                T::deserialize(serde::de::value::MapAccessDeserializer::new(map)).map(ObjectOnly)
+            }
+        }
+
+        deserializer.deserialize_map(Visitor(std::marker::PhantomData))
+    }
 }
 
 /// A JSON array whose elements are skipped, not built.
@@ -474,10 +510,10 @@ impl ChatCompletion {
     /// # Errors
     /// The body is not a valid OpenAI chat completion.
     pub fn from_openai_body(body: Bytes) -> Result<Self, serde_json::Error> {
-        if let Ok(CompletionProbe {
-            usage: Some(usage),
+        if let Ok(ObjectOnly(CompletionProbe {
+            usage: Some(ObjectOnly(usage)),
             choices: Some(SkippedArray),
-        }) = serde_json::from_slice::<CompletionProbe>(&body)
+        })) = serde_json::from_slice::<ObjectOnly<CompletionProbe>>(&body)
         {
             if usage.prompt_tokens > 0 || usage.completion_tokens > 0 {
                 return Ok(Self::Passthrough(ChatPassthrough { body, usage }));
@@ -873,6 +909,20 @@ mod tests {
     }
 
     #[test]
+    fn a_usage_that_is_not_an_object_is_never_forwarded_verbatim() {
+        // serde reads a derived struct from an array too (fields by
+        // position). Such a body must not be forwarded as it stands.
+        let body = r#"{"id":"c","object":"chat.completion","created":1,"model":"m",
+            "choices":[{"index":0,"message":{"role":"assistant","content":"hi"}}],
+            "usage":[8,2,10]}"#;
+        let completion = ChatCompletion::from_openai_body(Bytes::from_static(body.as_bytes()));
+        assert!(
+            !matches!(completion, Ok(ChatCompletion::Passthrough(_))),
+            "{completion:?}"
+        );
+    }
+
+    #[test]
     fn a_body_that_is_not_a_completion_is_an_error_even_with_usage() {
         for body in [
             // No `choices`: usage alone does not make a completion.
@@ -881,6 +931,11 @@ mod tests {
             r#"{"choices":"x","usage":{"prompt_tokens":8,"completion_tokens":2}}"#,
             // Truncated after a complete usage object.
             r#"{"usage":{"prompt_tokens":8,"completion_tokens":2},"choices":[{"index":0"#,
+            // A top-level array is never a completion, even when its items
+            // line up with the fields the probe reads.
+            r#"[{"prompt_tokens":8},[]]"#,
+            r#"[{"prompt_tokens":8,"completion_tokens":2,"total_tokens":10},[{"index":0}]]"#,
+            "[]",
             "not json",
         ] {
             assert!(

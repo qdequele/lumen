@@ -757,7 +757,12 @@ struct ParsedUsage {
 /// The payload is read through [`UsageProbe`], which keeps the usage counts
 /// and skips everything else (choices, deltas, content) without building it.
 fn parse_usage(payload: &[u8]) -> Option<ParsedUsage> {
-    let Lenient(usage) = serde_json::from_slice::<UsageProbe>(payload).ok()?.usage;
+    // Read through `Lenient`: a derived struct also deserializes from a JSON
+    // array (fields by position), and a chunk that is not an object carries
+    // no usage.
+    let Lenient(UsageProbe {
+        usage: Lenient(usage),
+    }) = serde_json::from_slice::<Lenient<UsageProbe>>(payload).ok()?;
     let (prompt, completion) = (usage.prompt_tokens.0, usage.completion_tokens.0);
     // No count at all, or nothing but zeros: the upstream reported nothing
     // (ADR 003). The caller then settles on the flagged estimate, exactly as
@@ -779,7 +784,7 @@ fn parse_usage(payload: &[u8]) -> Option<ParsedUsage> {
 
 /// The part of a streamed chunk the sniffer reads: its top-level `usage`.
 /// Every other field is skipped by serde without being built.
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 struct UsageProbe {
     #[serde(default)]
     usage: Lenient<UsageCounts>,
@@ -1237,6 +1242,15 @@ mod tests {
         s.scan(b"data: {\"usage\":\"{\"}\n\n");
         s.scan(b"data: {\"usage\":[{\"prompt_tokens\":5}]}\n\n");
         assert_eq!(s.result(10), (10, 2, true));
+    }
+
+    #[test]
+    fn a_chunk_that_is_not_an_object_is_not_upstream_usage() {
+        // serde reads a derived struct from an array too (fields by
+        // position): the first item must not be taken for the usage.
+        let mut s = UsageSniffer::default();
+        s.scan(b"data: [{\"prompt_tokens\":5,\"completion_tokens\":3,\"usage\":{}}]\n\n");
+        assert_eq!(s.result(10), (10, 1, true));
     }
 
     #[test]
