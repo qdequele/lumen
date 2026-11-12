@@ -9,7 +9,9 @@ use lumen_core::{Capability, GatewayError};
 use lumen_providers::decisions::rerank::RerankTemplate;
 
 use super::condition::FactSource;
-use super::overrides::{apply_chain, effective_field, Overridable, Overrides, Preset};
+use super::overrides::{
+    apply_chain, effective_field, effective_output_caps, Overridable, Overrides, Preset,
+};
 use super::table::{Node, RoutingTable, Strategy, Target, VirtualModel};
 use crate::triggers::{linear_escapes, Escape, Triggers};
 
@@ -69,6 +71,19 @@ impl Attempt {
         current: Option<serde_json::Value>,
     ) -> Option<serde_json::Value> {
         effective_field(&self.overrides, name, current)
+    }
+
+    /// The two spellings of the output cap, (`max_tokens`,
+    /// `max_completion_tokens`), as this attempt's request carries them,
+    /// given their values in the client request. They are resolved together
+    /// because a `default` on either applies only when both are absent.
+    #[must_use]
+    pub fn output_caps(
+        &self,
+        max_tokens: Option<serde_json::Value>,
+        max_completion_tokens: Option<serde_json::Value>,
+    ) -> (Option<serde_json::Value>, Option<serde_json::Value>) {
+        effective_output_caps(&self.overrides, max_tokens, max_completion_tokens)
     }
 }
 

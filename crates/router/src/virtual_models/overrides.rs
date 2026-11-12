@@ -295,6 +295,61 @@ pub fn effective_field(
     probe.value
 }
 
+/// The two spellings of a chat request's output cap standing in for the whole
+/// request. They are probed together because [`ChatRequest`] treats them as
+/// one field when a `default` applies.
+struct OutputCapProbe {
+    max_tokens: Option<Value>,
+    max_completion_tokens: Option<Value>,
+}
+
+impl OutputCapProbe {
+    fn slot(&mut self, name: &str) -> Option<&mut Option<Value>> {
+        match name {
+            "max_tokens" => Some(&mut self.max_tokens),
+            "max_completion_tokens" => Some(&mut self.max_completion_tokens),
+            _ => None,
+        }
+    }
+}
+
+impl Overridable for OutputCapProbe {
+    fn has_field(&self, name: &str) -> bool {
+        matches!(name, "max_tokens" | "max_completion_tokens")
+            && (self.max_tokens.is_some() || self.max_completion_tokens.is_some())
+    }
+
+    fn set_field(&mut self, name: &str, value: &Value) {
+        if let Some(slot) = self.slot(name) {
+            *slot = Some(value.clone());
+        }
+    }
+
+    fn remove_field(&mut self, name: &str) {
+        if let Some(slot) = self.slot(name) {
+            *slot = None;
+        }
+    }
+}
+
+/// The values `max_tokens` and `max_completion_tokens` end up with once
+/// `chain` is applied to a chat request carrying the given ones: the same
+/// rules as [`apply_chain`] on a [`ChatRequest`], where a client value under
+/// either spelling keeps a `default` on the other from being added.
+#[must_use]
+pub fn effective_output_caps(
+    chain: &[Arc<Overrides>],
+    max_tokens: Option<Value>,
+    max_completion_tokens: Option<Value>,
+) -> (Option<Value>, Option<Value>) {
+    let mut probe = OutputCapProbe {
+        max_tokens,
+        max_completion_tokens,
+    };
+    apply_chain(chain, &mut probe);
+    (probe.max_tokens, probe.max_completion_tokens)
+}
+
 /// A compiled chat preset.
 #[derive(Clone)]
 pub struct Preset {

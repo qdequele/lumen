@@ -184,13 +184,15 @@ pub async fn chat(
 /// that raises the cap cannot run past the key's budget on a small client
 /// value. An attempt's cap is the larger of `max_tokens` and
 /// `max_completion_tokens` (OpenAI-compatible providers forward the latter
-/// verbatim); an attempt that ends with neither reserves the default.
+/// verbatim); an attempt that ends with neither reserves the default. The two
+/// spellings are resolved together, as the overrides treat them as one field:
+/// a `default` on one never adds to a client value under the other.
 fn reserved_output_tokens(
     decision: &lumen_router::virtual_models::Decision,
     req: &ChatRequest,
 ) -> u64 {
     let max_tokens = req.max_tokens.map(serde_json::Value::from);
-    let max_completion_tokens = req.extra.get("max_completion_tokens").cloned();
+    let max_completion_tokens = req.extra.get("max_completion_tokens");
     let cap = |v: Option<serde_json::Value>| {
         v.and_then(|v| v.as_u64())
             .filter(|v| u32::try_from(*v).is_ok())
@@ -199,10 +201,10 @@ fn reserved_output_tokens(
         .attempts
         .iter()
         .map(|a| {
-            let tokens = cap(a.field("max_tokens", max_tokens.clone()));
-            let completion = cap(a.field("max_completion_tokens", max_completion_tokens.clone()));
-            tokens
-                .max(completion)
+            let (tokens, completion) =
+                a.output_caps(max_tokens.clone(), max_completion_tokens.cloned());
+            cap(tokens)
+                .max(cap(completion))
                 .unwrap_or(DEFAULT_RESERVED_OUTPUT_TOKENS)
         })
         .max()
@@ -1099,6 +1101,44 @@ mod tests {
         assert_eq!(
             reserved_output_tokens(&plain, &chat_req(None, Some(4000))),
             4000
+        );
+    }
+
+    #[test]
+    fn reservation_resolves_both_cap_spellings_as_one_field() {
+        use serde_json::json;
+        // A `default` on one spelling does not apply when the client sent the
+        // other: the upstream request carries the client value, and so does
+        // the reservation.
+        let default = decision_with(&[Some(json!({ "default": { "max_tokens": 4096 } }))]);
+        assert_eq!(
+            reserved_output_tokens(&default, &chat_req(None, Some(100))),
+            100
+        );
+        let default =
+            decision_with(&[Some(json!({ "default": { "max_completion_tokens": 4096 } }))]);
+        assert_eq!(
+            reserved_output_tokens(&default, &chat_req(Some(100), None)),
+            100
+        );
+        assert_eq!(
+            reserved_output_tokens(&default, &chat_req(None, None)),
+            4096
+        );
+        // What the reservation resolves is what the attempt sends.
+        let d = decision_with(&[Some(json!({ "default": { "max_tokens": 4096 } }))]);
+        let mut sent = chat_req(None, Some(100));
+        d.attempts[0].apply(&mut sent);
+        assert_eq!(sent.max_tokens, None);
+        assert_eq!(sent.extra.get("max_completion_tokens"), Some(&json!(100)));
+        // `drop` and `set` stay per spelling.
+        let dropped = decision_with(&[Some(json!({
+            "drop": ["max_completion_tokens"],
+            "default": { "max_tokens": 700 }
+        }))]);
+        assert_eq!(
+            reserved_output_tokens(&dropped, &chat_req(Some(100), Some(5000))),
+            100
         );
     }
 
