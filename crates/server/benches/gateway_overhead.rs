@@ -109,6 +109,7 @@ fn bench_executor(c: &mut Criterion) {
         escapes: Vec::new(),
         breaker_scope: None,
         retry: None,
+        first_token: None,
     }];
     let breakers = CircuitBreakers::new(BreakerConfig::default(), None);
     let config = ExecConfig {

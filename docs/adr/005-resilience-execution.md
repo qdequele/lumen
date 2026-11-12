@@ -243,3 +243,17 @@ clean terminal error each time).
 The peek lives in `crates/router/src/peek.rs` (generic over the frame type,
 unit-tested for commit / error / empty / cancel / timeout); wiremock acceptance
 tests are in `crates/server/tests/resilience.rs`.
+
+---
+
+## Amendment - 2026-11-12: per-link first-token timeout
+
+The first-token timeout was resolved once per request, from the first attempt's
+model, so a provider's `first_token_timeout_ms` applied only when its model was
+the primary: a slow local fallback configured for 60 s was cut at the default
+30 s, and a fallback behind a slow primary inherited the primary's longer
+deadline. The executor `Link` now carries an optional `first_token`, filled by
+the server from the link's own provider next to `Link::retry` (ADR 021), and
+the executor uses `link.first_token.unwrap_or(config.first_token)` for each
+attempt. The **total** timeout stays per request, resolved from the primary: it
+is one deadline over the whole chain.

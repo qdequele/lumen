@@ -489,16 +489,30 @@ impl ResilienceRuntime {
         }
     }
 
-    /// Give each link its provider's retry policy when that provider
-    /// overrides one (ADR 021); other links keep [`ExecConfig::retry`].
+    /// Give each link its provider's own knobs: the retry policy when that
+    /// provider overrides one (ADR 021; other links keep
+    /// [`ExecConfig::retry`]) and the first-token timeout (ADR 005, per-link
+    /// amendment), so a fallback is bounded by its own provider's
+    /// `first_token_timeout_ms` and not by the primary's.
     /// Call once the chain's links are built, before executing.
     pub fn apply_retry_overrides(&self, links: &mut [Link]) {
         let policy = self.policy.load();
-        if policy.provider_retry.is_empty() {
-            return;
+        if !policy.provider_retry.is_empty() {
+            for link in links.iter_mut() {
+                link.retry = policy.provider_retry.get(&link.provider_name).copied();
+            }
         }
-        for link in links {
-            link.retry = policy.provider_retry.get(&link.provider_name).copied();
+        // Without any override every link shares `ExecConfig::first_token`
+        // (the default): nothing to carry.
+        if !policy.model_timeouts.is_empty() {
+            for link in links {
+                link.first_token = Some(
+                    policy
+                        .model_timeouts
+                        .get(&link.model_id)
+                        .map_or(policy.default_timeouts.first_token, |t| t.first_token),
+                );
+            }
         }
     }
 }
@@ -713,6 +727,7 @@ mod tests {
             escapes: Vec::new(),
             breaker_scope: None,
             retry: None,
+            first_token: None,
         };
         let mut links = vec![link("hf"), link("oa")];
         rt.apply_retry_overrides(&mut links);
@@ -730,6 +745,55 @@ mod tests {
         let global = rt.exec_config("oa/embed").retry;
         assert_eq!(global.max_attempts, 2);
         assert_eq!(global.max_retry_after, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn each_link_gets_its_own_provider_first_token_timeout() {
+        let cfg = load(
+            r#"
+            [server]
+            first_token_timeout_ms = 30000
+            [[providers]]
+            name = "oa"
+            kind = "openai"
+            [[providers.models]]
+            id = "oa/gpt"
+            capabilities = ["chat"]
+            [[providers]]
+            name = "ollama"
+            kind = "ollama"
+            base_url = "http://127.0.0.1:9"
+            first_token_timeout_ms = 60000
+            [[providers.models]]
+            id = "ollama/llama"
+            capabilities = ["chat"]
+        "#,
+        );
+        let rt = ResilienceRuntime::from_config(&cfg, None);
+        let link = |provider: &str, model: &str| Link {
+            provider_name: provider.to_owned(),
+            model_id: model.to_owned(),
+            escapes: Vec::new(),
+            breaker_scope: None,
+            retry: None,
+            first_token: None,
+        };
+        // The override applies to the fallback although the chain's
+        // ExecConfig is resolved from the primary.
+        let mut links = vec![link("oa", "oa/gpt"), link("ollama", "ollama/llama")];
+        rt.apply_retry_overrides(&mut links);
+        assert_eq!(
+            rt.exec_config("oa/gpt").first_token,
+            Duration::from_secs(30)
+        );
+        assert_eq!(links[0].first_token, Some(Duration::from_secs(30)));
+        assert_eq!(links[1].first_token, Some(Duration::from_secs(60)));
+        // And the other way round: a fallback without an override does not
+        // inherit the primary's longer deadline.
+        let mut links = vec![link("ollama", "ollama/llama"), link("oa", "oa/gpt")];
+        rt.apply_retry_overrides(&mut links);
+        assert_eq!(links[0].first_token, Some(Duration::from_secs(60)));
+        assert_eq!(links[1].first_token, Some(Duration::from_secs(30)));
     }
 
     #[test]
@@ -755,6 +819,7 @@ mod tests {
             escapes: Vec::new(),
             breaker_scope: None,
             retry: None,
+            first_token: None,
         }];
         rt.apply_retry_overrides(&mut links);
         assert_eq!(links[0].retry.map(|r| r.max_attempts), Some(4));

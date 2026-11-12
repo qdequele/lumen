@@ -51,6 +51,11 @@ pub struct Link {
     /// This link's provider retry policy (ADR 021), or `None` for
     /// [`ExecConfig::retry`].
     pub retry: Option<RetryPolicy>,
+    /// This link's own first-token deadline (its provider's
+    /// `first_token_timeout_ms`), or `None` for [`ExecConfig::first_token`].
+    /// Per link, like `retry`: a fallback keeps its own provider's deadline
+    /// instead of inheriting the primary's.
+    pub first_token: Option<Duration>,
 }
 
 /// Resilience knobs for one execution.
@@ -59,7 +64,8 @@ pub struct ExecConfig {
     /// Retry policy applied per link.
     pub retry: RetryPolicy,
     /// Per-attempt first-token deadline (whole call for non-streaming; time to
-    /// the opened stream for streaming).
+    /// the opened stream for streaming). A link's own
+    /// [`Link::first_token`] takes precedence.
     pub first_token: Duration,
     /// Absolute cap on the whole call (all retries and fallbacks together).
     pub total: Duration,
@@ -166,7 +172,7 @@ where
             }
         }
 
-        let first_token = config.first_token;
+        let first_token = link.first_token.unwrap_or(config.first_token);
         let policy = link.retry.unwrap_or(config.retry);
         let outcome = retry(&policy, cancel, Some(deadline), || {
             // Invoke the call synchronously so the returned future is owned and
@@ -259,6 +265,7 @@ mod tests {
                 escapes: crate::triggers::linear_escapes(i, n),
                 breaker_scope: None,
                 retry: None,
+                first_token: None,
             })
             .collect()
     }
@@ -540,6 +547,7 @@ mod tests {
                 model_id: "a".into(),
                 breaker_scope: None,
                 retry: None,
+                first_token: None,
                 escapes: vec![Escape {
                     on: Triggers::DEFAULT,
                     next: 2,
@@ -551,6 +559,7 @@ mod tests {
                 escapes: vec![],
                 breaker_scope: None,
                 retry: None,
+                first_token: None,
             },
             Link {
                 provider_name: "pc".into(),
@@ -558,6 +567,7 @@ mod tests {
                 escapes: vec![],
                 breaker_scope: None,
                 retry: None,
+                first_token: None,
             },
         ];
         let out = execute(
@@ -587,6 +597,7 @@ mod tests {
                 model_id: "a".into(),
                 breaker_scope: None,
                 retry: None,
+                first_token: None,
                 escapes: vec![Escape {
                     on: Triggers::from_list(&[Trigger::RateLimited]),
                     next: 1,
@@ -598,6 +609,7 @@ mod tests {
                 escapes: vec![],
                 breaker_scope: None,
                 retry: None,
+                first_token: None,
             },
         ];
         let calls = AtomicUsize::new(0);
@@ -631,6 +643,7 @@ mod tests {
             model_id: "a".into(),
             breaker_scope: None,
             retry: None,
+            first_token: None,
             escapes: vec![Escape {
                 on: Triggers::DEFAULT,
                 next: 0,
@@ -929,6 +942,48 @@ mod tests {
         .unwrap();
         assert_eq!(result.model_used, "hf/bge-m3", "served by the primary");
         assert_eq!(calls.load(Ordering::SeqCst), 4, "503 x3 then 200");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_link_first_token_timeout_overrides_the_global_one() {
+        // Global: 30 s. The fallback's provider (a slow local model): 60 s.
+        // The fallback answers after 45 s and must not be cut at 30 s.
+        let mut chain = links(&[("openai", "gpt-4o"), ("ollama", "llama")]);
+        chain[1].first_token = Some(Duration::from_secs(60));
+        let out = execute(
+            &chain,
+            &breakers(),
+            &config(1),
+            &CancellationToken::new(),
+            |i| async move {
+                if i == 0 {
+                    Err(upstream_500())
+                } else {
+                    tokio::time::sleep(Duration::from_secs(45)).await;
+                    Ok::<usize, ProviderError>(i)
+                }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.model_used, "llama");
+
+        // And a shorter link deadline cuts earlier than the global one.
+        let mut chain = links(&[("openai", "gpt-4o")]);
+        chain[0].first_token = Some(Duration::from_secs(5));
+        let err = execute(
+            &chain,
+            &breakers(),
+            &config(1),
+            &CancellationToken::new(),
+            |_| async {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                Ok::<(), ProviderError>(())
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), "LM-3011");
     }
 
     #[tokio::test(start_paused = true)]

@@ -234,6 +234,7 @@ pub fn decision_links<'a>(
             escapes: a.escapes.clone(),
             breaker_scope: None,
             retry: None,
+            first_token: None,
         })
         .collect()
 }
