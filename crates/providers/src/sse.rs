@@ -33,6 +33,10 @@ pub struct SseEvent {
 pub struct SseParser {
     /// Bytes of the current, not-yet-terminated event (bounded).
     buffer: Vec<u8>,
+    /// Offset in `buffer` below which no event terminator can start: those
+    /// bytes were already scanned by an earlier `push`, so a large event
+    /// delivered over many reads is scanned once, not once per read.
+    scanned: usize,
 }
 
 impl SseParser {
@@ -52,13 +56,27 @@ impl SseParser {
         self.buffer.extend_from_slice(chunk);
 
         let mut events = Vec::new();
+        // Start of the first event not yet consumed. Events are parsed in
+        // place and the consumed prefix is removed once, after the loop, so a
+        // chunk of many small events does not shift the buffer per event.
+        let mut start = 0;
+        let mut from = self.scanned;
         // An event ends at a blank line. Scan for the earliest terminator of
         // either style; repeat while complete events remain in the buffer.
-        while let Some((end, skip)) = find_event_end(&self.buffer) {
-            let raw: Vec<u8> = self.buffer.drain(..end + skip).collect();
-            if let Some(event) = parse_event(&raw[..end]) {
+        while let Some((end, skip)) = find_event_end(&self.buffer, from) {
+            if let Some(event) = parse_event(&self.buffer[start..end]) {
                 events.push(event);
             }
+            start = end + skip;
+            from = start;
+        }
+        // A terminator is at most three bytes (`\n\r\n`), so one that starts
+        // in the last two bytes may still be completed by the next chunk:
+        // resume the next scan there, never before the pending event.
+        let resume = self.buffer.len().saturating_sub(2).max(start).max(from);
+        self.scanned = resume - start;
+        if start > 0 {
+            self.buffer.drain(..start);
         }
 
         // The cap applies to what is left INCOMPLETE after draining: a large
@@ -73,19 +91,18 @@ impl SseParser {
     }
 }
 
-/// Find the earliest event terminator - a line ending followed by an empty
-/// line (`\n\n` or `\n\r\n`; the `\r` of a CRLF field line is stripped by
-/// `parse_event`). Returns `(event_end, terminator_len)`.
-fn find_event_end(buf: &[u8]) -> Option<(usize, usize)> {
-    for (i, pair) in buf.windows(2).enumerate() {
-        if pair[0] != b'\n' {
-            continue;
-        }
-        if pair[1] == b'\n' {
-            return Some((i + 1, 1));
-        }
-        if pair[1] == b'\r' && buf.get(i + 2) == Some(&b'\n') {
-            return Some((i + 1, 2));
+/// Find the earliest event terminator starting at or after `from` - a line
+/// ending followed by an empty line (`\n\n` or `\n\r\n`; the `\r` of a CRLF
+/// field line is stripped by `parse_event`). Returns `(event_end,
+/// terminator_len)` as offsets into `buf`.
+fn find_event_end(buf: &[u8], from: usize) -> Option<(usize, usize)> {
+    let mut i = from;
+    while let Some(offset) = buf.get(i..)?.iter().position(|&b| b == b'\n') {
+        i += offset;
+        match buf.get(i + 1) {
+            Some(b'\n') => return Some((i + 1, 1)),
+            Some(b'\r') if buf.get(i + 2) == Some(&b'\n') => return Some((i + 1, 2)),
+            _ => i += 1,
         }
     }
     None
@@ -93,27 +110,46 @@ fn find_event_end(buf: &[u8]) -> Option<(usize, usize)> {
 
 /// Parse one raw event block (without its terminating blank line). Returns
 /// `None` for comment-only/empty blocks (e.g. `: keep-alive` pings).
+///
+/// Fields are borrowed from the buffer while parsing; the only allocations
+/// are the owned `event` and `data` of the result (plus one growth per extra
+/// line for multi-line data, which LLM providers do not send).
 fn parse_event(raw: &[u8]) -> Option<SseEvent> {
     let text = String::from_utf8_lossy(raw);
-    let mut event: Option<String> = None;
-    let mut data_lines: Vec<&str> = Vec::new();
+    let mut event: Option<&str> = None;
+    let mut first_data: Option<&str> = None;
+    let mut joined: Option<String> = None;
 
     for line in text.split('\n') {
         let line = line.strip_suffix('\r').unwrap_or(line);
         if let Some(value) = line.strip_prefix("data:") {
-            data_lines.push(value.strip_prefix(' ').unwrap_or(value));
+            let value = value.strip_prefix(' ').unwrap_or(value);
+            match (first_data, joined.as_mut()) {
+                (None, _) => first_data = Some(value),
+                (Some(_), Some(all)) => {
+                    all.push('\n');
+                    all.push_str(value);
+                }
+                (Some(first), None) => {
+                    let mut all = String::with_capacity(first.len() + 1 + value.len());
+                    all.push_str(first);
+                    all.push('\n');
+                    all.push_str(value);
+                    joined = Some(all);
+                }
+            }
         } else if let Some(value) = line.strip_prefix("event:") {
-            event = Some(value.strip_prefix(' ').unwrap_or(value).to_owned());
+            event = Some(value.strip_prefix(' ').unwrap_or(value));
         }
         // Comments (`:`) and unknown fields (`id:`, `retry:`) are ignored.
     }
 
-    if event.is_none() && data_lines.is_empty() {
+    if event.is_none() && first_data.is_none() {
         return None;
     }
     Some(SseEvent {
-        event,
-        data: data_lines.join("\n"),
+        event: event.map(str::to_owned),
+        data: joined.unwrap_or_else(|| first_data.unwrap_or_default().to_owned()),
     })
 }
 
@@ -222,5 +258,58 @@ mod tests {
         let mut p = SseParser::new();
         let big = vec![b'x'; MAX_EVENT_BYTES + 1];
         assert!(matches!(p.push(&big), Err(ProviderError::Translation(_))));
+    }
+
+    #[test]
+    fn large_event_delivered_byte_by_byte_is_parsed_once_complete() {
+        // A 256 KiB event arriving one byte per read: every push but the last
+        // yields nothing, and the event comes out intact. The scan offset
+        // keeps this linear (a rescan from byte 0 per push would be ~3e10
+        // byte comparisons here).
+        let payload = "x".repeat(256 * 1024);
+        let wire = format!("event: big\r\ndata: {payload}\r\n\r\ndata: after\n\n");
+        let mut p = SseParser::new();
+        let mut events = Vec::new();
+        for byte in wire.as_bytes() {
+            events.extend(p.push(std::slice::from_ref(byte)).expect("push succeeds"));
+        }
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event.as_deref(), Some("big"));
+        assert_eq!(events[0].data, payload);
+        assert_eq!(events[1].event, None);
+        assert_eq!(events[1].data, "after");
+    }
+
+    #[test]
+    fn terminator_split_at_every_position_yields_the_same_events() {
+        // Both terminator styles, cut at every byte offset: the scan offset
+        // must never skip a terminator whose bytes straddle two pushes.
+        for wire in [
+            "data: a\n\ndata: b\n\n",
+            "data: a\r\n\r\ndata: b\r\n\r\n",
+            "data: a\n\r\ndata: b\r\n\n",
+            "data: a\ndata: a2\n\n: ping\n\ndata: b\n\n",
+        ] {
+            let mut whole = SseParser::new();
+            let expected = push_str(&mut whole, wire);
+            for cut in 0..=wire.len() {
+                let mut p = SseParser::new();
+                let mut got = p.push(&wire.as_bytes()[..cut]).expect("push succeeds");
+                got.extend(p.push(&wire.as_bytes()[cut..]).expect("push succeeds"));
+                assert_eq!(got, expected, "wire {wire:?} cut at {cut}");
+            }
+        }
+    }
+
+    #[test]
+    fn utf8_code_point_split_across_chunks_is_preserved() {
+        let wire = "data: caf\u{e9} \u{1f600}\n\n".as_bytes();
+        for cut in 0..=wire.len() {
+            let mut p = SseParser::new();
+            let mut got = p.push(&wire[..cut]).expect("push succeeds");
+            got.extend(p.push(&wire[cut..]).expect("push succeeds"));
+            assert_eq!(got.len(), 1, "cut at {cut}");
+            assert_eq!(got[0].data, "caf\u{e9} \u{1f600}");
+        }
     }
 }
