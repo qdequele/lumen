@@ -158,7 +158,17 @@ impl FileSource {
         toml: &str,
         expected_hash: &str,
     ) -> Result<String, ConfigSourceError> {
-        let path = self.path.as_path();
+        // Resolve the path once and do everything at the resolved location.
+        // A config path is often a symlink (`/etc/lumen/config.toml` pointing
+        // into a managed directory): renaming a staged file over `self.path`
+        // itself would replace the LINK with a regular file and silently
+        // sever it from its target. `replace_file_in_place` in `main.rs`
+        // canonicalises for the same reason. Staging next to the resolved
+        // target also keeps the rename on one filesystem, which a link into
+        // another mount would not.
+        let resolved = std::fs::canonicalize(&self.path)
+            .map_err(|e| ConfigSourceError::Io(format!("resolving config path: {e}")))?;
+        let path = resolved.as_path();
 
         let current = std::fs::read(path)
             .map_err(|e| ConfigSourceError::Io(format!("reading config: {e}")))?;
@@ -222,7 +232,10 @@ impl FileSource {
             );
         }
 
-        let backup = path.with_extension("toml.bak");
+        // The backup stays a sibling of the path the operator configured
+        // (the link, when there is one), where it has always been and where
+        // the docs say to look for it.
+        let backup = self.path.with_extension("toml.bak");
         std::fs::copy(path, &backup)
             .map_err(|e| ConfigSourceError::Io(format!("backing up config: {e}")))?;
         std::fs::rename(&staged, path)
@@ -701,6 +714,58 @@ mod tests {
             std::fs::read_to_string(path.with_extension("toml.bak")).unwrap(),
             "a = 2\n"
         );
+    }
+
+    /// A config path that is a symlink (a common `/etc/lumen/config.toml`
+    /// layout) must stay one: the write goes to the file it points at, not
+    /// over the link itself.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn file_source_persist_writes_through_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let real_dir = dir.path().join("real");
+        std::fs::create_dir(&real_dir).unwrap();
+        let target = real_dir.join("lumen.toml");
+        std::fs::write(&target, "a = 1\n").unwrap();
+        let link_dir = dir.path().join("etc");
+        std::fs::create_dir(&link_dir).unwrap();
+        let link = link_dir.join("config.toml");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let src = FileSource::new(link.clone());
+        let doc = src.load().await.unwrap();
+        src.persist("a = 2\n", &doc.hash).await.unwrap();
+
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the config path must still be a symlink after a persist"
+        );
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "a = 2\n");
+        assert_eq!(std::fs::read_to_string(&link).unwrap(), "a = 2\n");
+        // The backup stays next to the path the operator configured, and no
+        // staging file is left in either directory.
+        assert_eq!(
+            std::fs::read_to_string(link.with_extension("toml.bak")).unwrap(),
+            "a = 1\n"
+        );
+        let names = |dir: &Path| {
+            let mut names: Vec<String> = std::fs::read_dir(dir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            names
+        };
+        assert_eq!(names(&real_dir), ["lumen.toml"]);
+        assert_eq!(names(&link_dir), ["config.toml", "config.toml.bak"]);
+        // A second persist still works through the link.
+        let doc = src.load().await.unwrap();
+        src.persist("a = 3\n", &doc.hash).await.unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "a = 3\n");
     }
 
     #[tokio::test]
