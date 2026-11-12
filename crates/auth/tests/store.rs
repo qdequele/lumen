@@ -348,6 +348,67 @@ async fn usage_batch_insert_and_retention_purge() {
     assert_eq!(store.count_usage().await.expect("count"), 1);
 }
 
+/// Insert `count` usage rows with `ts` = 1..=count.
+async fn seed_usage_rows(store: &KeyStore, count: i64) {
+    sqlx::query(
+        "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < ?) \
+         INSERT INTO usage_log (model, capability, tokens_in, tokens_out, latency_ms, status, ts) \
+         SELECT 'm', 'chat', 1, 1, 1, 200, x FROM n",
+    )
+    .bind(count)
+    .execute(store.pool())
+    .await
+    .expect("seed usage rows");
+}
+
+#[tokio::test]
+async fn the_retention_purge_deletes_every_old_row_across_chunks() {
+    use lumen_auth::store::USAGE_PURGE_CHUNK;
+    let store = KeyStore::in_memory().await.expect("open store");
+    // Two full chunks and a partial one past the cutoff, three rows inside.
+    let old = 2 * USAGE_PURGE_CHUNK + 1;
+    seed_usage_rows(&store, old + 3).await;
+
+    let purged = store.purge_usage_older_than(old + 1).await.expect("purge");
+    assert_eq!(purged, old.unsigned_abs());
+    assert_eq!(store.count_usage().await.expect("count"), 3);
+    assert_eq!(
+        store.purge_usage_older_than(old + 1).await.expect("purge"),
+        0
+    );
+}
+
+#[tokio::test]
+async fn the_retention_purge_commits_chunk_by_chunk() {
+    use lumen_auth::store::USAGE_PURGE_CHUNK;
+    // One unbounded DELETE holds the SQLite write lock for the whole table
+    // scan. Chunked, each statement commits on its own: when a later chunk
+    // fails, the earlier ones stay deleted. The failure is forced on the
+    // newest old row, which the oldest-first purge reaches last.
+    let store = KeyStore::in_memory().await.expect("open store");
+    let old = 2 * USAGE_PURGE_CHUNK + 1;
+    seed_usage_rows(&store, old).await;
+    sqlx::query("UPDATE usage_log SET status = 599 WHERE ts = ?")
+        .bind(old)
+        .execute(store.pool())
+        .await
+        .expect("mark the newest old row");
+    sqlx::query(
+        "CREATE TRIGGER refuse_last BEFORE DELETE ON usage_log WHEN OLD.status = 599 \
+         BEGIN SELECT RAISE(ABORT, 'delete refused'); END",
+    )
+    .execute(store.pool())
+    .await
+    .expect("create trigger");
+
+    assert!(store.purge_usage_older_than(old + 1).await.is_err());
+    assert_eq!(
+        store.count_usage().await.expect("count"),
+        1,
+        "the two full chunks before the failing statement must already be committed"
+    );
+}
+
 #[tokio::test]
 async fn usage_metadata_column_roundtrips_json() {
     let store = KeyStore::in_memory().await.expect("open store");

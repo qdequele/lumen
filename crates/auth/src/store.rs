@@ -712,6 +712,9 @@ pub struct OutboxInsert {
     pub created_ms: i64,
 }
 
+/// Rows deleted per statement by [`KeyStore::purge_usage_older_than`].
+pub const USAGE_PURGE_CHUNK: i64 = 5000;
+
 /// Rows deleted per statement by [`KeyStore::outbox_purge_delivered`].
 pub const OUTBOX_PURGE_CHUNK: i64 = 5000;
 
@@ -1702,13 +1705,32 @@ impl KeyStore {
 
     /// Delete usage entries with `ts` strictly older than `cutoff` (retention
     /// purge). Returns the number of rows removed.
+    ///
+    /// Deletes oldest-first in chunks of [`USAGE_PURGE_CHUNK`] rows, yielding
+    /// between chunks, like
+    /// [`outbox_purge_delivered`](Self::outbox_purge_delivered): one
+    /// unbounded `DELETE` over a large table would hold the SQLite write lock
+    /// (shared with the budget flush and the usage writer) past their busy
+    /// timeout. Each chunk commits on its own, so an error part-way keeps
+    /// what was already purged and the next run resumes.
     pub async fn purge_usage_older_than(&self, cutoff: i64) -> Result<u64, AuthError> {
-        let deleted = sqlx::query("DELETE FROM usage_log WHERE ts < ?")
+        let mut total = 0;
+        loop {
+            let purged = sqlx::query(
+                "DELETE FROM usage_log WHERE id IN (\
+                   SELECT id FROM usage_log WHERE ts < ? ORDER BY ts LIMIT ?)",
+            )
             .bind(cutoff)
+            .bind(USAGE_PURGE_CHUNK)
             .execute(&self.pool)
             .await?
             .rows_affected();
-        Ok(deleted)
+            total += purged;
+            if purged < USAGE_PURGE_CHUNK.unsigned_abs() {
+                return Ok(total);
+            }
+            tokio::task::yield_now().await;
+        }
     }
 
     /// Aggregate the usage log per `group_by`, under `filter` (issue #64).
