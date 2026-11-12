@@ -1512,3 +1512,64 @@ async fn put_webhooks_accepts_public_and_allowlisted_receivers() {
     body["url"] = json!("http://169.254.169.254/latest");
     assert_eq!(allowing.put_webhooks(&body).await.status(), 400);
 }
+
+// ---- Rejected writes never reach storage ------------------------------------
+
+/// A `signing_key_env` naming a variable this process cannot see, with no
+/// sealed secret to fall back on, is a 400. The refusal must come BEFORE the
+/// row is written: otherwise the previous good configuration is replaced by
+/// one no reload or restart can apply.
+#[tokio::test]
+async fn put_webhooks_with_an_unresolvable_signing_key_persists_nothing() {
+    let upstream = MockServer::start().await;
+    let receiver = MockServer::start().await;
+    mount_receiver(&receiver).await;
+    let config = webhook_config(&receiver.uri(), vec![EventKind::BudgetThreshold], vec![50]);
+    let h = spawn_gateway(chat_registry(&upstream.uri()), &config, None).await;
+
+    let mut body = put_body(&receiver.uri());
+    body["signing_key_env"] = json!("BILLING_WEBHOOK_SECRET_UNSET_FOR_PUT");
+    let response = h.put_webhooks(&body).await;
+    assert_eq!(response.status(), 400);
+    let error: Value = response.json().await.expect("error json");
+    assert_eq!(error["error"]["code"], "LM-1001");
+
+    assert!(
+        h.store.load_webhook_config().await.expect("load").is_none(),
+        "a rejected document must not reach storage"
+    );
+    let status: Value = h.get_webhooks().await.json().await.expect("status json");
+    assert_eq!(status["settings"]["url"], config.url.as_str());
+    assert_eq!(status["source"], "config");
+}
+
+/// Forgetting the sealed secret is refused when the live settings name an
+/// environment variable this process cannot see. A refusal must leave the
+/// secret where it was, not delete it and then answer 400.
+#[tokio::test]
+async fn a_refused_signing_key_delete_keeps_the_stored_secret() {
+    let upstream = MockServer::start().await;
+    let receiver = MockServer::start().await;
+    mount_receiver(&receiver).await;
+    let mut config = webhook_config(&receiver.uri(), vec![EventKind::BudgetThreshold], vec![50]);
+    config.signing_key_env = Some("BILLING_WEBHOOK_SECRET_UNSET_FOR_DELETE".to_owned());
+    let h = spawn_gateway(chat_registry(&upstream.uri()), &config, Some(SECRET)).await;
+
+    let response = h.delete_signing_key().await;
+    assert_eq!(response.status(), 400);
+    let error: Value = response.json().await.expect("error json");
+    assert_eq!(error["error"]["code"], "LM-1001");
+
+    let master = MasterKey::from_env_value(&master()).expect("master");
+    assert!(
+        h.store
+            .load_webhook_secret(&master)
+            .await
+            .expect("load the secret")
+            .is_some(),
+        "a refused delete must not have deleted the secret"
+    );
+    let status: Value = h.get_webhooks().await.json().await.expect("status json");
+    assert_eq!(status["signing_key_stored"], true);
+    assert_eq!(status["signed"], true);
+}

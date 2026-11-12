@@ -18,7 +18,7 @@ use lumen_auth::usage::{spawn_usage_writer_with_drop_hook, UsageWriterConfig};
 use lumen_server::{
     auth::{now_unix, AuthRuntime},
     build_app,
-    config::{ensure_boot_only, Config, ConfigSourceKind},
+    config::{Config, ConfigSourceKind},
     config_source::{ConfigContext, ConfigSource, DbSource},
     health::{spawn_health_checks, ProviderHealth},
     lifecycle, log_startup,
@@ -630,7 +630,7 @@ fn build_token_counter(config: &Config) -> Arc<TokenCounter> {
 /// (boot + dynamic) config, and the context just wraps the same path the
 /// process has always read and rewritten. DB mode reads ONLY the boot layer
 /// from `config_path` (a dynamic key there is a boot error -
-/// [`ensure_boot_only`]), requires `auth.enabled = true`, opens the auth
+/// `ensure_boot_only`), requires `auth.enabled = true`, opens the auth
 /// database early, and loads the stored dynamic document through
 /// [`ConfigContext::load_config`], which refuses one carrying a boot-layer
 /// key and merges it over the boot layer. An empty stored document (a
@@ -643,24 +643,16 @@ async fn boot_config_context(
     // Reading and parsing the boot file is synchronous file I/O, and this
     // runs inside the runtime: do it on the blocking pool.
     let path = config_path.to_path_buf();
-    let boot = tokio::task::spawn_blocking(move || -> anyhow::Result<Config> {
-        let boot = Config::load(&path)?;
-        if boot.config_source == ConfigSourceKind::Db {
-            let text = std::fs::read_to_string(&path)?;
-            ensure_boot_only(&text, &path.display().to_string())?;
-        }
-        Ok(boot)
-    })
-    .await
-    .context("boot config load task failed")??;
+    // `Config::load_boot` is the preflight `--check-config` runs too: every
+    // boot-file check that needs no database (db mode: boot-layer keys only,
+    // auth enabled) lives there, so the deploy gate and the boot agree.
+    let boot = tokio::task::spawn_blocking(move || Config::load_boot(&path))
+        .await
+        .context("boot config load task failed")??;
 
     match boot.config_source {
         ConfigSourceKind::File => Ok((boot, ConfigContext::file(config_path.to_path_buf()), None)),
         ConfigSourceKind::Db => {
-            anyhow::ensure!(
-                boot.auth.enabled,
-                "config_source = \"db\" requires [auth] enabled = true with a database"
-            );
             let store = KeyStore::connect(&boot.auth.db_url()).await?; // runs migrations
             let source = DbSource::new(store.clone());
             if source.load().await?.toml.is_empty() {
@@ -675,10 +667,14 @@ async fn boot_config_context(
             // the boot file, so the bind address, log format, auth switch
             // and DB path always come from the boot file alone - a stored
             // document can neither disable auth nor silently rebind.
-            let config = ctx
-                .load_config()
-                .await
-                .context("config_source = \"db\": the stored config document cannot be loaded")?;
+            // `log_summary`: this error ends up in the fatal log line, and a
+            // parse failure's full message quotes the stored document.
+            let config = ctx.load_config().await.map_err(|error| {
+                anyhow::anyhow!(
+                    "config_source = \"db\": the stored config document cannot be loaded: {}",
+                    error.log_summary()
+                )
+            })?;
             Ok((config, ctx, Some(store)))
         }
     }

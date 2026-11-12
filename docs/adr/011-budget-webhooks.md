@@ -114,6 +114,12 @@ timeout_ms = 5000
 max_attempts = 5
 ```
 
+The `LUMEN_`-prefixed name above is valid in a config *file* only. In
+`config_source = "db"` mode (ADR 012) the `[webhooks]` block lives in the
+stored document, which the boot-file load cannot see, so a `LUMEN_`-prefixed
+`signing_key_env` is refused there (`LM-1001`), like on `PUT /admin/webhooks`:
+use a name outside the prefix (`BILLING_WEBHOOK_SECRET`) or the sealed secret.
+
 No `[webhooks]` block means no sender task, no outbound calls, no behavior
 change. The block participates in hot reload like every other section
 (ADR 008): an invalid block rejects the reload, a changed URL or event set

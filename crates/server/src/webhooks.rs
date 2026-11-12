@@ -597,6 +597,51 @@ impl WebhookController {
         Ok(metrics)
     }
 
+    /// Run every fallible step of [`apply`](Self::apply) without building,
+    /// swapping or logging anything: validation, signing-secret resolution
+    /// and the metrics registration.
+    ///
+    /// The admin writes call this BEFORE they persist, so a document the
+    /// gateway could not apply never replaces a stored one that works.
+    ///
+    /// # Errors
+    /// The same messages [`apply`](Self::apply) would return.
+    pub fn preflight(&self, settings: &WebhookSettings) -> Result<(), String> {
+        settings.validate(SettingsOrigin::ConfigFile)?;
+        self.check_signing_key(settings)?;
+        let _guard = self
+            .apply_lock
+            .lock()
+            .map_err(|_| "the webhook apply lock is poisoned".to_owned())?;
+        self.metrics_handle().map(|_metrics| ())
+    }
+
+    /// Whether the signing secret `settings` asks for can be resolved right
+    /// now (environment first, then the sealed secret). A dry run of the
+    /// resolution [`apply`](Self::apply) performs: nothing is logged, nothing
+    /// is swapped.
+    ///
+    /// # Errors
+    /// `signing_key_env` names a variable that is unset or empty and no secret
+    /// is stored. The message names the variable, never a value.
+    pub fn check_signing_key(&self, settings: &WebhookSettings) -> Result<(), String> {
+        resolve_signing_key(settings, self.stored_secret.load_full(), false).map(|_key| ())
+    }
+
+    /// Whether the live settings could still resolve a signing secret (or
+    /// are deliberately unsigned) once the stored secret is gone. Checked
+    /// before `DELETE /admin/webhooks/signing-key` deletes anything.
+    ///
+    /// # Errors
+    /// The live settings name an environment variable this process cannot
+    /// see, so the stored secret is the only thing signing deliveries.
+    pub fn check_signing_key_without_stored_secret(&self) -> Result<(), String> {
+        match self.live_settings() {
+            Some(settings) => resolve_signing_key(&settings, None, false).map(|_key| ()),
+            None => Ok(()),
+        }
+    }
+
     /// Resolve the signing secret: the named environment variable first, then
     /// the sealed-at-rest secret (ADR 011 amendment §4).
     ///
@@ -608,36 +653,51 @@ impl WebhookController {
         &self,
         settings: &WebhookSettings,
     ) -> Result<Option<Arc<SigningKey>>, String> {
-        // Only variable NAMES appear in any message or log line below.
-        if let Some(var) = &settings.signing_key_env {
-            match std::env::var(var) {
-                Ok(value) if !value.is_empty() => {
-                    return Ok(Some(Arc::new(SigningKey::new(value.into_bytes()))));
-                }
-                _ => {
-                    if let Some(stored) = self.stored_secret.load_full() {
+        resolve_signing_key(settings, self.stored_secret.load_full(), true)
+    }
+}
+
+/// The resolution behind [`WebhookController::apply`] and its dry runs, over
+/// an explicit stored secret. `log` is off for a dry run, so a check that
+/// precedes an apply does not print every warning twice.
+fn resolve_signing_key(
+    settings: &WebhookSettings,
+    stored: Option<Arc<SigningKey>>,
+    log: bool,
+) -> Result<Option<Arc<SigningKey>>, String> {
+    // Only variable NAMES appear in any message or log line below.
+    if let Some(var) = &settings.signing_key_env {
+        return match std::env::var(var) {
+            Ok(value) if !value.is_empty() => {
+                Ok(Some(Arc::new(SigningKey::new(value.into_bytes()))))
+            }
+            _ => match stored {
+                Some(stored) => {
+                    if log {
                         tracing::warn!(
                             "webhooks.signing_key_env names '{var}', which is unset or empty; \
                              using the secret stored through PUT /admin/webhooks/signing-key"
                         );
-                        return Ok(Some(stored));
                     }
-                    return Err(format!(
-                        "webhooks.signing_key_env names '{var}', which is unset or empty in the \
-                         environment, and no signing secret is stored"
-                    ));
+                    Ok(Some(stored))
                 }
-            }
-        }
-        if let Some(stored) = self.stored_secret.load_full() {
-            return Ok(Some(stored));
-        }
+                None => Err(format!(
+                    "webhooks.signing_key_env names '{var}', which is unset or empty in the \
+                     environment, and no signing secret is stored"
+                )),
+            },
+        };
+    }
+    if stored.is_some() {
+        return Ok(stored);
+    }
+    if log {
         tracing::warn!(
             "webhooks are enabled with no signing secret: deliveries carry no x-lumen-signature \
              header and the receiver cannot verify authenticity"
         );
-        Ok(None)
     }
+    Ok(None)
 }
 
 /// Bridges the queue's drop accounting to Prometheus, so `lumen_auth` never

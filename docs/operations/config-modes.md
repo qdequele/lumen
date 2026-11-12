@@ -232,6 +232,14 @@ Secrets never enter the document in either mode: `api_key_env` and
 `config_versions` row is exactly as sensitive as the config file is
 today - no more, no less.
 
+One naming rule differs in db mode: `webhooks.signing_key_env` must not
+start with `LUMEN_` (for example use `BILLING_WEBHOOK_SECRET`, not
+`LUMEN_WEBHOOK_SECRET`). The boot file is parsed before the database is
+read, so the loader cannot keep a variable named only in the stored
+document out of its `LUMEN_*` overlay, and the process would refuse to
+start once that variable is exported. A config write naming such a
+variable is refused with `LM-1001`.
+
 ## Migrating between modes
 
 Switching modes is an operational procedure, not an API call: it always

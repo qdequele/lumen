@@ -914,10 +914,17 @@ pub async fn put_webhooks(
         .check_receiver_url(&settings.url)
         .await
         .map_err(GatewayError::InvalidRequest)?;
+    // Everything `apply` can refuse (an unresolvable signing secret above
+    // all) is checked before the write: a rejected document must not replace
+    // a stored row that works with one no reload or restart can apply.
+    controller
+        .preflight(&settings)
+        .map_err(GatewayError::InvalidRequest)?;
 
     // Persist, refresh the cache, then apply. Applying first would leave the
     // database disagreeing with a running pipeline if the write then failed;
-    // this order means a failed apply leaves the stored row ahead of the live
+    // this order means a failed apply (only possible now if the environment
+    // changed since the preflight) leaves the stored row ahead of the live
     // one, which `GET /admin/webhooks` makes visible and the next reload
     // reconciles.
     auth.store
@@ -1018,6 +1025,11 @@ pub async fn delete_webhook_signing_key(
 ) -> Result<StatusCode, ApiError> {
     let auth = runtime(&state)?;
     let controller = webhooks(&state)?;
+    // Refuse before deleting: a 400 that had already removed the secret would
+    // leave the live pipeline signing with a key no restart can find again.
+    controller
+        .check_signing_key_without_stored_secret()
+        .map_err(GatewayError::InvalidRequest)?;
     auth.store
         .delete_webhook_secret()
         .await
@@ -1026,9 +1038,8 @@ pub async fn delete_webhook_signing_key(
         .refresh_from_store(&auth.store, auth.master.as_ref())
         .await;
     if let Some(settings) = controller.live_settings() {
-        // The live pipeline keeps its old key on failure (`apply` swaps
-        // nothing when it errors), so delivery stays signed until the operator
-        // supplies a working source - the refusal is advisory, not a rollback.
+        // Only reachable with an error if the environment changed since the
+        // check above; `apply` swaps nothing when it errors.
         controller
             .apply(&settings, &auth.keys)
             .map_err(GatewayError::InvalidRequest)?;
@@ -1037,14 +1048,21 @@ pub async fn delete_webhook_signing_key(
 }
 
 /// `PUT /admin/provider-keys/{name}` body.
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 pub struct ProviderKeyBody {
     /// The provider API key to seal. Never logged; encrypted at rest.
     pub key: String,
 }
 
-// The body deliberately has no Debug-derived secret exposure: ProviderKeyBody
-// derives Debug for extractor plumbing but is never logged by the handler.
+// STRICT rule 5: the key must be unrepresentable through `Debug`, so a stray
+// `{:?}` on the extracted body cannot leak it.
+impl std::fmt::Debug for ProviderKeyBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProviderKeyBody")
+            .field("key", &"REDACTED")
+            .finish()
+    }
+}
 
 /// Store a provider key encrypted at rest and apply it without a restart: the
 /// handler pings the hot-reload trigger, and the reloader re-reads the key from
@@ -1685,7 +1703,7 @@ fn require_if_match(headers: &axum::http::HeaderMap) -> Result<String, ApiError>
 /// 4. Validate the candidate
 ///    ([`ConfigContext::validate_document`](crate::config_source::ConfigContext::validate_document):
 ///    parse, semantic validation, a throwaway registry build) - `LM-1001`
-///    (400) on failure, logged in full at `warn` and scrubbed of any
+///    (400) on failure, logged at `warn` without document content and scrubbed of any
 ///    filesystem path before it reaches the client
 ///    ([`describe_validation_rejection`]).
 /// 5. Persist through `ctx.source`. Its own compare-and-swap is a second,
@@ -1733,7 +1751,14 @@ where
         // for the same reason every other rejection below is (see
         // `describe_validation_rejection`'s doc comment): `ApiError`'s
         // `IntoResponse` only logs at `debug` for a non-5xx response.
-        tracing::warn!(%error, "config apply rejected: candidate document failed to parse");
+        //
+        // Logged as its content-free summary: the full message quotes the
+        // document (which holds operator prompt text) and goes to the client
+        // that sent it, never to a log.
+        tracing::warn!(
+            error = %error.log_summary(),
+            "config apply rejected: candidate document failed to parse"
+        );
         GatewayError::InvalidRequest(error.to_string())
     })?;
     if !diff.is_empty() {
@@ -1762,7 +1787,7 @@ where
         // ever validated or persisted.
         ensure_dynamic_only(&candidate, "candidate").map_err(|error| {
             tracing::warn!(
-                %error,
+                error = %error.log_summary(),
                 "config apply rejected: candidate document carried a boot-layer key in \
                  config_source = \"db\" mode"
             );
@@ -1774,6 +1799,7 @@ where
         .await
         .map_err(|error| describe_validation_rejection(&error))?;
     check_document_webhook_receiver(state, &current.toml, &candidate).await?;
+    check_document_webhook_signing_key(state, &current.toml, &candidate)?;
 
     let new_hash = match ctx.source.persist(&candidate, &current.hash).await {
         Ok(hash) => hash,
@@ -1850,6 +1876,46 @@ async fn check_document_webhook_receiver(
         .map_err(|message| GatewayError::InvalidRequest(message).into())
 }
 
+/// Refuse a `[webhooks]` block whose `signing_key_env` this process cannot
+/// resolve (variable unset or empty, no sealed secret to fall back on).
+///
+/// `Config::validate` only checks the shape of the name. The hot reload
+/// merely warns about an unresolvable one and keeps the previous pipeline,
+/// but boot treats the same block as fatal: accepting it here would turn a
+/// 204 now into a failed restart later (and in `config_source = "db"` mode a
+/// binary rollback would not help, the document lives in the database).
+///
+/// Like the receiver check, only a `signing_key_env` this write introduces
+/// or changes is checked, so an unrelated edit to a document the operator
+/// wrote by hand is never refused over it.
+fn check_document_webhook_signing_key(
+    state: &AppState,
+    current: &str,
+    candidate: &str,
+) -> Result<(), ApiError> {
+    let Some(controller) = state.webhooks.as_ref() else {
+        // No auth, so no webhooks: `Config::validate` refuses the block.
+        return Ok(());
+    };
+    let Some(new) = config_from_document(candidate)?.webhooks else {
+        return Ok(());
+    };
+    if new.signing_key_env.is_none() {
+        return Ok(());
+    }
+    let old_env = toml::from_str::<Config>(current)
+        .ok()
+        .and_then(|c| c.webhooks)
+        .map(|w| w.signing_key_env);
+    if old_env.as_ref() == Some(&new.signing_key_env) {
+        return Ok(());
+    }
+    // The message names the variable, never a value.
+    controller
+        .check_signing_key(&new)
+        .map_err(|message| GatewayError::InvalidRequest(message).into())
+}
+
 /// `LM-1004` (412), the same message on every path that produces it (the
 /// fast `If-Match` check in [`apply_document`] and `ConfigSource::persist`'s
 /// own compare-and-swap alike).
@@ -1884,7 +1950,8 @@ pub(crate) fn source_internal_error(error: &ConfigSourceError) -> ApiError {
 /// `RegistryError`'s variants never embed a path, so those pass through
 /// unchanged.
 ///
-/// The full detail - path included - still needs to reach a human somewhere,
+/// The detail (path, error kind, key path, position; never document content)
+/// still needs to reach a human somewhere,
 /// since a rejected apply is exactly the kind of thing an operator wants a
 /// record of. It does NOT reach it via `ApiError`'s `IntoResponse`
 /// (`crate::error`): that only logs `code` and `status` for a non-5xx
@@ -1892,7 +1959,14 @@ pub(crate) fn source_internal_error(error: &ConfigSourceError) -> ApiError {
 /// this function logs it directly, at `warn`, before scrubbing the message
 /// down to what the client is allowed to see.
 fn describe_validation_rejection(error: &ConfigLoadError) -> ApiError {
-    tracing::warn!(error = %error, "config apply rejected: candidate document failed validation");
+    // `log_summary`, not `Display`: a parse failure's full message quotes
+    // the document (the offending line or value), and a document holds
+    // operator prompt text that is never logged. The path, error kind, key
+    // path and line/column all survive.
+    tracing::warn!(
+        error = %error.log_summary(),
+        "config apply rejected: candidate document failed validation"
+    );
     match error {
         ConfigLoadError::Config(config_error) => match config_error {
             ConfigError::Parse { message, .. } | ConfigError::Validation { message, .. } => {
@@ -1973,8 +2047,9 @@ fn describe_validation_rejection(error: &ConfigLoadError) -> ApiError {
 /// any `LM-1001`.
 pub(crate) fn config_from_document(text: &str) -> Result<Config, ApiError> {
     toml::from_str::<Config>(text).map_err(|error| {
+        // Position only: toml's `Display` quotes the offending source line.
         tracing::error!(
-            %error,
+            position = %crate::config::toml_position(text, error.span()),
             "stored config document failed to parse while serving a granular admin read; \
              this should be unreachable, since every persisted document is validated first"
         );
@@ -1992,8 +2067,14 @@ pub(crate) fn config_from_document(text: &str) -> Result<Config, ApiError> {
 /// itself failed against a document that was already validated when it was
 /// persisted - an internal inconsistency, not a client mistake.
 fn edit_internal_error(error: &config_edit::EditError) -> ApiError {
-    tracing::error!(%error, "config document edit failed against an already-validated document");
-    GatewayError::Internal(error.to_string()).into()
+    // The summary, for the log line and for the internal error alike (a 5xx
+    // is logged with its message): `toml_edit` quotes the source line.
+    let summary = error.log_summary();
+    tracing::error!(
+        error = %summary,
+        "config document edit failed against an already-validated document"
+    );
+    GatewayError::Internal(summary).into()
 }
 
 /// One entry in [`ProvidersList`]: just enough to pick a provider without
@@ -2641,6 +2722,19 @@ mod tests {
         assert!(
             !dbg.contains("fg-super-secret-plaintext"),
             "Debug output leaked the plaintext: {dbg}"
+        );
+        assert!(dbg.contains("REDACTED"), "Debug output was: {dbg}");
+    }
+
+    #[test]
+    fn provider_key_body_debug_never_shows_the_key() {
+        let body = ProviderKeyBody {
+            key: "sk-provider-plaintext-do-not-print".to_owned(),
+        };
+        let dbg = format!("{body:?}");
+        assert!(
+            !dbg.contains("sk-provider-plaintext-do-not-print"),
+            "Debug output leaked the provider key: {dbg}"
         );
         assert!(dbg.contains("REDACTED"), "Debug output was: {dbg}");
     }
