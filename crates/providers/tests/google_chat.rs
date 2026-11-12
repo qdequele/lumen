@@ -3,7 +3,8 @@
 //! (issue #91): `frequency_penalty` / `presence_penalty` must reach the actual
 //! upstream body instead of being silently dropped.
 
-use lumen_core::{ChatMessage, ChatProvider, ChatRequest, MessageContent};
+use futures::StreamExt;
+use lumen_core::{ChatMessage, ChatProvider, ChatRequest, MessageContent, ProviderError};
 use lumen_providers::GoogleProvider;
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
@@ -76,4 +77,52 @@ async fn frequency_and_presence_penalty_reach_the_gemini_wire() {
         serde_json::from_slice(&mock.received_requests().await.unwrap()[0].body).unwrap();
     assert_eq!(sent["generationConfig"]["frequencyPenalty"], 0.5);
     assert_eq!(sent["generationConfig"]["presencePenalty"], -0.25);
+}
+
+/// A prompt-level safety block (HTTP 200, `promptFeedback.blockReason`, no
+/// candidates) surfaces as a content-filter refusal naming the provider, in
+/// both the non-streaming and streaming paths.
+#[tokio::test]
+async fn prompt_level_block_is_content_filtered_on_both_paths() {
+    let mock = MockServer::start().await;
+    let blocked = json!({
+        "promptFeedback": { "blockReason": "SAFETY" },
+        "usageMetadata": { "promptTokenCount": 5, "totalTokenCount": 5 }
+    });
+    Mock::given(method("POST"))
+        .and(path(format!("/v1beta/models/{MODEL}:generateContent")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(blocked.clone()))
+        .mount(&mock)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/v1beta/models/{MODEL}:streamGenerateContent"
+        )))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(format!("data: {blocked}\n\n")),
+        )
+        .mount(&mock)
+        .await;
+
+    let p = provider(mock.uri());
+    let err = p
+        .chat(request("blocked"), CancellationToken::new())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, ProviderError::ContentFiltered { provider, .. } if provider == "google-test"),
+        "{err:?}"
+    );
+
+    let mut stream = p
+        .chat_stream(request("blocked"), CancellationToken::new())
+        .await
+        .unwrap();
+    let first = stream.next().await.expect("one item");
+    assert!(
+        matches!(&first, Err(ProviderError::ContentFiltered { provider, .. }) if provider == "google-test"),
+        "{first:?}"
+    );
 }

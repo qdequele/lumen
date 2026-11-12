@@ -173,10 +173,37 @@ async fn fetch_all(
     .await
 }
 
-/// Whether the URL string starts with one of the allowed prefixes (empty =
+/// Whether the URL falls under one of the allowed prefixes (empty =
 /// unrestricted).
-fn prefix_allowed(url: &str, allowed: &[String]) -> bool {
-    allowed.is_empty() || allowed.iter().any(|p| url.starts_with(p))
+///
+/// The comparison is made on the PARSED, normalised URL (the one the request
+/// is actually sent to), never on the client's raw string: dot segments
+/// (`/tenant-a/../tenant-b/`, also percent-encoded) are already resolved, the
+/// host is lower-cased and default ports dropped. Each prefix is normalised
+/// the same way; one that does not parse as a URL matches nothing (fail
+/// closed). A prefix without a query or fragment must end on a path boundary:
+/// `https://h/tenant-a` covers `https://h/tenant-a/x.png` but neither
+/// `https://h/tenant-ab/x.png` nor `https://h.evil.example/`.
+fn prefix_allowed(url: &reqwest::Url, allowed: &[String]) -> bool {
+    if allowed.is_empty() {
+        return true;
+    }
+    let target = url.as_str();
+    allowed.iter().any(|raw| {
+        let Ok(prefix) = reqwest::Url::parse(raw) else {
+            tracing::debug!("image fetch: an allowed_url_prefixes entry is not a valid URL");
+            return false;
+        };
+        let p = prefix.as_str();
+        let Some(rest) = target.strip_prefix(p) else {
+            return false;
+        };
+        if prefix.query().is_some() || prefix.fragment().is_some() {
+            // The operator pinned part of the query: a plain prefix match.
+            return true;
+        }
+        p.ends_with('/') || rest.is_empty() || rest.starts_with(['/', '?', '#'])
+    })
 }
 
 /// Fetch a remote URL under all guards, returning a `data:<mime>;base64,<...>`
@@ -203,7 +230,7 @@ async fn fetch_to_data_uri(
         // Guard 2 + 3: host and prefix allowlists.
         let host = parsed.host_str().ok_or(GatewayError::ImageUrlRejected)?;
         if !host_allowed(host, &policy.allowed_hosts)
-            || !prefix_allowed(&current, &policy.allowed_url_prefixes)
+            || !prefix_allowed(&parsed, &policy.allowed_url_prefixes)
         {
             // Server-side diagnostic only; the host is not returned to the client.
             tracing::debug!(host, "image fetch rejected: host/prefix not allowed");
@@ -216,7 +243,11 @@ async fn fetch_to_data_uri(
             .ok_or(GatewayError::ImageUrlRejected)?;
         let addr = resolve_vetted_addr(host, port, policy, cancel).await?;
 
+        // `no_proxy`: an environment proxy (`HTTPS_PROXY`...) would resolve
+        // the target host itself, defeating both the vetted-address pin below
+        // and the private-IP block. Image fetches always go direct.
         let client = reqwest::Client::builder()
+            .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(policy.timeout)
             .resolve(host, addr)
@@ -226,7 +257,8 @@ async fn fetch_to_data_uri(
         let resp = tokio::select! {
             biased;
             () = cancel.cancelled() => return Err(GatewayError::ImageFetchFailed),
-            r = client.get(&current).send() => r.map_err(|_| GatewayError::ImageFetchFailed)?,
+            // Send the parsed URL that the guards vetted, not the raw string.
+            r = client.get(parsed.clone()).send() => r.map_err(|_| GatewayError::ImageFetchFailed)?,
         };
 
         let status = resp.status();
@@ -236,7 +268,8 @@ async fn fetch_to_data_uri(
                 .get(reqwest::header::LOCATION)
                 .and_then(|v| v.to_str().ok())
                 .ok_or(GatewayError::ImageFetchFailed)?;
-            // Resolve relative redirects against the current URL.
+            // Resolve relative redirects against the current URL. The next
+            // hop is re-parsed and re-validated by every guard above.
             current = parsed
                 .join(location)
                 .map_err(|_| GatewayError::ImageUrlRejected)?
@@ -478,5 +511,71 @@ mod tests {
         assert!(!host_allowed("notmycompany.com", &allow));
         // Case-insensitive.
         assert!(host_allowed("CDN.Example.COM", &allow));
+    }
+    fn url(s: &str) -> reqwest::Url {
+        reqwest::Url::parse(s).unwrap()
+    }
+
+    #[test]
+    fn empty_prefix_allowlist_permits_any() {
+        assert!(prefix_allowed(&url("https://h.example/x.png"), &[]));
+    }
+
+    #[test]
+    fn prefix_is_matched_on_the_normalised_url() {
+        let allow = vec!["https://h.example/tenant-a/".to_owned()];
+        assert!(prefix_allowed(
+            &url("https://h.example/tenant-a/x.png"),
+            &allow
+        ));
+        // Dot segments (plain or percent-encoded) are resolved before matching.
+        assert!(!prefix_allowed(
+            &url("https://h.example/tenant-a/../tenant-b/x.png"),
+            &allow
+        ));
+        assert!(!prefix_allowed(
+            &url("https://h.example/tenant-a/%2e%2e/tenant-b/x.png"),
+            &allow
+        ));
+        // Host case and a default port do not defeat a legitimate match.
+        assert!(prefix_allowed(
+            &url("https://H.Example:443/tenant-a/x.png"),
+            &allow
+        ));
+    }
+
+    #[test]
+    fn prefix_match_ends_on_a_path_boundary() {
+        let allow = vec!["https://h.example/tenant-a".to_owned()];
+        assert!(prefix_allowed(&url("https://h.example/tenant-a"), &allow));
+        assert!(prefix_allowed(
+            &url("https://h.example/tenant-a/x.png"),
+            &allow
+        ));
+        assert!(prefix_allowed(
+            &url("https://h.example/tenant-a?x=1"),
+            &allow
+        ));
+        assert!(!prefix_allowed(
+            &url("https://h.example/tenant-ab/x.png"),
+            &allow
+        ));
+        // A host-only prefix cannot be extended into another host.
+        let host_only = vec!["https://h.example".to_owned()];
+        assert!(prefix_allowed(&url("https://h.example/x.png"), &host_only));
+        assert!(!prefix_allowed(
+            &url("https://h.example.evil.test/x.png"),
+            &host_only
+        ));
+        assert!(!prefix_allowed(
+            &url("https://h.example@evil.test/x.png"),
+            &host_only
+        ));
+    }
+
+    #[test]
+    fn unparseable_prefix_matches_nothing() {
+        let allow = vec!["not a url".to_owned()];
+        assert!(!prefix_allowed(&url("https://h.example/x.png"), &allow));
     }
 }

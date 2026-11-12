@@ -18,9 +18,11 @@
 //! * `message_delta` → the final chunk with the mapped `finish_reason` and
 //!   full usage (`input_tokens` from `message_start` + `output_tokens` here);
 //! * `message_stop` → the terminal marker (`data: [DONE]` on the byte path);
-//! * `ping` and unknown events are ignored; `error` events surface as a
-//!   [`ProviderError`] (only the upstream error *type* is propagated - never
-//!   message bodies, which could echo prompt content).
+//! * `ping` and unknown events are ignored; `error` events surface as the
+//!   [`ProviderError`] class the same error would have had as an HTTP status
+//!   (`overloaded_error` -> retryable upstream 529, `rate_limit_error` ->
+//!   rate limited, ...), naming the provider. Only the upstream error *type*
+//!   is used - never message bodies, which could echo prompt content.
 
 use std::collections::HashMap;
 
@@ -28,7 +30,7 @@ use lumen_core::{ChatChunk, ChatChunkChoice, ChatDelta, ProviderError, Usage};
 use serde::Deserialize;
 use serde_json::json;
 
-use super::map_finish_reason;
+use super::{anthropic_usage, map_finish_reason};
 use crate::chat::{SseTranslator, StreamItem};
 use crate::sse::SseEvent;
 
@@ -38,6 +40,8 @@ pub(super) struct AnthropicTranslator {
     id: String,
     /// Model reported by `message_start`, falling back to the requested one.
     model: String,
+    /// The provider instance name, for error attribution.
+    provider_name: String,
     /// `input_tokens` captured at `message_start`, reported in the final usage.
     input_tokens: u32,
     /// Cache read/write breakdown captured at `message_start` (issue #99).
@@ -49,15 +53,17 @@ pub(super) struct AnthropicTranslator {
     tool_indices: HashMap<u64, u64>,
     /// Next OpenAI tool-call index to allocate.
     next_tool_index: u64,
-    /// Set once `message_stop` was seen; later events are ignored.
+    /// Set once `message_stop` or an `error` event was seen; later events are
+    /// ignored.
     finished: bool,
 }
 
 impl AnthropicTranslator {
-    pub(super) fn new(requested_model: &str) -> Self {
+    pub(super) fn new(requested_model: &str, provider_name: &str) -> Self {
         Self {
             id: String::new(),
             model: requested_model.to_owned(),
+            provider_name: provider_name.to_owned(),
             input_tokens: 0,
             cache_read_input_tokens: None,
             cache_creation_input_tokens: None,
@@ -188,17 +194,13 @@ impl SseTranslator for AnthropicTranslator {
                 BlockDelta::Other => Ok(Vec::new()),
             },
             AnthropicEvent::MessageDelta { delta, usage } => {
-                let completion = usage.output_tokens;
-                let usage = Usage {
-                    prompt_tokens: self.input_tokens,
-                    completion_tokens: completion,
-                    total_tokens: self.input_tokens.saturating_add(completion),
-                    estimated: None,
-                    // Cache breakdown captured at message_start rides the final
-                    // usage chunk (issue #99); Anthropic has no reasoning split.
-                    prompt_tokens_details: self.prompt_details(),
-                    completion_tokens_details: None,
-                };
+                // Cache breakdown captured at message_start rides the final
+                // usage chunk (issue #99) and counts toward `prompt_tokens`.
+                let usage = anthropic_usage(
+                    self.input_tokens,
+                    usage.output_tokens,
+                    self.prompt_details(),
+                );
                 Ok(vec![StreamItem::Chunk(self.chunk(
                     ChatDelta::default(),
                     map_finish_reason(delta.stop_reason.as_deref()),
@@ -209,13 +211,42 @@ impl SseTranslator for AnthropicTranslator {
                 self.finished = true;
                 Ok(vec![StreamItem::Done])
             }
-            AnthropicEvent::Error { error } => Err(ProviderError::Translation(format!(
-                "anthropic stream error event: {}",
-                error.error_type
-            ))),
+            AnthropicEvent::Error { error } => {
+                // The stream is over: latch so trailing events are ignored.
+                self.finished = true;
+                Err(stream_error(&self.provider_name, &error.error_type))
+            }
             AnthropicEvent::Ignored => Ok(Vec::new()),
         }
     }
+}
+
+/// Classify an in-stream `error` event by its `error.type`, as the HTTP
+/// status the same error carries outside a stream (Anthropic's documented
+/// error table: an in-stream `overloaded_error` "would normally correspond to
+/// an HTTP 529"). An unknown type is a generic retryable upstream failure.
+/// Only the type is logged, never the message.
+fn stream_error(provider: &str, error_type: &str) -> ProviderError {
+    let status = match error_type {
+        "invalid_request_error" => 400,
+        "authentication_error" => 401,
+        "billing_error" => 402,
+        "permission_error" => 403,
+        "not_found_error" => 404,
+        "request_too_large" => 413,
+        "rate_limit_error" => 429,
+        "timeout_error" => 504,
+        "overloaded_error" => 529,
+        // `api_error` and any type added later.
+        _ => 500,
+    };
+    tracing::warn!(
+        provider,
+        error_type,
+        status,
+        "anthropic stream carried an error event"
+    );
+    crate::mapping::classify_status(provider, status, None)
 }
 
 // ---- Wire types (streaming events) ----------------------------------------
@@ -340,7 +371,7 @@ mod tests {
     /// final usage chunk as an OpenAI-compatible `prompt_tokens_details`.
     #[test]
     fn streamed_final_usage_carries_cache_breakdown() {
-        let mut t = AnthropicTranslator::new("claude-req");
+        let mut t = AnthropicTranslator::new("claude-req", "anthropic-test");
         let items = feed(
             &mut t,
             &[
@@ -372,7 +403,11 @@ mod tests {
             panic!("expected finish chunk")
         };
         let usage = finish.usage.expect("usage on final chunk");
-        assert_eq!(usage.prompt_tokens, 10);
+        // `input_tokens` (10) excludes cached tokens; OpenAI's `prompt_tokens`
+        // includes them: 10 + 90 + 40.
+        assert_eq!(usage.prompt_tokens, 140);
+        assert_eq!(usage.completion_tokens, 7);
+        assert_eq!(usage.total_tokens, 147);
         assert_eq!(usage.cached_tokens(), Some(90));
         assert_eq!(usage.cache_write_tokens(), Some(40));
     }
@@ -380,7 +415,7 @@ mod tests {
     /// Without cache counts, the streamed usage carries no breakdown.
     #[test]
     fn streamed_usage_without_cache_has_no_breakdown() {
-        let mut t = AnthropicTranslator::new("m");
+        let mut t = AnthropicTranslator::new("m", "anthropic-test");
         let items = feed(
             &mut t,
             &[
@@ -413,7 +448,7 @@ mod tests {
     /// hardcoded `0`.
     #[test]
     fn chunk_created_is_a_real_unix_timestamp_not_zero() {
-        let mut t = AnthropicTranslator::new("claude-req");
+        let mut t = AnthropicTranslator::new("claude-req", "anthropic-test");
         let items = feed(
             &mut t,
             &[event(
@@ -441,7 +476,7 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     #[test]
     fn full_stream_with_tool_use_translates_to_openai_chunks() {
-        let mut t = AnthropicTranslator::new("claude-req");
+        let mut t = AnthropicTranslator::new("claude-req", "anthropic-test");
         let items = feed(
             &mut t,
             &[
@@ -565,7 +600,7 @@ mod tests {
     #[test]
     fn tool_call_indices_are_allocated_in_order_of_appearance() {
         // Anthropic block indices 3 and 7 → OpenAI tool indices 0 and 1.
-        let mut t = AnthropicTranslator::new("m");
+        let mut t = AnthropicTranslator::new("m", "anthropic-test");
         let items = feed(
             &mut t,
             &[
@@ -603,7 +638,7 @@ mod tests {
 
     #[test]
     fn ping_and_unknown_events_are_ignored() {
-        let mut t = AnthropicTranslator::new("m");
+        let mut t = AnthropicTranslator::new("m", "anthropic-test");
         let items = feed(
             &mut t,
             &[
@@ -617,26 +652,101 @@ mod tests {
         assert!(items.is_empty(), "{items:?}");
     }
 
+    fn error_event(error_type: &str) -> SseEvent {
+        event(
+            "error",
+            serde_json::json!({
+                "type": "error",
+                "error": { "type": error_type, "message": "SECRET DETAIL" }
+            }),
+        )
+    }
+
     #[test]
-    fn error_event_surfaces_type_but_never_the_message() {
-        let mut t = AnthropicTranslator::new("m");
+    fn overloaded_error_event_is_a_retryable_upstream_error_naming_the_provider() {
+        let mut t = AnthropicTranslator::new("m", "anthropic-test");
         let err = t
+            .translate(&error_event("overloaded_error"))
+            .expect_err("error event fails the stream");
+        assert!(
+            matches!(
+                &err,
+                ProviderError::Upstream { provider, status: 529, retryable: true, .. }
+                    if provider == "anthropic-test"
+            ),
+            "{err:?}"
+        );
+        assert!(!err.to_string().contains("SECRET DETAIL"));
+    }
+
+    #[test]
+    fn rate_limit_error_event_is_rate_limited() {
+        let mut t = AnthropicTranslator::new("m", "anthropic-test");
+        let err = t
+            .translate(&error_event("rate_limit_error"))
+            .expect_err("fails");
+        assert!(
+            matches!(&err, ProviderError::RateLimited { provider, .. } if provider == "anthropic-test"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn client_and_unknown_error_events_keep_their_class() {
+        let mut t = AnthropicTranslator::new("m", "anthropic-test");
+        let err = t
+            .translate(&error_event("invalid_request_error"))
+            .expect_err("fails");
+        assert!(
+            matches!(
+                err,
+                ProviderError::Upstream {
+                    status: 400,
+                    retryable: false,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        let mut t = AnthropicTranslator::new("m", "anthropic-test");
+        let err = t
+            .translate(&error_event("some_future_error"))
+            .expect_err("fails");
+        assert!(
+            matches!(
+                err,
+                ProviderError::Upstream {
+                    status: 500,
+                    retryable: true,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn events_after_an_error_event_are_ignored() {
+        let mut t = AnthropicTranslator::new("m", "anthropic-test");
+        let _ = t
+            .translate(&error_event("overloaded_error"))
+            .expect_err("fails");
+        let late = t
             .translate(&event(
-                "error",
+                "content_block_delta",
                 serde_json::json!({
-                    "type": "error",
-                    "error": { "type": "overloaded_error", "message": "SECRET DETAIL" }
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": { "type": "text_delta", "text": "late" }
                 }),
             ))
-            .expect_err("error event fails the stream");
-        let text = err.to_string();
-        assert!(text.contains("overloaded_error"));
-        assert!(!text.contains("SECRET DETAIL"));
+            .expect("ignored after the error");
+        assert!(late.is_empty(), "{late:?}");
     }
 
     #[test]
     fn malformed_event_json_is_a_translation_error() {
-        let mut t = AnthropicTranslator::new("m");
+        let mut t = AnthropicTranslator::new("m", "anthropic-test");
         let err = t
             .translate(&SseEvent {
                 event: Some("message_start".to_owned()),
@@ -648,7 +758,7 @@ mod tests {
 
     #[test]
     fn events_after_message_stop_are_ignored() {
-        let mut t = AnthropicTranslator::new("m");
+        let mut t = AnthropicTranslator::new("m", "anthropic-test");
         let _ = t
             .translate(&event(
                 "message_stop",

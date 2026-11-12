@@ -13,7 +13,10 @@ use lumen_core::{ChatChunk, ChatChunkChoice, ChatDelta, ProviderError, Usage};
 use serde::Deserialize;
 use serde_json::json;
 
-use super::map_finish_reason;
+use super::{
+    map_finish_reason, new_tool_call_id_prefix, prompt_block_error, with_thought_signature,
+    GeminiPromptFeedback, GeminiUsage,
+};
 use crate::chat::{SseTranslator, StreamItem};
 use crate::sse::SseEvent;
 
@@ -21,24 +24,31 @@ use crate::sse::SseEvent;
 pub(super) struct GoogleTranslator {
     /// The client-requested model (Gemini events do not repeat it).
     model: String,
+    /// The provider instance name, for error attribution.
+    provider_name: String,
     /// Whether the initial `role: assistant` chunk was emitted yet.
     started: bool,
     /// Set once a `finishReason` was seen; later events are ignored.
     finished: bool,
     /// Next OpenAI tool-call index to allocate (Gemini has no block indices).
     next_tool_index: u64,
+    /// Prefix of the tool-call ids synthesized for this response, unique
+    /// across responses (see [`new_tool_call_id_prefix`]).
+    tool_call_id_prefix: String,
     /// Set once any `functionCall` part was forwarded; a trailing Gemini
     /// `STOP` then maps to OpenAI's `tool_calls` rather than `stop`.
     saw_tool_call: bool,
 }
 
 impl GoogleTranslator {
-    pub(super) fn new(requested_model: &str) -> Self {
+    pub(super) fn new(requested_model: &str, provider_name: &str) -> Self {
         Self {
             model: requested_model.to_owned(),
+            provider_name: provider_name.to_owned(),
             started: false,
             finished: false,
             next_tool_index: 0,
+            tool_call_id_prefix: new_tool_call_id_prefix(),
             saw_tool_call: false,
         }
     }
@@ -86,6 +96,19 @@ impl SseTranslator for GoogleTranslator {
         let parsed: GeminiStreamChunk = serde_json::from_str(&event.data)
             .map_err(|e| ProviderError::Translation(format!("gemini stream event: {e}")))?;
 
+        // A prompt-level block arrives as a candidate-less fragment carrying
+        // `promptFeedback.blockReason`; no `finishReason` ever follows. Surface
+        // the refusal (LM-2013) and latch, rather than ending without a
+        // terminator (which would read as LM-3010 stream interrupted).
+        if let Some(err) = prompt_block_error(
+            parsed.prompt_feedback.as_ref(),
+            !parsed.candidates.is_empty(),
+            &self.provider_name,
+        ) {
+            self.finished = true;
+            return Err(err);
+        }
+
         let mut items = Vec::new();
         if !self.started {
             self.started = true;
@@ -121,12 +144,15 @@ impl SseTranslator for GoogleTranslator {
                 } else {
                     call.args
                 };
-                tool_deltas.push(json!({
-                    "index": index,
-                    "id": format!("call_{index}"),
-                    "type": "function",
-                    "function": { "name": call.name, "arguments": args.to_string() },
-                }));
+                tool_deltas.push(with_thought_signature(
+                    json!({
+                        "index": index,
+                        "id": format!("{}_{index}", self.tool_call_id_prefix),
+                        "type": "function",
+                        "function": { "name": call.name, "arguments": args.to_string() },
+                    }),
+                    part.thought_signature,
+                ));
             } else {
                 text.push_str(&part.text);
             }
@@ -160,14 +186,7 @@ impl SseTranslator for GoogleTranslator {
 
         if finish.is_some() {
             // The final fragment: emit the finish/usage chunk, then terminate.
-            let usage = parsed.usage_metadata.map(|u| Usage {
-                prompt_tokens: u.prompt,
-                completion_tokens: u.candidates,
-                total_tokens: u.total,
-                estimated: None,
-                prompt_tokens_details: None,
-                completion_tokens_details: None,
-            });
+            let usage = parsed.usage_metadata.map(GeminiUsage::into_usage);
             items.push(StreamItem::Chunk(self.chunk(
                 ChatDelta::default(),
                 finish,
@@ -187,7 +206,9 @@ struct GeminiStreamChunk {
     #[serde(default)]
     candidates: Vec<GeminiStreamCandidate>,
     #[serde(rename = "usageMetadata", default)]
-    usage_metadata: Option<GeminiStreamUsage>,
+    usage_metadata: Option<GeminiUsage>,
+    #[serde(rename = "promptFeedback", default)]
+    prompt_feedback: Option<GeminiPromptFeedback>,
 }
 
 #[derive(Deserialize)]
@@ -210,6 +231,10 @@ struct GeminiStreamPart {
     text: String,
     #[serde(rename = "functionCall", default)]
     function_call: Option<GeminiStreamFunctionCall>,
+    /// Opaque signature to replay with the call (see
+    /// [`with_thought_signature`]).
+    #[serde(rename = "thoughtSignature", default)]
+    thought_signature: Option<String>,
 }
 
 /// A streamed tool call. Gemini sends the whole call (name and complete args)
@@ -220,16 +245,6 @@ struct GeminiStreamFunctionCall {
     name: String,
     #[serde(default)]
     args: serde_json::Value,
-}
-
-#[derive(Deserialize)]
-struct GeminiStreamUsage {
-    #[serde(rename = "promptTokenCount", default)]
-    prompt: u32,
-    #[serde(rename = "candidatesTokenCount", default)]
-    candidates: u32,
-    #[serde(rename = "totalTokenCount", default)]
-    total: u32,
 }
 
 #[cfg(test)]
@@ -247,7 +262,7 @@ mod tests {
 
     #[test]
     fn stream_fragments_translate_to_role_text_finish_and_done() {
-        let mut t = GoogleTranslator::new("gemini-2.0");
+        let mut t = GoogleTranslator::new("gemini-2.0", "google-test");
         let first = t
             .translate(&event(serde_json::json!({
                 "candidates": [
@@ -297,7 +312,7 @@ mod tests {
 
     #[test]
     fn stream_function_call_becomes_tool_calls_delta_and_tool_calls_finish() {
-        let mut t = GoogleTranslator::new("gemini-2.0");
+        let mut t = GoogleTranslator::new("gemini-2.0", "google-test");
         let items = t
             .translate(&event(serde_json::json!({
                 "candidates": [{
@@ -348,7 +363,7 @@ mod tests {
 
     #[test]
     fn max_tokens_finish_maps_to_length() {
-        let mut t = GoogleTranslator::new("g");
+        let mut t = GoogleTranslator::new("g", "google-test");
         let items = t
             .translate(&event(serde_json::json!({
                 "candidates": [{
@@ -365,8 +380,112 @@ mod tests {
     }
 
     #[test]
+    fn stream_usage_folds_thoughts_into_completion_tokens() {
+        let mut t = GoogleTranslator::new("g", "google-test");
+        let items = t
+            .translate(&event(serde_json::json!({
+                "candidates": [{ "content": { "parts": [{ "text": "x" }] }, "finishReason": "STOP" }],
+                "usageMetadata": {
+                    "promptTokenCount": 10,
+                    "candidatesTokenCount": 4,
+                    "thoughtsTokenCount": 30,
+                    "totalTokenCount": 44
+                }
+            })))
+            .expect("ok");
+        let usage = items
+            .iter()
+            .find_map(|i| match i {
+                StreamItem::Chunk(c) => c.usage,
+                StreamItem::Done => None,
+            })
+            .expect("usage");
+        assert_eq!(usage.completion_tokens, 34);
+        assert_eq!(usage.total_tokens, 44);
+        assert_eq!(usage.reasoning_tokens(), Some(30));
+    }
+
+    /// A prompt-level block is a content-filter refusal (and latches), not a
+    /// silently unterminated stream.
+    #[test]
+    fn prompt_level_block_is_content_filtered_and_latches() {
+        let mut t = GoogleTranslator::new("g", "google-test");
+        let err = t
+            .translate(&event(serde_json::json!({
+                "promptFeedback": { "blockReason": "PROHIBITED_CONTENT" },
+                "usageMetadata": { "promptTokenCount": 3, "totalTokenCount": 3 }
+            })))
+            .expect_err("blocked");
+        assert!(
+            matches!(&err, ProviderError::ContentFiltered { provider, status: 400 } if provider == "google-test"),
+            "{err:?}"
+        );
+        let late = t
+            .translate(&event(serde_json::json!({
+                "candidates": [{ "content": { "parts": [{ "text": "late" }] } }]
+            })))
+            .expect("ok");
+        assert!(late.is_empty(), "{late:?}");
+    }
+
+    /// Two streams never synthesize the same tool-call id, and two calls in
+    /// one stream differ by index.
+    #[test]
+    fn stream_tool_call_ids_are_unique_across_streams() {
+        let fragment = serde_json::json!({
+            "candidates": [{
+                "content": { "parts": [
+                    { "functionCall": { "name": "a", "args": {} } },
+                    { "functionCall": { "name": "b", "args": {} } }
+                ] },
+                "finishReason": "STOP"
+            }]
+        });
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            let mut t = GoogleTranslator::new("g", "google-test");
+            for item in t.translate(&event(fragment.clone())).expect("ok") {
+                if let StreamItem::Chunk(c) = item {
+                    if let Some(calls) = c.choices[0].delta.extra.get("tool_calls") {
+                        ids.push(calls[0]["id"].as_str().expect("id").to_owned());
+                    }
+                }
+            }
+        }
+        assert_eq!(ids.len(), 4);
+        let unique: std::collections::HashSet<&String> = ids.iter().collect();
+        assert_eq!(unique.len(), 4, "{ids:?}");
+    }
+
+    /// A streamed `functionCall` part's `thoughtSignature` rides the tool-call
+    /// delta, so the client can send it back with the call.
+    #[test]
+    fn stream_function_call_carries_its_thought_signature() {
+        let mut t = GoogleTranslator::new("g", "google-test");
+        let items = t
+            .translate(&event(serde_json::json!({
+                "candidates": [{
+                    "content": { "parts": [{
+                        "functionCall": { "name": "a", "args": {} },
+                        "thoughtSignature": "SIG_A"
+                    }] },
+                    "finishReason": "STOP"
+                }]
+            })))
+            .expect("ok");
+        let StreamItem::Chunk(tool) = &items[1] else {
+            panic!("expected chunk")
+        };
+        assert_eq!(
+            tool.choices[0].delta.extra["tool_calls"][0]["extra_content"]["google"]
+                ["thought_signature"],
+            "SIG_A"
+        );
+    }
+
+    #[test]
     fn fragments_after_finish_are_ignored() {
-        let mut t = GoogleTranslator::new("g");
+        let mut t = GoogleTranslator::new("g", "google-test");
         let _ = t
             .translate(&event(serde_json::json!({
                 "candidates": [{ "content": { "parts": [] }, "finishReason": "STOP" }]
@@ -382,7 +501,7 @@ mod tests {
 
     #[test]
     fn malformed_fragment_is_a_translation_error() {
-        let mut t = GoogleTranslator::new("g");
+        let mut t = GoogleTranslator::new("g", "google-test");
         let err = t
             .translate(&SseEvent {
                 event: None,
@@ -394,7 +513,7 @@ mod tests {
 
     #[test]
     fn candidate_less_keepalive_fragments_forward_nothing() {
-        let mut t = GoogleTranslator::new("g");
+        let mut t = GoogleTranslator::new("g", "google-test");
         let first = t.translate(&event(serde_json::json!({}))).expect("ok");
         // Only the initial role chunk, no content.
         assert_eq!(first.len(), 1);
