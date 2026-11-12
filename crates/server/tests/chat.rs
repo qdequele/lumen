@@ -451,6 +451,43 @@ async fn ollama_streaming_passthrough_is_byte_identical() {
     assert_eq!(sent["stream_options"]["include_usage"], true);
 }
 
+/// ADR 003: the upstream is always asked for stream usage, even when the
+/// client sent `stream_options.include_usage: false`. The client's other
+/// stream options are forwarded.
+#[tokio::test]
+async fn a_client_cannot_opt_out_of_upstream_stream_usage() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(upstream_sse_body(2)),
+        )
+        .mount(&upstream)
+        .await;
+    let base = common::spawn_with(openai_registry(&upstream.uri()), LIMIT).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&json!({
+            "model": "gpt",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "stream": true,
+            "stream_options": { "include_usage": false, "include_obfuscation": false }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let _ = resp.text().await.unwrap();
+
+    let requests = upstream.received_requests().await.unwrap();
+    let sent: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(sent["stream_options"]["include_usage"], true);
+    assert_eq!(sent["stream_options"]["include_obfuscation"], false);
+}
+
 /// Issue #63: cancellation on the ollama chat path - a client disconnect
 /// mid-stream tears down the upstream connection promptly (the LiteLLM
 /// #22805 lesson), same as the OpenAI kind.
