@@ -109,15 +109,30 @@ pub fn items_to_chunks(
         .boxed()
 }
 
-/// Prepare an OpenAI-compatible request for streaming: set `stream = true` and,
-/// unless the client already set `stream_options`, ask the upstream to include
-/// a final usage chunk (the ADR 003 token-accounting hook). Never overrides a
-/// client-provided `stream_options`.
+/// Prepare an OpenAI-compatible request for streaming: set `stream = true` and
+/// ask the upstream to include a final usage chunk (the ADR 003
+/// token-accounting hook).
+///
+/// `stream_options.include_usage` is always `true` upstream, whatever the
+/// client sent: usage is what the gateway settles the stream on, and a client
+/// opting out would downgrade it to an estimate. The client's other
+/// `stream_options` keys are kept. A client that asked for no usage therefore
+/// still receives the usage chunk: the passthrough forwards the upstream
+/// bytes untouched (ADR 004).
 pub fn enable_stream_usage(req: &mut ChatRequest) {
     req.stream = true;
-    req.extra
-        .entry("stream_options".to_owned())
-        .or_insert_with(|| serde_json::json!({ "include_usage": true }));
+    match req.extra.get_mut("stream_options") {
+        Some(serde_json::Value::Object(options)) => {
+            options.insert("include_usage".to_owned(), serde_json::Value::Bool(true));
+        }
+        // Absent, or not an object (`null`): nothing of the client's to keep.
+        _ => {
+            req.extra.insert(
+                "stream_options".to_owned(),
+                serde_json::json!({ "include_usage": true }),
+            );
+        }
+    }
 }
 
 /// Turn a full [`ChatResponse`] into a single-frame chunk stream.
@@ -210,15 +225,42 @@ mod tests {
     }
 
     #[test]
-    fn enable_stream_usage_never_overrides_client_stream_options() {
+    fn enable_stream_usage_overrides_a_client_opt_out() {
+        // Usage is the gateway's accounting input (ADR 003): a client cannot
+        // turn it off upstream.
         let mut req = empty_request();
         req.extra.insert(
             "stream_options".to_owned(),
             serde_json::json!({ "include_usage": false }),
         );
         enable_stream_usage(&mut req);
-        // The client's explicit choice is preserved.
-        assert_eq!(req.extra["stream_options"]["include_usage"], false);
+        assert_eq!(req.extra["stream_options"]["include_usage"], true);
+    }
+
+    #[test]
+    fn enable_stream_usage_keeps_the_other_client_stream_options() {
+        let mut req = empty_request();
+        req.extra.insert(
+            "stream_options".to_owned(),
+            serde_json::json!({ "include_obfuscation": false }),
+        );
+        enable_stream_usage(&mut req);
+        assert_eq!(
+            req.extra["stream_options"],
+            serde_json::json!({ "include_obfuscation": false, "include_usage": true })
+        );
+    }
+
+    #[test]
+    fn enable_stream_usage_replaces_a_non_object_stream_options() {
+        let mut req = empty_request();
+        req.extra
+            .insert("stream_options".to_owned(), serde_json::Value::Null);
+        enable_stream_usage(&mut req);
+        assert_eq!(
+            req.extra["stream_options"],
+            serde_json::json!({ "include_usage": true })
+        );
     }
 
     #[tokio::test]

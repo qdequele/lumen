@@ -22,7 +22,7 @@ use crate::accounting::{Accounting, Outcome, Target, TokenBreakdown};
 use crate::auth::AuthedKey;
 use crate::bandwidth::UpstreamMark;
 use crate::byok::{RequestKeys, Served};
-use crate::error::ApiError;
+use crate::error::{body_rejection, ApiError};
 use crate::facts::Facts;
 use crate::resilience::routing_headers;
 use crate::state::AppState;
@@ -42,8 +42,9 @@ pub async fn rerank_handler(
     Extension(mark): Extension<UpstreamMark>,
     payload: Result<Json<lumen_core::RerankRequest>, JsonRejection>,
 ) -> Result<Response, ApiError> {
-    // Malformed body → LM-1001 in our envelope (not axum's plain-text default).
-    let Json(req) = payload.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
+    // Malformed body → LM-1001 in our envelope (not axum's plain-text
+    // default); a body over the limit → LM-1002.
+    let Json(req) = payload.map_err(|e| body_rejection(&e, state.body_limit))?;
 
     // Empty documents is a distinct, pinned client error (LM-2010).
     if req.documents.is_empty() {
@@ -100,6 +101,7 @@ pub async fn rerank_handler(
             capability: "rerank",
             model: &client_model,
             provider: &chain[0].route.provider_name,
+            account_model: decision.account,
         },
         estimated_tokens,
         estimated_cost,
@@ -163,12 +165,10 @@ pub async fn rerank_handler(
     let search_units = settle_search_units(&mut response, estimated_units);
     let (tokens_in, tokens_in_estimated) = settle_tokens(&mut response, estimated_tokens);
 
-    // Cost: search units, plus input tokens for models priced per token
-    // (`cost_per_1m_input`; zero for the search-unit-only rerankers).
-    let cost = pricing.search_cost(&executed.model_used, search_units)
-        + pricing.token_cost(&executed.model_used, tokens_in, 0);
-
-    // Settle accounting (ADR 003). Upstream-reported token counts (Jina,
+    // Settle accounting (ADR 003). The cost is search units, plus input
+    // tokens for models priced per token (`cost_per_1m_input`; zero for the
+    // search-unit-only rerankers), computed from the count that is settled.
+    // Upstream-reported token counts (Jina,
     // Voyage) settle inline, unflagged - there is nothing to refine. A
     // gateway-estimated count settles inline with the byte heuristic; when the
     // opt-in accurate tokenizer refines this model, the close is instead
@@ -181,12 +181,21 @@ pub async fn rerank_handler(
         let counter = state.token_counter();
         let model = executed.model_used.clone();
         let query = req.query.clone();
-        let docs: Vec<String> = req.documents.iter().map(|d| d.text().to_owned()).collect();
+        // The text the provider ranked (the `rank_fields` reduction).
+        let rank_fields = req.rank_fields.as_deref();
+        let docs: Vec<String> = req
+            .documents
+            .iter()
+            .map(|d| d.rank_text(rank_fields).into_owned())
+            .collect();
         tokio::spawn(async move {
             let tokens_in = counter
                 .refine_rerank(&model, query, docs)
                 .await
                 .unwrap_or(estimated_tokens);
+            // Price the count that is settled, not the heuristic it replaced.
+            let cost = pricing.search_cost(&model, search_units)
+                + pricing.token_cost(&model, tokens_in, 0);
             accounting.finish(&Outcome {
                 tokens_in,
                 tokens_out: 0,
@@ -200,6 +209,8 @@ pub async fn rerank_handler(
             });
         });
     } else {
+        let cost = pricing.search_cost(&executed.model_used, search_units)
+            + pricing.token_cost(&executed.model_used, tokens_in, 0);
         accounting.finish(&Outcome {
             tokens_in,
             tokens_out: 0,

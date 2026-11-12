@@ -188,6 +188,43 @@ async fn documents_accept_object_form() {
     assert_eq!(sent["documents"][2], "cherry");
 }
 
+/// ADR 003: the token estimate covers the text the provider ranks. Object
+/// documents selected by `rank_fields` have no `text` field, and must not
+/// count as empty.
+#[tokio::test]
+async fn rank_fields_documents_are_counted_in_the_token_estimate() {
+    let upstream = MockServer::start().await;
+    mount_cohere_rerank(&upstream).await;
+    let base = common::spawn_with(registry_for(&upstream.uri()), LIMIT).await;
+
+    let body = "b".repeat(400);
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/rerank"))
+        .json(&json!({
+            "model": "rerank-fast",
+            "query": "abcd",
+            "rank_fields": ["title", "body"],
+            "documents": [
+                { "title": "abcd", "body": body },
+                { "title": "abcd", "body": body },
+                { "title": "abcd", "body": body }
+            ]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let json: Value = resp.json().await.unwrap();
+    // Per document: query (1) + "abcd\n" + 400 bytes (405 bytes, 102 tokens).
+    assert_eq!(json["usage"]["total_tokens"], 3 * (1 + 102), "{json}");
+    assert_eq!(json["usage"]["tokens_estimated"], true);
+
+    // The estimate is on the same text the provider received.
+    let requests = upstream.received_requests().await.unwrap();
+    let sent: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(sent["documents"][0], format!("abcd\n{body}"));
+}
+
 #[tokio::test]
 async fn empty_documents_is_400_fg2010() {
     let upstream = MockServer::start().await;

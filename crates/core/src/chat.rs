@@ -141,8 +141,9 @@ pub struct DataUri {
 
 impl MessageContent {
     /// The concatenated text of the content (borrowed for `Text`; the joined
-    /// `text` parts for `Parts`). Empty for an image-only message. Used by the
-    /// token estimator and any text-only inspection path.
+    /// `text` parts for `Parts`). Empty for an image-only message. Used by
+    /// text-only inspection paths; the token estimator only needs
+    /// [`text_len`](Self::text_len).
     #[must_use]
     pub fn text(&self) -> Cow<'_, str> {
         match self {
@@ -158,6 +159,21 @@ impl MessageContent {
                 }
                 Cow::Owned(out)
             }
+        }
+    }
+
+    /// The byte length of [`text`](Self::text), computed without building it
+    /// (no allocation, whatever the number of parts).
+    #[must_use]
+    pub fn text_len(&self) -> usize {
+        match self {
+            MessageContent::Text(s) => s.len(),
+            MessageContent::Parts(parts) => parts
+                .iter()
+                .filter(|p| p.kind == "text")
+                .filter_map(|p| p.text.as_ref())
+                .map(String::len)
+                .sum(),
         }
     }
 
@@ -240,12 +256,19 @@ pub struct ChatRequest {
     pub n: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop: Option<Value>,
-    /// Whether the client requested a streaming (SSE) response.
-    #[serde(default)]
+    /// Whether the client requested a streaming (SSE) response. An explicit
+    /// `null` reads as `false`, like an absent field.
+    #[serde(default, deserialize_with = "null_as_false")]
     pub stream: bool,
     /// Any additional OpenAI fields (`tools`, `response_format`, ...).
     #[serde(flatten)]
     pub extra: Map<String, Value>,
+}
+
+/// Deserialize a boolean where an explicit `null` means `false` (some SDKs
+/// serialize an unset optional field as `null`).
+fn null_as_false<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
+    Ok(Option::<bool>::deserialize(deserializer)?.unwrap_or(false))
 }
 
 impl ChatRequest {
@@ -510,6 +533,42 @@ mod tests {
         ]}"#;
         let m: ChatMessage = serde_json::from_str(json).unwrap();
         assert_eq!(m.content.as_ref().unwrap().text(), "");
+    }
+
+    #[test]
+    fn text_len_is_the_length_of_text_for_every_shape() {
+        for json in [
+            r#"{"role":"user","content":"héllo"}"#,
+            r#"{"role":"user","content":[
+                {"type":"text","text":"what is "},
+                {"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}},
+                {"type":"input_audio","text":"not a text part"},
+                {"type":"text","text":"this?"},
+                {"type":"text"}
+            ]}"#,
+            r#"{"role":"user","content":[]}"#,
+        ] {
+            let m: ChatMessage = serde_json::from_str(json).unwrap();
+            let content = m.content.as_ref().unwrap();
+            assert_eq!(content.text_len(), content.text().len(), "{json}");
+        }
+    }
+
+    #[test]
+    fn stream_null_reads_as_false() {
+        // Some SDKs serialize an unset `stream` as an explicit null.
+        let parse = |stream: &str| {
+            serde_json::from_str::<ChatRequest>(&format!(
+                r#"{{"model":"m","messages":[]{stream}}}"#
+            ))
+        };
+        assert!(!parse(r#","stream":null"#).unwrap().stream);
+        assert!(!parse("").unwrap().stream);
+        assert!(!parse(r#","stream":false"#).unwrap().stream);
+        assert!(parse(r#","stream":true"#).unwrap().stream);
+        // Still a boolean: anything else is a client error.
+        assert!(parse(r#","stream":"yes""#).is_err());
+        assert!(parse(r#","stream":1"#).is_err());
     }
 
     #[test]

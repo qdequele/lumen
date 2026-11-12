@@ -18,7 +18,7 @@
 //! item.
 
 use crate::chat::{ChatRequest, MessageContent};
-use crate::embed::EmbedRequest;
+use crate::embed::{EmbedInput, EmbedItem, EmbedRequest};
 use crate::rerank::RerankRequest;
 
 /// The heuristic's byte-per-token ratio.
@@ -79,7 +79,13 @@ fn estimate_content_images(content: &MessageContent) -> u64 {
 /// zero tokens.
 #[must_use]
 pub fn estimate_text(text: &str) -> u64 {
-    (text.len() as u64).div_ceil(BYTES_PER_TOKEN)
+    estimate_bytes(text.len())
+}
+
+/// [`estimate_text`] for a text of `len` bytes, for callers that know the
+/// length without holding the text as one string.
+fn estimate_bytes(len: usize) -> u64 {
+    (len as u64).div_ceil(BYTES_PER_TOKEN)
 }
 
 /// Estimate the prompt tokens of a chat request: content of every message
@@ -94,28 +100,58 @@ pub fn estimate_chat_prompt(req: &ChatRequest) -> u64 {
             PER_MESSAGE_OVERHEAD
                 + m.content
                     .as_ref()
-                    .map_or(0, |c| estimate_text(&c.text()) + estimate_content_images(c))
+                    // The length of the text, never the text itself: joining
+                    // the parts would copy the whole prompt just to measure it.
+                    .map_or(0, |c| {
+                        estimate_bytes(c.text_len()) + estimate_content_images(c)
+                    })
         })
         .sum()
 }
 
 /// Estimate the input tokens of an embeddings request (sum over the batch).
 /// Pre-tokenized inputs (token-id arrays) contribute one token per id, with no
-/// byte heuristic; text inputs use the byte-per-token heuristic.
+/// byte heuristic; text inputs use the byte-per-token heuristic; image parts
+/// get the flat per-image estimate, so an image-only item is never zero.
 #[must_use]
 pub fn estimate_embed_input(req: &EmbedRequest) -> u64 {
     let text: u64 = req.input.iter().map(estimate_text).sum();
-    text.saturating_add(req.input.token_count())
+    text.saturating_add(estimate_embed_non_text(req))
+}
+
+/// The part of an embeddings estimate that is not text: one token per
+/// pre-tokenized id, plus the flat per-image estimate (see
+/// [`estimate_image_tokens`]) for every image part. A tokenizer pass over the
+/// text refines only the text, so this is added to its result unchanged.
+#[must_use]
+pub fn estimate_embed_non_text(req: &EmbedRequest) -> u64 {
+    let images: u64 = match &req.input {
+        EmbedInput::Multi(items) => items
+            .iter()
+            .filter_map(|item| match item {
+                EmbedItem::Parts(parts) => Some(parts),
+                EmbedItem::Text(_) => None,
+            })
+            .flatten()
+            .filter_map(crate::chat::ContentPart::image)
+            .map(|img| estimate_image_tokens(img.detail.as_deref()))
+            .sum(),
+        _ => 0,
+    };
+    images.saturating_add(req.input.token_count())
 }
 
 /// Estimate the tokens processed by a rerank request: the query is compared
-/// against every document, so it counts once per document.
+/// against every document, so it counts once per document. A document counts
+/// as the text the provider will rank (its `rank_fields` reduction for an
+/// object document, see [`RerankDocument::rank_text`](crate::rerank::RerankDocument::rank_text)).
 #[must_use]
 pub fn estimate_rerank(req: &RerankRequest) -> u64 {
     let query = estimate_text(&req.query);
+    let rank_fields = req.rank_fields.as_deref();
     req.documents
         .iter()
-        .map(|d| query + estimate_text(d.text()))
+        .map(|d| query + estimate_text(&d.rank_text(rank_fields)))
         .sum()
 }
 
@@ -268,6 +304,20 @@ mod tests {
     }
 
     #[test]
+    fn chat_parts_are_measured_as_one_text_without_joining_them() {
+        // Three one-byte parts are 3 bytes of text: 1 token, exactly what the
+        // joined text would give (not 1 token per part).
+        let split = request(vec![parts_msg(vec![
+            text_part("a"),
+            text_part("b"),
+            text_part("c"),
+        ])]);
+        let joined = request(vec![msg("abc")]);
+        assert_eq!(estimate_chat_prompt(&split), estimate_chat_prompt(&joined));
+        assert_eq!(estimate_chat_prompt(&split), PER_MESSAGE_OVERHEAD + 1);
+    }
+
+    #[test]
     fn embed_input_sums_the_batch() {
         let req: EmbedRequest =
             serde_json::from_str(r#"{"model":"m","input":["abcd","efghijkl"]}"#)
@@ -287,12 +337,64 @@ mod tests {
     }
 
     #[test]
+    fn embed_image_only_item_is_never_zero() {
+        let req: EmbedRequest = serde_json::from_str(
+            r#"{"model":"m","input":[[
+                {"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}]]}"#,
+        )
+        .expect("valid request");
+        assert_eq!(estimate_embed_input(&req), DEFAULT_IMAGE_TOKENS);
+    }
+
+    #[test]
+    fn embed_images_add_the_flat_estimate_to_the_text() {
+        let req: EmbedRequest = serde_json::from_str(
+            r#"{"model":"m","input":["abcd",[
+                {"type":"text","text":"abcdefgh"},
+                {"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA","detail":"low"}},
+                {"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}]]}"#,
+        )
+        .expect("valid request");
+        assert_eq!(
+            estimate_embed_input(&req),
+            1 + 2 + LOW_DETAIL_IMAGE_TOKENS + DEFAULT_IMAGE_TOKENS
+        );
+        assert_eq!(
+            estimate_embed_non_text(&req),
+            LOW_DETAIL_IMAGE_TOKENS + DEFAULT_IMAGE_TOKENS
+        );
+    }
+
+    #[test]
     fn rerank_counts_query_once_per_document() {
         let req: RerankRequest =
             serde_json::from_str(r#"{"model":"m","query":"abcd","documents":["abcd","abcdefgh"]}"#)
                 .expect("valid request");
         // (1 query + 1 doc) + (1 query + 2 doc) = 5
         assert_eq!(estimate_rerank(&req), 5);
+    }
+
+    #[test]
+    fn rerank_counts_the_fields_the_provider_will_rank() {
+        // Object documents with no `text` field: the ranked text is the
+        // `rank_fields` reduction ("abcd\nabcdefgh" = 13 bytes, 4 tokens), not
+        // the empty string.
+        let req: RerankRequest = serde_json::from_str(
+            r#"{"model":"m","query":"abcd","rank_fields":["title","body"],
+                "documents":[{"title":"abcd","body":"abcdefgh"},{"title":"abcd"}]}"#,
+        )
+        .expect("valid request");
+        // (1 query + 4 doc) + (1 query + 1 doc) = 7
+        assert_eq!(estimate_rerank(&req), 7);
+    }
+
+    #[test]
+    fn rerank_object_documents_without_rank_fields_count_their_text() {
+        let req: RerankRequest = serde_json::from_str(
+            r#"{"model":"m","query":"abcd","documents":[{"text":"abcdefgh","id":"zzzzzzzzzzzz"}]}"#,
+        )
+        .expect("valid request");
+        assert_eq!(estimate_rerank(&req), 3);
     }
 
     #[test]

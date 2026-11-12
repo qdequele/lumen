@@ -20,7 +20,7 @@ use crate::accounting::{Accounting, Outcome, Target, TokenBreakdown};
 use crate::auth::AuthedKey;
 use crate::bandwidth::UpstreamMark;
 use crate::byok::{RequestKeys, Served};
-use crate::error::ApiError;
+use crate::error::{body_rejection, ApiError};
 use crate::facts::Facts;
 use crate::resilience::routing_headers;
 use crate::state::AppState;
@@ -81,8 +81,8 @@ pub async fn embeddings(
     payload: Result<Json<lumen_core::EmbedRequest>, JsonRejection>,
 ) -> Result<Response, ApiError> {
     // Malformed request body → LM-1001 in our standard envelope (not axum's
-    // default plain-text rejection).
-    let Json(req) = payload.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
+    // default plain-text rejection); a body over the limit → LM-1002.
+    let Json(req) = payload.map_err(|e| body_rejection(&e, state.body_limit))?;
 
     if req.input.is_empty() {
         return Err(GatewayError::InvalidRequest("`input` must not be empty".to_owned()).into());
@@ -140,6 +140,7 @@ pub async fn embeddings(
             capability: "embed",
             model: &client_model,
             provider: &chain[0].route.provider_name,
+            account_model: decision.account,
         },
         estimated_input,
         estimated_cost,
@@ -284,12 +285,15 @@ fn finish_embed(
         let counter = state.token_counter();
         let model = model_used.to_owned();
         let texts: Vec<String> = req.input.iter().map(str::to_owned).collect();
+        // The recount covers the text only: images and pre-tokenized ids keep
+        // their estimate, so an image-only item is not refined down to zero.
+        let non_text = tokens::estimate_embed_non_text(req);
         let pricing_task = pricing.clone();
         tokio::spawn(async move {
             let refined = counter
                 .refine_embed(&model, texts)
                 .await
-                .unwrap_or(tokens_in);
+                .map_or(tokens_in, |text| text.saturating_add(non_text));
             let cost = pricing_task.token_cost(&model, refined, 0);
             accounting.finish(&Outcome {
                 tokens_in: refined,

@@ -375,6 +375,37 @@ async fn ollama_kind_serves_chat_through_its_openai_compatible_v1_path() {
 
 /// ADR 003 for the ollama chat path: an upstream reply with no `usage` still
 /// yields a non-zero token count, honestly labelled `estimated`.
+/// An explicit `"stream": null` is an unset `stream`: a normal JSON
+/// completion, not a 400.
+#[tokio::test]
+async fn stream_null_is_a_non_streaming_request() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_chat_body("llama3.2")))
+        .mount(&upstream)
+        .await;
+    let base = common::spawn_with(ollama_registry(&upstream.uri()), LIMIT).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&json!({
+            "model": "local-llama",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "stream": null
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["object"], "chat.completion");
+
+    let requests = upstream.received_requests().await.unwrap();
+    let sent: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(sent["stream"], false);
+}
+
 #[tokio::test]
 async fn ollama_chat_without_upstream_usage_reports_an_estimated_count() {
     let upstream = MockServer::start().await;
@@ -449,6 +480,43 @@ async fn ollama_streaming_passthrough_is_byte_identical() {
     let sent: Value = serde_json::from_slice(&requests[0].body).unwrap();
     assert_eq!(sent["stream"], true);
     assert_eq!(sent["stream_options"]["include_usage"], true);
+}
+
+/// ADR 003: the upstream is always asked for stream usage, even when the
+/// client sent `stream_options.include_usage: false`. The client's other
+/// stream options are forwarded.
+#[tokio::test]
+async fn a_client_cannot_opt_out_of_upstream_stream_usage() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(upstream_sse_body(2)),
+        )
+        .mount(&upstream)
+        .await;
+    let base = common::spawn_with(openai_registry(&upstream.uri()), LIMIT).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&json!({
+            "model": "gpt",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "stream": true,
+            "stream_options": { "include_usage": false, "include_obfuscation": false }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let _ = resp.text().await.unwrap();
+
+    let requests = upstream.received_requests().await.unwrap();
+    let sent: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(sent["stream_options"]["include_usage"], true);
+    assert_eq!(sent["stream_options"]["include_obfuscation"], false);
 }
 
 /// Issue #63: cancellation on the ollama chat path - a client disconnect

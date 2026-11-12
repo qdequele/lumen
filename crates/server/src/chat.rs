@@ -26,7 +26,7 @@
 //!   the provider byte stream: verbatim upstream for passthrough, translated
 //!   terminal event otherwise - the server never fabricates it);
 //! * **heartbeat** - a `: ping` SSE comment on idle streams so intermediaries
-//!   don't reap a slow upstream.
+//!   don't reap a slow upstream (never in the middle of a forwarded event).
 
 use std::convert::Infallible;
 
@@ -38,6 +38,7 @@ use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
 use bytes::Bytes;
 use futures::stream::{BoxStream, StreamExt};
+use futures::FutureExt;
 use lumen_auth::state::usd_to_micro;
 use std::sync::Arc;
 
@@ -50,7 +51,7 @@ use crate::accounting::{Accounting, Outcome, StreamAccounting, Target, TokenBrea
 use crate::auth::AuthedKey;
 use crate::bandwidth::UpstreamMark;
 use crate::byok::{RequestKeys, Served};
-use crate::error::ApiError;
+use crate::error::{body_rejection, ApiError};
 use crate::facts::Facts;
 use crate::pricing::DEFAULT_RESERVED_OUTPUT_TOKENS;
 use crate::resilience::routing_headers;
@@ -74,13 +75,12 @@ pub async fn chat(
 ) -> Result<Response, ApiError> {
     // Malformed body → LM-1001 in our envelope (not axum's plain-text default).
     //
-    // An over-limit body never reaches here: `RequestBodyLimitLayer` (see
-    // `app.rs`) short-circuits at the tower layer with a bare 413 before axum's
-    // routing/extraction runs, so `JsonRejection` never surfaces
-    // `PAYLOAD_TOO_LARGE` - verified empirically (a debug probe in this
-    // `map_err` never fired for an over-limit request). `app::map_body_limit_response`
-    // rewrites that bare 413 into the `LM-1002` envelope instead.
-    let Json(mut req) = payload.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
+    // A body whose `Content-Length` is over the limit never reaches here:
+    // `RequestBodyLimitLayer` (see `app.rs`) answers a bare 413 first, which
+    // `app::map_body_limit_response` rewrites into `LM-1002`. A chunked body
+    // is only found over the limit while it is read, so it surfaces here as a
+    // 413 rejection, mapped to the same `LM-1002`.
+    let Json(mut req) = payload.map_err(|e| body_rejection(&e, state.body_limit))?;
 
     if req.messages.is_empty() {
         return Err(GatewayError::InvalidRequest("`messages` must not be empty".to_owned()).into());
@@ -110,9 +110,9 @@ pub async fn chat(
                 Facts::chat(headers, key, req)
             })?
     };
-    let chain = lumen_router::resolve_chat_decision(&state.registry, &mut decision)?;
+    let mut chain = lumen_router::resolve_chat_decision(&state.registry, &mut decision)?;
     let primary = decision.primary_model().to_owned();
-    enforce_image_support(&state, &primary, &chain, &req)?;
+    enforce_image_support(&state, &primary, &mut chain, &mut decision, &req)?;
     let mut links = lumen_router::decision_links(
         &decision,
         chain.iter().map(|l| l.route.provider_name.as_str()),
@@ -149,6 +149,7 @@ pub async fn chat(
             capability: "chat",
             model: &client_model,
             provider: &chain[0].route.provider_name,
+            account_model: decision.account,
         },
         estimated_input + reserved_output,
         estimated_cost,
@@ -213,10 +214,18 @@ fn reserved_output_tokens(
 /// remote image URL is bound for a provider that only takes inline base64,
 /// `LM-2008` if a provider-native image source (Anthropic `file_id`, Gemini
 /// `fileUri`) is bound for a provider that cannot resolve it (issue #12).
+///
+/// The three rejections judge the primary. Fallback targets that do not
+/// declare the `image` modality are then removed from `chain` and `decision`
+/// (see [`drop_text_only_fallbacks`]). The `LM-2004` / `LM-2008` checks stay
+/// primary-only on purpose (`docs/providers.md`, `docs/errors.md`): a
+/// fail-over that reaches a provider unable to take the image source surfaces
+/// the same code there (GH #13).
 fn enforce_image_support(
     state: &AppState,
     client_model: &str,
-    chain: &[lumen_router::ChatChainLink],
+    chain: &mut Vec<lumen_router::ChatChainLink>,
+    decision: &mut lumen_router::virtual_models::Decision,
     req: &ChatRequest,
 ) -> Result<(), GatewayError> {
     let has_image = req.messages.iter().any(|m| {
@@ -276,7 +285,51 @@ fn enforce_image_support(
             source_kind: "gemini-file",
         });
     }
+    drop_text_only_fallbacks(state, chain, decision);
     Ok(())
+}
+
+/// Remove the fallback targets that cannot take an image from a request that
+/// carries one: a model that does not declare the `image` modality is not an
+/// attempt for it (as `/v1/decisions` skips its incompatible targets), so a
+/// fail-over never sends image content to a text-only model. The primary is
+/// kept: the caller has already checked it. `chain` and `decision.attempts`
+/// stay aligned, index for index.
+fn drop_text_only_fallbacks(
+    state: &AppState,
+    chain: &mut Vec<lumen_router::ChatChainLink>,
+    decision: &mut lumen_router::virtual_models::Decision,
+) {
+    // The common case (no fallback) skips the registry lookups.
+    if decision.attempts.len() < 2 {
+        return;
+    }
+    let keep: Vec<bool> = decision
+        .attempts
+        .iter()
+        .enumerate()
+        .map(|(i, attempt)| {
+            i == 0
+                || state
+                    .registry
+                    .modalities(&attempt.model_id)
+                    .is_some_and(|mods| mods.iter().any(|m| m == "image"))
+        })
+        .collect();
+    if keep.iter().all(|k| *k) {
+        return;
+    }
+    for (attempt, kept) in decision.attempts.iter().zip(&keep) {
+        if !kept {
+            tracing::debug!(
+                model = %attempt.model_id,
+                "skipping a fallback target without the image modality"
+            );
+        }
+    }
+    let mut kept = keep.iter();
+    chain.retain(|_| kept.next().copied().unwrap_or(true));
+    decision.retain_mask(&keep);
 }
 
 /// Everything the two chat execution paths share, bundled so the helpers stay
@@ -638,10 +691,106 @@ fn defer_chat_refinement(
 /// says "data: [DONE]" inside a delta can never spoof the terminator.
 const DONE_MARKER: &[u8] = b"\ndata: [DONE]";
 
-/// One SSE frame carrying the standard JSON error envelope.
-fn error_frame(error: &GatewayError) -> Bytes {
+/// How many trailing bytes of the forwarded stream are remembered: enough to
+/// complete a [`DONE_MARKER`] that started in an earlier frame.
+const TAIL_LEN: usize = DONE_MARKER.len() - 1;
+
+/// Whether `bytes` holds a whole [`DONE_MARKER`]. The marker opens with a
+/// newline, so only the (few) newlines of a frame are compared against it.
+fn contains_done(bytes: &[u8]) -> bool {
+    let mut rest = bytes;
+    while let Some(at) = rest.iter().position(|&b| b == b'\n') {
+        if rest[at..].starts_with(DONE_MARKER) {
+            return true;
+        }
+        rest = &rest[at + 1..];
+    }
+    false
+}
+
+/// The last bytes (at most [`TAIL_LEN`]) of the forwarded stream, in fixed
+/// storage: recording a frame allocates nothing and copies only those bytes.
+struct Tail {
+    bytes: [u8; TAIL_LEN],
+    len: usize,
+}
+
+impl Tail {
+    /// A stream that forwarded nothing yet, seeded with a virtual blank line:
+    /// a `[DONE]` opening the very first frame still matches the
+    /// line-anchored marker, and the stream stands on an event boundary.
+    fn line_start() -> Self {
+        let mut bytes = [0; TAIL_LEN];
+        bytes[..2].copy_from_slice(b"\n\n");
+        Self { bytes, len: 2 }
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+
+    /// Record a forwarded frame. Returns whether a [`DONE_MARKER`] ends in
+    /// it, including one that started in the bytes remembered so far.
+    fn push(&mut self, frame: &[u8]) -> bool {
+        // A marker that straddles the boundary starts in the tail and ends
+        // within the first `TAIL_LEN` bytes of the frame: the two are joined
+        // on the stack. The frame itself is searched in place.
+        let head = &frame[..frame.len().min(TAIL_LEN)];
+        let mut joint = [0; 2 * TAIL_LEN];
+        let joint_len = self.len + head.len();
+        joint[..self.len].copy_from_slice(self.as_slice());
+        joint[self.len..joint_len].copy_from_slice(head);
+        let joint = &joint[..joint_len];
+        let found = contains_done(joint) || contains_done(frame);
+
+        // A frame shorter than the tail is wholly in `joint`, after the
+        // bytes that were already there.
+        let last = if frame.len() >= TAIL_LEN {
+            &frame[frame.len() - TAIL_LEN..]
+        } else {
+            &joint[joint_len.saturating_sub(TAIL_LEN)..]
+        };
+        self.bytes[..last.len()].copy_from_slice(last);
+        self.len = last.len();
+        found
+    }
+}
+
+/// One SSE frame carrying the standard JSON error envelope, after `prefix`
+/// (the newlines that close a half-forwarded event, see [`event_closer`]).
+fn error_frame(error: &GatewayError, prefix: &str) -> Bytes {
     let json = serde_json::to_string(&error.to_envelope()).unwrap_or_else(|_| "{}".to_owned());
-    Bytes::from(format!("data: {json}\n\n"))
+    Bytes::from(format!("{prefix}data: {json}\n\n"))
+}
+
+/// The newlines that bring a forwarded byte stream ending in `tail` back to
+/// an SSE event boundary: empty when it already ends on one (a blank line),
+/// one newline when the last line is complete but its event is not, two when
+/// it stops mid-line.
+///
+/// Passthrough forwards upstream chunks verbatim, so the last one may stop
+/// anywhere; a frame the gateway injects after it (an error frame, a ping)
+/// would otherwise be glued onto the unfinished line or event. SSE accepts
+/// `\n`, `\r\n` and `\r` as line ends. A trailing lone `\r` gets two
+/// newlines: it may be the first half of a `\r\n`, which a single `\n` would
+/// only complete.
+fn event_closer(tail: &[u8]) -> &'static str {
+    let (rest, lone_cr) = if let Some(rest) = tail.strip_suffix(b"\r\n") {
+        (rest, false)
+    } else if let Some(rest) = tail.strip_suffix(b"\n") {
+        (rest, false)
+    } else if let Some(rest) = tail.strip_suffix(b"\r") {
+        (rest, true)
+    } else {
+        return "\n\n";
+    };
+    if matches!(rest.last(), Some(b'\n' | b'\r')) {
+        ""
+    } else if lone_cr {
+        "\n\n"
+    } else {
+        "\n"
+    }
 }
 
 /// What the guarded wait for the next upstream frame produced.
@@ -656,6 +805,7 @@ enum Step {
 
 /// Streaming wrapper state. Bounded: no frame content is retained beyond the
 /// few bytes needed to detect a `[DONE]` split across frame boundaries.
+/// Forwarding a frame allocates nothing here.
 struct EventStreamState {
     inner: BoxStream<'static, Result<Bytes, ProviderError>>,
     provider: String,
@@ -669,9 +819,15 @@ struct EventStreamState {
     saw_done: bool,
     /// Set after a terminal frame (error / LM-3010 / LM-3011): stream is over.
     ended: bool,
-    /// Trailing bytes of the previous frame, so a `[DONE]` marker split across
-    /// two frames is still detected. At most `DONE_MARKER.len() - 1` bytes.
-    tail: Vec<u8>,
+    /// Trailing bytes of the forwarded stream, so a `[DONE]` marker split
+    /// across two frames is still detected, and so the gateway knows whether
+    /// the stream stands on an event boundary before inserting a frame of its
+    /// own.
+    tail: Tail,
+    /// The heartbeat timer: one for the whole stream, re-armed before each
+    /// wait (a new timer per wait is registered with the time driver, then
+    /// cancelled, for every chunk that has to be waited for).
+    heartbeat: std::pin::Pin<Box<tokio::time::Sleep>>,
     /// Token/cost accounting riding along the stream (M5). `None` in unit
     /// tests that only exercise the guards. Its `Drop` settles the books, so
     /// a client disconnect can never leak a budget reservation.
@@ -685,13 +841,21 @@ impl EventStreamState {
         if let Some(accounting) = &mut self.accounting {
             accounting.scan(frame);
         }
-        let mut window = std::mem::take(&mut self.tail);
-        window.extend_from_slice(frame);
-        if window.windows(DONE_MARKER.len()).any(|w| w == DONE_MARKER) {
+        if self.tail.push(frame) {
             self.saw_done = true;
         }
-        let keep = window.len().min(DONE_MARKER.len() - 1);
-        self.tail = window.split_off(window.len() - keep);
+    }
+
+    /// The terminal SSE frame for `error`, closing any half-forwarded event
+    /// first so the frame is always an event of its own.
+    fn terminal_error_frame(&self, error: &GatewayError) -> Bytes {
+        error_frame(error, event_closer(self.tail.as_slice()))
+    }
+
+    /// Whether the forwarded bytes end on an event boundary, where a frame
+    /// of the gateway's own can be inserted without altering an event.
+    fn on_event_boundary(&self) -> bool {
+        event_closer(self.tail.as_slice()).is_empty()
     }
 
     /// Close the accounting record with the stream's terminal outcome, so
@@ -715,7 +879,10 @@ impl EventStreamState {
 /// verbatim forwarding this wrapper adds the three guards described in the
 /// module docs (LM-3011 first-token timeout, LM-3010 missing terminator,
 /// `: ping` heartbeat). A mid-stream provider error becomes a terminal SSE
-/// error frame carrying the standard JSON envelope.
+/// error frame carrying the standard JSON envelope. Both injected frames
+/// respect the event framing of the forwarded bytes: an error frame first
+/// closes an event the upstream left unfinished, and no ping is sent while
+/// one is half forwarded (see [`event_closer`]).
 ///
 /// `guard` is moved into the state so it lives exactly as long as the body: a
 /// client disconnect drops the body, drops the guard, and aborts the upstream
@@ -737,9 +904,8 @@ fn to_event_stream(
         got_first_frame: false,
         saw_done: false,
         ended: false,
-        // Seeded with a virtual line start so a `[DONE]` opening the very
-        // first frame still matches the line-anchored marker.
-        tail: vec![b'\n'],
+        tail: Tail::line_start(),
+        heartbeat: Box::pin(tokio::time::sleep(guards.heartbeat_interval)),
         accounting,
     };
 
@@ -748,14 +914,22 @@ fn to_event_stream(
             return None;
         }
 
-        let step = {
-            let heartbeat = tokio::time::sleep(s.guards.heartbeat_interval);
-            tokio::pin!(heartbeat);
-            if s.got_first_frame {
+        let step = loop {
+            // A frame that is already there is forwarded without touching a
+            // timer (the upstream always wins a tie, as in the waits below).
+            if let Some(item) = s.inner.next().now_or_never() {
+                break Step::Item(item);
+            }
+            // Each wait gets a full heartbeat interval, as a fresh timer
+            // would give it. Re-arming to a later deadline leaves the timer
+            // registered: no per-chunk registration with the time driver.
+            let rearmed = tokio::time::Instant::now() + s.guards.heartbeat_interval;
+            s.heartbeat.as_mut().reset(rearmed);
+            let step = if s.got_first_frame {
                 tokio::select! {
                     biased;
                     item = s.inner.next() => Step::Item(item),
-                    () = &mut heartbeat => Step::Ping,
+                    () = s.heartbeat.as_mut() => Step::Ping,
                 }
             } else {
                 tokio::select! {
@@ -765,9 +939,15 @@ fn to_event_stream(
                     () = tokio::time::sleep_until(s.first_frame_deadline) => {
                         Step::FirstTokenTimeout
                     }
-                    () = &mut heartbeat => Step::Ping,
+                    () = s.heartbeat.as_mut() => Step::Ping,
                 }
+            };
+            // The upstream paused in the middle of an event: a ping inserted
+            // there would be glued into it. Keep waiting instead.
+            if matches!(step, Step::Ping) && !s.on_event_boundary() {
+                continue;
             }
+            break step;
         };
 
         let frame = match step {
@@ -787,7 +967,7 @@ fn to_event_stream(
                 s.ended = true;
                 let error = GatewayError::from_provider(&s.provider, e);
                 s.settle_accounting(error.http_status());
-                error_frame(&error)
+                s.terminal_error_frame(&error)
             }
             Step::Item(None) => {
                 s.ended = true;
@@ -801,7 +981,7 @@ fn to_event_stream(
                     provider: s.provider.clone(),
                 };
                 s.settle_accounting(error.http_status());
-                error_frame(&error)
+                s.terminal_error_frame(&error)
             }
             Step::Ping => Bytes::from_static(b": ping\n\n"),
             Step::FirstTokenTimeout => {
@@ -810,7 +990,7 @@ fn to_event_stream(
                     provider: s.provider.clone(),
                 };
                 s.settle_accounting(error.http_status());
-                error_frame(&error)
+                s.terminal_error_frame(&error)
             }
         };
         Some((Ok::<Bytes, Infallible>(frame), s))
@@ -990,6 +1170,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn done_marker_is_detected_wherever_the_frames_are_cut() {
+        // The same stream cut in two at every byte, then fed byte by byte.
+        let body: &[u8] = b"data: {\"x\":1}\n\ndata: [DONE]\n\n";
+        for cut in 0..=body.len() {
+            let out = collect(wrap(
+                frames(vec![
+                    Ok(Bytes::copy_from_slice(&body[..cut])),
+                    Ok(Bytes::copy_from_slice(&body[cut..])),
+                ]),
+                guards(30_000, 15_000),
+            ))
+            .await;
+            assert_eq!(out.concat().as_bytes(), body, "cut at {cut}");
+        }
+        let bytes = body.iter().map(|b| Ok(Bytes::copy_from_slice(&[*b])));
+        let out = collect(wrap(frames(bytes.collect()), guards(30_000, 15_000))).await;
+        assert_eq!(out.concat().as_bytes(), body);
+    }
+
+    #[test]
+    fn tail_keeps_the_last_bytes_and_finds_the_marker_across_pushes() {
+        let mut tail = Tail::line_start();
+        assert_eq!(tail.as_slice(), b"\n\n");
+        // Shorter than the tail: appended to what was there.
+        assert!(!tail.push(b"abc"));
+        assert_eq!(tail.as_slice(), b"\n\nabc");
+        assert!(!tail.push(b""));
+        assert_eq!(tail.as_slice(), b"\n\nabc");
+        // Overflowing: only the last TAIL_LEN bytes stay.
+        assert!(!tail.push(b"0123456789"));
+        assert_eq!(tail.as_slice(), b"bc0123456789");
+        // Longer than the tail: the frame's own last bytes.
+        assert!(!tail.push(b"a long frame that ends with\ndata: [DO"));
+        assert_eq!(tail.as_slice(), b"th\ndata: [DO");
+        // The marker completes across the boundary.
+        assert!(tail.push(b"NE]\n\n"));
+        // A marker wholly inside one frame, and none at all.
+        assert!(Tail::line_start().push(b"data: {}\n\ndata: [DONE]\n\n"));
+        assert!(!Tail::line_start().push(b"data: {\"c\":\"data: [DONE]\"}\n\n"));
+    }
+
+    #[tokio::test]
     async fn done_marker_inside_model_content_does_not_suppress_fg_3010() {
         // The MODEL's own text contains "data: [DONE]" (inside a JSON string,
         // mid-line). Only a line-anchored terminator counts: when the upstream
@@ -1055,6 +1277,86 @@ mod tests {
         assert!(out[1].contains("client_cancelled"), "got: {}", out[1]);
         assert!(!out[1].contains("LM-5001"), "got: {}", out[1]);
         assert!(!out[1].contains("internal"), "got: {}", out[1]);
+    }
+
+    #[tokio::test]
+    async fn error_frame_after_a_chunk_cut_mid_line_starts_a_new_event() {
+        // Passthrough forwards upstream chunks as they come: the last one may
+        // stop mid-line. The gateway's error frame must not be glued onto it.
+        let out = collect(wrap(
+            frames(vec![Ok(Bytes::from_static(
+                b"data: {\"x\":1}\n\ndata: {\"x",
+            ))]),
+            guards(30_000, 15_000),
+        ))
+        .await;
+        assert_eq!(out.len(), 2, "got: {out:?}");
+        assert!(out[1].starts_with("\n\ndata: {"), "got: {:?}", out[1]);
+        assert!(out[1].contains("LM-3010"), "got: {}", out[1]);
+    }
+
+    #[tokio::test]
+    async fn error_frame_after_an_unterminated_event_adds_the_blank_line() {
+        // The last chunk ended a line but not its event (no blank line yet).
+        for (chunk, prefix) in [
+            (&b"data: {\"x\":1}\n"[..], "\ndata: {"),
+            (&b"data: {\"x\":1}\r\n"[..], "\ndata: {"),
+            // A lone CR may be the first half of a CRLF: two newlines are
+            // needed either way.
+            (&b"data: {\"x\":1}\r"[..], "\n\ndata: {"),
+        ] {
+            let out = collect(wrap(
+                frames(vec![
+                    Ok(Bytes::copy_from_slice(chunk)),
+                    Err(ProviderError::Unavailable {
+                        provider: "p".to_owned(),
+                    }),
+                ]),
+                guards(30_000, 15_000),
+            ))
+            .await;
+            assert_eq!(out.len(), 2, "got: {out:?}");
+            assert!(out[1].starts_with(prefix), "{chunk:?} got: {:?}", out[1]);
+        }
+    }
+
+    #[tokio::test]
+    async fn error_frame_on_an_event_boundary_is_not_prefixed() {
+        for chunk in [
+            &b"data: {\"x\":1}\n\n"[..],
+            &b"data: {\"x\":1}\r\n\r\n"[..],
+            &b"data: {\"x\":1}\r\r"[..],
+        ] {
+            let out = collect(wrap(
+                frames(vec![Ok(Bytes::copy_from_slice(chunk))]),
+                guards(30_000, 15_000),
+            ))
+            .await;
+            assert_eq!(out.len(), 2, "got: {out:?}");
+            assert!(out[1].starts_with("data: {"), "{chunk:?} got: {:?}", out[1]);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn no_heartbeat_is_injected_while_an_event_is_half_forwarded() {
+        // The upstream stalls 100 ms in the middle of an event (heartbeat
+        // every 15 ms): a ping there would corrupt the event, so none is
+        // sent until the event is complete. Then the pings resume.
+        let stalled = stream::iter(vec![Ok(Bytes::from_static(b"data: {\"x\""))])
+            .chain(
+                stream::once(async {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    Ok(Bytes::from_static(b":1}\n\n"))
+                })
+                .boxed(),
+            )
+            .chain(stream::pending())
+            .boxed();
+        let out: Vec<String> = collect(wrap(stalled, guards(50, 15)).take(4)).await;
+        assert_eq!(
+            out,
+            vec!["data: {\"x\"", ":1}\n\n", ": ping\n\n", ": ping\n\n"]
+        );
     }
 
     #[tokio::test(start_paused = true)]
