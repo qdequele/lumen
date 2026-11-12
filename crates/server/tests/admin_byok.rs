@@ -516,28 +516,39 @@ async fn team_key_secret_never_logged_on_admin_writes() {
 
     let h = spawn(CONFIG_TOML).await;
     let group = h.group(ACCOUNT_A).await;
-    let (status, created) = h.add_key(&group, "openai-main", SECRET, "prod").await;
-    assert_eq!(status, 201, "{created}");
-    // Failure paths log too: ineligible kind, bad label, wrong scope.
-    let _ = h.add_key(&group, "azure-main", SECRET, "prod").await;
-    let _ = h.add_key(&group, "openai-main", SECRET, "").await;
-    let _ = h
-        .call(
-            reqwest::Method::POST,
-            &format!("/admin/groups/{group}/byok/openai-main/keys"),
-            Some(ACCOUNT_B),
-            Some(json!({"key": SECRET, "label": "x"})),
-        )
-        .await;
-    let id = created["id"].as_str().expect("id");
-    let _ = h
-        .call(
-            reqwest::Method::DELETE,
-            &format!("/admin/groups/{group}/byok/openai-main/keys/{id}"),
-            Some(ACCOUNT_A),
-            None,
-        )
-        .await;
+    // Two passes with an interest-cache rebuild in between. A callsite first
+    // hit by a parallel test thread (which has no subscriber) while this
+    // test's subscriber is the only one registered is cached as "never", and
+    // the rebuild above cannot fix a callsite that is not registered yet.
+    // The first pass registers every callsite on these paths; the rebuild
+    // then recomputes them against this subscriber, so the second pass is
+    // always captured.
+    for pass in 0..2 {
+        let label = format!("prod-{pass}");
+        let (status, created) = h.add_key(&group, "openai-main", SECRET, &label).await;
+        assert_eq!(status, 201, "{created}");
+        // Failure paths log too: ineligible kind, bad label, wrong scope.
+        let _ = h.add_key(&group, "azure-main", SECRET, &label).await;
+        let _ = h.add_key(&group, "openai-main", SECRET, "").await;
+        let _ = h
+            .call(
+                reqwest::Method::POST,
+                &format!("/admin/groups/{group}/byok/openai-main/keys"),
+                Some(ACCOUNT_B),
+                Some(json!({"key": SECRET, "label": "x"})),
+            )
+            .await;
+        let id = created["id"].as_str().expect("id");
+        let _ = h
+            .call(
+                reqwest::Method::DELETE,
+                &format!("/admin/groups/{group}/byok/openai-main/keys/{id}"),
+                Some(ACCOUNT_A),
+                None,
+            )
+            .await;
+        tracing::callsite::rebuild_interest_cache();
+    }
 
     let logs = String::from_utf8_lossy(&buffer.lock().expect("log buffer")).into_owned();
     assert!(!logs.is_empty(), "the subscriber captured nothing");
