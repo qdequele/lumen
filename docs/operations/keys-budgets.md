@@ -83,13 +83,13 @@ together, so they take effect immediately with no restart.
 | Method | Path | Purpose |
 |---|---|---|
 | `POST` | `/admin/keys` | Create a virtual key. |
-| `GET` | `/admin/keys` | List active keys (records only - no hashes, no plaintext). `?include_deleted=true` adds tombstones; `?external_ref=...` filters. |
+| `GET` | `/admin/keys` | List active keys (records only - no hashes, no plaintext). `?include_deleted=true` adds tombstones; `?external_ref=...` filters; `?limit=` and `?cursor=` [page it](#paging-the-listings). |
 | `PATCH` | `/admin/keys/{id}` | Adjust budget/limits, or enable/disable a key. |
 | `DELETE` | `/admin/keys/{id}` | Soft-delete a key (tombstone; stops authenticating immediately). |
 | `POST` | `/admin/keys/{id}/rotate` | Mint a new secret for an existing key (one-time plaintext, identity and spend preserved). |
 | `POST` | `/admin/keys/{id}/grant` | Atomically add to a key's budget cap (concurrency-safe top-up). |
 | `POST` | `/admin/groups` | Create a budget group - a shared pool member keys draw from. With `parent_id`, a [sub-group](#sub-groups) of a top-level group. |
-| `GET` | `/admin/groups` | List active groups. `?include_deleted=true` adds tombstones; `?account_ref=...` filters. |
+| `GET` | `/admin/groups` | List active groups. `?include_deleted=true` adds tombstones; `?account_ref=...` filters; `?limit=` and `?cursor=` [page it](#paging-the-listings). |
 | `PATCH` | `/admin/groups/{id}` | Adjust a group's name or shared budget (pool spend preserved). |
 | `DELETE` | `/admin/groups/{id}` | Soft-delete a group. Refused while it still has active member keys or live sub-groups. |
 | `POST` | `/admin/groups/{id}/grant` | Atomically add to a group's shared budget cap (concurrency-safe top-up). |
@@ -579,6 +579,40 @@ Two accounting notes:
 One encoding note: an RFC3339 `+HH:MM` offset contains a `+`, which in a
 query string means a space - percent-encode it as `%2B`
 (`until=2026-07-15T03:00:00%2B02:00`), or use `Z`/unix seconds.
+
+### Paging the listings
+
+`GET /admin/keys` and `GET /admin/groups` return the whole listing by
+default, which is what existing clients expect. A deployment with many keys
+can read them a page at a time instead ([ADR 023](../adr/023-admin-listing-pagination.md)):
+
+```bash
+# First page: at most 200 keys, oldest first. -i shows the headers.
+curl -si -H "Authorization: Bearer $LUMEN_MASTER_KEY" \
+  "http://localhost:8080/admin/keys?limit=200"
+# X-Next-Cursor: 313736303030303030303a6b65795f...
+
+# Next page: send that value back unchanged.
+curl -si -H "Authorization: Bearer $LUMEN_MASTER_KEY" \
+  "http://localhost:8080/admin/keys?limit=200&cursor=313736303030303030303a6b65795f..."
+```
+
+- The body is the same bare JSON array as the unpaginated listing, in the
+  same order (creation time, then id): the pages of a walk, put end to end,
+  are the whole listing.
+- `X-Next-Cursor` is present while more rows remain and absent on the last
+  page. The value is opaque: pass it back as `cursor` without editing it.
+- `limit` is 1 to 1000; `cursor` without `limit` reads 100 rows. A `limit`
+  of 0 or above 1000, or a cursor the gateway did not issue, is 400
+  `LM-1001`.
+- Keep the filters (`include_deleted`, `external_ref`, `account_ref`,
+  `parent_id`) and the `X-Lumen-Account-Ref` header identical on every page
+  of one walk.
+- A walk is stable under writes: every row that existed when the walk
+  started (and is not deleted meanwhile) is returned exactly once, whatever
+  is created or deleted while you page. A row created during the walk
+  normally shows up at the end; one created in the very second of the last
+  row already returned may be left for the next walk.
 
 ## Outbound webhooks for budget events
 
