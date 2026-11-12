@@ -1980,9 +1980,9 @@ async fn config_document_writes_cannot_point_webhooks_at_internal_hosts() {
 /// refuse it with `LM-1001` and leave the document untouched.
 #[tokio::test]
 async fn config_document_writes_cannot_name_an_unresolvable_signing_key() {
+    const UNSET: &str = "BILLING_WEBHOOK_SECRET_UNSET_FOR_CONFIG_DOC";
     let operator_doc = format!("{CONFIG_TOML}\n[auth]\nenabled = true\n");
     let h = spawn_admin_with_webhook_guard(&operator_doc).await;
-    const UNSET: &str = "BILLING_WEBHOOK_SECRET_UNSET_FOR_CONFIG_DOC";
 
     let hash = h.current_hash().await;
     let response = h
