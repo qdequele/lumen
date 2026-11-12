@@ -317,3 +317,77 @@ when a new breaker would take the map past 1024 entries. Such a breaker is
 identical to the one its next request would create, so eviction never loses an
 open or half-open circuit or a failure streak. The request-path lookup now
 borrows the link's provider, group and model instead of allocating a key.
+
+---
+
+## Amendment - 2026-11-12: sub-batch retry for split embedding requests
+
+An embedding request with more inputs than the provider's `max_batch_size` is
+split into sub-batches (`embed_batched`, `crates/providers/src/batch.rs`). The
+first sub-batch error failed the whole request and dropped the sub-responses
+already received; the executor's retry then started again from the first
+input. For the single-input providers (`max_batch_size() = 1`: Bedrock,
+Vertex) a 1,000-input request is 1,000 upstream calls, so a 429 on call 900
+re-sent, and re-billed, the 899 that had succeeded, and sent them into an
+upstream that had just asked for less traffic.
+
+### Decision
+
+`embed_batched` retries a failed sub-batch on its own, inside the request, and
+keeps the completed sub-responses. The retry sits below the executor: it is
+one more reason a provider call takes longer, not a second resilience layer.
+
+- **Classification**: `ProviderError::is_retryable()`, the same single source
+  of truth as the executor's retry (429, 5xx, timeouts, unreachable). A client
+  error (4xx, translation, context length, content filter) and a cancellation
+  are returned at once.
+- **Backoff**: the executor's formula, `base * 2^n` capped at `max` with equal
+  jitter, floored at the upstream `Retry-After`. The `providers` crate does not
+  depend on `router`, so the pure function and the splitmix64 jitter are
+  repeated in `batch.rs` (a few lines, unit-tested against the same bounds).
+- **Bounds** (`SubBatchRetry`, defaults in brackets): at most `max_attempts`
+  [3] upstream calls per sub-batch, and at most `max_total_backoff` [10 s] of
+  waiting per request, all sub-batches together. A wait that does not fit in
+  what is left of that budget (a long `Retry-After` included) is not started:
+  the error is returned, hint intact, and the executor's retry, fallback and
+  `resilience.retry_after_max_ms` decide what to do with it, as before.
+- **The wait pauses the whole request.** A sub-batch that has to wait extends
+  a pause shared by every sub-batch of the request, and no sub-batch sends
+  anything before the pause ends. The budget is charged for the time added to
+  the pause, so it is wall-clock time: concurrent sub-batches that are rate
+  limited together wait once, not once each. Without the shared pause the
+  other concurrency slots would keep calling a rate-limited upstream while
+  one slot backed off.
+- **Concurrency is not multiplied.** A sub-batch retries inside its own
+  future, so it keeps its slot of the `buffered(concurrency)` stream while it
+  waits and when it calls again. The number of upstream calls in flight never
+  exceeds `concurrency` (4 from the server), whatever fails.
+- **Cancellation**: the pause races the request `CancellationToken`; a client
+  disconnect returns `ProviderError::Cancelled` and nothing more is sent.
+- **Scope**: only a request that was split. A request that fits in one
+  upstream call is not retried here: nothing would be saved.
+
+### Consequences
+
+- One logical request still records **one** breaker outcome per link:
+  sub-batch retries are invisible to the breaker, like the executor's own
+  retries. A sub-batch that fails for good fails the request with its error,
+  and the executor then retries or falls over as before; that retry does
+  start from the first input (completed sub-responses cannot be reused on
+  another model, and are not kept across executor attempts). The worst case
+  for one stubborn sub-batch is therefore `max_attempts` calls per executor
+  attempt.
+- The sub-batch waits run inside the executor's per-attempt first-token
+  timeout, which bounds a non-streaming call as a whole. The 10 s budget is
+  sized against its 30 s default; an operator who lowers
+  `first_token_timeout_ms` below it gets `LM-3011` first.
+- Each sub-batch request is cloned once (the copy a retry needs to send
+  again); the last attempt allowed moves the original. A request that is not
+  split is not cloned.
+- The policy is fixed in code for now. `embed_batched_with` takes a
+  `SubBatchRetry`, so wiring it to the per-provider `[resilience]` settings
+  (an operator who disables retries still gets the sub-batch retry today) is a
+  server-side change with no further design needed.
+- Still open: the upstream usage of a failed executor attempt is lost to
+  accounting (the sub-responses of an attempt that fails for good are
+  dropped). Partial results stay rejected for v1.

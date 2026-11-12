@@ -1873,3 +1873,102 @@ async fn bedrock_cohere_embeds_one_vector_per_multipart_item() {
     let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
     assert_eq!(body["texts"], json!(["solo", "foo\nbar"]));
 }
+
+// --------------------------------------------------------------------------
+// Sub-batch retry (ADR 005, 2026-11-12 amendment)
+// --------------------------------------------------------------------------
+
+/// Mount a response that answers only the first request it sees, ahead of
+/// the fixture's echo.
+async fn mount_once(mock: &MockServer, template: ResponseTemplate) {
+    Mock::given(method("POST"))
+        .respond_with(template)
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(mock)
+        .await;
+}
+
+/// 65 inputs on TEI (32 per call) are 3 upstream calls. One of them is rate
+/// limited once: it alone is sent again, and the request succeeds with every
+/// vector in input order, instead of failing and re-running all three.
+#[tokio::test]
+async fn rate_limited_sub_batch_is_retried_without_resending_the_others() {
+    let mock = MockServer::start().await;
+    mount_once(&mock, ResponseTemplate::new(429)).await;
+    TeiEmbedFixture.mount_echo(&mock).await;
+    let provider = TeiEmbedFixture.build(mock.uri());
+
+    let texts: Vec<String> = (0..65).map(|i| i.to_string()).collect();
+    let resp = batch::embed_batched(
+        &*provider,
+        batch_request(texts),
+        &CancellationToken::new(),
+        4,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(resp.data.len(), 65);
+    for (i, d) in resp.data.iter().enumerate() {
+        assert_eq!(d.index as usize, i);
+        assert_eq!(d.embedding[0], i as f32, "embedding out of order at {i}");
+    }
+    // 3 sub-batches + the one retry.
+    let calls = mock.received_requests().await.unwrap().len();
+    assert_eq!(calls, 4, "expected 4 upstream calls, got {calls}");
+}
+
+/// A client error on a sub-batch is returned as is: never sent again.
+#[tokio::test]
+async fn client_error_on_a_sub_batch_is_not_retried() {
+    let mock = MockServer::start().await;
+    mount_once(&mock, ResponseTemplate::new(400)).await;
+    TeiEmbedFixture.mount_echo(&mock).await;
+    let provider = TeiEmbedFixture.build(mock.uri());
+
+    let texts: Vec<String> = (0..65).map(|i| i.to_string()).collect();
+    let err = batch::embed_batched(
+        &*provider,
+        batch_request(texts),
+        &CancellationToken::new(),
+        4,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(!err.is_retryable(), "{err:?}");
+    let calls = mock.received_requests().await.unwrap().len();
+    assert!(calls <= 3, "a client error was retried: {calls} calls");
+}
+
+/// A client disconnect while a sub-batch waits out a `Retry-After` ends the
+/// request at once, and nothing more is sent upstream.
+#[tokio::test]
+async fn cancellation_during_a_sub_batch_backoff_stops_the_request() {
+    let mock = MockServer::start().await;
+    mount_status(&mock, 429, Some("5")).await;
+    let provider = TeiEmbedFixture.build(mock.uri());
+
+    let cancel = CancellationToken::new();
+    let canceller = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        canceller.cancel();
+    });
+
+    let texts: Vec<String> = (0..65).map(|i| i.to_string()).collect();
+    let started = Instant::now();
+    let err = batch::embed_batched(&*provider, batch_request(texts), &cancel, 4)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, ProviderError::Cancelled), "{err:?}");
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "cancellation did not interrupt the backoff: {:?}",
+        started.elapsed()
+    );
+    let calls = mock.received_requests().await.unwrap().len();
+    assert!(calls <= 3, "calls were sent during the pause: {calls}");
+}
