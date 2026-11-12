@@ -1327,6 +1327,19 @@ impl AuthState {
         }
         out
     }
+
+    /// Mark groups dirty again after a failed persist of what
+    /// [`drain_dirty_groups`](Self::drain_dirty_groups) returned: the drain
+    /// cleared their flags, so without this an idle group would never be
+    /// flushed again and its pool spend would be lost at the next boot. An id
+    /// no longer live (deleted meanwhile; the delete flushed it) is skipped.
+    pub fn mark_groups_dirty<'a>(&self, ids: impl IntoIterator<Item = &'a str>) {
+        for id in ids {
+            if let Some(entry) = self.groups.get(id) {
+                entry.dirty.store(true, Ordering::SeqCst);
+            }
+        }
+    }
 }
 
 /// One key's contribution to a budget flush (ADR 015).

@@ -245,3 +245,38 @@ async fn a_flush_that_waited_for_the_guard_stamps_the_time_it_ran() {
         released_ms - created_ms
     );
 }
+
+#[tokio::test]
+async fn a_failed_group_flush_is_retried_even_when_the_group_goes_idle() {
+    let (rt, plain, group_id) = runtime(false, true).await;
+    spend(&rt, &plain, 250_000);
+    let group_spent = || async {
+        sqlx::query("SELECT budget_spent FROM budget_groups WHERE id = ?")
+            .bind(&group_id)
+            .fetch_one(rt.store.pool())
+            .await
+            .unwrap()
+            .get::<f64, _>("budget_spent")
+    };
+
+    // The group write fails once (the key write is unaffected).
+    sqlx::query(
+        "CREATE TRIGGER fail_group_flush BEFORE UPDATE ON budget_groups \
+         BEGIN SELECT RAISE(ABORT, 'group flush refused'); END",
+    )
+    .execute(rt.store.pool())
+    .await
+    .unwrap();
+    assert!(flush_budgets(&rt).await, "the key flush still commits");
+    assert_eq!(group_spent().await, 0.0);
+
+    // The store recovers, and the group sees NO further traffic: the drained
+    // pool spend must still reach the database on the next flush (the
+    // shutdown flush is exactly this), or boot reloads a stale lower spend.
+    sqlx::query("DROP TRIGGER fail_group_flush")
+        .execute(rt.store.pool())
+        .await
+        .unwrap();
+    assert!(flush_budgets(&rt).await);
+    assert_eq!(group_spent().await, 0.25);
+}
