@@ -1605,6 +1605,66 @@ async fn voyage_embed_reports_upstream_total_tokens_as_prompt_tokens() {
     assert_eq!(resp.usage.estimated, None);
 }
 
+/// An OpenAI-compatible upstream may list `data` in any order: `index` is what
+/// ties a vector to its input. Across sub-batches the gateway must place each
+/// vector by that upstream index, not by its position in the array.
+#[tokio::test]
+async fn batched_reassembly_follows_the_upstream_index() {
+    // Like `OpenAiEcho`, but `data` is reversed (each entry keeps its index).
+    struct ReversedEcho;
+    impl Respond for ReversedEcho {
+        fn respond(&self, request: &Request) -> ResponseTemplate {
+            let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
+            let inputs = extract_inputs(&body["input"]);
+            let mut data: Vec<Value> = inputs
+                .iter()
+                .enumerate()
+                .map(|(i, s)| {
+                    let val: f32 = s.parse().unwrap_or(f32::NAN);
+                    json!({ "object": "embedding", "index": i, "embedding": [val] })
+                })
+                .collect();
+            data.reverse();
+            let n = inputs.len();
+            ResponseTemplate::new(200).set_body_json(json!({
+                "object": "list",
+                "data": data,
+                "model": "test-model",
+                "usage": { "prompt_tokens": n, "total_tokens": n }
+            }))
+        }
+    }
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ReversedEcho)
+        .mount(&mock)
+        .await;
+    let provider = OpenAiFixture.build(mock.uri());
+    let n = provider.max_batch_size() + 3;
+    let texts: Vec<String> = (0..n).map(|i| i.to_string()).collect();
+
+    let resp = batch::embed_batched(
+        &*provider,
+        batch_request(texts),
+        &CancellationToken::new(),
+        4,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(resp.data.len(), n);
+    for (i, item) in resp.data.iter().enumerate() {
+        assert_eq!(item.index as usize, i);
+        #[allow(clippy::cast_precision_loss)] // small test indices
+        let expected = i as f32;
+        assert!(
+            (item.embedding[0] - expected).abs() < f32::EPSILON,
+            "position {i} holds the vector of input {}",
+            item.embedding[0]
+        );
+    }
+}
+
 /// Ollama is keyless by default (no `Authorization` header), but a configured
 /// key is sent as bearer auth and never appears in `Debug`.
 #[tokio::test]

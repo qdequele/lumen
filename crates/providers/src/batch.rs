@@ -7,7 +7,9 @@
 
 use futures::stream::{self, StreamExt, TryStreamExt};
 use lumen_core::ProviderError;
-use lumen_core::{EmbedInput, EmbedRequest, EmbedResponse, EmbedUsage, EmbeddingProvider};
+use lumen_core::{
+    EmbedData, EmbedInput, EmbedRequest, EmbedResponse, EmbedUsage, EmbeddingProvider,
+};
 use tokio_util::sync::CancellationToken;
 
 /// Default number of sub-batches sent concurrently.
@@ -96,7 +98,35 @@ pub async fn embed_batched(
         .try_collect()
         .await?;
 
-    Ok(reassemble(responses, total_inputs, &model))
+    reassemble(responses, total_inputs, &model)
+}
+
+/// Put one sub-response's vectors in input order using the upstream `index`.
+///
+/// The upstream `index` (not the position in `data`) says which input a vector
+/// belongs to, so a sub-response is sorted by it before the global re-index.
+/// The indices must then be exactly `0..n`: a duplicate or a gap means the
+/// vectors cannot be matched to their inputs, which is the upstream's fault
+/// (a 502-class [`ProviderError::Translation`], LM-3002). The common case
+/// (already in order) is a single pass with no sort.
+fn order_by_upstream_index(data: &mut [EmbedData]) -> Result<(), ProviderError> {
+    let in_order = |data: &[EmbedData]| {
+        data.iter()
+            .enumerate()
+            .all(|(position, item)| item.index as usize == position)
+    };
+    if in_order(data) {
+        return Ok(());
+    }
+    data.sort_unstable_by_key(|item| item.index);
+    if in_order(data) {
+        Ok(())
+    } else {
+        Err(ProviderError::Translation(format!(
+            "embedding index values are not a permutation of 0..{}",
+            data.len()
+        )))
+    }
 }
 
 /// Reject a response whose embedding count does not match the number of inputs
@@ -123,6 +153,12 @@ fn chunk_vec<T>(items: Vec<T>, size: usize) -> impl Iterator<Item = Vec<T>> {
 }
 
 /// Concatenate sub-responses in order, re-index globally, and sum usage.
+/// Within a sub-response the upstream `index` decides the order (see
+/// [`order_by_upstream_index`]), never the arrival position.
+///
+/// # Errors
+/// [`ProviderError::Translation`] when a sub-response's indices are not a
+/// permutation of `0..n`.
 ///
 /// Usage is summed ONLY when every sub-batch reported upstream usage. If any
 /// sub-batch reported none (`prompt_tokens == 0`, e.g. Gemini's optional
@@ -134,7 +170,7 @@ fn reassemble(
     responses: Vec<EmbedResponse>,
     total_inputs: usize,
     requested_model: &str,
-) -> EmbedResponse {
+) -> Result<EmbedResponse, ProviderError> {
     let mut data = Vec::with_capacity(total_inputs);
     let mut usage = EmbedUsage::default();
     let mut model = String::new();
@@ -143,7 +179,8 @@ fn reassemble(
     // Every sub-batch must have reported usage for the sum to be exact.
     let all_reported = responses.iter().all(|r| r.usage.prompt_tokens > 0);
 
-    for resp in responses {
+    for mut resp in responses {
+        order_by_upstream_index(&mut resp.data)?;
         if model.is_empty() {
             model = resp.model;
         }
@@ -167,19 +204,19 @@ fn reassemble(
         requested_model.clone_into(&mut model);
     }
 
-    EmbedResponse {
+    Ok(EmbedResponse {
         object: "list".to_owned(),
         data,
         model,
         usage,
-    }
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use lumen_core::{EmbedData, EmbeddingEncoding};
+    use lumen_core::EmbeddingEncoding;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// A configurable embedding provider that never touches the network.
@@ -190,7 +227,21 @@ mod tests {
         /// `usage.prompt_tokens` to report per call, in call order; `0` means
         /// "reported no usage". Missing entries default to `0`.
         usage: Vec<u32>,
+        /// How each response's `data` is laid out relative to its inputs.
+        layout: Layout,
         calls: AtomicUsize,
+    }
+
+    /// Shape of the mock's `data` array. Each vector is `[input as f32]`, so a
+    /// test can tell which input a returned vector belongs to.
+    #[derive(Clone, Copy)]
+    enum Layout {
+        /// In input order, `index` == position.
+        InOrder,
+        /// Correct `index` on every entry, but the array is reversed.
+        Reversed,
+        /// Every entry claims `index: 0`.
+        AllZero,
     }
 
     impl MockProvider {
@@ -199,8 +250,14 @@ mod tests {
                 max_batch,
                 short,
                 usage,
+                layout: Layout::InOrder,
                 calls: AtomicUsize::new(0),
             }
+        }
+
+        fn with_layout(mut self, layout: Layout) -> Self {
+            self.layout = layout;
+            self
         }
     }
 
@@ -218,14 +275,24 @@ mod tests {
             } else {
                 asked
             };
-            let data = (0..n)
-                .map(|i| EmbedData {
+            let mut data: Vec<EmbedData> = req
+                .input
+                .iter()
+                .take(n)
+                .enumerate()
+                .map(|(i, text)| EmbedData {
                     object: "embedding".to_owned(),
-                    index: u32::try_from(i).unwrap_or(u32::MAX),
-                    embedding: vec![0.0_f32],
+                    index: match self.layout {
+                        Layout::AllZero => 0,
+                        Layout::InOrder | Layout::Reversed => u32::try_from(i).unwrap_or(u32::MAX),
+                    },
+                    embedding: vec![text.parse::<f32>().unwrap_or(f32::NAN)],
                     encoding: EmbeddingEncoding::default(),
                 })
                 .collect();
+            if matches!(self.layout, Layout::Reversed) {
+                data.reverse();
+            }
             let prompt = self.usage.get(call).copied().unwrap_or(0);
             Ok(EmbedResponse {
                 object: "list".to_owned(),
@@ -302,6 +369,36 @@ mod tests {
         assert_eq!(resp.usage.total_tokens, 0);
         // reassemble never flags the estimate itself; the server does.
         assert_eq!(resp.usage.estimated, None);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::float_cmp)] // the mock echoes small integers exactly
+    async fn sub_batches_are_reassembled_by_upstream_index_not_arrival_order() {
+        // 5 inputs, max_batch 2 => [0,1] [2,3] [4]; every sub-response lists
+        // its vectors in reverse with the right `index`. The vector at global
+        // position i must be the one for input i.
+        let provider = MockProvider::new(2, false, vec![1, 1, 1]).with_layout(Layout::Reversed);
+        let resp = embed_batched(&provider, batch_of(5), &CancellationToken::new(), 4)
+            .await
+            .unwrap();
+        let indices: Vec<u32> = resp.data.iter().map(|d| d.index).collect();
+        assert_eq!(indices, vec![0, 1, 2, 3, 4]);
+        let values: Vec<f32> = resp.data.iter().map(|d| d.embedding[0]).collect();
+        assert_eq!(values, vec![0.0, 1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[tokio::test]
+    async fn sub_batch_indices_that_are_not_a_permutation_are_a_translation_error() {
+        // Each two-item sub-response claims `index: 0` twice: there is no way
+        // to tell which vector belongs to which input.
+        let provider = MockProvider::new(2, false, vec![1, 1]).with_layout(Layout::AllZero);
+        let err = embed_batched(&provider, batch_of(4), &CancellationToken::new(), 4)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ProviderError::Translation(ref m) if m.contains("index")),
+            "expected Translation, got {err:?}"
+        );
     }
 
     #[tokio::test]
