@@ -833,6 +833,9 @@ pub struct AuthState {
     retired: std::sync::Mutex<Vec<Arc<KeyEntry>>>,
     /// Serializes flushers; see [`flush_guard`](Self::flush_guard).
     flush_lock: tokio::sync::Mutex<()>,
+    /// Orders admin key/group mutations against the hot reload's table
+    /// refresh; see [`sync_guard`](Self::sync_guard).
+    sync_lock: tokio::sync::Mutex<()>,
 }
 
 impl AuthState {
@@ -1171,6 +1174,24 @@ impl AuthState {
         if !retired.iter().any(|known| Arc::ptr_eq(known, &entry)) {
             retired.push(entry);
         }
+    }
+
+    /// Order the writers of the key and group tables against each other.
+    ///
+    /// Two kinds of caller change both the database and this in-memory state:
+    /// an admin mutation (database write, then in-memory apply) and the hot
+    /// reload's refresh (database read, then in-memory upsert). Each must hold
+    /// this guard across its whole pair. Without it a refresh can read a
+    /// snapshot, lose the race to an admin delete or patch, and then upsert
+    /// the stale snapshot over the completed mutation: a deleted key
+    /// authenticates again until the next restart, a disabled key is
+    /// re-enabled, a lowered budget is raised back.
+    ///
+    /// Never taken on the request path: authentication and admission stay
+    /// lock-free. Do not await a flush while holding it (a flush takes
+    /// [`flush_guard`](Self::flush_guard) and writes to the database).
+    pub async fn sync_guard(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.sync_lock.lock().await
     }
 
     /// Serialize flushers. Every flush (periodic, shutdown, admin) must hold

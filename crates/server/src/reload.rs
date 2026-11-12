@@ -511,6 +511,44 @@ pub fn spawn_config_reloader(
     Ok(handle)
 }
 
+/// Re-read the virtual-key and budget-group tables and upsert them into the
+/// in-memory state, so entries created offline (e.g. `lumen keys create`
+/// straight against the DB) become live. Groups refresh FIRST so the key pass
+/// can resolve its group pointers (ADR 009). New entries are inserted;
+/// existing ones only have their limits re-applied and keep their in-memory
+/// spend. A DB error keeps the current tables (a sick DB never locks anyone
+/// out).
+///
+/// The whole read-then-upsert runs under [`AuthState::sync_guard`], the guard
+/// every admin key/group mutation holds across its own DB write and in-memory
+/// apply. A mutation therefore lands entirely before the read (the snapshot
+/// already contains it) or entirely after the upsert (it overwrites the
+/// snapshot): a stale snapshot can never undo a completed delete, disable or
+/// budget change. Runs in the reload task, never on the request path.
+///
+/// [`AuthState::sync_guard`]: lumen_auth::state::AuthState::sync_guard
+pub async fn refresh_auth_tables(runtime: &crate::auth::AuthRuntime) {
+    let _sync = runtime.keys.sync_guard().await;
+    match runtime.store.load_groups().await {
+        Ok(groups) => runtime.keys.upsert_groups(&groups),
+        Err(error) => tracing::warn!(
+            %error,
+            "budget-group refresh failed; keeping the current in-memory group table"
+        ),
+    }
+    match runtime.store.load_auth_entries().await {
+        Ok(entries) => {
+            for (hash, record) in entries {
+                runtime.keys.upsert(hash, &record);
+            }
+        }
+        Err(error) => tracing::warn!(
+            %error,
+            "virtual-key refresh failed; keeping the current in-memory key table"
+        ),
+    }
+}
+
 /// Run one reload: load and validate the current document via
 /// `ctx.load_config()`, refresh the DB provider-key snapshot for its providers
 /// (async, in this task, off the request path), then apply it on a blocking
@@ -522,32 +560,8 @@ pub fn spawn_config_reloader(
 /// extended to the whole document). Public so the boot path and the tests
 /// share exactly one reload entry point.
 pub async fn reload_once(ctx: &Arc<ConfigContext>, targets: &Arc<ReloadTargets>) {
-    // Virtual keys and budget groups created offline (e.g. `lumen keys
-    // create` straight against the DB) become live here: re-read the tables
-    // and upsert into the in-memory state. Groups refresh FIRST so the key
-    // pass can resolve its group pointers (ADR 009). New entries are
-    // inserted; existing ones only have their limits re-applied and keep
-    // their in-memory spend. A DB error keeps the current tables (a sick DB
-    // never locks anyone out).
     if let Some(runtime) = &targets.auth_runtime {
-        match runtime.store.load_groups().await {
-            Ok(groups) => runtime.keys.upsert_groups(&groups),
-            Err(error) => tracing::warn!(
-                %error,
-                "budget-group refresh failed; keeping the current in-memory group table"
-            ),
-        }
-        match runtime.store.load_auth_entries().await {
-            Ok(entries) => {
-                for (hash, record) in entries {
-                    runtime.keys.upsert(hash, &record);
-                }
-            }
-            Err(error) => tracing::warn!(
-                %error,
-                "virtual-key refresh failed; keeping the current in-memory key table"
-            ),
-        }
+        refresh_auth_tables(runtime).await;
     }
     // The webhook config and its sealed signing secret live in the same DB;
     // refresh the cache the synchronous resolve below reads (ADR 011
