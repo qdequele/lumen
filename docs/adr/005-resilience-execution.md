@@ -257,3 +257,18 @@ the server from the link's own provider next to `Link::retry` (ADR 021), and
 the executor uses `link.first_token.unwrap_or(config.first_token)` for each
 attempt. The **total** timeout stays per request, resolved from the primary: it
 is one deadline over the whole chain.
+
+---
+
+## Amendment - 2026-11-12: the total timeout is attributed to the link in flight
+
+`LM-3013` named the first link of the chain whatever link was running when the
+total deadline fired, and that link's breaker got no outcome (a half-open probe
+was left to the auto-rearm described under *Half-open cannot wedge*). The
+executor now tracks the link being called outside the timeout envelope. When
+the deadline fires, `LM-3013` names that link's provider and its breaker
+records one failure, like a first-token or read timeout: the retry loop never
+sleeps past the deadline (ADR 021), so the deadline can only fire while that
+link's call is pending. A half-open probe cut by the total timeout therefore
+reopens the circuit at once; the auto-rearm remains for probes lost to a client
+disconnect.
