@@ -165,12 +165,10 @@ pub async fn rerank_handler(
     let search_units = settle_search_units(&mut response, estimated_units);
     let (tokens_in, tokens_in_estimated) = settle_tokens(&mut response, estimated_tokens);
 
-    // Cost: search units, plus input tokens for models priced per token
-    // (`cost_per_1m_input`; zero for the search-unit-only rerankers).
-    let cost = pricing.search_cost(&executed.model_used, search_units)
-        + pricing.token_cost(&executed.model_used, tokens_in, 0);
-
-    // Settle accounting (ADR 003). Upstream-reported token counts (Jina,
+    // Settle accounting (ADR 003). The cost is search units, plus input
+    // tokens for models priced per token (`cost_per_1m_input`; zero for the
+    // search-unit-only rerankers), computed from the count that is settled.
+    // Upstream-reported token counts (Jina,
     // Voyage) settle inline, unflagged - there is nothing to refine. A
     // gateway-estimated count settles inline with the byte heuristic; when the
     // opt-in accurate tokenizer refines this model, the close is instead
@@ -195,6 +193,9 @@ pub async fn rerank_handler(
                 .refine_rerank(&model, query, docs)
                 .await
                 .unwrap_or(estimated_tokens);
+            // Price the count that is settled, not the heuristic it replaced.
+            let cost = pricing.search_cost(&model, search_units)
+                + pricing.token_cost(&model, tokens_in, 0);
             accounting.finish(&Outcome {
                 tokens_in,
                 tokens_out: 0,
@@ -208,6 +209,8 @@ pub async fn rerank_handler(
             });
         });
     } else {
+        let cost = pricing.search_cost(&executed.model_used, search_units)
+            + pricing.token_cost(&executed.model_used, tokens_in, 0);
         accounting.finish(&Outcome {
             tokens_in,
             tokens_out: 0,

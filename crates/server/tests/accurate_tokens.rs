@@ -272,3 +272,97 @@ async fn rerank_metrics_get_the_accurate_count_via_the_deferred_close() {
     // (Heuristic would be 3 + 3 = 6.)
     wait_for_tokens(&base, "rerank", "input", 4.0).await;
 }
+
+/// The deferred rerank close prices the tokens it settles: the refined count,
+/// not the heuristic one it replaced (as chat and embeddings do).
+#[tokio::test]
+async fn rerank_refinement_recomputes_the_cost_from_the_refined_count() {
+    use figment::providers::Format as _;
+    use lumen_auth::store::KeyStore;
+    use lumen_auth::usage::{spawn_usage_writer, UsageWriterConfig};
+    use lumen_server::config::Config;
+    use lumen_server::pricing::CostTable;
+
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v2/rerank"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "results": [{ "index": 0, "relevance_score": 0.5 }]
+        })))
+        .mount(&upstream)
+        .await;
+
+    // $1 per input token, no search-unit price: the cost is the token count.
+    let toml = format!(
+        r#"
+        [[providers]]
+        name = "cohere"
+        kind = "cohere"
+        base_url = "{}"
+        [[providers.models]]
+        id = "gpt-4o-rerank"
+        upstream_id = "rerank-v3.5"
+        capabilities = ["rerank"]
+        cost_per_1m_input = 1000000.0
+        "#,
+        upstream.uri()
+    );
+    let config: Config = figment::Figment::new()
+        .merge(figment::providers::Toml::string(&toml))
+        .extract()
+        .expect("valid config");
+    let registry = Arc::new(
+        Registry::build(
+            config.provider_specs(),
+            http::build_client(),
+            Duration::from_secs(300),
+        )
+        .expect("registry builds"),
+    );
+    let store = KeyStore::in_memory().await.expect("open store");
+    let (logger, _writer) = spawn_usage_writer(
+        store.clone(),
+        UsageWriterConfig {
+            capacity: 64,
+            batch_max: 500,
+            flush_interval: Duration::from_millis(25),
+        },
+    );
+    let counter = Arc::new(TokenCounter::from_config(&TokenizerConfig {
+        mode: TokenizerMode::Accurate,
+    }));
+    let state = common::base_state(registry)
+        .with_token_counter(counter)
+        .with_pricing(CostTable::from_config(&config))
+        .with_usage(logger);
+    let base = common::spawn_state(state, LIMIT).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/rerank"))
+        .json(&json!({
+            "model": "gpt-4o-rerank",
+            "query": "hello world",
+            "documents": ["hello world"]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let mut rows = Vec::new();
+    for _ in 0..250 {
+        rows = store
+            .usage_export(0, i64::MAX, None, 10, None)
+            .await
+            .expect("usage rows");
+        if !rows.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(rows.len(), 1, "one usage row");
+    // Accurate: query(2) x 1 document + document(2) = 4 tokens, so $4.
+    // (The heuristic count is 6, which would cost $6.)
+    assert_eq!(rows[0].tokens_in, 4);
+    assert!((rows[0].cost - 4.0).abs() < 1e-9, "cost: {}", rows[0].cost);
+}
