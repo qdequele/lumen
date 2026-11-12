@@ -421,6 +421,71 @@ async fn jina_multi_text_part_item_joins_fragments_with_newline() {
     assert_eq!(body["input"][0]["text"], "The quick brown\nfox jumps");
 }
 
+/// Voyage's `/embeddings` is not the OpenAI schema: the width is
+/// `output_dimension`, there is no `user`, and `encoding_format` only accepts
+/// `base64`. The text path sends an explicit body with Voyage's own fields,
+/// never the raw OpenAI request.
+#[tokio::test]
+async fn voyage_text_path_sends_only_fields_voyage_accepts() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/embeddings"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "object": "list",
+            "data": [{ "object": "embedding", "index": 0, "embedding": [0.1] }],
+            "model": "voyage-3.5",
+            "usage": { "total_tokens": 2 }
+        })))
+        .mount(&upstream)
+        .await;
+    let provider: Arc<dyn EmbeddingProvider> = Arc::new(VoyageProvider::new(
+        http::build_client(),
+        "voyage-test",
+        Some(upstream.uri()),
+        Some("sk-x".to_owned()),
+    ));
+
+    let req = EmbedRequest {
+        model: "voyage-3.5".to_owned(),
+        input: EmbedInput::Batch(vec!["hello".to_owned()]),
+        encoding_format: Some("float".to_owned()),
+        dimensions: Some(512),
+        user: Some("end-user-1".to_owned()),
+        extra: serde_json::Map::new(),
+    };
+    provider.embed(req, CancellationToken::new()).await.unwrap();
+    assert_eq!(
+        sent_body(&upstream).await,
+        json!({ "model": "voyage-3.5", "input": ["hello"], "output_dimension": 512 })
+    );
+
+    // A single string stays a string; no width is sent when none was asked.
+    upstream.reset().await;
+    Mock::given(method("POST"))
+        .and(path("/embeddings"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "object": "list",
+            "data": [{ "object": "embedding", "index": 0, "embedding": [0.1] }],
+            "model": "voyage-3.5",
+            "usage": { "total_tokens": 2 }
+        })))
+        .mount(&upstream)
+        .await;
+    let req = EmbedRequest {
+        model: "voyage-3.5".to_owned(),
+        input: EmbedInput::Single("hello".to_owned()),
+        encoding_format: None,
+        dimensions: None,
+        user: None,
+        extra: serde_json::Map::new(),
+    };
+    provider.embed(req, CancellationToken::new()).await.unwrap();
+    assert_eq!(
+        sent_body(&upstream).await,
+        json!({ "model": "voyage-3.5", "input": "hello" })
+    );
+}
+
 /// A requested `dimensions` reaches Cohere's multimodal body as
 /// `output_dimension` (embed-v4), and is omitted when unset.
 #[tokio::test]

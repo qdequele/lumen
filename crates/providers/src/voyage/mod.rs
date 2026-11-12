@@ -1,7 +1,9 @@
 //! Voyage AI provider - embeddings and reranking.
 //!
-//! Voyage's embeddings endpoint is OpenAI-compatible (near-passthrough). Its
-//! rerank endpoint differs from Cohere's in two field names: the request uses
+//! Voyage's embeddings endpoint returns an OpenAI-shaped response, but its
+//! request has its own field set (`output_dimension` rather than `dimensions`,
+//! no `user`), so the body is built explicitly. Its rerank endpoint differs
+//! from Cohere's in two field names: the request uses
 //! `top_k` (not `top_n`) and the response nests results under `data` (not
 //! `results`). Voyage bills reranking in tokens, so `usage.search_units` is
 //! reported as `0`; `usage.total_tokens` carries Voyage's reported token
@@ -120,6 +122,20 @@ impl VoyageProvider {
     }
 }
 
+/// Voyage `/embeddings` (text) request body: only fields Voyage documents.
+/// `user` has no Voyage equivalent, and `encoding_format` is not forwarded
+/// (Voyage accepts only `base64` there; the gateway re-encodes the output at
+/// the request edge, so floats are always what it needs from the upstream).
+#[derive(Serialize)]
+struct VoyageEmbedRequest<'a> {
+    model: &'a str,
+    /// A string or an array of strings (token inputs are rejected up front).
+    input: &'a EmbedInput,
+    /// Voyage's name for `dimensions`; omitted when the client sets none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_dimension: Option<u32>,
+}
+
 /// Voyage `/multimodalembeddings` request body.
 #[derive(Serialize)]
 struct VoyageMultiRequest<'a> {
@@ -207,8 +223,8 @@ impl EmbeddingProvider for VoyageProvider {
         crate::mapping::reject_pretokenized_input(&self.provider_name, &req.input)?;
 
         // Multimodal (content-parts) requests go to Voyage's dedicated
-        // `/multimodalembeddings` endpoint; text-only requests stay on the
-        // OpenAI-compatible near-passthrough path.
+        // `/multimodalembeddings` endpoint; text-only requests go to
+        // `/embeddings`.
         if let EmbedInput::Multi(items) = &req.input {
             return self
                 .embed_multimodal(&req.model, items, req.dimensions, &cancel)
@@ -230,11 +246,20 @@ impl EmbeddingProvider for VoyageProvider {
                     .await;
             }
         }
+        // Voyage's `/embeddings` is OpenAI-shaped on the way out only: the
+        // request has its own field set (`output_dimension`, no `user`, and an
+        // `encoding_format` that only accepts `base64`), so build an explicit
+        // body instead of forwarding the OpenAI request verbatim.
         let url = format!("{}/embeddings", self.base_url);
+        let body = VoyageEmbedRequest {
+            model: &req.model,
+            input: &req.input,
+            output_dimension: req.dimensions,
+        };
         let bytes = post_json(
             &self.client,
             &url,
-            &req,
+            &body,
             self.api_key.as_deref(),
             &self.provider_name,
             &cancel,
