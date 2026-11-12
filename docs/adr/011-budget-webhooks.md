@@ -1,7 +1,8 @@
 # ADR 011 - Outbound webhooks for budget events
 
 - Status: accepted
-- Date: 2026-08-25 (amended 2026-08-26: admin control surface)
+- Date: 2026-08-25 (amended 2026-08-26: admin control surface; amended
+  2026-11-12: a threshold is fired only when its event was emitted)
 - Tracking issue: #146
 
 ## Context
@@ -246,6 +247,51 @@ reports key presence without key material.
 Detection, edge-triggering, payload construction, at-least-once delivery,
 idempotency and the "never on the request path" guarantee are all untouched.
 The admin surface configures the pipeline; it is not part of it.
+
+## Amendment 2026-11-12: a threshold is fired only when its event was emitted
+
+§1 says each threshold fires once per budget epoch. The per-subject state
+behind that is a count of the thresholds already fired. Two code paths used
+to raise that count without emitting anything, which could lose an event for
+good. The rule is now: **a threshold is recorded as fired only by the settle
+that emits its event.**
+
+- **Re-arming only lowers the fired count.** A grant or a `PATCH` that
+  changes the cap starts a new epoch: the count drops to the number of
+  thresholds the spend still reaches under the new cap, and never rises.
+  Re-arming emits nothing, and the spend it reads includes in-flight
+  reservations, so "reached" at that instant may be a crossing whose settle
+  has not run yet, or one that never happens because the call settles lower.
+- **A cap reduction past a threshold emits on the next settle.** Lowering
+  `budget_max` so that the spend now sits above a threshold leaves that
+  threshold armed. The next settle of that key or group emits
+  `budget.threshold` for it. Before, the reduction marked it fired and the
+  event was never sent.
+- **Re-arming happens only when the cap changed.** A hot reload re-applies
+  every key and group record. A record whose cap is unchanged does not touch
+  the signal state.
+- **A reload that reinstalls identical thresholds does not re-arm.** Every
+  config reload re-applies the webhook settings. When the new policy has the
+  same threshold list and the same `budget.threshold` / `budget.exhausted`
+  switches as the one it replaces, the per-subject state is left alone.
+  Before, each reload reset it against current spend, in-flight reservations
+  included, and could swallow the event of a crossing whose settle was still
+  to come.
+
+One case still marks thresholds fired without an event, on purpose: when a
+policy is installed with no predecessor (boot, first enable) or with a
+different threshold list or different budget-event switches, every subject
+is armed against its current spend. A key loaded at 90 % does not replay 50 %
+and 80 % on its first settle, and a new list is not replayed below the spend
+already reached. At boot no reservation is in flight; on a live process this
+is the accepted cost of changing the list.
+
+`budget.exhausted` is unchanged: it re-arms whenever a cap change leaves the
+subject with headroom.
+
+For receivers: a cap reduction can now produce a `budget.threshold` event
+that earlier versions dropped. Events were already to be treated as
+idempotent signals (§3), so no receiver change is needed.
 
 ## Future work
 

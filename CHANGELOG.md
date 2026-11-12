@@ -6,7 +6,124 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ## [Unreleased]
 
+### Security
+
+- **A hot reload can no longer bring a deleted key back.** A config reload
+  re-reads the key and group tables from the database and then updates the
+  tables in memory. An admin delete, disable or budget change that landed
+  between those two steps was overwritten by the older snapshot: a deleted
+  key authenticated again until the next restart, a disabled key was
+  re-enabled, a lowered budget was raised back. The reload's refresh and
+  every admin key or group write now run one after the other, never
+  interleaved. Nothing is added to the request path: authentication and
+  admission stay lock-free.
+
+- **`image_fetch.allowed_url_prefixes` can no longer be bypassed with dot
+  segments.** The prefix was compared with the URL as the client wrote it,
+  so with `allowed_url_prefixes = ["https://cdn.example.com/tenant-a/"]` a
+  request for `https://cdn.example.com/tenant-a/../tenant-b/x.png` passed
+  and fetched from `tenant-b` (percent-encoded dots too). The check now runs
+  on the parsed URL the request is actually sent to, on the first hop and on
+  every redirect, and a prefix without a trailing slash stops at a path
+  boundary: `https://h/tenant-a` no longer covers `https://h/tenant-ab/` or
+  `https://h.evil.example/`. Image fetches also ignore `HTTP_PROXY` /
+  `HTTPS_PROXY`: a proxy resolves the host itself, which defeated the
+  private-address block and the DNS pin.
+  Upgrade note: image fetches no longer go through environment proxies, so a
+  gateway that reaches image hosts only through a proxy can no longer fetch
+  them. An `allowed_url_prefixes` entry that is not a valid URL now matches
+  nothing; check that every entry is a full `http(s)://` URL.
+
+- **A failed request to an account virtual model no longer puts the team's
+  model id on `/metrics`.** When a request to an account's own virtual model
+  ([ADR 022](docs/adr/022-account-virtual-models.md)) failed before any
+  target served it, `lumen_request_duration_seconds` was labelled with the
+  id the team chose (`model="team/secret-bot"`), visible to anyone who can
+  scrape `/metrics`. The label is now the fixed value `model="account"`.
+
+- **Rejected config writes no longer log document content.** A config write
+  refused at parse or validation logged the full error, which quotes the
+  document (presets can hold operator prompt text). The log line now carries
+  a summary without content (error kind, key path, position); the full
+  message still goes to the client that sent the document. The request body
+  of `PUT /admin/provider-keys/{name}` also prints as `REDACTED` under
+  `Debug`, like the webhook secret body already did.
+
+- **CI workflows run with least-privilege tokens.** Each job declares the
+  permissions it needs, and third-party actions are pinned to a commit SHA.
+
+### Changed
+
+- **Virtual models have size limits.** One virtual model may list at most 64
+  targets, one `when` at most 16 conditions (counted through `any`), and the
+  targets of one model at most 16 `regex` conditions; a `regex` is at most
+  256 bytes long and 64 KiB once compiled. The 64-attempt limit did not
+  bound a `switch` (only its largest branch counts), and every `when` is
+  scanned per request and every regex compiled on each load. The limits
+  apply to platform and account virtual models alike.
+  Upgrade note: a config over a limit is now rejected at validation (the
+  process does not boot, a reload keeps the previous config, a config write
+  is 400 `LM-1001`). Run `lumen --check-config` on your config before
+  upgrading.
+
+- **The upstream is always asked for streaming usage.** On the
+  OpenAI-compatible kinds, a client that sent
+  `stream_options.include_usage: false` got it forwarded, the upstream sent
+  no usage chunk, and the stream settled on the local estimate, flagged
+  `estimated`. `include_usage` is now always `true` upstream; the client's
+  other `stream_options` keys are kept.
+  Upgrade note: a client that sent `include_usage: false` still receives the
+  final usage chunk (an empty `choices` array with `usage`), because the
+  stream is forwarded as the upstream sent it.
+
+- **Streaming does less work per chunk.** Forwarding a chunk no longer
+  allocates or registers a timer (one heartbeat timer per stream instead of
+  one per wait), and a chunk that carries no `usage` object is no longer
+  parsed as JSON for accounting.
+
+- **Embedding vectors and chat prompts are read with fewer copies.** An
+  upstream embedding vector (a float array or a base64 string) is
+  deserialized in one pass, without the intermediate buffer the previous
+  try-each-form decoding built, and the chat token estimate
+  measures a multi-part message without first joining its parts into one
+  string.
+
+- **`GET /admin/keys` and `GET /admin/groups` filter in SQL.** The
+  `external_ref`, `account_ref`, `parent_id` and account-scope filters were
+  applied in memory over every row; they are now part of the query.
+
+- **Idle circuit breakers are evicted.** A breaker is created per (provider,
+  model), and per team key pool, and was kept for the life of the process.
+  Breakers that are closed with no failure streak and not in use are now
+  dropped on a config reload and when the registry grows large. An open or
+  half-open circuit is never evicted.
+
+- **A deprecated model alias is logged once every 10 minutes per alias**,
+  not once per request. `lumen_deprecated_model_alias_total` still counts
+  every request.
+
 ### Fixed
+
+- **A `server.body_limit` above 2 MiB is now honoured.** The JSON extractors
+  kept axum's built-in 2 MiB cap whatever `server.body_limit` said, so with
+  the default 10 MiB limit (or the 32 MiB the decisions docs recommend) a
+  body over 2 MiB was still refused (400 `LM-1001` on chat, embeddings and
+  rerank, 413 on decisions). `server.body_limit` is now the only request
+  body limit, on every route, and a chunked body over it answers 413
+  `LM-1002` on those four endpoints.
+  Upgrade note: `/admin` request bodies were also held to 2 MiB and now
+  follow `server.body_limit` alone, so a larger limit also admits larger
+  admin bodies.
+
+- **Gemini thinking tokens are counted.** Gemini reports thinking tokens in
+  `usageMetadata.thoughtsTokenCount`, apart from `candidatesTokenCount`, and
+  the gateway read only the latter: on a thinking model `completion_tokens`
+  left out the thinking tokens in the response, in Prometheus, in
+  `usage_log` and in the cost charged to the key's budget. They are now
+  included in `completion_tokens` and reported in
+  `completion_tokens_details.reasoning_tokens`, streaming and not, on
+  `google` and `vertex_ai`. Expect higher output-token counts and cost for
+  thinking models: they now match what Google bills.
 
 - **`response_format: json_schema` now works on Anthropic models.** The
   Anthropic provider dropped `response_format` (or refused it with `strict =
@@ -34,6 +151,260 @@ All notable changes to LUMEN are documented here. The format is based on
   It now leaves a status-only row like an admission refusal: zero tokens,
   zero cost, the status the client got. The budget reservation is still
   refunded.
+
+- **Anthropic `prompt_tokens` includes cached tokens.** Anthropic's
+  `input_tokens` leaves out the tokens read from or written to the prompt
+  cache, and the gateway reported it as `prompt_tokens` unchanged: with
+  prompt caching, `prompt_tokens_details.cached_tokens` could exceed
+  `prompt_tokens`, and the cached tokens were missing from the token
+  counters, `usage_log` and the cost. `prompt_tokens` is now `input_tokens`
+  plus `cache_read_input_tokens` plus `cache_creation_input_tokens`,
+  streaming and not.
+  Upgrade note: for requests that use prompt caching, `prompt_tokens` and
+  the cost charged to the key's budget go up. Cache read and cache creation
+  tokens are priced at the model's input rate (`cost_per_1m_input`); there
+  is no separate cache rate.
+
+- **A lowered budget cap no longer swallows a `budget.threshold` event.**
+  Lowering `budget_max` so that the spend already sat above a threshold
+  marked that threshold as fired without sending anything, and so did every
+  config reload for a crossing whose request was still in flight. A
+  threshold is now recorded as fired only by the settle that emits its
+  event; a reload that reinstalls the same thresholds leaves the state
+  alone. See the 2026-11-12 amendment of
+  [ADR 011](docs/adr/011-budget-webhooks.md).
+  Upgrade note: lowering a budget cap past a threshold now emits
+  `budget.threshold` on the next settle of that key or group. A receiver
+  that tops up on this event will see it after a cap reduction.
+
+- **A blocked Gemini prompt is a content-filter refusal.** When Gemini
+  blocks a prompt it answers 200 with `promptFeedback.blockReason` and no
+  candidates. The gateway returned that as an empty successful completion,
+  and as `LM-3010` (stream ended without a terminator) when streaming. It
+  is now 400 `LM-2013` naming the provider, on `google` and `vertex_ai`, and
+  a virtual model can fail over on it with
+  `fallback_on = ["content_filter"]`.
+
+- **Gemini tool calls survive a second turn.** Three fixes on `google` and
+  `vertex_ai`. A `thoughtSignature` on a `functionCall` part was dropped, and
+  Gemini 3 models answer 400 to a call sent back without it: it is now
+  returned as `tool_calls[].extra_content.google.thought_signature` (where
+  Google's own OpenAI-compatible endpoint puts it) and replayed when the
+  client sends the assistant message back. The tool-call ids the gateway
+  makes up (Gemini returns none) repeated from one response to the next, so
+  a multi-turn history held two calls with the same id: they are now unique
+  across responses. Tool `parameters` schemas with `additionalProperties`
+  or `$schema`, which OpenAI clients send routinely, were refused by Gemini:
+  the two keywords are now stripped, as they already were for
+  `response_format`.
+
+- **Anthropic accepts requests that set both `temperature` and `top_p`.**
+  Current Claude models take one or the other and answer 400 to both, which
+  OpenAI clients send routinely. The gateway now sends `temperature` and
+  drops `top_p`. `n` above 1, which the Messages API cannot honour, was
+  dropped without a trace: it is now logged at `debug`, and refused with 400
+  `LM-1001` on a provider with `strict = true`.
+
+- **An error inside an upstream stream keeps its class.** An `error` event
+  in an Anthropic stream, or an exception frame in a Bedrock stream, is now
+  mapped like the HTTP status the same error carries outside a stream: a
+  rate limit or throttle is `LM-3001`, an overload or a service error is a
+  retryable upstream error, an invalid request is not retried. Only the
+  error type is used and logged, never its message.
+
+- **Bedrock without AWS credentials is an upstream auth failure.** A
+  `bedrock` provider with no credentials answered 502 `LM-3002`
+  (unparseable upstream response) although no request had been sent. It is
+  now 502 `LM-3003` naming the provider, and the log says which variables
+  to set.
+
+- **Bedrock merges adjacent messages of the same role.** Converse refuses
+  two consecutive `user` (or `assistant`) messages, which OpenAI accepts.
+  They are now merged into one message, content blocks in order.
+
+- **Bedrock Titan embeddings return one vector per input.** An input item
+  made of several text parts was embedded part by part, so the response
+  held more vectors than inputs. The parts of one item are now joined and
+  embedded once.
+
+- **`dimensions` reaches Cohere, TEI and Jina multimodal embeddings.** The
+  field was dropped, so the client got full-width vectors without an error.
+  It is now sent as `output_dimension` to Cohere and as `dimensions` to TEI
+  and to Jina's multimodal (content-parts) requests.
+
+- **Voyage text embeddings send only the fields Voyage documents.** The
+  OpenAI request was forwarded as is to Voyage's `/embeddings`. `dimensions`
+  is now sent as `output_dimension`, and `user` and `encoding_format` are no
+  longer forwarded (the gateway encodes the output itself).
+
+- **Ollama embeddings send the configured API key.** With `api_key_env` set
+  on an `ollama` provider (a server behind an authenticating proxy), chat
+  sent the bearer token and `/api/embed` sent none. Both now send it.
+
+- **A rerank response with a bad `index` is refused.** An upstream result
+  whose `index` was out of range or repeated was passed on: a score for the
+  wrong document, or a result with no document to return. It is now 502
+  `LM-3002`.
+
+- **`top_n: 0` on `/v1/rerank` is a client error.** It was forwarded: a 400
+  from the upstreams that take `top_n`, reported as an upstream error, and a
+  billed empty result from those that do not.
+  Upgrade note: rerank now rejects `top_n: 0` with 400 `LM-1001` before any
+  upstream call. Omit `top_n` to get every document.
+
+- **Split embedding batches are reassembled by the upstream `index`.** When
+  a request is split into sub-batches, each sub-response's vectors were
+  taken in arrival order. They are now ordered by the `index` the upstream
+  gave them, and a sub-response whose indices are not exactly `0..n` is 502
+  `LM-3002`.
+
+- **A `choice` rerank answer without probabilities is refused.** When the
+  upstream of a `choice` remap rerank left out the option probabilities,
+  every document scored 0 and the input order came back as a successful
+  rerank. It is now 502 `LM-3002`.
+
+- **A fallback target uses its own first-token timeout.** The first-token
+  deadline of the model the request resolved to first applied to every
+  link of the chain.
+  Upgrade note: a fallback target whose provider sets no
+  `first_token_timeout_ms` now uses the global
+  `server.first_token_timeout_ms` instead of inheriting the primary's
+  override. If you relied on a relaxed primary timeout covering slow
+  fallbacks, set `first_token_timeout_ms` on their providers.
+
+- **Circuit breaker tuning is hot-reloaded.** `circuit_failure_threshold`
+  and `circuit_cooldown_ms` were read once at boot. A reload now applies
+  them, to existing breakers too; an open circuit stays open.
+
+- **A skipped target no longer redirects a fallback out of its level.**
+  When a target of a nested virtual model was skipped for a request, a
+  fallback step that pointed at it could be re-aimed at a target of an
+  outer level, going around that outer level's `fallback_on`. A step whose
+  own level has no target left is now removed.
+
+- **A `default` `max_tokens` no longer overrides a client's
+  `max_completion_tokens`.** `max_tokens` and `max_completion_tokens` are
+  two spellings of one cap. A virtual model `default` on one was added to a
+  request that set the other, and the upstream then got both. A client
+  value under either spelling now keeps the default out, and admission
+  reserves the cap the attempt actually sends, resolving the two spellings
+  together.
+
+- **`LM-3013` names the link that was being called.** When the total
+  timeout fired during a fallback, the error names the provider of the link
+  in flight. That link's circuit breaker records a failure only once the
+  link has been running for its own first-token timeout; a link cut earlier
+  gets a neutral outcome, which releases a half-open probe it held.
+
+- **A half-open circuit admits one probe at a time.** A call admitted while
+  the circuit was still closed, and ending without a verdict (a client
+  disconnect, say), released the probe of another call, which let a second
+  probe through. Only the call that holds the probe releases it.
+
+- **Frames the gateway inserts in a stream no longer corrupt an event.**
+  Passthrough forwards upstream bytes as they come, so a chunk can stop in
+  the middle of an SSE event. An error frame sent at that point was glued
+  onto the unfinished line: it is now preceded by the newlines that close
+  the event. A heartbeat ping is held back until the stream stands between
+  two events.
+
+- **An all-zero stream `usage` chunk is not counted as usage.** Some
+  upstreams send `"usage": {"prompt_tokens": 0, "completion_tokens": 0}`
+  when they measured nothing. The stream settled on those zeros; it now
+  settles on the local estimate, flagged `estimated`, like the
+  non-streaming path.
+
+- **Rerank and embedding estimates count what is sent.** The local rerank
+  token estimate is now taken on the text the provider ranks (the
+  `rank_fields` reduction, or the `text` field of an object document), and
+  when the accurate tokenizer refines that estimate the cost is computed
+  from the refined count, not from the heuristic it replaces. The
+  embeddings estimate counts image parts with the flat per-image heuristic
+  (85 tokens at `detail: "low"`, 765 otherwise) where it counted zero.
+
+- **`"stream": null` is accepted on chat.** Some SDKs serialize an unset
+  `stream` as `null`, which was a 400. It now reads as `false`.
+
+- **A chat fail-over never sends an image to a text-only model.** For a
+  request carrying an image, only the model it resolved to first was
+  checked for the `image` modality. Fallback targets that do not declare
+  `image` are now skipped for that request; the first model is still
+  refused with `LM-2003` when it lacks it.
+
+- **Webhook admin writes check before they write.** `PUT /admin/webhooks`
+  with a `signing_key_env` the process cannot resolve stored the settings
+  and then answered 400, leaving a row no reload or restart could apply.
+  `DELETE /admin/webhooks/signing-key` removed the secret before refusing.
+  Both now refuse before touching the database. `DELETE /admin/webhooks`
+  also disables a stored row that was enabled but never applied, so the
+  next reload does not retry it, and it refreshes the cached row before
+  disabling, so a concurrent reload cannot re-apply the enabled row it read
+  before the write. An internal failure while checking or applying webhook
+  settings (a failed metrics registration, say) answers 500 `LM-5001`
+  instead of 400 `LM-1001`.
+
+- **A config write whose webhook signing key cannot be resolved is
+  refused.** `PUT /admin/config` and `PUT /admin/config/webhooks` accepted
+  a `[webhooks]` block naming a `signing_key_env` that is unset or empty
+  with no stored secret. The reload only warned, and the next restart
+  failed on it.
+  Upgrade note: such a write is now 400 `LM-1001` naming the variable.
+  Only a `signing_key_env` the write introduces or changes is checked.
+  Export the variable, or store the secret with
+  `PUT /admin/webhooks/signing-key`, before the write.
+
+- **`config_source = "db"`: a `LUMEN_`-prefixed `signing_key_env` is
+  refused on write.** The boot file is parsed before the database is read,
+  so a `LUMEN_` variable named only in the stored document was read as an
+  unknown config key and the process did not boot once it was exported.
+  Upgrade note: in db mode, config writes now answer 400 `LM-1001` when
+  `webhooks.signing_key_env` starts with `LUMEN_`. A stored document that
+  already uses one keeps loading, but every later config write is refused
+  until the variable is renamed or the secret is stored with
+  `PUT /admin/webhooks/signing-key`.
+
+- **`lumen --check-config` runs the db-mode boot checks.** With
+  `config_source = "db"` it printed OK for a boot file the process then
+  refused to start from: one carrying a dynamic-layer key, or with
+  `[auth]` disabled.
+  Upgrade note: a boot file `--check-config` used to accept can now be
+  refused. The autodeploy gate stops such a release before the restart
+  instead of failing at boot.
+
+- **A config write through a symlink keeps the symlink.** With the config
+  path a symlink (`/etc/lumen/config.toml` pointing into a managed
+  directory), an admin config write in file mode replaced the link with a
+  regular file. The write now goes to the link's target.
+
+- **A reload no longer re-applies an older stored webhook row.** A reload
+  that read the stored webhook settings just before an admin write could
+  put its older copy back in the cache afterwards. Refreshes are now
+  serialized.
+
+- **A failed group budget flush is retried for idle groups.** When the
+  flush of a group's spend failed and the group then received no request,
+  nothing marked it for the next flush: the spend stayed unsaved, and was
+  lost if the process restarted first. The groups of a failed flush are now
+  flushed again on the next interval.
+
+- **A failed usage-log batch is retried once, and counted if lost.** A
+  batch the database refused (a busy database during a purge, say) was
+  discarded with a log line only. It is now retried after 250 ms, and the
+  rows of a batch that fails twice are added to
+  `lumen_usage_log_dropped_total`, which until now counted only the rows
+  dropped on a full channel.
+
+- **The usage-log retention purge deletes in chunks.** One `DELETE` over a
+  large backlog held the SQLite write lock long enough to fail the usage
+  writer and the budget flush. The purge now deletes 5000 rows per
+  statement, oldest first. A retention window of 0 (reachable through a
+  reload that turns `[auth]` off) now skips the purge; it used to delete
+  every row.
+
+- **Vertex AI token handling.** A request waiting for the access-token
+  cache lock is now cancelled with the client, and a token response
+  without `expires_in` is cached for a short time, not minted again on
+  every request.
 
 ## [0.10.0] - 2026-11-08
 
