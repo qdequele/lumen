@@ -326,26 +326,48 @@ pub fn encode_embedding_base64(embedding: &[f32]) -> String {
 /// as base64-encoded little-endian `f32` bytes. We decode it to a float vector
 /// so a base64 request never breaks parsing (LUMEN always returns float
 /// arrays to the client in v1).
+///
+/// A hand-written visitor rather than a `#[serde(untagged)]` enum: an untagged
+/// enum first buffers the whole value into serde's generic `Content` tree
+/// (one boxed-enum node per float) and only then converts it, which doubles
+/// the work and the allocations for every vector of every embedding response.
+/// The visitor reads the array straight into the `Vec<f32>`.
 fn deserialize_embedding<'de, D>(deserializer: D) -> Result<Vec<f32>, D::Error>
 where
     D: Deserializer<'de>,
 {
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum Repr {
-        Floats(Vec<f32>),
-        Base64(String),
-    }
+    struct EmbeddingVisitor;
 
-    match Repr::deserialize(deserializer)? {
-        Repr::Floats(v) => Ok(v),
-        Repr::Base64(s) => {
+    impl<'de> serde::de::Visitor<'de> for EmbeddingVisitor {
+        type Value = Vec<f32>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("an array of numbers or a base64 string")
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::SeqAccess<'de>,
+        {
+            // The hint is upstream-controlled: cap it so a lying one cannot
+            // force a large allocation up front.
+            let mut out = Vec::with_capacity(seq.size_hint().unwrap_or(0).min(4096));
+            while let Some(value) = seq.next_element::<f32>()? {
+                out.push(value);
+            }
+            Ok(out)
+        }
+
+        fn visit_str<E>(self, s: &str) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
             use base64::Engine;
             let bytes = base64::engine::general_purpose::STANDARD
                 .decode(s.as_bytes())
-                .map_err(serde::de::Error::custom)?;
+                .map_err(E::custom)?;
             if bytes.len() % 4 != 0 {
-                return Err(serde::de::Error::custom(
+                return Err(E::custom(
                     "base64 embedding byte length is not a multiple of 4",
                 ));
             }
@@ -357,6 +379,8 @@ where
                 .collect())
         }
     }
+
+    deserializer.deserialize_any(EmbeddingVisitor)
 }
 
 /// An embedding response in OpenAI format.
@@ -522,6 +546,69 @@ mod tests {
         let json = format!(r#"{{"object":"embedding","index":0,"embedding":"{b64}"}}"#);
         let back: EmbedData = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back.embedding, vec![1.0, 2.0]);
+    }
+
+    fn embed_data_from(embedding_json: &str) -> Result<EmbedData, serde_json::Error> {
+        serde_json::from_str(&format!(
+            r#"{{"object":"embedding","index":0,"embedding":{embedding_json}}}"#
+        ))
+    }
+
+    #[test]
+    fn embedding_deserializes_from_a_number_array() {
+        // Floats, integers, negatives and exponents are all JSON numbers.
+        let data = embed_data_from("[0.5, -1, 2, 1e-3]").expect("float array");
+        assert_eq!(data.embedding, vec![0.5, -1.0, 2.0, 1e-3]);
+        assert_eq!(data.encoding, EmbeddingEncoding::Float);
+        // An empty array is an empty vector.
+        assert_eq!(embed_data_from("[]").expect("empty").embedding.len(), 0);
+        // Through a `Value` (owned, non-streaming deserializer) too.
+        let via_value: EmbedData = serde_json::from_value(
+            serde_json::json!({"object":"embedding","index":3,"embedding":[1.5, 2]}),
+        )
+        .expect("from value");
+        assert_eq!(via_value.embedding, vec![1.5, 2.0]);
+        assert_eq!(via_value.index, 3);
+    }
+
+    #[test]
+    fn embedding_deserializes_from_a_base64_string() {
+        // 1.0f32 and -2.0f32, little-endian.
+        let data = embed_data_from(r#""AACAPwAAAMA=""#).expect("base64");
+        assert_eq!(data.embedding, vec![1.0, -2.0]);
+        // The empty string is an empty vector.
+        assert_eq!(embed_data_from(r#""""#).expect("empty").embedding.len(), 0);
+        // Owned-string path (through a `Value`).
+        let via_value: EmbedData = serde_json::from_value(
+            serde_json::json!({"object":"embedding","index":0,"embedding":"AACAPwAAAMA="}),
+        )
+        .expect("from value");
+        assert_eq!(via_value.embedding, vec![1.0, -2.0]);
+    }
+
+    #[test]
+    fn embedding_rejects_malformed_base64_and_other_shapes() {
+        // Three bytes: valid base64, not a whole number of f32s.
+        let err = embed_data_from(r#""AAAA""#).expect_err("3 bytes");
+        assert!(
+            err.to_string()
+                .contains("base64 embedding byte length is not a multiple of 4"),
+            "{err}"
+        );
+        // Not base64 at all.
+        assert!(embed_data_from(r#""not base64!""#).is_err());
+        // Neither an array of numbers nor a string.
+        for bad in [
+            "null",
+            "1.5",
+            "true",
+            r#"{"a":1}"#,
+            r#"["a"]"#,
+            "[[1.0]]",
+            "[null]",
+        ] {
+            assert!(embed_data_from(bad).is_err(), "{bad} must be rejected");
+        }
     }
 
     #[test]
