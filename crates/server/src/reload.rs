@@ -135,6 +135,23 @@ impl AuthKnobs {
         self.retention_days.load(Ordering::Relaxed)
     }
 
+    /// The retention purge's cutoff at `now` (unix seconds): usage rows with
+    /// `ts` strictly older are purged. `None` means "do not purge".
+    ///
+    /// A window of 0 days is `None`, never `now`: `Config::validate` refuses
+    /// 0 only while auth is enabled, but a reload stores the knob
+    /// unconditionally, so a document that disables auth (and leaves
+    /// `retention_days = 0`) reaches a purge task that is still running. A
+    /// cutoff of `now - 0` would then delete the whole usage log on its next
+    /// tick. Mirrors the `.max(1)` guard on the flush cadence.
+    #[must_use]
+    pub fn retention_cutoff(&self, now: i64) -> Option<i64> {
+        match self.retention_days() {
+            0 => None,
+            days => Some(now.saturating_sub(i64::from(days) * 86_400)),
+        }
+    }
+
     /// Overwrite both knobs from a freshly loaded config (called on reload).
     fn store_from_config(&self, config: &Config) {
         self.flush_interval_ms
@@ -881,6 +898,23 @@ mod tests {
             t.resilience.breakers.get("openai", "openai/gpt").state(),
             CircuitState::Open,
             "reload must not reset circuit-breaker state"
+        );
+    }
+
+    #[test]
+    fn a_zero_retention_window_never_yields_a_purge_cutoff() {
+        // 0 reaches the live knob through a reload that disables auth (the
+        // non-zero check only runs while auth is enabled). `now - 0` as a
+        // cutoff would delete every usage row.
+        assert_eq!(AuthKnobs::new(10_000, 0).retention_cutoff(1_000_000), None);
+        assert_eq!(
+            AuthKnobs::new(10_000, 2).retention_cutoff(1_000_000),
+            Some(1_000_000 - 2 * 86_400)
+        );
+        // No overflow on a degenerate clock.
+        assert_eq!(
+            AuthKnobs::new(10_000, u32::MAX).retention_cutoff(i64::MIN),
+            Some(i64::MIN)
         );
     }
 

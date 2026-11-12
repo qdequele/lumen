@@ -1401,8 +1401,12 @@ async fn boot_auth_stack(
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
-            let retention = i64::from(purge_knobs.retention_days()) * 86_400;
-            match store.purge_usage_older_than(now_unix() - retention).await {
+            // `None` = a zero window (a reload that disabled auth stores 0):
+            // skip, never purge with a cutoff of "now".
+            let Some(cutoff) = purge_knobs.retention_cutoff(now_unix()) else {
+                continue;
+            };
+            match store.purge_usage_older_than(cutoff).await {
                 Ok(0) => {}
                 Ok(purged) => tracing::info!(purged, "usage-log retention purge"),
                 Err(error) => tracing::warn!(%error, "usage-log purge failed"),
