@@ -112,7 +112,7 @@ impl TokenMetrics {
         )?;
         let usage_log_dropped_total = IntCounter::new(
             "lumen_usage_log_dropped_total",
-            "Usage-log entries dropped because the logging channel was full.",
+            "Usage-log entries dropped: the logging channel was full, or the database refused a batch twice.",
         )?;
         let metadata_rejected_total = IntCounter::new(
             "lumen_metadata_rejected_total",
