@@ -52,6 +52,31 @@ All notable changes to LUMEN are documented here. The format is based on
 - **CI workflows run with least-privilege tokens.** Each job declares the
   permissions it needs, and third-party actions are pinned to a commit SHA.
 
+### Added
+
+- **`GET /admin/keys` and `GET /admin/groups` can be read page by page.**
+  Both take optional `limit` (1 to 1000) and `cursor` query parameters. With
+  either, the response is one page, in the same order as the whole listing,
+  with an `X-Next-Cursor` header while more rows remain: send it back as
+  `cursor` to get the next page (100 rows when `limit` is left out). Without
+  them the response is unchanged: the whole listing, as a bare array. An
+  invalid `limit` or `cursor` is 400 `LM-1001`. `docs/openapi.yaml` declares
+  the parameters and the header. See
+  [ADR 023](docs/adr/023-admin-listing-pagination.md).
+  Upgrade note: migration 0021 adds `(created_at, id)` indexes on the key
+  and group tables. It is index-only (no row changes) and forward-only, and
+  the indexes are built at the first boot of the new version.
+
+- **Cached input and cache writes can have their own price.** Cost had one
+  input rate per model, so input tokens read from a provider's prompt cache
+  were charged at the full input price. Two optional model prices,
+  `cost_per_1m_cached_input` and `cost_per_1m_cache_write`, now price the
+  cached and the cache-write share of a chat request's `prompt_tokens`,
+  streaming and not. Each defaults to `cost_per_1m_input` when unset, so an
+  existing config prices exactly as before. Token counts in the response,
+  the metrics and `usage_log` are unchanged; only the cost moves. See
+  "Prompt caching" in `docs/operations/token-accounting.md`.
+
 ### Changed
 
 - **Virtual models have size limits.** One virtual model may list at most 64
@@ -90,7 +115,12 @@ All notable changes to LUMEN are documented here. The format is based on
 
 - **`GET /admin/keys` and `GET /admin/groups` filter in SQL.** The
   `external_ref`, `account_ref`, `parent_id` and account-scope filters were
-  applied in memory over every row; they are now part of the query.
+  applied in memory over every row; they are now part of the query, and an
+  account-scoped key listing reads a new index on `virtual_keys.group_id`
+  where it scanned the table.
+  Upgrade note: migration 0020 adds that index. It is index-only (no row
+  changes) and forward-only, and the index is built at the first boot of
+  the new version.
 
 - **Idle circuit breakers are evicted.** A breaker is created per (provider,
   model), and per team key pool, and was kept for the life of the process.
@@ -102,6 +132,76 @@ All notable changes to LUMEN are documented here. The format is based on
   not once per request. `lumen_deprecated_model_alias_total` still counts
   every request.
 
+- **Non-streaming answers from OpenAI-compatible upstreams are forwarded as
+  bytes.** A chat completion or an embeddings answer from a same-schema
+  upstream (`openai` and the kinds built on it, `mistral`, `azure`) was
+  parsed and serialized again, although the gateway reads only the usage
+  from it. The upstream body is now forwarded unchanged: for chat, when it
+  reports usage and has a `choices` array; for embeddings, when the request
+  fits one upstream call, the body reports usage and every vector is already
+  in the encoding the client asked for. Every other answer takes the parsed
+  path as before (a body without usage gets the flagged estimate, a split
+  request is reassembled, the other encoding is converted). See the
+  2026-11-12 amendment of
+  [ADR 004](docs/adr/004-streaming-passthrough.md).
+  Upgrade note: a forwarded body is byte for byte the upstream's. Upstream
+  fields the gateway used to drop (unknown keys in `usage` or in a choice,
+  such as a provider's `cost`) now reach the client, key order and spacing
+  are the upstream's, and the digits of embedding floats are the upstream's
+  instead of a re-serialized `f32`. A client that rejects unknown fields or
+  compares bodies byte for byte will see the difference.
+
+- **A split embeddings request retries a failed sub-batch on its own.** A
+  request with more inputs than the provider takes per call is split into
+  sub-batches. The first sub-batch error failed the whole request and
+  dropped the sub-responses already received, and the request-level retry
+  started again from the first input: with the single-input providers
+  (Bedrock, Vertex), a 429 on call 900 of 1,000 re-sent, and re-billed, the
+  899 that had succeeded. A sub-batch that fails with a retryable error
+  (429, 5xx, timeout) is now retried alone, with the request-level backoff
+  and `Retry-After` as a floor: at most 3 calls per sub-batch and 10 s of
+  waiting per request. A wait pauses the whole request, so retries never
+  add to the 4 upstream calls in flight. See the 2026-11-12 amendment of
+  [ADR 005](docs/adr/005-resilience-execution.md).
+  Upgrade note: inside one request-level attempt, a split request can now
+  call the upstream up to `min(3, retry_max_attempts)` times per sub-batch
+  and wait up to 10 s longer. The sub-batch retry follows the retry
+  configuration of the provider called: `retry_max_attempts = 1`, in
+  `[resilience]` or on the provider, turns it off too. Its delays and the
+  10 s budget are not configurable.
+
+- **Logs are written through a bounded, non-blocking queue.** Every log
+  line was a blocking write to stdout on a runtime worker, so a slow log
+  pipe could stall request handling. Lines now go into a queue of 16,384
+  lines drained by a dedicated thread, and shutdown flushes what is queued.
+  The output format is unchanged.
+  Upgrade note: when stdout stalls long enough to fill the queue, further
+  lines are dropped instead of blocking requests, and the number of lines
+  dropped is printed on stderr at exit.
+
+- **Image fetches share one HTTP client.** Every image, and every redirect
+  hop, built a new client to pin the vetted DNS address, with its TLS
+  configuration and root store. One client per process now serves them,
+  with a resolver that answers only with the address vetted for a hop in
+  flight and fails for any other name; the port dialled is the one of the
+  request URL. The per-hop pin, the size cap, the per-fetch timeout and the
+  refusal of proxies and client-followed redirects are unchanged.
+
+- **Less work per upstream call.** The chat, embeddings and rerank handlers
+  copied the parsed request twice per attempt; it is now copied once, when a
+  provider is about to be called. The SSE parser scanned its buffer from the
+  start on every read (quadratic for a large event split over many reads);
+  it now scans each byte once and parses events in place.
+
+- **Built and tested on Rust 1.100.0, with refreshed dependencies.** A
+  semver-compatible `cargo update` (52 packages), the `jsonschema`
+  dev-dependency from 0.58 to 0.61 (tests only), and one new dependency,
+  `tracing-appender` 0.2.5, for the log queue above. The minimum supported
+  Rust version stays 1.94.
+  Upgrade note: nothing to do for a deployment. The reqwest 0.13 and
+  toml 1.x major bumps are deliberately deferred: the workspace stays on
+  reqwest 0.12 and toml 0.8.
+
 ### Fixed
 
 - **A `server.body_limit` above 2 MiB is now honoured.** The JSON extractors
@@ -110,10 +210,12 @@ All notable changes to LUMEN are documented here. The format is based on
   body over 2 MiB was still refused (400 `LM-1001` on chat, embeddings and
   rerank, 413 on decisions). `server.body_limit` is now the only request
   body limit, on every route, and a chunked body over it answers 413
-  `LM-1002` on those four endpoints.
+  `LM-1002` on those four endpoints and on the `/admin` routes.
   Upgrade note: `/admin` request bodies were also held to 2 MiB and now
   follow `server.body_limit` alone, so a larger limit also admits larger
-  admin bodies.
+  admin bodies. An `/admin` body that runs over the limit while it is read
+  (chunked, no `Content-Length`) now answers 413 `LM-1002` quoting the
+  limit, where it answered 400 `LM-1001`.
 
 - **Gemini thinking tokens are counted.** Gemini reports thinking tokens in
   `usageMetadata.thoughtsTokenCount`, apart from `candidatesTokenCount`, and
@@ -124,6 +226,18 @@ All notable changes to LUMEN are documented here. The format is based on
   `completion_tokens_details.reasoning_tokens`, streaming and not, on
   `google` and `vertex_ai`. Expect higher output-token counts and cost for
   thinking models: they now match what Google bills.
+
+- **Gemini usage adds up.** Gemini reports the tokens a built-in tool (code
+  execution, search) feeds back to the model in
+  `usageMetadata.toolUsePromptTokenCount`, apart from `promptTokenCount`,
+  and the gateway left them out of `prompt_tokens`. A response without
+  `totalTokenCount` reported `total_tokens: 0` next to non-zero parts.
+  Tool-use prompt tokens now count in `prompt_tokens`, and `total_tokens` is
+  the upstream total, raised to `prompt_tokens + completion_tokens` when it
+  is absent or lower, streaming and not.
+  Upgrade note: for Gemini requests that use built-in tools,
+  `prompt_tokens` and the cost charged to the key's budget go up by the
+  tool-use prompt tokens.
 
 - **`response_format: json_schema` now works on Anthropic models.** The
   Anthropic provider dropped `response_format` (or refused it with `strict =
@@ -162,8 +276,10 @@ All notable changes to LUMEN are documented here. The format is based on
   streaming and not.
   Upgrade note: for requests that use prompt caching, `prompt_tokens` and
   the cost charged to the key's budget go up. Cache read and cache creation
-  tokens are priced at the model's input rate (`cost_per_1m_input`); there
-  is no separate cache rate.
+  tokens are priced at the model's input rate (`cost_per_1m_input`) unless
+  the model sets the new optional prices `cost_per_1m_cached_input` (cache
+  reads) and `cost_per_1m_cache_write` (cache creation), which both default
+  to `cost_per_1m_input` (see Added).
 
 - **A lowered budget cap no longer swallows a `budget.threshold` event.**
   Lowering `budget_max` so that the spend already sat above a threshold
@@ -237,6 +353,15 @@ All notable changes to LUMEN are documented here. The format is based on
   is now sent as `output_dimension`, and `user` and `encoding_format` are no
   longer forwarded (the gateway encodes the output itself).
 
+- **Jina text embeddings send only the fields Jina documents.** The OpenAI
+  request was forwarded as is to Jina's `/embeddings`, with `user` and
+  `encoding_format`, which Jina's schema does not define (its output
+  encoding field is `embedding_type`). The body now holds `model`, `input`
+  and `dimensions` only.
+  Upgrade note: `user` and `encoding_format` no longer reach Jina on text
+  embeddings. The client's `encoding_format` is still honoured: the gateway
+  encodes the output itself.
+
 - **Ollama embeddings send the configured API key.** With `api_key_env` set
   on an `ollama` provider (a server behind an authenticating proxy), chat
   sent the bearer token and `/api/embed` sent none. Both now send it.
@@ -250,7 +375,9 @@ All notable changes to LUMEN are documented here. The format is based on
   from the upstreams that take `top_n`, reported as an upstream error, and a
   billed empty result from those that do not.
   Upgrade note: rerank now rejects `top_n: 0` with 400 `LM-1001` before any
-  upstream call. Omit `top_n` to get every document.
+  upstream call. Omit `top_n` to get every document. `docs/openapi.yaml`
+  now declares `top_n` with `minimum: 1` (it said `minimum: 0`): a contract
+  change the Lab re-vendors after the release.
 
 - **Split embedding batches are reassembled by the upstream `index`.** When
   a request is split into sub-batches, each sub-response's vectors were
@@ -322,14 +449,28 @@ All notable changes to LUMEN are documented here. The format is based on
   embeddings estimate counts image parts with the flat per-image heuristic
   (85 tokens at `detail: "low"`, 765 otherwise) where it counted zero.
 
+- **A refined chat count keeps its per-image estimate.** With the accurate
+  tokenizer, the deferred recount of a chat request covers the text only, so
+  a vision request whose upstream reported no usage lost its per-image
+  estimate once refined (857 estimated tokens settled as 6 in `usage_log`
+  and Prometheus). The image share of the estimate is now added back to the
+  refined text count, as embeddings already did.
+
 - **`"stream": null` is accepted on chat.** Some SDKs serialize an unset
   `stream` as `null`, which was a 400. It now reads as `false`.
 
-- **A chat fail-over never sends an image to a text-only model.** For a
-  request carrying an image, only the model it resolved to first was
-  checked for the `image` modality. Fallback targets that do not declare
-  `image` are now skipped for that request; the first model is still
-  refused with `LM-2003` when it lacks it.
+- **A chat fail-over never sends an image to a target that cannot take
+  it.** For a request carrying an image, only the model it resolved to
+  first was checked: for the `image` modality, for remote image URLs
+  (`LM-2004`) and for provider-native file references (`LM-2008`). A
+  fail-over could then reach a text-only model, raise `LM-2004` from a
+  Gemini fallback in the middle of a fail-over, or send an
+  `anthropic-file:` id or a Gemini file URI as is to a provider that reads
+  it as a plain image URL. Fallback targets that do not declare `image`,
+  whose provider cannot fetch the request's remote image URLs (`google`,
+  `vertex_ai`, `bedrock`) or cannot resolve its file references are now
+  skipped for that request. `LM-2003`, `LM-2004` and `LM-2008` are raised
+  only for the model the request resolved to first, never from a fallback.
 
 - **Webhook admin writes check before they write.** `PUT /admin/webhooks`
   with a `signing_key_env` the process cannot resolve stored the settings
