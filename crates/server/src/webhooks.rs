@@ -255,6 +255,29 @@ struct Pipeline {
     signing: Arc<ArcSwapOption<SigningKey>>,
 }
 
+/// Why webhook settings could not be applied (or would not be, for a
+/// [`preflight`](WebhookController::preflight)). The two cases are different
+/// faults: the admin API answers the first with a 400 and the second with a
+/// 500.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum WebhookApplyError {
+    /// The settings themselves are at fault: they do not validate, or name a
+    /// signing secret this process cannot resolve. The message names the
+    /// field or the variable, never a value.
+    #[error("{0}")]
+    Invalid(String),
+    /// The gateway is at fault whatever the settings say: the Prometheus
+    /// collectors could not be registered, or the apply lock is poisoned.
+    #[error("{0}")]
+    Internal(String),
+}
+
+impl WebhookApplyError {
+    fn lock_poisoned() -> Self {
+        Self::Internal("the webhook apply lock is poisoned".to_owned())
+    }
+}
+
 /// The webhook control surface: builds, retunes and tears down the delivery
 /// pipeline, and answers `GET /admin/webhooks`.
 ///
@@ -426,21 +449,23 @@ impl WebhookController {
     /// Returns the source that won, so the caller can log or report it.
     ///
     /// # Errors
-    /// The winning settings do not validate, the signing secret cannot be
-    /// resolved, or the Prometheus collectors cannot be registered. The
-    /// previous pipeline is left running in every case.
+    /// [`WebhookApplyError::Invalid`] when the winning settings do not
+    /// validate or the signing secret cannot be resolved,
+    /// [`WebhookApplyError::Internal`] when the Prometheus collectors cannot
+    /// be registered or the apply lock is poisoned. The previous pipeline is
+    /// left running in every case.
     pub fn resolve_and_apply(
         &self,
         file_block: Option<&WebhookSettings>,
         keys: &AuthState,
-    ) -> Result<SettingsSource, String> {
+    ) -> Result<SettingsSource, WebhookApplyError> {
         // The cached row is read UNDER the apply lock: reading it first would
         // let an admin write refresh the cache and apply its settings between
         // this read and this apply, which would then put the older row back.
         // A poisoned lock still excludes other appliers (the error carries
         // the guard); only the apply branches refuse it, like `apply`.
         let guard = self.apply_lock.lock();
-        let poisoned = || "the webhook apply lock is poisoned".to_owned();
+        let poisoned = WebhookApplyError::lock_poisoned;
         match self.stored() {
             Some(stored) if stored.enabled => {
                 if guard.is_err() {
@@ -491,26 +516,40 @@ impl WebhookController {
     /// already accepted is thrown away to resize a channel.
     ///
     /// # Errors
-    /// Invalid settings, an unresolvable signing secret, or a metrics
-    /// registration failure. Nothing is swapped on error.
-    pub fn apply(&self, settings: &WebhookSettings, keys: &AuthState) -> Result<(), String> {
+    /// [`WebhookApplyError::Invalid`] for invalid settings or an unresolvable
+    /// signing secret, [`WebhookApplyError::Internal`] for a metrics
+    /// registration failure or a poisoned apply lock. Nothing is swapped on
+    /// error.
+    pub fn apply(
+        &self,
+        settings: &WebhookSettings,
+        keys: &AuthState,
+    ) -> Result<(), WebhookApplyError> {
         // Held across the whole sequence: validate, register, build, swap.
         let _guard = self
             .apply_lock
             .lock()
-            .map_err(|_| "the webhook apply lock is poisoned".to_owned())?;
+            .map_err(|_| WebhookApplyError::lock_poisoned())?;
         self.apply_locked(settings, keys)
     }
 
     /// [`apply`](Self::apply) for a caller that already holds `apply_lock`.
-    fn apply_locked(&self, settings: &WebhookSettings, keys: &AuthState) -> Result<(), String> {
+    fn apply_locked(
+        &self,
+        settings: &WebhookSettings,
+        keys: &AuthState,
+    ) -> Result<(), WebhookApplyError> {
         // Defence in depth. Each surface validates with its own origin before
         // reaching here - the config loader on parse, the admin route before
         // it writes - so this pass uses the permissive origin: it re-checks the
         // rules both surfaces share, and must not re-apply the API-only
         // `LUMEN_` prefix rule to a perfectly legal file-declared variable.
-        settings.validate(SettingsOrigin::ConfigFile)?;
-        let signing = self.resolve_signing_key(settings)?;
+        settings
+            .validate(SettingsOrigin::ConfigFile)
+            .map_err(WebhookApplyError::Invalid)?;
+        let signing = self
+            .resolve_signing_key(settings)
+            .map_err(WebhookApplyError::Invalid)?;
         let metrics = self.metrics_handle()?;
 
         let current = self.live.load_full();
@@ -606,12 +645,13 @@ impl WebhookController {
     /// afterwards. Must be called with `apply_lock` held: Prometheus refuses a
     /// duplicate registration, so two racing first-enables would make one of
     /// them fail for no operator-visible reason.
-    fn metrics_handle(&self) -> Result<WebhookMetrics, String> {
+    fn metrics_handle(&self) -> Result<WebhookMetrics, WebhookApplyError> {
         if let Some(metrics) = self.metrics.get() {
             return Ok(metrics.clone());
         }
-        let metrics = WebhookMetrics::register(&self.registry)
-            .map_err(|error| format!("could not register the webhook metrics: {error}"))?;
+        let metrics = WebhookMetrics::register(&self.registry).map_err(|error| {
+            WebhookApplyError::Internal(format!("could not register the webhook metrics: {error}"))
+        })?;
         let _ = self.metrics.set(metrics.clone());
         Ok(metrics)
     }
@@ -624,14 +664,19 @@ impl WebhookController {
     /// gateway could not apply never replaces a stored one that works.
     ///
     /// # Errors
-    /// The same messages [`apply`](Self::apply) would return.
-    pub fn preflight(&self, settings: &WebhookSettings) -> Result<(), String> {
-        settings.validate(SettingsOrigin::ConfigFile)?;
-        self.check_signing_key(settings)?;
+    /// The same errors [`apply`](Self::apply) would return: the document's
+    /// own faults as [`WebhookApplyError::Invalid`], the gateway's as
+    /// [`WebhookApplyError::Internal`].
+    pub fn preflight(&self, settings: &WebhookSettings) -> Result<(), WebhookApplyError> {
+        settings
+            .validate(SettingsOrigin::ConfigFile)
+            .map_err(WebhookApplyError::Invalid)?;
+        self.check_signing_key(settings)
+            .map_err(WebhookApplyError::Invalid)?;
         let _guard = self
             .apply_lock
             .lock()
-            .map_err(|_| "the webhook apply lock is poisoned".to_owned())?;
+            .map_err(|_| WebhookApplyError::lock_poisoned())?;
         self.metrics_handle().map(|_metrics| ())
     }
 
@@ -1274,6 +1319,59 @@ mod tests {
             "https://new.example/events",
             "the reload re-applied a stored row older than the cached one"
         );
+    }
+
+    #[tokio::test]
+    async fn preflight_and_apply_tell_invalid_settings_from_internal_failures() {
+        let keys = AuthState::default();
+        let good = settings_with_env(None);
+
+        // The document's own faults.
+        let controller = controller();
+        let unresolvable = settings_with_env(Some("LUMEN_TEST_WEBHOOK_SECRET_ABSENT"));
+        for settings in [&unresolvable, &WebhookSettings::default()] {
+            assert!(matches!(
+                controller.preflight(settings),
+                Err(WebhookApplyError::Invalid(_))
+            ));
+            assert!(matches!(
+                controller.apply(settings, &keys),
+                Err(WebhookApplyError::Invalid(_))
+            ));
+        }
+
+        // A failed Prometheus registration is the gateway's fault.
+        let _taken = WebhookMetrics::register(&controller.registry).expect("register");
+        assert!(matches!(
+            controller.preflight(&good),
+            Err(WebhookApplyError::Internal(_))
+        ));
+        assert!(matches!(
+            controller.apply(&good, &keys),
+            Err(WebhookApplyError::Internal(_))
+        ));
+
+        // So is a poisoned apply lock.
+        let controller = Arc::new(self::controller());
+        let poisoner = Arc::clone(&controller);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.apply_lock.lock();
+            panic!("poison the apply lock");
+        })
+        .join();
+        assert!(matches!(
+            controller.preflight(&good),
+            Err(WebhookApplyError::Internal(_))
+        ));
+        assert!(matches!(
+            controller.apply(&good, &keys),
+            Err(WebhookApplyError::Internal(_))
+        ));
+        controller.stored.store(Some(stored_row(&good.url)));
+        assert!(matches!(
+            controller.resolve_and_apply(None, &keys),
+            Err(WebhookApplyError::Internal(_))
+        ));
     }
 
     #[test]

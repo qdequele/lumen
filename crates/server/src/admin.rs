@@ -864,6 +864,19 @@ fn webhooks(state: &AppState) -> Result<&Arc<crate::webhooks::WebhookController>
         .ok_or_else(|| GatewayError::Unauthorized.into())
 }
 
+/// Map a refused webhook apply (or preflight): settings the gateway cannot
+/// accept are the caller's error (400 `LM-1001`, the message names the field
+/// or the variable), a failure of the gateway itself (metrics registration,
+/// a poisoned lock) is an opaque 500 `LM-5001`.
+fn webhook_apply_error(error: crate::webhooks::WebhookApplyError) -> ApiError {
+    use crate::webhooks::WebhookApplyError;
+    match error {
+        WebhookApplyError::Invalid(message) => GatewayError::InvalidRequest(message),
+        WebhookApplyError::Internal(message) => GatewayError::Internal(message),
+    }
+    .into()
+}
+
 /// Build the current status snapshot.
 fn webhook_status(controller: &crate::webhooks::WebhookController) -> WebhookStatus {
     let live = controller.live_settings();
@@ -894,7 +907,8 @@ pub async fn get_webhooks(State(state): State<AppState>) -> Result<Json<WebhookS
 /// successful one survives a restart.
 ///
 /// Invalid settings are a 400 `LM-1001` naming the field, like every other
-/// admin write. An unresolvable signing secret (a `signing_key_env` naming a
+/// admin write; a failure of the gateway itself while checking or applying
+/// them is a 500 `LM-5001`. An unresolvable signing secret (a `signing_key_env` naming a
 /// variable this process cannot see, with nothing stored) is the same: it
 /// would silently downgrade a billing integration to unsigned deliveries.
 pub async fn put_webhooks(
@@ -919,7 +933,7 @@ pub async fn put_webhooks(
     // a stored row that works with one no reload or restart can apply.
     controller
         .preflight(&settings)
-        .map_err(GatewayError::InvalidRequest)?;
+        .map_err(webhook_apply_error)?;
 
     // Persist, refresh the cache, then apply. Applying first would leave the
     // database disagreeing with a running pipeline if the write then failed;
@@ -936,7 +950,7 @@ pub async fn put_webhooks(
         .await;
     controller
         .apply(&settings, &auth.keys)
-        .map_err(GatewayError::InvalidRequest)?;
+        .map_err(webhook_apply_error)?;
     Ok(Json(webhook_status(controller)))
 }
 
@@ -1009,7 +1023,7 @@ pub async fn put_webhook_signing_key(
     if let Some(settings) = controller.live_settings() {
         controller
             .apply(&settings, &auth.keys)
-            .map_err(GatewayError::InvalidRequest)?;
+            .map_err(webhook_apply_error)?;
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1043,7 +1057,7 @@ pub async fn delete_webhook_signing_key(
         // check above; `apply` swaps nothing when it errors.
         controller
             .apply(&settings, &auth.keys)
-            .map_err(GatewayError::InvalidRequest)?;
+            .map_err(webhook_apply_error)?;
     }
     Ok(StatusCode::NO_CONTENT)
 }

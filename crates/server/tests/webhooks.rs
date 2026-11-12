@@ -1573,3 +1573,26 @@ async fn a_refused_signing_key_delete_keeps_the_stored_secret() {
     assert_eq!(status["signing_key_stored"], true);
     assert_eq!(status["signed"], true);
 }
+
+/// A failure inside the gateway while checking a valid document (here the
+/// Prometheus collectors cannot be registered) is the gateway's fault: a 500
+/// `LM-5001`, never a 400 blaming the document. Nothing is persisted.
+#[tokio::test]
+async fn put_webhooks_reports_an_internal_preflight_failure_as_a_500() {
+    let upstream = MockServer::start().await;
+    let receiver = MockServer::start().await;
+    mount_receiver(&receiver).await;
+    let h = spawn_gateway_without_webhooks(chat_registry(&upstream.uri())).await;
+    // Take the collector names first, so the controller's own registration
+    // is refused as a duplicate.
+    let _taken = lumen_telemetry::WebhookMetrics::register(&h.metrics).expect("register");
+
+    let response = h.put_webhooks(&put_body(&receiver.uri())).await;
+    assert_eq!(response.status(), 500);
+    let error: Value = response.json().await.expect("error json");
+    assert_eq!(error["error"]["code"], "LM-5001");
+    assert!(
+        h.store.load_webhook_config().await.expect("load").is_none(),
+        "a document that could not be applied must not reach storage"
+    );
+}
