@@ -4,6 +4,8 @@
 //! documents plus a `relevance_score`); this helper guarantees the client-facing
 //! invariants regardless of upstream behaviour:
 //!
+//! * `top_n: 0` is a client error (400, `LM-1001`), raised before any
+//!   upstream call;
 //! * `top_n` is clamped to the document count (silently) before the upstream
 //!   call, and the result set is truncated to it afterwards (TEI, for instance,
 //!   has no `top_n` and returns every document);
@@ -30,6 +32,18 @@ pub async fn rerank(
     mut req: RerankRequest,
     cancel: &CancellationToken,
 ) -> Result<RerankResponse, ProviderError> {
+    // `top_n: 0` asks for no result. Forwarded, it is a 400 on the upstreams
+    // that take `top_n` and a billed empty 200 on those that do not, so it is
+    // rejected here, before any upstream call, as a client error (400,
+    // LM-1001). The provider name is left empty: the caller's route name
+    // fills it in (`GatewayError::from_provider`).
+    if req.top_n == Some(0) {
+        return Err(ProviderError::UnsupportedInput {
+            provider: String::new(),
+            reason: "a `top_n` of 0 (it must be at least 1)".to_owned(),
+        });
+    }
+
     // Reduce object documents to a single ranking text at the edge, per
     // `rank_fields`, so every downstream provider only ever sees plain text.
     // A no-op for requests that are already all bare strings and set no
@@ -254,6 +268,26 @@ mod tests {
             .await
             .unwrap();
         assert!(resp.results[0].document.is_none());
+    }
+
+    #[tokio::test]
+    async fn top_n_zero_is_rejected_before_the_provider_is_called() {
+        let provider = StubProvider::new(vec![result(0, 0.9)]);
+        let req = request(&["a"], Some(0), false);
+        let err = rerank(&provider, req, &CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ProviderError::UnsupportedInput { ref reason, .. } if reason.contains("top_n")),
+            "got {err:?}"
+        );
+        // A client fault: never retried, never held against the provider.
+        assert!(!err.is_retryable());
+        assert!(!err.is_provider_fault());
+        assert!(
+            provider.seen_top_n.lock().unwrap().is_empty(),
+            "no (billed) upstream call for a request that asks for nothing"
+        );
     }
 
     #[tokio::test]

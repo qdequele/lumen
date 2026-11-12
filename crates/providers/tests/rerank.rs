@@ -723,6 +723,33 @@ async fn together_passes_rerank_conformance_suite() {
     run_conformance(&TogetherFixture).await;
 }
 
+/// `top_n: 0` asks for nothing: it is a client error (400, `LM-1001`) raised
+/// before any upstream call, for a provider that forwards `top_n` (Cohere) and
+/// one that has none (TEI, which would otherwise bill an empty 200).
+#[tokio::test]
+async fn top_n_zero_is_a_client_error_with_no_upstream_call() {
+    let fixtures: [&dyn RerankFixture; 2] = [&CohereFixture, &TeiFixture];
+    for fx in fixtures {
+        let mock = MockServer::start().await;
+        fx.mount_scored(&mock).await;
+        let provider = fx.build(mock.uri());
+
+        let mut req = request(&["a", "b", "c"]);
+        req.top_n = Some(0);
+        let err = rerank::rerank(&*provider, req, &CancellationToken::new())
+            .await
+            .expect_err("top_n 0 must be rejected");
+        assert!(
+            matches!(err, ProviderError::UnsupportedInput { .. }),
+            "got {err:?}"
+        );
+        let gateway = lumen_core::GatewayError::from_provider("p", err);
+        assert_eq!(gateway.code(), "LM-1001");
+        assert!(gateway.to_string().contains("top_n"), "got: {gateway}");
+        assert_eq!(mock.received_requests().await.unwrap().len(), 0);
+    }
+}
+
 /// The upstream scores three documents but only two were sent: its index 2
 /// names no request document, so the finaliser rejects the response as a
 /// translation error instead of returning a score for a phantom document.
