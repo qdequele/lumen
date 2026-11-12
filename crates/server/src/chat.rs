@@ -1115,8 +1115,9 @@ mod tests {
             reserved_output_tokens(&default, &chat_req(None, Some(100))),
             100
         );
-        let default =
-            decision_with(&[Some(json!({ "default": { "max_completion_tokens": 4096 } }))]);
+        let default = decision_with(&[Some(
+            json!({ "default": { "max_completion_tokens": 4096 } }),
+        )]);
         assert_eq!(
             reserved_output_tokens(&default, &chat_req(Some(100), None)),
             100
