@@ -146,7 +146,7 @@ impl CohereProvider {
         .await?;
         Ok(translate_sse_stream(
             bytes,
-            CohereTranslator::new(&req.model),
+            CohereTranslator::new(&req.model, &self.provider_name),
         ))
     }
 }
