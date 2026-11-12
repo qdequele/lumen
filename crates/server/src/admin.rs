@@ -896,10 +896,17 @@ pub async fn put_webhooks(
         .check_receiver_url(&settings.url)
         .await
         .map_err(GatewayError::InvalidRequest)?;
+    // Everything `apply` can refuse (an unresolvable signing secret above
+    // all) is checked before the write: a rejected document must not replace
+    // a stored row that works with one no reload or restart can apply.
+    controller
+        .preflight(&settings)
+        .map_err(GatewayError::InvalidRequest)?;
 
     // Persist, refresh the cache, then apply. Applying first would leave the
     // database disagreeing with a running pipeline if the write then failed;
-    // this order means a failed apply leaves the stored row ahead of the live
+    // this order means a failed apply (only possible now if the environment
+    // changed since the preflight) leaves the stored row ahead of the live
     // one, which `GET /admin/webhooks` makes visible and the next reload
     // reconciles.
     auth.store
@@ -1000,6 +1007,11 @@ pub async fn delete_webhook_signing_key(
 ) -> Result<StatusCode, ApiError> {
     let auth = runtime(&state)?;
     let controller = webhooks(&state)?;
+    // Refuse before deleting: a 400 that had already removed the secret would
+    // leave the live pipeline signing with a key no restart can find again.
+    controller
+        .check_signing_key_without_stored_secret()
+        .map_err(GatewayError::InvalidRequest)?;
     auth.store
         .delete_webhook_secret()
         .await
@@ -1008,9 +1020,8 @@ pub async fn delete_webhook_signing_key(
         .refresh_from_store(&auth.store, auth.master.as_ref())
         .await;
     if let Some(settings) = controller.live_settings() {
-        // The live pipeline keeps its old key on failure (`apply` swaps
-        // nothing when it errors), so delivery stays signed until the operator
-        // supplies a working source - the refusal is advisory, not a rollback.
+        // Only reachable with an error if the environment changed since the
+        // check above; `apply` swaps nothing when it errors.
         controller
             .apply(&settings, &auth.keys)
             .map_err(GatewayError::InvalidRequest)?;
