@@ -21,7 +21,9 @@ use lumen_telemetry::tokens::{
     BreakdownKind, BreakdownSample, Direction, TokenMetrics, TokenSample,
 };
 use lumen_telemetry::LatencyMetrics;
-use serde_json::Value;
+use serde::de::value::MapAccessDeserializer;
+use serde::de::{IgnoredAny, MapAccess, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -639,7 +641,8 @@ const MAX_SNIFFED_LINE: usize = 256 * 1024;
 
 /// Scans forwarded SSE bytes, line by line, retaining ONLY the latest valid
 /// top-level usage object plus a frame count - bounded state, no response
-/// accumulation (ADR 004), and serde only on the rare candidate lines.
+/// accumulation (ADR 004), and serde only on the rare candidate lines (those
+/// with a usage object), through a probe that builds nothing but the counts.
 #[derive(Debug, Default)]
 struct UsageSniffer {
     partial: Vec<u8>,
@@ -695,9 +698,9 @@ impl UsageSniffer {
             if payload != b"[DONE]" && !payload.is_empty() {
                 self.data_frames += 1;
                 // serde runs only on candidate lines (usually exactly one
-                // per stream); a content frame that merely CONTAINS the text
-                // "usage" fails the parse and cannot shadow the real chunk.
-                if contains(payload, b"\"usage\"") {
+                // per stream): a byte check first rules out every line with
+                // no usage object, `"usage":null` included (ADR 004).
+                if has_usage_object(payload) {
                     if let Some(parsed) = parse_usage(payload) {
                         self.upstream_usage = Some((parsed.prompt, parsed.completion));
                         self.upstream_breakdown = parsed.breakdown;
@@ -742,28 +745,26 @@ struct ParsedUsage {
 /// Extract prompt/completion counts and the OpenAI-shaped token breakdown from
 /// one SSE payload iff it carries a genuine top-level `usage` object with at
 /// least one non-zero count (an all-zero object is an upstream that reported
-/// nothing, never measured usage). The breakdown reads the nested `prompt_tokens_details`
-/// (`cached_tokens`, `cache_creation_tokens`) and `completion_tokens_details`
-/// (`reasoning_tokens`); absent keys stay `None`, never a fabricated zero.
+/// nothing, never measured usage). The breakdown reads the nested
+/// `prompt_tokens_details` (`cached_tokens`, `cache_creation_tokens`) and
+/// `completion_tokens_details` (`reasoning_tokens`); absent keys stay `None`,
+/// never a fabricated zero.
+///
+/// The payload is read through [`UsageProbe`], which keeps the usage counts
+/// and skips everything else (choices, deltas, content) without building it.
 fn parse_usage(payload: &[u8]) -> Option<ParsedUsage> {
-    let value = serde_json::from_slice::<Value>(payload).ok()?;
-    let usage = value.get("usage").filter(|u| u.is_object())?;
-    let prompt = usage.get("prompt_tokens").and_then(Value::as_u64);
-    let completion = usage.get("completion_tokens").and_then(Value::as_u64);
+    let Lenient(usage) = serde_json::from_slice::<UsageProbe>(payload).ok()?.usage;
+    let (prompt, completion) = (usage.prompt_tokens.0, usage.completion_tokens.0);
     // No count at all, or nothing but zeros: the upstream reported nothing
     // (ADR 003). The caller then settles on the flagged estimate, exactly as
     // the non-streaming path does.
     if prompt.unwrap_or(0) == 0 && completion.unwrap_or(0) == 0 {
         return None;
     }
-    let prompt_details = usage.get("prompt_tokens_details");
-    let completion_details = usage.get("completion_tokens_details");
-    let nested =
-        |parent: Option<&Value>, key: &str| parent.and_then(|d| d.get(key)).and_then(Value::as_u64);
     let breakdown = TokenBreakdown {
-        cached_tokens: nested(prompt_details, "cached_tokens"),
-        cache_write_tokens: nested(prompt_details, "cache_creation_tokens"),
-        reasoning_tokens: nested(completion_details, "reasoning_tokens"),
+        cached_tokens: usage.prompt_tokens_details.0.cached_tokens.0,
+        cache_write_tokens: usage.prompt_tokens_details.0.cache_creation_tokens.0,
+        reasoning_tokens: usage.completion_tokens_details.0.reasoning_tokens.0,
     };
     Some(ParsedUsage {
         prompt: prompt.unwrap_or(0),
@@ -772,8 +773,150 @@ fn parse_usage(payload: &[u8]) -> Option<ParsedUsage> {
     })
 }
 
-fn contains(haystack: &[u8], needle: &[u8]) -> bool {
-    haystack.windows(needle.len()).any(|w| w == needle)
+/// The part of a streamed chunk the sniffer reads: its top-level `usage`.
+/// Every other field is skipped by serde without being built.
+#[derive(Deserialize)]
+struct UsageProbe {
+    #[serde(default)]
+    usage: Lenient<UsageCounts>,
+}
+
+/// The counts of a `usage` object.
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct UsageCounts {
+    prompt_tokens: Count,
+    completion_tokens: Count,
+    prompt_tokens_details: Lenient<PromptDetails>,
+    completion_tokens_details: Lenient<CompletionDetails>,
+}
+
+/// The counts read from `usage.prompt_tokens_details`.
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct PromptDetails {
+    cached_tokens: Count,
+    cache_creation_tokens: Count,
+}
+
+/// The counts read from `usage.completion_tokens_details`.
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct CompletionDetails {
+    reasoning_tokens: Count,
+}
+
+/// A token count: `Some` for a non-negative JSON integer, `None` for any
+/// other value (`null`, a float, a string, ...). An odd field never fails
+/// the probe, so it never costs the stream its upstream usage.
+#[derive(Default)]
+struct Count(Option<u64>);
+
+impl<'de> Deserialize<'de> for Count {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct CountVisitor;
+        impl<'de> Visitor<'de> for CountVisitor {
+            type Value = Count;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("any JSON value")
+            }
+            fn visit_u64<E>(self, v: u64) -> Result<Count, E> {
+                Ok(Count(Some(v)))
+            }
+            fn visit_i64<E>(self, v: i64) -> Result<Count, E> {
+                Ok(Count(u64::try_from(v).ok()))
+            }
+            fn visit_f64<E>(self, _: f64) -> Result<Count, E> {
+                Ok(Count(None))
+            }
+            fn visit_bool<E>(self, _: bool) -> Result<Count, E> {
+                Ok(Count(None))
+            }
+            fn visit_str<E>(self, _: &str) -> Result<Count, E> {
+                Ok(Count(None))
+            }
+            fn visit_unit<E>(self) -> Result<Count, E> {
+                Ok(Count(None))
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<Count, A::Error> {
+                skip_seq(seq).map(|()| Count(None))
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Count, A::Error> {
+                while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+                Ok(Count(None))
+            }
+        }
+        deserializer.deserialize_any(CountVisitor)
+    }
+}
+
+/// `T` read from a JSON object; any other value (`null`, a string, an
+/// array, ...) reads as `T::default()` instead of failing the probe.
+#[derive(Default)]
+struct Lenient<T>(T);
+
+impl<'de, T: Deserialize<'de> + Default> Deserialize<'de> for Lenient<T> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct LenientVisitor<T>(std::marker::PhantomData<T>);
+        impl<'de, T: Deserialize<'de> + Default> Visitor<'de> for LenientVisitor<T> {
+            type Value = Lenient<T>;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("any JSON value")
+            }
+            fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Lenient<T>, A::Error> {
+                T::deserialize(MapAccessDeserializer::new(map)).map(Lenient)
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<Lenient<T>, A::Error> {
+                skip_seq(seq).map(|()| Lenient(T::default()))
+            }
+            fn visit_u64<E>(self, _: u64) -> Result<Lenient<T>, E> {
+                Ok(Lenient(T::default()))
+            }
+            fn visit_i64<E>(self, _: i64) -> Result<Lenient<T>, E> {
+                Ok(Lenient(T::default()))
+            }
+            fn visit_f64<E>(self, _: f64) -> Result<Lenient<T>, E> {
+                Ok(Lenient(T::default()))
+            }
+            fn visit_bool<E>(self, _: bool) -> Result<Lenient<T>, E> {
+                Ok(Lenient(T::default()))
+            }
+            fn visit_str<E>(self, _: &str) -> Result<Lenient<T>, E> {
+                Ok(Lenient(T::default()))
+            }
+            fn visit_unit<E>(self) -> Result<Lenient<T>, E> {
+                Ok(Lenient(T::default()))
+            }
+        }
+        deserializer.deserialize_any(LenientVisitor(std::marker::PhantomData))
+    }
+}
+
+/// Consume the rest of a JSON array without building it.
+fn skip_seq<'de, A: SeqAccess<'de>>(mut seq: A) -> Result<(), A::Error> {
+    while seq.next_element::<IgnoredAny>()?.is_some() {}
+    Ok(())
+}
+
+/// Whether `payload` may hold a `usage` object: a `"usage"` key whose value
+/// opens with `{`. A byte scan, no parsing.
+///
+/// This is what keeps serde off the content chunks (ADR 004): with
+/// `include_usage` on, OpenAI sends `"usage":null` on every one of them. A
+/// `"usage"` written by the model sits inside a JSON string, where its
+/// quotes are escaped, so it never reads as a key here.
+fn has_usage_object(payload: &[u8]) -> bool {
+    const KEY: &[u8] = b"\"usage\"";
+    let mut rest = payload;
+    while let Some(at) = rest.windows(KEY.len()).position(|w| w == KEY) {
+        rest = &rest[at + KEY.len()..];
+        if let Some(value) = rest.trim_ascii_start().strip_prefix(b":") {
+            if value.trim_ascii_start().first() == Some(&b'{') {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -1015,6 +1158,81 @@ mod tests {
         s.scan(b"data: {\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":6}}\n\n");
         s.scan(b"data: {\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":0}}\n\n");
         assert_eq!(s.result(99), (5, 6, false));
+    }
+
+    // ADR 004: with `include_usage` on, OpenAI puts `"usage":null` on every
+    // content chunk. Those lines are ruled out on bytes alone, before serde.
+    #[test]
+    fn only_a_usage_object_makes_a_line_a_candidate() {
+        assert!(!has_usage_object(br#"{"choices":[],"usage":null}"#));
+        assert!(!has_usage_object(br#"{"choices":[], "usage" : null }"#));
+        assert!(!has_usage_object(
+            br#"{"choices":[{"delta":{"content":"hi"}}]}"#
+        ));
+        // The model writing about "usage": escaped inside a JSON string.
+        assert!(!has_usage_object(
+            br#"{"choices":[{"delta":{"content":"\"usage\":{"}}],"usage":null}"#
+        ));
+        // A string value that reads "usage" is not the key.
+        assert!(!has_usage_object(br#"{"kind":"usage","usage":null}"#));
+        assert!(has_usage_object(br#"{"usage":{"prompt_tokens":1}}"#));
+        assert!(has_usage_object(b"{\"usage\" :\t{ \"prompt_tokens\":1}}"));
+        assert!(has_usage_object(
+            br#"{"kind":"usage","usage":{"prompt_tokens":1}}"#
+        ));
+    }
+
+    #[test]
+    fn a_null_usage_chunk_still_counts_as_a_frame() {
+        let mut s = UsageSniffer::default();
+        s.scan(b"data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}],\"usage\":null}\n\n");
+        assert_eq!(s.result(10), (10, 1, true));
+    }
+
+    #[test]
+    fn usage_is_read_from_a_chunk_that_also_carries_content() {
+        // Some upstreams report running usage on every chunk.
+        let mut s = UsageSniffer::default();
+        s.scan(
+            b"data: {\"id\":\"c\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\",\
+              \"tool_calls\":[{\"function\":{\"arguments\":\"{}\"}}]}}],\
+              \"usage\":{\"prompt_tokens\":9,\"completion_tokens\":2,\"total_tokens\":11}}\n\n",
+        );
+        assert_eq!(s.result(99), (9, 2, false));
+    }
+
+    #[test]
+    fn odd_usage_fields_read_as_absent_without_losing_the_counts() {
+        let mut s = UsageSniffer::default();
+        s.scan(
+            b"data: {\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":6,\
+              \"total_tokens\":\"eleven\",\"prompt_tokens_details\":null,\
+              \"completion_tokens_details\":[1,2],\"extra\":{\"a\":[{}]}}}\n\n",
+        );
+        assert_eq!(s.result(99), (5, 6, false));
+        let b = s.breakdown();
+        assert_eq!(b.cached_tokens, None);
+        assert_eq!(b.reasoning_tokens, None);
+
+        // A count that is not a non-negative integer is absent, not an error.
+        let mut s = UsageSniffer::default();
+        s.scan(
+            b"data: {\"usage\":{\"prompt_tokens\":7.5,\"completion_tokens\":3,\
+              \"prompt_tokens_details\":{\"cached_tokens\":-1,\"audio_tokens\":0},\
+              \"completion_tokens_details\":{\"reasoning_tokens\":2}}}\n\n",
+        );
+        assert_eq!(s.result(99), (0, 3, false));
+        let b = s.breakdown();
+        assert_eq!(b.cached_tokens, None);
+        assert_eq!(b.reasoning_tokens, Some(2));
+    }
+
+    #[test]
+    fn a_usage_that_is_not_an_object_is_not_upstream_usage() {
+        let mut s = UsageSniffer::default();
+        s.scan(b"data: {\"usage\":\"{\"}\n\n");
+        s.scan(b"data: {\"usage\":[{\"prompt_tokens\":5}]}\n\n");
+        assert_eq!(s.result(10), (10, 2, true));
     }
 
     #[test]
