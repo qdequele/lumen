@@ -272,3 +272,19 @@ sleeps past the deadline (ADR 021), so the deadline can only fire while that
 link's call is pending. A half-open probe cut by the total timeout therefore
 reopens the circuit at once; the auto-rearm remains for probes lost to a client
 disconnect.
+
+---
+
+## Amendment - 2026-11-12: only the probe holder releases the probe
+
+A call that ends with no verdict on the provider (a cancellation, a client
+fault, a link refused before the upstream call) hands a half-open probe back so
+the next caller can probe at once. That release was unconditional: a request
+admitted while the breaker was still closed, finishing with a neutral outcome
+after the circuit had opened and gone half-open, cleared the flag of a probe it
+did not hold, and a second probe was admitted while the first was in flight.
+`admit` now returns `Admission::Probe(marker)` for the probe, and
+`on_neutral(marker)` releases only the outstanding probe with that marker.
+`on_success` and `on_failure` are unchanged: any completed call is a verdict on
+the provider. A probe still runs its link's full retry policy; this ADR never
+made it a single attempt.

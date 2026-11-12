@@ -795,7 +795,7 @@ mod tests {
         );
         assert!(matches!(
             breaker.admit(now + Duration::from_secs(2)),
-            lumen_router::circuit::Admission::Allowed
+            lumen_router::circuit::Admission::Probe(_)
         ));
     }
 

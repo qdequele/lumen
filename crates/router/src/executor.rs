@@ -171,7 +171,10 @@ where
             link.breaker_scope.as_deref(),
             &link.model_id,
         );
-        if let Admission::Rejected { retry_after } = breaker.admit(Instant::now()) {
+        let admission = breaker.admit(Instant::now());
+        // The half-open probe, when this call is the one that holds it.
+        let probe = admission.probe();
+        if let Admission::Rejected { retry_after } = admission {
             // Circuit open: never touches the upstream. Moves on only through
             // an escape that lists `circuit_open`.
             let error = GatewayError::CircuitOpen {
@@ -229,8 +232,8 @@ where
                     mapped
                 } else {
                     // No verdict on the provider, but a half-open probe this
-                    // call took is handed back.
-                    breaker.on_neutral();
+                    // call took is handed back (and only by this call).
+                    breaker.on_neutral(probe);
                     match (&error, &upstream_failure) {
                         // Refused by the chain lock of another provider's
                         // pool (an exhausted pool is reported under its own

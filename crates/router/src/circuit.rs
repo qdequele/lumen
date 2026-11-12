@@ -110,11 +110,30 @@ impl CircuitState {
 /// The result of asking a breaker for permission to call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Admission {
-    /// Proceed (Closed, or the single Half-Open probe).
+    /// Proceed: the breaker is Closed.
     Allowed,
+    /// Proceed as the single Half-Open probe. The marker goes back to
+    /// [`CircuitBreaker::on_neutral`] if the call ends without a verdict.
+    Probe(Probe),
     /// Short-circuit; advertise roughly how long until a probe is admitted.
     Rejected { retry_after: Duration },
 }
+
+impl Admission {
+    /// The probe marker, when this admission is the half-open probe.
+    #[must_use]
+    pub const fn probe(self) -> Option<Probe> {
+        match self {
+            Admission::Probe(probe) => Some(probe),
+            Admission::Allowed | Admission::Rejected { .. } => None,
+        }
+    }
+}
+
+/// Identifies one admitted half-open probe, so only the call that holds it
+/// can hand it back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Probe(u64);
 
 #[derive(Debug)]
 struct Inner {
@@ -130,6 +149,18 @@ struct Inner {
     /// cooldown with no resolution the probe is presumed lost and a fresh one
     /// is admitted, so the breaker can never wedge shut.
     probe_admitted_at: Option<Instant>,
+    /// Number of probes admitted so far: the id of the outstanding one.
+    probe_seq: u64,
+}
+
+impl Inner {
+    /// Admit the caller as the half-open probe.
+    fn start_probe(&mut self, now: Instant) -> Admission {
+        self.probe_in_flight = true;
+        self.probe_admitted_at = Some(now);
+        self.probe_seq = self.probe_seq.wrapping_add(1);
+        Admission::Probe(Probe(self.probe_seq))
+    }
 }
 
 /// One circuit breaker, keyed externally by (provider, model).
@@ -157,6 +188,7 @@ impl CircuitBreaker {
                 opened_at: None,
                 probe_in_flight: false,
                 probe_admitted_at: None,
+                probe_seq: 0,
             }),
             config,
             provider,
@@ -192,11 +224,10 @@ impl CircuitBreaker {
                     .map_or(now, |opened| opened + self.config.cooldown());
                 if now >= ready_at {
                     inner.state = CircuitState::HalfOpen;
-                    inner.probe_in_flight = true;
-                    inner.probe_admitted_at = Some(now);
+                    let admission = inner.start_probe(now);
                     drop(inner);
                     self.report(CircuitState::HalfOpen);
-                    Admission::Allowed
+                    admission
                 } else {
                     Admission::Rejected {
                         retry_after: ready_at.saturating_duration_since(now),
@@ -217,9 +248,7 @@ impl CircuitBreaker {
                             .map_or(cooldown, |d| d.saturating_duration_since(now)),
                     }
                 } else {
-                    inner.probe_in_flight = true;
-                    inner.probe_admitted_at = Some(now);
-                    Admission::Allowed
+                    inner.start_probe(now)
                 }
             }
         }
@@ -270,11 +299,19 @@ impl CircuitBreaker {
     /// Record a call that says nothing about the provider's health (a
     /// cancellation, a client fault, or a link the gateway refused before
     /// calling upstream). Leaves the state and the failure streak alone, but
-    /// releases a half-open probe this call held, so the next caller can
-    /// probe right away instead of waiting for the probe to go stale.
-    pub fn on_neutral(&self) {
+    /// releases the half-open probe this call held (`probe`, from its
+    /// [`Admission`]), so the next caller can probe right away instead of
+    /// waiting for the probe to go stale. A call that does not hold the
+    /// outstanding probe (admitted while the breaker was still closed, or
+    /// holding a probe since presumed lost and replaced) releases nothing:
+    /// otherwise its neutral outcome would let a second probe through while
+    /// the first is still in flight.
+    pub fn on_neutral(&self, probe: Option<Probe>) {
+        let Some(Probe(id)) = probe else {
+            return;
+        };
         let mut inner = self.lock();
-        if inner.state == CircuitState::HalfOpen {
+        if inner.state == CircuitState::HalfOpen && inner.probe_in_flight && inner.probe_seq == id {
             inner.probe_in_flight = false;
             inner.probe_admitted_at = None;
         }
@@ -440,7 +477,7 @@ mod tests {
 
         // After the cooldown: exactly one probe is admitted, the next rejected.
         let after = t0 + Duration::from_secs(31);
-        assert_eq!(b.admit(after), Admission::Allowed);
+        assert!(matches!(b.admit(after), Admission::Probe(_)));
         assert_eq!(b.state(), CircuitState::HalfOpen);
         assert!(matches!(b.admit(after), Admission::Rejected { .. }));
     }
@@ -453,7 +490,7 @@ mod tests {
             b.on_failure(t0);
         }
         let after = t0 + Duration::from_secs(31);
-        assert_eq!(b.admit(after), Admission::Allowed);
+        assert!(matches!(b.admit(after), Admission::Probe(_)));
         b.on_success();
         assert_eq!(b.state(), CircuitState::Closed);
         assert_eq!(b.admit(after), Admission::Allowed);
@@ -470,17 +507,19 @@ mod tests {
             b.on_failure(t0);
         }
         let probe_at = t0 + Duration::from_secs(31);
-        assert_eq!(b.admit(probe_at), Admission::Allowed); // probe admitted…
-                                                           // …and simply never resolved. A second probe within the cooldown is
-                                                           // still rejected (single-probe guarantee holds inside the window).
+        assert!(matches!(b.admit(probe_at), Admission::Probe(_))); // probe admitted…
+                                                                   // …and simply never resolved. A second probe within the cooldown is
+                                                                   // still rejected (single-probe guarantee holds inside the window).
         assert!(matches!(
             b.admit(probe_at + Duration::from_secs(1)),
             Admission::Rejected { .. }
         ));
         // But once the lost probe's own cooldown elapses, a fresh probe passes.
-        assert_eq!(
-            b.admit(probe_at + Duration::from_secs(31)),
-            Admission::Allowed,
+        assert!(
+            matches!(
+                b.admit(probe_at + Duration::from_secs(31)),
+                Admission::Probe(_)
+            ),
             "a lost probe must not pin the breaker shut"
         );
     }
@@ -493,7 +532,7 @@ mod tests {
             b.on_failure(t0);
         }
         let after = t0 + Duration::from_secs(31);
-        assert_eq!(b.admit(after), Admission::Allowed); // probe
+        assert!(matches!(b.admit(after), Admission::Probe(_))); // probe
         b.on_failure(after); // probe fails
         assert_eq!(b.state(), CircuitState::Open);
         // The cooldown restarts from the probe failure.
@@ -501,7 +540,10 @@ mod tests {
             b.admit(after + Duration::from_secs(1)),
             Admission::Rejected { .. }
         ));
-        assert_eq!(b.admit(after + Duration::from_secs(31)), Admission::Allowed);
+        assert!(matches!(
+            b.admit(after + Duration::from_secs(31)),
+            Admission::Probe(_)
+        ));
     }
 
     #[tokio::test]
@@ -516,7 +558,7 @@ mod tests {
                 assert!(retry_after <= Duration::from_secs(20));
                 assert!(retry_after > Duration::from_secs(0));
             }
-            Admission::Allowed => panic!("should be rejected mid-cooldown"),
+            other => panic!("should be rejected mid-cooldown: {other:?}"),
         }
     }
 
@@ -559,10 +601,10 @@ mod tests {
             existing.admit(t0 + Duration::from_secs(9)),
             Admission::Rejected { .. }
         ));
-        assert_eq!(
+        assert!(matches!(
             existing.admit(t0 + Duration::from_secs(11)),
-            Admission::Allowed
-        );
+            Admission::Probe(_)
+        ));
 
         // A breaker created afterwards uses the new tuning too.
         let fresh = breakers.get("openai", "gpt-4o-mini");
@@ -580,18 +622,52 @@ mod tests {
             b.on_failure(t0);
         }
         let after = t0 + Duration::from_secs(31);
-        assert_eq!(b.admit(after), Admission::Allowed); // probe
-        b.on_neutral();
+        let probe = b.admit(after).probe();
+        assert!(probe.is_some());
+        b.on_neutral(probe);
         assert_eq!(b.state(), CircuitState::HalfOpen, "no verdict");
-        assert_eq!(b.admit(after), Admission::Allowed, "probe released");
+        assert!(
+            matches!(b.admit(after), Admission::Probe(_)),
+            "probe released"
+        );
         // While closed it touches nothing: the streak survives.
         let c = breaker();
         for _ in 0..4 {
             c.on_failure(t0);
         }
-        c.on_neutral();
+        c.on_neutral(None);
         c.on_failure(t0);
         assert_eq!(c.state(), CircuitState::Open);
+    }
+
+    #[tokio::test]
+    async fn only_the_probe_holder_releases_the_probe() {
+        let b = breaker();
+        let t0 = Instant::now();
+        // A slow request admitted while the breaker was still closed.
+        let early = b.admit(t0).probe();
+        assert_eq!(early, None);
+        for _ in 0..5 {
+            b.on_failure(t0);
+        }
+        let after = t0 + Duration::from_secs(31);
+        let probe = b.admit(after).probe();
+        assert!(probe.is_some());
+        // The early request ends with no verdict (a client disconnect): it
+        // holds no probe, so the probe stays in flight and no second one is
+        // admitted.
+        b.on_neutral(early);
+        assert!(matches!(b.admit(after), Admission::Rejected { .. }));
+
+        // A probe presumed lost and replaced cannot release its successor.
+        let later = after + Duration::from_secs(31);
+        let second = b.admit(later).probe();
+        assert!(second.is_some() && second != probe);
+        b.on_neutral(probe);
+        assert!(matches!(b.admit(later), Admission::Rejected { .. }));
+        // The holder can.
+        b.on_neutral(second);
+        assert!(matches!(b.admit(later), Admission::Probe(_)));
     }
 
     #[tokio::test]
