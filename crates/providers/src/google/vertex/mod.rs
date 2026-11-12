@@ -336,7 +336,7 @@ impl VertexProvider {
         .await?;
         Ok(translate_sse_stream(
             bytes,
-            GoogleTranslator::new(&req.model),
+            GoogleTranslator::new(&req.model, &self.provider_name),
         ))
     }
 }
@@ -369,7 +369,7 @@ impl ChatProvider for VertexProvider {
         .await?;
         let parsed: GeminiResponse = serde_json::from_slice(&bytes)
             .map_err(|e| ProviderError::Translation(format!("google vertex response: {e}")))?;
-        Ok(translate_response(parsed, &req.model))
+        translate_response(parsed, &req.model, &self.provider_name)
     }
 
     async fn chat_stream(

@@ -13,7 +13,7 @@ use lumen_core::{ChatChunk, ChatChunkChoice, ChatDelta, ProviderError, Usage};
 use serde::Deserialize;
 use serde_json::json;
 
-use super::{map_finish_reason, GeminiUsage};
+use super::{map_finish_reason, prompt_block_error, GeminiPromptFeedback, GeminiUsage};
 use crate::chat::{SseTranslator, StreamItem};
 use crate::sse::SseEvent;
 
@@ -21,6 +21,8 @@ use crate::sse::SseEvent;
 pub(super) struct GoogleTranslator {
     /// The client-requested model (Gemini events do not repeat it).
     model: String,
+    /// The provider instance name, for error attribution.
+    provider_name: String,
     /// Whether the initial `role: assistant` chunk was emitted yet.
     started: bool,
     /// Set once a `finishReason` was seen; later events are ignored.
@@ -33,9 +35,10 @@ pub(super) struct GoogleTranslator {
 }
 
 impl GoogleTranslator {
-    pub(super) fn new(requested_model: &str) -> Self {
+    pub(super) fn new(requested_model: &str, provider_name: &str) -> Self {
         Self {
             model: requested_model.to_owned(),
+            provider_name: provider_name.to_owned(),
             started: false,
             finished: false,
             next_tool_index: 0,
@@ -85,6 +88,19 @@ impl SseTranslator for GoogleTranslator {
         }
         let parsed: GeminiStreamChunk = serde_json::from_str(&event.data)
             .map_err(|e| ProviderError::Translation(format!("gemini stream event: {e}")))?;
+
+        // A prompt-level block arrives as a candidate-less fragment carrying
+        // `promptFeedback.blockReason`; no `finishReason` ever follows. Surface
+        // the refusal (LM-2013) and latch, rather than ending without a
+        // terminator (which would read as LM-3010 stream interrupted).
+        if let Some(err) = prompt_block_error(
+            parsed.prompt_feedback.as_ref(),
+            !parsed.candidates.is_empty(),
+            &self.provider_name,
+        ) {
+            self.finished = true;
+            return Err(err);
+        }
 
         let mut items = Vec::new();
         if !self.started {
@@ -181,6 +197,8 @@ struct GeminiStreamChunk {
     candidates: Vec<GeminiStreamCandidate>,
     #[serde(rename = "usageMetadata", default)]
     usage_metadata: Option<GeminiUsage>,
+    #[serde(rename = "promptFeedback", default)]
+    prompt_feedback: Option<GeminiPromptFeedback>,
 }
 
 #[derive(Deserialize)]
@@ -230,7 +248,7 @@ mod tests {
 
     #[test]
     fn stream_fragments_translate_to_role_text_finish_and_done() {
-        let mut t = GoogleTranslator::new("gemini-2.0");
+        let mut t = GoogleTranslator::new("gemini-2.0", "google-test");
         let first = t
             .translate(&event(serde_json::json!({
                 "candidates": [
@@ -280,7 +298,7 @@ mod tests {
 
     #[test]
     fn stream_function_call_becomes_tool_calls_delta_and_tool_calls_finish() {
-        let mut t = GoogleTranslator::new("gemini-2.0");
+        let mut t = GoogleTranslator::new("gemini-2.0", "google-test");
         let items = t
             .translate(&event(serde_json::json!({
                 "candidates": [{
@@ -331,7 +349,7 @@ mod tests {
 
     #[test]
     fn max_tokens_finish_maps_to_length() {
-        let mut t = GoogleTranslator::new("g");
+        let mut t = GoogleTranslator::new("g", "google-test");
         let items = t
             .translate(&event(serde_json::json!({
                 "candidates": [{
@@ -349,7 +367,7 @@ mod tests {
 
     #[test]
     fn stream_usage_folds_thoughts_into_completion_tokens() {
-        let mut t = GoogleTranslator::new("g");
+        let mut t = GoogleTranslator::new("g", "google-test");
         let items = t
             .translate(&event(serde_json::json!({
                 "candidates": [{ "content": { "parts": [{ "text": "x" }] }, "finishReason": "STOP" }],
@@ -373,9 +391,32 @@ mod tests {
         assert_eq!(usage.reasoning_tokens(), Some(30));
     }
 
+    /// A prompt-level block is a content-filter refusal (and latches), not a
+    /// silently unterminated stream.
+    #[test]
+    fn prompt_level_block_is_content_filtered_and_latches() {
+        let mut t = GoogleTranslator::new("g", "google-test");
+        let err = t
+            .translate(&event(serde_json::json!({
+                "promptFeedback": { "blockReason": "PROHIBITED_CONTENT" },
+                "usageMetadata": { "promptTokenCount": 3, "totalTokenCount": 3 }
+            })))
+            .expect_err("blocked");
+        assert!(
+            matches!(&err, ProviderError::ContentFiltered { provider, status: 400 } if provider == "google-test"),
+            "{err:?}"
+        );
+        let late = t
+            .translate(&event(serde_json::json!({
+                "candidates": [{ "content": { "parts": [{ "text": "late" }] } }]
+            })))
+            .expect("ok");
+        assert!(late.is_empty(), "{late:?}");
+    }
+
     #[test]
     fn fragments_after_finish_are_ignored() {
-        let mut t = GoogleTranslator::new("g");
+        let mut t = GoogleTranslator::new("g", "google-test");
         let _ = t
             .translate(&event(serde_json::json!({
                 "candidates": [{ "content": { "parts": [] }, "finishReason": "STOP" }]
@@ -391,7 +432,7 @@ mod tests {
 
     #[test]
     fn malformed_fragment_is_a_translation_error() {
-        let mut t = GoogleTranslator::new("g");
+        let mut t = GoogleTranslator::new("g", "google-test");
         let err = t
             .translate(&SseEvent {
                 event: None,
@@ -403,7 +444,7 @@ mod tests {
 
     #[test]
     fn candidate_less_keepalive_fragments_forward_nothing() {
-        let mut t = GoogleTranslator::new("g");
+        let mut t = GoogleTranslator::new("g", "google-test");
         let first = t.translate(&event(serde_json::json!({}))).expect("ok");
         // Only the initial role chunk, no content.
         assert_eq!(first.len(), 1);

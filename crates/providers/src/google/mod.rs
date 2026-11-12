@@ -327,6 +327,44 @@ struct GeminiResponse {
     candidates: Vec<GeminiCandidate>,
     #[serde(rename = "usageMetadata", default)]
     usage_metadata: GeminiUsage,
+    #[serde(rename = "promptFeedback", default)]
+    prompt_feedback: Option<GeminiPromptFeedback>,
+}
+
+/// Gemini `promptFeedback`: when `blockReason` is set "the prompt was blocked
+/// and no candidates are returned" (HTTP 200 all the same).
+#[derive(Default, Deserialize)]
+pub(super) struct GeminiPromptFeedback {
+    #[serde(rename = "blockReason", default)]
+    block_reason: Option<String>,
+}
+
+/// A prompt-level block (`promptFeedback.blockReason` set, no candidates) as
+/// the content-filter refusal it is (LM-2013), rather than an empty success
+/// or, when streaming, a stream without a terminator (LM-3010). Gemini
+/// answers 200, so the carried status is a synthetic 400: the client's input
+/// was refused. Only the block reason enum is logged, never the prompt.
+pub(super) fn prompt_block_error(
+    feedback: Option<&GeminiPromptFeedback>,
+    has_candidates: bool,
+    provider_name: &str,
+) -> Option<ProviderError> {
+    if has_candidates {
+        return None;
+    }
+    let reason = feedback?.block_reason.as_deref()?;
+    if reason.is_empty() || reason == "BLOCK_REASON_UNSPECIFIED" {
+        return None;
+    }
+    tracing::debug!(
+        provider = provider_name,
+        block_reason = reason,
+        "gemini blocked the prompt (promptFeedback.blockReason)"
+    );
+    Some(ProviderError::ContentFiltered {
+        provider: provider_name.to_owned(),
+        status: 400,
+    })
 }
 
 #[derive(Deserialize)]
@@ -786,7 +824,22 @@ fn collect_stop_sequences(stop: &serde_json::Value) -> Vec<String> {
 }
 
 /// Build an OpenAI-shaped [`ChatResponse`] from a Gemini response.
-fn translate_response(resp: GeminiResponse, requested_model: &str) -> ChatResponse {
+///
+/// # Errors
+/// Returns [`ProviderError::ContentFiltered`] when Gemini blocked the prompt
+/// (`promptFeedback.blockReason` with no candidates).
+fn translate_response(
+    resp: GeminiResponse,
+    requested_model: &str,
+    provider_name: &str,
+) -> Result<ChatResponse, ProviderError> {
+    if let Some(err) = prompt_block_error(
+        resp.prompt_feedback.as_ref(),
+        !resp.candidates.is_empty(),
+        provider_name,
+    ) {
+        return Err(err);
+    }
     let mut text = String::new();
     let mut tool_calls: Vec<serde_json::Value> = Vec::new();
     let mut finish_reason = None;
@@ -834,7 +887,7 @@ fn translate_response(resp: GeminiResponse, requested_model: &str) -> ChatRespon
 
     let usage = resp.usage_metadata.into_usage();
 
-    ChatResponse {
+    Ok(ChatResponse {
         id: String::new(),
         object: "chat.completion".to_owned(),
         created: 0, // Gemini does not return a creation timestamp.
@@ -851,7 +904,7 @@ fn translate_response(resp: GeminiResponse, requested_model: &str) -> ChatRespon
         }],
         usage: Some(usage),
         extra: serde_json::Map::new(),
-    }
+    })
 }
 
 #[async_trait]
@@ -887,7 +940,7 @@ impl ChatProvider for GoogleProvider {
 
         let parsed: GeminiResponse = serde_json::from_slice(&bytes)
             .map_err(|e| ProviderError::Translation(format!("google gemini response: {e}")))?;
-        Ok(translate_response(parsed, &req.model))
+        translate_response(parsed, &req.model, &self.provider_name)
     }
 
     async fn chat_stream(
@@ -952,7 +1005,7 @@ pub mod fuzzing {
     /// whatever parses; must never panic on malformed or adversarial input.
     pub fn fuzz_translate_response(data: &[u8], requested_model: &str) {
         if let Ok(resp) = serde_json::from_slice::<GeminiResponse>(data) {
-            let _ = translate_response(resp, requested_model);
+            let _ = translate_response(resp, requested_model, "fuzz");
         }
     }
 }
@@ -990,7 +1043,7 @@ impl GoogleProvider {
         .await?;
         Ok(translate_sse_stream(
             bytes,
-            GoogleTranslator::new(&req.model),
+            GoogleTranslator::new(&req.model, &self.provider_name),
         ))
     }
 }
@@ -1093,7 +1146,7 @@ mod tests {
             }
         }))
         .unwrap();
-        let usage = translate_response(resp, "gemini-2.5-pro").usage.unwrap();
+        let usage = translate_response(resp, "gemini-2.5-pro", "google").unwrap().usage.unwrap();
         assert_eq!(usage.prompt_tokens, 10);
         assert_eq!(usage.completion_tokens, 34);
         assert_eq!(usage.total_tokens, 44);
@@ -1110,9 +1163,37 @@ mod tests {
             }
         }))
         .unwrap();
-        let usage = translate_response(resp, "gemini-2.0").usage.unwrap();
+        let usage = translate_response(resp, "gemini-2.0", "google").unwrap().usage.unwrap();
         assert_eq!(usage.completion_tokens, 4);
         assert_eq!(usage.completion_tokens_details, None);
+    }
+
+    /// A 200 with `promptFeedback.blockReason` and no candidates is a
+    /// content-policy refusal naming the provider, not an empty success.
+    #[test]
+    fn prompt_level_block_is_content_filtered() {
+        let resp: GeminiResponse = serde_json::from_value(json!({
+            "promptFeedback": { "blockReason": "SAFETY" },
+            "usageMetadata": { "promptTokenCount": 9, "totalTokenCount": 9 }
+        }))
+        .unwrap();
+        let err = translate_response(resp, "gemini-2.0", "google-main").unwrap_err();
+        assert!(
+            matches!(&err, ProviderError::ContentFiltered { provider, status: 400 } if provider == "google-main"),
+            "{err:?}"
+        );
+    }
+
+    /// Prompt feedback without a block reason, or alongside candidates, is
+    /// not a refusal.
+    #[test]
+    fn prompt_feedback_without_block_reason_is_not_an_error() {
+        let resp: GeminiResponse = serde_json::from_value(json!({
+            "candidates": [{ "content": { "parts": [{ "text": "ok" }] }, "finishReason": "STOP" }],
+            "promptFeedback": { "safetyRatings": [] }
+        }))
+        .unwrap();
+        assert!(translate_response(resp, "gemini-2.0", "google").is_ok());
     }
 
     #[test]
@@ -1133,6 +1214,7 @@ mod tests {
                 },
                 finish_reason: Some("MAX_TOKENS".to_owned()),
             }],
+            prompt_feedback: None,
             usage_metadata: GeminiUsage {
                 prompt: 7,
                 candidates: 4,
@@ -1140,7 +1222,7 @@ mod tests {
                 total: 11,
             },
         };
-        let out = translate_response(resp, "gemini-2.0");
+        let out = translate_response(resp, "gemini-2.0", "google").unwrap();
         assert_eq!(
             out.choices[0]
                 .message
@@ -1343,6 +1425,7 @@ mod tests {
                 },
                 finish_reason: Some("STOP".to_owned()),
             }],
+            prompt_feedback: None,
             usage_metadata: GeminiUsage {
                 prompt: 4,
                 candidates: 2,
@@ -1350,7 +1433,7 @@ mod tests {
                 total: 6,
             },
         };
-        let out = translate_response(resp, "gemini-2.0");
+        let out = translate_response(resp, "gemini-2.0", "google").unwrap();
         let message = &out.choices[0].message;
         // Pure tool-call message: content is null, tool_calls carry the call.
         assert_eq!(message.content, None);
