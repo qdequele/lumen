@@ -18,7 +18,7 @@
 //! item.
 
 use crate::chat::{ChatRequest, MessageContent};
-use crate::embed::EmbedRequest;
+use crate::embed::{EmbedInput, EmbedItem, EmbedRequest};
 use crate::rerank::RerankRequest;
 
 /// The heuristic's byte-per-token ratio.
@@ -101,11 +101,34 @@ pub fn estimate_chat_prompt(req: &ChatRequest) -> u64 {
 
 /// Estimate the input tokens of an embeddings request (sum over the batch).
 /// Pre-tokenized inputs (token-id arrays) contribute one token per id, with no
-/// byte heuristic; text inputs use the byte-per-token heuristic.
+/// byte heuristic; text inputs use the byte-per-token heuristic; image parts
+/// get the flat per-image estimate, so an image-only item is never zero.
 #[must_use]
 pub fn estimate_embed_input(req: &EmbedRequest) -> u64 {
     let text: u64 = req.input.iter().map(estimate_text).sum();
-    text.saturating_add(req.input.token_count())
+    text.saturating_add(estimate_embed_non_text(req))
+}
+
+/// The part of an embeddings estimate that is not text: one token per
+/// pre-tokenized id, plus the flat per-image estimate (see
+/// [`estimate_image_tokens`]) for every image part. A tokenizer pass over the
+/// text refines only the text, so this is added to its result unchanged.
+#[must_use]
+pub fn estimate_embed_non_text(req: &EmbedRequest) -> u64 {
+    let images: u64 = match &req.input {
+        EmbedInput::Multi(items) => items
+            .iter()
+            .filter_map(|item| match item {
+                EmbedItem::Parts(parts) => Some(parts),
+                EmbedItem::Text(_) => None,
+            })
+            .flatten()
+            .filter_map(crate::chat::ContentPart::image)
+            .map(|img| estimate_image_tokens(img.detail.as_deref()))
+            .sum(),
+        _ => 0,
+    };
+    images.saturating_add(req.input.token_count())
 }
 
 /// Estimate the tokens processed by a rerank request: the query is compared
@@ -287,6 +310,35 @@ mod tests {
         let batch: EmbedRequest = serde_json::from_str(r#"{"model":"m","input":[[1,2],[3,4,5]]}"#)
             .expect("valid request");
         assert_eq!(estimate_embed_input(&batch), 5);
+    }
+
+    #[test]
+    fn embed_image_only_item_is_never_zero() {
+        let req: EmbedRequest = serde_json::from_str(
+            r#"{"model":"m","input":[[
+                {"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}]]}"#,
+        )
+        .expect("valid request");
+        assert_eq!(estimate_embed_input(&req), DEFAULT_IMAGE_TOKENS);
+    }
+
+    #[test]
+    fn embed_images_add_the_flat_estimate_to_the_text() {
+        let req: EmbedRequest = serde_json::from_str(
+            r#"{"model":"m","input":["abcd",[
+                {"type":"text","text":"abcdefgh"},
+                {"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA","detail":"low"}},
+                {"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}]]}"#,
+        )
+        .expect("valid request");
+        assert_eq!(
+            estimate_embed_input(&req),
+            1 + 2 + LOW_DETAIL_IMAGE_TOKENS + DEFAULT_IMAGE_TOKENS
+        );
+        assert_eq!(
+            estimate_embed_non_text(&req),
+            LOW_DETAIL_IMAGE_TOKENS + DEFAULT_IMAGE_TOKENS
+        );
     }
 
     #[test]

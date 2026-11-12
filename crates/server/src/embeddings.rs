@@ -285,12 +285,15 @@ fn finish_embed(
         let counter = state.token_counter();
         let model = model_used.to_owned();
         let texts: Vec<String> = req.input.iter().map(str::to_owned).collect();
+        // The recount covers the text only: images and pre-tokenized ids keep
+        // their estimate, so an image-only item is not refined down to zero.
+        let non_text = tokens::estimate_embed_non_text(req);
         let pricing_task = pricing.clone();
         tokio::spawn(async move {
             let refined = counter
                 .refine_embed(&model, texts)
                 .await
-                .unwrap_or(tokens_in);
+                .map_or(tokens_in, |text| text.saturating_add(non_text));
             let cost = pricing_task.token_cost(&model, refined, 0);
             accounting.finish(&Outcome {
                 tokens_in: refined,

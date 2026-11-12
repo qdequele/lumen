@@ -378,6 +378,39 @@ async fn image_input_to_text_only_model_is_400_fg2003_without_upstream_call() {
     );
 }
 
+/// ADR 003: an image-only item with a usage-silent upstream is never zero
+/// tokens. It gets the flat per-image estimate, flagged.
+#[tokio::test]
+async fn image_only_input_without_upstream_usage_is_estimated_not_zero() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/embeddings"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "object": "list",
+            "data": [{ "object": "embedding", "index": 0, "embedding": [0.1] }],
+            "model": "multimodal-embed"
+        })))
+        .mount(&upstream)
+        .await;
+    let base = common::spawn_with(registry_for(&upstream.uri()), LIMIT).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/embeddings"))
+        .json(&json!({
+            "model": "embed-image",
+            "input": [[
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
+            ]]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["usage"]["prompt_tokens"], 765, "{body}");
+    assert_eq!(body["usage"]["estimated"], true, "{body}");
+}
+
 #[tokio::test]
 async fn data_uri_image_is_counted_in_media_metrics() {
     let upstream = MockServer::start().await;
