@@ -6,12 +6,16 @@
 //! cancelled if the client disconnects (via the drop guard), aborting the
 //! upstream call.
 
+use axum::body::Body;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::State;
-use axum::http::HeaderMap;
+use axum::http::{header, HeaderMap};
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
-use lumen_core::{tokens, Capability, GatewayError, ProviderError};
+use lumen_core::{
+    tokens, Capability, EmbedCompletion, EmbedRequest, EmbeddingProvider, GatewayError,
+    ProviderError,
+};
 use lumen_providers::batch;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -190,13 +194,7 @@ pub async fn embeddings(
                         let provider =
                             provider.ok_or(ProviderError::Unavailable { provider: name })?;
                         mark.mark();
-                        batch::embed_batched(
-                            provider.as_ref(),
-                            req,
-                            &cancel,
-                            batch::DEFAULT_CONCURRENCY,
-                        )
-                        .await
+                        embed_upstream(provider.as_ref(), req, &cancel).await
                     }
                 };
                 keys.attempt(
@@ -214,10 +212,36 @@ pub async fn embeddings(
         .map_err(|e| accounting.fail(e))?;
     // (an early return above drops `accounting`, refunding the reservation)
 
-    let (mut response, served) = executed.value;
+    let (completion, served) = executed.value;
     accounting.served_by(&executed.model_used, &executed.provider_used);
     let route = decision.route_of(executed.index);
     accounting.set_route(route, decision.account);
+    let billable = matches!(served, Served::Platform);
+
+    let mut response = match completion {
+        // The upstream body already is the client's answer: usage reported,
+        // every vector in the requested encoding. It is forwarded as the
+        // bytes received (ADR 004, 2026-11-12 amendment).
+        EmbedCompletion::Passthrough(upstream) => {
+            let tokens_in = u64::from(upstream.usage().prompt_tokens);
+            finish_embed(
+                &state,
+                accounting,
+                &pricing,
+                &executed.model_used,
+                &req,
+                (tokens_in, false),
+                billable,
+            );
+            return Ok((
+                routing_headers(&executed.model_used, route),
+                [(header::CONTENT_TYPE, "application/json")],
+                Body::from(upstream.into_body()),
+            )
+                .into_response());
+        }
+        EmbedCompletion::Typed(response) => response,
+    };
 
     // ADR 003: upstream usage when reported, else the local estimate - never
     // a silent zero (e.g. TEI reports nothing). The response envelope always
@@ -240,7 +264,7 @@ pub async fn embeddings(
         &executed.model_used,
         &req,
         (tokens_in, estimated),
-        matches!(served, Served::Platform),
+        billable,
     );
 
     // Honor the requested output encoding (OpenAI `encoding_format`), as the
@@ -259,6 +283,36 @@ pub async fn embeddings(
     }
 
     Ok((routing_headers(&executed.model_used, route), Json(response)).into_response())
+}
+
+/// Send one attempt's request upstream.
+///
+/// A request that fits one upstream call goes through
+/// [`EmbeddingProvider::embed_completion`], so a same-schema body can come
+/// back as bytes (ADR 004, 2026-11-12 amendment); one that has to be split
+/// goes through [`batch::embed_batched`], whose reassembled answer is always
+/// typed. Either way the number of vectors returned must equal the number of
+/// inputs sent: a short upstream response is a `LM-3002`, never a silent
+/// short result (issue #89, the same check as `batch.rs`).
+async fn embed_upstream(
+    provider: &dyn EmbeddingProvider,
+    req: EmbedRequest,
+    cancel: &CancellationToken,
+) -> Result<EmbedCompletion, ProviderError> {
+    let expected = req.input.len();
+    if expected > provider.max_batch_size().max(1) {
+        return batch::embed_batched(provider, req, cancel, batch::DEFAULT_CONCURRENCY)
+            .await
+            .map(EmbedCompletion::Typed);
+    }
+    let completion = provider.embed_completion(req, cancel.clone()).await?;
+    let returned = completion.vector_count();
+    if returned != expected {
+        return Err(ProviderError::Translation(format!(
+            "embedding count {returned} != input count {expected}"
+        )));
+    }
+    Ok(completion)
 }
 
 /// Close the embed accounting record: inline for upstream-reported or

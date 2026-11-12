@@ -42,8 +42,8 @@ pub use decisions::{
     QuestionKind, Text,
 };
 pub use embed::{
-    encode_embedding_base64, EmbedData, EmbedInput, EmbedItem, EmbedRequest, EmbedResponse,
-    EmbedUsage, EmbeddingEncoding,
+    encode_embedding_base64, EmbedCompletion, EmbedData, EmbedInput, EmbedItem, EmbedPassthrough,
+    EmbedRequest, EmbedResponse, EmbedUsage, EmbeddingEncoding,
 };
 pub use error::{
     BudgetScope, ErrorBody, ErrorEnvelope, ErrorType, GatewayError, ProviderError, QuotaKind,

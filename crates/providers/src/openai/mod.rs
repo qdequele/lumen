@@ -9,7 +9,7 @@ use bytes::Bytes;
 use futures::stream::BoxStream;
 use lumen_core::{
     developer_role_as_system, ChatChunk, ChatCompletion, ChatProvider, ChatRequest, ChatResponse,
-    EmbedRequest, EmbedResponse, EmbeddingProvider, ProviderError,
+    EmbedCompletion, EmbedRequest, EmbedResponse, EmbeddingProvider, ProviderError,
 };
 use std::fmt;
 use tokio_util::sync::CancellationToken;
@@ -79,6 +79,26 @@ impl OpenAiProvider {
         }
     }
 
+    /// Send an embeddings request and return the upstream body. Shared
+    /// transport + error classification; a client disconnect aborts the
+    /// in-flight call (see `post_json`).
+    async fn post_embed(
+        &self,
+        req: &EmbedRequest,
+        cancel: &CancellationToken,
+    ) -> Result<Bytes, ProviderError> {
+        let url = format!("{}/embeddings", self.base_url);
+        post_json(
+            &self.client,
+            &url,
+            req,
+            self.api_key.as_deref(),
+            &self.provider_name,
+            cancel,
+        )
+        .await
+    }
+
     /// Send a non-streaming completion and return the upstream body.
     async fn post_chat(
         &self,
@@ -120,23 +140,24 @@ impl EmbeddingProvider for OpenAiProvider {
         req: EmbedRequest,
         cancel: CancellationToken,
     ) -> Result<EmbedResponse, ProviderError> {
-        let url = format!("{}/embeddings", self.base_url);
-
-        // Shared transport + error classification; a client disconnect aborts
-        // the in-flight call (see `post_json`).
-        let bytes = post_json(
-            &self.client,
-            &url,
-            &req,
-            self.api_key.as_deref(),
-            &self.provider_name,
-            &cancel,
-        )
-        .await?;
+        let bytes = self.post_embed(&req, &cancel).await?;
 
         // The detail stays out of the client response (from_provider discards
         // it) so a malformed body cannot leak upstream data.
         serde_json::from_slice::<EmbedResponse>(&bytes)
+            .map_err(|e| ProviderError::Translation(format!("openai embeddings response: {e}")))
+    }
+
+    async fn embed_completion(
+        &self,
+        req: EmbedRequest,
+        cancel: CancellationToken,
+    ) -> Result<EmbedCompletion, ProviderError> {
+        // The upstream was sent the client's `encoding_format`, so its vectors
+        // normally come back in the encoding the client wants: keep the body
+        // as bytes when they do (ADR 004, 2026-11-12).
+        let bytes = self.post_embed(&req, &cancel).await?;
+        EmbedCompletion::from_openai_body(bytes, req.output_encoding())
             .map_err(|e| ProviderError::Translation(format!("openai embeddings response: {e}")))
     }
 

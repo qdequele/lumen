@@ -264,11 +264,75 @@ fn bench_response_passthrough(c: &mut Criterion) {
     }
 }
 
+/// An OpenAI-format embeddings body: `vectors` vectors of 1536 dimensions,
+/// as float arrays or base64 strings.
+fn embeddings_body(vectors: usize, base64: bool) -> bytes::Bytes {
+    let items: Vec<String> = (0..vectors)
+        .map(|index| {
+            // Values spread over [-1, 1) with full f32 digits, like a real
+            // normalized embedding.
+            #[allow(clippy::cast_precision_loss)]
+            let vector: Vec<f32> = (0..1536)
+                .map(|d| ((index * 1536 + d) as f32 * 0.618_034).sin() * 0.05)
+                .collect();
+            let embedding = if base64 {
+                format!("\"{}\"", lumen_core::encode_embedding_base64(&vector))
+            } else {
+                serde_json::to_string(&vector).expect("floats")
+            };
+            format!(r#"{{"object":"embedding","index":{index},"embedding":{embedding}}}"#)
+        })
+        .collect();
+    bytes::Bytes::from(format!(
+        r#"{{"object":"list","data":[{}],"model":"text-embedding-3-small","usage":{{"prompt_tokens":64,"total_tokens":64}}}}"#,
+        items.join(",")
+    ))
+}
+
+/// What the gateway does with an embeddings body (ADR 004, 2026-11-12):
+/// `typed` decodes every vector to `Vec<f32>` and encodes it again,
+/// `passthrough` probes the usage and the vector count and keeps the bytes.
+fn bench_embeddings_passthrough(c: &mut Criterion) {
+    use lumen_core::{EmbedCompletion, EmbedResponse, EmbeddingEncoding};
+    for (name, base64, encoding) in [
+        ("float", false, EmbeddingEncoding::Float),
+        ("base64", true, EmbeddingEncoding::Base64),
+    ] {
+        for vectors in [1, 32] {
+            let body = embeddings_body(vectors, base64);
+            c.bench_function(&format!("embed_response_typed_{name}_{vectors}"), |b| {
+                b.iter(|| {
+                    let mut response: EmbedResponse =
+                        serde_json::from_slice(black_box(&body)).expect("parse");
+                    for item in &mut response.data {
+                        item.encoding = encoding;
+                    }
+                    let out = serde_json::to_vec(&response).expect("serialize");
+                    black_box(out.len());
+                });
+            });
+            c.bench_function(
+                &format!("embed_response_passthrough_{name}_{vectors}"),
+                |b| {
+                    b.iter(|| {
+                        let completion =
+                            EmbedCompletion::from_openai_body(black_box(&body).clone(), encoding)
+                                .expect("probe");
+                        assert!(matches!(completion, EmbedCompletion::Passthrough(_)));
+                        black_box(completion);
+                    });
+                },
+            );
+        }
+    }
+}
+
 criterion_group!(
     benches,
     bench_executor,
     bench_json_roundtrip,
     bench_decisions,
-    bench_response_passthrough
+    bench_response_passthrough,
+    bench_embeddings_passthrough
 );
 criterion_main!(benches);

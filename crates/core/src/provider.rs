@@ -8,7 +8,7 @@
 
 use crate::chat::{ChatChunk, ChatCompletion, ChatRequest, ChatResponse};
 use crate::decisions::{DecisionLimits, DecisionRequest, DecisionResponse};
-use crate::embed::{EmbedRequest, EmbedResponse};
+use crate::embed::{EmbedCompletion, EmbedRequest, EmbedResponse};
 use crate::error::{GatewayError, ProviderError};
 use crate::rerank::{RerankRequest, RerankResponse};
 use async_trait::async_trait;
@@ -118,6 +118,24 @@ pub trait EmbeddingProvider: Send + Sync {
         req: EmbedRequest,
         cancel: CancellationToken,
     ) -> Result<EmbedResponse, ProviderError>;
+
+    /// Embed one batch (at most [`max_batch_size`] inputs) for the request
+    /// path, which forwards an upstream body unchanged when it can (ADR 004,
+    /// 2026-11-12 amendment).
+    ///
+    /// The default wraps [`embed`](EmbeddingProvider::embed). Providers whose
+    /// upstream answers in the OpenAI format override it with
+    /// [`EmbedCompletion::from_openai_body`], so vectors already in the
+    /// encoding the client asked for are not decoded and encoded again.
+    ///
+    /// [`max_batch_size`]: EmbeddingProvider::max_batch_size
+    async fn embed_completion(
+        &self,
+        req: EmbedRequest,
+        cancel: CancellationToken,
+    ) -> Result<EmbedCompletion, ProviderError> {
+        self.embed(req, cancel).await.map(EmbedCompletion::Typed)
+    }
 
     /// Maximum number of inputs the upstream accepts in a single request.
     fn max_batch_size(&self) -> usize;

@@ -436,7 +436,7 @@ struct CompletionProbe {
 }
 
 /// A JSON array whose elements are skipped, not built.
-pub(crate) struct SkippedArray;
+struct SkippedArray;
 
 impl<'de> Deserialize<'de> for SkippedArray {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {

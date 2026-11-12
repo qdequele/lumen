@@ -32,7 +32,7 @@ use bytes::Bytes;
 use futures::stream::BoxStream;
 use lumen_core::{
     developer_role_as_system, ChatChunk, ChatCompletion, ChatProvider, ChatRequest, ChatResponse,
-    EmbedRequest, EmbedResponse, EmbeddingProvider, ProviderError,
+    EmbedCompletion, EmbedRequest, EmbedResponse, EmbeddingProvider, ProviderError,
 };
 use std::fmt;
 use tokio_util::sync::CancellationToken;
@@ -130,6 +130,24 @@ impl AzureProvider {
     /// The single `api-key` auth header (never a bearer token).
     fn headers(&self) -> [(&str, &str); 1] {
         [("api-key", self.api_key.as_deref().unwrap_or(""))]
+    }
+
+    /// Send an embeddings request and return the upstream body.
+    async fn post_embed(
+        &self,
+        req: &EmbedRequest,
+        cancel: &CancellationToken,
+    ) -> Result<Bytes, ProviderError> {
+        let url = self.deployment_url(&req.model, "embeddings");
+        post_json_with_headers(
+            &self.client,
+            &url,
+            req,
+            &self.headers(),
+            &self.provider_name,
+            cancel,
+        )
+        .await
     }
 
     /// Send a non-streaming completion and return the upstream body.
@@ -281,17 +299,20 @@ impl EmbeddingProvider for AzureProvider {
         req: EmbedRequest,
         cancel: CancellationToken,
     ) -> Result<EmbedResponse, ProviderError> {
-        let url = self.deployment_url(&req.model, "embeddings");
-        let bytes = post_json_with_headers(
-            &self.client,
-            &url,
-            &req,
-            &self.headers(),
-            &self.provider_name,
-            &cancel,
-        )
-        .await?;
+        let bytes = self.post_embed(&req, &cancel).await?;
         serde_json::from_slice::<EmbedResponse>(&bytes)
+            .map_err(|e| ProviderError::Translation(format!("azure embeddings response: {e}")))
+    }
+
+    async fn embed_completion(
+        &self,
+        req: EmbedRequest,
+        cancel: CancellationToken,
+    ) -> Result<EmbedCompletion, ProviderError> {
+        // Keep the body as bytes when its vectors are already in the encoding
+        // the client wants (ADR 004, 2026-11-12).
+        let bytes = self.post_embed(&req, &cancel).await?;
+        EmbedCompletion::from_openai_body(bytes, req.output_encoding())
             .map_err(|e| ProviderError::Translation(format!("azure embeddings response: {e}")))
     }
 

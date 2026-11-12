@@ -2,7 +2,10 @@
 //! non-streaming upstream body back as the bytes received when nothing in it
 //! has to change, and as a typed response otherwise.
 
-use lumen_core::{ChatCompletion, ChatMessage, ChatProvider, ChatRequest, MessageContent};
+use lumen_core::{
+    ChatCompletion, ChatMessage, ChatProvider, ChatRequest, EmbedCompletion, EmbedInput,
+    EmbedRequest, EmbeddingProvider, MessageContent,
+};
 use lumen_providers::{AzureProvider, MistralProvider, OpenAiProvider};
 use tokio_util::sync::CancellationToken;
 use wiremock::matchers::{method, path_regex};
@@ -123,5 +126,99 @@ async fn chat_body_that_is_not_a_completion_is_a_translation_error() {
             matches!(err, lumen_core::ProviderError::Translation(_)),
             "{name}: {err:?}"
         );
+    }
+}
+
+/// Float vectors with more digits than an `f32` keeps, odd spacing and an
+/// unknown usage field.
+const EMBED_BODY: &str = "{ \"object\":\"list\",\"data\":[ {\"object\":\"embedding\",\
+    \"index\":0,\"embedding\":[0.006929283495992422, -1e-3]} ],\n\
+    \"model\":\"m\",\"usage\":{\"total_tokens\":3,\"prompt_tokens\":3,\"cost\":0.5} }";
+
+fn embed_request(encoding_format: Option<&str>) -> EmbedRequest {
+    EmbedRequest {
+        model: "m".to_owned(),
+        input: EmbedInput::Single("hi".to_owned()),
+        encoding_format: encoding_format.map(str::to_owned),
+        dimensions: None,
+        user: None,
+        extra: serde_json::Map::new(),
+    }
+}
+
+/// The three OpenAI-compatible embedding providers, pointed at `uri`.
+fn embed_providers(uri: &str) -> Vec<(&'static str, Box<dyn EmbeddingProvider>)> {
+    let client = reqwest::Client::new();
+    let key = Some("sk-test".to_owned());
+    vec![
+        (
+            "openai",
+            Box::new(OpenAiProvider::new(
+                client.clone(),
+                "openai",
+                Some(uri.to_owned()),
+                key.clone(),
+            )),
+        ),
+        (
+            "mistral",
+            Box::new(MistralProvider::new(
+                client.clone(),
+                "mistral",
+                Some(uri.to_owned()),
+                key.clone(),
+            )),
+        ),
+        (
+            "azure",
+            Box::new(AzureProvider::new(client, "azure", uri, None, key)),
+        ),
+    ]
+}
+
+async fn embed_upstream_answering(body: &'static str) -> MockServer {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path_regex("embeddings$"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(body, "application/json"))
+        .mount(&upstream)
+        .await;
+    upstream
+}
+
+#[tokio::test]
+async fn embed_body_in_the_requested_encoding_is_returned_as_the_bytes_received() {
+    let upstream = embed_upstream_answering(EMBED_BODY).await;
+    for (name, provider) in embed_providers(&upstream.uri()) {
+        for encoding_format in [None, Some("float")] {
+            let completion = provider
+                .embed_completion(embed_request(encoding_format), CancellationToken::new())
+                .await
+                .unwrap();
+            assert_eq!(completion.vector_count(), 1, "{name}");
+            let EmbedCompletion::Passthrough(body) = completion else {
+                panic!("{name}: expected a passthrough");
+            };
+            assert_eq!(body.usage().prompt_tokens, 3, "{name}");
+            assert_eq!(body.into_body(), EMBED_BODY.as_bytes(), "{name}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn embed_body_in_another_encoding_is_returned_typed() {
+    // The client asked for base64 and the upstream answered with floats: the
+    // gateway has to re-encode, so the vectors are decoded.
+    let upstream = embed_upstream_answering(EMBED_BODY).await;
+    for (name, provider) in embed_providers(&upstream.uri()) {
+        let completion = provider
+            .embed_completion(embed_request(Some("base64")), CancellationToken::new())
+            .await
+            .unwrap();
+        let EmbedCompletion::Typed(response) = completion else {
+            panic!("{name}: expected the typed response");
+        };
+        assert_eq!(response.data[0].embedding.len(), 2, "{name}");
+        assert_eq!(response.usage.prompt_tokens, 3, "{name}");
     }
 }
