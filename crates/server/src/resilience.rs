@@ -240,13 +240,17 @@ impl ResilienceRuntime {
 
     /// Atomically replace the derived policy (retry, timeouts, virtual models) from a
     /// new config - the hot-reload entry point. Circuit-breaker state is left
-    /// untouched, so an open circuit stays open across a reload; the breaker
+    /// untouched, so an open circuit stays open across a reload (only
+    /// breakers that are closed with no failure streak are evicted); the breaker
     /// tuning (`circuit_failure_threshold`, `circuit_cooldown_ms`) is live,
     /// for existing breakers too.
     pub fn reload_policy(&self, config: &Config) {
         self.policy
             .store(Arc::new(ResiliencePolicy::from_config(config)));
         self.breakers.set_config(breaker_config(config));
+        // Drop the breakers that hold no state (removed models, team pools
+        // of groups that went quiet): a reload is the cheap moment for it.
+        self.breakers.prune();
         // Account tables hold compiled platform nodes: rebuild them over the
         // new platform snapshot (ADR 022).
         self.recompile_accounts();

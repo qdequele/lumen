@@ -11,7 +11,9 @@
 //! Time is passed in as a [`tokio::time::Instant`] so the state machine is
 //! deterministic under `tokio::time` pause in tests.
 
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::borrow::Borrow;
+use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use dashmap::DashMap;
@@ -321,12 +323,83 @@ impl CircuitBreaker {
     pub fn state(&self) -> CircuitState {
         self.lock().state
     }
+
+    /// Whether the breaker holds nothing a fresh one would not: closed, with
+    /// no failure streak.
+    fn is_idle(&self) -> bool {
+        let inner = self.lock();
+        inner.state == CircuitState::Closed && inner.consecutive_failures == 0
+    }
 }
+
+/// The registry key: a provider, the budget group whose team key pool serves
+/// it (`None` for the platform's own key) and a model.
+#[derive(Debug, PartialEq, Eq)]
+struct Key {
+    provider: String,
+    scope: Option<String>,
+    model: String,
+}
+
+/// A [`Key`] by reference, so the per-request lookup borrows the link's
+/// strings instead of allocating an owned key (the map is keyed by
+/// `Borrow<dyn KeyRef>`).
+trait KeyRef {
+    fn parts(&self) -> (&str, Option<&str>, &str);
+}
+
+impl KeyRef for Key {
+    fn parts(&self) -> (&str, Option<&str>, &str) {
+        (&self.provider, self.scope.as_deref(), &self.model)
+    }
+}
+
+impl KeyRef for (&str, Option<&str>, &str) {
+    fn parts(&self) -> (&str, Option<&str>, &str) {
+        *self
+    }
+}
+
+impl<'a> Borrow<dyn KeyRef + 'a> for Key {
+    fn borrow(&self) -> &(dyn KeyRef + 'a) {
+        self
+    }
+}
+
+// `Borrow` requires the owned and the borrowed form to hash and compare
+// alike: both go through `parts`.
+impl Hash for Key {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.parts().hash(state);
+    }
+}
+
+impl Hash for dyn KeyRef + '_ {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.parts().hash(state);
+    }
+}
+
+impl PartialEq for dyn KeyRef + '_ {
+    fn eq(&self, other: &Self) -> bool {
+        self.parts() == other.parts()
+    }
+}
+
+impl Eq for dyn KeyRef + '_ {}
+
+/// Registry size past which creating a breaker first prunes the idle ones.
+/// Platform breakers are bounded by the configured (provider, model) pairs;
+/// team-scoped ones (ADR 018) grow with the budget groups that ever sent a
+/// request.
+const PRUNE_THRESHOLD: usize = 1024;
 
 /// The process-wide set of breakers, created lazily per (provider, model).
 #[derive(Debug)]
 pub struct CircuitBreakers {
-    map: DashMap<(String, String), Arc<CircuitBreaker>>,
+    map: DashMap<Key, Arc<CircuitBreaker>>,
+    /// The size at which the next insert prunes (see [`PRUNE_THRESHOLD`]).
+    prune_at: AtomicUsize,
     config: Arc<LiveConfig>,
     metrics: Option<ResilienceMetrics>,
 }
@@ -337,6 +410,7 @@ impl CircuitBreakers {
     pub fn new(config: BreakerConfig, metrics: Option<ResilienceMetrics>) -> Self {
         Self {
             map: DashMap::new(),
+            prune_at: AtomicUsize::new(PRUNE_THRESHOLD),
             config: Arc::new(LiveConfig::new(config)),
             metrics,
         }
@@ -365,10 +439,13 @@ impl CircuitBreakers {
 
     /// The breaker for a (provider, model) as served by `scope`: `None` is
     /// the platform's own key (the [`get`](Self::get) breaker); `Some(group)`
-    /// is that budget group's team key pool (ADR 018), keyed
-    /// `"{provider}#group:{group}"` so a team's failures and the platform's
-    /// never trip each other. A scoped breaker does not feed the
-    /// `lumen_circuit_state` gauge (one series per group would be unbounded).
+    /// is that budget group's team key pool (ADR 018), a separate breaker so
+    /// a team's failures and the platform's never trip each other. A scoped
+    /// breaker does not feed the `lumen_circuit_state` gauge (one series per
+    /// group would be unbounded).
+    ///
+    /// The lookup of an existing breaker borrows its arguments: nothing is
+    /// allocated per request.
     #[must_use]
     pub fn get_scoped(
         &self,
@@ -376,16 +453,23 @@ impl CircuitBreakers {
         scope: Option<&str>,
         model: &str,
     ) -> Arc<CircuitBreaker> {
-        let name = scope.map_or_else(
-            || provider.to_owned(),
-            |group| format!("{provider}#group:{group}"),
-        );
-        let key = (name, model.to_owned());
-        if let Some(existing) = self.map.get(&key) {
+        let borrowed: &dyn KeyRef = &(provider, scope, model);
+        if let Some(existing) = self.map.get(borrowed) {
             return Arc::clone(existing.value());
         }
+        // First use of this key (cold): keep the registry bounded before
+        // growing it. Done before `entry`, which locks a shard.
+        if self.map.len() >= self.prune_at.load(Ordering::Relaxed) {
+            self.prune();
+            // If most entries are live, wait for the registry to double
+            // rather than scanning it on every insert.
+            self.prune_at.store(
+                self.map.len().saturating_mul(2).max(PRUNE_THRESHOLD),
+                Ordering::Relaxed,
+            );
+        }
         let breaker = Arc::new(CircuitBreaker::new(
-            key.0.clone(),
+            provider.to_owned(),
             model.to_owned(),
             Arc::clone(&self.config),
             if scope.is_some() {
@@ -394,19 +478,57 @@ impl CircuitBreakers {
                 self.metrics.clone()
             },
         ));
+        let key = Key {
+            provider: provider.to_owned(),
+            scope: scope.map(str::to_owned),
+            model: model.to_owned(),
+        };
         // `entry` keeps creation atomic against a racing insert of the same key.
         Arc::clone(self.map.entry(key).or_insert(breaker).value())
     }
 
+    /// Evict the breakers that hold no state: closed, with no failure
+    /// streak, and not in use by a request. Such a breaker is identical to
+    /// the one its next request would create, so nothing is lost; an open or
+    /// half-open circuit, a failure streak and a breaker a request is using
+    /// are always kept. Runs on reload and when the registry passes
+    /// [`PRUNE_THRESHOLD`], never per request. Returns how many were evicted.
+    pub fn prune(&self) -> usize {
+        let before = self.map.len();
+        // `retain` holds each shard's write lock, and a lookup clones the
+        // `Arc` under the same shard's read lock: a count of 1 here means no
+        // request holds, or can be acquiring, this breaker.
+        self.map
+            .retain(|_, breaker| Arc::strong_count(breaker) > 1 || !breaker.is_idle());
+        before.saturating_sub(self.map.len())
+    }
+
+    /// How many breakers the registry holds.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    /// Whether the registry holds no breaker.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
     /// A snapshot of every known breaker's state (observability; not the hot
-    /// path).
+    /// path): `(provider, model, state)`, where a team-scoped breaker's
+    /// provider reads `"{provider}#group:{group}"`.
     #[must_use]
     pub fn snapshot(&self) -> Vec<(String, String, CircuitState)> {
         self.map
             .iter()
             .map(|e| {
-                let (provider, model) = e.key();
-                (provider.clone(), model.clone(), e.value().state())
+                let key = e.key();
+                let provider = key.scope.as_ref().map_or_else(
+                    || key.provider.clone(),
+                    |group| format!("{}#group:{group}", key.provider),
+                );
+                (provider, key.model.clone(), e.value().state())
             })
             .collect()
     }
@@ -668,6 +790,112 @@ mod tests {
         // The holder can.
         b.on_neutral(second);
         assert!(matches!(b.admit(later), Admission::Probe(_)));
+    }
+
+    #[tokio::test]
+    async fn prune_evicts_only_breakers_without_state() {
+        let breakers = CircuitBreakers::new(config(), None);
+        let now = Instant::now();
+        // Idle: closed, no streak, nobody holding it.
+        let _ = breakers
+            .get_scoped("openai", Some("idle"), "gpt-4o")
+            .state();
+        // A failure streak below the threshold.
+        breakers
+            .get_scoped("openai", Some("streak"), "gpt-4o")
+            .on_failure(now);
+        // An open circuit.
+        for _ in 0..5 {
+            breakers
+                .get_scoped("openai", Some("open"), "gpt-4o")
+                .on_failure(now);
+        }
+        // Idle, but a request is holding it.
+        let in_use = breakers.get_scoped("openai", Some("busy"), "gpt-4o");
+        assert_eq!(breakers.len(), 4);
+
+        assert_eq!(breakers.prune(), 1);
+        let mut left: Vec<String> = breakers
+            .snapshot()
+            .into_iter()
+            .map(|(provider, _, _)| provider)
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            vec![
+                "openai#group:busy",
+                "openai#group:open",
+                "openai#group:streak"
+            ]
+        );
+        // What was kept is still the same breaker, state included.
+        assert!(Arc::ptr_eq(
+            &in_use,
+            &breakers.get_scoped("openai", Some("busy"), "gpt-4o")
+        ));
+        assert_eq!(
+            breakers
+                .get_scoped("openai", Some("open"), "gpt-4o")
+                .state(),
+            CircuitState::Open
+        );
+        breakers
+            .get_scoped("openai", Some("streak"), "gpt-4o")
+            .on_success();
+        drop(in_use);
+        assert_eq!(breakers.prune(), 2, "once idle and released, both go");
+        assert_eq!(breakers.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_registry_stays_bounded_as_groups_come_and_go() {
+        let breakers = CircuitBreakers::new(config(), None);
+        let now = Instant::now();
+        for _ in 0..5 {
+            breakers
+                .get_scoped("openai", Some("down"), "gpt-4o")
+                .on_failure(now);
+        }
+        // Far more one-off groups than the threshold, each leaving an idle
+        // breaker behind.
+        for i in 0..(PRUNE_THRESHOLD * 5) {
+            let _ = breakers
+                .get_scoped("openai", Some(&format!("g{i}")), "gpt-4o")
+                .state();
+        }
+        assert!(breakers.len() <= PRUNE_THRESHOLD, "{}", breakers.len());
+        assert_eq!(
+            breakers
+                .get_scoped("openai", Some("down"), "gpt-4o")
+                .state(),
+            CircuitState::Open,
+            "live state survives every prune"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_key_tells_provider_scope_and_model_apart() {
+        let breakers = CircuitBreakers::new(config(), None);
+        let a = breakers.get_scoped("openai", Some("g1"), "gpt-4o");
+        // Same strings, shifted across the parts: all distinct breakers.
+        for (provider, scope, model) in [
+            ("openai", None, "gpt-4o"),
+            ("openai", Some("g2"), "gpt-4o"),
+            ("openai", Some("g1"), "gpt-4o-mini"),
+            ("openai#group:g1", None, "gpt-4o"),
+            ("g1", Some("openai"), "gpt-4o"),
+        ] {
+            assert!(!Arc::ptr_eq(
+                &a,
+                &breakers.get_scoped(provider, scope, model)
+            ));
+        }
+        assert!(Arc::ptr_eq(
+            &a,
+            &breakers.get_scoped("openai", Some("g1"), "gpt-4o")
+        ));
+        assert_eq!(breakers.len(), 6);
     }
 
     #[tokio::test]

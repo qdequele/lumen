@@ -288,3 +288,17 @@ did not hold, and a second probe was admitted while the first was in flight.
 `on_success` and `on_failure` are unchanged: any completed call is a verdict on
 the provider. A probe still runs its link's full retry policy; this ADR never
 made it a single attempt.
+
+---
+
+## Amendment - 2026-11-12: breaker eviction
+
+The original decision called the breaker map "bounded by the (provider x
+model) count". Team-scoped breakers (ADR 018) broke that bound: one entry per
+(provider, budget group, model) that ever served a request, kept for the life
+of the process. The registry now evicts breakers that hold no state (closed,
+no failure streak, not held by an in-flight request): on every reload, and
+when a new breaker would take the map past 1024 entries. Such a breaker is
+identical to the one its next request would create, so eviction never loses an
+open or half-open circuit or a failure streak. The request-path lookup now
+borrows the link's provider, group and model instead of allocating a key.
