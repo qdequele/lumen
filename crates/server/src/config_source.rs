@@ -482,7 +482,12 @@ impl ConfigContext {
             ConfigSourceKind::Db => {
                 let text = text.to_owned();
                 let boot_path = self.boot_path.clone();
-                load_blocking(move || Config::load_with_dynamic(&boot_path, &text)).await?
+                load_blocking(move || {
+                    let config = Config::load_with_dynamic(&boot_path, &text)?;
+                    ensure_db_mode_signing_env(&config, &boot_path)?;
+                    Ok(config)
+                })
+                .await?
             }
         };
         // A throwaway client: this runs on an admin route, never the hot
@@ -495,6 +500,44 @@ impl ConfigContext {
         )?;
         Ok(())
     }
+}
+
+/// Refuse a `config_source = "db"` candidate whose `[webhooks]` block names a
+/// `LUMEN_`-prefixed `signing_key_env`.
+///
+/// `LUMEN_`-prefixed variables live in the config loader's overlay namespace
+/// and are only kept out of it by being named in the document the loader is
+/// reading. At boot (and in `--check-config`) the boot file is parsed alone,
+/// before the database is open, so a name stored in the dynamic document is
+/// unknown to that load: once the variable is exported it is read as an
+/// unknown config key and the process exits before it ever reaches the
+/// database. `lumen_auth::events` refuses the prefix on the stored
+/// `/admin/webhooks` row for the same reason.
+///
+/// Write path only: a document stored before this check existed still loads
+/// (it boots whenever the variable is unset and a sealed secret signs), and
+/// refusing it on the read path would turn that working boot into a failure.
+fn ensure_db_mode_signing_env(config: &Config, boot_path: &Path) -> Result<(), ConfigError> {
+    let Some(var) = config
+        .webhooks
+        .as_ref()
+        .and_then(|w| w.signing_key_env.as_deref())
+    else {
+        return Ok(());
+    };
+    if !var.starts_with("LUMEN_") {
+        return Ok(());
+    }
+    Err(ConfigError::Validation {
+        path: boot_path.display().to_string(),
+        message: format!(
+            "webhooks.signing_key_env '{var}' must not start with 'LUMEN_' in config_source = \
+             \"db\" mode: that prefix is the config loader's namespace and the boot file is \
+             parsed before the database is read, so the variable cannot be excluded from it. \
+             Name the variable without the prefix, or store the secret with PUT \
+             /admin/webhooks/signing-key"
+        ),
+    })
 }
 
 /// Run a synchronous `Config`-parsing closure on the blocking pool and fold

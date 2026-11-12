@@ -920,6 +920,36 @@ async fn put_config_rejects_restart_only_boot_layer_keys_in_db_mode() {
     assert_eq!(after["config"].as_str().expect("config string"), "");
 }
 
+/// In db mode the boot file is parsed before the database is open, so the
+/// loader cannot know a stored `signing_key_env` name and keep it out of its
+/// `LUMEN_` overlay: once the variable is exported, `deny_unknown_fields`
+/// rejects it as config key `webhook_secret` and the process never reaches
+/// the database. A db-mode document therefore may not name a
+/// `LUMEN_`-prefixed variable, exactly like the stored `/admin/webhooks` row.
+#[tokio::test]
+async fn put_config_rejects_a_lumen_prefixed_signing_key_env_in_db_mode() {
+    let h = spawn_admin_db_mode(registry()).await;
+    let empty_hash = h.current_hash().await;
+
+    let doc =
+        "[webhooks]\nurl = \"https://b.example/e\"\nsigning_key_env = \"LUMEN_WEBHOOK_SECRET\"\n";
+    let response = h.put_config(doc, &empty_hash).await;
+    assert_eq!(response.status(), 400);
+    let body: Value = response.json().await.expect("json");
+    assert_eq!(body["error"]["code"].as_str().expect("code"), "LM-1001");
+    let message = body["error"]["message"].as_str().expect("message");
+    assert!(
+        message.contains("signing_key_env") && message.contains("LUMEN_"),
+        "the rejection must name the field and the prefix: {message}"
+    );
+    let after: Value = h.get("/admin/config").await.json().await.expect("json");
+    assert_eq!(after["config"].as_str().expect("config string"), "");
+
+    // The same block under a name outside the loader's namespace is fine.
+    let doc = doc.replace("LUMEN_WEBHOOK_SECRET", "BILLING_WEBHOOK_SECRET");
+    assert_eq!(h.put_config(&doc, &empty_hash).await.status(), 204);
+}
+
 /// Final-review fix wave, Finding 1: a candidate that sets a boot-layer key
 /// EXPLICITLY to its own built-in default produces NO diff against
 /// `boot_layer_diff` alone - in db mode the current (empty) document already
