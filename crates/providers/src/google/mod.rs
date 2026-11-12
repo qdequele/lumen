@@ -424,6 +424,11 @@ struct GeminiFunctionCall {
 pub(super) struct GeminiUsage {
     #[serde(rename = "promptTokenCount", default)]
     prompt: u32,
+    /// Tokens of the tool-use prompt(s): what a built-in tool (code
+    /// execution, search) fed back to the model. Reported SEPARATELY from
+    /// `promptTokenCount` and billed as input.
+    #[serde(rename = "toolUsePromptTokenCount", default)]
+    tool_use_prompt: u32,
     #[serde(rename = "candidatesTokenCount", default)]
     candidates: u32,
     /// Thinking tokens (thinking models only). Reported SEPARATELY from
@@ -431,23 +436,34 @@ pub(super) struct GeminiUsage {
     /// `prompt + tool-use prompt + thoughts + response candidates`.
     #[serde(rename = "thoughtsTokenCount", default)]
     thoughts: Option<u32>,
+    /// `None` when the upstream sent no total (never read as a real 0).
     #[serde(rename = "totalTokenCount", default)]
-    total: u32,
+    total: Option<u32>,
 }
 
 impl GeminiUsage {
-    /// OpenAI-shaped usage. Thinking tokens are billed as output, so they are
-    /// folded into `completion_tokens` (OpenAI semantics: reasoning tokens are
-    /// a subset of completion tokens) and exposed as
+    /// OpenAI-shaped usage, self-consistent: `total_tokens` is never below
+    /// `prompt_tokens + completion_tokens`.
+    ///
+    /// Thinking tokens are billed as output, so they are folded into
+    /// `completion_tokens` (OpenAI semantics: reasoning tokens are a subset
+    /// of completion tokens) and exposed as
     /// `completion_tokens_details.reasoning_tokens`. Absent thoughts stay
-    /// absent, never a fabricated zero (ADR 003).
+    /// absent, never a fabricated zero (ADR 003). Tool-use prompt tokens are
+    /// billed as input, so they are folded into `prompt_tokens`. The total is
+    /// the upstream `totalTokenCount`, raised to the sum of the parts when it
+    /// is absent or lower; a higher upstream total is kept, so a token
+    /// category this struct does not model is not under-reported.
     pub(super) fn into_usage(self) -> Usage {
+        let prompt_tokens = self.prompt.saturating_add(self.tool_use_prompt);
+        let completion_tokens = self
+            .candidates
+            .saturating_add(self.thoughts.unwrap_or_default());
+        let parts = prompt_tokens.saturating_add(completion_tokens);
         Usage {
-            prompt_tokens: self.prompt,
-            completion_tokens: self
-                .candidates
-                .saturating_add(self.thoughts.unwrap_or_default()),
-            total_tokens: self.total,
+            prompt_tokens,
+            completion_tokens,
+            total_tokens: self.total.unwrap_or_default().max(parts),
             estimated: None,
             // Gemini cached-content tokens are not surfaced yet (issue #99 scope).
             prompt_tokens_details: None,
@@ -1231,6 +1247,76 @@ mod tests {
         assert_eq!(usage.reasoning_tokens(), Some(30));
     }
 
+    /// `toolUsePromptTokenCount` is billed input that `promptTokenCount` does
+    /// not include (the documented total is `prompt + tool-use prompt +
+    /// thoughts + candidates`): it belongs in `prompt_tokens`, so the parts
+    /// add up to the total.
+    #[test]
+    fn tool_use_prompt_tokens_count_as_prompt_tokens() {
+        let resp: GeminiResponse = serde_json::from_value(json!({
+            "candidates": [{ "content": { "parts": [{ "text": "ok" }] }, "finishReason": "STOP" }],
+            "usageMetadata": {
+                "promptTokenCount": 10,
+                "toolUsePromptTokenCount": 25,
+                "candidatesTokenCount": 4,
+                "thoughtsTokenCount": 6,
+                "totalTokenCount": 45
+            }
+        }))
+        .unwrap();
+        let usage = translate_response(resp, "gemini-2.5-pro", "google")
+            .unwrap()
+            .usage
+            .unwrap();
+        assert_eq!(usage.prompt_tokens, 35);
+        assert_eq!(usage.completion_tokens, 10);
+        assert_eq!(usage.total_tokens, 45);
+        assert_eq!(
+            usage.total_tokens,
+            usage.prompt_tokens + usage.completion_tokens
+        );
+    }
+
+    /// An absent `totalTokenCount` is computed from the parts, never
+    /// reported as 0 next to non-zero parts.
+    #[test]
+    fn absent_total_token_count_is_computed_from_the_parts() {
+        let resp: GeminiResponse = serde_json::from_value(json!({
+            "candidates": [{ "content": { "parts": [{ "text": "ok" }] }, "finishReason": "STOP" }],
+            "usageMetadata": { "promptTokenCount": 10, "candidatesTokenCount": 4 }
+        }))
+        .unwrap();
+        let usage = translate_response(resp, "gemini-2.0", "google")
+            .unwrap()
+            .usage
+            .unwrap();
+        assert_eq!(usage.prompt_tokens, 10);
+        assert_eq!(usage.completion_tokens, 4);
+        assert_eq!(usage.total_tokens, 14);
+    }
+
+    /// An upstream total above the sum of the reported parts is kept (a
+    /// category this gateway does not model must not be under-reported); one
+    /// below it is raised to the sum.
+    #[test]
+    fn upstream_total_is_never_below_the_sum_of_the_parts() {
+        let usage = |total: u32| {
+            let resp: GeminiResponse = serde_json::from_value(json!({
+                "candidates": [{ "content": { "parts": [{ "text": "ok" }] }, "finishReason": "STOP" }],
+                "usageMetadata": {
+                    "promptTokenCount": 10, "candidatesTokenCount": 4, "totalTokenCount": total
+                }
+            }))
+            .unwrap();
+            translate_response(resp, "gemini-2.0", "google")
+                .unwrap()
+                .usage
+                .unwrap()
+        };
+        assert_eq!(usage(20).total_tokens, 20);
+        assert_eq!(usage(3).total_tokens, 14);
+    }
+
     /// Without `thoughtsTokenCount` no reasoning breakdown is fabricated.
     #[test]
     fn absent_thoughts_tokens_leave_no_reasoning_breakdown() {
@@ -1467,8 +1553,9 @@ mod tests {
             usage_metadata: GeminiUsage {
                 prompt: 7,
                 candidates: 4,
+                tool_use_prompt: 0,
                 thoughts: None,
-                total: 11,
+                total: Some(11),
             },
         };
         let out = translate_response(resp, "gemini-2.0", "google").unwrap();
@@ -1679,8 +1766,9 @@ mod tests {
             usage_metadata: GeminiUsage {
                 prompt: 4,
                 candidates: 2,
+                tool_use_prompt: 0,
                 thoughts: None,
-                total: 6,
+                total: Some(6),
             },
         };
         let out = translate_response(resp, "gemini-2.0", "google").unwrap();
