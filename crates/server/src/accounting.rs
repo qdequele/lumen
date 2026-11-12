@@ -741,7 +741,8 @@ struct ParsedUsage {
 
 /// Extract prompt/completion counts and the OpenAI-shaped token breakdown from
 /// one SSE payload iff it carries a genuine top-level `usage` object with at
-/// least one count. The breakdown reads the nested `prompt_tokens_details`
+/// least one non-zero count (an all-zero object is an upstream that reported
+/// nothing, never measured usage). The breakdown reads the nested `prompt_tokens_details`
 /// (`cached_tokens`, `cache_creation_tokens`) and `completion_tokens_details`
 /// (`reasoning_tokens`); absent keys stay `None`, never a fabricated zero.
 fn parse_usage(payload: &[u8]) -> Option<ParsedUsage> {
@@ -749,7 +750,10 @@ fn parse_usage(payload: &[u8]) -> Option<ParsedUsage> {
     let usage = value.get("usage").filter(|u| u.is_object())?;
     let prompt = usage.get("prompt_tokens").and_then(Value::as_u64);
     let completion = usage.get("completion_tokens").and_then(Value::as_u64);
-    if prompt.is_none() && completion.is_none() {
+    // No count at all, or nothing but zeros: the upstream reported nothing
+    // (ADR 003). The caller then settles on the flagged estimate, exactly as
+    // the non-streaming path does.
+    if prompt.unwrap_or(0) == 0 && completion.unwrap_or(0) == 0 {
         return None;
     }
     let prompt_details = usage.get("prompt_tokens_details");
@@ -987,6 +991,30 @@ mod tests {
         let mut s = UsageSniffer::default();
         s.scan(b"data: {\"choices\":[],\"usage\":null}\n\n");
         assert_eq!(s.result(10), (10, 1, true));
+    }
+
+    // ADR 003: an upstream that sends a usage object full of zeros reported
+    // nothing. The stream settles on the flagged estimate, like the
+    // non-streaming path, never on an unflagged zero.
+    #[test]
+    fn all_zero_usage_is_not_upstream_usage() {
+        let mut s = UsageSniffer::default();
+        s.scan(b"data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n");
+        s.scan(
+            b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":0,\
+              \"total_tokens\":0}}\n\n",
+        );
+        s.scan(b"data: [DONE]\n\n");
+        assert_eq!(s.result(10), (10, 2, true));
+        assert_eq!(s.breakdown().cached_tokens, None);
+    }
+
+    #[test]
+    fn all_zero_usage_does_not_erase_real_usage_seen_earlier() {
+        let mut s = UsageSniffer::default();
+        s.scan(b"data: {\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":6}}\n\n");
+        s.scan(b"data: {\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":0}}\n\n");
+        assert_eq!(s.result(99), (5, 6, false));
     }
 
     #[test]
