@@ -272,4 +272,14 @@ async fn the_filtered_listings_search_their_indexes() {
         detail.contains("idx_budget_groups_account_ref (account_ref=?)"),
         "scoped keys: {detail}"
     );
+    // ...and reaches the keys of those groups through the `group_id` index
+    // (migration 0020), never a scan of `virtual_keys`.
+    assert!(
+        detail.contains("USING INDEX idx_virtual_keys_group_id (group_id=?)"),
+        "scoped keys: {detail}"
+    );
+    assert!(
+        !detail.contains("SCAN virtual_keys"),
+        "scoped keys: {detail}"
+    );
 }

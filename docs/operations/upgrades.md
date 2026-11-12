@@ -58,6 +58,10 @@ no separate migrate command and nothing to run by hand.
 - **Integrity-checked.** Each applied migration's checksum is verified at
   boot; a mismatch is a hard, named error rather than a silent
   divergence.
+- **Index-only migrations change no rows.** Migration 0020 adds an index on
+  `virtual_keys.group_id` (account-scoped key listings no longer scan the
+  table). It is built once, at the first boot of the new binary, in time
+  proportional to the number of keys; nothing to run by hand.
 - With `[auth].enabled = false` there is no database and this whole
   section is moot.
 
