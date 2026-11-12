@@ -1604,3 +1604,75 @@ async fn voyage_embed_reports_upstream_total_tokens_as_prompt_tokens() {
     assert_eq!(resp.usage.total_tokens, 7);
     assert_eq!(resp.usage.estimated, None);
 }
+
+/// A two-item multimodal batch whose second item carries two text fragments.
+fn two_items_one_multipart() -> EmbedInput {
+    let part = |t: &str| ContentPart {
+        kind: "text".to_owned(),
+        text: Some(t.to_owned()),
+        image_url: None,
+        extra: serde_json::Map::new(),
+    };
+    EmbedInput::Multi(vec![
+        EmbedItem::Text("solo".to_owned()),
+        EmbedItem::Parts(vec![part("foo"), part("bar")]),
+    ])
+}
+
+/// Bedrock Titan embeds per ITEM, never per text fragment: an item made of two
+/// text parts is one `InvokeModel` call carrying the newline-joined text, so
+/// the vector count equals the item count (same contract as issue #90).
+#[tokio::test]
+async fn bedrock_titan_embeds_one_vector_per_multipart_item() {
+    let mock = MockServer::start().await;
+    // A fixed valid vector per call (the echo responder needs numeric text).
+    BedrockTitanFixture
+        .mount_delayed(&mock, Duration::ZERO)
+        .await;
+    let provider = BedrockTitanFixture.build(mock.uri());
+
+    let mut req = req_for(&BedrockTitanFixture, Vec::new());
+    req.input = two_items_one_multipart();
+    let resp = provider.embed(req, CancellationToken::new()).await.unwrap();
+    assert_eq!(resp.data.len(), 2);
+
+    let requests = mock.received_requests().await.unwrap();
+    assert_eq!(
+        requests.len(),
+        2,
+        "one InvokeModel per item, not per fragment"
+    );
+    let second: Value = serde_json::from_slice(&requests[1].body).unwrap();
+    assert_eq!(second["inputText"], "foo\nbar");
+}
+
+/// Bedrock Cohere sends one `texts` entry per ITEM (fragments joined), so the
+/// returned vector count matches the item count.
+#[tokio::test]
+async fn bedrock_cohere_embeds_one_vector_per_multipart_item() {
+    // One vector per `texts` entry, whatever the (non-numeric) text is.
+    struct CohereCount;
+    impl Respond for CohereCount {
+        fn respond(&self, request: &Request) -> ResponseTemplate {
+            let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
+            let n = body["texts"].as_array().map_or(0, Vec::len);
+            let embeddings: Vec<Value> = (0..n).map(|_| json!([0.0])).collect();
+            ResponseTemplate::new(200).set_body_json(json!({ "embeddings": embeddings }))
+        }
+    }
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(CohereCount)
+        .mount(&mock)
+        .await;
+    let provider = BedrockCohereFixture.build(mock.uri());
+
+    let mut req = req_for(&BedrockCohereFixture, Vec::new());
+    req.input = two_items_one_multipart();
+    let resp = provider.embed(req, CancellationToken::new()).await.unwrap();
+    assert_eq!(resp.data.len(), 2);
+
+    let requests = mock.received_requests().await.unwrap();
+    let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(body["texts"], json!(["solo", "foo\nbar"]));
+}
