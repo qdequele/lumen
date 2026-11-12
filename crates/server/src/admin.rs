@@ -101,7 +101,7 @@
 //! provider, webhook and config routes answer `403 LM-4005`.
 
 use crate::admin_scope::AccountScope;
-use crate::error::ApiError;
+use crate::error::{body_rejection, ApiError};
 use crate::state::AppState;
 use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::extract::{Path, Query, State};
@@ -218,6 +218,22 @@ fn unknown_group(id: &str) -> ApiError {
     GatewayError::NotFound(format!("unknown group id '{id}'")).into()
 }
 
+/// The JSON body of an admin write, or why it was refused: the one place
+/// every admin handler maps its body-extractor rejection. A body that ran
+/// over `body_limit` while it was read (chunked, no `Content-Length`) is
+/// `413 LM-1002` quoting the limit, as on `/v1/*`; anything else (malformed
+/// JSON, a wrong content type, an unknown field) is `400 LM-1001`. The
+/// rejection text describes the shape and never echoes a field value.
+pub(crate) fn json_body<T>(
+    state: &AppState,
+    payload: Result<Json<T>, JsonRejection>,
+) -> Result<T, ApiError> {
+    match payload {
+        Ok(Json(body)) => Ok(body),
+        Err(rejection) => Err(body_rejection(&rejection, state.body_limit).into()),
+    }
+}
+
 pub(crate) fn runtime(state: &AppState) -> Result<&crate::auth::AuthRuntime, ApiError> {
     state
         .auth
@@ -283,7 +299,7 @@ pub async fn create_key(
     scope: AccountScope,
     payload: Result<Json<NewKey>, JsonRejection>,
 ) -> Result<(StatusCode, Json<CreatedKey>), ApiError> {
-    let Json(params) = payload.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
+    let params = json_body(&state, payload)?;
     params.validate().map_err(GatewayError::InvalidRequest)?;
     validate_ref("external_ref", params.external_ref.as_deref(), false)?;
     let auth = runtime(&state)?;
@@ -443,7 +459,7 @@ pub async fn patch_key(
     scope: AccountScope,
     payload: Result<Json<KeyPatch>, JsonRejection>,
 ) -> Result<Json<VirtualKeyRecord>, ApiError> {
-    let Json(patch) = payload.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
+    let patch = json_body(&state, payload)?;
     patch.validate().map_err(GatewayError::InvalidRequest)?;
     validate_ref(
         "external_ref",
@@ -586,7 +602,7 @@ pub async fn create_group(
     scope: AccountScope,
     payload: Result<Json<NewGroup>, JsonRejection>,
 ) -> Result<(StatusCode, Json<GroupRecord>), ApiError> {
-    let Json(mut params) = payload.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
+    let mut params = json_body(&state, payload)?;
     params.validate().map_err(GatewayError::InvalidRequest)?;
     let auth = runtime(&state)?;
     // A sub-group (ADR 020) takes its parent's account: on a scoped call the
@@ -731,7 +747,7 @@ pub async fn patch_group(
     scope: AccountScope,
     payload: Result<Json<GroupPatch>, JsonRejection>,
 ) -> Result<Json<GroupRecord>, ApiError> {
-    let Json(patch) = payload.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
+    let patch = json_body(&state, payload)?;
     patch.validate().map_err(GatewayError::InvalidRequest)?;
     let shared = runtime_arc(&state)?;
     let auth = shared.as_ref();
@@ -844,9 +860,10 @@ const MAX_GRANT_USD: f64 = lumen_auth::store::MAX_BUDGET_USD;
 /// belt-and-braces in case a future serde version saturates to `inf`
 /// instead of erroring.
 fn validated_grant_amount(
+    state: &AppState,
     payload: Result<Json<GrantBody>, JsonRejection>,
 ) -> Result<f64, ApiError> {
-    let Json(body) = payload.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
+    let body = json_body(state, payload)?;
     if body.amount.is_finite() && body.amount > 0.0 && body.amount <= MAX_GRANT_USD {
         Ok(body.amount)
     } else {
@@ -872,7 +889,7 @@ pub async fn grant_key(
     scope: AccountScope,
     payload: Result<Json<GrantBody>, JsonRejection>,
 ) -> Result<Json<VirtualKeyRecord>, ApiError> {
-    let amount = validated_grant_amount(payload)?;
+    let amount = validated_grant_amount(&state, payload)?;
     let auth = runtime(&state)?;
     scope.guard_key(&auth.store, &id).await?;
     let _sync = auth.keys.sync_guard().await;
@@ -904,7 +921,7 @@ pub async fn grant_group(
     scope: AccountScope,
     payload: Result<Json<GrantBody>, JsonRejection>,
 ) -> Result<Json<GroupRecord>, ApiError> {
-    let amount = validated_grant_amount(payload)?;
+    let amount = validated_grant_amount(&state, payload)?;
     let auth = runtime(&state)?;
     scope.guard_group(&auth.store, &id).await?;
     let _sync = auth.keys.sync_guard().await;
@@ -1024,7 +1041,7 @@ pub async fn put_webhooks(
     State(state): State<AppState>,
     payload: Result<Json<WebhookSettings>, JsonRejection>,
 ) -> Result<Json<WebhookStatus>, ApiError> {
-    let Json(settings) = payload.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
+    let settings = json_body(&state, payload)?;
     let auth = runtime(&state)?;
     let controller = webhooks(&state)?;
     settings
@@ -1109,7 +1126,7 @@ pub async fn put_webhook_signing_key(
     State(state): State<AppState>,
     payload: Result<Json<WebhookSecretBody>, JsonRejection>,
 ) -> Result<StatusCode, ApiError> {
-    let Json(body) = payload.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
+    let body = json_body(&state, payload)?;
     if body.secret.is_empty() {
         return Err(GatewayError::InvalidRequest("`secret` must not be empty".to_owned()).into());
     }
@@ -1202,7 +1219,7 @@ pub async fn put_provider_key(
     Path(name): Path<String>,
     payload: Result<Json<ProviderKeyBody>, JsonRejection>,
 ) -> Result<StatusCode, ApiError> {
-    let Json(body) = payload.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
+    let body = json_body(&state, payload)?;
     if body.key.trim().is_empty() {
         return Err(GatewayError::InvalidRequest("`key` must not be empty".to_owned()).into());
     }
@@ -2304,7 +2321,7 @@ pub async fn put_provider(
     payload: Result<Json<ProviderConfig>, JsonRejection>,
 ) -> Result<StatusCode, ApiError> {
     let if_match = require_if_match(&headers)?;
-    let Json(provider) = payload.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
+    let provider = json_body(&state, payload)?;
     if provider.name != name {
         return Err(GatewayError::InvalidRequest(format!(
             "path provider name '{name}' does not match the request body's 'name' field '{}'",
@@ -2487,7 +2504,7 @@ pub async fn put_virtual_model(
     payload: Result<Json<lumen_router::virtual_models::VirtualModelConfig>, JsonRejection>,
 ) -> Result<StatusCode, ApiError> {
     let if_match = require_if_match(&headers)?;
-    let Json(vm) = payload.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
+    let vm = json_body(&state, payload)?;
     if vm.id != id {
         return Err(GatewayError::InvalidRequest(format!(
             "path virtual model id '{id}' does not match the request body's 'id' field '{}'",

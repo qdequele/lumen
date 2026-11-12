@@ -15,7 +15,7 @@
 //! disable or delete also evicts the key from the live pool before
 //! answering.
 
-use crate::admin::{internal, runtime};
+use crate::admin::{internal, json_body, runtime};
 use crate::byok_admin::{
     document_providers, ineligible, request_reload, unknown_provider, MAX_KEY_BYTES,
     MAX_LABEL_CHARS, MIN_KEY_CHARS,
@@ -178,7 +178,7 @@ pub async fn add_platform_key(
 ) -> Result<(StatusCode, Json<PlatformKeyView>), ApiError> {
     let auth = runtime(&state)?;
     // JsonRejection text describes the shape, never echoes field values.
-    let Json(body) = payload.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
+    let body = json_body(&state, payload)?;
     let key = body.key.trim();
     if key.chars().count() < MIN_KEY_CHARS {
         return Err(GatewayError::InvalidRequest(format!(
@@ -242,7 +242,7 @@ pub async fn patch_platform_key(
     payload: Result<Json<PatchPlatformKeyBody>, JsonRejection>,
 ) -> Result<Json<PlatformKeyView>, ApiError> {
     let auth = runtime(&state)?;
-    let Json(body) = payload.map_err(|e| GatewayError::InvalidRequest(e.body_text()))?;
+    let body = json_body(&state, payload)?;
     let record = auth
         .store
         .set_platform_provider_key_enabled(&provider, &key_id, body.enabled)
