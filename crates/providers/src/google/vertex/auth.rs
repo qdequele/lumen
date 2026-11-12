@@ -34,6 +34,30 @@ const SCOPE: &str = "https://www.googleapis.com/auth/cloud-platform";
 /// never presented to the upstream in the last seconds of its life.
 const EXPIRY_SKEW: Duration = Duration::from_secs(60);
 
+/// How long a token whose lifetime the endpoint did not state (`expires_in`
+/// missing or zero) is cached. Without a floor such a token is "expired" the
+/// moment it is cached and every request re-mints one, putting the token
+/// exchange back on the per-request path.
+const UNKNOWN_LIFETIME_TTL: Duration = Duration::from_secs(30);
+
+/// How long to cache a token that states `expires_in` seconds of life: the
+/// stated lifetime less [`EXPIRY_SKEW`]; a token shorter-lived than the skew
+/// is cached for half its life rather than not at all; an unstated lifetime
+/// gets [`UNKNOWN_LIFETIME_TTL`]. Never zero.
+fn cache_ttl(expires_in: Option<u64>) -> Duration {
+    match expires_in {
+        None | Some(0) => UNKNOWN_LIFETIME_TTL,
+        Some(secs) => {
+            let lifetime = Duration::from_secs(secs);
+            if lifetime > EXPIRY_SKEW {
+                lifetime.checked_sub(EXPIRY_SKEW).unwrap_or(lifetime / 2)
+            } else {
+                lifetime / 2
+            }
+        }
+    }
+}
+
 /// Requested lifetime of the signed assertion (Google caps this at 1 hour).
 const ASSERTION_TTL_SECS: u64 = 3600;
 
@@ -98,14 +122,16 @@ struct Claims<'a> {
 #[derive(Deserialize)]
 struct TokenResponse {
     access_token: String,
+    /// Token lifetime in seconds. Google always states it; `None` (or zero)
+    /// falls back to a short floor, see [`cache_ttl`].
     #[serde(default)]
-    expires_in: u64,
+    expires_in: Option<u64>,
 }
 
 /// A cached access token and the instant it should be refreshed by.
 struct CachedToken {
     value: String,
-    /// Absolute deadline (already discounted by [`EXPIRY_SKEW`]).
+    /// Absolute deadline (already discounted, see [`cache_ttl`]).
     refresh_at: Instant,
 }
 
@@ -158,12 +184,14 @@ impl TokenSource {
     /// The lock is held across the token fetch, so concurrent callers coalesce
     /// onto a single upstream exchange rather than stampeding it. The valid-cache
     /// path only clones a `String`, so it stays off the network hot path.
+    /// Waiting for the lock honours `cancel` like the exchange itself: a caller
+    /// queued behind a slow exchange is released as soon as its client leaves.
     ///
     /// # Errors
     /// A signing, transport, non-2xx or malformed-response failure at the token
     /// endpoint becomes a provider-named upstream error (never a client 401).
     pub(crate) async fn token(&self, cancel: &CancellationToken) -> Result<String, ProviderError> {
-        let mut guard = self.cache.lock().await;
+        let mut guard = with_cancel(cancel, async { Ok(self.cache.lock().await) }).await?;
         if let Some(cached) = guard.as_ref() {
             if Instant::now() < cached.refresh_at {
                 return Ok(cached.value.clone());
@@ -237,8 +265,14 @@ impl TokenSource {
         };
 
         let parsed = with_cancel(cancel, call).await?;
-        let lifetime = Duration::from_secs(parsed.expires_in);
-        let refresh_at = Instant::now() + lifetime.saturating_sub(EXPIRY_SKEW);
+        if parsed.expires_in.is_none_or(|secs| secs == 0) {
+            tracing::warn!(
+                provider,
+                "token endpoint stated no token lifetime (expires_in); \
+                 caching the token for a short default"
+            );
+        }
+        let refresh_at = Instant::now() + cache_ttl(parsed.expires_in);
         Ok(CachedToken {
             value: parsed.access_token,
             refresh_at,
@@ -354,5 +388,73 @@ mod tests {
             }
             other => panic!("expected Upstream, got {other:?}"),
         }
+    }
+    #[test]
+    fn cache_ttl_is_never_zero() {
+        // Google's usual hour: the stated lifetime less the skew.
+        assert_eq!(cache_ttl(Some(3600)), Duration::from_secs(3540));
+        // Missing or zero: a short floor, not "expired on arrival".
+        assert_eq!(cache_ttl(None), UNKNOWN_LIFETIME_TTL);
+        assert_eq!(cache_ttl(Some(0)), UNKNOWN_LIFETIME_TTL);
+        // Shorter-lived than the skew: half its life, still cached.
+        assert_eq!(cache_ttl(Some(40)), Duration::from_secs(20));
+        assert_eq!(cache_ttl(Some(60)), Duration::from_secs(30));
+        assert!(cache_ttl(Some(1)) > Duration::ZERO);
+    }
+
+    async fn mock_token_endpoint(body: serde_json::Value) -> (wiremock::MockServer, TokenSource) {
+        let mock = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(body))
+            .mount(&mock)
+            .await;
+        let mut key = sample_key();
+        key.token_uri = format!("{}/token", mock.uri());
+        let source = TokenSource::new(reqwest::Client::new(), "vertex", key);
+        (mock, source)
+    }
+
+    /// A token response without `expires_in` used to be cached with a zero
+    /// lifetime, so every request re-minted a token.
+    #[tokio::test]
+    async fn token_without_expires_in_is_cached_not_reminted() {
+        let (mock, source) =
+            mock_token_endpoint(serde_json::json!({ "access_token": "ya29.x" })).await;
+        let cancel = CancellationToken::new();
+        for _ in 0..3 {
+            assert_eq!(source.token(&cancel).await.expect("token"), "ya29.x");
+        }
+        assert_eq!(mock.received_requests().await.expect("recorded").len(), 1);
+    }
+
+    /// Once the refresh deadline passes, the next call mints a new token.
+    #[tokio::test]
+    async fn token_past_its_refresh_deadline_is_reminted() {
+        let (mock, source) = mock_token_endpoint(
+            serde_json::json!({ "access_token": "ya29.x", "expires_in": 3600 }),
+        )
+        .await;
+        let cancel = CancellationToken::new();
+        source.token(&cancel).await.expect("token");
+        if let Some(cached) = source.cache.lock().await.as_mut() {
+            cached.refresh_at = Instant::now();
+        }
+        source.token(&cancel).await.expect("token");
+        assert_eq!(mock.received_requests().await.expect("recorded").len(), 2);
+    }
+
+    /// A caller queued behind an in-flight exchange (which holds the cache
+    /// lock) is released by its own cancellation instead of waiting it out.
+    #[tokio::test]
+    async fn waiting_for_the_cache_lock_is_cancellable() {
+        let source = TokenSource::new(reqwest::Client::new(), "vertex", sample_key());
+        let _held = source.cache.lock().await;
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let err = tokio::time::timeout(Duration::from_secs(5), source.token(&cancel))
+            .await
+            .expect("must not wait for the lock")
+            .expect_err("cancelled");
+        assert!(matches!(err, ProviderError::Cancelled), "{err:?}");
     }
 }
