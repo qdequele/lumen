@@ -119,7 +119,13 @@ failure with the virtual model id and the reason:
    attempts of every target, a `switch` only its largest branch, and a
    foundation target counts 1 (a DAG that lists the same child several times
    per level multiplies quickly; the error names the model and its count);
-7. the contents of `overrides`, `preset` and `remap`.
+7. at most **64** targets per virtual model (the attempt limit does not
+   bound a `switch`, which counts only its largest branch);
+8. `when` conditions: at most **16** attribute tests per `when` table
+   (counted through `any`), at most **16** `regex` conditions per virtual
+   model, and each `regex` at most **256** bytes long and **64 KiB** once
+   compiled (see section 3);
+9. the contents of `overrides`, `preset` and `remap`.
 
 A `preset` on a virtual model that is only reached through another one is
 ignored at request time (section 6), and loading logs a warning.
@@ -191,7 +197,10 @@ nested table `metadata = { plan = "pro" }` and is rejected; write
 
 **Operators.** A bare value means equality. Otherwise use a one-key table:
 `in` (a list), `ne`, `gt`, `gte`, `lt`, `lte`, or `regex` (compiled at load;
-an invalid regex is a validation error). Several keys in one `when` table are
+an invalid regex is a validation error, and so is one longer than 256 bytes
+or compiling to more than 64 KiB. Unicode classes are what makes a pattern
+large: `\w+` fits once, `\w{20}` does not; ASCII classes such as `[a-z0-9_]`
+or `(?-u:\w)` cost almost nothing). Several keys in one `when` table are
 ANDed. `any = [ {...}, {...} ]` is an OR of tables and can nest. A missing
 attribute makes its comparison false (including `ne`), so the branch does not
 match and evaluation moves on to the next rule.

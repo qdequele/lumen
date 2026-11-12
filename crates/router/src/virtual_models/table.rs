@@ -32,6 +32,16 @@ pub const MAX_DEPTH: usize = 8;
 /// the same child several times per level.
 pub const MAX_ATTEMPTS: usize = 64;
 
+/// Most targets one virtual model may list. `MAX_ATTEMPTS` does not bound a
+/// `switch` (it counts only its largest branch), and every target's `when`
+/// is scanned per request until one matches.
+pub const MAX_TARGETS: usize = 64;
+
+/// Most `regex` conditions across the targets of one virtual model: each is
+/// compiled on every load and held in memory (see
+/// [`REGEX_SIZE_LIMIT`](super::condition::REGEX_SIZE_LIMIT)).
+pub const MAX_REGEXES: usize = 16;
+
 /// What compilation needs to know about the foundation models.
 #[derive(Debug, Clone, Default)]
 pub struct FoundationIndex {
@@ -487,6 +497,17 @@ impl Compiler<'_> {
         }
         self.stack.pop();
 
+        let regexes: usize = targets
+            .iter()
+            .filter_map(|t| t.when.as_ref())
+            .map(Condition::regex_count)
+            .sum();
+        if regexes > MAX_REGEXES {
+            return Err(err(format!(
+                "holds {regexes} regex conditions; the limit is {MAX_REGEXES}"
+            )));
+        }
+
         // The height comes from the compiled children, so the depth limit
         // does not depend on the order the models are declared in.
         let height = 1 + targets
@@ -800,6 +821,9 @@ fn validate_shape(c: &VirtualModelConfig) -> Result<(), String> {
         }
         _ => {}
     }
+    if n > MAX_TARGETS {
+        return Err(format!("lists {n} targets; the limit is {MAX_TARGETS}"));
+    }
     for (i, t) in c.targets.iter().enumerate() {
         match (c.strategy, t.weight) {
             (StrategyKind::Split, None | Some(0)) => {
@@ -1068,6 +1092,29 @@ mod tests {
     }
 
     #[test]
+    fn an_account_model_over_a_limit_is_disabled_not_served() {
+        #[derive(serde::Deserialize)]
+        struct Doc {
+            virtual_models: Vec<VirtualModelConfig>,
+        }
+        let doc: Doc = toml::from_str(&switch_toml(MAX_TARGETS, |i| {
+            format!("{{ group = \"g{i}\" }}")
+        }))
+        .unwrap();
+        let table = RoutingTable::compile_account(
+            &doc.virtual_models,
+            &foundation(),
+            &RoutingTable::default(),
+        );
+        assert!(table.get("w").is_none());
+        assert!(table.is_disabled("w"));
+        assert!(table
+            .problems("w")
+            .iter()
+            .any(|p| p.kind == ProblemKind::Disabled && p.message.contains("limit is 64")));
+    }
+
+    #[test]
     fn a_valid_composed_table_compiles() {
         let (table, warnings) = compile(
             r#"
@@ -1247,6 +1294,46 @@ mod tests {
             fan_out_toml(3, 4)
         );
         assert!(err(&doubled).contains("expands to 128 attempts"));
+    }
+
+    /// A `switch` over `targets` conditional branches plus the default.
+    fn switch_toml(targets: usize, when: impl Fn(usize) -> String) -> String {
+        let mut branches: Vec<String> = (0..targets)
+            .map(|i| format!("{{ when = {}, model = \"gpt-4o\" }}", when(i)))
+            .collect();
+        branches.push("{ model = \"claude\" }".to_owned());
+        format!(
+            "[[virtual_models]]\nid = \"w\"\ncapability = \"chat\"\nstrategy = \"switch\"\n\
+             targets = [{}]\n",
+            branches.join(", ")
+        )
+    }
+
+    #[test]
+    fn switch_targets_and_regexes_are_capped_per_virtual_model() {
+        let by_group = |i: usize| format!("{{ group = \"g{i}\" }}");
+        // MAX_ATTEMPTS counts a switch's largest branch only, so it never
+        // bounded the number of branches.
+        assert!(compile(&switch_toml(MAX_TARGETS - 1, by_group)).is_ok());
+        let e = err(&switch_toml(MAX_TARGETS, by_group));
+        assert!(e.contains("lists 65 targets; the limit is 64"), "{e}");
+
+        let by_regex = |i: usize| format!("{{ group = {{ regex = \"^g{i}-[0-9]+$\" }} }}");
+        assert!(compile(&switch_toml(MAX_REGEXES, by_regex)).is_ok());
+        let e = err(&switch_toml(MAX_REGEXES + 1, by_regex));
+        assert!(
+            e.contains("holds 17 regex conditions; the limit is 16"),
+            "{e}"
+        );
+        // An expensive pattern is the existing validation error, naming the
+        // target.
+        let e = err(&switch_toml(1, |_| {
+            "{ group = { regex = '\\p{L}{50}' } }".to_owned()
+        }));
+        assert!(
+            e.contains("virtual model 'w': target 'gpt-4o'") && e.contains("too expensive"),
+            "{e}"
+        );
     }
 
     #[test]

@@ -11,11 +11,11 @@ pub mod decide;
 pub mod overrides;
 pub mod table;
 
-pub use condition::{Condition, FactSource};
+pub use condition::{Condition, FactSource, MAX_CONDITIONS, MAX_REGEX_LEN, REGEX_SIZE_LIMIT};
 pub use config::VirtualModelConfig;
 pub use decide::{Attempt, Decision};
 pub use overrides::{Overridable, Overrides, Preset};
 pub use table::{
     FoundationIndex, Problem, ProblemKind, RoutingConfigError, RoutingTable, VirtualModel,
-    MAX_ATTEMPTS, MAX_DEPTH,
+    MAX_ATTEMPTS, MAX_DEPTH, MAX_REGEXES, MAX_TARGETS,
 };

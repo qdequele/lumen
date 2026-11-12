@@ -2,8 +2,21 @@
 //! request against a [`FactSource`] without allocating.
 
 use lumen_core::Capability;
-use regex::Regex;
+use regex::{Regex, RegexBuilder};
 use serde_json::{Map, Value};
+
+/// Longest `regex` pattern accepted, in bytes.
+pub const MAX_REGEX_LEN: usize = 256;
+
+/// Largest compiled program one `regex` may need, in bytes (the `regex`
+/// crate's default is 10 MiB). Also caps the lazy DFA cache it may grow at
+/// match time. Unicode classes are the expensive part: `\w+` fits once, a
+/// pattern repeating them does not; ASCII classes (`[a-z0-9_]`, `(?-u:\w)`)
+/// cost almost nothing.
+pub const REGEX_SIZE_LIMIT: usize = 64 * 1024;
+
+/// Most attribute tests in one `when` table, counted through `any`.
+pub const MAX_CONDITIONS: usize = 16;
 
 /// What a condition can look at. Implemented by the server per request;
 /// every method is cheap, and `input_tokens` is only called when a condition
@@ -150,6 +163,30 @@ impl Condition {
     /// # Errors
     /// A human-readable reason naming the offending key.
     pub fn compile(when: &Map<String, Value>, capability: Capability) -> Result<Self, String> {
+        let compiled = Self::compile_table(when, capability)?;
+        if compiled.count(&|_| true) > MAX_CONDITIONS {
+            return Err(format!(
+                "`when` holds more than {MAX_CONDITIONS} conditions"
+            ));
+        }
+        Ok(compiled)
+    }
+
+    /// How many `regex` tests the condition holds.
+    #[must_use]
+    pub fn regex_count(&self) -> usize {
+        self.count(&|op| matches!(op, Op::Regex(_)))
+    }
+
+    /// The attribute tests whose operator satisfies `keep`.
+    fn count(&self, keep: &dyn Fn(&Op) -> bool) -> usize {
+        match self {
+            Self::All(items) | Self::Any(items) => items.iter().map(|c| c.count(keep)).sum(),
+            Self::Test(_, op) => usize::from(keep(op)),
+        }
+    }
+
+    fn compile_table(when: &Map<String, Value>, capability: Capability) -> Result<Self, String> {
         if when.is_empty() {
             return Err("`when` must not be empty".to_owned());
         }
@@ -167,7 +204,7 @@ impl Condition {
                     let Value::Object(table) = item else {
                         return Err("`any` must be an array of condition tables".to_owned());
                     };
-                    any.push(Self::compile(table, capability)?);
+                    any.push(Self::compile_table(table, capability)?);
                 }
                 all.push(Self::Any(any));
                 continue;
@@ -244,9 +281,24 @@ fn compile_op(kind: Kind, key: &str, value: &Value) -> Result<Op, String> {
             let pattern = operand
                 .as_str()
                 .ok_or_else(|| format!("`{key}`: `regex` takes a string"))?;
-            Regex::new(pattern)
+            if pattern.len() > MAX_REGEX_LEN {
+                return Err(format!(
+                    "`{key}`: regex is longer than {MAX_REGEX_LEN} bytes"
+                ));
+            }
+            RegexBuilder::new(pattern)
+                .size_limit(REGEX_SIZE_LIMIT)
+                .dfa_size_limit(REGEX_SIZE_LIMIT)
+                .build()
                 .map(Op::Regex)
-                .map_err(|e| format!("`{key}`: invalid regex: {e}"))
+                .map_err(|e| match e {
+                    // The crate's message would name its own byte count.
+                    regex::Error::CompiledTooBig(_) => format!(
+                        "`{key}`: regex is too expensive (it compiles to more than \
+                         {REGEX_SIZE_LIMIT} bytes; prefer ASCII classes such as [a-z0-9_])"
+                    ),
+                    e => format!("`{key}`: invalid regex: {e}"),
+                })
         }
         other => Err(format!("`{key}`: unknown operator `{other}`")),
     }
@@ -497,5 +549,47 @@ mod tests {
         )
         .contains("exactly one"));
         assert!(e(json!({ "metadata.": "x" }), Capability::Chat).contains("unknown condition"));
+    }
+
+    #[test]
+    fn regexes_are_bounded_in_length_and_compiled_size() {
+        let e = |v: Value| Condition::compile(&when(v), Capability::Chat).unwrap_err();
+        // Short to write, huge to compile (well under the crate's default
+        // 10 MiB limit, far over ours).
+        let big = e(json!({ "group": { "regex": r"\p{L}{50}" } }));
+        assert!(big.contains("too expensive"), "{big}");
+        let long = e(json!({ "group": { "regex": "a".repeat(MAX_REGEX_LEN + 1) } }));
+        assert!(long.contains("longer than"), "{long}");
+        // The bounds leave ordinary patterns alone.
+        for ok in [
+            "^tenant-[0-9]+$",
+            r"\w+",
+            r"(?i)^(eu|uk)-[a-z0-9_.-]+$",
+            &"a".repeat(MAX_REGEX_LEN),
+        ] {
+            Condition::compile(&when(json!({ "group": { "regex": ok } })), Capability::Chat)
+                .unwrap_or_else(|e| panic!("{ok}: {e}"));
+        }
+    }
+
+    #[test]
+    fn a_when_table_is_bounded_in_conditions_through_any() {
+        let tests = |n: usize| -> Vec<Value> {
+            (0..n)
+                .map(|i| json!({ "group": { "regex": format!("^g{i}$") } }))
+                .collect()
+        };
+        let ok = Condition::compile(
+            &when(json!({ "any": tests(MAX_CONDITIONS) })),
+            Capability::Chat,
+        )
+        .unwrap();
+        assert_eq!(ok.regex_count(), MAX_CONDITIONS);
+        let e = Condition::compile(
+            &when(json!({ "stream": true, "any": tests(MAX_CONDITIONS) })),
+            Capability::Chat,
+        )
+        .unwrap_err();
+        assert!(e.contains("more than 16 conditions"), "{e}");
     }
 }
