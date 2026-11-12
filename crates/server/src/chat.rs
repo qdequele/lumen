@@ -218,12 +218,11 @@ fn reserved_output_tokens(
 /// `LM-2008` if a provider-native image source (Anthropic `file_id`, Gemini
 /// `fileUri`) is bound for a provider that cannot resolve it (issue #12).
 ///
-/// The three rejections judge the primary. Fallback targets that do not
-/// declare the `image` modality are then removed from `chain` and `decision`
-/// (see [`drop_text_only_fallbacks`]). The `LM-2004` / `LM-2008` checks stay
-/// primary-only on purpose (`docs/providers.md`, `docs/errors.md`): a
-/// fail-over that reaches a provider unable to take the image source surfaces
-/// the same code there (GH #13).
+/// The three rejections judge the primary. Fallback targets that cannot take
+/// the request's images (no `image` modality, or a provider that cannot fetch
+/// its remote URLs or resolve its provider-native sources) are then removed
+/// from `chain` and `decision` (see [`drop_incompatible_fallbacks`]), so a
+/// fail-over never sends a target an input it cannot use (GH #13).
 fn enforce_image_support(
     state: &AppState,
     client_model: &str,
@@ -231,14 +230,9 @@ fn enforce_image_support(
     decision: &mut lumen_router::virtual_models::Decision,
     req: &ChatRequest,
 ) -> Result<(), GatewayError> {
-    let has_image = req.messages.iter().any(|m| {
-        m.content
-            .as_ref()
-            .is_some_and(lumen_core::MessageContent::has_image)
-    });
-    if !has_image {
+    let Some(sources) = ImageSources::of(req) else {
         return Ok(());
-    }
+    };
     // LM-2003: model must declare the "image" modality.
     let vision_ok = state
         .registry
@@ -249,59 +243,96 @@ fn enforce_image_support(
             model: client_model.to_owned(),
         });
     }
+    let primary = &chain[0].route;
     // LM-2004: if the PRIMARY provider can't take a remote URL, reject one.
-    // A provider-native reference is excluded even when it is also an
-    // `https://` URL (a Gemini Files API URI is both): it is not a URL the
-    // provider would have to fetch, and the LM-2008 checks below own its
-    // routing verdict.
-    let has_remote_url = req.messages.iter().any(|m| {
-        matches!(m.content.as_ref(), Some(lumen_core::MessageContent::Parts(parts))
-        if parts.iter().any(|p| p.image_url.as_ref().is_some_and(|i| {
-            i.is_remote() && i.gemini_file_uri().is_none() && i.anthropic_file_id().is_none()
-        })))
-    });
-    if has_remote_url && !chain[0].route.provider.accepts_remote_image_url() {
+    if sources.remote_url && !primary.provider.accepts_remote_image_url() {
         return Err(GatewayError::ImageUrlNotSupported {
-            provider: chain[0].route.provider_name.clone(),
+            provider: primary.provider_name.clone(),
         });
     }
     // LM-2008: a provider-native image source bound for the wrong provider
     // (issue #12) - an honest client error, not a translation failure
     // surfaced as a 502.
-    let has_mismatched_anthropic_file = req.messages.iter().any(|m| {
-        matches!(m.content.as_ref(), Some(lumen_core::MessageContent::Parts(parts))
-            if parts.iter().any(|p| p.image_url.as_ref().is_some_and(|i| i.anthropic_file_id().is_some())))
-    });
-    if has_mismatched_anthropic_file && !chain[0].route.provider.accepts_anthropic_file_id() {
+    if sources.anthropic_file && !primary.provider.accepts_anthropic_file_id() {
         return Err(GatewayError::ImageSourceNotSupported {
-            provider: chain[0].route.provider_name.clone(),
+            provider: primary.provider_name.clone(),
             source_kind: "anthropic-file",
         });
     }
-    let has_mismatched_gemini_file = req.messages.iter().any(|m| {
-        matches!(m.content.as_ref(), Some(lumen_core::MessageContent::Parts(parts))
-            if parts.iter().any(|p| p.image_url.as_ref().is_some_and(|i| i.gemini_file_uri().is_some())))
-    });
-    if has_mismatched_gemini_file && !chain[0].route.provider.accepts_gemini_file_uri() {
+    if sources.gemini_file && !primary.provider.accepts_gemini_file_uri() {
         return Err(GatewayError::ImageSourceNotSupported {
-            provider: chain[0].route.provider_name.clone(),
+            provider: primary.provider_name.clone(),
             source_kind: "gemini-file",
         });
     }
-    drop_text_only_fallbacks(state, chain, decision);
+    drop_incompatible_fallbacks(state, chain, decision, sources);
     Ok(())
 }
 
-/// Remove the fallback targets that cannot take an image from a request that
-/// carries one: a model that does not declare the `image` modality is not an
-/// attempt for it (as `/v1/decisions` skips its incompatible targets), so a
-/// fail-over never sends image content to a text-only model. The primary is
-/// kept: the caller has already checked it. `chain` and `decision.attempts`
-/// stay aligned, index for index.
-fn drop_text_only_fallbacks(
+/// The kinds of image source a chat request carries, beyond inline `data:`
+/// bytes (which every vision provider takes).
+#[derive(Clone, Copy, Default)]
+struct ImageSources {
+    /// A remote `http(s)` URL the provider would have to fetch. A
+    /// provider-native reference is excluded even when it is also an
+    /// `https://` URL (a Gemini Files API URI is both): it is not a URL the
+    /// provider fetches, and the `LM-2008` check owns its routing verdict.
+    remote_url: bool,
+    /// An Anthropic `file_id` reference (`anthropic-file:<id>`).
+    anthropic_file: bool,
+    /// A Gemini `fileUri` (Files API URI or `gs://` object).
+    gemini_file: bool,
+}
+
+impl ImageSources {
+    /// The sources of `req`'s images, or `None` when it carries no image.
+    fn of(req: &ChatRequest) -> Option<Self> {
+        let mut sources = None;
+        for message in &req.messages {
+            let Some(lumen_core::MessageContent::Parts(parts)) = message.content.as_ref() else {
+                continue;
+            };
+            for image in parts.iter().filter_map(lumen_core::ContentPart::image) {
+                let found = sources.get_or_insert_with(Self::default);
+                let (anthropic, gemini) = (
+                    image.anthropic_file_id().is_some(),
+                    image.gemini_file_uri().is_some(),
+                );
+                found.anthropic_file |= anthropic;
+                found.gemini_file |= gemini;
+                found.remote_url |= image.is_remote() && !anthropic && !gemini;
+            }
+        }
+        sources
+    }
+
+    /// Why `provider` cannot take these sources, if it cannot.
+    fn refused_by(self, provider: &dyn ChatProvider) -> Option<&'static str> {
+        if self.remote_url && !provider.accepts_remote_image_url() {
+            Some("its provider cannot fetch a remote image URL")
+        } else if self.anthropic_file && !provider.accepts_anthropic_file_id() {
+            Some("its provider cannot resolve an Anthropic file id")
+        } else if self.gemini_file && !provider.accepts_gemini_file_uri() {
+            Some("its provider cannot resolve a Gemini file URI")
+        } else {
+            None
+        }
+    }
+}
+
+/// Remove the fallback targets that cannot take the images of a request that
+/// carries some: a model that does not declare the `image` modality, or whose
+/// provider cannot fetch the request's remote image URLs or resolve its
+/// provider-native sources, is not an attempt for it (as `/v1/decisions`
+/// skips its incompatible targets). A fail-over therefore never sends a
+/// target an input it cannot use. The primary is kept: the caller has already
+/// checked it and answered with its own error. `chain` and
+/// `decision.attempts` stay aligned, index for index.
+fn drop_incompatible_fallbacks(
     state: &AppState,
     chain: &mut Vec<lumen_router::ChatChainLink>,
     decision: &mut lumen_router::virtual_models::Decision,
+    sources: ImageSources,
 ) {
     // The common case (no fallback) skips the registry lookups.
     if decision.attempts.len() < 2 {
@@ -310,25 +341,33 @@ fn drop_text_only_fallbacks(
     let keep: Vec<bool> = decision
         .attempts
         .iter()
+        .zip(chain.iter())
         .enumerate()
-        .map(|(i, attempt)| {
-            i == 0
-                || state
-                    .registry
-                    .modalities(&attempt.model_id)
-                    .is_some_and(|mods| mods.iter().any(|m| m == "image"))
+        .map(|(i, (attempt, link))| {
+            if i == 0 {
+                return true;
+            }
+            let reason = if state
+                .registry
+                .modalities(&attempt.model_id)
+                .is_some_and(|mods| mods.iter().any(|m| m == "image"))
+            {
+                sources.refused_by(link.route.provider.as_ref())
+            } else {
+                Some("it does not declare the image modality")
+            };
+            if let Some(reason) = reason {
+                tracing::debug!(
+                    model = %attempt.model_id,
+                    reason,
+                    "skipping a fallback target that cannot take the request's images"
+                );
+            }
+            reason.is_none()
         })
         .collect();
     if keep.iter().all(|k| *k) {
         return;
-    }
-    for (attempt, kept) in decision.attempts.iter().zip(&keep) {
-        if !kept {
-            tracing::debug!(
-                model = %attempt.model_id,
-                "skipping a fallback target without the image modality"
-            );
-        }
     }
     let mut kept = keep.iter();
     chain.retain(|_| kept.next().copied().unwrap_or(true));

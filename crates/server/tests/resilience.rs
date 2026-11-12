@@ -298,57 +298,199 @@ async fn falls_back_to_second_provider_and_advertises_it() {
     assert_eq!(fallback.received_requests().await.unwrap().len(), 1);
 }
 
-// GH #13 / LM-2004: the primary (OpenAI) accepts a remote image URL, so the
-// LM-2004 pre-flight (which only inspects `chain[0]`) lets the request
-// through. The primary then fails and the chain falls back to Gemini, which
-// cannot take a remote URL. That must surface as the honest LM-2004 client
-// error (400), not an upstream LM-3002 (502) - a fail-over is not the
-// client's fault when it happens, but *this specific* failure (an
-// image-incapable fallback) is a client-input problem, not the fallback
-// provider's fault.
-#[tokio::test]
-async fn fallback_incapable_of_remote_image_url_is_lm_2004_not_502() {
-    let primary = MockServer::start().await;
-    let fallback = MockServer::start().await;
-    // Primary always fails, forcing a fail-over to the Gemini fallback. The
-    // fallback mock is never given a mapping - it must never be hit.
-    Mock::given(method("POST"))
-        .and(path("/chat/completions"))
-        .respond_with(ResponseTemplate::new(503))
-        .mount(&primary)
-        .await;
-
-    let base = spawn(&config_from(
-        &image_capable_primary_with_gemini_fallback_config(&primary.uri(), &fallback.uri()),
-    ))
-    .await;
-
-    let resp = reqwest::Client::new()
+/// POST a one-image chat request for `model` whose image is `url`.
+async fn post_image_chat(base: &str, model: &str, url: &str) -> reqwest::Response {
+    reqwest::Client::new()
         .post(format!("{base}/v1/chat/completions"))
         .json(&json!({
-            "model": "gpt",
+            "model": model,
             "messages": [{"role":"user","content":[
                 {"type":"text","text":"what is this?"},
-                {"type":"image_url","image_url":{"url":"https://example.com/x.png"}}
+                {"type":"image_url","image_url":{"url": url}}
             ]}]
         }))
         .send()
         .await
-        .expect("request sent");
+        .expect("request sent")
+}
 
-    assert_eq!(
-        resp.status(),
-        400,
-        "an image-incapable fallback must surface as a client error, not a 502"
+/// A server that answers every POST with `status`.
+async fn always(status: u16) -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(status))
+        .mount(&server)
+        .await;
+    server
+}
+
+// GH #13 / LM-2004: the primary (OpenAI) accepts a remote image URL, so the
+// request clears the LM-2004 pre-flight, which judges the primary. A Gemini
+// fallback cannot fetch a remote URL: it is not an attempt for this request,
+// exactly as a text-only fallback is not one for an image. The fail-over goes
+// on to the next target that can take the URL.
+#[tokio::test]
+async fn fallback_incapable_of_remote_image_url_is_skipped() {
+    let primary = always(503).await;
+    let gemini = always(503).await;
+    let third = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(chat_body("gpt")))
+        .mount(&third)
+        .await;
+    let config = format!(
+        r#"{}
+        [[providers]]
+        name = "third"
+        kind = "openai"
+        base_url = "{}"
+        [[providers.models]]
+        id = "third/third-gpt"
+        upstream_id = "gpt"
+        capabilities = ["chat"]
+        modalities = ["text", "image"]
+
+        [[virtual_models]]
+        id = "lumen/three"
+        capability = "chat"
+        strategy = "fallback"
+        targets = [
+            {{ model = "primary/primary-gpt" }},
+            {{ model = "fallback/gemini-fb" }},
+            {{ model = "third/third-gpt" }},
+        ]
+        "#,
+        image_capable_primary_with_gemini_fallback_config(&primary.uri(), &gemini.uri()),
+        third.uri()
     );
-    let body: Value = resp.json().await.expect("json body");
-    assert_eq!(body["error"]["code"], "LM-2004");
+    let base = spawn(&config_from(&config)).await;
 
-    // The primary was tried (and exhausted its retry budget); the fallback
-    // was never actually contacted over HTTP - the remote URL is rejected in
-    // translation, before any request leaves the gateway.
+    let resp = post_image_chat(&base, "lumen/three", "https://example.com/x.png").await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers()
+            .get("x-lumen-model-used")
+            .and_then(|v| v.to_str().ok()),
+        Some("third/third-gpt")
+    );
     assert!(!primary.received_requests().await.unwrap().is_empty());
-    assert!(fallback.received_requests().await.unwrap().is_empty());
+    assert!(
+        gemini.received_requests().await.unwrap().is_empty(),
+        "a target that cannot fetch the URL must never be sent it"
+    );
+
+    // An inline `data:` image is something Gemini can take: the same chain
+    // does fail over to it.
+    let _ = post_image_chat(&base, "lumen/three", "data:image/png;base64,AAAA").await;
+    assert!(
+        !gemini.received_requests().await.unwrap().is_empty(),
+        "an inline image still fails over to the Gemini target"
+    );
+}
+
+// When the only fallback cannot take the remote URL, nothing is left after
+// the primary: its own upstream failure is what the client sees (not an
+// `LM-2004` blaming the client for a fail-over it did not choose).
+#[tokio::test]
+async fn primary_failure_surfaces_when_no_fallback_can_take_the_remote_image_url() {
+    let primary = always(503).await;
+    let gemini = always(200).await;
+    let base = spawn(&config_from(
+        &image_capable_primary_with_gemini_fallback_config(&primary.uri(), &gemini.uri()),
+    ))
+    .await;
+
+    let resp = post_image_chat(&base, "gpt", "https://example.com/x.png").await;
+    assert_eq!(resp.status(), 502);
+    let body: Value = resp.json().await.expect("json body");
+    assert_eq!(body["error"]["code"], "LM-3003");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("'primary'")),
+        "{body}"
+    );
+    assert!(!primary.received_requests().await.unwrap().is_empty());
+    assert!(gemini.received_requests().await.unwrap().is_empty());
+}
+
+// LM-2008 follows the same rule: a provider-native image source is judged on
+// the primary, and a fallback that cannot resolve it is skipped. An OpenAI
+// fallback would otherwise be sent `anthropic-file:...` or a Gemini file URI
+// verbatim as an image URL.
+#[tokio::test]
+async fn fallback_incapable_of_a_provider_native_image_source_is_skipped() {
+    for (kind, url) in [
+        ("anthropic", "anthropic-file:file_abc123"),
+        (
+            "google",
+            "https://generativelanguage.googleapis.com/v1beta/files/abc123",
+        ),
+        ("google", "gs://bucket/cat.png"),
+    ] {
+        let primary = always(503).await;
+        let fallback = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(chat_body("gpt")))
+            .mount(&fallback)
+            .await;
+        let config = format!(
+            r#"
+            [resilience]
+            retry_max_attempts = 1
+            retry_base_ms = 5
+            retry_max_ms = 20
+
+            [[providers]]
+            name = "primary"
+            kind = "{kind}"
+            base_url = "{}"
+            [[providers.models]]
+            id = "primary/native"
+            capabilities = ["chat"]
+            modalities = ["text", "image"]
+
+            [[providers]]
+            name = "fallback"
+            kind = "openai"
+            base_url = "{}"
+            [[providers.models]]
+            id = "fallback/gpt-fb"
+            upstream_id = "gpt"
+            capabilities = ["chat"]
+            modalities = ["text", "image"]
+
+            [[virtual_models]]
+            id = "lumen/native"
+            capability = "chat"
+            strategy = "fallback"
+            targets = [{{ model = "primary/native" }}, {{ model = "fallback/gpt-fb" }}]
+            "#,
+            primary.uri(),
+            fallback.uri()
+        );
+        let base = spawn(&config_from(&config)).await;
+
+        let resp = post_image_chat(&base, "lumen/native", url).await;
+        assert_ne!(resp.status(), 200, "{kind} {url}");
+        let body: Value = resp.json().await.expect("json body");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("'primary'")),
+            "{kind} {url}: {body}"
+        );
+        assert!(
+            fallback.received_requests().await.unwrap().is_empty(),
+            "{kind} {url}: the fallback cannot resolve this source"
+        );
+
+        // A plain inline image still fails over to the OpenAI target.
+        let resp = post_image_chat(&base, "lumen/native", "data:image/png;base64,AAAA").await;
+        assert_eq!(resp.status(), 200, "{kind}");
+    }
 }
 
 // Criterion 3: 5 failures open the circuit; the next request skips the primary
