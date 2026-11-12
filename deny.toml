@@ -28,6 +28,15 @@ ignore = [
     # runtime or client YAML. Replace serde_yaml_ng with a maintained parser to
     # drop this. Added 2026-10-31.
     "RUSTSEC-2024-0449",
+    # Bundled SQLite before 3.54.0 (CVE-2026-119375): a database opened with a
+    # sibling `-wal` file of a different page size can return uninitialized
+    # page-cache memory. Local vector: it needs a crafted `lumen.db` + `-wal`
+    # pair at the operator-configured database path, so write access to the
+    # data directory, which already gives access to the database itself.
+    # Patched in libsqlite3-sys 0.39, but sqlx-sqlite 0.9.0 (latest as of
+    # 2026-11-12) requires <0.38. Drop this once sqlx accepts 0.39.
+    # Added 2026-11-12.
+    "RUSTSEC-2026-0459",
 ]
 
 [licenses]
