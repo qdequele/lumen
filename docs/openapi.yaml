@@ -296,7 +296,7 @@ components:
               - type: object
                 additionalProperties: true
         rank_fields: { type: array, items: { type: string } }
-        top_n: { type: integer, minimum: 0, description: "Clamped to the document count." }
+        top_n: { type: integer, minimum: 1, description: "At least 1, clamped to the document count. `0` is 400 `LM-1001`; omit it to get every document." }
         return_documents: { type: boolean, default: false }
     RerankResponse:
       type: object
