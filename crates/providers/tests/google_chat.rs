@@ -95,7 +95,9 @@ async fn prompt_level_block_is_content_filtered_on_both_paths() {
         .mount(&mock)
         .await;
     Mock::given(method("POST"))
-        .and(path(format!("/v1beta/models/{MODEL}:streamGenerateContent")))
+        .and(path(format!(
+            "/v1beta/models/{MODEL}:streamGenerateContent"
+        )))
         .respond_with(
             ResponseTemplate::new(200)
                 .insert_header("content-type", "text/event-stream")

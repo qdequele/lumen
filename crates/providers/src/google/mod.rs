@@ -1146,7 +1146,10 @@ mod tests {
             }
         }))
         .unwrap();
-        let usage = translate_response(resp, "gemini-2.5-pro", "google").unwrap().usage.unwrap();
+        let usage = translate_response(resp, "gemini-2.5-pro", "google")
+            .unwrap()
+            .usage
+            .unwrap();
         assert_eq!(usage.prompt_tokens, 10);
         assert_eq!(usage.completion_tokens, 34);
         assert_eq!(usage.total_tokens, 44);
@@ -1163,7 +1166,10 @@ mod tests {
             }
         }))
         .unwrap();
-        let usage = translate_response(resp, "gemini-2.0", "google").unwrap().usage.unwrap();
+        let usage = translate_response(resp, "gemini-2.0", "google")
+            .unwrap()
+            .usage
+            .unwrap();
         assert_eq!(usage.completion_tokens, 4);
         assert_eq!(usage.completion_tokens_details, None);
     }

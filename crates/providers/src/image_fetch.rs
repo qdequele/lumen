@@ -524,7 +524,10 @@ mod tests {
     #[test]
     fn prefix_is_matched_on_the_normalised_url() {
         let allow = vec!["https://h.example/tenant-a/".to_owned()];
-        assert!(prefix_allowed(&url("https://h.example/tenant-a/x.png"), &allow));
+        assert!(prefix_allowed(
+            &url("https://h.example/tenant-a/x.png"),
+            &allow
+        ));
         // Dot segments (plain or percent-encoded) are resolved before matching.
         assert!(!prefix_allowed(
             &url("https://h.example/tenant-a/../tenant-b/x.png"),
@@ -545,8 +548,14 @@ mod tests {
     fn prefix_match_ends_on_a_path_boundary() {
         let allow = vec!["https://h.example/tenant-a".to_owned()];
         assert!(prefix_allowed(&url("https://h.example/tenant-a"), &allow));
-        assert!(prefix_allowed(&url("https://h.example/tenant-a/x.png"), &allow));
-        assert!(prefix_allowed(&url("https://h.example/tenant-a?x=1"), &allow));
+        assert!(prefix_allowed(
+            &url("https://h.example/tenant-a/x.png"),
+            &allow
+        ));
+        assert!(prefix_allowed(
+            &url("https://h.example/tenant-a?x=1"),
+            &allow
+        ));
         assert!(!prefix_allowed(
             &url("https://h.example/tenant-ab/x.png"),
             &allow
