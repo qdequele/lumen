@@ -108,17 +108,22 @@ impl PinnedResolver {
         }
     }
 
-    /// The vetted address to connect to for `host`, if a hop pinned one. With
+    /// The vetted IP to connect to for `host`, if a hop pinned one. With
     /// several concurrent hops on one host, the most recent pin: every pin was
     /// vetted for this host under the same policy, so any of them upholds the
     /// guard.
-    fn pinned(&self, host: &str) -> Option<SocketAddr> {
+    ///
+    /// Only the IP is answered, never the pinned port: pins are keyed by host,
+    /// and concurrent hops may target different ports of one host
+    /// (`http://h/` and `https://h/`, or an explicit port). The port always
+    /// comes from the URL of the request being sent (see `resolve`).
+    fn pinned(&self, host: &str) -> Option<IpAddr> {
         self.pins
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .get(host)
             .and_then(|pins| pins.last())
-            .map(|(_, addr)| *addr)
+            .map(|(_, addr)| addr.ip())
     }
 }
 
@@ -127,8 +132,12 @@ impl reqwest::dns::Resolve for PinnedResolver {
         let pinned = self.pinned(name.as_str());
         Box::pin(async move {
             match pinned {
-                Some(addr) => {
-                    let addrs: reqwest::dns::Addrs = Box::new(std::iter::once(addr));
+                Some(ip) => {
+                    // Port 0: the connector then applies the port of the
+                    // request URL (explicit, or the scheme default), which is
+                    // the port the guards vetted for this hop.
+                    let addrs: reqwest::dns::Addrs =
+                        Box::new(std::iter::once(SocketAddr::new(ip, 0)));
                     Ok(addrs)
                 }
                 // Fail closed: no vetted address, no connection.
@@ -805,16 +814,46 @@ mod tests {
         let b: SocketAddr = "8.8.8.8:443".parse().unwrap();
 
         let first = resolver.pin("h.example", a);
-        assert_eq!(resolver.pinned("h.example"), Some(a));
+        assert_eq!(resolver.pinned("h.example"), Some(a.ip()));
         assert_eq!(resolver.pinned("other.example"), None);
 
         let second = resolver.pin("h.example", b);
-        assert_eq!(resolver.pinned("h.example"), Some(b));
+        assert_eq!(resolver.pinned("h.example"), Some(b.ip()));
         drop(first);
-        assert_eq!(resolver.pinned("h.example"), Some(b));
+        assert_eq!(resolver.pinned("h.example"), Some(b.ip()));
         drop(second);
         assert_eq!(resolver.pinned("h.example"), None);
         assert!(resolver.pins.lock().unwrap().is_empty());
+    }
+
+    /// The port of a connection comes from the request URL, never from a
+    /// pin: a concurrent hop on another port of the same host (here a pin
+    /// for port 1, still held) must not redirect this hop there.
+    #[tokio::test]
+    async fn a_pin_for_another_port_of_the_host_does_not_change_the_port_dialled() {
+        let server = image_server().await;
+        let fetcher = Fetcher::new().unwrap();
+        let ip = server.address().ip();
+        let target = url(&format!(
+            "http://pinned.invalid:{}/img.png",
+            server.address().port()
+        ));
+
+        let hop = fetcher.resolver.pin("pinned.invalid", *server.address());
+        // Pinned later, so it is the pin the resolver answers with.
+        let other_port = fetcher
+            .resolver
+            .pin("pinned.invalid", SocketAddr::new(ip, 1));
+
+        let resp = fetcher
+            .client
+            .get(target)
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        drop((hop, other_port));
     }
 
     /// A cancelled hop drops its pin.
