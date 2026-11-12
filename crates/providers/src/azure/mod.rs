@@ -31,8 +31,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::BoxStream;
 use lumen_core::{
-    developer_role_as_system, ChatChunk, ChatProvider, ChatRequest, ChatResponse, EmbedRequest,
-    EmbedResponse, EmbeddingProvider, ProviderError,
+    developer_role_as_system, ChatChunk, ChatCompletion, ChatProvider, ChatRequest, ChatResponse,
+    EmbedCompletion, EmbedRequest, EmbedResponse, EmbeddingProvider, ProviderError,
 };
 use std::fmt;
 use tokio_util::sync::CancellationToken;
@@ -131,6 +131,47 @@ impl AzureProvider {
     fn headers(&self) -> [(&str, &str); 1] {
         [("api-key", self.api_key.as_deref().unwrap_or(""))]
     }
+
+    /// Send an embeddings request and return the upstream body.
+    async fn post_embed(
+        &self,
+        req: &EmbedRequest,
+        cancel: &CancellationToken,
+    ) -> Result<Bytes, ProviderError> {
+        let url = self.deployment_url(&req.model, "embeddings");
+        post_json_with_headers(
+            &self.client,
+            &url,
+            req,
+            &self.headers(),
+            &self.provider_name,
+            cancel,
+        )
+        .await
+    }
+
+    /// Send a non-streaming completion and return the upstream body.
+    async fn post_chat(
+        &self,
+        mut req: ChatRequest,
+        cancel: &CancellationToken,
+    ) -> Result<Bytes, ProviderError> {
+        // This entry point is non-streaming; never ask the upstream to stream.
+        req.stream = false;
+        // `developer` needs api-version 2024-12-01-preview or later, and the
+        // GA default predates it; `system` is equivalent on every version.
+        developer_role_as_system(&mut req.messages);
+        let url = self.deployment_url(&req.model, "chat/completions");
+        post_json_with_headers(
+            &self.client,
+            &url,
+            &req,
+            &self.headers(),
+            &self.provider_name,
+            cancel,
+        )
+        .await
+    }
 }
 
 /// Percent-encode a URL path segment or query value: every byte outside the
@@ -198,25 +239,23 @@ impl fmt::Debug for AzureProvider {
 impl ChatProvider for AzureProvider {
     async fn chat(
         &self,
-        mut req: ChatRequest,
+        req: ChatRequest,
         cancel: CancellationToken,
     ) -> Result<ChatResponse, ProviderError> {
-        // This entry point is non-streaming; never ask the upstream to stream.
-        req.stream = false;
-        // `developer` needs api-version 2024-12-01-preview or later, and the
-        // GA default predates it; `system` is equivalent on every version.
-        developer_role_as_system(&mut req.messages);
-        let url = self.deployment_url(&req.model, "chat/completions");
-        let bytes = post_json_with_headers(
-            &self.client,
-            &url,
-            &req,
-            &self.headers(),
-            &self.provider_name,
-            &cancel,
-        )
-        .await?;
+        let bytes = self.post_chat(req, &cancel).await?;
         serde_json::from_slice::<ChatResponse>(&bytes)
+            .map_err(|e| ProviderError::Translation(format!("azure chat response: {e}")))
+    }
+
+    async fn chat_completion(
+        &self,
+        req: ChatRequest,
+        cancel: CancellationToken,
+    ) -> Result<ChatCompletion, ProviderError> {
+        // Azure OpenAI answers in the OpenAI format: keep its body as bytes
+        // when nothing in it has to change (ADR 004, 2026-11-12).
+        let bytes = self.post_chat(req, &cancel).await?;
+        ChatCompletion::from_openai_body(bytes)
             .map_err(|e| ProviderError::Translation(format!("azure chat response: {e}")))
     }
 
@@ -260,17 +299,20 @@ impl EmbeddingProvider for AzureProvider {
         req: EmbedRequest,
         cancel: CancellationToken,
     ) -> Result<EmbedResponse, ProviderError> {
-        let url = self.deployment_url(&req.model, "embeddings");
-        let bytes = post_json_with_headers(
-            &self.client,
-            &url,
-            &req,
-            &self.headers(),
-            &self.provider_name,
-            &cancel,
-        )
-        .await?;
+        let bytes = self.post_embed(&req, &cancel).await?;
         serde_json::from_slice::<EmbedResponse>(&bytes)
+            .map_err(|e| ProviderError::Translation(format!("azure embeddings response: {e}")))
+    }
+
+    async fn embed_completion(
+        &self,
+        req: EmbedRequest,
+        cancel: CancellationToken,
+    ) -> Result<EmbedCompletion, ProviderError> {
+        // Keep the body as bytes when its vectors are already in the encoding
+        // the client wants (ADR 004, 2026-11-12).
+        let bytes = self.post_embed(&req, &cancel).await?;
+        EmbedCompletion::from_openai_body(bytes, req.output_encoding())
             .map_err(|e| ProviderError::Translation(format!("azure embeddings response: {e}")))
     }
 

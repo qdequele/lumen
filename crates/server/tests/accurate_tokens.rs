@@ -143,6 +143,81 @@ async fn chat_envelope_stays_heuristic_while_metrics_get_the_accurate_count() {
     wait_for_tokens(&base, "chat", "output", 2.0).await;
 }
 
+/// The accurate recount covers the text only: the per-image estimate of a
+/// vision request must survive it, not be refined away (as embeddings do).
+#[tokio::test]
+async fn chat_refinement_keeps_the_per_image_estimate() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "chatcmpl-1",
+            "object": "chat.completion",
+            "created": 1,
+            "model": "gpt-4-0613",
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": "hello world" },
+                "finish_reason": "stop"
+            }]
+        })))
+        .mount(&upstream)
+        .await;
+
+    let specs = vec![ProviderSpec {
+        name: "openai".to_owned(),
+        kind: ProviderKind::Openai,
+        api_key: Some("sk-test".to_owned()),
+        base_url: Some(upstream.uri()),
+        api_version: None,
+        strict: false,
+        connect_timeout_ms: None,
+        models: vec![ModelSpec {
+            id: "gpt-4".to_owned(),
+            upstream_id: "gpt-4-0613".to_owned(),
+            capabilities: vec![Capability::Chat],
+            modalities: vec!["text".to_owned(), "image".to_owned()],
+            release_date: None,
+        }],
+        decisions_path: None,
+        forward_unknown_fields: None,
+    }];
+    let registry = Arc::new(
+        Registry::build(
+            specs,
+            http::build_client(),
+            std::time::Duration::from_secs(300),
+        )
+        .expect("registry builds"),
+    );
+    let base = spawn_accurate(registry).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&json!({
+            "model": "gpt-4",
+            "messages": [{ "role": "user", "content": [
+                { "type": "text", "text": "hello world" },
+                { "type": "image_url", "image_url": { "url": "data:image/png;base64,AAAA" } },
+                { "type": "image_url",
+                  "image_url": { "url": "data:image/png;base64,AAAA", "detail": "low" } }
+            ]}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+
+    // Heuristic envelope: text ceil(11/4)=3 + 4 overhead + images 765 + 85.
+    assert_eq!(body["usage"]["estimated"], true);
+    assert_eq!(body["usage"]["prompt_tokens"], 857);
+
+    // Refined: exact text 2 + 4 overhead, plus the same 850 image tokens.
+    wait_for_tokens(&base, "chat", "input", 856.0).await;
+    wait_for_tokens(&base, "chat", "output", 2.0).await;
+}
+
 #[tokio::test]
 async fn embed_envelope_stays_heuristic_while_metrics_get_the_accurate_count() {
     let upstream = MockServer::start().await;

@@ -517,14 +517,17 @@ Follow-ups of the decisions spec (`docs/superpowers/specs/2026-10-08-decisions-d
 
 ## Noted while building M8 (vision / image input)
 
-- **`LM-2004` pre-flight is primary-only.** A remote `http(s)` image URL is
+- ~~**`LM-2004` pre-flight is primary-only.** A remote `http(s)` image URL is
   rejected up front (`LM-2004`, 400) only when the model's *primary* provider
-  can't fetch it (Gemini). If the primary accepts URLs (OpenAI) but a Gemini
-  model is a *fallback*, a fail-over to Gemini surfaces as `LM-3002` (502,
-  translation error) rather than a client 4xx - safe (never fetched, no retry
-  loop) but a soft break of the 4xx/5xx separation (rule 8). Options if it ever
-  bites: scan the whole chain in the pre-flight (rejects some primary-servable
-  requests), or add a dedicated client-input `ProviderError` mapped to a 4xx.
+  can't fetch it (Gemini); a fail-over to a Gemini *fallback* surfaced the
+  error from the fallback instead.~~ **Resolved** with the approach taken for
+  the `image` modality: the `LM-2004` and `LM-2008` checks still judge the
+  primary and answer with its error, and fallback targets whose provider
+  cannot fetch the request's remote image URLs or resolve its provider-native
+  sources are skipped (`drop_incompatible_fallbacks` in
+  `crates/server/src/chat.rs`). Neither alternative listed here before
+  (rejecting on any link of the chain, or a client 4xx raised mid fail-over)
+  was kept: both fail requests the primary can serve.
 - **Per-image token heuristic for the estimation fallback - done** (issue #9,
   see the note above under "M8 (vision - image input to chat)"). The remaining
   gap is a true dimension-based tile count, which needs image decoding this

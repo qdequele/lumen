@@ -1243,12 +1243,15 @@ itself (OpenAI, Anthropic); Gemini's `inline_data` field takes only inline
 bytes, so a remote URL routed to Gemini is rejected with `LM-2004` (400)
 instead of the gateway silently fetching it on the caller's behalf.
 
-The `LM-2004` pre-flight check inspects the **primary** provider of the model's
-fallback chain. In the uncommon case where the primary accepts remote URLs
-(e.g. OpenAI) but a Gemini model is configured as a *fallback*, a request with a
-remote image URL passes pre-flight and, only if the primary then fails over to
-Gemini, surfaces as an upstream `LM-3002` (502) - the gateway still never
-fetches the URL. Configure inline `data:` URIs when a Gemini fallback is in play.
+The `LM-2004` pre-flight check judges the **primary**: the provider of the
+model the request resolves to first. Fallback targets follow the same rule as
+for the `image` modality above: a target whose provider cannot fetch a remote
+URL (`google`, `vertex_ai`, `bedrock`) is skipped for a request carrying one.
+With an OpenAI primary and a Gemini fallback, a request with a remote image
+URL is served by OpenAI or, if OpenAI fails, goes on to the next target that
+takes URLs; when none is left it ends with the primary's own error, never
+with an `LM-2004` raised by a fail-over. Send inline `data:` URIs when a
+Gemini, Vertex or Bedrock fallback is meant to cover vision traffic.
 
 **Provider-native image sources (issue #12).** Two provider-native reference
 forms are recognised in the `image_url.url` field, for callers whose images
@@ -1265,7 +1268,11 @@ not the reference's own provider is rejected pre-flight with `LM-2008` (400) -
 an honest client error instead of a confusing upstream failure. A Gemini
 Files API URI is also an `https://` URL, but it is exempt from the `LM-2004`
 remote-URL check: it is not a URL the provider would have to fetch, and its
-routing verdict belongs to the `LM-2008` check.
+routing verdict belongs to the `LM-2008` check. Fallback targets on another
+provider are skipped for a request carrying such a reference (an
+`anthropic-file:` id only fails over to `anthropic` targets, a Gemini file URI
+only to `google` ones), so the reference is never forwarded to a provider
+that would read it as a plain image URL.
 
 > **`gs://` caveat.** The gateway forwards a `gs://` URI to Gemini verbatim,
 > but the Gemini **Developer API** (`generativelanguage.googleapis.com`, the

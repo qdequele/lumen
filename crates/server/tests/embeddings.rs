@@ -254,6 +254,146 @@ async fn base64_encoding_format_re_encodes_vectors_on_the_way_out() {
     assert_eq!(b64, expected);
 }
 
+/// Mount `body` as the upstream's raw `/embeddings` answer and POST `request`
+/// through the gateway.
+async fn embed_through_gateway(body: &str, request: Value) -> (String, reqwest::Response) {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/embeddings"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(body, "application/json"))
+        .mount(&upstream)
+        .await;
+    let base = common::spawn_with(registry_for(&upstream.uri()), LIMIT).await;
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/embeddings"))
+        .json(&request)
+        .send()
+        .await
+        .unwrap();
+    (base, resp)
+}
+
+/// Read `lumen_tokens_total{capability="embed",direction="input"}`.
+async fn embed_input_tokens(base: &str) -> Option<f64> {
+    let text = reqwest::get(format!("{base}/metrics"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    text.lines()
+        .find(|line| {
+            line.starts_with("lumen_tokens_total{")
+                && line.contains("capability=\"embed\"")
+                && line.contains("direction=\"input\"")
+        })
+        .and_then(|line| line.rsplit(' ').next())
+        .and_then(|v| v.parse().ok())
+}
+
+/// An upstream `/embeddings` body with two vectors given as raw JSON, odd
+/// spacing and key order, more float digits than an `f32` keeps, and an
+/// unknown usage field: a typed round trip changes every one of those.
+fn raw_embed_body(vectors: [&str; 2], usage: &str) -> String {
+    format!(
+        "{{ \"object\":\"list\",\n  \"data\":[ {{\"object\":\"embedding\",\"index\":0,\
+         \"embedding\":{}}},\n {{\"embedding\":{},\"index\":1,\"object\":\"embedding\"}} ],\n  \
+         \"model\":\"text-embedding-3-small\"{usage} }}\n",
+        vectors[0], vectors[1]
+    )
+}
+
+const RAW_USAGE: &str = r#", "usage":{"total_tokens":7,"prompt_tokens":7,"cost":0.25}"#;
+const RAW_FLOATS: &str = "[0.006929283495992422, -1e-3, 2]";
+
+/// ADR 004 (2026-11-12): float vectors for a client that wants floats reach
+/// it as the exact bytes the upstream sent, and the tokens are still counted.
+#[tokio::test]
+async fn float_body_with_usage_is_forwarded_byte_identical() {
+    let body = raw_embed_body([RAW_FLOATS, RAW_FLOATS], RAW_USAGE);
+    let (base, resp) = embed_through_gateway(
+        &body,
+        json!({ "model": "embed-small", "input": ["a", "b"] }),
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers()["content-type"], "application/json");
+    assert_eq!(resp.bytes().await.unwrap(), body.as_bytes());
+    assert_eq!(embed_input_tokens(&base).await, Some(7.0));
+}
+
+/// The base64 case the passthrough exists for: base64 asked, base64 answered,
+/// no decode to `f32` and no second encode.
+#[tokio::test]
+async fn base64_body_for_a_base64_client_is_forwarded_byte_identical() {
+    let b64 = format!("\"{}\"", lumen_core::encode_embedding_base64(&[1.0, -2.0]));
+    let body = raw_embed_body([&b64, &b64], RAW_USAGE);
+    let (base, resp) = embed_through_gateway(
+        &body,
+        json!({ "model": "embed-small", "input": ["a", "b"], "encoding_format": "base64" }),
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.bytes().await.unwrap(), body.as_bytes());
+    assert_eq!(embed_input_tokens(&base).await, Some(7.0));
+}
+
+/// A body whose vectors are not in the encoding the client asked for still
+/// takes the typed path and is converted.
+#[tokio::test]
+async fn base64_body_for_a_float_client_is_decoded() {
+    let b64 = format!("\"{}\"", lumen_core::encode_embedding_base64(&[1.0, -2.0]));
+    let body = raw_embed_body([&b64, &b64], RAW_USAGE);
+    let (_, resp) = embed_through_gateway(
+        &body,
+        json!({ "model": "embed-small", "input": ["a", "b"] }),
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    let out: Value = resp.json().await.unwrap();
+    assert_eq!(out["data"][0]["embedding"], json!([1.0, -2.0]));
+    assert_eq!(out["data"][1]["embedding"], json!([1.0, -2.0]));
+    assert_eq!(out["usage"]["prompt_tokens"], 7);
+    assert!(out["usage"].get("estimated").is_none());
+}
+
+/// A body without usable usage has to change (the flagged estimate is added),
+/// so it is not forwarded as bytes, whatever its encoding.
+#[tokio::test]
+async fn body_without_usage_gets_the_flagged_estimate() {
+    for usage in ["", r#", "usage":{"prompt_tokens":0,"total_tokens":0}"#] {
+        let body = raw_embed_body([RAW_FLOATS, RAW_FLOATS], usage);
+        let (base, resp) = embed_through_gateway(
+            &body,
+            json!({ "model": "embed-small", "input": ["hello there", "general kenobi"] }),
+        )
+        .await;
+        assert_eq!(resp.status(), 200, "usage {usage:?}");
+        let out: Value = resp.json().await.unwrap();
+        assert_eq!(out["usage"]["estimated"], true, "usage {usage:?}");
+        let estimate = out["usage"]["prompt_tokens"].as_u64().unwrap();
+        assert!(estimate > 0, "never a silent zero: {out}");
+        #[allow(clippy::cast_precision_loss)]
+        let expected = estimate as f64;
+        assert_eq!(embed_input_tokens(&base).await, Some(expected));
+    }
+}
+
+/// The count check holds on the forwarded path: a body that is eligible for
+/// passthrough but holds fewer vectors than inputs is `LM-3002` (issue #89).
+#[tokio::test]
+async fn short_body_with_usage_is_502_not_forwarded() {
+    let body = raw_embed_body([RAW_FLOATS, RAW_FLOATS], RAW_USAGE);
+    let (_, resp) = embed_through_gateway(
+        &body,
+        json!({ "model": "embed-small", "input": ["a", "b", "c"] }),
+    )
+    .await;
+    assert_eq!(resp.status(), 502);
+    let out: Value = resp.json().await.unwrap();
+    assert_eq!(out["error"]["code"], "LM-3002");
+}
+
 #[tokio::test]
 async fn token_input_to_text_only_provider_is_400_fg1001_without_upstream_call() {
     // A TEI-kind provider cannot consume pre-tokenized input; the gateway must

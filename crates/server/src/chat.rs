@@ -43,7 +43,8 @@ use lumen_auth::state::usd_to_micro;
 use std::sync::Arc;
 
 use lumen_core::{
-    tokens, Capability, ChatProvider, ChatRequest, GatewayError, ProviderError, Usage,
+    tokens, Capability, ChatCompletion, ChatProvider, ChatRequest, GatewayError, ProviderError,
+    Usage,
 };
 use tokio_util::sync::{CancellationToken, DropGuard};
 
@@ -217,12 +218,11 @@ fn reserved_output_tokens(
 /// `LM-2008` if a provider-native image source (Anthropic `file_id`, Gemini
 /// `fileUri`) is bound for a provider that cannot resolve it (issue #12).
 ///
-/// The three rejections judge the primary. Fallback targets that do not
-/// declare the `image` modality are then removed from `chain` and `decision`
-/// (see [`drop_text_only_fallbacks`]). The `LM-2004` / `LM-2008` checks stay
-/// primary-only on purpose (`docs/providers.md`, `docs/errors.md`): a
-/// fail-over that reaches a provider unable to take the image source surfaces
-/// the same code there (GH #13).
+/// The three rejections judge the primary. Fallback targets that cannot take
+/// the request's images (no `image` modality, or a provider that cannot fetch
+/// its remote URLs or resolve its provider-native sources) are then removed
+/// from `chain` and `decision` (see [`drop_incompatible_fallbacks`]), so a
+/// fail-over never sends a target an input it cannot use (GH #13).
 fn enforce_image_support(
     state: &AppState,
     client_model: &str,
@@ -230,14 +230,9 @@ fn enforce_image_support(
     decision: &mut lumen_router::virtual_models::Decision,
     req: &ChatRequest,
 ) -> Result<(), GatewayError> {
-    let has_image = req.messages.iter().any(|m| {
-        m.content
-            .as_ref()
-            .is_some_and(lumen_core::MessageContent::has_image)
-    });
-    if !has_image {
+    let Some(sources) = ImageSources::of(req) else {
         return Ok(());
-    }
+    };
     // LM-2003: model must declare the "image" modality.
     let vision_ok = state
         .registry
@@ -248,59 +243,96 @@ fn enforce_image_support(
             model: client_model.to_owned(),
         });
     }
+    let primary = &chain[0].route;
     // LM-2004: if the PRIMARY provider can't take a remote URL, reject one.
-    // A provider-native reference is excluded even when it is also an
-    // `https://` URL (a Gemini Files API URI is both): it is not a URL the
-    // provider would have to fetch, and the LM-2008 checks below own its
-    // routing verdict.
-    let has_remote_url = req.messages.iter().any(|m| {
-        matches!(m.content.as_ref(), Some(lumen_core::MessageContent::Parts(parts))
-        if parts.iter().any(|p| p.image_url.as_ref().is_some_and(|i| {
-            i.is_remote() && i.gemini_file_uri().is_none() && i.anthropic_file_id().is_none()
-        })))
-    });
-    if has_remote_url && !chain[0].route.provider.accepts_remote_image_url() {
+    if sources.remote_url && !primary.provider.accepts_remote_image_url() {
         return Err(GatewayError::ImageUrlNotSupported {
-            provider: chain[0].route.provider_name.clone(),
+            provider: primary.provider_name.clone(),
         });
     }
     // LM-2008: a provider-native image source bound for the wrong provider
     // (issue #12) - an honest client error, not a translation failure
     // surfaced as a 502.
-    let has_mismatched_anthropic_file = req.messages.iter().any(|m| {
-        matches!(m.content.as_ref(), Some(lumen_core::MessageContent::Parts(parts))
-            if parts.iter().any(|p| p.image_url.as_ref().is_some_and(|i| i.anthropic_file_id().is_some())))
-    });
-    if has_mismatched_anthropic_file && !chain[0].route.provider.accepts_anthropic_file_id() {
+    if sources.anthropic_file && !primary.provider.accepts_anthropic_file_id() {
         return Err(GatewayError::ImageSourceNotSupported {
-            provider: chain[0].route.provider_name.clone(),
+            provider: primary.provider_name.clone(),
             source_kind: "anthropic-file",
         });
     }
-    let has_mismatched_gemini_file = req.messages.iter().any(|m| {
-        matches!(m.content.as_ref(), Some(lumen_core::MessageContent::Parts(parts))
-            if parts.iter().any(|p| p.image_url.as_ref().is_some_and(|i| i.gemini_file_uri().is_some())))
-    });
-    if has_mismatched_gemini_file && !chain[0].route.provider.accepts_gemini_file_uri() {
+    if sources.gemini_file && !primary.provider.accepts_gemini_file_uri() {
         return Err(GatewayError::ImageSourceNotSupported {
-            provider: chain[0].route.provider_name.clone(),
+            provider: primary.provider_name.clone(),
             source_kind: "gemini-file",
         });
     }
-    drop_text_only_fallbacks(state, chain, decision);
+    drop_incompatible_fallbacks(state, chain, decision, sources);
     Ok(())
 }
 
-/// Remove the fallback targets that cannot take an image from a request that
-/// carries one: a model that does not declare the `image` modality is not an
-/// attempt for it (as `/v1/decisions` skips its incompatible targets), so a
-/// fail-over never sends image content to a text-only model. The primary is
-/// kept: the caller has already checked it. `chain` and `decision.attempts`
-/// stay aligned, index for index.
-fn drop_text_only_fallbacks(
+/// The kinds of image source a chat request carries, beyond inline `data:`
+/// bytes (which every vision provider takes).
+#[derive(Clone, Copy, Default)]
+struct ImageSources {
+    /// A remote `http(s)` URL the provider would have to fetch. A
+    /// provider-native reference is excluded even when it is also an
+    /// `https://` URL (a Gemini Files API URI is both): it is not a URL the
+    /// provider fetches, and the `LM-2008` check owns its routing verdict.
+    remote_url: bool,
+    /// An Anthropic `file_id` reference (`anthropic-file:<id>`).
+    anthropic_file: bool,
+    /// A Gemini `fileUri` (Files API URI or `gs://` object).
+    gemini_file: bool,
+}
+
+impl ImageSources {
+    /// The sources of `req`'s images, or `None` when it carries no image.
+    fn of(req: &ChatRequest) -> Option<Self> {
+        let mut sources = None;
+        for message in &req.messages {
+            let Some(lumen_core::MessageContent::Parts(parts)) = message.content.as_ref() else {
+                continue;
+            };
+            for image in parts.iter().filter_map(lumen_core::ContentPart::image) {
+                let found = sources.get_or_insert_with(Self::default);
+                let (anthropic, gemini) = (
+                    image.anthropic_file_id().is_some(),
+                    image.gemini_file_uri().is_some(),
+                );
+                found.anthropic_file |= anthropic;
+                found.gemini_file |= gemini;
+                found.remote_url |= image.is_remote() && !anthropic && !gemini;
+            }
+        }
+        sources
+    }
+
+    /// Why `provider` cannot take these sources, if it cannot.
+    fn refused_by(self, provider: &dyn ChatProvider) -> Option<&'static str> {
+        if self.remote_url && !provider.accepts_remote_image_url() {
+            Some("its provider cannot fetch a remote image URL")
+        } else if self.anthropic_file && !provider.accepts_anthropic_file_id() {
+            Some("its provider cannot resolve an Anthropic file id")
+        } else if self.gemini_file && !provider.accepts_gemini_file_uri() {
+            Some("its provider cannot resolve a Gemini file URI")
+        } else {
+            None
+        }
+    }
+}
+
+/// Remove the fallback targets that cannot take the images of a request that
+/// carries some: a model that does not declare the `image` modality, or whose
+/// provider cannot fetch the request's remote image URLs or resolve its
+/// provider-native sources, is not an attempt for it (as `/v1/decisions`
+/// skips its incompatible targets). A fail-over therefore never sends a
+/// target an input it cannot use. The primary is kept: the caller has already
+/// checked it and answered with its own error. `chain` and
+/// `decision.attempts` stay aligned, index for index.
+fn drop_incompatible_fallbacks(
     state: &AppState,
     chain: &mut Vec<lumen_router::ChatChainLink>,
     decision: &mut lumen_router::virtual_models::Decision,
+    sources: ImageSources,
 ) {
     // The common case (no fallback) skips the registry lookups.
     if decision.attempts.len() < 2 {
@@ -309,25 +341,33 @@ fn drop_text_only_fallbacks(
     let keep: Vec<bool> = decision
         .attempts
         .iter()
+        .zip(chain.iter())
         .enumerate()
-        .map(|(i, attempt)| {
-            i == 0
-                || state
-                    .registry
-                    .modalities(&attempt.model_id)
-                    .is_some_and(|mods| mods.iter().any(|m| m == "image"))
+        .map(|(i, (attempt, link))| {
+            if i == 0 {
+                return true;
+            }
+            let reason = if state
+                .registry
+                .modalities(&attempt.model_id)
+                .is_some_and(|mods| mods.iter().any(|m| m == "image"))
+            {
+                sources.refused_by(link.route.provider.as_ref())
+            } else {
+                Some("it does not declare the image modality")
+            };
+            if let Some(reason) = reason {
+                tracing::debug!(
+                    model = %attempt.model_id,
+                    reason,
+                    "skipping a fallback target that cannot take the request's images"
+                );
+            }
+            reason.is_none()
         })
         .collect();
     if keep.iter().all(|k| *k) {
         return;
-    }
-    for (attempt, kept) in decision.attempts.iter().zip(&keep) {
-        if !kept {
-            tracing::debug!(
-                model = %attempt.model_id,
-                "skipping a fallback target without the image modality"
-            );
-        }
     }
     let mut kept = keep.iter();
     chain.retain(|_| kept.next().copied().unwrap_or(true));
@@ -349,6 +389,28 @@ struct ChatExec<'a> {
     keys: &'a RequestKeys,
 }
 
+impl ChatExec<'_> {
+    /// The request one upstream call sends for link `i`: the client's request
+    /// with that attempt's overrides (ADR 014) and the link's upstream model
+    /// id. `stream` is forced on for the streaming path and left as the
+    /// client sent it otherwise.
+    ///
+    /// This is the only deep copy of the request on the request path. The
+    /// client's request stays shared by reference across every attempt, retry
+    /// and key rotation; a copy is made here, when a provider is about to be
+    /// called, because [`ChatProvider`] takes its request by value (providers
+    /// rewrite and consume it).
+    fn attempt_request(&self, i: usize, stream: bool) -> ChatRequest {
+        let mut req = self.req.clone();
+        self.decision.attempts[i].apply(&mut req);
+        if stream {
+            req.stream = true;
+        }
+        self.chain[i].route.upstream_id.clone_into(&mut req.model);
+        req
+    }
+}
+
 /// Streaming path: open the upstream byte stream and peek its first frame with
 /// retry/fallback (only before the first content frame reaches the client,
 /// spec 6.2 + ADR 005 2026-07-15), then hand it to the M4 frame guards.
@@ -367,15 +429,8 @@ async fn chat_streaming(
         ctx.cancel,
         |i| {
             let platform = ctx.chain[i].route.provider.clone();
-            let provider_name = ctx.chain[i].route.provider_name.clone();
-            let cancel = ctx.cancel.clone();
-            let mut attempt_req = ctx.req.clone();
-            ctx.decision.attempts[i].apply(&mut attempt_req);
-            attempt_req.stream = true;
-            ctx.chain[i]
-                .route
-                .upstream_id
-                .clone_into(&mut attempt_req.model);
+            let provider_name = ctx.chain[i].route.provider_name.as_str();
+            let cancel = ctx.cancel;
             let (keys, registry, mark) = (ctx.keys, &*ctx.state.registry, ctx.mark);
             async move {
                 // Open, then PEEK the first frame before committing (ADR 005,
@@ -387,22 +442,19 @@ async fn chat_streaming(
                 // over too. Once a content frame arrives we commit and the M4
                 // frame guards own the rest (no mid-stream retry). Marked only
                 // when an upstream call is actually sent (platform or team key).
-                let open = |provider: Option<Arc<dyn ChatProvider>>| {
-                    let (req, cancel, name) =
-                        (attempt_req.clone(), cancel.clone(), provider_name.clone());
-                    async move {
-                        let provider = provider.ok_or(ProviderError::Unavailable {
-                            provider: name.clone(),
-                        })?;
-                        mark.mark();
-                        let stream = provider.chat_stream_bytes(req, cancel.clone()).await?;
-                        lumen_router::peek::peek_first_frame(stream, &name, &cancel).await
-                    }
+                let open = |provider: Option<Arc<dyn ChatProvider>>| async move {
+                    let provider = provider.ok_or_else(|| ProviderError::Unavailable {
+                        provider: provider_name.to_owned(),
+                    })?;
+                    mark.mark();
+                    let req = ctx.attempt_request(i, true);
+                    let stream = provider.chat_stream_bytes(req, cancel.clone()).await?;
+                    lumen_router::peek::peek_first_frame(stream, provider_name, cancel).await
                 };
                 keys.attempt(
                     registry,
                     i,
-                    &provider_name,
+                    provider_name,
                     || open(Some(platform)),
                     |set| open(set.chat.clone()),
                 )
@@ -464,31 +516,23 @@ async fn chat_non_streaming(
         ctx.cancel,
         |i| {
             let platform = ctx.chain[i].route.provider.clone();
-            let provider_name = ctx.chain[i].route.provider_name.clone();
-            let cancel = ctx.cancel.clone();
-            let mut attempt_req = ctx.req.clone();
-            ctx.decision.attempts[i].apply(&mut attempt_req);
-            ctx.chain[i]
-                .route
-                .upstream_id
-                .clone_into(&mut attempt_req.model);
+            let provider_name = ctx.chain[i].route.provider_name.as_str();
+            let cancel = ctx.cancel;
             let (keys, registry, mark) = (ctx.keys, &*ctx.state.registry, ctx.mark);
             async move {
                 // Marked only when an upstream call is actually sent.
-                let call = |provider: Option<Arc<dyn ChatProvider>>| {
-                    let (req, cancel, name) =
-                        (attempt_req.clone(), cancel.clone(), provider_name.clone());
-                    async move {
-                        let provider =
-                            provider.ok_or(ProviderError::Unavailable { provider: name })?;
-                        mark.mark();
-                        provider.chat(req, cancel).await
-                    }
+                let call = |provider: Option<Arc<dyn ChatProvider>>| async move {
+                    let provider = provider.ok_or_else(|| ProviderError::Unavailable {
+                        provider: provider_name.to_owned(),
+                    })?;
+                    mark.mark();
+                    let req = ctx.attempt_request(i, false);
+                    provider.chat_completion(req, cancel.clone()).await
                 };
                 keys.attempt(
                     registry,
                     i,
-                    &provider_name,
+                    provider_name,
                     || call(Some(platform)),
                     |set| call(set.chat.clone()),
                 )
@@ -503,13 +547,66 @@ async fn chat_non_streaming(
     accounting.served_by(&executed.model_used, &executed.provider_used);
     let route = ctx.decision.route_of(executed.index);
     accounting.set_route(route, ctx.decision.account);
-    let (mut response, served) = executed.value;
+    let (completion, served) = executed.value;
     let served_model = executed.model_used.clone();
     let billable = matches!(served, Served::Platform);
-    let cost = settle_non_streaming(ctx, accounting, &served_model, &mut response, billable);
     let mut headers = routing_headers(&served_model, route);
-    insert_cost_header(&mut headers, cost, billable);
-    Ok((headers, Json(response)).into_response())
+    Ok(match completion {
+        // The upstream body already is the client's answer: its usage is
+        // reported and nothing in it has to change, so it is forwarded as the
+        // bytes received (ADR 004, 2026-11-12 amendment).
+        ChatCompletion::Passthrough(upstream) => {
+            let cost = settle_reported(accounting, &served_model, upstream.usage(), billable);
+            insert_cost_header(&mut headers, cost, billable);
+            (
+                headers,
+                [(header::CONTENT_TYPE, "application/json")],
+                Body::from(upstream.into_body()),
+            )
+                .into_response()
+        }
+        ChatCompletion::Typed(mut response) => {
+            let cost =
+                settle_non_streaming(ctx, accounting, &served_model, &mut response, billable);
+            insert_cost_header(&mut headers, cost, billable);
+            (headers, Json(response)).into_response()
+        }
+    })
+}
+
+/// Close the books on a completion whose usage the upstream reported.
+fn settle_reported(
+    accounting: Accounting,
+    client_model: &str,
+    usage: &Usage,
+    billable: bool,
+) -> f64 {
+    let (tokens_in, tokens_out) = (
+        u64::from(usage.prompt_tokens),
+        u64::from(usage.completion_tokens),
+    );
+    // Issue #99: carry the upstream-reported breakdown through to Prometheus
+    // and usage_log. The response body already holds it.
+    let breakdown = TokenBreakdown::from_usage(usage);
+    let cost = accounting.pricing().token_cost_with_cache(
+        client_model,
+        tokens_in,
+        tokens_out,
+        breakdown.cached_tokens,
+        breakdown.cache_write_tokens,
+    );
+    accounting.finish(&Outcome {
+        tokens_in,
+        tokens_out,
+        estimated: false,
+        search_units: None,
+        breakdown,
+        media: lumen_core::MediaUsage::default(),
+        cost,
+        status: 200,
+        billable,
+    });
+    cost
 }
 
 /// Close the books on a non-streaming completion (ADR 003): upstream usage
@@ -534,33 +631,7 @@ fn settle_non_streaming(
         .usage
         .filter(|u| u.prompt_tokens > 0 || u.completion_tokens > 0);
     if let Some(usage) = reported {
-        let (tokens_in, tokens_out) = (
-            u64::from(usage.prompt_tokens),
-            u64::from(usage.completion_tokens),
-        );
-        // Issue #99: carry the upstream-reported breakdown through to
-        // Prometheus and usage_log. The response envelope already holds it
-        // (deserialized straight into `response.usage`).
-        let breakdown = TokenBreakdown::from_usage(&usage);
-        let cost = accounting.pricing().token_cost_with_cache(
-            client_model,
-            tokens_in,
-            tokens_out,
-            breakdown.cached_tokens,
-            breakdown.cache_write_tokens,
-        );
-        accounting.finish(&Outcome {
-            tokens_in,
-            tokens_out,
-            estimated: false,
-            search_units: None,
-            breakdown,
-            media: lumen_core::MediaUsage::default(),
-            cost,
-            status: 200,
-            billable,
-        });
-        return cost;
+        return settle_reported(accounting, client_model, &usage, billable);
     }
 
     // Upstream reported nothing: the envelope gets the inline heuristic.
@@ -669,11 +740,16 @@ fn defer_chat_refinement(
         .iter()
         .filter_map(|c| c.message.content.as_ref().map(|c| c.text()))
         .collect();
+    // The recount covers the text only: images keep their flat estimate, so
+    // a vision prompt is not refined down to its text (as for embeddings).
+    let non_text = tokens::estimate_chat_non_text(ctx.req);
     tokio::spawn(async move {
         let (refined_in, refined_out) = counter
             .refine_chat(&model, message_texts, output_text)
             .await
-            .unwrap_or(heuristic);
+            .map_or(heuristic, |(text_in, out)| {
+                (text_in.saturating_add(non_text), out)
+            });
         let cost = accounting
             .pricing()
             .token_cost(&model, refined_in, refined_out);

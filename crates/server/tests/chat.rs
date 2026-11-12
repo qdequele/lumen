@@ -646,6 +646,124 @@ async fn openai_without_breakdown_omits_detail_objects() {
     assert!(out["usage"].get("completion_tokens_details").is_none());
 }
 
+/// Read one `lumen_tokens_total` series for chat from `/metrics`.
+async fn chat_tokens_metric(base: &str, direction: &str) -> Option<f64> {
+    let text = reqwest::get(format!("{base}/metrics"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    text.lines()
+        .find(|line| {
+            line.starts_with("lumen_tokens_total{")
+                && line.contains("capability=\"chat\"")
+                && line.contains(&format!("direction=\"{direction}\""))
+        })
+        .and_then(|line| line.rsplit(' ').next())
+        .and_then(|v| v.parse().ok())
+}
+
+/// ADR 004 (2026-11-12): an OpenAI-format body that reports usage reaches the
+/// client as the exact bytes the upstream sent (spacing, key order, unknown
+/// fields and all), and the gateway still accounts its tokens.
+#[tokio::test]
+async fn non_streaming_body_with_usage_is_forwarded_byte_identical() {
+    let upstream_body = "{ \"id\":\"c-1\",\"object\":\"chat.completion\",\"created\":7,\n  \
+        \"model\":\"gpt-4o-2024-08-06\", \"system_fingerprint\":\"fp_1\",\n  \
+        \"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"hi\",\
+        \"refusal\":null},\"logprobs\":null,\"finish_reason\":\"stop\"}],\n  \
+        \"usage\":{\"total_tokens\":10,\"completion_tokens\":2,\"prompt_tokens\":8,\
+        \"cost\":0.25,\"prompt_tokens_details\":{\"cached_tokens\":4,\"audio_tokens\":0}} }\n";
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(upstream_body, "application/json"))
+        .mount(&upstream)
+        .await;
+
+    let base = common::spawn_with(openai_registry(&upstream.uri()), LIMIT).await;
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&json!({ "model": "gpt", "messages": [{ "role": "user", "content": "hi" }] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers()["content-type"],
+        "application/json",
+        "a forwarded body is still declared as JSON"
+    );
+    assert!(resp.headers().contains_key("x-lumen-cost-micro-usd"));
+    assert_eq!(resp.bytes().await.unwrap(), upstream_body.as_bytes());
+
+    // Pillar 5: the forwarded body's usage is what the gateway counted.
+    assert_eq!(chat_tokens_metric(&base, "input").await, Some(8.0));
+    assert_eq!(chat_tokens_metric(&base, "output").await, Some(2.0));
+}
+
+/// The other side of ADR 004 (2026-11-12): a body without usable usage has to
+/// change (the flagged estimate is added), so it takes the typed path, which
+/// still keeps the upstream's unknown fields.
+#[tokio::test]
+async fn non_streaming_body_without_usage_gets_the_flagged_estimate() {
+    for usage in [
+        Value::Null,
+        json!({ "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0 }),
+    ] {
+        let mut body = openai_chat_body("gpt-4o-2024-08-06");
+        body["usage"] = usage.clone();
+        body["system_fingerprint"] = json!("fp_1");
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&upstream)
+            .await;
+
+        let base = common::spawn_with(openai_registry(&upstream.uri()), LIMIT).await;
+        let resp = reqwest::Client::new()
+            .post(format!("{base}/v1/chat/completions"))
+            .json(&json!({ "model": "gpt", "messages": [{ "role": "user", "content": "hi" }] }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "usage {usage}");
+        let out: Value = resp.json().await.unwrap();
+        assert_eq!(out["usage"]["estimated"], true, "usage {usage}");
+        assert!(out["usage"]["prompt_tokens"].as_u64().unwrap() > 0);
+        assert!(out["usage"]["completion_tokens"].as_u64().unwrap() > 0);
+        assert_eq!(out["system_fingerprint"], "fp_1");
+        assert_eq!(out["choices"][0]["message"]["content"], "hi there");
+    }
+}
+
+/// A 200 that carries usage but is not a completion is still an upstream
+/// fault (`LM-3002`), never forwarded as if it were an answer.
+#[tokio::test]
+async fn non_streaming_body_with_usage_but_no_choices_is_502() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "usage": { "prompt_tokens": 8, "completion_tokens": 2, "total_tokens": 10 }
+        })))
+        .mount(&upstream)
+        .await;
+
+    let base = common::spawn_with(openai_registry(&upstream.uri()), LIMIT).await;
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&json!({ "model": "gpt", "messages": [{ "role": "user", "content": "hi" }] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 502);
+    let out: Value = resp.json().await.unwrap();
+    assert_eq!(out["error"]["code"], "LM-3002");
+}
+
 #[tokio::test]
 async fn unknown_model_is_404_fg2001() {
     let upstream = MockServer::start().await;

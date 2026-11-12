@@ -8,8 +8,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::BoxStream;
 use lumen_core::{
-    developer_role_as_system, ChatChunk, ChatProvider, ChatRequest, ChatResponse, EmbedRequest,
-    EmbedResponse, EmbeddingProvider, ProviderError,
+    developer_role_as_system, ChatChunk, ChatCompletion, ChatProvider, ChatRequest, ChatResponse,
+    EmbedCompletion, EmbedRequest, EmbedResponse, EmbeddingProvider, ProviderError,
 };
 use std::fmt;
 use tokio_util::sync::CancellationToken;
@@ -78,6 +78,47 @@ impl OpenAiProvider {
             developer_role_as_system(&mut req.messages);
         }
     }
+
+    /// Send an embeddings request and return the upstream body. Shared
+    /// transport + error classification; a client disconnect aborts the
+    /// in-flight call (see `post_json`).
+    async fn post_embed(
+        &self,
+        req: &EmbedRequest,
+        cancel: &CancellationToken,
+    ) -> Result<Bytes, ProviderError> {
+        let url = format!("{}/embeddings", self.base_url);
+        post_json(
+            &self.client,
+            &url,
+            req,
+            self.api_key.as_deref(),
+            &self.provider_name,
+            cancel,
+        )
+        .await
+    }
+
+    /// Send a non-streaming completion and return the upstream body.
+    async fn post_chat(
+        &self,
+        mut req: ChatRequest,
+        cancel: &CancellationToken,
+    ) -> Result<Bytes, ProviderError> {
+        // This entry point is non-streaming; never ask the upstream to stream.
+        req.stream = false;
+        self.prepare_roles(&mut req);
+        let url = format!("{}/chat/completions", self.base_url);
+        post_json(
+            &self.client,
+            &url,
+            &req,
+            self.api_key.as_deref(),
+            &self.provider_name,
+            cancel,
+        )
+        .await
+    }
 }
 
 /// Redacted so the API key can never reach a log line via `{:?}`.
@@ -99,23 +140,24 @@ impl EmbeddingProvider for OpenAiProvider {
         req: EmbedRequest,
         cancel: CancellationToken,
     ) -> Result<EmbedResponse, ProviderError> {
-        let url = format!("{}/embeddings", self.base_url);
-
-        // Shared transport + error classification; a client disconnect aborts
-        // the in-flight call (see `post_json`).
-        let bytes = post_json(
-            &self.client,
-            &url,
-            &req,
-            self.api_key.as_deref(),
-            &self.provider_name,
-            &cancel,
-        )
-        .await?;
+        let bytes = self.post_embed(&req, &cancel).await?;
 
         // The detail stays out of the client response (from_provider discards
         // it) so a malformed body cannot leak upstream data.
         serde_json::from_slice::<EmbedResponse>(&bytes)
+            .map_err(|e| ProviderError::Translation(format!("openai embeddings response: {e}")))
+    }
+
+    async fn embed_completion(
+        &self,
+        req: EmbedRequest,
+        cancel: CancellationToken,
+    ) -> Result<EmbedCompletion, ProviderError> {
+        // The upstream was sent the client's `encoding_format`, so its vectors
+        // normally come back in the encoding the client wants: keep the body
+        // as bytes when they do (ADR 004, 2026-11-12).
+        let bytes = self.post_embed(&req, &cancel).await?;
+        EmbedCompletion::from_openai_body(bytes, req.output_encoding())
             .map_err(|e| ProviderError::Translation(format!("openai embeddings response: {e}")))
     }
 
@@ -128,23 +170,23 @@ impl EmbeddingProvider for OpenAiProvider {
 impl ChatProvider for OpenAiProvider {
     async fn chat(
         &self,
-        mut req: ChatRequest,
+        req: ChatRequest,
         cancel: CancellationToken,
     ) -> Result<ChatResponse, ProviderError> {
-        // This entry point is non-streaming; never ask the upstream to stream.
-        req.stream = false;
-        self.prepare_roles(&mut req);
-        let url = format!("{}/chat/completions", self.base_url);
-        let bytes = post_json(
-            &self.client,
-            &url,
-            &req,
-            self.api_key.as_deref(),
-            &self.provider_name,
-            &cancel,
-        )
-        .await?;
+        let bytes = self.post_chat(req, &cancel).await?;
         serde_json::from_slice::<ChatResponse>(&bytes)
+            .map_err(|e| ProviderError::Translation(format!("openai chat response: {e}")))
+    }
+
+    async fn chat_completion(
+        &self,
+        req: ChatRequest,
+        cancel: CancellationToken,
+    ) -> Result<ChatCompletion, ProviderError> {
+        // The upstream already answers in the OpenAI format: keep its body as
+        // bytes when nothing in it has to change (ADR 004, 2026-11-12).
+        let bytes = self.post_chat(req, &cancel).await?;
+        ChatCompletion::from_openai_body(bytes)
             .map_err(|e| ProviderError::Translation(format!("openai chat response: {e}")))
     }
 
