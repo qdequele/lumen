@@ -969,9 +969,10 @@ pub async fn delete_webhooks(
             .map(|_disabled| ()),
     }
     .map_err(|e| internal(&e))?;
-    controller.disable(&auth.keys);
+    // Refresh the cache, then disable (the order `put_webhooks` uses): a
+    // reload that cached the row before the write above cannot re-apply it.
     controller
-        .refresh_from_store(&auth.store, auth.master.as_ref())
+        .disable_from_store(&auth.store, auth.master.as_ref(), &auth.keys)
         .await;
     Ok(Json(webhook_status(controller)))
 }

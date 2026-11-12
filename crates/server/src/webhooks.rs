@@ -577,6 +577,25 @@ impl WebhookController {
         self.disable_locked(keys);
     }
 
+    /// Turn the pipeline off after an admin write persisted a disabled row:
+    /// refresh the cache from the store, then disable under the apply lock.
+    ///
+    /// The order matters, and is the one `PUT /admin/webhooks` uses. A reload
+    /// that cached the row before the write resolves from the cache under the
+    /// apply lock ([`resolve_and_apply`](Self::resolve_and_apply)): once this
+    /// refresh has returned it can only see the disabled row, whichever side
+    /// of the disable it runs on. Disabling first would leave a window in
+    /// which that reload re-applies the stale enabled row for good.
+    pub async fn disable_from_store(
+        &self,
+        store: &KeyStore,
+        master: Option<&MasterKey>,
+        keys: &AuthState,
+    ) {
+        self.refresh_from_store(store, master).await;
+        self.disable(keys);
+    }
+
     /// [`disable`](Self::disable) for a caller that already holds `apply_lock`.
     fn disable_locked(&self, keys: &AuthState) {
         keys.set_signals(None);
@@ -1160,6 +1179,65 @@ mod tests {
         assert_eq!(
             controller.stored().expect("cached").settings.url,
             "https://new.example/events"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reload_racing_a_delete_cannot_reapply_the_row_it_cached_before() {
+        // A reload refreshed the cache before the DELETE wrote its disabled
+        // row, and resolves while the DELETE is still under way. Holding the
+        // refresh guard pins the DELETE at its own refresh, so the reload's
+        // resolve runs in the middle of it, against the stale enabled row.
+        let store = KeyStore::in_memory().await.expect("store");
+        let settings = WebhookSettings {
+            url: "https://old.example/events".to_owned(),
+            ..WebhookSettings::default()
+        };
+        store
+            .save_webhook_config(&settings)
+            .await
+            .expect("store the enabled row");
+        let controller = Arc::new(controller());
+        let keys = Arc::new(AuthState::default());
+        controller.refresh_from_store(&store, None).await;
+        controller
+            .resolve_and_apply(None, &keys)
+            .expect("the enabled row applies");
+
+        // The DELETE persists its decision, then turns the pipeline off.
+        store
+            .save_webhook_config_disabled(&settings)
+            .await
+            .expect("store the disabled row");
+        let guard = controller.refresh_lock.lock().await;
+        let delete_controller = Arc::clone(&controller);
+        let delete_store = store.clone();
+        let delete_keys = Arc::clone(&keys);
+        let mut delete = tokio::spawn(async move {
+            delete_controller
+                .disable_from_store(&delete_store, None, &delete_keys)
+                .await;
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), &mut delete)
+                .await
+                .is_err(),
+            "the DELETE waits for the refresh in progress"
+        );
+        // The reload resolves from the cache it refreshed before the write.
+        controller
+            .resolve_and_apply(None, &keys)
+            .expect("the reload resolves");
+        drop(guard);
+        delete.await.expect("delete");
+
+        assert!(
+            !controller.stored().expect("cached").enabled,
+            "the cache holds the disabled row"
+        );
+        assert!(
+            controller.live_settings().is_none(),
+            "the reload re-applied the enabled row the DELETE replaced"
         );
     }
 
