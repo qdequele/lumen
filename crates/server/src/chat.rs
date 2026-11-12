@@ -26,7 +26,7 @@
 //!   the provider byte stream: verbatim upstream for passthrough, translated
 //!   terminal event otherwise - the server never fabricates it);
 //! * **heartbeat** - a `: ping` SSE comment on idle streams so intermediaries
-//!   don't reap a slow upstream.
+//!   don't reap a slow upstream (never in the middle of a forwarded event).
 
 use std::convert::Infallible;
 
@@ -637,10 +637,41 @@ fn defer_chat_refinement(
 /// says "data: [DONE]" inside a delta can never spoof the terminator.
 const DONE_MARKER: &[u8] = b"\ndata: [DONE]";
 
-/// One SSE frame carrying the standard JSON error envelope.
-fn error_frame(error: &GatewayError) -> Bytes {
+/// One SSE frame carrying the standard JSON error envelope, after `prefix`
+/// (the newlines that close a half-forwarded event, see [`event_closer`]).
+fn error_frame(error: &GatewayError, prefix: &str) -> Bytes {
     let json = serde_json::to_string(&error.to_envelope()).unwrap_or_else(|_| "{}".to_owned());
-    Bytes::from(format!("data: {json}\n\n"))
+    Bytes::from(format!("{prefix}data: {json}\n\n"))
+}
+
+/// The newlines that bring a forwarded byte stream ending in `tail` back to
+/// an SSE event boundary: empty when it already ends on one (a blank line),
+/// one newline when the last line is complete but its event is not, two when
+/// it stops mid-line.
+///
+/// Passthrough forwards upstream chunks verbatim, so the last one may stop
+/// anywhere; a frame the gateway injects after it (an error frame, a ping)
+/// would otherwise be glued onto the unfinished line or event. SSE accepts
+/// `\n`, `\r\n` and `\r` as line ends. A trailing lone `\r` gets two
+/// newlines: it may be the first half of a `\r\n`, which a single `\n` would
+/// only complete.
+fn event_closer(tail: &[u8]) -> &'static str {
+    let (rest, lone_cr) = if let Some(rest) = tail.strip_suffix(b"\r\n") {
+        (rest, false)
+    } else if let Some(rest) = tail.strip_suffix(b"\n") {
+        (rest, false)
+    } else if let Some(rest) = tail.strip_suffix(b"\r") {
+        (rest, true)
+    } else {
+        return "\n\n";
+    };
+    if matches!(rest.last(), Some(b'\n' | b'\r')) {
+        ""
+    } else if lone_cr {
+        "\n\n"
+    } else {
+        "\n"
+    }
 }
 
 /// What the guarded wait for the next upstream frame produced.
@@ -668,8 +699,10 @@ struct EventStreamState {
     saw_done: bool,
     /// Set after a terminal frame (error / LM-3010 / LM-3011): stream is over.
     ended: bool,
-    /// Trailing bytes of the previous frame, so a `[DONE]` marker split across
-    /// two frames is still detected. At most `DONE_MARKER.len() - 1` bytes.
+    /// Trailing bytes of the forwarded stream, so a `[DONE]` marker split
+    /// across two frames is still detected, and so the gateway knows whether
+    /// the stream stands on an event boundary before inserting a frame of its
+    /// own. At most `DONE_MARKER.len() - 1` bytes.
     tail: Vec<u8>,
     /// Token/cost accounting riding along the stream (M5). `None` in unit
     /// tests that only exercise the guards. Its `Drop` settles the books, so
@@ -693,6 +726,18 @@ impl EventStreamState {
         self.tail = window.split_off(window.len() - keep);
     }
 
+    /// The terminal SSE frame for `error`, closing any half-forwarded event
+    /// first so the frame is always an event of its own.
+    fn terminal_error_frame(&self, error: &GatewayError) -> Bytes {
+        error_frame(error, event_closer(&self.tail))
+    }
+
+    /// Whether the forwarded bytes end on an event boundary, where a frame
+    /// of the gateway's own can be inserted without altering an event.
+    fn on_event_boundary(&self) -> bool {
+        event_closer(&self.tail).is_empty()
+    }
+
     /// Close the accounting record with the stream's terminal outcome, so
     /// `usage_log.status` reflects what actually happened (200 = clean end,
     /// 502/504 = in-band error frame). Idempotent; Drop is the safety net
@@ -714,7 +759,10 @@ impl EventStreamState {
 /// verbatim forwarding this wrapper adds the three guards described in the
 /// module docs (LM-3011 first-token timeout, LM-3010 missing terminator,
 /// `: ping` heartbeat). A mid-stream provider error becomes a terminal SSE
-/// error frame carrying the standard JSON envelope.
+/// error frame carrying the standard JSON envelope. Both injected frames
+/// respect the event framing of the forwarded bytes: an error frame first
+/// closes an event the upstream left unfinished, and no ping is sent while
+/// one is half forwarded (see [`event_closer`]).
 ///
 /// `guard` is moved into the state so it lives exactly as long as the body: a
 /// client disconnect drops the body, drops the guard, and aborts the upstream
@@ -736,9 +784,10 @@ fn to_event_stream(
         got_first_frame: false,
         saw_done: false,
         ended: false,
-        // Seeded with a virtual line start so a `[DONE]` opening the very
-        // first frame still matches the line-anchored marker.
-        tail: vec![b'\n'],
+        // Seeded with a virtual blank line: a `[DONE]` opening the very
+        // first frame still matches the line-anchored marker, and a stream
+        // that forwarded nothing yet stands on an event boundary.
+        tail: vec![b'\n', b'\n'],
         accounting,
     };
 
@@ -747,10 +796,10 @@ fn to_event_stream(
             return None;
         }
 
-        let step = {
+        let step = loop {
             let heartbeat = tokio::time::sleep(s.guards.heartbeat_interval);
             tokio::pin!(heartbeat);
-            if s.got_first_frame {
+            let step = if s.got_first_frame {
                 tokio::select! {
                     biased;
                     item = s.inner.next() => Step::Item(item),
@@ -766,7 +815,13 @@ fn to_event_stream(
                     }
                     () = &mut heartbeat => Step::Ping,
                 }
+            };
+            // The upstream paused in the middle of an event: a ping inserted
+            // there would be glued into it. Keep waiting instead.
+            if matches!(step, Step::Ping) && !s.on_event_boundary() {
+                continue;
             }
+            break step;
         };
 
         let frame = match step {
@@ -786,7 +841,7 @@ fn to_event_stream(
                 s.ended = true;
                 let error = GatewayError::from_provider(&s.provider, e);
                 s.settle_accounting(error.http_status());
-                error_frame(&error)
+                s.terminal_error_frame(&error)
             }
             Step::Item(None) => {
                 s.ended = true;
@@ -800,7 +855,7 @@ fn to_event_stream(
                     provider: s.provider.clone(),
                 };
                 s.settle_accounting(error.http_status());
-                error_frame(&error)
+                s.terminal_error_frame(&error)
             }
             Step::Ping => Bytes::from_static(b": ping\n\n"),
             Step::FirstTokenTimeout => {
@@ -809,7 +864,7 @@ fn to_event_stream(
                     provider: s.provider.clone(),
                 };
                 s.settle_accounting(error.http_status());
-                error_frame(&error)
+                s.terminal_error_frame(&error)
             }
         };
         Some((Ok::<Bytes, Infallible>(frame), s))
@@ -1054,6 +1109,84 @@ mod tests {
         assert!(out[1].contains("client_cancelled"), "got: {}", out[1]);
         assert!(!out[1].contains("LM-5001"), "got: {}", out[1]);
         assert!(!out[1].contains("internal"), "got: {}", out[1]);
+    }
+
+    #[tokio::test]
+    async fn error_frame_after_a_chunk_cut_mid_line_starts_a_new_event() {
+        // Passthrough forwards upstream chunks as they come: the last one may
+        // stop mid-line. The gateway's error frame must not be glued onto it.
+        let out = collect(wrap(
+            frames(vec![Ok(Bytes::from_static(b"data: {\"x\":1}\n\ndata: {\"x"))]),
+            guards(30_000, 15_000),
+        ))
+        .await;
+        assert_eq!(out.len(), 2, "got: {out:?}");
+        assert!(out[1].starts_with("\n\ndata: {"), "got: {:?}", out[1]);
+        assert!(out[1].contains("LM-3010"), "got: {}", out[1]);
+    }
+
+    #[tokio::test]
+    async fn error_frame_after_an_unterminated_event_adds_the_blank_line() {
+        // The last chunk ended a line but not its event (no blank line yet).
+        for (chunk, prefix) in [
+            (&b"data: {\"x\":1}\n"[..], "\ndata: {"),
+            (&b"data: {\"x\":1}\r\n"[..], "\ndata: {"),
+            // A lone CR may be the first half of a CRLF: two newlines are
+            // needed either way.
+            (&b"data: {\"x\":1}\r"[..], "\n\ndata: {"),
+        ] {
+            let out = collect(wrap(
+                frames(vec![
+                    Ok(Bytes::copy_from_slice(chunk)),
+                    Err(ProviderError::Unavailable {
+                        provider: "p".to_owned(),
+                    }),
+                ]),
+                guards(30_000, 15_000),
+            ))
+            .await;
+            assert_eq!(out.len(), 2, "got: {out:?}");
+            assert!(out[1].starts_with(prefix), "{chunk:?} got: {:?}", out[1]);
+        }
+    }
+
+    #[tokio::test]
+    async fn error_frame_on_an_event_boundary_is_not_prefixed() {
+        for chunk in [
+            &b"data: {\"x\":1}\n\n"[..],
+            &b"data: {\"x\":1}\r\n\r\n"[..],
+            &b"data: {\"x\":1}\r\r"[..],
+        ] {
+            let out = collect(wrap(
+                frames(vec![Ok(Bytes::copy_from_slice(chunk))]),
+                guards(30_000, 15_000),
+            ))
+            .await;
+            assert_eq!(out.len(), 2, "got: {out:?}");
+            assert!(out[1].starts_with("data: {"), "{chunk:?} got: {:?}", out[1]);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn no_heartbeat_is_injected_while_an_event_is_half_forwarded() {
+        // The upstream stalls 100 ms in the middle of an event (heartbeat
+        // every 15 ms): a ping there would corrupt the event, so none is
+        // sent until the event is complete. Then the pings resume.
+        let stalled = stream::iter(vec![Ok(Bytes::from_static(b"data: {\"x\""))])
+            .chain(
+                stream::once(async {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    Ok(Bytes::from_static(b":1}\n\n"))
+                })
+                .boxed(),
+            )
+            .chain(stream::pending())
+            .boxed();
+        let out: Vec<String> = collect(wrap(stalled, guards(50, 15)).take(4)).await;
+        assert_eq!(
+            out,
+            vec!["data: {\"x\"", ":1}\n\n", ": ping\n\n", ": ping\n\n"]
+        );
     }
 
     #[tokio::test(start_paused = true)]
