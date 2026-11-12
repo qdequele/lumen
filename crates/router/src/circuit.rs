@@ -11,6 +11,7 @@
 //! Time is passed in as a [`tokio::time::Instant`] so the state machine is
 //! deterministic under `tokio::time` pause in tests.
 
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use dashmap::DashMap;
@@ -37,6 +38,52 @@ impl Default for BreakerConfig {
             cooldown: Duration::from_secs(30),
         }
     }
+}
+
+/// The tuning every breaker of a registry reads on each `admit` /
+/// `on_failure`: two atomics, so a hot reload
+/// ([`CircuitBreakers::set_config`]) reaches the existing breakers without a
+/// lock on the request path and without touching their state.
+#[derive(Debug)]
+struct LiveConfig {
+    failure_threshold: AtomicU32,
+    /// The cooldown in nanoseconds (saturating: about 584 years).
+    cooldown_nanos: AtomicU64,
+}
+
+impl LiveConfig {
+    fn new(config: BreakerConfig) -> Self {
+        Self {
+            failure_threshold: AtomicU32::new(config.failure_threshold),
+            cooldown_nanos: AtomicU64::new(nanos(config.cooldown)),
+        }
+    }
+
+    fn store(&self, config: BreakerConfig) {
+        self.failure_threshold
+            .store(config.failure_threshold, Ordering::Relaxed);
+        self.cooldown_nanos
+            .store(nanos(config.cooldown), Ordering::Relaxed);
+    }
+
+    fn load(&self) -> BreakerConfig {
+        BreakerConfig {
+            failure_threshold: self.failure_threshold(),
+            cooldown: self.cooldown(),
+        }
+    }
+
+    fn failure_threshold(&self) -> u32 {
+        self.failure_threshold.load(Ordering::Relaxed)
+    }
+
+    fn cooldown(&self) -> Duration {
+        Duration::from_nanos(self.cooldown_nanos.load(Ordering::Relaxed))
+    }
+}
+
+fn nanos(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
 }
 
 /// Observable breaker state.
@@ -89,7 +136,8 @@ struct Inner {
 #[derive(Debug)]
 pub struct CircuitBreaker {
     inner: Mutex<Inner>,
-    config: BreakerConfig,
+    /// Shared with the registry, so a reload retunes this breaker in place.
+    config: Arc<LiveConfig>,
     provider: String,
     model: String,
     metrics: Option<ResilienceMetrics>,
@@ -99,7 +147,7 @@ impl CircuitBreaker {
     fn new(
         provider: String,
         model: String,
-        config: BreakerConfig,
+        config: Arc<LiveConfig>,
         metrics: Option<ResilienceMetrics>,
     ) -> Self {
         Self {
@@ -141,7 +189,7 @@ impl CircuitBreaker {
             CircuitState::Open => {
                 let ready_at = inner
                     .opened_at
-                    .map_or(now, |opened| opened + self.config.cooldown);
+                    .map_or(now, |opened| opened + self.config.cooldown());
                 if now >= ready_at {
                     inner.state = CircuitState::HalfOpen;
                     inner.probe_in_flight = true;
@@ -160,12 +208,13 @@ impl CircuitBreaker {
                 // outstanding longer than the cooldown, in which case it is
                 // presumed lost (no on_success/on_failure ever ran) and a fresh
                 // probe is admitted so the breaker cannot wedge shut.
-                let expires_at = inner.probe_admitted_at.map(|t| t + self.config.cooldown);
+                let cooldown = self.config.cooldown();
+                let expires_at = inner.probe_admitted_at.map(|t| t + cooldown);
                 let stale = expires_at.is_none_or(|deadline| now >= deadline);
                 if inner.probe_in_flight && !stale {
                     Admission::Rejected {
                         retry_after: expires_at
-                            .map_or(self.config.cooldown, |d| d.saturating_duration_since(now)),
+                            .map_or(cooldown, |d| d.saturating_duration_since(now)),
                     }
                 } else {
                     inner.probe_in_flight = true;
@@ -207,7 +256,7 @@ impl CircuitBreaker {
             }
             CircuitState::Closed => {
                 inner.consecutive_failures += 1;
-                if inner.consecutive_failures >= self.config.failure_threshold {
+                if inner.consecutive_failures >= self.config.failure_threshold() {
                     inner.state = CircuitState::Open;
                     inner.opened_at = Some(now);
                     drop(inner);
@@ -241,7 +290,7 @@ impl CircuitBreaker {
 #[derive(Debug)]
 pub struct CircuitBreakers {
     map: DashMap<(String, String), Arc<CircuitBreaker>>,
-    config: BreakerConfig,
+    config: Arc<LiveConfig>,
     metrics: Option<ResilienceMetrics>,
 }
 
@@ -251,9 +300,24 @@ impl CircuitBreakers {
     pub fn new(config: BreakerConfig, metrics: Option<ResilienceMetrics>) -> Self {
         Self {
             map: DashMap::new(),
-            config,
+            config: Arc::new(LiveConfig::new(config)),
             metrics,
         }
+    }
+
+    /// Replace the tuning of every breaker, existing and future (the
+    /// hot-reload entry point). State is untouched: an open circuit stays
+    /// open, and its remaining cooldown is measured with the new value. A
+    /// closed breaker whose failure streak already reaches a lowered
+    /// threshold opens on its next failure.
+    pub fn set_config(&self, config: BreakerConfig) {
+        self.config.store(config);
+    }
+
+    /// The tuning currently in force.
+    #[must_use]
+    pub fn config(&self) -> BreakerConfig {
+        self.config.load()
     }
 
     /// The breaker for a (provider, model), created on first use.
@@ -286,7 +350,7 @@ impl CircuitBreakers {
         let breaker = Arc::new(CircuitBreaker::new(
             key.0.clone(),
             model.to_owned(),
-            self.config,
+            Arc::clone(&self.config),
             if scope.is_some() {
                 None
             } else {
@@ -323,7 +387,12 @@ mod tests {
     }
 
     fn breaker() -> CircuitBreaker {
-        CircuitBreaker::new("openai".to_owned(), "gpt-4o".to_owned(), config(), None)
+        CircuitBreaker::new(
+            "openai".to_owned(),
+            "gpt-4o".to_owned(),
+            Arc::new(LiveConfig::new(config())),
+            None,
+        )
     }
 
     #[tokio::test]
@@ -466,6 +535,41 @@ mod tests {
         let c = breakers.get("openai", "gpt-4o-mini");
         assert_eq!(c.state(), CircuitState::Closed);
         assert_eq!(breakers.snapshot().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_new_config_reaches_existing_breakers_and_keeps_their_state() {
+        let breakers = CircuitBreakers::new(config(), None);
+        let existing = breakers.get("openai", "gpt-4o");
+        let t0 = Instant::now();
+        existing.on_failure(t0);
+        existing.on_failure(t0);
+        assert_eq!(existing.state(), CircuitState::Closed);
+
+        // Threshold 5 -> 3, cooldown 30 s -> 10 s: the breaker created before
+        // the change opens on its third failure and probes after 10 s.
+        breakers.set_config(BreakerConfig {
+            failure_threshold: 3,
+            cooldown: Duration::from_secs(10),
+        });
+        assert_eq!(breakers.config().failure_threshold, 3);
+        existing.on_failure(t0);
+        assert_eq!(existing.state(), CircuitState::Open, "streak kept");
+        assert!(matches!(
+            existing.admit(t0 + Duration::from_secs(9)),
+            Admission::Rejected { .. }
+        ));
+        assert_eq!(
+            existing.admit(t0 + Duration::from_secs(11)),
+            Admission::Allowed
+        );
+
+        // A breaker created afterwards uses the new tuning too.
+        let fresh = breakers.get("openai", "gpt-4o-mini");
+        for _ in 0..3 {
+            fresh.on_failure(t0);
+        }
+        assert_eq!(fresh.state(), CircuitState::Open);
     }
 
     #[tokio::test]

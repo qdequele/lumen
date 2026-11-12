@@ -178,10 +178,19 @@ impl ResiliencePolicy {
     }
 }
 
+/// The circuit-breaker tuning of `config`.
+fn breaker_config(config: &Config) -> BreakerConfig {
+    BreakerConfig {
+        failure_threshold: config.resilience.circuit_failure_threshold,
+        cooldown: Duration::from_millis(config.resilience.circuit_cooldown_ms),
+    }
+}
+
 /// Process-wide resilience state. The circuit breakers are stable for the life
 /// of the process (so their state survives a hot reload); the derived policy is
 /// behind an [`ArcSwap`] so a config reload can replace it atomically without
-/// touching breaker state (DEBT-1 / M7 §7.3).
+/// touching breaker state (DEBT-1 / M7 §7.3). The breaker tuning follows the
+/// reload through [`CircuitBreakers::set_config`].
 #[derive(Debug)]
 pub struct ResilienceRuntime {
     /// Per-(provider, model) circuit breakers - never rebuilt on reload.
@@ -205,13 +214,8 @@ impl ResilienceRuntime {
     /// provided.
     #[must_use]
     pub fn from_config(config: &Config, metrics: Option<ResilienceMetrics>) -> Self {
-        let r = &config.resilience;
-        let breaker_config = BreakerConfig {
-            failure_threshold: r.circuit_failure_threshold,
-            cooldown: Duration::from_millis(r.circuit_cooldown_ms),
-        };
         Self {
-            breakers: CircuitBreakers::new(breaker_config, metrics.clone()),
+            breakers: CircuitBreakers::new(breaker_config(config), metrics.clone()),
             policy: arc_swap::ArcSwap::from_pointee(ResiliencePolicy::from_config(config)),
             metrics,
             accounts: arc_swap::ArcSwap::from_pointee(HashMap::new()),
@@ -236,10 +240,13 @@ impl ResilienceRuntime {
 
     /// Atomically replace the derived policy (retry, timeouts, virtual models) from a
     /// new config - the hot-reload entry point. Circuit-breaker state is left
-    /// untouched, so an open circuit stays open across a reload.
+    /// untouched, so an open circuit stays open across a reload; the breaker
+    /// tuning (`circuit_failure_threshold`, `circuit_cooldown_ms`) is live,
+    /// for existing breakers too.
     pub fn reload_policy(&self, config: &Config) {
         self.policy
             .store(Arc::new(ResiliencePolicy::from_config(config)));
+        self.breakers.set_config(breaker_config(config));
         // Account tables hold compiled platform nodes: rebuild them over the
         // new platform snapshot (ADR 022).
         self.recompile_accounts();
@@ -745,6 +752,51 @@ mod tests {
         let global = rt.exec_config("oa/embed").retry;
         assert_eq!(global.max_attempts, 2);
         assert_eq!(global.max_retry_after, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn breaker_tuning_follows_hot_reload_and_keeps_state() {
+        let toml = |threshold: u32, cooldown_ms: u64| {
+            format!(
+                r#"
+                [resilience]
+                circuit_failure_threshold = {threshold}
+                circuit_cooldown_ms = {cooldown_ms}
+                [[providers]]
+                name = "oa"
+                kind = "openai"
+                [[providers.models]]
+                id = "oa/gpt"
+                capabilities = ["chat"]
+                "#
+            )
+        };
+        let rt = ResilienceRuntime::from_config(&load(&toml(5, 30_000)), None);
+        let breaker = rt.breakers.get("oa", "oa/gpt");
+        let now = tokio::time::Instant::now();
+        breaker.on_failure(now);
+        breaker.on_failure(now);
+
+        rt.reload_policy(&load(&toml(3, 1_000)));
+        assert_eq!(
+            rt.breakers.config(),
+            BreakerConfig {
+                failure_threshold: 3,
+                cooldown: Duration::from_secs(1),
+            }
+        );
+        // The breaker that existed before the reload: its streak of two is
+        // kept and the new threshold of three applies to it.
+        breaker.on_failure(now);
+        assert_eq!(
+            breaker.state(),
+            lumen_router::circuit::CircuitState::Open,
+            "an existing breaker reads the reloaded threshold"
+        );
+        assert!(matches!(
+            breaker.admit(now + Duration::from_secs(2)),
+            lumen_router::circuit::Admission::Allowed
+        ));
     }
 
     #[test]
