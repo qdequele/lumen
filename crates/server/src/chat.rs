@@ -109,9 +109,9 @@ pub async fn chat(
                 Facts::chat(headers, key, req)
             })?
     };
-    let chain = lumen_router::resolve_chat_decision(&state.registry, &mut decision)?;
+    let mut chain = lumen_router::resolve_chat_decision(&state.registry, &mut decision)?;
     let primary = decision.primary_model().to_owned();
-    enforce_image_support(&state, &primary, &chain, &req)?;
+    enforce_image_support(&state, &primary, &mut chain, &mut decision, &req)?;
     let mut links = lumen_router::decision_links(
         &decision,
         chain.iter().map(|l| l.route.provider_name.as_str()),
@@ -213,10 +213,18 @@ fn reserved_output_tokens(
 /// remote image URL is bound for a provider that only takes inline base64,
 /// `LM-2008` if a provider-native image source (Anthropic `file_id`, Gemini
 /// `fileUri`) is bound for a provider that cannot resolve it (issue #12).
+///
+/// The three rejections judge the primary. Fallback targets that do not
+/// declare the `image` modality are then removed from `chain` and `decision`
+/// (see [`drop_text_only_fallbacks`]). The `LM-2004` / `LM-2008` checks stay
+/// primary-only on purpose (`docs/providers.md`, `docs/errors.md`): a
+/// fail-over that reaches a provider unable to take the image source surfaces
+/// the same code there (GH #13).
 fn enforce_image_support(
     state: &AppState,
     client_model: &str,
-    chain: &[lumen_router::ChatChainLink],
+    chain: &mut Vec<lumen_router::ChatChainLink>,
+    decision: &mut lumen_router::virtual_models::Decision,
     req: &ChatRequest,
 ) -> Result<(), GatewayError> {
     let has_image = req.messages.iter().any(|m| {
@@ -276,7 +284,51 @@ fn enforce_image_support(
             source_kind: "gemini-file",
         });
     }
+    drop_text_only_fallbacks(state, chain, decision);
     Ok(())
+}
+
+/// Remove the fallback targets that cannot take an image from a request that
+/// carries one: a model that does not declare the `image` modality is not an
+/// attempt for it (as `/v1/decisions` skips its incompatible targets), so a
+/// fail-over never sends image content to a text-only model. The primary is
+/// kept: the caller has already checked it. `chain` and `decision.attempts`
+/// stay aligned, index for index.
+fn drop_text_only_fallbacks(
+    state: &AppState,
+    chain: &mut Vec<lumen_router::ChatChainLink>,
+    decision: &mut lumen_router::virtual_models::Decision,
+) {
+    // The common case (no fallback) skips the registry lookups.
+    if decision.attempts.len() < 2 {
+        return;
+    }
+    let keep: Vec<bool> = decision
+        .attempts
+        .iter()
+        .enumerate()
+        .map(|(i, attempt)| {
+            i == 0
+                || state
+                    .registry
+                    .modalities(&attempt.model_id)
+                    .is_some_and(|mods| mods.iter().any(|m| m == "image"))
+        })
+        .collect();
+    if keep.iter().all(|k| *k) {
+        return;
+    }
+    for (attempt, kept) in decision.attempts.iter().zip(&keep) {
+        if !kept {
+            tracing::debug!(
+                model = %attempt.model_id,
+                "skipping a fallback target without the image modality"
+            );
+        }
+    }
+    let mut kept = keep.iter();
+    chain.retain(|_| kept.next().copied().unwrap_or(true));
+    decision.retain_mask(&keep);
 }
 
 /// Everything the two chat execution paths share, bundled so the helpers stay

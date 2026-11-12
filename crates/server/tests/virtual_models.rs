@@ -144,6 +144,91 @@ async fn fallback_virtual_model_serves_from_second_target_and_reports_route() {
     );
 }
 
+/// A fallback target that does not declare the `image` modality is not an
+/// attempt for a request carrying an image: the fail-over skips it and goes
+/// on to the next target that can take the image.
+#[tokio::test]
+async fn image_request_skips_text_only_fallback_targets() {
+    let (a, b, c) = (
+        upstream(503, "model-a").await,
+        upstream(200, "model-b").await,
+        upstream(200, "model-c").await,
+    );
+    let cfg = load(&format!(
+        r#"
+        [resilience]
+        retry_max_attempts = 1
+        retry_base_ms = 10
+        retry_max_ms = 20
+
+        [[providers]]
+        name = "a"
+        kind = "openai"
+        base_url = "{}"
+        [[providers.models]]
+        id = "a/model-a"
+        capabilities = ["chat"]
+        modalities = ["text", "image"]
+
+        [[providers]]
+        name = "b"
+        kind = "openai"
+        base_url = "{}"
+        [[providers.models]]
+        id = "b/model-b"
+        capabilities = ["chat"]
+
+        [[providers]]
+        name = "c"
+        kind = "openai"
+        base_url = "{}"
+        [[providers.models]]
+        id = "c/model-c"
+        capabilities = ["chat"]
+        modalities = ["text", "image"]
+
+        [[virtual_models]]
+        id = "acme/vision"
+        capability = "chat"
+        strategy = "fallback"
+        targets = [{{ model = "a/model-a" }}, {{ model = "b/model-b" }}, {{ model = "c/model-c" }}]
+        "#,
+        a.uri(),
+        b.uri(),
+        c.uri()
+    ));
+    let base = spawn(&cfg, &cfg).await;
+    let image = json!({
+        "model": "acme/vision",
+        "messages": [{ "role": "user", "content": [
+            { "type": "text", "text": "what is this?" },
+            { "type": "image_url", "image_url": { "url": "data:image/png;base64,AAAA" } }
+        ]}]
+    });
+
+    let resp = post(&base, image, &[]).await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(header(&resp, "x-lumen-model-used"), Some("c/model-c"));
+    assert_eq!(
+        header(&resp, "x-lumen-route"),
+        Some("acme/vision>c/model-c")
+    );
+    assert!(
+        b.received_requests().await.expect("requests").is_empty(),
+        "the text-only target must never receive the image"
+    );
+
+    // Without an image, the text-only target is a normal fallback.
+    let resp = post(
+        &base,
+        json!({ "model": "acme/vision", "messages": [{ "role": "user", "content": "hi" }] }),
+        &[],
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(header(&resp, "x-lumen-model-used"), Some("b/model-b"));
+}
+
 #[tokio::test]
 async fn a_direct_foundation_call_has_no_route_header() {
     let (a, b) = (
