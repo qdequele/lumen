@@ -101,6 +101,7 @@ pub async fn rerank_handler(
             capability: "rerank",
             model: &client_model,
             provider: &chain[0].route.provider_name,
+            account_model: decision.account,
         },
         estimated_tokens,
         estimated_cost,

@@ -148,6 +148,7 @@ pub async fn chat(
             capability: "chat",
             model: &client_model,
             provider: &chain[0].route.provider_name,
+            account_model: decision.account,
         },
         estimated_input + reserved_output,
         estimated_cost,
@@ -1116,7 +1117,9 @@ mod tests {
         // Passthrough forwards upstream chunks as they come: the last one may
         // stop mid-line. The gateway's error frame must not be glued onto it.
         let out = collect(wrap(
-            frames(vec![Ok(Bytes::from_static(b"data: {\"x\":1}\n\ndata: {\"x"))]),
+            frames(vec![Ok(Bytes::from_static(
+                b"data: {\"x\":1}\n\ndata: {\"x",
+            ))]),
             guards(30_000, 15_000),
         ))
         .await;

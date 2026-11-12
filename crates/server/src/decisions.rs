@@ -105,6 +105,7 @@ async fn handle(
             capability: "decisions",
             model: &client_model,
             provider: &first.route.provider_name,
+            account_model: decision.account,
         },
         estimated_input,
         estimated_cost,

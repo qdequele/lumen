@@ -140,6 +140,7 @@ pub async fn embeddings(
             capability: "embed",
             model: &client_model,
             provider: &chain[0].route.provider_name,
+            account_model: decision.account,
         },
         estimated_input,
         estimated_cost,

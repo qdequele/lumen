@@ -95,6 +95,9 @@ pub struct Target<'a> {
     pub model: &'a str,
     /// Provider instance name.
     pub provider: &'a str,
+    /// The requested model is a virtual model owned by one account (ADR
+    /// 022): its id is never a Prometheus label value, on failure included.
+    pub account_model: bool,
 }
 
 /// Open accounting for one admitted request.
@@ -109,7 +112,9 @@ pub struct Accounting {
     /// The route of a virtual-model request (ADR 014), set by the handler
     /// after execution; `None` for a foundation model called directly.
     route: Option<String>,
-    /// The requested virtual model belongs to one account (ADR 022).
+    /// The requested virtual model belongs to one account (ADR 022). Known
+    /// from admission on, so a failure before anything is served never
+    /// labels a metric with the team-defined id.
     account_model: bool,
     provider: String,
     key_id: Option<String>,
@@ -200,7 +205,7 @@ impl Accounting {
             model: target.model.to_owned(),
             model_used: target.model.to_owned(),
             route: None,
-            account_model: false,
+            account_model: target.account_model,
             provider: target.provider.to_owned(),
             key_id,
             group_id,
@@ -231,9 +236,17 @@ impl Accounting {
         drop(self.reservation.take());
         let elapsed = self.completed.unwrap_or_else(|| self.started.elapsed());
         let status = error.http_status();
+        // Nothing served the request, so `model_used` is still the requested
+        // id. For an account model that id is team-defined and never a label
+        // value (ADR 022): the fixed label stands in for it.
+        let model_label = if self.account_model {
+            crate::account_models::METRIC_LABEL
+        } else {
+            &self.model_used
+        };
         self.latency.observe_request(
             self.capability,
-            &self.model_used,
+            model_label,
             &self.provider,
             status,
             elapsed.as_secs_f64(),
@@ -823,6 +836,41 @@ mod tests {
         let out = metrics.encode_text();
         assert!(out.contains(r#"status="200""#), "{out}");
         assert!(!out.contains(r#"status="499""#), "{out}");
+    }
+
+    // ADR 022: a request to an account virtual model that fails before any
+    // target served it has only the team-chosen id to name its model. That
+    // id must not become a label value.
+    #[test]
+    fn a_failed_account_model_request_is_labelled_account() {
+        let metrics = Metrics::new();
+        let mut accounting = open_accounting(&metrics);
+        accounting.model = "team/secret-bot".to_owned();
+        accounting.model_used = "team/secret-bot".to_owned();
+        accounting.account_model = true;
+        let _ = accounting.fail(GatewayError::UpstreamUnavailable {
+            provider: "openai".to_owned(),
+        });
+
+        let out = metrics.encode_text();
+        assert!(!out.contains("team/secret-bot"), "{out}");
+        let line = out
+            .lines()
+            .find(|l| l.starts_with("lumen_request_duration_seconds_count"))
+            .unwrap_or_else(|| panic!("no request duration sample:\n{out}"));
+        assert!(line.contains(r#"model="account""#), "{line}");
+    }
+
+    // A platform model (or a foundation model) keeps its own id on failure.
+    #[test]
+    fn a_failed_platform_model_request_keeps_its_id() {
+        let metrics = Metrics::new();
+        let mut accounting = open_accounting(&metrics);
+        let _ = accounting.fail(GatewayError::UpstreamUnavailable {
+            provider: "openai".to_owned(),
+        });
+        let out = metrics.encode_text();
+        assert!(out.contains(r#"model="gpt""#), "{out}");
     }
 
     #[test]
