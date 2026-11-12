@@ -9,7 +9,7 @@
 //! All state is in-memory; nothing here touches a database.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -55,6 +55,26 @@ pub fn routing_headers(model_used: &str, route: Option<&str>) -> HeaderMap {
     headers
 }
 
+/// How often a deprecated bare model id is logged, per alias. Every use is
+/// still counted on `lumen_deprecated_model_alias_total`; the log line is a
+/// synchronous write, so it must not be paid per request.
+const ALIAS_WARN_INTERVAL_SECS: u64 = 600;
+
+/// Whether a use of an alias at `now_secs` (seconds since the runtime
+/// started) should be logged, given `last`, the slot holding when it last
+/// was (`0`: never; stored one second ahead so a use at second zero is not
+/// "never"). Lock-free: of concurrent callers in a new interval, exactly one
+/// wins the swap and logs.
+fn alias_warning_due(last: &AtomicU64, now_secs: u64) -> bool {
+    let stamp = now_secs.saturating_add(1);
+    let previous = last.load(Ordering::Relaxed);
+    if previous != 0 && stamp.saturating_sub(previous) < ALIAS_WARN_INTERVAL_SECS {
+        return false;
+    }
+    last.compare_exchange(previous, stamp, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
+}
+
 /// The two request-scoped timeouts the executor enforces (connect is a
 /// client-wide setting, applied when the HTTP client is built).
 #[derive(Debug, Clone, Copy)]
@@ -86,6 +106,10 @@ struct ResiliencePolicy {
     /// Deprecated bare id -> its `provider/model` (or `namespace/model`) id,
     /// from the same config snapshot as `routing`. Hidden: never listed.
     aliases: Arc<HashMap<String, String>>,
+    /// When each alias was last logged (see [`alias_warning_due`]), keyed
+    /// like `aliases`. Rebuilt with the policy, so a reload logs each alias
+    /// still in use once more.
+    alias_warned: Arc<HashMap<String, AtomicU64>>,
 }
 
 impl ResiliencePolicy {
@@ -151,6 +175,11 @@ impl ResiliencePolicy {
                 )
             })
             .collect();
+        let aliases = config.model_aliases();
+        let alias_warned = aliases
+            .keys()
+            .map(|alias| (alias.clone(), AtomicU64::new(0)))
+            .collect();
         Self {
             retry,
             provider_retry,
@@ -158,7 +187,8 @@ impl ResiliencePolicy {
             model_timeouts,
             routing: Arc::new(routing),
             foundation: Arc::new(config.foundation_index()),
-            aliases: Arc::new(config.model_aliases()),
+            aliases: Arc::new(aliases),
+            alias_warned: Arc::new(alias_warned),
         }
     }
 
@@ -174,6 +204,7 @@ impl ResiliencePolicy {
             routing: Arc::new(RoutingTable::default()),
             foundation: Arc::new(FoundationIndex::default()),
             aliases: Arc::new(HashMap::new()),
+            alias_warned: Arc::new(HashMap::new()),
         }
     }
 }
@@ -207,6 +238,8 @@ pub struct ResilienceRuntime {
     accounts_write: Mutex<()>,
     /// The highest store generation installed into `accounts`.
     account_generation: AtomicI64,
+    /// When the runtime was built: the clock of the alias-warning limiter.
+    started: std::time::Instant,
 }
 
 impl ResilienceRuntime {
@@ -221,6 +254,7 @@ impl ResilienceRuntime {
             accounts: arc_swap::ArcSwap::from_pointee(HashMap::new()),
             accounts_write: Mutex::new(()),
             account_generation: AtomicI64::new(0),
+            started: std::time::Instant::now(),
         }
     }
 
@@ -235,6 +269,7 @@ impl ResilienceRuntime {
             accounts: arc_swap::ArcSwap::from_pointee(HashMap::new()),
             accounts_write: Mutex::new(()),
             account_generation: AtomicI64::new(0),
+            started: std::time::Instant::now(),
         }
     }
 
@@ -280,9 +315,10 @@ impl ResilienceRuntime {
 
     /// The id a request's `model` names: itself, or, for a deprecated bare id
     /// (`gpt-4o` for `openai/gpt-4o`), the prefixed id it aliases. An alias
-    /// resolves but is never listed; each use is logged and counted on
-    /// `lumen_deprecated_model_alias_total` so the aliases can be dropped once
-    /// nobody sends them.
+    /// resolves but is never listed; each use is counted on
+    /// `lumen_deprecated_model_alias_total`, and logged at most once per
+    /// alias every ten minutes, so the aliases can be dropped once nobody
+    /// sends them.
     #[must_use]
     pub fn canonical_model(&self, requested: &str) -> String {
         self.canonical_model_for(None, requested)
@@ -302,11 +338,19 @@ impl ResilienceRuntime {
         let Some(canonical) = policy.aliases.get(requested) else {
             return requested.to_owned();
         };
-        tracing::warn!(
-            alias = %requested,
-            model = %canonical,
-            "deprecated bare model id: send the `provider/model` id instead"
-        );
+        let due = policy
+            .alias_warned
+            .get(requested)
+            .is_some_and(|last| alias_warning_due(last, self.started.elapsed().as_secs()));
+        if due {
+            tracing::warn!(
+                alias = %requested,
+                model = %canonical,
+                "deprecated bare model id: send the `provider/model` id instead \
+                 (logged at most once per alias every ten minutes; every use is counted \
+                 on lumen_deprecated_model_alias_total)"
+            );
+        }
         if let Some(metrics) = &self.metrics {
             metrics.inc_deprecated_alias(requested, canonical);
         }
@@ -693,6 +737,29 @@ mod tests {
         assert!(metrics.encode_text().contains(
             "lumen_deprecated_model_alias_total{alias=\"gpt-4o\",model=\"openai/gpt-4o\"} 1"
         ));
+        // Every use is counted, whatever the log limiter decides.
+        assert_eq!(rt.canonical_model("gpt-4o"), "openai/gpt-4o");
+        assert!(metrics.encode_text().contains(
+            "lumen_deprecated_model_alias_total{alias=\"gpt-4o\",model=\"openai/gpt-4o\"} 2"
+        ));
+        // The first use took the alias's log slot; the second did not log.
+        let policy = rt.policy.load();
+        let last = &policy.alias_warned["gpt-4o"];
+        assert_ne!(last.load(Ordering::Relaxed), 0);
+        assert!(!alias_warning_due(last, rt.started.elapsed().as_secs()));
+    }
+
+    #[test]
+    fn a_deprecated_alias_is_logged_once_per_interval() {
+        let last = AtomicU64::new(0);
+        assert!(alias_warning_due(&last, 0), "the first use logs");
+        assert!(!alias_warning_due(&last, 0));
+        assert!(!alias_warning_due(&last, ALIAS_WARN_INTERVAL_SECS - 1));
+        assert!(alias_warning_due(&last, ALIAS_WARN_INTERVAL_SECS));
+        assert!(!alias_warning_due(&last, ALIAS_WARN_INTERVAL_SECS + 1));
+        assert!(alias_warning_due(&last, 2 * ALIAS_WARN_INTERVAL_SECS));
+        // Each alias has its own slot.
+        assert!(alias_warning_due(&AtomicU64::new(0), 1));
     }
 
     #[test]

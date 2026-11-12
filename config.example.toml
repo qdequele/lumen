@@ -341,8 +341,9 @@ health_check_interval_ms = 30000  # probe cadence (must not be 0 when enabled)
 #                 rejected at load and on the admin API; `lumen config migrate`
 #                 prefixes an older config. The old bare ids keep resolving as
 #                 hidden deprecated aliases (never listed in GET /v1/models;
-#                 each use is logged and counted on
-#                 `lumen_deprecated_model_alias_total`).
+#                 each use is counted on
+#                 `lumen_deprecated_model_alias_total` and logged at most
+#                 once per alias every ten minutes).
 #   upstream_id   what LUMEN sends upstream (defaults to `id` without its
 #                 `<provider>/` prefix)
 #   capabilities  any of: "chat", "embed", "rerank", "decisions" (ADR 017; the

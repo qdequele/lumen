@@ -38,9 +38,10 @@ its id without the `<provider>/` prefix.
 **Deprecated bare aliases.** So existing clients keep working, each prefixed
 id's bare form (`gpt-4o` for `openai/gpt-4o`) still resolves to it. These
 aliases are hidden: `GET /v1/models` never lists them, usage and metrics
-record the prefixed id, and every use logs a warning and increments
-`lumen_deprecated_model_alias_total{alias,model}`, so you know when nobody
-sends them any more. A bare form that is itself a configured id is no alias;
+record the prefixed id, and every use increments
+`lumen_deprecated_model_alias_total{alias,model}` (a warning is also logged,
+at most once per alias every ten minutes), so you know when nobody sends
+them any more. A bare form that is itself a configured id is no alias;
 when a virtual model and a foundation model share a bare form, the virtual
 model gets it (a migrated fallback chain keeps its old client-facing id);
 two of the same kind get none. The aliases will be removed in a future
