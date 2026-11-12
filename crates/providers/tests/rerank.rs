@@ -722,3 +722,25 @@ async fn nvidia_passes_rerank_conformance_suite() {
 async fn together_passes_rerank_conformance_suite() {
     run_conformance(&TogetherFixture).await;
 }
+
+/// The upstream scores three documents but only two were sent: its index 2
+/// names no request document, so the finaliser rejects the response as a
+/// translation error instead of returning a score for a phantom document.
+/// Cloudflare is included because its index travels as `id`.
+#[tokio::test]
+async fn upstream_index_out_of_range_is_a_translation_error() {
+    let fixtures: [&dyn RerankFixture; 3] = [&CohereFixture, &TeiFixture, &CloudflareFixture];
+    for fx in fixtures {
+        let mock = MockServer::start().await;
+        fx.mount_scored(&mock).await;
+        let provider = fx.build(mock.uri());
+
+        let err = rerank::rerank(&*provider, request(&["a", "b"]), &CancellationToken::new())
+            .await
+            .expect_err("an out-of-range index must not be served");
+        assert!(
+            matches!(err, ProviderError::Translation(ref m) if m.contains("out of range")),
+            "got {err:?}"
+        );
+    }
+}
