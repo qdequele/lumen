@@ -15,8 +15,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, TryLockError};
 use std::time::{Duration, Instant};
 
+use prometheus::core::{Collector, Desc};
+use prometheus::proto::MetricFamily;
+use prometheus::IntCounter;
 use tracing_appender::non_blocking::{ErrorCounter, NonBlocking, NonBlockingBuilder, WorkerGuard};
 use tracing_subscriber::EnvFilter;
+
+use crate::metrics::Metrics;
 
 /// Maximum number of formatted log lines waiting for the writer thread.
 ///
@@ -167,6 +172,31 @@ impl LogHandle {
         }
     }
 
+    /// Register `lumen_log_lines_dropped_total` on `metrics`: the log lines
+    /// discarded because the queue was full, as [`dropped_lines`] counts
+    /// them.
+    ///
+    /// The value is read when `/metrics` is scraped, from the atomic the
+    /// writer already keeps: emitting a log line touches nothing new (no
+    /// lock, no extra counter).
+    ///
+    /// # Errors
+    ///
+    /// [`prometheus::Error`] if the collector is registered twice.
+    ///
+    /// [`dropped_lines`]: Self::dropped_lines
+    pub fn register_dropped_lines(&self, metrics: &Metrics) -> Result<(), prometheus::Error> {
+        let counter = IntCounter::new(
+            "lumen_log_lines_dropped_total",
+            "Log lines dropped because the log output could not keep up (the queue was full).",
+        )?;
+        metrics.registry().register(Box::new(DroppedLinesCollector {
+            dropped: self.dropped.clone(),
+            counter,
+            scrape: Mutex::new(()),
+        }))
+    }
+
     /// Whether a flush has stopped the writer.
     #[cfg(test)]
     fn is_stopped(&self) -> bool {
@@ -177,6 +207,37 @@ impl LogHandle {
     #[cfg(test)]
     fn is_claimed(&self) -> bool {
         self.writer.worker.lock().unwrap().is_none()
+    }
+}
+
+/// Exposes the writer's dropped-line count as a Prometheus counter.
+///
+/// `tracing-appender` owns the count (an atomic), so there is nothing to
+/// increment from here: each scrape raises the Prometheus counter to the
+/// current value.
+struct DroppedLinesCollector {
+    dropped: ErrorCounter,
+    counter: IntCounter,
+    /// Held for the length of a scrape only, so that two concurrent scrapes
+    /// cannot both add the same difference. Nothing else ever takes it.
+    scrape: Mutex<()>,
+}
+
+impl Collector for DroppedLinesCollector {
+    fn desc(&self) -> Vec<&Desc> {
+        self.counter.desc()
+    }
+
+    fn collect(&self) -> Vec<MetricFamily> {
+        let scrape = match self.scrape.lock() {
+            Ok(scrape) => scrape,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let dropped = u64::try_from(self.dropped.dropped_lines()).unwrap_or(u64::MAX);
+        self.counter
+            .inc_by(dropped.saturating_sub(self.counter.get()));
+        drop(scrape);
+        self.counter.collect()
     }
 }
 
@@ -438,6 +499,37 @@ mod tests {
         // The guard is still alive: only the hook can have stopped the writer.
         assert!(guard.handle().is_stopped());
         assert_eq!(sink.lines().len(), 11);
+    }
+
+    #[test]
+    fn dropped_lines_are_exposed_as_a_prometheus_counter() {
+        let sink = GatedSink::default();
+        let (writer, guard) = non_blocking(sink.clone(), 4);
+        let metrics = Metrics::new();
+        guard.handle().register_dropped_lines(&metrics).unwrap();
+
+        // Present from the first scrape, at zero.
+        let out = metrics.encode_text();
+        assert!(out.contains("# TYPE lumen_log_lines_dropped_total counter"));
+        assert!(out.contains("lumen_log_lines_dropped_total 0\n"), "{out}");
+
+        emit(writer, 49);
+        let dropped = guard.dropped_lines();
+        assert!(dropped >= 44, "dropped {dropped}");
+        // Read at scrape time, and stable from one scrape to the next.
+        for _ in 0..2 {
+            let out = metrics.encode_text();
+            assert!(
+                out.contains(&format!("lumen_log_lines_dropped_total {dropped}\n")),
+                "{out}"
+            );
+        }
+
+        // Once per registry, like every other collector.
+        assert!(guard.handle().register_dropped_lines(&metrics).is_err());
+
+        sink.open();
+        drop(guard);
     }
 
     #[test]

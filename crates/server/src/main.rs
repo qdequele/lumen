@@ -31,7 +31,7 @@ use lumen_server::{
 };
 use lumen_telemetry::{
     logging::{init_logging, install_panic_flush_hook},
-    LatencyMetrics, Metrics, ReloadMetrics, ResilienceMetrics, TokenMetrics,
+    LatencyMetrics, LogGuard, LogHandle, Metrics, ReloadMetrics, ResilienceMetrics, TokenMetrics,
 };
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -164,7 +164,7 @@ fn main() -> ExitCode {
         install_panic_flush_hook(guard.handle());
     }
 
-    match run(config_path) {
+    match run(config_path, log_guard.as_ref().map(LogGuard::handle)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             tracing::error!(error = %format!("{err:#}"), "server exited with error");
@@ -690,7 +690,7 @@ async fn boot_config_context(
 
 // Linear boot sequence: each step depends on the previous one's output.
 #[allow(clippy::too_many_lines)]
-fn run(config_path: PathBuf) -> anyhow::Result<()> {
+fn run(config_path: PathBuf, log: Option<LogHandle>) -> anyhow::Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -720,7 +720,7 @@ fn run(config_path: PathBuf) -> anyhow::Result<()> {
             latency,
             resilience: resilience_metrics,
             reload: reload_metrics,
-        } = register_metrics(&config)?;
+        } = register_metrics(&config, log.as_ref())?;
         let resilience = Arc::new(ResilienceRuntime::from_config(
             &config,
             Some(resilience_metrics.clone()),
@@ -1124,7 +1124,10 @@ struct RegisteredMetrics {
 }
 
 /// Create the registry and register every always-on collector.
-fn register_metrics(config: &Config) -> anyhow::Result<RegisteredMetrics> {
+///
+/// `log` is the log writer's handle, absent only when logging was already
+/// initialised by someone else: it exposes the lines the log queue dropped.
+fn register_metrics(config: &Config, log: Option<&LogHandle>) -> anyhow::Result<RegisteredMetrics> {
     let metrics = Metrics::new();
     let tokens = TokenMetrics::register(&metrics, &config.telemetry.metadata_labels)
         .context("failed to register token metrics")?;
@@ -1133,6 +1136,10 @@ fn register_metrics(config: &Config) -> anyhow::Result<RegisteredMetrics> {
     let resilience =
         ResilienceMetrics::register(&metrics).context("failed to register resilience metrics")?;
     let reload = ReloadMetrics::register(&metrics).context("failed to register reload metrics")?;
+    if let Some(log) = log {
+        log.register_dropped_lines(&metrics)
+            .context("failed to register log metrics")?;
+    }
     Ok(RegisteredMetrics {
         metrics,
         tokens,
