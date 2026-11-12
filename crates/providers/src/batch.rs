@@ -11,7 +11,10 @@
 //! the sub-batches that already completed (and were billed) are kept instead
 //! of being thrown away for the retry above to start again from input 0. This
 //! matters most for the single-input providers (Bedrock, Vertex), where N
-//! inputs are N upstream calls. See [`SubBatchRetry`] for the bounds.
+//! inputs are N upstream calls. See [`SubBatchRetry`] for the bounds. The
+//! server derives the policy from the retry configuration of the provider
+//! called ([`SubBatchRetry::capped_at`]): no sub-batch retry when that
+//! configuration allows no retry.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, PoisonError};
@@ -83,6 +86,25 @@ impl SubBatchRetry {
             base: Duration::ZERO,
             max: Duration::ZERO,
             max_total_backoff: Duration::ZERO,
+        }
+    }
+
+    /// The default policy held within a request-level retry policy that
+    /// allows `policy_max_attempts` attempts (the effective
+    /// `retry_max_attempts` of the provider called, ADR 021).
+    ///
+    /// A policy that allows no retry (`<= 1`) turns the sub-batch retry off;
+    /// otherwise a sub-batch gets at most that many attempts, and never more
+    /// than the default. The delays and the backoff budget stay the defaults.
+    #[must_use]
+    pub fn capped_at(policy_max_attempts: u32) -> Self {
+        if policy_max_attempts <= 1 {
+            return Self::never();
+        }
+        let default = Self::default();
+        Self {
+            max_attempts: default.max_attempts.min(policy_max_attempts),
+            ..default
         }
     }
 }
@@ -264,7 +286,8 @@ async fn embed_sub_batch(
 /// Embed `req` through `provider`, splitting into sub-batches when it exceeds
 /// the provider's `max_batch_size`. Cancellation propagates to every in-flight
 /// sub-batch. A failed sub-batch is retried on its own with the default
-/// [`SubBatchRetry`].
+/// [`SubBatchRetry`]; a caller that knows the provider's retry policy uses
+/// [`embed_batched_with`] and [`SubBatchRetry::capped_at`] instead.
 ///
 /// # Errors
 /// The provider's error for the first sub-batch that fails for good, or
@@ -930,6 +953,24 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, ProviderError::RateLimited { .. }), "{err:?}");
         assert_eq!(provider.calls_for("1"), 1);
+    }
+
+    #[test]
+    fn capped_at_follows_the_request_level_attempt_count() {
+        // No retry allowed above: no sub-batch retry either.
+        assert_eq!(SubBatchRetry::capped_at(0), SubBatchRetry::never());
+        assert_eq!(SubBatchRetry::capped_at(1), SubBatchRetry::never());
+        // Fewer attempts than the default: the policy's count, default delays.
+        assert_eq!(
+            SubBatchRetry::capped_at(2),
+            SubBatchRetry {
+                max_attempts: 2,
+                ..SubBatchRetry::default()
+            }
+        );
+        // As many or more: the default is the ceiling.
+        assert_eq!(SubBatchRetry::capped_at(3), SubBatchRetry::default());
+        assert_eq!(SubBatchRetry::capped_at(6), SubBatchRetry::default());
     }
 
     #[test]

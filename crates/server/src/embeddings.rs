@@ -183,6 +183,10 @@ pub async fn embeddings(
             let attempt = &decision.attempts[i];
             let (keys, registry, mark, req, cancel) =
                 (&keys, &*state.registry, &mark, &req, &cancel);
+            // A split request retries a failed sub-batch within this link's
+            // retry policy: off when the policy allows no retry (ADR 005).
+            let sub_batch_retry =
+                batch::SubBatchRetry::capped_at(links[i].retry.unwrap_or(exec.retry).max_attempts);
             async move {
                 // Marked only when an upstream call is actually sent.
                 let call = |provider: Option<Arc<dyn EmbeddingProvider>>| async move {
@@ -193,7 +197,7 @@ pub async fn embeddings(
                     let mut attempt_req = req.clone();
                     attempt.apply(&mut attempt_req);
                     link.upstream_id.clone_into(&mut attempt_req.model);
-                    embed_upstream(provider.as_ref(), attempt_req, cancel).await
+                    embed_upstream(provider.as_ref(), attempt_req, cancel, sub_batch_retry).await
                 };
                 keys.attempt(
                     registry,
@@ -288,20 +292,28 @@ pub async fn embeddings(
 /// A request that fits one upstream call goes through
 /// [`EmbeddingProvider::embed_completion`], so a same-schema body can come
 /// back as bytes (ADR 004, 2026-11-12 amendment); one that has to be split
-/// goes through [`batch::embed_batched`], whose reassembled answer is always
-/// typed. Either way the number of vectors returned must equal the number of
+/// goes through [`batch::embed_batched_with`], whose reassembled answer is
+/// always typed and which retries a failed sub-batch within `sub_batch_retry`
+/// (derived from the link's retry policy, ADR 005). Either way the number of vectors returned must equal the number of
 /// inputs sent: a short upstream response is a `LM-3002`, never a silent
 /// short result (issue #89, the same check as `batch.rs`).
 async fn embed_upstream(
     provider: &dyn EmbeddingProvider,
     req: EmbedRequest,
     cancel: &CancellationToken,
+    sub_batch_retry: batch::SubBatchRetry,
 ) -> Result<EmbedCompletion, ProviderError> {
     let expected = req.input.len();
     if expected > provider.max_batch_size().max(1) {
-        return batch::embed_batched(provider, req, cancel, batch::DEFAULT_CONCURRENCY)
-            .await
-            .map(EmbedCompletion::Typed);
+        return batch::embed_batched_with(
+            provider,
+            req,
+            cancel,
+            batch::DEFAULT_CONCURRENCY,
+            sub_batch_retry,
+        )
+        .await
+        .map(EmbedCompletion::Typed);
     }
     let completion = provider.embed_completion(req, cancel.clone()).await?;
     let returned = completion.vector_count();

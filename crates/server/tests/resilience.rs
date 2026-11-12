@@ -1340,3 +1340,143 @@ async fn rate_limit_hint_above_the_cap_is_not_waited_for() {
     assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
     assert!(started.elapsed() < Duration::from_secs(5));
 }
+
+// ---------------------------------------------------------------------------
+// Sub-batch retry of a split embeddings request follows the retry policy
+// (ADR 005, 2026-11-12 amendment)
+// ---------------------------------------------------------------------------
+
+/// One TEI-kind provider (32 inputs per upstream call) on `url`, with a
+/// millisecond request-level backoff. `resilience` lands in `[resilience]`,
+/// `provider` on the provider.
+fn split_embed_config(url: &str, resilience: &str, provider: &str) -> Config {
+    config_from(&format!(
+        r#"
+        [resilience]
+        retry_base_ms = 1
+        retry_max_ms = 5
+        {resilience}
+
+        [[providers]]
+        name = "tei"
+        kind = "tei"
+        base_url = "{url}"
+        {provider}
+        [[providers.models]]
+        id = "tei/bge"
+        capabilities = ["embed"]
+        "#
+    ))
+}
+
+/// Number of inputs in a TEI `/embed` request body.
+fn tei_inputs(request: &wiremock::Request) -> usize {
+    serde_json::from_slice::<Value>(&request.body)
+        .ok()
+        .and_then(|body| body["inputs"].as_array().map(Vec::len))
+        .unwrap_or(0)
+}
+
+/// A TEI upstream for a 33-input request, which the gateway splits into a
+/// 32-input sub-batch (always answered) and a 1-input sub-batch that gets a
+/// 503 for its first `failures` calls.
+async fn split_embed_upstream(failures: u64) -> MockServer {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/embed"))
+        .and(|r: &wiremock::Request| tei_inputs(r) == 1)
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(failures)
+        .mount(&upstream)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/embed"))
+        .respond_with(|r: &wiremock::Request| {
+            ResponseTemplate::new(200).set_body_json(vec![vec![0.5f32, 0.25]; tei_inputs(r)])
+        })
+        .mount(&upstream)
+        .await;
+    upstream
+}
+
+/// POST 33 inputs, then report the status and how many upstream calls each
+/// of the two sub-batches received: `(status, 32-input calls, 1-input calls)`.
+async fn post_split_embed(base: &str, upstream: &MockServer) -> (u16, usize, usize) {
+    let inputs: Vec<String> = (0..33).map(|i| format!("text {i}")).collect();
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/embeddings"))
+        .json(&json!({ "model": "tei/bge", "input": inputs }))
+        .send()
+        .await
+        .expect("send embeddings");
+    let status = resp.status().as_u16();
+    if status == 200 {
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(body["data"].as_array().map(Vec::len), Some(33));
+    }
+    let requests = upstream.received_requests().await.unwrap();
+    let calls = |n: usize| requests.iter().filter(|r| tei_inputs(r) == n).count();
+    (status, calls(32), calls(1))
+}
+
+/// Retries enabled (the default policy): the failed sub-batch is sent again
+/// on its own and the completed one is not.
+#[tokio::test]
+async fn split_embeddings_retry_a_failed_sub_batch_when_retries_are_enabled() {
+    let upstream = split_embed_upstream(1).await;
+    let base = spawn(&split_embed_config(&upstream.uri(), "", "")).await;
+
+    let (status, full, single) = post_split_embed(&base, &upstream).await;
+    assert_eq!(status, 200);
+    assert_eq!(single, 2, "the failed sub-batch is retried");
+    assert_eq!(full, 1, "the completed sub-batch is not sent again");
+}
+
+/// `retry_max_attempts = 1` in `[resilience]` turns the sub-batch retry off
+/// too: one call per sub-batch, and the upstream error is returned.
+#[tokio::test]
+async fn split_embeddings_do_not_retry_a_sub_batch_when_retries_are_disabled() {
+    let upstream = split_embed_upstream(1).await;
+    let config = split_embed_config(&upstream.uri(), "retry_max_attempts = 1", "");
+    let base = spawn(&config).await;
+
+    let (status, full, single) = post_split_embed(&base, &upstream).await;
+    assert_eq!(status, 502);
+    assert_eq!(single, 1, "no sub-batch retry when retries are disabled");
+    assert_eq!(full, 1);
+}
+
+/// A provider that disables retries for itself (ADR 021) gets no sub-batch
+/// retry either, whatever the global policy allows.
+#[tokio::test]
+async fn split_embeddings_follow_the_provider_retry_override() {
+    let upstream = split_embed_upstream(1).await;
+    let config = split_embed_config(
+        &upstream.uri(),
+        "retry_max_attempts = 3",
+        "retry_max_attempts = 1",
+    );
+    let base = spawn(&config).await;
+
+    let (status, full, single) = post_split_embed(&base, &upstream).await;
+    assert_eq!(status, 502);
+    assert_eq!(single, 1, "the provider's own policy allows no retry");
+    assert_eq!(full, 1);
+}
+
+/// The sub-batch attempt count never exceeds the policy's: with two attempts
+/// allowed, a sub-batch that always fails is called twice per request-level
+/// attempt (2 x 2), not three times (2 x 3).
+#[tokio::test]
+async fn split_embeddings_sub_batch_attempts_are_capped_by_the_policy() {
+    let upstream = split_embed_upstream(u64::MAX).await;
+    let config = split_embed_config(&upstream.uri(), "retry_max_attempts = 2", "");
+    let base = spawn(&config).await;
+
+    let (status, _full, single) = post_split_embed(&base, &upstream).await;
+    assert_eq!(status, 502);
+    assert_eq!(
+        single, 4,
+        "two sub-batch attempts per request-level attempt"
+    );
+}

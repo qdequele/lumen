@@ -346,7 +346,8 @@ one more reason a provider call takes longer, not a second resilience layer.
   depend on `router`, so the pure function and the splitmix64 jitter are
   repeated in `batch.rs` (a few lines, unit-tested against the same bounds).
 - **Bounds** (`SubBatchRetry`, defaults in brackets): at most `max_attempts`
-  [3] upstream calls per sub-batch, and at most `max_total_backoff` [10 s] of
+  [3, lowered to the provider's `retry_max_attempts`, see Consequences]
+  upstream calls per sub-batch, and at most `max_total_backoff` [10 s] of
   waiting per request, all sub-batches together. A wait that does not fit in
   what is left of that budget (a long `Retry-After` included) is not started:
   the error is returned, hint intact, and the executor's retry, fallback and
@@ -384,10 +385,19 @@ one more reason a provider call takes longer, not a second resilience layer.
 - Each sub-batch request is cloned once (the copy a retry needs to send
   again); the last attempt allowed moves the original. A request that is not
   split is not cloned.
-- The policy is fixed in code for now. `embed_batched_with` takes a
-  `SubBatchRetry`, so wiring it to the per-provider `[resilience]` settings
-  (an operator who disables retries still gets the sub-batch retry today) is a
-  server-side change with no further design needed.
+- The sub-batch retry follows the retry configuration of the provider
+  called. The embeddings handler builds the `SubBatchRetry` of each upstream
+  call from the effective retry policy of its link (the provider's own
+  `retry_max_attempts` when it sets one, ADR 021, `[resilience]` otherwise)
+  with `SubBatchRetry::capped_at`: `retry_max_attempts = 1` turns the
+  sub-batch retry off, and a sub-batch never gets more attempts than the
+  policy allows nor more than the default 3 (a provider with
+  `retry_max_attempts = 6` still retries a sub-batch at most twice). The
+  delays (200 ms base, 5 s cap) and the 10 s budget are not configurable:
+  `retry_base_ms`, `retry_max_ms` and `retry_after_max_ms` apply to the
+  executor's retry only. The policy is read per request, so a hot reload
+  applies to the next request, like the executor's. `providers` still does
+  not depend on `router`: the server passes the attempt count.
 - Still open: the upstream usage of a failed executor attempt is lost to
   accounting (the sub-responses of an attempt that fails for good are
   dropped). Partial results stay rejected for v1.

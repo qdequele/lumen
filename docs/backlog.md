@@ -251,8 +251,9 @@ Follow-ups of the decisions spec (`docs/superpowers/specs/2026-10-08-decisions-d
   (provider-wide, model-agnostic) does not carry.
 - ~~**A failed sub-batch re-runs the whole embedding request (code review,
   needs a design decision).**~~ **Resolved**: `embed_batched` retries a failed
-  sub-batch on its own and keeps the completed sub-responses. Design, bounds
-  and what stays open (the usage of a failed attempt, a configurable policy):
+  sub-batch on its own and keeps the completed sub-responses, within the
+  retry configuration of the provider called (`retry_max_attempts = 1` turns
+  it off). Design, bounds and what stays open (the usage of a failed attempt):
   ADR 005, amendment of 2026-11-12 "sub-batch retry for split embedding
   requests" (`docs/adr/005-resilience-execution.md`).
 

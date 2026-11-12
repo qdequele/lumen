@@ -281,6 +281,11 @@ mode = "heuristic"                # "heuristic" (default) or "accurate"
 # past the total timeout (ADR 021). While streaming, a retry happens only if
 # no chunk has yet reached the client. A retry never bills twice. All four
 # retry knobs can be overridden per provider (see the ollama-local block).
+# An embeddings request split into several upstream calls (more inputs than
+# the provider takes per call) also retries a failed sub-batch on its own,
+# keeping the completed ones: up to min(3, retry_max_attempts) calls per
+# sub-batch and 10 s of waiting per request. `retry_max_attempts = 1` (here
+# or on the provider) turns that off too (ADR 005).
 retry_max_attempts = 3            # total attempts per provider incl. the first
                                   # (set to 1 to disable retries); must not be 0
 retry_base_ms = 200               # base backoff wait after the first failure

@@ -43,6 +43,14 @@ retry_after_max_ms = 60000   # longest upstream wait hint honoured
 
 Set `retry_max_attempts = 1` to disable retries entirely.
 
+An embeddings request with more inputs than the provider takes per call is
+split into several upstream calls. A sub-batch that fails with a retryable
+error is retried on its own, so the completed (and billed) sub-batches are
+kept: up to `min(3, retry_max_attempts)` calls per sub-batch, with at most
+10 s of waiting per request. It follows the same switch: with
+`retry_max_attempts = 1`, globally or on the provider called, a failed
+sub-batch is not retried.
+
 A retry never bills twice: a request is admitted once before the first
 attempt and settled once with the usage of the attempt that succeeded.
 
