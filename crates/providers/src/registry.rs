@@ -1108,12 +1108,11 @@ fn build_providers(
                 base_url.clone(),
                 spec.api_key.clone(),
             ));
-            let embed: Arc<dyn EmbeddingProvider> = Arc::new(OllamaProvider::new(
-                client.clone(),
-                spec.name.clone(),
-                base_url,
-                spec.strict,
-            ));
+            let embed: Arc<dyn EmbeddingProvider> = Arc::new(
+                OllamaProvider::new(client.clone(), spec.name.clone(), base_url, spec.strict)
+                    // Keyless in practice; forwarded if set, like chat above.
+                    .with_api_key(spec.api_key.clone()),
+            );
             Ok(BuiltProviders {
                 chat: Some(chat),
                 embed: Some(embed),
@@ -1607,6 +1606,55 @@ mod tests {
         assert!(reg.chat_route("m").is_some(), "ollama chat must resolve");
         assert!(reg.embedding_route("m").is_some(), "ollama embed");
         assert!(reg.rerank_route("m").is_none(), "ollama has no rerank");
+    }
+
+    /// An `api_key` configured on an ollama provider (an authenticating proxy
+    /// in front of it) must reach the native embed path as bearer auth, as it
+    /// already does for chat and decisions on the same provider.
+    #[tokio::test]
+    async fn ollama_embed_route_sends_the_configured_api_key() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/embed"))
+            .and(header("authorization", "Bearer sk-test-xxx"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "model": "m",
+                "embeddings": [[0.5]],
+                "prompt_eval_count": 1
+            })))
+            .expect(1)
+            .mount(&mock)
+            .await;
+
+        let reg = Registry::build(
+            vec![spec(
+                ProviderKind::Ollama,
+                "ollama",
+                Some(&mock.uri()),
+                vec![model("m", &[Capability::Embed])],
+            )],
+            reqwest::Client::new(),
+            Duration::from_secs(300),
+        )
+        .expect("ollama builds");
+        let route = reg.embedding_route("m").expect("embed route");
+        let req = lumen_core::EmbedRequest {
+            model: route.upstream_id.clone(),
+            input: lumen_core::EmbedInput::Single("hi".to_owned()),
+            encoding_format: None,
+            dimensions: None,
+            user: None,
+            extra: serde_json::Map::new(),
+        };
+        let resp = route
+            .provider
+            .embed(req, tokio_util::sync::CancellationToken::new())
+            .await
+            .expect("embed with bearer auth");
+        assert_eq!(resp.data.len(), 1);
     }
 
     #[test]

@@ -4,9 +4,13 @@
 //! documents plus a `relevance_score`); this helper guarantees the client-facing
 //! invariants regardless of upstream behaviour:
 //!
+//! * `top_n: 0` is a client error (400, `LM-1001`), raised before any
+//!   upstream call;
 //! * `top_n` is clamped to the document count (silently) before the upstream
 //!   call, and the result set is truncated to it afterwards (TEI, for instance,
 //!   has no `top_n` and returns every document);
+//! * every upstream `index` names a distinct request document (out of range or
+//!   duplicated is a translation error, never a silently wrong ranking);
 //! * results are sorted by descending `relevance_score` - the gateway never
 //!   trusts the upstream to have ordered them;
 //! * source document texts are echoed into `document` only when
@@ -15,7 +19,7 @@
 use std::cmp::Ordering;
 
 use lumen_core::{
-    ProviderError, RerankDocument, RerankProvider, RerankRequest, RerankResponse,
+    ProviderError, RerankDocument, RerankProvider, RerankRequest, RerankResponse, RerankResult,
     RerankResultDocument,
 };
 use tokio_util::sync::CancellationToken;
@@ -28,6 +32,18 @@ pub async fn rerank(
     mut req: RerankRequest,
     cancel: &CancellationToken,
 ) -> Result<RerankResponse, ProviderError> {
+    // `top_n: 0` asks for no result. Forwarded, it is a 400 on the upstreams
+    // that take `top_n` and a billed empty 200 on those that do not, so it is
+    // rejected here, before any upstream call, as a client error (400,
+    // LM-1001). The provider name is left empty: the caller's route name
+    // fills it in (`GatewayError::from_provider`).
+    if req.top_n == Some(0) {
+        return Err(ProviderError::UnsupportedInput {
+            provider: String::new(),
+            reason: "a `top_n` of 0 (it must be at least 1)".to_owned(),
+        });
+    }
+
     // Reduce object documents to a single ranking text at the edge, per
     // `rank_fields`, so every downstream provider only ever sees plain text.
     // A no-op for requests that are already all bare strings and set no
@@ -67,6 +83,7 @@ pub async fn rerank(
     };
 
     let mut resp = provider.rerank(req, cancel.clone()).await?;
+    check_indices(&resp.results, n_docs)?;
 
     // Defensive ordering: stable sort by descending score keeps upstream order
     // on ties. NaN scores (should never happen) sort as equal rather than panic.
@@ -92,12 +109,40 @@ pub async fn rerank(
     Ok(resp)
 }
 
+/// Reject upstream results whose `index` does not name a request document, or
+/// names the same document twice. The index is the only link between a score
+/// and its document (Cloudflare's `id` included), so a bad one would hand the
+/// client a score for the wrong document, or a result with no document to
+/// echo. That is the upstream's fault: a 502-class
+/// [`ProviderError::Translation`] (LM-3002), never a silently wrong ranking.
+fn check_indices(results: &[RerankResult], n_docs: usize) -> Result<(), ProviderError> {
+    let mut seen = vec![false; n_docs];
+    for result in results {
+        match seen.get_mut(result.index as usize) {
+            None => {
+                return Err(ProviderError::Translation(format!(
+                    "rerank result index {} is out of range for {n_docs} documents",
+                    result.index
+                )));
+            }
+            Some(slot) if *slot => {
+                return Err(ProviderError::Translation(format!(
+                    "duplicate rerank result index {}",
+                    result.index
+                )));
+            }
+            Some(slot) => *slot = true,
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 #[allow(clippy::float_cmp)] // exact scores are set by the tests themselves
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use lumen_core::{RerankResult, RerankUsage};
+    use lumen_core::RerankUsage;
 
     /// A provider that returns the given results verbatim, recording the
     /// `top_n` of each call so the clamp can be asserted.
@@ -223,6 +268,55 @@ mod tests {
             .await
             .unwrap();
         assert!(resp.results[0].document.is_none());
+    }
+
+    #[tokio::test]
+    async fn top_n_zero_is_rejected_before_the_provider_is_called() {
+        let provider = StubProvider::new(vec![result(0, 0.9)]);
+        let req = request(&["a"], Some(0), false);
+        let err = rerank(&provider, req, &CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ProviderError::UnsupportedInput { ref reason, .. } if reason.contains("top_n")),
+            "got {err:?}"
+        );
+        // A client fault: never retried, never held against the provider.
+        assert!(!err.is_retryable());
+        assert!(!err.is_provider_fault());
+        assert!(
+            provider.seen_top_n.lock().unwrap().is_empty(),
+            "no (billed) upstream call for a request that asks for nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn out_of_range_upstream_index_is_a_translation_error() {
+        // Two documents, but the upstream points at a third.
+        let provider = StubProvider::new(vec![result(0, 0.9), result(2, 0.8)]);
+        let req = request(&["a", "b"], None, true);
+        let err = rerank(&provider, req, &CancellationToken::new())
+            .await
+            .unwrap_err();
+        match err {
+            ProviderError::Translation(msg) => {
+                assert!(msg.contains("index 2"), "got: {msg}");
+            }
+            other => panic!("expected Translation, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn duplicated_upstream_index_is_a_translation_error() {
+        let provider = StubProvider::new(vec![result(1, 0.9), result(1, 0.8)]);
+        let req = request(&["a", "b"], None, false);
+        let err = rerank(&provider, req, &CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ProviderError::Translation(ref m) if m.contains("duplicate")),
+            "got {err:?}"
+        );
     }
 
     #[tokio::test]

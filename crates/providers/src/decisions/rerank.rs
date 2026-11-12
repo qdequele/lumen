@@ -678,6 +678,15 @@ impl DecisionRerankProvider {
             Some(_) => return Err(translation("expected a choice answer")),
             None => return Err(translation("no answer for the choice")),
         };
+        // The distribution IS the ranking. Upstreams may omit it (it is
+        // optional on the wire), and then every document would score 0.0 and
+        // the input order would be served as a successful rerank. An answer
+        // with no positive probability cannot rank anything.
+        if probabilities.iter().all(|(_, p)| *p <= 0.0) {
+            return Err(translation(
+                "choice answer carries no option probabilities to rank by",
+            ));
+        }
         let results = (0..req.documents.len())
             .map(|i| {
                 Ok(RerankResult {
@@ -1121,7 +1130,7 @@ mod tests {
     async fn choice_options_are_serialised_in_document_order() {
         let (p, fake) = provider(choice_template(), |_| Answer::Choice {
             choice: ChoiceValue::Str("d0".into()),
-            probabilities: Vec::new(),
+            probabilities: vec![(ChoiceValue::Str("d0".into()), 1.0)],
             confidence: None,
         });
         let docs: Vec<String> = (0..12).map(|i| format!("doc{i}")).collect();
@@ -1130,8 +1139,9 @@ mod tests {
             .rerank(request(&refs), CancellationToken::new())
             .await
             .unwrap();
-        // Missing probabilities score 0, never panic.
-        assert!(out.results.iter().all(|r| r.relevance_score == 0.0));
+        // Options missing from a partial distribution score 0, never panic.
+        assert_eq!(out.results[0].relevance_score, 1.0);
+        assert!(out.results[1..].iter().all(|r| r.relevance_score == 0.0));
         let seen = fake.seen.lock().unwrap()[0].clone();
         let mut last = 0;
         for i in 0..12 {
@@ -1140,6 +1150,37 @@ mod tests {
                 .unwrap_or_else(|| panic!("d{i} missing in {seen}"));
             assert!(at >= last, "d{i} out of order in {seen}");
             last = at;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_choice_with_an_empty_or_all_zero_distribution_is_a_translation_error() {
+        // Without a distribution every document would score 0.0 and the
+        // "ranking" would be the input order, served as a success.
+        let empty = |_: &str| Answer::Choice {
+            choice: ChoiceValue::Str("d1".into()),
+            probabilities: Vec::new(),
+            confidence: None,
+        };
+        let zeros = |_: &str| Answer::Choice {
+            choice: ChoiceValue::Str("d1".into()),
+            probabilities: vec![
+                (ChoiceValue::Str("d0".into()), 0.0),
+                (ChoiceValue::Str("d1".into()), 0.0),
+            ],
+            confidence: None,
+        };
+        let answers: [fn(&str) -> Answer; 2] = [empty, zeros];
+        for answer in answers {
+            let (p, _) = provider(choice_template(), answer);
+            let err = p
+                .rerank(request(&["a", "b"]), CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, ProviderError::Translation(ref m) if m.contains("probabilities")),
+                "{err:?}"
+            );
         }
     }
 
