@@ -85,7 +85,12 @@ impl EmbeddingProvider for JinaProvider {
         // is OpenAI-shaped either way.
         let url = format!("{}/embeddings", self.base_url);
         let bytes = if let EmbedInput::Multi(items) = &req.input {
-            let body = json!({ "model": req.model, "input": jina_multimodal_input(items) });
+            let mut body = json!({ "model": req.model, "input": jina_multimodal_input(items) });
+            // Jina names the output width `dimensions`, like OpenAI; without
+            // it the request would silently return full-width vectors.
+            if let Some(dimensions) = req.dimensions {
+                body["dimensions"] = json!(dimensions);
+            }
             post_json(
                 &self.client,
                 &url,

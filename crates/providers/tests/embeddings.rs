@@ -1605,6 +1605,60 @@ async fn voyage_embed_reports_upstream_total_tokens_as_prompt_tokens() {
     assert_eq!(resp.usage.estimated, None);
 }
 
+/// Embed one text with `dimensions: 256` through `fx` and return the body the
+/// upstream received.
+async fn body_sent_with_dimensions(fx: &dyn EmbedFixture) -> Value {
+    let mock = MockServer::start().await;
+    fx.mount_echo(&mock).await;
+    let provider = fx.build(mock.uri());
+
+    let mut req = req_for(fx, vec!["0".into()]);
+    req.dimensions = Some(256);
+    provider.embed(req, CancellationToken::new()).await.unwrap();
+
+    let requests = mock.received_requests().await.unwrap();
+    serde_json::from_slice(&requests[0].body).unwrap()
+}
+
+/// Cohere v2 embed names the output width `output_dimension`; a requested
+/// `dimensions` must reach the upstream instead of being silently dropped.
+#[tokio::test]
+async fn cohere_embed_maps_dimensions_to_output_dimension() {
+    let body = body_sent_with_dimensions(&CohereEmbedFixture).await;
+    assert_eq!(body["output_dimension"], 256);
+    assert!(body.get("dimensions").is_none(), "got body: {body}");
+}
+
+/// Cohere omits `output_dimension` when the client sets no `dimensions`.
+#[tokio::test]
+async fn cohere_embed_omits_output_dimension_by_default() {
+    let mock = MockServer::start().await;
+    CohereEmbedFixture.mount_echo(&mock).await;
+    let provider = CohereEmbedFixture.build(mock.uri());
+    let req = batch_request(vec!["0".into()]);
+    provider.embed(req, CancellationToken::new()).await.unwrap();
+    let requests = mock.received_requests().await.unwrap();
+    let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert!(body.get("output_dimension").is_none(), "got body: {body}");
+}
+
+/// TEI's `/embed` accepts `dimensions` natively; it must be forwarded.
+#[tokio::test]
+async fn tei_embed_forwards_dimensions() {
+    let body = body_sent_with_dimensions(&TeiEmbedFixture).await;
+    assert_eq!(body["dimensions"], 256);
+
+    // Absent by default.
+    let mock = MockServer::start().await;
+    TeiEmbedFixture.mount_echo(&mock).await;
+    let provider = TeiEmbedFixture.build(mock.uri());
+    let req = batch_request(vec!["0".into()]);
+    provider.embed(req, CancellationToken::new()).await.unwrap();
+    let requests = mock.received_requests().await.unwrap();
+    let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(body, json!({ "inputs": ["0"] }));
+}
+
 /// A two-item multimodal batch whose second item carries two text fragments.
 fn two_items_one_multipart() -> EmbedInput {
     let part = |t: &str| ContentPart {

@@ -420,3 +420,80 @@ async fn jina_multi_text_part_item_joins_fragments_with_newline() {
     let body = sent_body(&upstream).await;
     assert_eq!(body["input"][0]["text"], "The quick brown\nfox jumps");
 }
+
+/// A requested `dimensions` reaches Cohere's multimodal body as
+/// `output_dimension` (embed-v4), and is omitted when unset.
+#[tokio::test]
+async fn cohere_multimodal_maps_dimensions_to_output_dimension() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "embeddings": { "float": [[0.1, 0.2]] },
+            "meta": { "billed_units": { "input_tokens": 5 } }
+        })))
+        .mount(&upstream)
+        .await;
+    let provider: Arc<dyn EmbeddingProvider> = Arc::new(CohereProvider::new(
+        http::build_client(),
+        "cohere-test",
+        Some(upstream.uri()),
+        Some("sk-x".to_owned()),
+    ));
+
+    let mut req = multimodal_request("embed-v4.0");
+    req.dimensions = Some(512);
+    provider.embed(req, CancellationToken::new()).await.unwrap();
+    let body = sent_body(&upstream).await;
+    assert_eq!(body["output_dimension"], 512);
+
+    upstream.reset().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "embeddings": { "float": [[0.1, 0.2]] }
+        })))
+        .mount(&upstream)
+        .await;
+    provider
+        .embed(multimodal_request("embed-v4.0"), CancellationToken::new())
+        .await
+        .unwrap();
+    let body = sent_body(&upstream).await;
+    assert!(body.get("output_dimension").is_none(), "got body: {body}");
+}
+
+/// Jina's multimodal body carries `dimensions` (its own parameter name) when
+/// the client sets it, and omits it otherwise.
+#[tokio::test]
+async fn jina_multimodal_forwards_dimensions() {
+    let upstream = MockServer::start().await;
+    let provider: Arc<dyn EmbeddingProvider> = Arc::new(JinaProvider::new(
+        http::build_client(),
+        "jina-test",
+        Some(upstream.uri()),
+        Some("sk-x".to_owned()),
+    ));
+
+    for dimensions in [Some(512), None] {
+        upstream.reset().await;
+        Mock::given(method("POST"))
+            .and(path("/embeddings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "object": "list",
+                "data": [{ "object": "embedding", "index": 0, "embedding": [0.1] }],
+                "model": "jina-clip-v2",
+                "usage": { "prompt_tokens": 4, "total_tokens": 4 }
+            })))
+            .mount(&upstream)
+            .await;
+
+        let mut req = multimodal_request("jina-clip-v2");
+        req.dimensions = dimensions;
+        provider.embed(req, CancellationToken::new()).await.unwrap();
+
+        let body = sent_body(&upstream).await;
+        match dimensions {
+            Some(d) => assert_eq!(body["dimensions"], d),
+            None => assert!(body.get("dimensions").is_none(), "got body: {body}"),
+        }
+    }
+}

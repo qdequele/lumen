@@ -7,7 +7,8 @@
 //! * chat: `POST /v2/chat` - request/response translation lives in [`chat`],
 //!   SSE streaming-event translation in [`stream`] (see their module docs -
 //!   the wire shape is OpenAI-adjacent, closer than Anthropic's);
-//! * embed: `POST /v2/embed` takes `{ model, texts, input_type, embedding_types }`
+//! * embed: `POST /v2/embed` takes `{ model, texts, input_type, embedding_types,
+//!   output_dimension }`
 //!   and returns `{ embeddings: { float: [[..]] }, meta: { billed_units } }`.
 //!   `input_type` defaults to `search_document` but a caller may override it
 //!   (e.g. `search_query`) via the `input_type` field on an otherwise
@@ -222,6 +223,10 @@ struct CohereEmbedRequest<'a> {
     /// honors a caller's override (issue #22) - see [`resolve_input_type`].
     input_type: &'a str,
     embedding_types: [&'static str; 1],
+    /// Cohere's name for `dimensions` (embed-v4 and newer); omitted when the
+    /// client sets none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_dimension: Option<u32>,
 }
 
 /// Multimodal request body (embed-v4): each batch item becomes one `inputs`
@@ -232,6 +237,9 @@ struct CohereEmbedMultiRequest<'a> {
     inputs: Vec<CohereInput<'a>>,
     input_type: &'a str,
     embedding_types: [&'static str; 1],
+    /// Cohere's name for `dimensions`; omitted when the client sets none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_dimension: Option<u32>,
 }
 
 #[derive(Serialize)]
@@ -283,6 +291,11 @@ fn resolve_input_type(req: &EmbedRequest) -> &str {
 /// Build the request body, choosing the text `texts` shape or the multimodal
 /// `inputs` content-array shape (used whenever the input is a content-parts
 /// batch, so per-item grouping and images are preserved).
+///
+/// A requested `dimensions` is sent as Cohere's `output_dimension`. Only
+/// embed-v4 and newer accept it; it is forwarded for every model so an
+/// unsupported model or size fails upstream instead of silently returning
+/// full-width vectors.
 fn build_cohere_body(req: &EmbedRequest) -> CohereEmbedBody<'_> {
     let input_type = resolve_input_type(req);
     match &req.input {
@@ -302,6 +315,7 @@ fn build_cohere_body(req: &EmbedRequest) -> CohereEmbedBody<'_> {
                 inputs,
                 input_type,
                 embedding_types: ["float"],
+                output_dimension: req.dimensions,
             })
         }
         // Token-array inputs never reach here: `embed()` rejects them up front
@@ -315,6 +329,7 @@ fn build_cohere_body(req: &EmbedRequest) -> CohereEmbedBody<'_> {
             texts: req.input.iter().collect(),
             input_type,
             embedding_types: ["float"],
+            output_dimension: req.dimensions,
         }),
     }
 }
