@@ -63,6 +63,9 @@ jsonwebtoken = { version = "11", default-features = false, features = ["use_pem"
 # Logging / metrics
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
+# Non-blocking log writer: stdout writes happen on a dedicated thread, never on
+# a runtime worker (crates/telemetry/src/logging.rs).
+tracing-appender = "0.2"
 prometheus = { version = "0.14", default-features = false }
 
 # Config
