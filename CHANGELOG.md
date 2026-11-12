@@ -173,11 +173,13 @@ All notable changes to LUMEN are documented here. The format is based on
 - **Logs are written through a bounded, non-blocking queue.** Every log
   line was a blocking write to stdout on a runtime worker, so a slow log
   pipe could stall request handling. Lines now go into a queue of 16,384
-  lines drained by a dedicated thread, and shutdown flushes what is queued.
+  lines drained by a dedicated thread. Shutdown flushes what is queued, and
+  so does a panic, for a little over a second before the process aborts.
   The output format is unchanged.
   Upgrade note: when stdout stalls long enough to fill the queue, further
-  lines are dropped instead of blocking requests, and the number of lines
-  dropped is printed on stderr at exit.
+  lines are dropped instead of blocking requests. The new counter
+  `lumen_log_lines_dropped_total` on `/metrics` reports them, and the total
+  is printed on stderr at exit.
 
 - **Image fetches share one HTTP client.** Every image, and every redirect
   hop, built a new client to pin the vetted DNS address, with its TLS
