@@ -92,6 +92,11 @@ impl CostTable {
     /// breakdown larger than `tokens_in` is clamped, so the three parts
     /// always sum to `tokens_in` and a malformed upstream count can never
     /// produce a negative or inflated input.
+    ///
+    /// The result is bit-identical to [`token_cost`](Self::token_cost)
+    /// whenever the breakdown cannot change the price: no cached or written
+    /// token, or cache rates equal to the input rate (the default when none
+    /// is configured).
     #[must_use]
     pub fn token_cost_with_cache(
         &self,
@@ -104,11 +109,24 @@ impl CostTable {
         self.prices.get(model).map_or(0.0, |p| {
             let cached = cached.unwrap_or(0).min(tokens_in);
             let cache_write = cache_write.unwrap_or(0).min(tokens_in - cached);
-            let plain = tokens_in - cached - cache_write;
-            to_f64(plain) * p.input_token
-                + to_f64(cached) * p.cached_input_token
-                + to_f64(cache_write) * p.cache_write_token
-                + to_f64(tokens_out) * p.output_token
+            // A part priced at the input rate (no cache rate configured, or
+            // one equal to it) or holding no token adds nothing a single
+            // product does not already cover. Splitting the input anyway
+            // would round three products instead of one and could land one
+            // ULP away from `token_cost`, so the split is only made when it
+            // changes the price.
+            let same_rate = |rate: f64| rate.to_bits() == p.input_token.to_bits();
+            let input = if (cached == 0 || same_rate(p.cached_input_token))
+                && (cache_write == 0 || same_rate(p.cache_write_token))
+            {
+                to_f64(tokens_in) * p.input_token
+            } else {
+                let plain = tokens_in - cached - cache_write;
+                to_f64(plain) * p.input_token
+                    + to_f64(cached) * p.cached_input_token
+                    + to_f64(cache_write) * p.cache_write_token
+            };
+            input + to_f64(tokens_out) * p.output_token
         })
     }
 
@@ -214,10 +232,40 @@ mod tests {
             Some(600_000),
             Some(200_000),
         );
-        assert!(
-            (flat - with_breakdown).abs() < 1e-12,
-            "{flat} {with_breakdown}"
+        assert_eq!(flat.to_bits(), with_breakdown.to_bits());
+
+        // Bit for bit, not merely close: summing three partial products
+        // rounds differently from one product (one ULP apart here).
+        // 123457 plain + 654321 cached + 222223 written, at 2.5 per 1M.
+        let t = table(
+            r#"
+            [[providers]]
+            name = "openai"
+            kind = "openai"
+            [[providers.models]]
+            id = "openai/gpt"
+            capabilities = ["chat"]
+            cost_per_1m_input = 2.5
+            cost_per_1m_output = 10.0
+        "#,
         );
+        for tokens_out in [0, 100_000] {
+            let flat = t.token_cost("openai/gpt", 1_000_001, tokens_out);
+            let with_breakdown = t.token_cost_with_cache(
+                "openai/gpt",
+                1_000_001,
+                tokens_out,
+                Some(654_321),
+                Some(222_223),
+            );
+            assert_eq!(flat.to_bits(), with_breakdown.to_bits());
+        }
+        // A breakdown that clamps to nothing is the flat cost too, whatever
+        // the cache rates are.
+        let t = table(CACHE_PRICED);
+        let flat = t.token_cost("anthropic/claude", 1_000_001, 7);
+        let zeroes = t.token_cost_with_cache("anthropic/claude", 1_000_001, 7, Some(0), Some(0));
+        assert_eq!(flat.to_bits(), zeroes.to_bits());
 
         // Only the read rate set: written tokens stay at the input rate.
         let t = table(CACHE_PRICED);
