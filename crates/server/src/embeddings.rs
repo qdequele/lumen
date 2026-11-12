@@ -171,36 +171,34 @@ pub async fn embeddings(
     .await?;
 
     // Execute across the chain with retries, fallback, circuit breaking and the
-    // per-model timeouts. A fresh request clone (per attempt/link) carries that
-    // link's upstream id.
+    // per-model timeouts. The client's request is shared by reference across
+    // attempts, retries and key rotations: the one copy an upstream call needs
+    // (providers take their request by value) is made when a provider is about
+    // to be called, carrying that attempt's overrides and upstream id.
     let executed =
         lumen_router::executor::execute(&links, &state.resilience.breakers, &exec, &cancel, |i| {
-            let platform = chain[i].route.provider.clone();
-            let provider_name = chain[i].route.provider_name.clone();
-            let cancel = cancel.clone();
-            let mut attempt_req = req.clone();
-            decision.attempts[i].apply(&mut attempt_req);
-            chain[i]
-                .route
-                .upstream_id
-                .clone_into(&mut attempt_req.model);
-            let (keys, registry, mark) = (&keys, &*state.registry, &mark);
+            let link = &chain[i].route;
+            let platform = link.provider.clone();
+            let provider_name = link.provider_name.as_str();
+            let attempt = &decision.attempts[i];
+            let (keys, registry, mark, req, cancel) =
+                (&keys, &*state.registry, &mark, &req, &cancel);
             async move {
                 // Marked only when an upstream call is actually sent.
-                let call = |provider: Option<Arc<dyn lumen_core::EmbeddingProvider>>| {
-                    let (req, cancel, name) =
-                        (attempt_req.clone(), cancel.clone(), provider_name.clone());
-                    async move {
-                        let provider =
-                            provider.ok_or(ProviderError::Unavailable { provider: name })?;
-                        mark.mark();
-                        embed_upstream(provider.as_ref(), req, &cancel).await
-                    }
+                let call = |provider: Option<Arc<dyn EmbeddingProvider>>| async move {
+                    let provider = provider.ok_or_else(|| ProviderError::Unavailable {
+                        provider: provider_name.to_owned(),
+                    })?;
+                    mark.mark();
+                    let mut attempt_req = req.clone();
+                    attempt.apply(&mut attempt_req);
+                    link.upstream_id.clone_into(&mut attempt_req.model);
+                    embed_upstream(provider.as_ref(), attempt_req, cancel).await
                 };
                 keys.attempt(
                     registry,
                     i,
-                    &provider_name,
+                    provider_name,
                     || call(Some(platform)),
                     |set| call(set.embed.clone()),
                 )

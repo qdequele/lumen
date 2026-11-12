@@ -227,6 +227,35 @@ fn bench_decisions(c: &mut Criterion) {
     }
 }
 
+/// The cost of one deep copy of a chat request. The handlers make one per
+/// upstream call (the copy the provider consumes); they used to make two.
+fn bench_request_clone(c: &mut Criterion) {
+    let small = sample_request();
+    let mut large = sample_request();
+    // A 12-turn conversation of ~8 KB with a tool definition.
+    let turn = large.messages[1].clone();
+    for i in 0..12 {
+        let mut message = turn.clone();
+        message.content = Some(MessageContent::Text(format!(
+            "turn {i}: {}",
+            "x".repeat(660)
+        )));
+        large.messages.push(message);
+    }
+    large.extra.insert(
+        "tools".to_owned(),
+        serde_json::json!([{ "type": "function", "function": {
+            "name": "search", "description": "Search the index.",
+            "parameters": { "type": "object", "properties": {
+                "q": { "type": "string" }, "limit": { "type": "integer" } } } } }]),
+    );
+    for (name, req) in [("small", small), ("8k", large)] {
+        c.bench_function(&format!("chat_request_clone_{name}"), |b| {
+            b.iter(|| black_box(black_box(&req).clone()));
+        });
+    }
+}
+
 /// An OpenAI-format completion body whose answer is `content_bytes` long.
 fn completion_body(content_bytes: usize) -> bytes::Bytes {
     let content = "The quick brown fox. ".repeat(content_bytes / 21 + 1);
@@ -332,6 +361,7 @@ criterion_group!(
     bench_executor,
     bench_json_roundtrip,
     bench_decisions,
+    bench_request_clone,
     bench_response_passthrough,
     bench_embeddings_passthrough
 );

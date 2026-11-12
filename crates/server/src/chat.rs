@@ -350,6 +350,28 @@ struct ChatExec<'a> {
     keys: &'a RequestKeys,
 }
 
+impl ChatExec<'_> {
+    /// The request one upstream call sends for link `i`: the client's request
+    /// with that attempt's overrides (ADR 014) and the link's upstream model
+    /// id. `stream` is forced on for the streaming path and left as the
+    /// client sent it otherwise.
+    ///
+    /// This is the only deep copy of the request on the request path. The
+    /// client's request stays shared by reference across every attempt, retry
+    /// and key rotation; a copy is made here, when a provider is about to be
+    /// called, because [`ChatProvider`] takes its request by value (providers
+    /// rewrite and consume it).
+    fn attempt_request(&self, i: usize, stream: bool) -> ChatRequest {
+        let mut req = self.req.clone();
+        self.decision.attempts[i].apply(&mut req);
+        if stream {
+            req.stream = true;
+        }
+        self.chain[i].route.upstream_id.clone_into(&mut req.model);
+        req
+    }
+}
+
 /// Streaming path: open the upstream byte stream and peek its first frame with
 /// retry/fallback (only before the first content frame reaches the client,
 /// spec 6.2 + ADR 005 2026-07-15), then hand it to the M4 frame guards.
@@ -368,15 +390,8 @@ async fn chat_streaming(
         ctx.cancel,
         |i| {
             let platform = ctx.chain[i].route.provider.clone();
-            let provider_name = ctx.chain[i].route.provider_name.clone();
-            let cancel = ctx.cancel.clone();
-            let mut attempt_req = ctx.req.clone();
-            ctx.decision.attempts[i].apply(&mut attempt_req);
-            attempt_req.stream = true;
-            ctx.chain[i]
-                .route
-                .upstream_id
-                .clone_into(&mut attempt_req.model);
+            let provider_name = ctx.chain[i].route.provider_name.as_str();
+            let cancel = ctx.cancel;
             let (keys, registry, mark) = (ctx.keys, &*ctx.state.registry, ctx.mark);
             async move {
                 // Open, then PEEK the first frame before committing (ADR 005,
@@ -388,22 +403,19 @@ async fn chat_streaming(
                 // over too. Once a content frame arrives we commit and the M4
                 // frame guards own the rest (no mid-stream retry). Marked only
                 // when an upstream call is actually sent (platform or team key).
-                let open = |provider: Option<Arc<dyn ChatProvider>>| {
-                    let (req, cancel, name) =
-                        (attempt_req.clone(), cancel.clone(), provider_name.clone());
-                    async move {
-                        let provider = provider.ok_or(ProviderError::Unavailable {
-                            provider: name.clone(),
-                        })?;
-                        mark.mark();
-                        let stream = provider.chat_stream_bytes(req, cancel.clone()).await?;
-                        lumen_router::peek::peek_first_frame(stream, &name, &cancel).await
-                    }
+                let open = |provider: Option<Arc<dyn ChatProvider>>| async move {
+                    let provider = provider.ok_or_else(|| ProviderError::Unavailable {
+                        provider: provider_name.to_owned(),
+                    })?;
+                    mark.mark();
+                    let req = ctx.attempt_request(i, true);
+                    let stream = provider.chat_stream_bytes(req, cancel.clone()).await?;
+                    lumen_router::peek::peek_first_frame(stream, provider_name, cancel).await
                 };
                 keys.attempt(
                     registry,
                     i,
-                    &provider_name,
+                    provider_name,
                     || open(Some(platform)),
                     |set| open(set.chat.clone()),
                 )
@@ -465,31 +477,23 @@ async fn chat_non_streaming(
         ctx.cancel,
         |i| {
             let platform = ctx.chain[i].route.provider.clone();
-            let provider_name = ctx.chain[i].route.provider_name.clone();
-            let cancel = ctx.cancel.clone();
-            let mut attempt_req = ctx.req.clone();
-            ctx.decision.attempts[i].apply(&mut attempt_req);
-            ctx.chain[i]
-                .route
-                .upstream_id
-                .clone_into(&mut attempt_req.model);
+            let provider_name = ctx.chain[i].route.provider_name.as_str();
+            let cancel = ctx.cancel;
             let (keys, registry, mark) = (ctx.keys, &*ctx.state.registry, ctx.mark);
             async move {
                 // Marked only when an upstream call is actually sent.
-                let call = |provider: Option<Arc<dyn ChatProvider>>| {
-                    let (req, cancel, name) =
-                        (attempt_req.clone(), cancel.clone(), provider_name.clone());
-                    async move {
-                        let provider =
-                            provider.ok_or(ProviderError::Unavailable { provider: name })?;
-                        mark.mark();
-                        provider.chat_completion(req, cancel).await
-                    }
+                let call = |provider: Option<Arc<dyn ChatProvider>>| async move {
+                    let provider = provider.ok_or_else(|| ProviderError::Unavailable {
+                        provider: provider_name.to_owned(),
+                    })?;
+                    mark.mark();
+                    let req = ctx.attempt_request(i, false);
+                    provider.chat_completion(req, cancel.clone()).await
                 };
                 keys.attempt(
                     registry,
                     i,
-                    &provider_name,
+                    provider_name,
                     || call(Some(platform)),
                     |set| call(set.chat.clone()),
                 )

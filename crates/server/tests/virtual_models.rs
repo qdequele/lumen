@@ -367,6 +367,64 @@ async fn preset_and_overrides_reach_the_upstream_body() {
     );
 }
 
+/// Each upstream call is built from the client's request, never from the
+/// request a previous attempt sent: one target's overrides and upstream id do
+/// not leak into the retry of the same target or into the next target.
+#[tokio::test]
+async fn each_attempt_sends_its_own_overrides_and_upstream_id() {
+    let (a, b) = (
+        upstream(503, "model-a").await,
+        upstream(200, "model-b").await,
+    );
+    let cfg = load(
+        &two_providers(
+            &a.uri(),
+            &b.uri(),
+            r#"
+        [[virtual_models]]
+        id = "acme/bot"
+        capability = "chat"
+        strategy = "fallback"
+        targets = [
+            { model = "a/model-a", overrides = { set = { max_tokens = 11 }, drop = ["seed"] } },
+            { model = "b/model-b" },
+        ]
+    "#,
+        )
+        .replace("retry_max_attempts = 1", "retry_max_attempts = 2"),
+    );
+    let base = spawn(&cfg, &cfg).await;
+    let resp = post(
+        &base,
+        json!({ "model": "acme/bot", "seed": 1,
+        "messages": [{ "role": "user", "content": "hi" }] }),
+        &[],
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(header(&resp, "x-lumen-model-used"), Some("b/model-b"));
+
+    let to_a = a.received_requests().await.unwrap();
+    assert!(
+        to_a.len() >= 2,
+        "the first target is retried: {}",
+        to_a.len()
+    );
+    for request in &to_a {
+        let sent: Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(sent["model"], json!("model-a"));
+        assert_eq!(sent["max_tokens"], json!(11));
+        assert!(sent.get("seed").is_none());
+    }
+    let to_b = b.received_requests().await.unwrap();
+    assert_eq!(to_b.len(), 1);
+    let sent: Value = serde_json::from_slice(&to_b[0].body).unwrap();
+    assert_eq!(sent["model"], json!("model-b"));
+    assert_eq!(sent["seed"], json!(1));
+    assert!(sent.get("max_tokens").is_none());
+    assert_eq!(sent["messages"][0]["content"], json!("hi"));
+}
+
 #[tokio::test]
 async fn an_encoding_format_override_sets_the_response_encoding() {
     let b = MockServer::start().await;
