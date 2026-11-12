@@ -1604,6 +1604,45 @@ impl Config {
         Self::from_figment(&figment, &label)
     }
 
+    /// Load the BOOT file and run every boot check that needs no database:
+    /// [`Self::load`], then, in `config_source = "db"` mode, the two rules
+    /// ADR 012 puts on that file (boot-layer keys only, see
+    /// [`ensure_boot_only`], and `auth.enabled = true`, since the dynamic
+    /// document lives in the auth database).
+    ///
+    /// The one preflight shared by the real boot and `--check-config`, so
+    /// the deploy gate can never print "config OK" for a boot file the
+    /// process then refuses to start from.
+    ///
+    /// Synchronous file I/O: call it before the runtime starts or on the
+    /// blocking pool.
+    ///
+    /// # Errors
+    /// Everything [`Self::load`] returns, plus
+    /// [`ConfigError::DynamicKeyInBootConfig`] and a
+    /// [`ConfigError::Validation`] for db mode without auth.
+    pub fn load_boot(path: &Path) -> Result<Self, ConfigError> {
+        let boot = Self::load(path)?;
+        if boot.config_source == ConfigSourceKind::Db {
+            let label = path.display().to_string();
+            let text = std::fs::read_to_string(path).map_err(|e| ConfigError::Parse {
+                path: label.clone(),
+                // An I/O error kind only: no file content can be in it.
+                message: format!("could not read the file: {e}"),
+            })?;
+            ensure_boot_only(&text, &label)?;
+            if !boot.auth.enabled {
+                return Err(ConfigError::Validation {
+                    path: label,
+                    message: "config_source = \"db\" requires [auth] enabled = true with a \
+                              database"
+                        .to_owned(),
+                });
+            }
+        }
+        Ok(boot)
+    }
+
     /// Load and validate configuration for `config_source = "db"` boot
     /// (ADR 012): `boot_path` supplies the boot layer (server bind, log
     /// format, `auth.enabled` / `auth.db_path`, `config_source`), and

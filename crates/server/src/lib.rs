@@ -91,10 +91,14 @@ pub enum ConfigCheckError {
 }
 
 /// Load and fully validate the config at `path` the same way the server does
-/// at boot: parsing, semantic validation (`Config::load`) and provider
-/// registry construction (`build_registry`), which additionally catches
-/// provider/model reference errors that only surface once the registry is
-/// built (e.g. a missing `base_url`).
+/// at boot: parsing, semantic validation and the `config_source = "db"`
+/// boot-file rules ([`Config::load_boot`], the preflight the boot path runs
+/// too) and provider registry construction (`build_registry`), which
+/// additionally catches provider/model reference errors that only surface
+/// once the registry is built (e.g. a missing `base_url`).
+///
+/// In `config_source = "db"` mode only the boot file is checked: the stored
+/// dynamic document lives in the database, which this never opens.
 ///
 /// Deliberately local-only, so it is safe to run ahead of a real boot in a CI
 /// or deploy pipeline: it never binds a listener, opens the auth database, or
@@ -104,7 +108,7 @@ pub enum ConfigCheckError {
 /// Returns [`ConfigCheckError`] if the config fails to load, fails semantic
 /// validation, or describes an invalid provider registry.
 pub fn check_config(path: &Path) -> Result<ConfigCheckReport, ConfigCheckError> {
-    let config = Config::load(path)?;
+    let config = Config::load_boot(path)?;
     let provider_count = config.providers.len();
     let model_count = config.providers.iter().map(|p| p.models.len()).sum();
     build_registry(&config)?;
