@@ -19,7 +19,7 @@ pub mod webhooks;
 
 pub use decisions::DecisionMetrics;
 pub use latency::LatencyMetrics;
-pub use logging::init_logging;
+pub use logging::{init_logging, LogGuard};
 pub use metrics::Metrics;
 pub use reload::ReloadMetrics;
 pub use resilience::ResilienceMetrics;

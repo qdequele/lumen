@@ -154,7 +154,9 @@ fn main() -> ExitCode {
     };
 
     // Logging is initialised only after config parses, so the format is known.
-    init_logging(config.log_format.into(), "info");
+    // The guard owns the log writer thread: it lives until `main` returns, where
+    // dropping it flushes every queued line (including the error logged below).
+    let _log_guard = init_logging(config.log_format.into(), "info");
 
     match run(config_path) {
         Ok(()) => ExitCode::SUCCESS,
