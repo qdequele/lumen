@@ -2,6 +2,8 @@
 //!
 //! Both of Mistral's `chat/completions` and `embeddings` endpoints are
 //! OpenAI-compatible, so this is a near-passthrough (like [`crate::openai`]).
+//! One exception: reasoning models answer with `content` as an array of
+//! chunks, which [`content`] flattens to the OpenAI string shape.
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -15,6 +17,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::chat::{enable_stream_usage, single_shot_stream};
 use crate::http::{open_stream, post_json};
+
+mod content;
 
 /// Default Mistral API base (includes the `/v1` prefix).
 pub(crate) const DEFAULT_BASE_URL: &str = "https://api.mistral.ai/v1";
@@ -86,8 +90,9 @@ impl MistralProvider {
         req.stream = false;
         // Mistral has no `developer` role (OpenAI's alias for `system`).
         developer_role_as_system(&mut req.messages);
+        content::strip_reasoning(&mut req.messages);
         let url = format!("{}/chat/completions", self.base_url);
-        post_json(
+        let body = post_json(
             &self.client,
             &url,
             &req,
@@ -95,7 +100,10 @@ impl MistralProvider {
             &self.provider_name,
             cancel,
         )
-        .await
+        .await?;
+        // Reasoning models send `content` as chunks: flatten them so the
+        // body (forwarded or parsed) has OpenAI's string content.
+        Ok(content::normalize_completion(body))
     }
 }
 
@@ -148,11 +156,13 @@ impl ChatProvider for MistralProvider {
         mut req: ChatRequest,
         cancel: CancellationToken,
     ) -> Result<BoxStream<'static, Result<Bytes, ProviderError>>, ProviderError> {
-        // Zero-copy passthrough (Mistral speaks OpenAI SSE). See ADR 004.
+        // Zero-copy passthrough (Mistral speaks OpenAI SSE), except for the
+        // frames whose `content` is an array of chunks. See ADR 004.
         enable_stream_usage(&mut req);
         developer_role_as_system(&mut req.messages);
+        content::strip_reasoning(&mut req.messages);
         let url = format!("{}/chat/completions", self.base_url);
-        open_stream(
+        let bytes = open_stream(
             &self.client,
             &url,
             &req,
@@ -160,7 +170,8 @@ impl ChatProvider for MistralProvider {
             &self.provider_name,
             &cancel,
         )
-        .await
+        .await?;
+        Ok(content::normalize_stream(bytes))
     }
 }
 

@@ -46,6 +46,13 @@ impl SseParser {
         Self::default()
     }
 
+    /// Whether no incomplete event is buffered: the next chunk starts a new
+    /// event.
+    #[must_use]
+    pub fn is_idle(&self) -> bool {
+        self.buffer.is_empty()
+    }
+
     /// Feed one raw chunk; return every event completed by it.
     ///
     /// # Errors
