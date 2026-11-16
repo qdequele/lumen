@@ -185,3 +185,34 @@ profile, a shared and noisy host; medians):
 
 The float probe still walks every digit to find the end of the array; only the
 number conversion, the `Vec<f32>` and the re-serialization are gone.
+
+## Amendment 2026-11-16 - Mistral content chunks
+
+Mistral's reasoning models (Magistral, Mistral Large 4) answer with
+`content` as an array of chunks, `thinking` and `text`, in a completion and
+in every streamed delta of the thinking phase. OpenAI clients expect a
+string there: the Lab playground printed `[object Object]` for each chunk,
+and typed OpenAI SDKs fail to parse it. Forwarding those bytes was not "the
+upstream speaks the OpenAI schema", so the Mistral provider now rewrites
+them, and only them:
+
+- `content` becomes the `text` chunks joined, or `""` when there is none
+  (never `null`, so a client that appends each delta keeps a clean string);
+- the thinking text goes to `reasoning_content`, the field DeepSeek, vLLM
+  and others use for it;
+- `reasoning_content` on a message the client sends back is dropped before
+  the call, as Mistral rejects fields it does not know.
+
+**What stays zero-copy.** A cheap byte scan for `"content"` followed by `[`
+decides. A completion body without one is forwarded as received (it is then
+probed like any other, amendment 2026-11-12). On a stream, a transport chunk
+that starts and ends on a frame boundary and holds no content array is
+forwarded untouched, which is every chunk of a non-reasoning model. A chunk
+that does not, goes through the SSE parser (`sse.rs`); each complete frame
+is written back as `data: ...` lines, parsed and rewritten only when it
+carries a content array, and an incomplete frame waits for the next chunk.
+Comment frames (`: ping`) on that slow path are not forwarded.
+
+**What changes for clients.** A rewritten body or frame is re-serialized:
+key order and spacing change, values do not. Usage is untouched, so token
+accounting (ADR 003) reads the same numbers.

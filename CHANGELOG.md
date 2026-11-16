@@ -206,6 +206,17 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ### Fixed
 
+- **Mistral reasoning models answer with string content.** Magistral and
+  Mistral Large 4 send `content` as an array of `thinking` and `text`
+  chunks, and the gateway forwarded it as is: OpenAI clients got objects
+  where they expect a string (the Lab playground printed `[object Object]`
+  for every streamed chunk, typed SDKs failed to parse the answer). The
+  Mistral provider now returns OpenAI's shape, streamed or not: `content` is
+  the text, and the thinking is in `reasoning_content`. A
+  `reasoning_content` sent back on an assistant message is dropped before
+  the call, since Mistral rejects it. Answers from other Mistral models are
+  still forwarded byte for byte.
+
 - **A `server.body_limit` above 2 MiB is now honoured.** The JSON extractors
   kept axum's built-in 2 MiB cap whatever `server.body_limit` said, so with
   the default 10 MiB limit (or the 32 MiB the decisions docs recommend) a

@@ -176,6 +176,11 @@ cost_per_1m_input = 0.10
 - **Auth**: `api_key_env` (e.g. `MISTRAL_API_KEY`), bearer token.
 - **base_url**: optional override.
 - **Embed batch limit**: 512.
+- **Reasoning models** (Magistral, Mistral Large 4): Mistral sends their
+  answer as `thinking` and `text` chunks. LUMEN returns OpenAI's shape:
+  `content` is the text, and the thinking is in `reasoning_content` (on the
+  message, or on each streamed delta). A `reasoning_content` sent back on an
+  assistant message is dropped before the call.
 
 ```toml
 [[providers]]
