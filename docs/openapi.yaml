@@ -1327,7 +1327,7 @@ paths:
       summary: Turn the platform-key fallback on or off for one pool
       description: |
         A provider whose kind does not take a team key (Azure, Bedrock,
-        Google/Vertex, keyless kinds) is 400 `LM-1001`. An unknown provider
+        Vertex AI, keyless kinds) is 400 `LM-1001`. An unknown provider
         is 404 `LM-1003`.
       operationId: putTeamProvider
       security: [{ masterKey: [] }]
@@ -1352,7 +1352,7 @@ paths:
         The key is sealed with the master key and never returned. At most 10
         keys per (group, provider); the 11th is 400 `LM-1001`, as are a
         provider whose kind does not take a team key (Azure, Bedrock,
-        Google/Vertex, keyless kinds), a key shorter than 16 characters or
+        Vertex AI, keyless kinds), a key shorter than 16 characters or
         longer than 1024 bytes after trimming, and a label outside 1 to 64
         characters. An unknown provider is 404 `LM-1003`.
       operationId: addTeamKey
@@ -1470,7 +1470,7 @@ paths:
       description: |
         The key is sealed with the master key, never returned, and enabled. At
         most 20 keys per provider; the 21st is 400 `LM-1001`, as are a provider
-        whose kind does not take a pool key (Azure, Bedrock, Google/Vertex,
+        whose kind does not take a pool key (Azure, Bedrock, Vertex AI,
         keyless kinds), a key shorter than 16 characters or longer than 1024
         bytes after trimming, and a label outside 1 to 64 characters. An
         unknown provider is 404 `LM-1003`.

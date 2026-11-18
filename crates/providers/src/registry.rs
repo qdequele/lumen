@@ -1554,6 +1554,89 @@ mod tests {
         assert!(out.is_ok(), "{out:?}");
     }
 
+    /// The Gemini API takes a pool key too: the rebuilt instance sends it as
+    /// `x-goog-api-key`, and a key Gemini rejects (a 400 naming
+    /// `API_KEY_INVALID`) comes back as an upstream 401, the status a pool
+    /// benches a key on.
+    #[tokio::test]
+    async fn rekeyed_google_sends_the_pool_key_and_reports_a_rejected_one_as_401() {
+        use lumen_core::{ChatRequest, ProviderError};
+        use tokio_util::sync::CancellationToken;
+        use wiremock::matchers::{header, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(header("x-goog-api-key", "pool-key-good"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "candidates": [{
+                    "content": { "parts": [{ "text": "ok" }], "role": "model" },
+                    "finishReason": "STOP"
+                }],
+                "usageMetadata": {
+                    "promptTokenCount": 1, "candidatesTokenCount": 1, "totalTokenCount": 2
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(header("x-goog-api-key", "pool-key-bad"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": {
+                    "code": 400,
+                    "message": "API key not valid. Please pass a valid API key.",
+                    "status": "INVALID_ARGUMENT",
+                    "details": [{
+                        "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                        "reason": "API_KEY_INVALID",
+                        "domain": "googleapis.com"
+                    }]
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let reg = Registry::build(
+            vec![spec(
+                ProviderKind::Google,
+                "google",
+                Some(&server.uri()),
+                vec![model("m", &[Capability::Chat])],
+            )],
+            reqwest::Client::new(),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        let request = || ChatRequest {
+            model: "m".to_owned(),
+            messages: Vec::new(),
+            temperature: None,
+            top_p: None,
+            max_tokens: None,
+            n: None,
+            stop: None,
+            stream: false,
+            extra: serde_json::Map::new(),
+        };
+        let chat = |key: &str| {
+            reg.rekeyed("google", key)
+                .and_then(|set| set.chat.clone())
+                .expect("chat")
+        };
+        let ok = chat("pool-key-good")
+            .chat(request(), CancellationToken::new())
+            .await;
+        assert!(ok.is_ok(), "{ok:?}");
+        let rejected = chat("pool-key-bad")
+            .chat(request(), CancellationToken::new())
+            .await;
+        assert!(
+            matches!(rejected, Err(ProviderError::Upstream { status: 401, .. })),
+            "{rejected:?}"
+        );
+    }
+
     fn model(id: &str, caps: &[Capability]) -> ModelSpec {
         ModelSpec {
             id: id.to_owned(),

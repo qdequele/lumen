@@ -54,6 +54,15 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ### Added
 
+- **Google (Gemini API) providers take team keys and default pool keys.** A
+  provider of kind `google` was listed with `eligible: false`, so its key
+  could only be changed in the gateway's config. It now accepts keys under
+  `/admin/groups/{id}/byok` and `/admin/platform-keys` like the other plain
+  API key kinds. Gemini answers a rejected key with a 400 naming
+  `API_KEY_INVALID` where other vendors answer 401: that response is now
+  reported as an upstream 401, so a pool benches the key and tries the next
+  one. Vertex AI (service-account credentials) stays ineligible.
+
 - **`GET /admin/keys` and `GET /admin/groups` can be read page by page.**
   Both take optional `limit` (1 to 1000) and `cursor` query parameters. With
   either, the response is one page, in the same order as the whole listing,
@@ -564,6 +573,15 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ### Added
 
+- **Google (Gemini API) providers take team keys and default pool keys.** A
+  provider of kind `google` was listed with `eligible: false`, so its key
+  could only be changed in the gateway's config. It now accepts keys under
+  `/admin/groups/{id}/byok` and `/admin/platform-keys` like the other plain
+  API key kinds. Gemini answers a rejected key with a 400 naming
+  `API_KEY_INVALID` where other vendors answer 401: that response is now
+  reported as an upstream 401, so a pool benches the key and tries the next
+  one. Vertex AI (service-account credentials) stays ineligible.
+
 - **Account virtual models ([ADR 022](docs/adr/022-account-virtual-models.md)).**
   Each Lab account on a shared gateway can now own virtual models. The
   `/admin/config/virtual_models` routes (list, `GET`/`PUT`/`DELETE {id}`,
@@ -638,6 +656,15 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ### Added
 
+- **Google (Gemini API) providers take team keys and default pool keys.** A
+  provider of kind `google` was listed with `eligible: false`, so its key
+  could only be changed in the gateway's config. It now accepts keys under
+  `/admin/groups/{id}/byok` and `/admin/platform-keys` like the other plain
+  API key kinds. Gemini answers a rejected key with a 400 naming
+  `API_KEY_INVALID` where other vendors answer 401: that response is now
+  reported as an upstream 401, so a pool benches the key and tries the next
+  one. Vertex AI (service-account credentials) stays ineligible.
+
 - **`disabled` on a foundation model.** `disabled = true` on a
   `[[providers.models]]` entry (the model's `disabled` field in
   `PUT /admin/config/providers/{name}`) takes it out of service without
@@ -703,6 +730,15 @@ binary reported 0.7.0 and failed deploy health checks; use 0.8.1.
 
 ### Added
 
+- **Google (Gemini API) providers take team keys and default pool keys.** A
+  provider of kind `google` was listed with `eligible: false`, so its key
+  could only be changed in the gateway's config. It now accepts keys under
+  `/admin/groups/{id}/byok` and `/admin/platform-keys` like the other plain
+  API key kinds. Gemini answers a rejected key with a 400 naming
+  `API_KEY_INVALID` where other vendors answer 401: that response is now
+  reported as an upstream 401, so a pool benches the key and tries the next
+  one. Vertex AI (service-account credentials) stays ineligible.
+
 - **Team key pools route requests (BYOK).** A request whose virtual key
   belongs to a budget group with its own keys for the provider is sent with
   those keys, round-robin; a rate-limited key is benched and a key the
@@ -751,6 +787,15 @@ binary reported 0.7.0 and failed deploy health checks; use 0.8.1.
   RS256 signing, which offers no remote timing oracle.
 
 ### Added
+
+- **Google (Gemini API) providers take team keys and default pool keys.** A
+  provider of kind `google` was listed with `eligible: false`, so its key
+  could only be changed in the gateway's config. It now accepts keys under
+  `/admin/groups/{id}/byok` and `/admin/platform-keys` like the other plain
+  API key kinds. Gemini answers a rejected key with a 400 naming
+  `API_KEY_INVALID` where other vendors answer 401: that response is now
+  reported as an upstream 401, so a pool benches the key and tries the next
+  one. Vertex AI (service-account credentials) stays ineligible.
 
 - **Model release watcher.** A daily GitHub Actions workflow
   (`.github/workflows/model-watch.yml`, standard-library Python under
@@ -807,6 +852,15 @@ binary reported 0.7.0 and failed deploy health checks; use 0.8.1.
   credential, get their own client and keep following redirects as before.
 
 ### Added
+
+- **Google (Gemini API) providers take team keys and default pool keys.** A
+  provider of kind `google` was listed with `eligible: false`, so its key
+  could only be changed in the gateway's config. It now accepts keys under
+  `/admin/groups/{id}/byok` and `/admin/platform-keys` like the other plain
+  API key kinds. Gemini answers a rejected key with a 400 naming
+  `API_KEY_INVALID` where other vendors answer 401: that response is now
+  reported as an upstream 401, so a pool benches the key and tries the next
+  one. Vertex AI (service-account credentials) stays ineligible.
 
 - **Meilisearch Lab platform contract v2** (`docs/operations/lab-integration.md`,
   ADR 015 amendment). The gateway is now a Lab *instance*: `LAB_URL`,
@@ -947,6 +1001,15 @@ binary reported 0.7.0 and failed deploy health checks; use 0.8.1.
 
 ### Added
 
+- **Google (Gemini API) providers take team keys and default pool keys.** A
+  provider of kind `google` was listed with `eligible: false`, so its key
+  could only be changed in the gateway's config. It now accepts keys under
+  `/admin/groups/{id}/byok` and `/admin/platform-keys` like the other plain
+  API key kinds. Gemini answers a rejected key with a 400 naming
+  `API_KEY_INVALID` where other vendors answer 401: that response is now
+  reported as an upstream 401, so a pool benches the key and tries the next
+  one. Vertex AI (service-account credentials) stays ineligible.
+
 - **Model release dates on `GET /v1/models`.** A model may declare
   `release_date = "YYYY-MM-DD"` (quoted, or as a bare TOML date) in its
   `[[providers.models]]` block (validated at load: an impossible or malformed date aborts startup or is
@@ -959,6 +1022,15 @@ binary reported 0.7.0 and failed deploy health checks; use 0.8.1.
 ## [0.6.0] - 2026-09-28
 
 ### Added
+
+- **Google (Gemini API) providers take team keys and default pool keys.** A
+  provider of kind `google` was listed with `eligible: false`, so its key
+  could only be changed in the gateway's config. It now accepts keys under
+  `/admin/groups/{id}/byok` and `/admin/platform-keys` like the other plain
+  API key kinds. Gemini answers a rejected key with a 400 naming
+  `API_KEY_INVALID` where other vendors answer 401: that response is now
+  reported as an upstream 401, so a pool benches the key and tries the next
+  one. Vertex AI (service-account credentials) stays ineligible.
 
 - **Jev as a reranker (ADR 013 amendment).** A `typesafe` model declaring
   `capabilities = ["rerank"]` serves plain `POST /v1/rerank` through a
@@ -1002,6 +1074,15 @@ binary reported 0.7.0 and failed deploy health checks; use 0.8.1.
 ## [0.5.0] - 2026-09-26
 
 ### Added
+
+- **Google (Gemini API) providers take team keys and default pool keys.** A
+  provider of kind `google` was listed with `eligible: false`, so its key
+  could only be changed in the gateway's config. It now accepts keys under
+  `/admin/groups/{id}/byok` and `/admin/platform-keys` like the other plain
+  API key kinds. Gemini answers a rejected key with a 400 naming
+  `API_KEY_INVALID` where other vendors answer 401: that response is now
+  reported as an upstream 401, so a pool benches the key and tries the next
+  one. Vertex AI (service-account credentials) stays ineligible.
 
 - **Docs: config source modes (ADR 012, task 10 of the config-source-abstraction
   plan).** New `docs/operations/config-modes.md`: the
@@ -1161,6 +1242,15 @@ binary reported 0.7.0 and failed deploy health checks; use 0.8.1.
 ## [0.4.0] - 2026-08-26
 
 ### Added
+
+- **Google (Gemini API) providers take team keys and default pool keys.** A
+  provider of kind `google` was listed with `eligible: false`, so its key
+  could only be changed in the gateway's config. It now accepts keys under
+  `/admin/groups/{id}/byok` and `/admin/platform-keys` like the other plain
+  API key kinds. Gemini answers a rejected key with a 400 naming
+  `API_KEY_INVALID` where other vendors answer 401: that response is now
+  reported as an upstream 401, so a pool benches the key and tries the next
+  one. Vertex AI (service-account credentials) stays ineligible.
 
 - **Outbound webhooks for budget events** (ADR 011 and its 2026-08-26
   amendment, closes #146). LUMEN can POST `budget.threshold`,
@@ -1338,6 +1428,15 @@ pipeline fix.
   in the SigV4 signer. No behavior change; all suites pass unchanged.
 
 ### Added
+
+- **Google (Gemini API) providers take team keys and default pool keys.** A
+  provider of kind `google` was listed with `eligible: false`, so its key
+  could only be changed in the gateway's config. It now accepts keys under
+  `/admin/groups/{id}/byok` and `/admin/platform-keys` like the other plain
+  API key kinds. Gemini answers a rejected key with a 400 naming
+  `API_KEY_INVALID` where other vendors answer 401: that response is now
+  reported as an upstream 401, so a pool benches the key and tries the next
+  one. Vertex AI (service-account credentials) stays ineligible.
 
 - `KeyStore::usage_export`: cursor-paginated raw `usage_log` read, ordered by
   primary key so pages cannot skip or repeat rows while new requests land
@@ -1527,6 +1626,15 @@ pipeline fix.
 ## [0.2.0] - 2026-07-21
 
 ### Added
+
+- **Google (Gemini API) providers take team keys and default pool keys.** A
+  provider of kind `google` was listed with `eligible: false`, so its key
+  could only be changed in the gateway's config. It now accepts keys under
+  `/admin/groups/{id}/byok` and `/admin/platform-keys` like the other plain
+  API key kinds. Gemini answers a rejected key with a 400 naming
+  `API_KEY_INVALID` where other vendors answer 401: that response is now
+  reported as an upstream 401, so a pool benches the key and tries the next
+  one. Vertex AI (service-account credentials) stays ineligible.
 
 - **Release pipeline hardening.** `release.yml` no longer ships untested
   code: a full gate job (fmt, clippy pedantic, workspace tests) must pass on
