@@ -132,6 +132,12 @@ const CONTENT_FILTER_CODES: &[&str] = &[
 /// Error-message phrases of a content-policy refusal, lowercase.
 const CONTENT_FILTER_PHRASES: &[&str] = &["content management policy", "blocked by safety"];
 
+/// Structured error code of a rejected API key on a 400, lowercase: Gemini
+/// answers an invalid `x-goog-api-key` with HTTP 400 and an `ErrorInfo`
+/// whose `reason` is `API_KEY_INVALID`, where every other vendor answers
+/// 401/403.
+const INVALID_KEY_CODES: &[&str] = &["api_key_invalid"];
+
 /// JSON keys whose string value is an error code worth matching.
 const CODE_KEYS: &[&str] = &["code", "type", "reason", "status"];
 
@@ -407,6 +413,12 @@ pub fn classify_error(
                 provider: provider.to_owned(),
                 status,
             };
+        }
+        // A key the vendor rejected is reported as a 401 whatever status the
+        // vendor chose, so a key pool benches it and tries the next key
+        // (ADR 018) instead of answering the client with a 400 of its own.
+        if status == 400 && matches(INVALID_KEY_CODES, &[]) {
+            return classify_status(provider, 401, None);
         }
     }
     // A 503 without a useful `Retry-After` may still say when it will be up
@@ -805,6 +817,25 @@ mod tests {
                 ),
             }
         }
+    }
+
+    #[test]
+    fn a_rejected_gemini_key_is_an_upstream_401() {
+        let body = br#"{"error":{"code":400,"message":"API key not valid. Please pass a valid API key.","status":"INVALID_ARGUMENT","details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"API_KEY_INVALID","domain":"googleapis.com"}]}}"#;
+        assert!(matches!(
+            classify_error("google-main", 400, None, body),
+            ProviderError::Upstream {
+                status: 401,
+                retryable: false,
+                ..
+            }
+        ));
+        // The same word in a message, or any other 400, stays a 400.
+        let prose = br#"{"error":{"code":400,"message":"field API_KEY_INVALID is unknown","status":"INVALID_ARGUMENT"}}"#;
+        assert!(matches!(
+            classify_error("google-main", 400, None, prose),
+            ProviderError::Upstream { status: 400, .. }
+        ));
     }
 
     #[test]

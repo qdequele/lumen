@@ -93,9 +93,9 @@ impl ProviderKind {
     }
 
     /// Whether a team may bring its own key for this kind (BYOK): kinds that
-    /// take a plain API key on the vendor's own URL. Cloud-credential kinds
-    /// (Azure, Bedrock, Google, Vertex), self-hosted and keyless kinds are
-    /// not.
+    /// take a plain API key on the vendor's own URL (Google is the Gemini
+    /// API and its `x-goog-api-key`). Cloud-credential kinds (Azure, Bedrock,
+    /// Vertex), self-hosted and keyless kinds are not.
     #[must_use]
     pub const fn byok_eligible(self) -> bool {
         matches!(
@@ -114,6 +114,7 @@ impl ProviderKind {
                 | ProviderKind::Perplexity
                 | ProviderKind::Xai
                 | ProviderKind::Deepinfra
+                | ProviderKind::Google
         )
     }
 
@@ -236,6 +237,7 @@ mod tests {
             ProviderKind::Perplexity,
             ProviderKind::Xai,
             ProviderKind::Deepinfra,
+            ProviderKind::Google,
         ];
         for kind in eligible {
             assert!(kind.byok_eligible(), "{kind:?}");
@@ -243,7 +245,6 @@ mod tests {
         for kind in [
             ProviderKind::Azure,
             ProviderKind::Bedrock,
-            ProviderKind::Google,
             ProviderKind::VertexAi,
             ProviderKind::Ollama,
             ProviderKind::Tei,

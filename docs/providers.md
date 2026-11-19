@@ -1335,8 +1335,8 @@ On the hosted gateway a budget group (one Lab account) can bring its own API
 keys for a provider ([ADR 018](adr/018-team-provider-keys-and-bandwidth.md)).
 Only kinds that take a plain API key on the vendor URL are eligible: openai,
 anthropic, mistral, cohere, jina, voyage, groq, together, fireworks, deepseek,
-openrouter, perplexity, xai, deepinfra. Azure, Bedrock, Google/Vertex and
-keyless kinds are not.
+openrouter, perplexity, xai, deepinfra, google (the Gemini API key). Azure,
+Bedrock, Vertex AI, self-hosted and keyless kinds are not.
 
 - A group holds up to 10 keys per provider, managed under
   `/admin/groups/{id}/byok` (keys are sealed at rest and only `label`, `last4`

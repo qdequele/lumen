@@ -54,6 +54,15 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ### Added
 
+- **Google (Gemini API) providers take team keys and default pool keys.** A
+  provider of kind `google` was listed with `eligible: false`, so its key
+  could only be changed in the gateway's config. It now accepts keys under
+  `/admin/groups/{id}/byok` and `/admin/platform-keys` like the other plain
+  API key kinds. Gemini answers a rejected key with a 400 naming
+  `API_KEY_INVALID` where other vendors answer 401: that response is now
+  reported as an upstream 401, so a pool benches the key and tries the next
+  one. Vertex AI (service-account credentials) stays ineligible.
+
 - **`GET /admin/keys` and `GET /admin/groups` can be read page by page.**
   Both take optional `limit` (1 to 1000) and `cursor` query parameters. With
   either, the response is one page, in the same order as the whole listing,

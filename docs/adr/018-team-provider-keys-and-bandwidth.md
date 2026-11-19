@@ -21,7 +21,9 @@ Lab bills the bandwidth instead.
    per-provider `fallback` flag (default off). Keys are sealed at rest with
    the master key, never returned (only `label`, `last4`, status) and never
    logged. Only kinds that take a plain API key on the vendor URL are
-   eligible; Azure, Bedrock, Google/Vertex and keyless kinds are not. A pool
+   eligible (Google's Gemini API included: its key rejection, a 400 naming
+   `API_KEY_INVALID`, is reported as a 401); Azure, Bedrock, Vertex AI and
+   keyless kinds are not. A pool
    row is trusted only when its provider is in the live config and eligible.
    The admin API is `/admin/groups/{id}/byok` (list), `PUT .../{provider}`
    (fallback flag), `POST .../{provider}/keys`, `DELETE .../keys/{key_id}`,
