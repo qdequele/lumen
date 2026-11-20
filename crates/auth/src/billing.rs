@@ -10,7 +10,8 @@ use serde::Serialize;
 
 /// The `product` every LUMEN event carries.
 pub const PRODUCT: &str = "lumen";
-/// The only event type LUMEN reports.
+/// The billing event type (the Lab alert types live in
+/// [`lab_alerts`](crate::lab_alerts)).
 pub const EVENT_TYPE: &str = "usage.recorded";
 /// The operation LUMEN reports: one event aggregates every capability of a
 /// key over the billed window (spec section 4.3).
@@ -134,13 +135,41 @@ impl UsageEvent {
 /// A random UUIDv7 (RFC 9562) for `unix_ms`, lower-case hyphenated.
 #[must_use]
 pub fn uuid_v7(unix_ms: i64) -> String {
-    use std::fmt::Write;
     let mut bytes = [0_u8; 16];
     rand::rng().fill_bytes(&mut bytes);
     let ms = u64::try_from(unix_ms).unwrap_or(0) & 0xFFFF_FFFF_FFFF;
     bytes[..6].copy_from_slice(&ms.to_be_bytes()[2..]);
     bytes[6] = (bytes[6] & 0x0F) | 0x70;
     bytes[8] = (bytes[8] & 0x3F) | 0x80;
+    format_uuid(&bytes)
+}
+
+/// The namespace of LUMEN's name-based (UUIDv5) Lab event ids. Fixed
+/// forever: changing it would re-send every state-change event under a new id.
+pub const LAB_EVENT_NAMESPACE: [u8; 16] = [
+    0x4c, 0x75, 0x6d, 0x65, 0x6e, 0x2d, 0x4c, 0x61, 0x62, 0x2d, 0x45, 0x76, 0x65, 0x6e, 0x74, 0x73,
+];
+
+/// The UUIDv5 (RFC 9562, SHA-1) of `name` in [`LAB_EVENT_NAMESPACE`],
+/// lower-case hyphenated: the same name always gives the same id, so the Lab
+/// deduplicates a state change reported twice (two replicas, a retried scan).
+#[must_use]
+pub fn uuid_v5(name: &str) -> String {
+    use sha1::Digest as _;
+    let mut hasher = sha1::Sha1::new();
+    hasher.update(LAB_EVENT_NAMESPACE);
+    hasher.update(name.as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0F) | 0x50;
+    bytes[8] = (bytes[8] & 0x3F) | 0x80;
+    format_uuid(&bytes)
+}
+
+/// `bytes` as a lower-case hyphenated UUID.
+fn format_uuid(bytes: &[u8; 16]) -> String {
+    use std::fmt::Write;
     let mut out = String::with_capacity(36);
     for (i, b) in bytes.iter().enumerate() {
         if matches!(i, 4 | 6 | 8 | 10) {
@@ -235,6 +264,16 @@ mod tests {
         assert_eq!(&id[14..15], "7");
         assert!(matches!(&id[19..20], "8" | "9" | "a" | "b"), "{id}");
         assert_ne!(uuid_v7(1), uuid_v7(1), "random tail must differ");
+    }
+
+    #[test]
+    fn uuid_v5_is_stable_and_has_the_version_and_variant_bits() {
+        let id = uuid_v5("key:k1:2026-11-20T00:00:00.000Z:7");
+        assert!(is_uuid(&id), "{id}");
+        assert_eq!(id, uuid_v5("key:k1:2026-11-20T00:00:00.000Z:7"));
+        assert_ne!(id, uuid_v5("key:k1:2026-11-20T00:00:00.000Z:1"));
+        assert_eq!(&id[14..15], "5");
+        assert!(matches!(&id[19..20], "8" | "9" | "a" | "b"), "{id}");
     }
 
     #[test]

@@ -6,6 +6,7 @@
 - Amends: ADR 011 §2 (billing events only)
 - Amended: 2026-10-10 (platform contract v2)
 - Amended: 2026-11-05 (bandwidth and BYOK units, ADR 018)
+- Amended: 2026-11-20 (Lab alerts)
 
 ## Context
 
@@ -163,3 +164,47 @@ the units `bytes_in`, `bytes_out`, `byok_tokens_in` and `byok_tokens_out`.
 Bandwidth is charged to `spent_micro` at the group's rate, never to the
 settled-cost counter billing reads. See
 [ADR 018](018-team-provider-keys-and-bandwidth.md).
+
+## Amendment 2026-11-20: Lab alerts
+
+The Lab now turns engine events into user emails, and its schema accepts
+four Gateway alert types besides `usage.recorded` (the Lab deploys first: it
+rejects an unknown type). In Lab mode LUMEN reports them through the same
+outbox, signature and delivery as the bill:
+
+1. **`budget.threshold` and `budget.exhausted`** for the budgets a team set
+   itself: a key's own budget (scope `key`) and a sub-group's (scope
+   `group`, ADR 020). Never the lease: the Lab tracks credits, so a lease
+   crossing or a `parent_group` refusal is not reported. Thresholds are
+   fixed at 50, 80 and 95 %. Detection reuses the ADR 011 edge trigger
+   (`SignalState`) over a second, Lab-only state per entry, so webhooks and
+   Lab alerts never arm each other.
+2. **`key.expiring`** at 7 days left, 1 day left and on expiry, from an
+   hourly scan of live, enabled team keys. A `lab_key_expiry_notices` row
+   and the outbox row are written in one transaction; the row's key
+   (key, expiry, milestone) makes each milestone once across restarts and
+   replicas, and the event id is the schema's UUIDv5.
+3. **`provider_key.status_changed`** when a team provider key starts being
+   refused (`provider_auth` for 401/403, `provider_quota` for 402) and when
+   it works again. Transitions only, tracked per key in memory. A 402 now
+   benches a pool key like a 401/403.
+
+**Who.** A subject belongs to a Lab team when its top-level group (the
+lease, `lab-<account id>`) has an `account_ref` that is a UUID; that is the
+event's `account_id`.
+
+**Durable and once-only.** Nothing is written on the request path (rule 4).
+A detected budget or provider-key alert waits in memory and the next budget
+flush writes it in the same transaction as the key spend and usage events,
+with the subject's alert state in `lab_budget_alert_state` (the budget
+period's cap, the thresholds sent, whether exhaustion was sent). At boot a
+state recorded under the current cap is restored, so a restart neither
+replays an alert nor loses one whose spend was flushed before it; a failed
+flush keeps its alerts. Migration `0022_lab_alerts.sql` is additive.
+
+**Not done.** An OpenAI `insufficient_quota` 429 is still a rate limit:
+classifying it needs the 429 body, which the gateway does not read so a
+stalled body never delays a failover. A provider-key status is not
+persisted, so a restart may report a still-failing key once more.
+
+The operator view is [Lab integration](../operations/lab-integration.md#alerts).

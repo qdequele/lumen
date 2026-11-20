@@ -14,9 +14,9 @@
 //!    the same request found its pool exhausted with the fallback off (then
 //!    the attempt is refused, so a chain never reaches the platform's keys);
 //! 2. a pool: its keys round-robin; a rate-limited key is benched
-//!    `max(retry_after, 30s)`, a key answering 401/403 is marked failing and
-//!    benched 10 minutes, and the next key is tried; any other result is the
-//!    attempt's result;
+//!    `max(retry_after, 30s)`, a key answering 401/403 (rejected) or 402
+//!    (out of quota or credit) is marked failing and benched 10 minutes, and
+//!    the next key is tried; any other result is the attempt's result;
 //! 3. no usable key left: the platform key when the group turned the
 //!    fallback on, else `LM-3021` ([`ProviderError::TeamKeysExhausted`]).
 //!
@@ -25,6 +25,11 @@
 //! (`api_key_env` / `provider_keys`) is then ignored. Only a provider with no
 //! platform key at all uses its configured key.
 //!
+//! In Lab mode a team key that starts failing, and one that works again
+//! after failing, is reported once per change as
+//! `provider_key.status_changed` (ADR 015 amendment 2026-11-20): queued in
+//! memory and written to the outbox by the next budget flush.
+//!
 //! Pools are keyed by the group of the authenticated virtual key, never by
 //! anything the client sends: a key with no group never uses a team key, and
 //! one group's keys never serve another group. Secrets are held in
@@ -32,12 +37,16 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use lumen_auth::crypto::MasterKey;
+use lumen_auth::lab_alerts::{
+    LabAlert, ProviderKeyStatus, ProviderKeyStatusData, REASON_PROVIDER_AUTH, REASON_PROVIDER_QUOTA,
+};
+use lumen_auth::state::KeyEntry;
 use lumen_auth::store::{GroupProviderKeyRecord, KeyStore, PlatformProviderKeyRecord};
 use lumen_auth::AuthError;
 use lumen_core::ProviderError;
@@ -49,7 +58,7 @@ use crate::auth::AuthedKey;
 
 /// Shortest bench for a rate-limited key.
 const MIN_RATE_LIMIT_BENCH: Duration = Duration::from_secs(30);
-/// Bench for a key the provider rejected (401/403).
+/// Bench for a key the provider rejected (401/403) or refused for quota (402).
 const FAILING_BENCH: Duration = Duration::from_secs(600);
 
 /// Which key served an attempt.
@@ -80,8 +89,13 @@ enum Health {
 /// One team key of a pool.
 pub struct PoolKey {
     id: String,
+    /// The key's label, for a Lab alert; refreshed by every reload.
+    label: ArcSwap<String>,
     secret: Zeroizing<String>,
     health: Mutex<Health>,
+    /// A `failing` status was reported to the Lab and no `ok` since: the
+    /// edge that makes `provider_key.status_changed` fire on changes only.
+    reported_failing: AtomicBool,
     /// The provider instances built with this key, and the registry
     /// generation they were built under.
     cached: Mutex<Option<(u64, Arc<ProviderSet>)>>,
@@ -99,13 +113,83 @@ impl std::fmt::Debug for PoolKey {
 }
 
 impl PoolKey {
-    fn new(id: String, secret: Zeroizing<String>) -> Self {
+    fn new(id: String, label: String, secret: Zeroizing<String>) -> Self {
         Self {
             id,
+            label: ArcSwap::from_pointee(label),
             secret,
             health: Mutex::new(Health::Unused),
+            reported_failing: AtomicBool::new(false),
             cached: Mutex::new(None),
         }
+    }
+
+    /// Report a team key the provider refuses, once until it works again.
+    /// Nothing outside Lab mode or for a key that is not a Lab team's.
+    fn report_failing(
+        &self,
+        team: Option<&KeyEntry>,
+        provider: &str,
+        status: u16,
+        reason: &'static str,
+        message: &str,
+    ) {
+        let Some(team) = team else {
+            return;
+        };
+        if self.reported_failing.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        self.report(
+            team,
+            ProviderKeyStatusData {
+                provider: provider.to_owned(),
+                key_id: self.id.clone(),
+                key_name: self.label.load().as_str().to_owned(),
+                status: ProviderKeyStatus::Failing,
+                status_code: Some(status),
+                reason: Some(reason),
+                message: Some(message.to_owned()),
+            },
+        );
+    }
+
+    /// Report a team key that works again after a reported failure. One
+    /// relaxed load per success otherwise.
+    fn report_ok(&self, team: Option<&KeyEntry>, provider: &str) {
+        let Some(team) = team else {
+            return;
+        };
+        if !self.reported_failing.load(Ordering::Relaxed)
+            || !self.reported_failing.swap(false, Ordering::SeqCst)
+        {
+            return;
+        }
+        self.report(
+            team,
+            ProviderKeyStatusData {
+                provider: provider.to_owned(),
+                key_id: self.id.clone(),
+                key_name: self.label.load().as_str().to_owned(),
+                status: ProviderKeyStatus::Ok,
+                status_code: None,
+                reason: None,
+                message: None,
+            },
+        );
+    }
+
+    fn report(&self, team: &KeyEntry, data: ProviderKeyStatusData) {
+        let Some((alerts, account)) = team.lab_alerts() else {
+            return;
+        };
+        tracing::info!(
+            provider = %data.provider,
+            key_id = %self.id,
+            status = ?data.status,
+            "team provider key status reported to the Lab"
+        );
+        alerts.push(LabAlert::provider_key(account, data, now_ms()));
     }
 
     fn benched(&self, now_ms: i64) -> bool {
@@ -191,7 +275,11 @@ impl TeamPools {
                 .and_then(|providers| providers.get(&record.provider))
                 .and_then(|pool| pool.keys.iter().find(|k| k.id == record.id))
                 .cloned();
-            let key = previous.unwrap_or_else(|| Arc::new(PoolKey::new(record.id, secret)));
+            if let Some(previous) = &previous {
+                previous.label.store(Arc::new(record.label.clone()));
+            }
+            let key =
+                previous.unwrap_or_else(|| Arc::new(PoolKey::new(record.id, record.label, secret)));
             grouped
                 .entry(record.group_id)
                 .or_default()
@@ -300,7 +388,9 @@ impl TeamPools {
                 .get(&record.provider)
                 .and_then(|pool| pool.keys.iter().find(|k| k.id == record.id))
                 .cloned();
-            pool.push(previous.unwrap_or_else(|| Arc::new(PoolKey::new(record.id, secret))));
+            pool.push(
+                previous.unwrap_or_else(|| Arc::new(PoolKey::new(record.id, record.label, secret))),
+            );
         }
         let next = grouped
             .into_iter()
@@ -441,6 +531,9 @@ pub async fn refresh_pools(
 pub struct RequestKeys {
     /// The authenticated key's budget group, when it has any pool.
     group: Option<String>,
+    /// The authenticated key, when its group has a pool: the team a
+    /// provider-key status change is reported for.
+    team: Option<Arc<KeyEntry>>,
     pools: Option<Arc<HashMap<String, Arc<Pool>>>>,
     /// The platform's key pools (ADR 019), used wherever the platform key
     /// would serve.
@@ -464,8 +557,12 @@ impl RequestKeys {
         let group = key.and_then(|AuthedKey(entry)| entry.root_group_id());
         let platform = pools.platform.load_full();
         let pools = group.as_deref().and_then(|group| pools.group(group));
+        let team = key
+            .filter(|_| pools.is_some())
+            .map(|AuthedKey(entry)| Arc::clone(entry));
         Self {
             group: group.filter(|_| pools.is_some()),
+            team,
             pools,
             platform,
             chain_lock: None,
@@ -576,7 +673,16 @@ impl RequestKeys {
             *lock(&self.locked) = Some(provider.to_owned());
         }
 
-        match rotate(pool, registry, provider, "team", &mut keyed).await {
+        match rotate(
+            pool,
+            registry,
+            provider,
+            "team",
+            self.team.as_deref(),
+            &mut keyed,
+        )
+        .await
+        {
             Rotation::Served(value, key_id) => return Ok((value, Served::Team { key_id })),
             Rotation::Failed(error) => return Err(error),
             Rotation::Exhausted(_) => {}
@@ -615,7 +721,7 @@ impl RequestKeys {
             .provider_kind(provider)
             .is_some_and(ProviderKind::byok_eligible);
         if let Some(pool) = self.platform.get(provider).filter(|_| eligible) {
-            match rotate(pool, registry, provider, "platform", keyed).await {
+            match rotate(pool, registry, provider, "platform", None, keyed).await {
                 Rotation::Served(value, _) => return Ok((value, Served::Platform)),
                 Rotation::Failed(error) => return Err(error),
                 Rotation::Exhausted(Some(last)) => return Err(last),
@@ -649,13 +755,15 @@ enum Rotation<T> {
 
 /// One pass over `pool`, from its cursor: each key not benched is tried
 /// with `keyed`; a rate limit benches it `max(retry_after, 30s)`, a 401/403
-/// marks it failing for 10 minutes, and the next key is tried. `who` names
-/// the pool in logs (`team` | `platform`), never a secret.
+/// or a 402 marks it failing for 10 minutes, and the next key is tried. `who`
+/// names the pool in logs (`team` | `platform`), never a secret. `team` is
+/// the authenticated key of a team pool, for the Lab status alerts.
 async fn rotate<T, K, KF>(
     pool: &Pool,
     registry: &Registry,
     provider: &str,
     who: &'static str,
+    team: Option<&KeyEntry>,
     keyed: &mut K,
 ) -> Rotation<T>
 where
@@ -679,6 +787,7 @@ where
         match keyed(set).await {
             Ok(value) => {
                 key.set_health(Health::Ok);
+                key.report_ok(team, provider);
                 pool.cursor.store((index + 1) % count, Ordering::Relaxed);
                 return Rotation::Served(value, key.id.clone());
             }
@@ -691,12 +800,26 @@ where
                 tracing::info!(provider, key_id = %key.id, pool = who, "provider key rate-limited; trying the next one");
                 last = Some(error);
             }
-            Err(error @ ProviderError::Upstream { status, .. }) if matches!(status, 401 | 403) => {
+            Err(error @ ProviderError::Upstream { status, .. }) if matches!(status, 401..=403) => {
+                let (reason, code) = if status == 402 {
+                    (
+                        format!(
+                            "the provider refused this key: out of quota or credit (HTTP {status})"
+                        ),
+                        REASON_PROVIDER_QUOTA,
+                    )
+                } else {
+                    (
+                        format!("the provider rejected this key (HTTP {status})"),
+                        REASON_PROVIDER_AUTH,
+                    )
+                };
+                key.report_failing(team, provider, status, code, &reason);
                 key.set_health(Health::Failing {
                     until_ms: now_ms().saturating_add(duration_ms(FAILING_BENCH)),
-                    reason: format!("the provider rejected this key (HTTP {status})"),
+                    reason,
                 });
-                tracing::warn!(provider, key_id = %key.id, pool = who, status, "provider key rejected by the provider; trying the next one");
+                tracing::warn!(provider, key_id = %key.id, pool = who, status, "provider key refused by the provider; trying the next one");
                 last = Some(error);
             }
             Err(error) => return Rotation::Failed(error),
@@ -772,6 +895,7 @@ mod tests {
     fn keys_for(pools: &TeamPools, group: &str) -> RequestKeys {
         RequestKeys {
             group: Some(group.to_owned()),
+            team: None,
             pools: pools.group(group),
             platform: pools.platform.load_full(),
             chain_lock: None,
@@ -1151,6 +1275,183 @@ mod tests {
         assert_eq!(pools.status("g", "k2").0, "unused");
     }
 
+    const LAB_ACCOUNT: &str = "0192f3c1-7c2e-7b1a-9f00-3c9d2e4a5b61";
+
+    /// A Lab team's key (group `g`, the lease) under a live Lab alert sink.
+    fn lab_team_key(account_ref: &str) -> (lumen_auth::state::AuthState, Arc<KeyEntry>) {
+        use lumen_auth::store::{GroupRecord, VirtualKeyRecord};
+        let state = lumen_auth::state::AuthState::load(
+            vec![GroupRecord {
+                id: "g".to_owned(),
+                name: format!("lab-{account_ref}"),
+                budget_max: None,
+                budget_spent: 0.0,
+                created_at: 0,
+                deleted_at: None,
+                account_ref: Some(account_ref.to_owned()),
+                bandwidth_micro_usd_per_gb: 0,
+                parent_id: None,
+            }],
+            vec![(
+                lumen_auth::key::hash_key("sk"),
+                VirtualKeyRecord {
+                    id: "vk".to_owned(),
+                    name: "vk".to_owned(),
+                    group_id: Some("g".to_owned()),
+                    budget_max: None,
+                    budget_spent: 0.0,
+                    rpm_limit: None,
+                    tpm_limit: None,
+                    expires_at: None,
+                    disabled: false,
+                    created_at: 0,
+                    deleted_at: None,
+                    external_ref: None,
+                    billed_micro: 0,
+                },
+            )],
+        );
+        state.set_lab_alerts(
+            Some(Arc::new(lumen_auth::lab_alerts::LabAlerts::default())),
+            &[],
+        );
+        let entry = state.authenticate("sk", 0).expect("key");
+        (state, entry)
+    }
+
+    /// One attempt on a one-key team pool whose key answers `status`
+    /// (0 = success; 429 = rate limited).
+    async fn team_attempt(reg: &Registry, keys: &RequestKeys, status: u16) {
+        let _ = keys
+            .attempt(
+                reg,
+                0,
+                "p",
+                || async { Ok::<_, ProviderError>(()) },
+                |_| async move {
+                    if status == 429 {
+                        Err(ProviderError::RateLimited {
+                            provider: "p".into(),
+                            retry_after: None,
+                        })
+                    } else if status != 0 {
+                        Err(ProviderError::Upstream {
+                            provider: "p".into(),
+                            status,
+                            retryable: false,
+                            retry_after: None,
+                        })
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
+            .await;
+    }
+
+    fn statuses(state: &lumen_auth::state::AuthState) -> Vec<serde_json::Value> {
+        state
+            .lab_alerts()
+            .expect("Lab mode")
+            .take()
+            .iter()
+            .map(|a| serde_json::from_str::<serde_json::Value>(&a.body().unwrap()).unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_team_key_reports_failing_and_recovery_once_each() {
+        let reg = registry(ProviderKind::Openai);
+        let pools = TeamPools::default();
+        pools.replace(vec![record("k1", "g")], &[]);
+        let (state, entry) = lab_team_key(LAB_ACCOUNT);
+        let mut keys = keys_for(&pools, "g");
+        keys.team = Some(entry);
+        let unbench = || {
+            let group = pools.group("g").expect("pool");
+            group["p"].keys[0].set_health(Health::Unused);
+        };
+
+        team_attempt(&reg, &keys, 401).await;
+        let events = statuses(&state);
+        assert_eq!(events.len(), 1, "{events:?}");
+        let e = &events[0];
+        assert_eq!(e["type"], "provider_key.status_changed");
+        assert_eq!(e["account_id"], LAB_ACCOUNT);
+        assert_eq!(e["data"]["status"], "failing");
+        assert_eq!(e["data"]["status_code"], 401);
+        assert_eq!(e["data"]["reason"], "provider_auth");
+        assert_eq!(e["data"]["key_id"], "k1");
+        assert_eq!(e["data"]["key_name"], "l");
+        assert_eq!(e["data"]["provider"], "p");
+        assert!(!e.to_string().contains("secret-k1"), "never the secret");
+
+        // Still failing after its bench: not a change, nothing reported.
+        unbench();
+        team_attempt(&reg, &keys, 403).await;
+        assert_eq!(statuses(&state), [] as [serde_json::Value; 0]);
+
+        // Works again: one `ok`, then nothing on further successes.
+        unbench();
+        team_attempt(&reg, &keys, 0).await;
+        team_attempt(&reg, &keys, 0).await;
+        let events = statuses(&state);
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0]["data"]["status"], "ok");
+        assert!(events[0]["data"].get("reason").is_none());
+
+        // Out of quota is its own reason.
+        team_attempt(&reg, &keys, 402).await;
+        let events = statuses(&state);
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0]["data"]["reason"], "provider_quota");
+        assert_eq!(pools.status("g", "k1").0, "failing");
+    }
+
+    #[tokio::test]
+    async fn rate_limits_platform_keys_and_non_lab_teams_are_not_reported() {
+        let reg = registry(ProviderKind::Openai);
+        let pools = TeamPools::default();
+        pools.replace(vec![record("k1", "g")], &[]);
+        pools.replace_platform(vec![platform_record("pk1", true)]);
+
+        // A rate limit is a bench, not a status change.
+        let (state, entry) = lab_team_key(LAB_ACCOUNT);
+        let mut keys = keys_for(&pools, "g");
+        keys.team = Some(Arc::clone(&entry));
+        team_attempt(&reg, &keys, 429).await;
+        assert_eq!(statuses(&state), [] as [serde_json::Value; 0]);
+
+        // The platform pool is never a team's key.
+        let platform_only = keys_for(&pools, "other");
+        let _ = platform_only
+            .attempt(
+                &reg,
+                0,
+                "p",
+                || async { Ok::<_, ProviderError>(()) },
+                |_| async {
+                    Err::<(), _>(ProviderError::Upstream {
+                        provider: "p".into(),
+                        status: 401,
+                        retryable: false,
+                        retry_after: None,
+                    })
+                },
+            )
+            .await;
+        assert_eq!(statuses(&state), [] as [serde_json::Value; 0]);
+
+        // A group whose account is not a Lab account id reports nothing.
+        let (operator, entry) = lab_team_key("team-a");
+        let mut keys = keys_for(&pools, "g");
+        keys.team = Some(entry);
+        let group = pools.group("g").expect("pool");
+        group["p"].keys[0].set_health(Health::Unused);
+        team_attempt(&reg, &keys, 401).await;
+        assert_eq!(statuses(&operator), [] as [serde_json::Value; 0]);
+    }
+
     #[tokio::test]
     async fn no_group_or_ineligible_kind_uses_the_platform_key() {
         let pools = Arc::new(TeamPools::default());
@@ -1300,7 +1601,11 @@ mod tests {
 
     #[test]
     fn debug_never_shows_the_secret() {
-        let key = PoolKey::new("k1".into(), Zeroizing::new("sk-very-secret".into()));
+        let key = PoolKey::new(
+            "k1".into(),
+            "label".into(),
+            Zeroizing::new("sk-very-secret".into()),
+        );
         let dbg = format!("{key:?}");
         assert!(
             !dbg.contains("sk-very-secret") && dbg.contains("<redacted>"),
