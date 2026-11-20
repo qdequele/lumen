@@ -25,10 +25,14 @@
 use crate::billing::{uuid_v7, BillingPolicy, UsageDelta, UsageEvent, UsageUnits};
 use crate::events::{BudgetSignals, EventKind, EventScope, SignalCell, SignalState, Subject};
 use crate::key::hash_key;
+use crate::lab_alerts::{
+    lab_account, BudgetAlertState, LabAlert, LabAlertCell, LabAlerts, Team, BUDGET_THRESHOLDS,
+};
 use crate::store::{FlushRow, GroupRecord, OutboxInsert, VirtualKeyRecord};
 use arc_swap::{ArcSwap, ArcSwapOption};
 use dashmap::DashMap;
 use lumen_core::{BudgetScope, GatewayError, QuotaKind};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -130,6 +134,12 @@ pub struct GroupEntry {
     signals: Arc<SignalCell>,
     /// Edge-trigger state for this pool's budget signals (ADR 011).
     signal_state: SignalState,
+    /// The live Lab alert sink (ADR 015 amendment 2026-11-20), shared with
+    /// every entry; `None` outside Lab mode.
+    lab: Arc<LabAlertCell>,
+    /// Edge-trigger state of this pool's Lab budget alerts. Separate from the
+    /// webhook state: its thresholds are fixed and it is restored at boot.
+    lab_state: SignalState,
     /// The control-plane account this pool is the lease of (ADR 015); swapped
     /// by admin PATCH. `None` = the pool's keys are never billed.
     account_ref: ArcSwapOption<String>,
@@ -147,8 +157,10 @@ pub struct GroupEntry {
 }
 
 impl GroupEntry {
-    fn from_record(record: &GroupRecord, signals: Arc<SignalCell>) -> Self {
+    fn from_record(record: &GroupRecord, signals: Arc<SignalCell>, lab: Arc<LabAlertCell>) -> Self {
         Self {
+            lab,
+            lab_state: SignalState::default(),
             parent_id: record.parent_id.clone(),
             parent: OnceLock::new(),
             id: record.id.clone(),
@@ -217,6 +229,7 @@ impl GroupEntry {
         self.with_signals(|signals, state, subject| {
             state.rearm(signals.thresholds(), subject);
         });
+        self.with_lab(|_, state, subject| state.rearm(&BUDGET_THRESHOLDS, subject));
     }
 
     /// Arm the pool's budget signals against current spend for a newly
@@ -225,6 +238,65 @@ impl GroupEntry {
         self.with_signals(|signals, state, subject| {
             state.arm_to_current(signals.thresholds(), subject);
         });
+    }
+
+    /// Run `f` with the Lab alert sink, this pool's Lab state and its
+    /// subject; nothing outside Lab mode. Only a sub-group is ever a Lab
+    /// budget subject: a top-level group is a team's lease (the Lab tracks
+    /// credits) or not a team at all.
+    fn with_lab(&self, f: impl FnOnce(&LabAlerts, &SignalState, &Subject<'_>)) {
+        if self.parent_id.is_none() {
+            return;
+        }
+        let guard = self.lab.load();
+        let Some(alerts) = guard.as_ref() else {
+            return;
+        };
+        let name = self.name.load();
+        let max = self.budget_max_micro.load(Ordering::SeqCst);
+        let subject = Subject {
+            scope: EventScope::Group,
+            id: &self.id,
+            name: name.as_str(),
+            max_micro: (max != UNLIMITED).then_some(max),
+            spent_micro: self.spent_micro.load(Ordering::SeqCst),
+        };
+        f(alerts, &self.lab_state, &subject);
+    }
+
+    /// The Lab team of a sub-group: its parent lease's account.
+    fn lab_team(&self) -> Option<Team> {
+        let parent = self.parent()?;
+        let account = parent.account_ref.load();
+        Some(Team {
+            account_id: lab_account(account.as_deref().map(String::as_str))?,
+            api_key_id: None,
+        })
+    }
+
+    /// Lab `budget.threshold` detection on a settle (sub-groups only).
+    fn lab_on_settle(&self) {
+        // An uncapped pool has no threshold: skip the subject snapshot.
+        if self.budget_max_micro.load(Ordering::Relaxed) == UNLIMITED {
+            return;
+        }
+        self.with_lab(|alerts, state, subject| {
+            lab_settle(alerts, state, subject, || self.lab_team());
+        });
+    }
+
+    /// Lab `budget.exhausted` detection on a refusal (sub-groups only).
+    fn lab_on_refusal(&self) {
+        self.with_lab(|alerts, state, subject| {
+            lab_refusal(alerts, state, subject, || self.lab_team());
+        });
+    }
+
+    /// Arm the Lab state for a newly installed sink or a new entry: restored
+    /// from `stored` when it was recorded under the current cap, else armed
+    /// against current spend (see [`SignalState::arm_to_current`]).
+    fn arm_lab(&self, stored: Option<&BudgetAlertState>) {
+        self.with_lab(|_, state, subject| arm_lab_state(state, subject, stored));
     }
 
     /// The group's opaque id (the `budget_groups.id` column).
@@ -312,6 +384,12 @@ pub struct KeyEntry {
     signals: Arc<SignalCell>,
     /// Edge-trigger state for this key's budget signals (ADR 011).
     signal_state: SignalState,
+    /// The live Lab alert sink (ADR 015 amendment 2026-11-20), shared with
+    /// every entry; `None` outside Lab mode.
+    lab: Arc<LabAlertCell>,
+    /// Edge-trigger state of this key's Lab budget alerts (see
+    /// [`GroupEntry`]'s).
+    lab_state: SignalState,
     /// Control-plane key reference (ADR 015), reported as `api_key_id`.
     external_ref: ArcSwapOption<String>,
     /// Cumulative settled real cost in micro-USD; the billing source
@@ -348,8 +426,14 @@ const _: () = assert!(std::mem::align_of::<KeyEntry>() == CACHE_LINE);
 const _: () = assert!(std::mem::align_of::<GroupEntry>() == CACHE_LINE);
 
 impl KeyEntry {
-    fn from_record(record: &VirtualKeyRecord, signals: Arc<SignalCell>) -> Self {
+    fn from_record(
+        record: &VirtualKeyRecord,
+        signals: Arc<SignalCell>,
+        lab: Arc<LabAlertCell>,
+    ) -> Self {
         let entry = Self {
+            lab,
+            lab_state: SignalState::default(),
             id: record.id.clone(),
             group: ArcSwapOption::empty(),
             budget_max_micro: AtomicI64::new(UNLIMITED),
@@ -501,6 +585,7 @@ impl KeyEntry {
         self.with_signals(|signals, state, subject| {
             state.rearm(signals.thresholds(), subject);
         });
+        self.with_lab(|_, state, subject| state.rearm(&BUDGET_THRESHOLDS, subject));
     }
 
     /// Arm the key's budget signals against current spend for a newly
@@ -509,6 +594,68 @@ impl KeyEntry {
         self.with_signals(|signals, state, subject| {
             state.arm_to_current(signals.thresholds(), subject);
         });
+    }
+
+    /// Run `f` with the Lab alert sink, this key's Lab state and its
+    /// subject; nothing outside Lab mode.
+    fn with_lab(&self, f: impl FnOnce(&LabAlerts, &SignalState, &Subject<'_>)) {
+        let guard = self.lab.load();
+        let Some(alerts) = guard.as_ref() else {
+            return;
+        };
+        let name = self.name.load();
+        let max = self.budget_max_micro.load(Ordering::SeqCst);
+        let subject = Subject {
+            scope: EventScope::Key,
+            id: &self.id,
+            name: name.as_str(),
+            max_micro: (max != UNLIMITED).then_some(max),
+            spent_micro: self.spent_micro.load(Ordering::SeqCst),
+        };
+        f(alerts, &self.lab_state, &subject);
+    }
+
+    /// The Lab team of this key: the account of its group's top-level group
+    /// (the lease), when that is a Lab account.
+    fn lab_team(&self) -> Option<Team> {
+        let account = self.account_ref()?;
+        Some(Team {
+            account_id: lab_account(Some(account.as_str()))?,
+            api_key_id: self.external_ref.load_full().map(|r| r.as_str().to_owned()),
+        })
+    }
+
+    /// The live Lab alert sink and this key's Lab account, for alerts raised
+    /// outside the budget (a team provider key changing status). `None`
+    /// outside Lab mode or for a key that is not a Lab team's.
+    #[must_use]
+    pub fn lab_alerts(&self) -> Option<(Arc<LabAlerts>, String)> {
+        let alerts = self.lab.load_full()?;
+        let account = lab_account(self.account_ref().as_deref().map(String::as_str))?;
+        Some((alerts, account))
+    }
+
+    /// Lab `budget.threshold` detection on a settle.
+    fn lab_on_settle(&self) {
+        // An uncapped key has no threshold: skip the subject snapshot.
+        if self.budget_max_micro.load(Ordering::Relaxed) == UNLIMITED {
+            return;
+        }
+        self.with_lab(|alerts, state, subject| {
+            lab_settle(alerts, state, subject, || self.lab_team());
+        });
+    }
+
+    /// Lab `budget.exhausted` detection on a refusal of the key's budget.
+    fn lab_on_refusal(&self) {
+        self.with_lab(|alerts, state, subject| {
+            lab_refusal(alerts, state, subject, || self.lab_team());
+        });
+    }
+
+    /// See [`GroupEntry`]'s `arm_lab`.
+    fn arm_lab(&self, stored: Option<&BudgetAlertState>) {
+        self.with_lab(|_, state, subject| arm_lab_state(state, subject, stored));
     }
 
     /// Emit one administrative lifecycle event (`key.disabled` / `key.rotated`
@@ -592,6 +739,7 @@ impl KeyEntry {
             // billing backend (ADR 011 §1). Edge-triggered, so a key that
             // keeps being refused does not flood the queue.
             self.with_signals(|signals, state, subject| state.on_refusal(signals, subject));
+            self.lab_on_refusal();
             return Err(GatewayError::BudgetExceeded {
                 scope: BudgetScope::Key,
             });
@@ -614,6 +762,9 @@ impl KeyEntry {
                 self.dirty.store(true, Ordering::SeqCst);
                 unwind_windows(self);
                 group.with_signals(|signals, state, subject| state.on_refusal(signals, subject));
+                // A sub-group's own budget (never the lease: its refusal
+                // below is the Lab's credits, which the Lab tracks itself).
+                group.lab_on_refusal();
                 return Err(GatewayError::BudgetExceeded {
                     scope: BudgetScope::Group,
                 });
@@ -804,6 +955,13 @@ impl Reservation {
                 parent.with_signals(|signals, state, subject| state.on_settle(signals, subject));
             }
         }
+        // Lab alerts (ADR 015 amendment 2026-11-20): the same compare on its
+        // own state, queued in memory for the next flush. Never the parent:
+        // that is the team's lease.
+        self.entry.lab_on_settle();
+        if let Some(group) = &self.group {
+            group.lab_on_settle();
+        }
     }
 }
 
@@ -845,6 +1003,9 @@ pub struct AuthState {
     /// (the default) = no `[webhooks]` block: entries do no detection work at
     /// all. Installed and swapped through [`set_signals`](Self::set_signals).
     signals: Arc<SignalCell>,
+    /// The Lab alert sink every entry shares (ADR 015 amendment 2026-11-20);
+    /// `None` outside Lab mode. See [`set_lab_alerts`](Self::set_lab_alerts).
+    lab: Arc<LabAlertCell>,
     /// The billing policy (ADR 015); `None` = no `[usage_events]` block, every
     /// key non-billable.
     billing: ArcSwapOption<BillingPolicy>,
@@ -911,6 +1072,35 @@ impl AuthState {
         for entry in &self.by_id {
             entry.arm_signals();
         }
+    }
+
+    /// Install (or clear, with `None`) the Lab alert sink: Lab mode, set once
+    /// at boot with the billing policy. Every live entry's Lab state is then
+    /// restored from `stored` (the states persisted with the alerts) when it
+    /// was recorded under the entry's current cap, and armed against current
+    /// spend otherwise, so a restart neither replays nor loses an alert.
+    pub fn set_lab_alerts(&self, alerts: Option<Arc<LabAlerts>>, stored: &[BudgetAlertState]) {
+        let enabled = alerts.is_some();
+        self.lab.store(alerts);
+        if !enabled {
+            return;
+        }
+        let stored: HashMap<(&str, &str), &BudgetAlertState> = stored
+            .iter()
+            .map(|s| ((s.scope.as_str(), s.subject_id.as_str()), s))
+            .collect();
+        for group in &self.groups {
+            group.arm_lab(stored.get(&("group", group.id.as_str())).copied());
+        }
+        for entry in &self.by_id {
+            entry.arm_lab(stored.get(&("key", entry.id.as_str())).copied());
+        }
+    }
+
+    /// The live Lab alert sink, in Lab mode.
+    #[must_use]
+    pub fn lab_alerts(&self) -> Option<Arc<LabAlerts>> {
+        self.lab.load_full()
     }
 
     /// Install (or clear) the billing policy. Set once at boot from
@@ -1009,13 +1199,18 @@ impl AuthState {
                 existing.get().set_group(group);
             }
             dashmap::Entry::Vacant(slot) => {
-                let entry = Arc::new(KeyEntry::from_record(record, Arc::clone(&self.signals)));
+                let entry = Arc::new(KeyEntry::from_record(
+                    record,
+                    Arc::clone(&self.signals),
+                    Arc::clone(&self.lab),
+                ));
                 entry.set_group(group);
                 // A key that arrives under a live policy (a hot reload, the
                 // rotate fallback) carries its spend with it: the thresholds
                 // already behind it are armed as fired, without an event.
                 // Nothing is in flight on an entry no request can reach yet.
                 entry.arm_signals();
+                entry.arm_lab(None);
                 self.by_hash.insert(hash, Arc::clone(&entry));
                 slot.insert(entry);
             }
@@ -1081,10 +1276,15 @@ impl AuthState {
                 Arc::clone(existing.get())
             }
             dashmap::Entry::Vacant(slot) => {
-                let entry = Arc::new(GroupEntry::from_record(record, Arc::clone(&self.signals)));
+                let entry = Arc::new(GroupEntry::from_record(
+                    record,
+                    Arc::clone(&self.signals),
+                    Arc::clone(&self.lab),
+                ));
                 // Armed against the spend it arrives with, like a new key in
                 // `upsert`: no member can reach the pool before the insert.
                 entry.arm_signals();
+                entry.arm_lab(None);
                 slot.insert(Arc::clone(&entry));
                 entry
             }
@@ -1253,6 +1453,15 @@ impl AuthState {
     /// entry, exactly like [`drain_dirty`](Self::drain_dirty). Retired keys
     /// are included until a [`commit_flush`](Self::commit_flush) removes them.
     pub fn drain_flush(&self, now_ms: i64) -> FlushBatch {
+        // Lab alerts first: an alert taken here was queued after the settle
+        // that moved the spend, so the spend read below includes its
+        // crossing, and both are persisted in the same transaction.
+        let alerts = self
+            .lab
+            .load()
+            .as_ref()
+            .map(|lab| lab.take())
+            .unwrap_or_default();
         let billing_on = self.billing_enabled();
         let mut items: Vec<FlushItem> = self
             .retired
@@ -1275,7 +1484,7 @@ impl AuthState {
                 .filter(|entry| entry.dirty.swap(false, Ordering::SeqCst))
                 .map(|entry| entry.value().flush_item(billing_on, now_ms)),
         );
-        FlushBatch { items }
+        FlushBatch { items, alerts }
     }
 
     /// The flush was persisted: move each watermark and each billed key's
@@ -1326,6 +1535,9 @@ impl AuthState {
     /// is retried, and give the swapped-out units back. Retired keys stay in
     /// the retired list for the next flush.
     pub fn rollback_flush(&self, batch: FlushBatch) {
+        if let Some(lab) = self.lab.load().as_ref() {
+            lab.restore(batch.alerts);
+        }
         for item in batch.items {
             item.entry.dirty.store(true, Ordering::SeqCst);
             if let Some(delta) = item.delta {
@@ -1405,13 +1617,32 @@ struct FlushItem {
 #[must_use = "a drained batch must go to AuthState::commit_flush or AuthState::rollback_flush"]
 pub struct FlushBatch {
     items: Vec<FlushItem>,
+    /// Lab alerts detected since the last flush (ADR 015 amendment
+    /// 2026-11-20), written to the outbox with the spend.
+    alerts: Vec<LabAlert>,
 }
 
 impl FlushBatch {
     /// Nothing to persist.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.items.is_empty()
+        self.items.is_empty() && self.alerts.is_empty()
+    }
+
+    /// The Lab alerts in this batch, in detection order.
+    #[must_use]
+    pub fn alerts(&self) -> &[LabAlert] {
+        &self.alerts
+    }
+
+    /// The Lab budget states to persist with this batch's alerts, in order
+    /// (the last one of a subject wins).
+    #[must_use]
+    pub fn alert_states(&self) -> Vec<BudgetAlertState> {
+        self.alerts
+            .iter()
+            .filter_map(|alert| alert.state.clone())
+            .collect()
     }
 
     /// The rows for [`KeyStore::persist_flush`](crate::store::KeyStore::persist_flush).
@@ -1452,6 +1683,7 @@ impl FlushBatch {
                     created_ms: now_ms,
                 })
             })
+            .chain(self.alerts.iter().map(|alert| alert.outbox_insert(now_ms)))
             .collect()
     }
 }
@@ -1552,6 +1784,83 @@ impl KeyEntry {
             window_end_ms: now_ms,
         };
         item(settled, Some(delta))
+    }
+}
+
+/// The Lab state of `subject` to persist with an alert.
+fn lab_budget_state(subject: &Subject<'_>, crossed: u32, exhausted: bool) -> BudgetAlertState {
+    BudgetAlertState {
+        scope: subject.scope,
+        subject_id: subject.id.to_owned(),
+        budget_max_micro: subject.max_micro.unwrap_or(UNLIMITED),
+        crossed,
+        exhausted,
+    }
+}
+
+/// Claim the Lab thresholds `subject` newly passed and queue one
+/// `budget.threshold` per threshold, when the subject is a Lab team's
+/// (`team`). Allocates only on a crossing.
+fn lab_settle(
+    alerts: &LabAlerts,
+    state: &SignalState,
+    subject: &Subject<'_>,
+    team: impl FnOnce() -> Option<Team>,
+) {
+    let range = state.claim_crossings(&BUDGET_THRESHOLDS, subject);
+    if range.is_empty() {
+        return;
+    }
+    let Some(team) = team() else {
+        return;
+    };
+    let now_ms = crate::now_unix_ms();
+    for index in range {
+        // The state after THIS alert: a flush that persists only part of the
+        // batch is impossible (one transaction), but the last state written
+        // for a subject must be the one of its last alert.
+        let crossed = u32::try_from(index + 1).unwrap_or(u32::MAX);
+        alerts.push(LabAlert::budget_threshold(
+            team.clone(),
+            subject,
+            BUDGET_THRESHOLDS[index],
+            lab_budget_state(subject, crossed, state.exhausted()),
+            now_ms,
+        ));
+    }
+}
+
+/// Claim the Lab exhaustion edge and queue `budget.exhausted`, when the
+/// subject is a Lab team's.
+fn lab_refusal(
+    alerts: &LabAlerts,
+    state: &SignalState,
+    subject: &Subject<'_>,
+    team: impl FnOnce() -> Option<Team>,
+) {
+    if !state.claim_exhaustion() {
+        return;
+    }
+    let Some(team) = team() else {
+        return;
+    };
+    alerts.push(LabAlert::budget_exhausted(
+        team,
+        subject,
+        lab_budget_state(subject, state.crossed(), true),
+        crate::now_unix_ms(),
+    ));
+}
+
+/// Restore a Lab state recorded under the subject's current cap, or arm it
+/// against current spend.
+fn arm_lab_state(state: &SignalState, subject: &Subject<'_>, stored: Option<&BudgetAlertState>) {
+    let cap = subject.max_micro.unwrap_or(UNLIMITED);
+    match stored {
+        Some(stored) if stored.budget_max_micro == cap => {
+            state.restore(stored.crossed, stored.exhausted);
+        }
+        _ => state.arm_to_current(&BUDGET_THRESHOLDS, subject),
     }
 }
 
@@ -1708,8 +2017,13 @@ mod tests {
             billed_micro: 0,
         };
         let signals = Arc::new(SignalCell::default());
-        let a = Arc::new(KeyEntry::from_record(&record, Arc::clone(&signals)));
-        let b = Arc::new(KeyEntry::from_record(&record, signals));
+        let lab = Arc::new(LabAlertCell::default());
+        let a = Arc::new(KeyEntry::from_record(
+            &record,
+            Arc::clone(&signals),
+            Arc::clone(&lab),
+        ));
+        let b = Arc::new(KeyEntry::from_record(&record, signals, lab));
         let (pa, pb) = (Arc::as_ptr(&a) as usize, Arc::as_ptr(&b) as usize);
         assert_eq!(pa % CACHE_LINE, 0, "entry starts on a line boundary");
         assert_eq!(pb % CACHE_LINE, 0, "entry starts on a line boundary");

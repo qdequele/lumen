@@ -54,6 +54,26 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ### Added
 
+- **Lab alerts: budget, key-expiry and provider-key events.** In Lab mode
+  (`[usage_events]` set) the gateway now reports four more event types
+  through the same signed outbox as `usage.recorded`, so the Lab can email
+  the team. `budget.threshold` (50, 80 and 95 %) and `budget.exhausted`
+  cover the budgets a team set on its own keys and sub-groups, never its
+  credit lease. `key.expiring` is sent 7 days and 1 day before a key
+  expires and once it has expired (an hourly scan). And
+  `provider_key.status_changed` is sent when a team's own provider key
+  starts being refused (`provider_auth` for 401/403, `provider_quota` for
+  402) and when it works again. Only keys and groups under a Lab account
+  (a UUID `account_ref`) are reported. Each alert is written to the outbox
+  in the same transaction as the spend or scan that raised it, with the
+  state that makes it once-only across restarts and replicas. The
+  vendored `lab-events.schema.json` is updated to the Lab's copy that
+  accepts these types. See
+  [Lab integration](docs/operations/lab-integration.md#alerts).
+  Deploy note: migration `0022_lab_alerts.sql` adds two tables (additive).
+  The Lab must accept the new types before this release reaches it: it
+  rejects an unknown type.
+
 - **Google (Gemini API) providers take team keys and default pool keys.** A
   provider of kind `google` was listed with `eligible: false`, so its key
   could only be changed in the gateway's config. It now accepts keys under
@@ -87,6 +107,12 @@ All notable changes to LUMEN are documented here. The format is based on
   "Prompt caching" in `docs/operations/token-accounting.md`.
 
 ### Changed
+
+- **A team or default pool key answering HTTP 402 is benched like a
+  rejected key.** A provider answering 402 (out of quota or credit) for one
+  key of a pool now marks that key `failing` for 10 minutes and tries the
+  next key, as for 401/403, instead of returning the 402 as the attempt's
+  result.
 
 - **Virtual models have size limits.** One virtual model may list at most 64
   targets, one `when` at most 16 conditions (counted through `any`), and the

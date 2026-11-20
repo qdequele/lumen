@@ -1342,7 +1342,10 @@ Bedrock, Vertex AI, self-hosted and keyless kinds are not.
   `/admin/groups/{id}/byok` (keys are sealed at rest and only `label`, `last4`
   and status are ever returned).
 - Keys are used round-robin. A 429 benches a key for `max(Retry-After, 30s)`;
-  a 401/403 marks it failing for 10 minutes.
+  a 401/403 (rejected) or a 402 (out of quota or credit) marks it failing
+  for 10 minutes. In Lab mode the change to failing, and back to working, is
+  reported to the Lab as `provider_key.status_changed`
+  ([Lab integration](operations/lab-integration.md#alerts)).
 - When no team key is usable, the request goes to the platform's key only if
   the provider's `fallback` is on (default off); otherwise it fails with
   `LM-3021` (429) without calling upstream. With fallback off, later links of
@@ -1372,7 +1375,8 @@ under `/admin/platform-keys` (platform-only: master key, no
 - Wherever the platform key served a request before (no team pool, or a team
   pool with the fallback on and no usable team key), the pool's enabled keys
   are tried round-robin with the team-key rules: a 429 benches a key for
-  `max(Retry-After, 30s)`, a 401/403 marks it failing for 10 minutes.
+  `max(Retry-After, 30s)`, a 401/403 or a 402 marks it failing for 10
+  minutes.
 - A provider with at least one platform key, enabled or not, has a pool, and
   its configured key (`api_key_env` or `PUT /admin/provider-keys/{name}`) is
   then ignored. When no pool key is usable, the request ends with the last

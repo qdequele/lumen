@@ -542,23 +542,36 @@ impl SignalState {
         if !signals.wants(EventKind::BudgetThreshold) {
             return;
         }
+        for index in self.claim_crossings(signals.thresholds(), subject) {
+            signals.queue.emit(subject.event(
+                EventKind::BudgetThreshold,
+                Some(signals.thresholds()[index]),
+            ));
+        }
+    }
+
+    /// Claim the thresholds (ascending) `subject` newly reached: the indices
+    /// into `thresholds` whose event the caller must now emit. Empty for an
+    /// uncapped subject and when nothing moved.
+    ///
+    /// `fetch_max` claims the crossing: only the caller that actually raised
+    /// the count gets a non-empty range, so a threshold is claimed once per
+    /// epoch even under concurrent settles. Shared by the webhook signals
+    /// (ADR 011) and the Lab alerts (ADR 015), each over its own state.
+    pub fn claim_crossings(
+        &self,
+        thresholds: &[u8],
+        subject: &Subject<'_>,
+    ) -> std::ops::Range<usize> {
         let Some(percent) = subject.consumed_percent() else {
-            return;
+            return 0..0;
         };
-        let reached = crossed_count(signals.thresholds(), percent);
-        // `fetch_max` claims the crossing: only the caller that actually
-        // raised the count emits, so a threshold fires once per epoch even
-        // under concurrent settles.
+        let reached = crossed_count(thresholds, percent);
         let previous = self.crossed.fetch_max(reached, Ordering::SeqCst);
         if previous >= reached {
-            return;
+            return 0..0;
         }
-        let (from, to) = (previous as usize, reached as usize);
-        for threshold in &signals.thresholds()[from..to] {
-            signals
-                .queue
-                .emit(subject.event(EventKind::BudgetThreshold, Some(*threshold)));
-        }
+        previous as usize..reached as usize
     }
 
     /// Fire `budget.exhausted` for the first `LM-4001` refusal since this
@@ -568,12 +581,37 @@ impl SignalState {
         if !signals.wants(EventKind::BudgetExhausted) {
             return;
         }
-        if self.exhausted.swap(true, Ordering::SeqCst) {
-            return;
+        if self.claim_exhaustion() {
+            signals
+                .queue
+                .emit(subject.event(EventKind::BudgetExhausted, None));
         }
-        signals
-            .queue
-            .emit(subject.event(EventKind::BudgetExhausted, None));
+    }
+
+    /// Claim the exhaustion edge: `true` for the first refusal since the
+    /// subject last had headroom, `false` after.
+    pub fn claim_exhaustion(&self) -> bool {
+        !self.exhausted.swap(true, Ordering::SeqCst)
+    }
+
+    /// The number of thresholds fired in the current epoch.
+    #[must_use]
+    pub fn crossed(&self) -> u32 {
+        self.crossed.load(Ordering::SeqCst)
+    }
+
+    /// Whether `budget.exhausted` fired in the current epoch.
+    #[must_use]
+    pub fn exhausted(&self) -> bool {
+        self.exhausted.load(Ordering::SeqCst)
+    }
+
+    /// Restore a state recorded durably in the same epoch (the Lab alerts
+    /// after a restart, ADR 015): exactly what was emitted, so the next
+    /// settle emits a crossing that was reached but never recorded.
+    pub fn restore(&self, crossed: u32, exhausted: bool) {
+        self.crossed.store(crossed, Ordering::SeqCst);
+        self.exhausted.store(exhausted, Ordering::SeqCst);
     }
 
     /// Re-arm both signals against a changed cap: a new budget epoch (ADR 011

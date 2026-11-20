@@ -91,8 +91,8 @@ The mapping between a failure and the code that eventually surfaces:
   key's, so one never opens the other.
 - **`LM-3021` (429)** - the caller's group brought its own keys for the
   provider and none is usable right now (rate-limited keys are benched for
-  `max(Retry-After, 30s)`, keys the provider rejects with 401/403 for 10
-  minutes). Decided by the gateway, so it is never retried and never counts
+  `max(Retry-After, 30s)`, keys the provider rejects with 401/402/403 for
+  10 minutes). Decided by the gateway, so it is never retried and never counts
   against the circuit breaker. A fallback chain may move on under its
   `rate_limited` trigger, but a later link only runs if the group also serves
   it with its own keys: with the fallback off, no link reaches the platform's

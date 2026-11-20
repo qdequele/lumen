@@ -26,6 +26,7 @@ zeroize = { workspace = true }
 dashmap = { workspace = true }
 arc-swap = { workspace = true }
 tokio = { workspace = true }
+sha1 = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

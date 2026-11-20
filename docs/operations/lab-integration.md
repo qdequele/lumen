@@ -314,6 +314,60 @@ cost, in the Lab-owned v2 shape (`contracts/vendor/lab/lab-events.schema.json`):
   with a notice, and while the Lab has not published its copy yet (`404`) it
   passes with a warning.
 
+## Alerts
+
+Besides the bill, a gateway in Lab mode reports four alert types through the
+same outbox, signature and delivery, so the Lab can email the team (ADR 015,
+amendment 2026-11-20). They follow the same Lab-owned schema.
+
+**Who is reported.** Only keys and groups of a Lab team: their top-level
+group (the lease, `lab-<account id>`) carries an `account_ref` that is a UUID.
+`account_id` is that account. The lease itself is never a budget subject: the
+Lab tracks the team's credits, and a `LM-4001` refusal by the lease (scope
+`parent_group`) is not an alert.
+
+| Type | When | `data` |
+|---|---|---|
+| `budget.threshold` | A key's own budget (scope `key`) or a sub-group's budget (scope `group`) passes 50, 80 or 95 % | `scope`, `subject_id`, `subject_name`, `budget_max_micro_usd`, `spent_micro_usd`, `threshold` |
+| `budget.exhausted` | The first `LM-4001` refusal by that key's or sub-group's budget since it last had headroom | the same, without `threshold` |
+| `key.expiring` | A live, enabled team key has 7 days left, 1 day left, or has expired (up to a day after) | `key_id`, `key_name`, `expires_at`, `days_left` (7, 1 or 0) |
+| `provider_key.status_changed` | A team provider key (BYOK) starts being refused, or works again after that | `provider`, `key_id`, `key_name`, `status` (`failing` or `ok`), and when failing `status_code`, `reason`, `message` |
+
+- Money is integer micro-USD. `subject_id` and `key_id` are LUMEN ids;
+  `api_key_id` is the key's `external_ref` for a key subject or a
+  `key.expiring`, else `null`.
+- `reason` is `provider_auth` for a 401 or 403 and `provider_quota` for a
+  402. A 429 is a rate limit (the key is benched 30 s or more), not a status
+  change, and is not reported.
+- `budget.*` and `provider_key.status_changed` ids are UUIDv7 minted when
+  the alert is detected. `key.expiring` ids are the UUIDv5 of
+  `key:{key_id}:{expires_at}:{days_left}`, as the schema defines.
+
+**Once, durably.** Detection stays in memory, where the decision is made:
+the budget alerts on the settle and the refusal (the webhook edge trigger,
+ADR 011, over its own state and the fixed 50/80/95 list), the provider-key
+alerts on the key rotation. The next budget flush writes each alert to the
+outbox in the same transaction as the spend that crossed it, together with
+the subject's alert state (`lab_budget_alert_state`: the cap of the budget
+period, the thresholds sent and whether exhaustion was sent). At boot a
+state recorded under the subject's current cap is restored, so a restart
+neither replays an alert nor loses one whose spend was flushed before it;
+any other subject is armed against its current spend. A failed flush keeps
+its alerts for the next one. A changed cap (a grant or a `PATCH`) starts a
+new budget period, as for webhooks.
+
+The `key.expiring` scan runs hourly (first at boot) and writes a
+`lab_key_expiry_notices` row and the outbox row in one transaction; the
+unique row makes each milestone once per key and expiry across restarts,
+overlapping scans and replicas. A new `expires_at` is a new set of
+milestones.
+
+A provider-key status is per process: a key already failing when the
+gateway restarts is reported again the first time it fails after the
+restart, and its recovery is reported only if its failure was. A second
+replica may report the same change once more. Both are acceptable for a
+notice and never repeat per request.
+
 ## Delivery
 
 One sender task per process, only when `[usage_events]` is set.
@@ -476,6 +530,9 @@ hand.
 Enabling this block makes the gateway call the configured URL. Events carry
 no prompt, no response, no request metadata and no model id: only the account
 and key refs, the LUMEN key id, unit counts, micro-USD cost and the window.
+Alerts add key, group and team provider key ids and names, budget figures,
+an expiry date, and for a refused provider key its HTTP status and a fixed
+message; never a secret and never the provider's error body.
 The boot-time identity call sends the instance credentials (the id and the
 bearer secret) and nothing else. Per-model detail stays in `usage_log` and
 `GET /admin/usage/export`, which remain best-effort and are not the billing
@@ -492,7 +549,9 @@ LUMEN carries no Lab code. The Lab side of platform contract v2 is:
 2. Accept `product: "lumen"` with `operation: "gateway"` and the four unit
    names in its own `contracts/lab-events.schema.json` (the file LUMEN
    vendors), and price them in `saas/config/pricing.yml` (LUMEN's money is
-   `provider_cost_micro_usd`).
+   `provider_cost_micro_usd`). Accept the alert types (`budget.threshold`,
+   `budget.exhausted`, `key.expiring`, `provider_key.status_changed`) before
+   a gateway that sends them is deployed: the Lab rejects an unknown type.
 3. Verify `X-Lab-Instance-Id`, `X-Lab-Timestamp` and `X-Lab-Signature` on
    `POST /internal/events` and answer `{"accepted": [...]}`.
 4. Validate each event of a batch on its own and leave an invalid one's id

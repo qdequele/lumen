@@ -1,6 +1,6 @@
 //! The one budget flush (ADR 009, 015): memory to SQLite for key spend, the
-//! billing watermark and the usage events that bill it, then group pool
-//! spend. Called by the periodic flush task, the shutdown drain and the
+//! billing watermark, the usage events that bill it and the Lab alerts
+//! detected since the last flush, then group pool spend. Called by the periodic flush task, the shutdown drain and the
 //! key-delete final flush, so the three can never diverge. Every flush runs
 //! under the flush guard, because the billing watermark only moves at commit.
 //! Never on the request path; failures are logged and retried by the next
@@ -95,7 +95,12 @@ async fn persist(runtime: &AuthRuntime, batch: FlushBatch, now_ms: i64) -> bool 
             return false;
         }
     };
-    match runtime.store.persist_flush(&batch.rows(), &events).await {
+    let states = batch.alert_states();
+    match runtime
+        .store
+        .persist_flush_with_alerts(&batch.rows(), &events, &states, now_ms)
+        .await
+    {
         Ok(()) => {
             runtime.keys.commit_flush(batch);
             true

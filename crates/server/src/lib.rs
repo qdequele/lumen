@@ -26,6 +26,7 @@ pub mod embeddings;
 pub mod error;
 pub mod facts;
 pub mod health;
+pub mod lab_alerts;
 pub mod lab_identity;
 pub mod lifecycle;
 pub mod metadata;

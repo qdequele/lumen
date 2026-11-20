@@ -6,8 +6,9 @@
 //! against in-memory state only.
 
 use crate::crypto::MasterKey;
-use crate::events::WebhookSettings;
+use crate::events::{EventScope, WebhookSettings};
 use crate::key::{generate, hash_key, random_id, PlaintextKey};
+use crate::lab_alerts::BudgetAlertState;
 use crate::{now_unix, AuthError};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteConnection, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
@@ -712,6 +713,22 @@ pub struct OutboxInsert {
     pub created_ms: i64,
 }
 
+/// A Lab team key with an expiry, as the `key.expiring` scan reads it
+/// (ADR 015, amendment 2026-11-20).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpiringKey {
+    /// The key id.
+    pub id: String,
+    /// The key name.
+    pub name: String,
+    /// Expiry, unix seconds.
+    pub expires_at: i64,
+    /// The key's `external_ref` (the Lab key id), if any.
+    pub external_ref: Option<String>,
+    /// The `account_ref` of the key's top-level group.
+    pub account_ref: Option<String>,
+}
+
 /// Rows deleted per statement by [`KeyStore::purge_usage_older_than`].
 pub const USAGE_PURGE_CHUNK: i64 = 5000;
 
@@ -1334,7 +1351,40 @@ impl KeyStore {
         rows: &[FlushRow],
         events: &[OutboxInsert],
     ) -> Result<(), AuthError> {
+        self.persist_flush_with_alerts(rows, events, &[], 0).await
+    }
+
+    /// [`persist_flush`](Self::persist_flush) plus the Lab alert states of
+    /// the budget alerts among `events` (ADR 015, amendment 2026-11-20): an
+    /// alert, its subject's state and the spend that crossed it are
+    /// committed together or not at all. States are applied in order, so the
+    /// last one of a subject wins.
+    pub async fn persist_flush_with_alerts(
+        &self,
+        rows: &[FlushRow],
+        events: &[OutboxInsert],
+        states: &[BudgetAlertState],
+        now_ms: i64,
+    ) -> Result<(), AuthError> {
         let mut tx = self.pool.begin().await?;
+        for state in states {
+            sqlx::query(
+                "INSERT INTO lab_budget_alert_state \
+                   (scope, subject_id, budget_max_micro, crossed, exhausted, updated_ms) \
+                 VALUES (?, ?, ?, ?, ?, ?) \
+                 ON CONFLICT (scope, subject_id) DO UPDATE SET \
+                   budget_max_micro = excluded.budget_max_micro, crossed = excluded.crossed, \
+                   exhausted = excluded.exhausted, updated_ms = excluded.updated_ms",
+            )
+            .bind(state.scope.as_str())
+            .bind(&state.subject_id)
+            .bind(state.budget_max_micro)
+            .bind(i64::from(state.crossed))
+            .bind(state.exhausted)
+            .bind(now_ms)
+            .execute(&mut *tx)
+            .await?;
+        }
         for row in rows {
             sqlx::query("UPDATE virtual_keys SET budget_spent = ?, billed_micro = ? WHERE id = ?")
                 .bind(row.spent_usd)
@@ -1356,6 +1406,109 @@ impl KeyStore {
         }
         tx.commit().await?;
         Ok(())
+    }
+
+    /// Every recorded Lab budget alert state (boot, ADR 015 amendment
+    /// 2026-11-20). A row with an unknown scope is skipped.
+    pub async fn load_lab_budget_states(&self) -> Result<Vec<BudgetAlertState>, AuthError> {
+        let rows = sqlx::query(
+            "SELECT scope, subject_id, budget_max_micro, crossed, exhausted \
+             FROM lab_budget_alert_state",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut states = Vec::with_capacity(rows.len());
+        for row in rows {
+            let scope = match row.try_get::<String, _>("scope")?.as_str() {
+                "key" => EventScope::Key,
+                "group" => EventScope::Group,
+                _ => continue,
+            };
+            states.push(BudgetAlertState {
+                scope,
+                subject_id: row.try_get("subject_id")?,
+                budget_max_micro: row.try_get("budget_max_micro")?,
+                crossed: u32::try_from(row.try_get::<i64, _>("crossed")?).unwrap_or(0),
+                exhausted: row.try_get("exhausted")?,
+            });
+        }
+        Ok(states)
+    }
+
+    /// Live, enabled keys of a group expiring in `(from_secs, to_secs]`,
+    /// with the `account_ref` of their top-level group (a sub-group's
+    /// parent, ADR 020). The `key.expiring` scan filters Lab teams.
+    pub async fn lab_expiring_keys(
+        &self,
+        from_secs: i64,
+        to_secs: i64,
+    ) -> Result<Vec<ExpiringKey>, AuthError> {
+        let rows = sqlx::query(
+            "SELECT k.id, k.name, k.expires_at, k.external_ref, \
+                    COALESCE(p.account_ref, g.account_ref) AS account_ref \
+             FROM virtual_keys k \
+             JOIN budget_groups g ON g.id = k.group_id AND g.deleted_at IS NULL \
+             LEFT JOIN budget_groups p ON p.id = g.parent_id \
+             WHERE k.deleted_at IS NULL AND k.disabled = 0 \
+               AND k.expires_at > ? AND k.expires_at <= ? \
+             ORDER BY k.expires_at, k.id",
+        )
+        .bind(from_secs)
+        .bind(to_secs)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(ExpiringKey {
+                    id: row.try_get("id")?,
+                    name: row.try_get("name")?,
+                    expires_at: row.try_get("expires_at")?,
+                    external_ref: row.try_get("external_ref")?,
+                    account_ref: row.try_get("account_ref")?,
+                })
+            })
+            .collect()
+    }
+
+    /// Record one `key.expiring` notice and enqueue its event, in one
+    /// transaction: `false` (and nothing enqueued) when the notice for this
+    /// key, expiry and milestone was already recorded, by an earlier scan or
+    /// another replica.
+    pub async fn record_key_expiry_notice(
+        &self,
+        key_id: &str,
+        expires_at: i64,
+        days_left: u32,
+        event: &OutboxInsert,
+    ) -> Result<bool, AuthError> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let inserted = sqlx::query(
+            "INSERT OR IGNORE INTO lab_key_expiry_notices \
+               (key_id, expires_at, days_left, created_ms) VALUES (?, ?, ?, ?)",
+        )
+        .bind(key_id)
+        .bind(expires_at)
+        .bind(i64::from(days_left))
+        .bind(event.created_ms)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if inserted == 0 {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        sqlx::query(
+            "INSERT OR IGNORE INTO usage_outbox (id, body, created_ms, next_attempt_ms) \
+             VALUES (?, ?, ?, ?)",
+        )
+        .bind(&event.id)
+        .bind(&event.body)
+        .bind(event.created_ms)
+        .bind(event.created_ms)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(true)
     }
 
     /// Up to `limit` pending events whose next attempt is due, oldest first.

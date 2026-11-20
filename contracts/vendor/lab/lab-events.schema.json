@@ -2,20 +2,34 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://lab.meilisearch.com/contracts/lab-events.schema.json",
   "title": "Lab event",
-  "description": "One event a product engine reports to the Lab at POST /internal/events, delivered in batches of at most 500 as {\"events\": [<event>, ...]} and acknowledged with 200 {\"accepted\": [<id>, ...]}. Owned by meilisearch/lab (contracts/lab-events.schema.json); Scrapix, glutony and Lumen vendor a byte copy under contracts/vendor/lab/ and drift-check it in CI. The Lab takes the reporting deployment from the authenticated X-Lab-Instance-Id header, never from the body.",
+  "description": "One event a product engine reports to the Lab at POST /internal/events, delivered in batches of at most 500 as {\"events\": [<event>, ...]} and acknowledged with 200 {\"accepted\": [<id>, ...]}. Owned by meilisearch/lab (contracts/lab-events.schema.json); Scrapix, glutony, Lumen and meili-connect vendor a byte copy under contracts/vendor/lab/ and drift-check it in CI. The Lab takes the reporting deployment from the authenticated X-Lab-Instance-Id header, never from the body.",
   "type": "object",
   "required": ["id", "type", "occurred_at", "account_id", "api_key_id", "product", "data"],
   "additionalProperties": false,
   "properties": {
     "id": {
       "$ref": "#/$defs/uuid",
-      "description": "Idempotency key. UUIDv7 per request; UUIDv5 of a stable name for job-final events (job:{job_id}:usage, job:{job_id}:lifecycle)."
+      "description": "Idempotency key. UUIDv7 per request; UUIDv5 of a stable name for job-final events (job:{job_id}:usage, job:{job_id}:lifecycle: a job has one lifecycle event, completed, failed or cancelled) and for state changes (see each type)."
     },
-    "type": { "enum": ["usage.recorded", "job.completed", "job.failed"] },
+    "type": {
+      "enum": [
+        "usage.recorded",
+        "job.completed",
+        "job.failed",
+        "job.cancelled",
+        "source.status_changed",
+        "sync.state_changed",
+        "budget.threshold",
+        "budget.exhausted",
+        "key.expiring",
+        "provider_key.status_changed"
+      ],
+      "description": "usage.recorded: billable usage. job.*: a crawl or pipeline run ended (scrapix, glutony). source.status_changed: a scheduled Pipelines source started failing or recovered (glutony). sync.state_changed: a Connect sync changed state (connect). budget.*, key.expiring, provider_key.status_changed: Gateway alerts (lumen). The Lab rejects a type it does not know without retrying it, so an engine may send a new type only once the Lab that accepts it is deployed."
+    },
     "occurred_at": { "type": "string", "format": "date-time" },
     "account_id": { "$ref": "#/$defs/uuid", "description": "The Lab account the usage belongs to." },
     "api_key_id": { "type": ["string", "null"], "description": "The Lab API key id when known." },
-    "product": { "enum": ["scrapix", "lumen", "glutony"] },
+    "product": { "enum": ["scrapix", "lumen", "glutony", "connect"] },
     "data": { "type": "object" }
   },
   "allOf": [
@@ -32,6 +46,34 @@
       "then": { "properties": { "data": { "$ref": "#/$defs/jobFailedData" } } }
     },
     {
+      "if": { "properties": { "type": { "const": "job.cancelled" } }, "required": ["type"] },
+      "then": { "properties": { "data": { "$ref": "#/$defs/jobCancelledData" } } }
+    },
+    {
+      "if": { "properties": { "type": { "const": "source.status_changed" } }, "required": ["type"] },
+      "then": { "properties": { "product": { "const": "glutony" }, "data": { "$ref": "#/$defs/sourceStatusData" } } }
+    },
+    {
+      "if": { "properties": { "type": { "const": "sync.state_changed" } }, "required": ["type"] },
+      "then": { "properties": { "product": { "const": "connect" }, "data": { "$ref": "#/$defs/syncStateData" } } }
+    },
+    {
+      "if": { "properties": { "type": { "const": "budget.threshold" } }, "required": ["type"] },
+      "then": { "properties": { "product": { "const": "lumen" }, "data": { "$ref": "#/$defs/budgetThresholdData" } } }
+    },
+    {
+      "if": { "properties": { "type": { "const": "budget.exhausted" } }, "required": ["type"] },
+      "then": { "properties": { "product": { "const": "lumen" }, "data": { "$ref": "#/$defs/budgetData" } } }
+    },
+    {
+      "if": { "properties": { "type": { "const": "key.expiring" } }, "required": ["type"] },
+      "then": { "properties": { "product": { "const": "lumen" }, "data": { "$ref": "#/$defs/keyExpiringData" } } }
+    },
+    {
+      "if": { "properties": { "type": { "const": "provider_key.status_changed" } }, "required": ["type"] },
+      "then": { "properties": { "product": { "const": "lumen" }, "data": { "$ref": "#/$defs/providerKeyStatusData" } } }
+    },
+    {
       "if": { "properties": { "type": { "const": "usage.recorded" }, "product": { "const": "scrapix" } }, "required": ["type", "product"] },
       "then": { "properties": { "data": { "properties": { "operation": { "enum": ["scrape", "map", "search", "parse", "ocr", "extract", "crawl"] } } } } }
     },
@@ -45,7 +87,15 @@
     },
     {
       "if": { "properties": { "product": { "const": "lumen" } }, "required": ["product"] },
-      "then": { "properties": { "type": { "const": "usage.recorded" } } }
+      "then": { "properties": { "type": { "enum": ["usage.recorded", "budget.threshold", "budget.exhausted", "key.expiring", "provider_key.status_changed"] } } }
+    },
+    {
+      "if": { "properties": { "type": { "const": "usage.recorded" }, "product": { "const": "connect" } }, "required": ["type", "product"] },
+      "then": { "properties": { "data": { "properties": { "operation": { "enum": ["sync"] }, "units": { "$ref": "#/$defs/connectUnits" } } } } }
+    },
+    {
+      "if": { "properties": { "product": { "const": "connect" } }, "required": ["product"] },
+      "then": { "properties": { "type": { "enum": ["usage.recorded", "sync.state_changed"] } } }
     }
   ],
   "$defs": {
@@ -55,8 +105,20 @@
     },
     "units": {
       "type": "object",
-      "description": "Raw units by name. The Lab prices the names in saas/config/pricing.yml; unknown names are kept and ignored. Lumen sends requests, tokens_in, tokens_out, tokens_estimated, bytes_in, bytes_out, byok_tokens_in, byok_tokens_out.",
+      "description": "Raw units by name. The Lab prices the names in saas/config/pricing.yml; unknown names are kept and ignored. Lumen sends requests, tokens_in, tokens_out, tokens_estimated, bytes_in, bytes_out, byok_tokens_in, byok_tokens_out. Connect sends exactly connectUnits.",
       "additionalProperties": { "type": "integer", "minimum": 0 }
+    },
+    "connectUnits": {
+      "type": "object",
+      "description": "One Connect sync's usage over a flush interval (job_id is the sync id). documents_streamed: document writes and deletes applied from the change stream; documents_snapshot: documents written by a first sync or a resync the user asked for; documents_resync: documents rewritten by a resync the system started (free, reported); bytes: uncompressed payload bytes sent to Meilisearch; sync_seconds: seconds the sync spent snapshotting or streaming (free at launch, reported). Only documents Meilisearch accepted count.",
+      "additionalProperties": false,
+      "properties": {
+        "documents_streamed": { "type": "integer", "minimum": 0 },
+        "documents_snapshot": { "type": "integer", "minimum": 0 },
+        "documents_resync": { "type": "integer", "minimum": 0 },
+        "bytes": { "type": "integer", "minimum": 0 },
+        "sync_seconds": { "type": "integer", "minimum": 0 }
+      }
     },
     "usageData": {
       "type": "object",
@@ -66,7 +128,7 @@
         "operation": {
           "type": "string",
           "minLength": 1,
-          "description": "Product-specific operation name. scrapix: scrape|map|search|parse|ocr|extract|crawl. glutony: ingest. lumen: chat|embed|rerank|systemone|gateway."
+          "description": "Product-specific operation name. scrapix: scrape|map|search|parse|ocr|extract|crawl. glutony: ingest. lumen: chat|embed|rerank|systemone|gateway. connect: sync."
         },
         "units": { "$ref": "#/$defs/units" },
         "provider_cost_micro_usd": {
@@ -86,16 +148,36 @@
         }
       }
     },
+    "reason": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]{0,63}$",
+      "description": "Why it failed or stopped, as a stable code the Lab words for the user; the free-text message stays next to it. An open set: the Lab shows the message alone for a code it does not know. Known codes: insufficient_credits (the team has no credits), gateway_budget_exhausted, no_gateway (an AI step had no Gateway to call), destination_auth (Meilisearch rejected the key), destination_unreachable, destination_rejected (Meilisearch refused the documents or the index), source_auth (the source refused the credentials), source_not_found (404/410), source_unreachable, source_config (publication, slot, privilege or schema problem on the source), invalid_config (the crawl, pipeline or sync is invalid), invalid_input (the file or document could not be read), stalled (no progress), no_pages (nothing could be crawled), delete_guard (a mass delete was held back), resync_budget_spent, internal."
+    },
+    "jobGroup": {
+      "type": "object",
+      "description": "The run this job belongs to, so the Lab can tell one email about it instead of one per job. source_run: a scheduled Pipelines source run (id: the run id, name: the source's name). archive: the files of one uploaded archive (id: the archive's job id). batch: one batch ingest request (id: the batch id).",
+      "required": ["kind", "id"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "enum": ["source_run", "archive", "batch"] },
+        "id": { "type": "string", "minLength": 1 },
+        "name": { "type": "string" }
+      }
+    },
     "jobCompletedData": {
       "type": "object",
       "required": ["job_id", "index_uid", "pages_crawled", "documents_indexed", "duration_secs"],
       "additionalProperties": false,
       "properties": {
         "job_id": { "type": "string" },
-        "index_uid": { "type": "string" },
+        "index_uid": { "type": "string", "description": "The Meilisearch index written to. glutony before v3 sent the pipeline uid here; it now sends that as pipeline." },
         "pages_crawled": { "type": "integer", "minimum": 0 },
         "documents_indexed": { "type": "integer", "minimum": 0 },
-        "duration_secs": { "type": "integer", "minimum": 0 }
+        "duration_secs": { "type": "integer", "minimum": 0 },
+        "pages_failed": { "type": "integer", "minimum": 0, "description": "scrapix: pages that could not be fetched or processed." },
+        "documents_failed": { "type": "integer", "minimum": 0, "description": "Documents Meilisearch refused (failed tasks)." },
+        "pipeline": { "type": "string", "description": "glutony: the pipeline's uid." },
+        "group": { "$ref": "#/$defs/jobGroup" }
       }
     },
     "jobFailedData": {
@@ -105,7 +187,115 @@
       "properties": {
         "job_id": { "type": "string" },
         "error_message": { "type": "string" },
-        "pages_crawled": { "type": "integer", "minimum": 0 }
+        "pages_crawled": { "type": "integer", "minimum": 0 },
+        "reason": { "$ref": "#/$defs/reason" },
+        "step": { "type": "string", "description": "glutony: the id of the step that failed." },
+        "index_uid": { "type": "string" },
+        "pipeline": { "type": "string" },
+        "group": { "$ref": "#/$defs/jobGroup" }
+      }
+    },
+    "jobCancelledData": {
+      "type": "object",
+      "description": "A job someone cancelled. It is the job's lifecycle event (same id as job.completed or job.failed would have).",
+      "required": ["job_id"],
+      "additionalProperties": false,
+      "properties": {
+        "job_id": { "type": "string" },
+        "index_uid": { "type": "string" },
+        "pages_crawled": { "type": "integer", "minimum": 0 },
+        "documents_indexed": { "type": "integer", "minimum": 0 },
+        "pipeline": { "type": "string" },
+        "group": { "$ref": "#/$defs/jobGroup" }
+      }
+    },
+    "sourceStatusData": {
+      "type": "object",
+      "description": "A scheduled Pipelines source changed status: failing after a run failed while it was ok, ok after a run succeeded while it was failing. Sent on the change only, not every run. Id: UUIDv5 of source:{source_id}:run:{run_id}:status, so a retried run reports once.",
+      "required": ["source_id", "status"],
+      "additionalProperties": false,
+      "properties": {
+        "source_id": { "type": "string", "minLength": 1 },
+        "source_name": { "type": "string" },
+        "status": { "enum": ["failing", "ok"] },
+        "run_id": { "type": "string" },
+        "pipeline": { "type": "string" },
+        "reason": { "$ref": "#/$defs/reason" },
+        "error_message": { "type": "string" },
+        "consecutive_failures": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "syncStateData": {
+      "type": "object",
+      "description": "A Connect sync changed state. Sent on every change of `to`, and when a snapshot ends (from snapshotting to streaming). Id: a UUIDv7 made when the change is recorded and kept across retries.",
+      "required": ["sync_id", "to"],
+      "additionalProperties": false,
+      "properties": {
+        "sync_id": { "type": "string", "minLength": 1 },
+        "sync_name": { "type": "string", "description": "The sync's label, for example postgres → products." },
+        "from": { "$ref": "#/$defs/syncState" },
+        "to": { "$ref": "#/$defs/syncState" },
+        "resync": { "type": "boolean", "description": "The snapshot that ended or started was a resync, not the first one." },
+        "reason": { "$ref": "#/$defs/reason" },
+        "message": { "type": "string" }
+      }
+    },
+    "syncState": {
+      "enum": ["pending", "snapshotting", "streaming", "paused", "source_paused", "held", "failed", "deleted"],
+      "description": "paused: by the user. source_paused: the source is down or unresolvable and the sync waits for it. held: stopped until the user fixes something (reason says what). failed: stopped for good."
+    },
+    "budgetData": {
+      "type": "object",
+      "description": "A Gateway budget a team set on one of its keys (scope key) or groups (scope group) ran out: requests on it are refused. Never the team's own credit lease, which the Lab tracks itself. Id: a UUIDv7 made when it is recorded and kept across retries; sent once per budget period.",
+      "required": ["scope", "subject_id", "budget_max_micro_usd", "spent_micro_usd"],
+      "additionalProperties": false,
+      "properties": {
+        "scope": { "enum": ["key", "group"] },
+        "subject_id": { "type": "string", "minLength": 1 },
+        "subject_name": { "type": "string" },
+        "budget_max_micro_usd": { "type": "integer", "minimum": 0 },
+        "spent_micro_usd": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "budgetThresholdData": {
+      "type": "object",
+      "description": "A Gateway budget passed a share of its maximum (by default 50, 80 and 95 percent), once per budget period. Id: a UUIDv7 made when it is recorded and kept across retries.",
+      "required": ["scope", "subject_id", "budget_max_micro_usd", "spent_micro_usd", "threshold"],
+      "additionalProperties": false,
+      "properties": {
+        "scope": { "enum": ["key", "group"] },
+        "subject_id": { "type": "string", "minLength": 1 },
+        "subject_name": { "type": "string" },
+        "budget_max_micro_usd": { "type": "integer", "minimum": 0 },
+        "spent_micro_usd": { "type": "integer", "minimum": 0 },
+        "threshold": { "type": "integer", "minimum": 1, "maximum": 100, "description": "Percent of the budget." }
+      }
+    },
+    "keyExpiringData": {
+      "type": "object",
+      "description": "A Gateway key expires soon (days_left 7 and 1) or has expired (days_left 0). Id: UUIDv5 of key:{key_id}:{expires_at}:{days_left}.",
+      "required": ["key_id", "expires_at", "days_left"],
+      "additionalProperties": false,
+      "properties": {
+        "key_id": { "type": "string", "minLength": 1 },
+        "key_name": { "type": "string" },
+        "expires_at": { "type": "string", "format": "date-time" },
+        "days_left": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "providerKeyStatusData": {
+      "type": "object",
+      "description": "A provider key the team brought (BYOK) started being refused by its provider (failing: 401/403, or out of quota) or works again (ok). Sent on the change only. Id: UUIDv7.",
+      "required": ["provider", "status"],
+      "additionalProperties": false,
+      "properties": {
+        "provider": { "type": "string", "minLength": 1 },
+        "key_id": { "type": "string" },
+        "key_name": { "type": "string" },
+        "status": { "enum": ["failing", "ok"] },
+        "status_code": { "type": "integer", "minimum": 100, "maximum": 599 },
+        "reason": { "$ref": "#/$defs/reason" },
+        "message": { "type": "string" }
       }
     }
   }

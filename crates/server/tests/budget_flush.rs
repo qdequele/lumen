@@ -280,3 +280,69 @@ async fn a_failed_group_flush_is_retried_even_when_the_group_goes_idle() {
     assert!(flush_budgets(&rt).await);
     assert_eq!(group_spent().await, 0.25);
 }
+
+#[tokio::test]
+async fn a_lab_budget_alert_is_written_with_the_spend_that_crossed_it() {
+    let (rt, plain, _) = runtime(true, true).await;
+    rt.keys.set_lab_alerts(
+        Some(Arc::new(lumen_auth::lab_alerts::LabAlerts::default())),
+        &[],
+    );
+    // A sub-group of the lease, with its own budget, holding the key.
+    let lease = rt.store.load_groups().await.unwrap()[0].id.clone();
+    let sub = rt
+        .store
+        .create_group(NewGroup {
+            name: "staging".to_owned(),
+            budget_max: Some(1.0),
+            account_ref: None,
+            parent_id: Some(lease.clone()),
+        })
+        .await
+        .unwrap();
+    rt.keys.upsert_group(&sub);
+    let key_id = rt.store.list_keys(false).await.unwrap()[0].id.clone();
+    let patch: lumen_auth::store::KeyPatch =
+        serde_json::from_str(&format!(r#"{{"group_id":"{}"}}"#, sub.id)).unwrap();
+    let updated = rt.store.update_key(&key_id, patch).await.unwrap().unwrap();
+    rt.keys.apply(&updated);
+
+    spend(&rt, &plain, 600_000);
+    assert!(flush_budgets(&rt).await);
+    let bodies: Vec<serde_json::Value> = rt
+        .store
+        .outbox_due(i64::MAX, 10)
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| serde_json::from_str(&row.body).unwrap())
+        .collect();
+    let alerts: Vec<_> = bodies
+        .iter()
+        .filter(|b| b["type"] == "budget.threshold")
+        .collect();
+    assert_eq!(alerts.len(), 1, "{bodies:?}");
+    assert_eq!(alerts[0]["data"]["scope"], "group");
+    assert_eq!(alerts[0]["data"]["subject_id"], sub.id.as_str());
+    assert_eq!(alerts[0]["data"]["threshold"], 50);
+    assert_eq!(alerts[0]["account_id"], ACCOUNT);
+    let states = rt.store.load_lab_budget_states().await.unwrap();
+    assert_eq!(states.len(), 1);
+    assert_eq!(
+        (states[0].subject_id.as_str(), states[0].crossed),
+        (sub.id.as_str(), 1)
+    );
+
+    // The lease itself (6 % of $10) is never reported, and nothing repeats.
+    spend(&rt, &plain, 10_000);
+    assert!(flush_budgets(&rt).await);
+    let thresholds = rt
+        .store
+        .outbox_due(i64::MAX, 20)
+        .await
+        .unwrap()
+        .iter()
+        .filter(|row| row.body.contains("\"budget.threshold\""))
+        .count();
+    assert_eq!(thresholds, 1);
+}

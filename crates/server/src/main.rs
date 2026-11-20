@@ -1274,6 +1274,32 @@ fn spawn_budget_flush_task(runtime: Arc<AuthRuntime>, knobs: Arc<AuthKnobs>) {
     });
 }
 
+/// Lab mode (ADR 015): the billing policy and the Lab alert sink. The states
+/// persisted with earlier alerts resume each subject's budget period, so a
+/// restart neither replays nor loses an alert (amendment 2026-11-20).
+async fn enable_lab_mode(
+    keys: &AuthState,
+    store: &KeyStore,
+    config: &Config,
+) -> anyhow::Result<()> {
+    let Some(usage_events) = &config.usage_events else {
+        return Ok(());
+    };
+    keys.set_billing(Some(Arc::new(lumen_auth::billing::BillingPolicy {
+        source: usage_events.source_label().to_owned(),
+    })));
+    tracing::info!(source = %usage_events.source_label(), "billing usage events enabled");
+    let states = store
+        .load_lab_budget_states()
+        .await
+        .context("failed to load Lab alert states")?;
+    keys.set_lab_alerts(
+        Some(Arc::new(lumen_auth::lab_alerts::LabAlerts::default())),
+        &states,
+    );
+    Ok(())
+}
+
 /// Refuse to bill with a live group whose `account_ref` is not a UUID (ADR
 /// 015): the admin API only enforces the shape while `[usage_events]` is on,
 /// so a ref written before it was enabled would be sent as an `account_id`
@@ -1364,12 +1390,7 @@ async fn boot_auth_stack(
         .await
         .context("failed to load virtual keys")?;
     let keys = AuthState::load(groups, entries);
-    if let Some(usage_events) = &config.usage_events {
-        keys.set_billing(Some(Arc::new(lumen_auth::billing::BillingPolicy {
-            source: usage_events.source_label().to_owned(),
-        })));
-        tracing::info!(source = %usage_events.source_label(), "billing usage events enabled");
-    }
+    enable_lab_mode(&keys, &store, config).await?;
     tracing::info!(key_count = keys.len(), group_count, "virtual keys loaded");
 
     // Rows the writer finally discards (a batch the DB refused twice) land in
@@ -1403,6 +1424,9 @@ async fn boot_auth_stack(
     master_value.zeroize();
 
     spawn_budget_flush_task(Arc::clone(&runtime), Arc::clone(&auth_knobs));
+    if config.usage_events.is_some() {
+        lumen_server::lab_alerts::spawn_key_expiry_task(store.clone());
+    }
 
     // Retention purge: drop usage_log rows older than the window. The window is
     // read live from `auth_knobs` each tick so a reload retunes it in place.

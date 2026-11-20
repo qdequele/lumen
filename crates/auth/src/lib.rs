@@ -16,12 +16,15 @@
 //!   (ADR 011), detected on the settle that already happens per request and
 //!   queued through a bounded channel.
 //! * [`billing`] - billing usage events for a control plane (ADR 015).
+//! * [`lab_alerts`] - budget, key-expiry and provider-key alerts reported to
+//!   the Lab through the same outbox (ADR 015, amendment 2026-11-20).
 
 pub mod billing;
 pub mod crypto;
 pub mod error;
 pub mod events;
 pub mod key;
+pub mod lab_alerts;
 pub mod state;
 pub mod store;
 pub mod usage;
