@@ -8,6 +8,9 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ### Security
 
+- `url` 2.5.8 to 2.5.9 (with `form_urlencoded` 1.2.3, which it needs), for
+  RUSTSEC-2026-0592: a stack overflow in `Url::origin()` on deeply nested
+  `blob:` URLs. Lockfile only. The `audit · deny` CI job failed on it.
 - **A hot reload can no longer bring a deleted key back.** A config reload
   re-reads the key and group tables from the database and then updates the
   tables in memory. An admin delete, disable or budget change that landed
