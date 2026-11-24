@@ -108,6 +108,9 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ### Changed
 
+- The vendored `lab-events.schema.json` follows the Lab's copy, which adds
+  `sync.health_changed`, an event only Connect sends. Nothing LUMEN sends
+  changes.
 - **A team or default pool key answering HTTP 402 is benched like a
   rejected key.** A provider answering 402 (out of quota or credit) for one
   key of a pool now marks that key `failing` for 10 minutes and tries the

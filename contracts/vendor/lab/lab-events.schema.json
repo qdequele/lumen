@@ -19,12 +19,13 @@
         "job.cancelled",
         "source.status_changed",
         "sync.state_changed",
+        "sync.health_changed",
         "budget.threshold",
         "budget.exhausted",
         "key.expiring",
         "provider_key.status_changed"
       ],
-      "description": "usage.recorded: billable usage. job.*: a crawl or pipeline run ended (scrapix, glutony). source.status_changed: a scheduled Pipelines source started failing or recovered (glutony). sync.state_changed: a Connect sync changed state (connect). budget.*, key.expiring, provider_key.status_changed: Gateway alerts (lumen). The Lab rejects a type it does not know without retrying it, so an engine may send a new type only once the Lab that accepts it is deployed."
+      "description": "usage.recorded: billable usage. job.*: a crawl or pipeline run ended (scrapix, glutony). source.status_changed: a scheduled Pipelines source started failing or recovered (glutony). sync.state_changed: a Connect sync changed state (connect). sync.health_changed: a Connect sync's lag or the WAL its slot keeps on the source crossed a threshold, or came back under it (connect). budget.*, key.expiring, provider_key.status_changed: Gateway alerts (lumen). The Lab rejects a type it does not know without retrying it, so an engine may send a new type only once the Lab that accepts it is deployed."
     },
     "occurred_at": { "type": "string", "format": "date-time" },
     "account_id": { "$ref": "#/$defs/uuid", "description": "The Lab account the usage belongs to." },
@@ -56,6 +57,10 @@
     {
       "if": { "properties": { "type": { "const": "sync.state_changed" } }, "required": ["type"] },
       "then": { "properties": { "product": { "const": "connect" }, "data": { "$ref": "#/$defs/syncStateData" } } }
+    },
+    {
+      "if": { "properties": { "type": { "const": "sync.health_changed" } }, "required": ["type"] },
+      "then": { "properties": { "product": { "const": "connect" }, "data": { "$ref": "#/$defs/syncHealthData" } } }
     },
     {
       "if": { "properties": { "type": { "const": "budget.threshold" } }, "required": ["type"] },
@@ -95,7 +100,7 @@
     },
     {
       "if": { "properties": { "product": { "const": "connect" } }, "required": ["product"] },
-      "then": { "properties": { "type": { "enum": ["usage.recorded", "sync.state_changed"] } } }
+      "then": { "properties": { "type": { "enum": ["usage.recorded", "sync.state_changed", "sync.health_changed"] } } }
     }
   ],
   "$defs": {
@@ -238,6 +243,23 @@
         "resync": { "type": "boolean", "description": "The snapshot that ended or started was a resync, not the first one." },
         "reason": { "$ref": "#/$defs/reason" },
         "message": { "type": "string" }
+      }
+    },
+    "syncHealthData": {
+      "type": "object",
+      "description": "A Connect sync's health crossed a threshold the engine sets (warning) or came back under it (ok), per cause. lag: the sync is streaming but behind its source by more than the threshold. wal_retained: the sync's replication slot keeps more WAL on the source than the threshold, whatever the sync's state: a stopped sync's slot keeps WAL until the source's disk fills or the slot is invalidated, so it is measured while the sync is paused, held or failed too. Sent on the change only, once it has held for the engine's settle time. Id: a UUIDv7 made when the change is recorded and kept across retries.",
+      "required": ["sync_id", "status", "cause"],
+      "additionalProperties": false,
+      "properties": {
+        "sync_id": { "type": "string", "minLength": 1 },
+        "sync_name": { "type": "string" },
+        "status": { "enum": ["warning", "ok"] },
+        "cause": { "enum": ["lag", "wal_retained"] },
+        "state": { "$ref": "#/$defs/syncState" },
+        "lag_seconds": { "type": "integer", "minimum": 0 },
+        "retained_wal_bytes": { "type": "integer", "minimum": 0 },
+        "threshold": { "type": "integer", "minimum": 0, "description": "The threshold crossed: seconds for lag, bytes for wal_retained." },
+        "source_limit_bytes": { "type": "integer", "minimum": 0, "description": "wal_retained: the source's own cap on the WAL a slot may keep (Postgres max_slot_wal_keep_size), when it has one. Past it the source invalidates the slot and the sync must resync." }
       }
     },
     "syncState": {
