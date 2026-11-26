@@ -6,6 +6,8 @@ All notable changes to LUMEN are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-11-26
+
 ### Security
 
 - `url` 2.5.8 to 2.5.9 (with `form_urlencoded` 1.2.3, which it needs), for
@@ -2793,7 +2795,8 @@ This closes every remaining streaming criterion:
 - Docs: error-code reference (`docs/errors.md`), ADR 001 (crate/lib naming),
   and this changelog.
 
-[Unreleased]: https://github.com/qdequele/lumen/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/qdequele/lumen/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/qdequele/lumen/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/qdequele/lumen/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/qdequele/lumen/compare/v0.8.1...v0.9.0
 [0.8.1]: https://github.com/qdequele/lumen/compare/v0.7.0...v0.8.1
